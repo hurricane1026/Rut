@@ -619,7 +619,12 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         // wake-up event. For wait(any), choose a concrete event kind so
         // event predicates observe a deterministic branch in offline tests.
         jit::YieldKind resume_kind = unpacked.yield_kind;
-        if (resume_kind == jit::YieldKind::Any) resume_kind = jit::YieldKind::Recv;
+        if (resume_kind == jit::YieldKind::Any) {
+            // Use the timeout winner when a timer arm exists (Any with
+            // non-zero payload), otherwise fall back to recv.
+            resume_kind = (unpacked.yield_payload_u32() == 0u) ? jit::YieldKind::Recv
+                                                                : jit::YieldKind::Timer;
+        }
         ctx.resume_event_kind = static_cast<u32>(resume_kind);
         ctx.resume_event_result = (resume_kind == jit::YieldKind::Timer) ? 0 : 1;
         ctx.state = unpacked.next_state;

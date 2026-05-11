@@ -3195,6 +3195,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 const Span store_span = mir.functions[i].blocks[bi].term.span;
                 for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++) {
                     if (mir.functions[i].resume_blocks[wi + 1] != bi) continue;
+                    // Slot persistence is optional at runtime: some callers run
+                    // handlers without frame slots by leaving ctx.slot_count==0.
+                    // Codegen defends against this by guarding slot writes with
+                    // the stored slot_count.
                     auto kind = b.emit_resume_event_kind({store_span.line, store_span.col});
                     if (!kind ||
                         !b.emit_ctx_store_slot_i32(

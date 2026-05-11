@@ -357,18 +357,29 @@ TEST(simulate_engine, static_status_match) {
 // The caller must keep `rir` alive for as long as the Engine.
 static bool compile_to_rir(const char* src, FrontendRirModule& rir) {
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    if (!lexed) return false;
+    if (!lexed) {
+        return false;
+    }
     auto ast = parse_file(lexed.value());
-    if (!ast) return false;
+    if (!ast) {
+        return false;
+    }
     std::unique_ptr<AstFile> ast_owned(ast.value());
     auto hir = analyze_file(*ast_owned);
-    if (!hir) return false;
+    if (!hir) {
+        return false;
+    }
     std::unique_ptr<HirModule> hir_owned(hir.value());
     auto mir = build_mir(*hir_owned);
-    if (!mir) return false;
+    if (!mir) {
+        return false;
+    }
     std::unique_ptr<MirModule> mir_owned(mir.value());
     auto lowered = lower_to_rir(*mir_owned, rir);
-    return lowered.has_value();
+    if (!lowered) {
+        return false;
+    }
+    return true;
 }
 
 TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
@@ -461,7 +472,7 @@ TEST(simulate_engine, wait_result_fields_survive_later_waits) {
     Engine engine;
     REQUIRE(engine.init(rir.module, nullptr, 0));
 
-    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
     CHECK_EQ(result.verdict, Verdict::Match);
     CHECK_EQ(result.actual_status, 204u);
     CHECK_EQ(result.yield_count, 2u);
@@ -476,13 +487,36 @@ TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
         "408 } } }\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
+    REQUIRE_GE(rir.module.func_count, 1u);
+    REQUIRE_GE(rir.module.functions[0].yield_count, 1u);
+    CHECK_EQ(rir.module.functions[0].yield_kinds[0], static_cast<u8>(jit::YieldKind::Any));
+    CHECK_EQ(rir.module.functions[0].yield_payload[0], 50u);
 
     Engine engine;
     REQUIRE(engine.init(rir.module, nullptr, 0));
 
-    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 204));
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
     CHECK_EQ(result.verdict, Verdict::Match);
-    CHECK_EQ(result.actual_status, 204u);
+    CHECK_EQ(result.actual_status, 408u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, wait_any_expression_can_resume_with_timer_predicate) {
+    const char* src =
+        "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
+        "return 408 } else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+
+    const auto result = simulate_one(engine, make_entry("GET /x HTTP/1.1\r\nHost: x\r\n\r\n", 408));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 408u);
     CHECK_EQ(result.yield_count, 1u);
 
     engine.shutdown();
