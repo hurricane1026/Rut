@@ -150,10 +150,10 @@ enum class Opcode : u8 {
     ResumeEventKind,    // %r = ctx.resume_event_kind    → i32
     ResumeEventResult,  // %r = ctx.resume_event_result → i32
     CtxLoadSlotI32,     // %r = ctx.slot[i]            → i32
-                          // Falls back to current resume metadata when
-                          // slot data is unavailable: even index slots
-                          // read resume_event_kind, odd index slots read
-                          // resume_event_result.
+                        // Falls back to current resume metadata when
+                        // slot data is unavailable: even index slots
+                        // read resume_event_kind, odd index slots read
+                        // resume_event_result.
     ReqRemoteAddr,      // %r = req.remote_addr          → IP
     ReqContentLength,   // %r = req.content_length       → ByteSize
     ReqCookie,          // %r = req.cookie "name"        → Optional(str)

@@ -472,7 +472,8 @@ TEST(simulate_engine, wait_result_fields_survive_later_waits) {
 
 TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
     const char* src =
-        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(50) => { return 408 } } }\n";
+        "route GET \"/x\" { wait any { downstream.recv() => { return 204 } timer(50) => { return "
+        "408 } } }\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
 
@@ -490,7 +491,8 @@ TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
 
 TEST(simulate_engine, timer_wait_result_matches_runtime_zero) {
     const char* src =
-        "route GET \"/x\" { let ev = wait(50) if ev.result == 0 { return 204 } else { return 500 } }\n";
+        "route GET \"/x\" { let ev = wait(50) if ev.result == 0 { return 204 } else { return 500 } "
+        "}\n";
     FrontendRirModule rir{};
     REQUIRE(compile_to_rir(src, rir));
 

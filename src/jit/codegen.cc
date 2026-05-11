@@ -539,43 +539,35 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef count = LLVMBuildLoad2(c.builder, c.i32_ty, count_ptr, "ctx.slot.count");
             LLVMValueRef has_slot = LLVMBuildICmp(
                 c.builder, LLVMIntUGT, count, LLVMConstInt(c.i32_ty, slot, 0), "ctx.has.slot");
-            LLVMValueRef fallback = nullptr;
+
+            const u32 byte_offset = static_cast<u32>(sizeof(HandlerCtx)) + slot * 8u;
+            LLVMValueRef off = LLVMConstInt(c.i32_ty, byte_offset, 0);
+            LLVMValueRef ptr =
+                LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ctx.slot.ptr");
+            LLVMTypeRef slot_ptr_ty = LLVMPointerType(c.i32_ty, 0);
+            LLVMValueRef slot_i32_ptr =
+                LLVMBuildBitCast(c.builder, ptr, slot_ptr_ty, "ctx.slot.ptr32");
+
+            LLVMValueRef fallback_ptr = nullptr;
             if ((slot & 1u) == 0) {
                 LLVMValueRef kind_off = LLVMConstInt(
                     c.i32_ty, static_cast<u32>(offsetof(HandlerCtx, resume_event_kind)), 0);
                 LLVMValueRef kind_ptr =
                     LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &kind_off, 1, "ev.kind.ptr");
-                fallback = LLVMBuildLoad2(c.builder, c.i32_ty, kind_ptr, "ev.kind");
+                fallback_ptr =
+                    LLVMBuildBitCast(c.builder, kind_ptr, slot_ptr_ty, "ctx.slot.fallback.ptr32");
             } else {
                 LLVMValueRef result_off = LLVMConstInt(
                     c.i32_ty, static_cast<u32>(offsetof(HandlerCtx, resume_event_result)), 0);
                 LLVMValueRef result_ptr =
                     LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &result_off, 1, "ev.result.ptr");
-                fallback = LLVMBuildLoad2(c.builder, c.i32_ty, result_ptr, "ev.result");
+                fallback_ptr =
+                    LLVMBuildBitCast(c.builder, result_ptr, slot_ptr_ty, "ctx.slot.fallback.ptr32");
             }
-
-            LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(c.builder);
-            LLVMValueRef fn = LLVMGetBasicBlockParent(cur_bb);
-            LLVMBasicBlockRef load_bb =
-                LLVMAppendBasicBlockInContext(c.llvm_ctx, fn, "ctx.slot.load");
-            LLVMBasicBlockRef cont_bb =
-                LLVMAppendBasicBlockInContext(c.llvm_ctx, fn, "ctx.slot.load.cont");
-            LLVMBuildCondBr(c.builder, has_slot, load_bb, cont_bb);
-
-            LLVMPositionBuilderAtEnd(c.builder, load_bb);
-            const u32 byte_offset = static_cast<u32>(sizeof(HandlerCtx)) + slot * 8u;
-            LLVMValueRef off = LLVMConstInt(c.i32_ty, byte_offset, 0);
-            LLVMValueRef ptr =
-                LLVMBuildGEP2(c.builder, c.i8_ty, c.param_ctx, &off, 1, "ctx.slot.ptr");
-            LLVMValueRef loaded = LLVMBuildLoad2(c.builder, c.i32_ty, ptr, "ctx.slot");
-            LLVMBuildBr(c.builder, cont_bb);
-            LLVMBasicBlockRef loaded_bb = LLVMGetInsertBlock(c.builder);
-
-            LLVMPositionBuilderAtEnd(c.builder, cont_bb);
-            LLVMValueRef v = LLVMBuildPhi(c.builder, c.i32_ty, "ctx.slot.value");
-            LLVMValueRef incoming[] = {loaded, fallback};
-            LLVMBasicBlockRef incoming_bbs[] = {loaded_bb, cur_bb};
-            LLVMAddIncoming(v, incoming, incoming_bbs, 2);
+            LLVMValueRef slot_or_fallback_ptr = LLVMBuildSelect(
+                c.builder, has_slot, slot_i32_ptr, fallback_ptr, "ctx.slot.ptr.sel");
+            LLVMValueRef v =
+                LLVMBuildLoad2(c.builder, c.i32_ty, slot_or_fallback_ptr, "ctx.slot.value");
             c.set_value(inst.result, v);
             break;
         }

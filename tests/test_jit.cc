@@ -34,9 +34,9 @@ static Str lit(const char* s) {
 
 struct TestHandlerCtxFrame {
     HandlerCtx ctx{};
-    u64 slots[8]{};
+    u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
 
-    TestHandlerCtxFrame() { ctx.slot_count = 8; }
+    TestHandlerCtxFrame() { ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
 };
 
 // RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all
@@ -15021,7 +15021,8 @@ route GET "/sleep" { wait(1500) return 200 }
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
 
     // First call: TimerYield carrying raw 1500 ms payload.
@@ -15077,7 +15078,8 @@ route GET "/long" { wait(100000) return 200 }
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    HandlerCtx ctx{};
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
     ctx.state = 0;
     auto outcome = invoke_jit_handler(handler,
                                       nullptr,

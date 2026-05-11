@@ -158,8 +158,7 @@ route POST "/upload" {
 }
 ```
 
-The older `wait(any(...))` expression form remains available and returns the
-same result surface as other event waits:
+The older `wait(any(...))` expression form remains available and returns the same result surface as other event waits:
 
 ```rut
 route POST "/upload" {
@@ -254,7 +253,8 @@ route GET "/x" {
 In other words:
 
 ```text
-let* ; (guard | wait)* ; terminal_control
+let* ;
+(guard | wait)*; terminal_control
 ```
 
 `let` bindings may appear before the first `wait`. Top-level guards may appear
@@ -330,8 +330,8 @@ The following are future work rather than current behavior:
 - Response starts inside `wait(downstream.send(response(...)))`; use terminal
   `return response(...)` for downstream responses until route completion can
   model "send and finish" without a second terminal response.
-- Exact event subsets inside `wait(any(...))`; today it uses current-connection
-  `Any` once the listed forms validate.
+- Exact event subsets inside `wait(any(...))`; today it uses current-connection `Any`
+  once the listed forms validate.
 - Parameterized IO starts inside `wait(any(...))`; start the operation before a
   later race wait until that payload has a richer representation.
 - `wait any` arm result binding such as `r = downstream.recv() => { ... }`.
