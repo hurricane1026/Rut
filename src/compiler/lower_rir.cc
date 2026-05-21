@@ -2265,17 +2265,18 @@ static FrontendResult<rir::ValueId> materialize_local_init(
             if (!inner) return frontend_error(FrontendError::OutOfMemory, span);
             return inner.value();
         }
-        const rir::TypeKind inner_kind =
-            shape.type == MirTypeKind::Str ? rir::TypeKind::Str : rir::TypeKind::I32;
+        const rir::TypeKind inner_kind = shape.type == MirTypeKind::Bool  ? rir::TypeKind::Bool
+                                         : shape.type == MirTypeKind::Str ? rir::TypeKind::Str
+                                                                          : rir::TypeKind::I32;
         auto inner = b.make_type(inner_kind);
         if (!inner) return frontend_error(FrontendError::OutOfMemory, span);
         return inner.value();
     };
 
     if (local.may_error) {
-        if (local_shape.type != MirTypeKind::I32 && local_shape.type != MirTypeKind::Str &&
-            local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct &&
-            local_shape.type != MirTypeKind::Unknown)
+        if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
+            local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
+            local_shape.type != MirTypeKind::Struct && local_shape.type != MirTypeKind::Unknown)
             return frontend_error(FrontendError::UnsupportedSyntax, local.span);
         auto inner = make_inner_type(local_shape, local.span);
         if (!inner) return core::make_unexpected(inner.error());
@@ -2446,8 +2447,9 @@ static FrontendResult<rir::ValueId> materialize_local_init(
                                  local_count,
                                  local.span);
 
-    if (local_shape.type != MirTypeKind::I32 && local_shape.type != MirTypeKind::Str &&
-        local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct)
+    if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
+        local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
+        local_shape.type != MirTypeKind::Struct)
         return frontend_error(FrontendError::UnsupportedSyntax, local.span);
 
     auto inner = make_inner_type(local_shape, local.span);

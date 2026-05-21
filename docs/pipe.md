@@ -111,6 +111,21 @@ route GET "/admin" {
 }
 ```
 
+## Method Stages
+
+The placeholder can also be the receiver of a method-call stage:
+
+```rut
+route GET "/method-stage" {
+    let ok = 200 | _.eq(200)
+    if ok { return 200 } else { return 500 }
+}
+```
+
+`_` and `_1` are accepted as method receivers. Tuple-slot receivers such as
+`_2.method(...)` are still rejected; use a function stage with tuple-slot
+arguments when a pipeline needs to project tuple slots.
+
 ## Optional Header Flow
 
 `req.header(...)` returns an optional string. A pipe stage only runs when the
@@ -226,6 +241,7 @@ route GET "/generic" {
 ## Supported Today
 
 - Function-call stages: `value | fn(_, other_arg)`.
+- Method-call stages with a whole-value receiver: `value | _.method(other_arg)`.
 - Placeholder position anywhere in the function argument list.
 - Single-stage and chained pipes.
 - Tuple slot placeholders `_1` ... `_10`.
@@ -238,7 +254,6 @@ route GET "/generic" {
 
 The following are future work rather than current behavior:
 
-- Method-call stages on the right-hand side.
 - Placeholder-free stages. A pipe stage must consume the left-hand value
   explicitly.
 - Multiple placeholders in a single stage.
