@@ -17309,6 +17309,373 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
 }
+TEST(frontend, source_pipe_accepts_method_stage_receiver_placeholder) {
+    const auto src = R"(
+route GET "/users" {
+    let ok = 200 | _.eq(200)
+    if ok { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::Bool);
+}
+TEST(frontend, source_pipe_method_stage_runtime_optional_lhs_flows_via_or) {
+    const auto src = R"(
+route GET "/users" {
+    let ok = req.header("Host") | _.eq("example.com")
+    let safe = or(ok, false)
+    if safe { return 200 } else { return 404 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::Bool);
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::Bool);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, source_pipe_method_stage_reuses_analyzed_lhs_receiver) {
+    const auto src = R"(
+struct Box { value: i32 }
+route GET "/users" {
+    let box = Box(value: 200)
+    let ok = box.value | _.eq(200)
+    if ok { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::Bool);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, source_pipe_method_stage_direct_dispatch_keeps_receiver_placeholder) {
+    const auto src = R"(
+protocol Ident { func id() -> i32 }
+struct Box { value: i32 }
+Box impl Ident {
+    func id(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    let box = Box(value: 200)
+    let code = box | _.id()
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, source_pipe_method_stage_known_nil_falls_back_via_or) {
+    const auto src = R"(
+route GET "/users" {
+    let ok = nil | _.eq(200)
+    let safe = or(ok, false)
+    if safe { return 200 } else { return 404 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::Bool);
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::Bool);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, source_pipe_method_stage_known_nil_dispatches_protocol_method_shape) {
+    const auto src = R"(
+protocol MaybeCode { func code() -> i32 }
+struct Box { value: i32 }
+Box impl MaybeCode {
+    func code(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    let box: Box = nil
+    let code = box | _.code()
+    let safe = or(code, 500)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+    CHECK(hir->routes[0].locals[2].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[2].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[2].may_error);
+}
+TEST(frontend, source_pipe_method_stage_runtime_optional_lhs_dispatches_protocol_method) {
+    const auto src = R"(
+protocol MaybeCode { func code() -> i32 }
+struct Box { value: i32 }
+Box impl MaybeCode {
+    func code(self: Box) -> i32 => self.value
+}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 200) } else { nil }
+}
+route GET "/users" {
+    let code = maybeBox(req.http11) | _.code()
+    let safe = or(code, 500)
+    if safe == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, source_pipe_method_stage_known_error_preserves_error_variant) {
+    const auto src = R"(
+route GET "/users" {
+    let failed = error(.timeout)
+    let ok = failed | _.eq(200)
+    let safe = or(ok, false)
+    if safe { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::Bool);
+    CHECK(hir->routes[0].locals[1].may_error);
+    CHECK_EQ(hir->routes[0].locals[1].error_variant_index,
+             hir->routes[0].locals[0].error_variant_index);
+    CHECK_EQ(hir->routes[0].locals[1].init.error_variant_index,
+             hir->routes[0].locals[0].init.error_variant_index);
+    CHECK_FALSE(hir->routes[0].locals[2].may_error);
+}
+TEST(frontend, source_pipe_method_stage_known_error_accesses_standard_error_field_shape) {
+    const auto src = R"(
+route GET "/users" {
+    let failed = error(.timeout)
+    let code = failed | _.code()
+    let safe = or(code, 500)
+    if safe == 500 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[1].may_error);
+    CHECK_EQ(hir->routes[0].locals[1].error_variant_index,
+             hir->routes[0].locals[0].error_variant_index);
+    CHECK(hir->routes[0].locals[2].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[2].may_error);
+}
+TEST(frontend, source_pipe_method_stage_known_error_dispatches_value_method_shape) {
+    const auto src = R"(
+protocol MaybeMsg { func msg() -> i32 }
+struct Box { value: i32 }
+Box impl MaybeMsg {
+    func msg(self: Box) -> i32 => self.value
+}
+route GET "/users" {
+    let box: Box = error(.timeout)
+    let code = box | _.msg()
+    let safe = or(code, 500)
+    if safe == 500 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[1].may_error);
+    CHECK_EQ(hir->routes[0].locals[1].error_variant_index,
+             hir->routes[0].locals[0].error_variant_index);
+    CHECK(hir->routes[0].locals[2].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[2].may_error);
+}
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+TEST(frontend, source_pipe_method_stage_known_nil_validates_regex) {
+    const auto src = R"(
+route GET "/users" {
+    let ok = nil | _.matches(re"[")
+    let safe = or(ok, false)
+    if safe { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::InvalidRegex);
+}
+#endif
+TEST(frontend, analyze_rejects_pipe_method_stage_runtime_optional_tuple_return) {
+    const auto src = R"(
+protocol Pairable { func pair() -> (i32, i32) }
+struct Box { value: i32 }
+Box impl Pairable {
+    func pair(self: Box) -> (i32, i32) => (self.value, 500)
+}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 200) } else { nil }
+}
+route GET "/users" {
+    let pair = maybeBox(req.http11) | _.pair()
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_pipe_method_stage_known_nil_tuple_return) {
+    const auto src = R"(
+protocol Pairable { func pair() -> (i32, i32) }
+struct Box { value: i32 }
+Box impl Pairable {
+    func pair(self: Box) -> (i32, i32) => (self.value, 500)
+}
+route GET "/users" {
+    let box: Box = nil
+    let pair = box | _.pair()
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_pipe_method_stage_known_error_tuple_return) {
+    const auto src = R"(
+protocol Pairable { func pair() -> (i32, i32) }
+struct Box { value: i32 }
+Box impl Pairable {
+    func pair(self: Box) -> (i32, i32) => (self.value, 500)
+}
+route GET "/users" {
+    let box: Box = error(.timeout)
+    let pair = box | _.pair()
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_pipe_method_stage_known_nil_typed_cmp_mismatch) {
+    const auto src = R"(
+route GET "/users" {
+    let code: i32 = nil
+    let ok = code | _.eq("200")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_pipe_method_stage_known_nil_typed_matches_non_string_receiver) {
+    const auto src = R"(
+route GET "/users" {
+    let code: i32 = nil
+    let ok = code | _.matches(re"2")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+TEST(frontend, analyze_rejects_pipe_method_stage_slot_two_receiver) {
+    const auto src = R"(
+route GET "/users" {
+    let ok = 200 | _2.eq(200)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, source_pipe_accepts_tuple_literal_multi_slot_placeholders) {
     const auto src = R"(
 func second(a: i32, b: i32) -> i32 => b
