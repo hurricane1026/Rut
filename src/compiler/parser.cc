@@ -8,6 +8,9 @@ namespace rut {
 
 namespace {
 
+constexpr Str kGuardMatchArmIfDetail = lit_str("guard match arms do not support if guards");
+constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
+
 struct Parser {
     const LexedTokens* toks = nullptr;
     AstFile* file = nullptr;
@@ -75,7 +78,8 @@ struct Parser {
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
         if (block.block_stmts.len == 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, span_from(*rbrace.value()));
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*rbrace.value()), kEmptyBlockDetail);
         block.span.end = rbrace.value()->end;
         if (block.block_stmts.len == 1) return *block.block_stmts[0];
         return block;
@@ -114,7 +118,9 @@ struct Parser {
                     arm.pattern = pattern.value();
                 }
                 if (const Token* kw_if = take(TokenType::KwIf))
-                    return frontend_error(FrontendError::UnsupportedSyntax, span_from(*kw_if));
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*kw_if),
+                                          kGuardMatchArmIfDetail);
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 auto arm_stmt = parse_func_body_stmt();
@@ -337,7 +343,10 @@ struct Parser {
                 auto msg_expr = parse_expr();
                 if (!msg_expr) return core::make_unexpected(msg_expr.error());
                 if (msg_expr->kind != AstExprKind::StrLit)
-                    return frontend_error(FrontendError::UnsupportedSyntax, msg_expr->span);
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        msg_expr->span,
+                        lit_str("error message argument must be a string literal"));
                 msg = msg_expr->str_value;
                 while (take(TokenType::Comma)) {
                     auto field_name = expect_field_name();
@@ -460,7 +469,8 @@ struct Parser {
             if (all_digits && index > 0) {
                 if (index > 10)
                     return frontend_error(FrontendError::UnsupportedSyntax,
-                                          span_from(*ident.value()));
+                                          span_from(*ident.value()),
+                                          lit_str("placeholder index must be between _1 and _10"));
                 expr.kind = AstExprKind::Placeholder;
                 expr.int_value = index;
                 expr.span = span_from(*ident.value());
@@ -738,7 +748,9 @@ struct Parser {
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
             if (stmt.block_stmts.len == 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, span_from(*rbrace.value()));
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*rbrace.value()),
+                                      kEmptyBlockDetail);
             stmt.span.end = rbrace.value()->end;
             return stmt;
         }
@@ -803,7 +815,9 @@ struct Parser {
                         arm.pattern = pattern.value();
                     }
                     if (const Token* kw_if = take(TokenType::KwIf))
-                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(*kw_if));
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*kw_if),
+                                              kGuardMatchArmIfDetail);
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
                     auto arm_stmt = parse_stmt();
@@ -1152,8 +1166,11 @@ struct Parser {
                 return core::make_unexpected(for_kw.error());
             auto var_name = expect(TokenType::Ident);
             if (!var_name) return core::make_unexpected(var_name.error());
-            auto in_kw = expect(TokenType::KwIn);
-            if (!in_kw) return core::make_unexpected(in_kw.error());
+            auto in_kw = take(TokenType::KwIn);
+            if (!in_kw)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*var_name.value()),
+                                      lit_str("for loop expects 'in' after iterator name"));
             auto iter_expr = parse_expr();
             if (!iter_expr) return core::make_unexpected(iter_expr.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -1489,7 +1506,9 @@ struct Parser {
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
             if (block.block_stmts.len == 0)
-                return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*rbrace.value()),
+                                      kEmptyBlockDetail);
             block.span = Span{start.start, rbrace.value()->end, start.line, start.col};
             return block;
         }
