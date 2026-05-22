@@ -17586,6 +17586,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(
+        hir.error().detail.eq(lit("pipe method stage with nil/error propagation must return bool, "
+                                  "i32, str, variant, or struct")));
 }
 TEST(frontend, analyze_rejects_pipe_method_stage_known_nil_tuple_return) {
     const auto src = R"(
@@ -17607,6 +17610,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(
+        hir.error().detail.eq(lit("pipe method stage with nil/error propagation must return bool, "
+                                  "i32, str, variant, or struct")));
 }
 TEST(frontend, analyze_rejects_pipe_method_stage_known_error_tuple_return) {
     const auto src = R"(
@@ -17628,6 +17634,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(
+        hir.error().detail.eq(lit("pipe method stage with nil/error propagation must return bool, "
+                                  "i32, str, variant, or struct")));
 }
 TEST(frontend, analyze_rejects_pipe_method_stage_known_nil_typed_cmp_mismatch) {
     const auto src = R"(
@@ -17826,6 +17835,7 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("pipe rhs must be a call stage or _.method(...) stage")));
 }
 TEST(frontend, analyze_rejects_pipe_with_placeholder_slot_two) {
     const auto src = R"(
@@ -18062,6 +18072,32 @@ route GET "/users" {
     CHECK(hir->routes[0].locals[1].type == HirTypeKind::Str);
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, analyze_rejects_pipe_method_stage_different_error_variants_detail) {
+    const auto src = R"(
+struct Box { value: i32 }
+struct AuthError { err: Error, token: str }
+protocol MaybeFail { func failstage() -> Box }
+Box impl MaybeFail {
+    func failstage(self: Box) -> Box => error(.forbidden)
+}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 200) } else { error(AuthError, .timeout, "timed out", token: "abc") }
+}
+route GET "/users" {
+    let box = maybeBox(req.http11) | _.failstage()
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("pipe method stage cannot combine different propagated error variants")));
 }
 TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_optional_error_stage_via_or) {
     const auto src = R"(
