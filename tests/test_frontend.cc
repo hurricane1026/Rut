@@ -1625,6 +1625,36 @@ TEST(frontend, parse_wait_rejects_unknown_suffix) {
     CHECK(!ast);
 }
 
+TEST(frontend, parse_rejects_empty_if_block_with_detail) {
+    const char* src = "route GET \"/x\" { if true { } else { return 200 } return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("empty block is not supported")));
+}
+
+TEST(frontend, parse_rejects_empty_statement_block_with_detail) {
+    const char* src = "route GET \"/x\" { { } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("empty block is not supported")));
+}
+
+TEST(frontend, parse_rejects_non_string_error_message_with_detail) {
+    const char* src = "route GET \"/x\" { let failed = error(.timeout, 42) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("error message argument must be a string literal")));
+}
+
 TEST(frontend, analyze_accepts_let_guard_wait_source_order) {
     // Guards and waits are threaded in source order after pre-wait locals.
     const char* src =
@@ -9749,6 +9779,7 @@ TEST(frontend, parse_rejects_guard_match_arm_guard) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("guard match arms do not support if guards")));
 }
 TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
     const char* src =
@@ -16699,6 +16730,7 @@ route GET "/users" { return 200 }
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("guard match arms do not support if guards")));
 }
 TEST(frontend, analyze_rejects_function_block_guard_match_without_wildcard) {
     const auto src = R"(
@@ -17882,6 +17914,7 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("placeholder index must be between _1 and _10")));
 }
 TEST(frontend, source_pipe_runtime_optional_lhs_flows_via_or) {
     const auto src = R"(
@@ -24827,21 +24860,27 @@ TEST(frontend, analyze_plain_for_loop_body_let_scoped_to_body) {
 }
 
 TEST(frontend, parse_for_loop_rejects_missing_in) {
-    // `inline for item <missing in> [1, 2, 3]` — expect must see KwIn, else unexpected-token.
+    // Missing `in` is reported at the iterator name, not at the following expression.
     const char* src = "route GET \"/x\" { inline for item [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    CHECK(!ast);
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("for loop expects 'in' after iterator name")));
+    CHECK_EQ(ast.error().span.col, 29u);
 }
 
 TEST(frontend, parse_plain_for_loop_rejects_missing_in) {
-    // `for item <missing in> [1, 2, 3]` — parse should fail before analysis.
+    // Plain `for` uses the same missing-`in` diagnostic as `inline for`.
     const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    CHECK(!ast);
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("for loop expects 'in' after iterator name")));
+    CHECK_EQ(ast.error().span.col, 22u);
 }
 
 int main(int argc, char** argv) {
