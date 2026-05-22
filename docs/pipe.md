@@ -45,8 +45,8 @@ where `tenant_from_host(...)` is also expanded into ordinary expression IR.
 
 ## Basic Use
 
-The right-hand side must be a function call with exactly one placeholder.
-`_` and `_1` both mean "the whole value from the left-hand side":
+The right-hand side must be a function call stage. `_` and `_1` both mean "the
+whole value from the left-hand side":
 
 ```rut
 func normalize_status(code: i32) -> i32 {
@@ -63,6 +63,13 @@ The same call can use `_1`:
 
 ```rut
 let code = 204 | normalize_status(_1)
+```
+
+If a function-call stage has no placeholder, the left-hand value is passed as
+the first argument:
+
+```rut
+let code = 204 | normalize_status()
 ```
 
 ## Chaining
@@ -240,11 +247,14 @@ route GET "/generic" {
 
 ## Supported Today
 
-- Function-call stages: `value | fn(_, other_arg)`.
+- Function-call stages with placeholders: `value | fn(_, other_arg)`.
+- Placeholder-free function-call stages: `value | fn(other_arg)` passes `value`
+  as the first argument.
 - Method-call stages with a whole-value receiver: `value | _.method(other_arg)`.
 - Placeholder position anywhere in the function argument list.
 - Single-stage and chained pipes.
-- Tuple slot placeholders `_1` ... `_10`.
+- Tuple slot placeholders `_1` ... `_10`, including multiple placeholders in a
+  single stage.
 - Tuple literals, tuple locals, tuple-returning functions, struct fields,
   variant payloads, and generic tuple/struct shapes.
 - Optional/error propagation through runtime values.
@@ -254,9 +264,6 @@ route GET "/generic" {
 
 The following are future work rather than current behavior:
 
-- Placeholder-free stages. A pipe stage must consume the left-hand value
-  explicitly.
-- Multiple placeholders in a single stage.
 - Tuple-slot placeholders for runtime optional/error left-hand values beyond
   `_` / `_1`.
 - A dedicated MIR/RIR pipe representation; current lowering intentionally
