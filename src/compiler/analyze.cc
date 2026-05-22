@@ -6136,6 +6136,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                        value.type == HirTypeKind::Str || value.type == HirTypeKind::Variant ||
                        value.type == HirTypeKind::Struct;
             };
+            auto unsupported_missing_result = [&]() -> FrontendResult<HirExpr> {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    method_stage.span,
+                    lit_str("pipe method stage with nil/error propagation must return bool, i32, "
+                            "str, variant, or struct"));
+            };
             auto shape_only_result = [](HirExpr value) {
                 value.lhs = nullptr;
                 value.rhs = nullptr;
@@ -6195,8 +6202,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (lhs_state == KnownValueState::Nil) {
                 auto ret = infer_known_missing_method_result();
                 if (!ret) return core::make_unexpected(ret.error());
-                if (!is_lowerable_missing_result(ret.value()))
-                    return frontend_error(FrontendError::UnsupportedSyntax, method_stage.span);
+                if (!is_lowerable_missing_result(ret.value())) return unsupported_missing_result();
                 HirExpr folded{};
                 folded.kind = HirExprKind::Nil;
                 copy_result_shape(&folded, ret.value());
@@ -6210,8 +6216,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     return frontend_error(FrontendError::UnsupportedSyntax, method_stage.span);
                 auto ret = infer_known_missing_method_result();
                 if (!ret) return core::make_unexpected(ret.error());
-                if (!is_lowerable_missing_result(ret.value()))
-                    return frontend_error(FrontendError::UnsupportedSyntax, method_stage.span);
+                if (!is_lowerable_missing_result(ret.value())) return unsupported_missing_result();
                 HirExpr folded = *err_expr;
                 const u32 error_struct_index = folded.error_struct_index;
                 const u32 error_variant_index = folded.error_variant_index;
@@ -6240,11 +6245,14 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     method_stage, route, mod, locals, local_count, binding, &unwrapped);
                 if (!then_expr) return core::make_unexpected(then_expr.error());
                 if (!is_lowerable_missing_result(then_expr.value()))
-                    return frontend_error(FrontendError::UnsupportedSyntax, method_stage.span);
+                    return unsupported_missing_result();
                 if (lhs->may_error && then_expr->may_error &&
                     (lhs->error_struct_index != then_expr->error_struct_index ||
                      lhs->error_variant_index != then_expr->error_variant_index))
-                    return frontend_error(FrontendError::UnsupportedSyntax, method_stage.span);
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          method_stage.span,
+                                          lit_str("pipe method stage cannot combine different "
+                                                  "propagated error variants"));
                 if (!route->exprs.push(then_expr.value()))
                     return frontend_error(FrontendError::TooManyItems, expr.span);
                 HirExpr* then_ptr = &route->exprs[route->exprs.len - 1];
@@ -6300,7 +6308,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (expr.rhs->kind == AstExprKind::Call)
             return analyze_call_expr(
                 *expr.rhs, route, mod, locals, local_count, binding, &lhs.value());
-        return frontend_error(FrontendError::UnsupportedSyntax, expr.rhs->span);
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.rhs->span,
+                              lit_str("pipe rhs must be a call stage or _.method(...) stage"));
     }
     if (expr.kind == AstExprKind::Eq || expr.kind == AstExprKind::Lt ||
         expr.kind == AstExprKind::Gt) {
