@@ -6501,7 +6501,19 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if (fn_index == mod.functions.len) return fail_with_name(expr.span, "unknown function");
     const auto& fn = mod.functions[fn_index];
-    if (expr.args.len != fn.params.len) return fail_with_name(expr.span, "argument count mismatch");
+    u32 pipe_placeholder_count = 0;
+    if (pipe_lhs != nullptr) {
+        for (u32 i = 0; i < expr.args.len; i++) {
+            if (expr.args[i]->kind == AstExprKind::Placeholder) pipe_placeholder_count++;
+        }
+    }
+    const bool pipe_inject_lhs =
+        pipe_lhs != nullptr && pipe_placeholder_count == 0 && fn.params.len == expr.args.len + 1;
+    if (pipe_lhs != nullptr && pipe_placeholder_count == 0 && !pipe_inject_lhs)
+        return fail_call(expr.span, "pipe call missing placeholder", nullptr);
+    const u32 effective_arg_count = expr.args.len + (pipe_inject_lhs ? 1u : 0u);
+    if (effective_arg_count != fn.params.len)
+        return fail_with_name(expr.span, "argument count mismatch");
     if (expr.type_args.len != 0 && expr.type_args.len != fn.type_params.len)
         return fail_with_name(expr.span, "type argument count mismatch");
     GenericBinding generic_bindings[HirFunction::kMaxTypeParams]{};
@@ -6669,6 +6681,63 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!concretized) return core::make_unexpected(concretized.error());
         return expected;
     };
+    auto check_call_arg =
+        [&](u32 param_index, const HirExpr& analyzed_arg, Span span) -> FrontendResult<void> {
+        if (fn.params[param_index].type == HirTypeKind::Generic) {
+            if (!bind_generic_shape(generic_bindings,
+                                    fn.type_params.len,
+                                    fn.params[param_index].generic_index,
+                                    analyzed_arg))
+                return core::make_unexpected(
+                    fail_call(span, "failed to bind generic param", nullptr).error());
+            if (fn.type_params[fn.params[param_index].generic_index].has_error_constraint &&
+                !generic_binding_satisfies_error_constraint(
+                    mod, generic_bindings[fn.params[param_index].generic_index]))
+                return core::make_unexpected(
+                    fail_call(span, "generic param error constraint failed", nullptr).error());
+            if (fn.type_params[fn.params[param_index].generic_index].has_eq_constraint &&
+                !generic_binding_satisfies_eq_constraint(
+                    mod, generic_bindings[fn.params[param_index].generic_index]))
+                return core::make_unexpected(
+                    fail_call(span, "generic param eq constraint failed", nullptr).error());
+            if (fn.type_params[fn.params[param_index].generic_index].has_ord_constraint &&
+                !generic_binding_satisfies_ord_constraint(
+                    mod, generic_bindings[fn.params[param_index].generic_index]))
+                return core::make_unexpected(
+                    fail_call(span, "generic param ord constraint failed", nullptr).error());
+            for (u32 cpi = 0;
+                 cpi < fn.type_params[fn.params[param_index].generic_index].custom_protocol_count;
+                 cpi++) {
+                const u32 proto_index = fn.type_params[fn.params[param_index].generic_index]
+                                            .custom_protocol_indices[cpi];
+                if (!generic_binding_satisfies_custom_protocol(
+                        mod, generic_bindings[fn.params[param_index].generic_index], proto_index))
+                    return core::make_unexpected(fail_call(span,
+                                                           "generic param custom protocol failed",
+                                                           &mod.protocols[proto_index].name)
+                                                     .error());
+            }
+        } else if (fn.params[param_index].template_variant_index != 0xffffffffu ||
+                   fn.params[param_index].template_struct_index != 0xffffffffu) {
+            const auto expected_shape = make_expected_param_expr(fn.params[param_index]);
+            if (!bind_named_generic_shape(
+                    mod, generic_bindings, fn.type_params.len, expected_shape, analyzed_arg))
+                return core::make_unexpected(
+                    fail_call(span, "template generic shape mismatch", nullptr).error());
+            auto expected = concrete_param_expr(fn.params[param_index]);
+            if (!expected) return core::make_unexpected(expected.error());
+            if (!same_hir_type_shape(mod, analyzed_arg, expected.value()))
+                return core::make_unexpected(
+                    fail_call(span, "template arg shape mismatch", nullptr).error());
+        } else {
+            auto expected = concrete_param_expr(fn.params[param_index]);
+            if (!expected) return core::make_unexpected(expected.error());
+            if (!same_hir_type_shape(mod, analyzed_arg, expected.value()))
+                return core::make_unexpected(
+                    fail_call(span, "concrete param shape mismatch", nullptr).error());
+        }
+        return {};
+    };
     if (pipe_lhs != nullptr) {
         const auto lhs_state = known_value_state(*pipe_lhs, locals, local_count, 0);
         if (lhs_state == KnownValueState::Nil) {
@@ -6769,74 +6838,30 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             unwrapped.lhs = lhs_ptr;
 
             HirExpr analyzed_args[AstExpr::kMaxArgs]{};
+            u32 arg_offset = 0;
+            if (pipe_inject_lhs) {
+                analyzed_args[0] = unwrapped;
+                auto checked = check_call_arg(0, analyzed_args[0], expr.span);
+                if (!checked) return core::make_unexpected(checked.error());
+                arg_offset = 1;
+            }
             for (u32 i = 0; i < expr.args.len; i++) {
                 const auto& arg_expr = *expr.args[i];
+                const u32 param_index = i + arg_offset;
                 if (arg_expr.kind == AstExprKind::Placeholder) {
-                    analyzed_args[i] = unwrapped;
+                    analyzed_args[param_index] = unwrapped;
                 } else {
                     auto arg = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
                     if (!arg) return core::make_unexpected(arg.error());
                     if (arg->may_nil || arg->may_error)
                         return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
-                    analyzed_args[i] = arg.value();
+                    analyzed_args[param_index] = arg.value();
                 }
-                if (fn.params[i].type == HirTypeKind::Generic) {
-                    if (!bind_generic_shape(generic_bindings,
-                                            fn.type_params.len,
-                                            fn.params[i].generic_index,
-                                            analyzed_args[i]))
-                        return fail_call(
-                            expr.args[i]->span, "failed to bind generic param", nullptr);
-                    if (fn.type_params[fn.params[i].generic_index].has_error_constraint &&
-                        !generic_binding_satisfies_error_constraint(
-                            mod, generic_bindings[fn.params[i].generic_index]))
-                        return fail_call(
-                            expr.args[i]->span, "generic param error constraint failed", nullptr);
-                    if (fn.type_params[fn.params[i].generic_index].has_eq_constraint &&
-                        !generic_binding_satisfies_eq_constraint(
-                            mod, generic_bindings[fn.params[i].generic_index]))
-                        return fail_call(
-                            expr.args[i]->span, "generic param eq constraint failed", nullptr);
-                    if (fn.type_params[fn.params[i].generic_index].has_ord_constraint &&
-                        !generic_binding_satisfies_ord_constraint(
-                            mod, generic_bindings[fn.params[i].generic_index]))
-                        return fail_call(
-                            expr.args[i]->span, "generic param ord constraint failed", nullptr);
-                    for (u32 cpi = 0;
-                         cpi < fn.type_params[fn.params[i].generic_index].custom_protocol_count;
-                         cpi++) {
-                        const u32 proto_index =
-                            fn.type_params[fn.params[i].generic_index].custom_protocol_indices[cpi];
-                        if (!generic_binding_satisfies_custom_protocol(
-                                mod, generic_bindings[fn.params[i].generic_index], proto_index))
-                            return fail_call(expr.args[i]->span,
-                                             "generic param custom protocol failed",
-                                             &mod.protocols[proto_index].name);
-                    }
-                } else if (fn.params[i].template_variant_index != 0xffffffffu ||
-                           fn.params[i].template_struct_index != 0xffffffffu) {
-                    const auto expected_shape = make_expected_param_expr(fn.params[i]);
-                    if (!bind_named_generic_shape(mod,
-                                                  generic_bindings,
-                                                  fn.type_params.len,
-                                                  expected_shape,
-                                                  analyzed_args[i]))
-                        return fail_call(
-                            expr.args[i]->span, "template generic shape mismatch", nullptr);
-                    auto expected = concrete_param_expr(fn.params[i]);
-                    if (!expected) return core::make_unexpected(expected.error());
-                    if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                        return fail_call(
-                            expr.args[i]->span, "template generic arg shape mismatch", nullptr);
-                } else {
-                    auto expected = concrete_param_expr(fn.params[i]);
-                    if (!expected) return core::make_unexpected(expected.error());
-                    if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                        return fail_call(
-                            expr.args[i]->span, "concrete param shape mismatch", nullptr);
-                }
+                auto checked =
+                    check_call_arg(param_index, analyzed_args[param_index], expr.args[i]->span);
+                if (!checked) return core::make_unexpected(checked.error());
             }
-            if (placeholder_count != 1)
+            if (!pipe_inject_lhs && placeholder_count != 1)
                 return fail_call(expr.span, "placeholder pipe count mismatch", nullptr);
 
             auto ret = concrete_return_expr();
@@ -6849,7 +6874,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                        route,
                                                        mod,
                                                        analyzed_args,
-                                                       expr.args.len,
+                                                       effective_arg_count,
                                                        generic_bindings,
                                                        fn.type_params.len);
             if (!then_expr) return core::make_unexpected(then_expr.error());
@@ -6941,8 +6966,19 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     HirExpr analyzed_args[AstExpr::kMaxArgs]{};
     u32 placeholder_count = 0;
     const HirExpr* placeholder_source = pipe_lhs;
+    u32 arg_offset = 0;
+    if (pipe_inject_lhs) {
+        if (!route->exprs.push(*pipe_lhs))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        placeholder_source = &route->exprs[route->exprs.len - 1];
+        analyzed_args[0] = *placeholder_source;
+        auto checked = check_call_arg(0, analyzed_args[0], expr.span);
+        if (!checked) return core::make_unexpected(checked.error());
+        arg_offset = 1;
+    }
     for (u32 i = 0; i < expr.args.len; i++) {
         const auto& arg_expr = *expr.args[i];
+        const u32 param_index = i + arg_offset;
         if (arg_expr.kind == AstExprKind::Placeholder) {
             if (pipe_lhs == nullptr)
                 return fail_call(arg_expr.span, "placeholder outside pipe", nullptr);
@@ -6955,66 +6991,26 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             auto slot_expr =
                 placeholder_slot_expr(*placeholder_source, arg_expr.int_value, arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
-            analyzed_args[i] = slot_expr.value();
+            analyzed_args[param_index] = slot_expr.value();
         } else {
             auto arg = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
             if (!arg) return core::make_unexpected(arg.error());
             if (arg->may_nil || arg->may_error)
                 return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
-            analyzed_args[i] = arg.value();
+            analyzed_args[param_index] = arg.value();
         }
-        if (fn.params[i].type == HirTypeKind::Generic) {
-            if (!bind_generic_shape(generic_bindings,
-                                    fn.type_params.len,
-                                    fn.params[i].generic_index,
-                                    analyzed_args[i]))
-                return fail_call(expr.args[i]->span, "failed to bind generic param", nullptr);
-            if (fn.type_params[fn.params[i].generic_index].has_error_constraint &&
-                !generic_binding_satisfies_error_constraint(
-                    mod, generic_bindings[fn.params[i].generic_index]))
-                return fail_call(
-                    expr.args[i]->span, "generic param error constraint failed", nullptr);
-            if (fn.type_params[fn.params[i].generic_index].has_eq_constraint &&
-                !generic_binding_satisfies_eq_constraint(
-                    mod, generic_bindings[fn.params[i].generic_index]))
-                return fail_call(expr.args[i]->span, "generic param eq constraint failed", nullptr);
-            if (fn.type_params[fn.params[i].generic_index].has_ord_constraint &&
-                !generic_binding_satisfies_ord_constraint(
-                    mod, generic_bindings[fn.params[i].generic_index]))
-                return fail_call(
-                    expr.args[i]->span, "generic param ord constraint failed", nullptr);
-            for (u32 cpi = 0;
-                 cpi < fn.type_params[fn.params[i].generic_index].custom_protocol_count;
-                 cpi++) {
-                const u32 proto_index =
-                    fn.type_params[fn.params[i].generic_index].custom_protocol_indices[cpi];
-                if (!generic_binding_satisfies_custom_protocol(
-                        mod, generic_bindings[fn.params[i].generic_index], proto_index))
-                    return fail_call(expr.args[i]->span,
-                                     "generic param custom protocol failed",
-                                     &mod.protocols[proto_index].name);
-            }
-        } else if (fn.params[i].template_variant_index != 0xffffffffu ||
-                   fn.params[i].template_struct_index != 0xffffffffu) {
-            const auto expected_shape = make_expected_param_expr(fn.params[i]);
-            if (!bind_named_generic_shape(
-                    mod, generic_bindings, fn.type_params.len, expected_shape, analyzed_args[i]))
-                return fail_call(expr.args[i]->span, "template generic shape mismatch", nullptr);
-            auto expected = concrete_param_expr(fn.params[i]);
-            if (!expected) return core::make_unexpected(expected.error());
-            if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                return fail_call(expr.args[i]->span, "template arg shape mismatch", nullptr);
-        } else {
-            auto expected = concrete_param_expr(fn.params[i]);
-            if (!expected) return core::make_unexpected(expected.error());
-            if (!same_hir_type_shape(mod, analyzed_args[i], expected.value()))
-                return fail_call(expr.args[i]->span, "concrete param shape mismatch", nullptr);
-        }
+        auto checked = check_call_arg(param_index, analyzed_args[param_index], expr.args[i]->span);
+        if (!checked) return core::make_unexpected(checked.error());
     }
-    if (pipe_lhs != nullptr && placeholder_count == 0)
+    if (pipe_lhs != nullptr && !pipe_inject_lhs && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
-    auto inlined = instantiate_function_expr(
-        fn.body, route, mod, analyzed_args, expr.args.len, generic_bindings, fn.type_params.len);
+    auto inlined = instantiate_function_expr(fn.body,
+                                             route,
+                                             mod,
+                                             analyzed_args,
+                                             effective_arg_count,
+                                             generic_bindings,
+                                             fn.type_params.len);
     if (!inlined) {
         return core::make_unexpected(inlined.error());
     }

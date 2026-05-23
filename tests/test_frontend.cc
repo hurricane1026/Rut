@@ -17324,6 +17324,42 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
 }
+TEST(frontend, source_pipe_placeholder_free_stage_injects_lhs_as_first_arg) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = 200 | id()
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+}
+TEST(frontend, source_pipe_placeholder_free_stage_keeps_explicit_args_after_lhs) {
+    const auto src = R"(
+func second(a: i32, b: i32) -> i32 => b
+route GET "/users" {
+    let code = 200 | second(500)
+    if code == 500 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+}
 TEST(frontend, source_pipe_accepts_placeholder_slot_one_alias) {
     const auto src = R"(
 func second(a: i32, b: i32) -> i32 => b
@@ -17376,6 +17412,29 @@ route GET "/users" {
     CHECK(hir->routes[0].locals[0].may_nil);
     CHECK_FALSE(hir->routes[0].locals[0].may_error);
     CHECK(hir->routes[0].locals[1].type == HirTypeKind::Bool);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+}
+TEST(frontend, source_pipe_placeholder_free_runtime_optional_lhs_flows_via_or) {
+    const auto src = R"(
+func id(x: str) -> str => x
+route GET "/users" {
+    let host = req.header("Host") | id()
+    let safe = or(host, "missing")
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::Str);
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK(hir->routes[0].locals[1].type == HirTypeKind::Str);
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
