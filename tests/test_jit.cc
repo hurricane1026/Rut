@@ -15782,6 +15782,64 @@ route {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_decorator_passes_then_pre_wait_local_guard_then_waits) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+route {
+    @passing "*"
+    GET "/sleep" {
+        let allowed = req.path == "/"
+        guard allowed else { return 404 }
+        wait(1000)
+        return 200
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
+    ctx.state = 0;
+    auto r0 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r0.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(r0.next_state, 1);
+    CHECK_EQ(static_cast<u8>(r0.yield_kind), static_cast<u8>(YieldKind::Timer));
+    CHECK_EQ(r0.yield_payload_u32(), 1000u);
+
+    ctx.state = r0.next_state;
+    auto r1 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r1.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r1.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_route_decorator_passes_then_multiple_waits) {
     const auto src = R"rut(
 func passing(_ req: i32) -> i32 => 0

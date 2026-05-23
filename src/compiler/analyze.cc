@@ -7212,6 +7212,18 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     return term;
 }
 
+static bool terminator_reads_any_local(const HirTerminator& term,
+                                       const HirLocal* locals,
+                                       u32 local_count) {
+    if (term.kind != HirTerminatorKind::ReturnStatus ||
+        term.source_kind != HirTerminatorSourceKind::LocalRef)
+        return false;
+    for (u32 li = 0; li < local_count; li++) {
+        if (locals[li].ref_index == term.local_ref_index) return true;
+    }
+    return false;
+}
+
 static FrontendResult<void> analyze_guard_match_arms(
     const FixedVec<AstStatement::MatchArm, AstStatement::kMaxMatchArms>& ast_arms,
     const HirExpr& subject,
@@ -14792,14 +14804,28 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
         }
         if (route.waits.len != 0 && route.decorator_guard_count != 0) {
+            const u32 first_wait_start = route.waits[0].span.start;
+            // Pre-wait locals are allowed only for pre-wait work. They may feed
+            // user guards before the first wait, but must not be introduced by a
+            // wait expression or after the first resume boundary.
             for (u32 li = 0; li < user_local_count_before_decorators; li++) {
-                if (route.locals[li].name.len != 0) {
+                if (route.locals[li].name.len != 0 &&
+                    (route.locals[li].is_wait_result ||
+                     route.locals[li].span.start > first_wait_start)) {
                     return frontend_error(FrontendError::UnsupportedSyntax, route.locals[li].span);
                 }
             }
             if (user_guard_after_wait || route.control.kind != HirControlKind::Direct ||
                 route.for_loops.len != 0) {
                 return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+            }
+            // The resumed terminal path skips pre-wait local initialization.
+            // Keep decorated wait routes from reading user locals there.
+            if (terminator_reads_any_local(route.control.direct_term,
+                                           route.locals.data,
+                                           user_local_count_before_decorators)) {
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      route.control.direct_term.span);
             }
         }
 
