@@ -152,15 +152,16 @@ The decorator runs before the timer yield is armed:
 - If `auth` returns `401`, the handler immediately returns `401`.
 - If `auth` returns `0`, the handler yields the timer and resumes to `return 200`.
 
-Decorated `wait(...)` routes may include top-level `guard` statements before
-the first wait. The decorator guards run first, then the user guards, then the
-wait is armed:
+Decorated `wait(...)` routes may include `let` bindings and top-level `guard`
+statements before the first wait. The decorator guards run first, then the
+pre-wait user guards, then the wait is armed:
 
 ```rut
 route {
     @auth "*"
     GET "/x" {
-        guard req.method == GET else { return 405 }
+        let allowed = req.method == GET
+        guard allowed else { return 405 }
         wait(50)
         return 204
     }
@@ -168,7 +169,8 @@ route {
 ```
 
 Current limitation: decorated `wait(...)` routes must still use direct terminal
-control and cannot contain user `let` bindings. These forms are rejected today:
+control, cannot contain user `let` bindings after a wait, and cannot bind wait
+results into locals. These forms are rejected today:
 
 ```rut
 route {
@@ -180,7 +182,14 @@ route {
 ```rut
 route {
     @auth "*"
-    GET "/x" { let code = 200 wait(50) return 200 }
+    GET "/x" { wait(50) let code = 200 return 200 }
+}
+```
+
+```rut
+route {
+    @auth "*"
+    GET "/x" { let ev = wait(downstream.recv()) return 204 }
 }
 ```
 

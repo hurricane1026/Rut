@@ -1715,6 +1715,34 @@ route {
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
+TEST(frontend, analyze_accepts_decorated_wait_with_pre_wait_local) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" {
+        let allowed = req.path == "/"
+        guard allowed else { return 404 }
+        wait(50)
+        return 204
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].decorators.len, 1u);
+    REQUIRE_EQ(hir->routes[0].decorator_guard_count, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("allowed")));
+    CHECK(!hir->routes[0].locals[0].is_wait_result);
+    REQUIRE_EQ(hir->routes[0].guards.len, 2u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+}
+
 TEST(frontend, analyze_rejects_decorated_wait_with_post_wait_guard) {
     const char* src = R"rut(
 func auth(_ req: i32) -> i32 => 0
@@ -1753,12 +1781,32 @@ route {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
-TEST(frontend, analyze_rejects_decorated_wait_with_user_local) {
+TEST(frontend, analyze_rejects_decorated_wait_with_post_wait_user_local) {
     const char* src = R"rut(
 func auth(_ req: i32) -> i32 => 0
 route {
     @auth "*"
-    GET "/x" { let code = 200 wait(50) return 200 }
+    GET "/x" { wait(50) let code = 200 return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_rejects_decorated_wait_with_wait_result_local) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" {
+        let ev = wait(downstream.recv())
+        return 204
+    }
 }
 )rut";
     auto lexed = lex(lit(src));
