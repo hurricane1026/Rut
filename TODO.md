@@ -19,7 +19,7 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] Test framework fault injection provides shared mmap/mprotect/socket/recv/poll/read/write/send/connect/epoll/timerfd/accept/open scopes for network/runtime tests.
 - [x] Malformed upstream E2E coverage drives real proxy sockets through malformed status, EOF, header, and framing failures.
 - [x] Replay/simulate route-action matrix coverage documents Static, Default, Proxy/JIT Forward, JIT ReturnStatus, mismatch, and malformed capture behavior.
-- [x] Coverage helper now keeps the runtime threshold gate while printing per-area summaries for runtime, parser, replay/sim, JIT, and optional changed first-party files.
+- [x] Coverage helper now keeps the runtime threshold gate while printing per-area summaries for runtime, compiler, replay/sim, JIT, and optional changed first-party files.
 
 ## P0: State Invariant Coverage Follow-ups
 
@@ -68,7 +68,7 @@ Outstanding work items, prioritized for the next implementation passes.
 
 **Work**:
 - Review `scripts/coverage_report.py` exclusions and CI coverage target.
-- Keep per-area coverage summaries for runtime, parser, replay/sim, and JIT actionable as test coverage changes.
+- Keep per-area coverage summaries for runtime, compiler, replay/sim, and JIT actionable as test coverage changes.
 - Wire changed-file coverage summaries into CI/PR output if the signal proves useful.
 
 **Acceptance**:

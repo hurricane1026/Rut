@@ -53,7 +53,7 @@ AREAS = (
         ("include/rut/common/", "include/rut/runtime/", "src/runtime/"),
         RUNTIME_EXCLUDE_PATH_RE,
     ),
-    CoverageArea("parser", ("include/rut/compiler/", "src/compiler/")),
+    CoverageArea("compiler", ("include/rut/compiler/", "src/compiler/")),
     CoverageArea("replay/sim", ("include/rut/sim/", "src/sim/")),
     CoverageArea("jit", ("include/rut/jit/", "src/jit/")),
 )
@@ -133,6 +133,12 @@ def area_stats(files: dict[str, dict[int, int]]) -> tuple[int, int, list[tuple[i
     return covered, total, per_file_stats
 
 
+def format_pct(covered: int, total: int) -> str:
+    if total == 0:
+        return "  n/a"
+    return f"{100.0 * covered / total:>5.1f}%"
+
+
 def normalize_changed_path(path: str) -> str | None:
     path = path.strip()
     if not path:
@@ -191,8 +197,7 @@ def print_changed_file_summary(
                 print(f"{area.name:<12} {'n/a':>7} {'n/a':>7} {'n/a':>7}  {changed_path}")
             continue
         area_name, missed, total, covered = stats
-        pct = 100.0 * covered / total if total else 100.0
-        print(f"{area_name:<12} {missed:>7} {total:>7}  {pct:>5.1f}%  {changed_path}")
+        print(f"{area_name:<12} {missed:>7} {total:>7}  {format_pct(covered, total)}  {changed_path}")
 
 
 def main() -> int:
@@ -228,22 +233,24 @@ def main() -> int:
     for area in AREAS:
         covered, total, per_file_stats = area_stats(merged[area.name])
         summaries[area.name] = (covered, total, per_file_stats)
-        pct = 100.0 * covered / total if total else 100.0
-        print(f"{area.name:<12} {covered:>10} {total:>7}  {pct:>5.1f}%")
+        print(f"{area.name:<12} {covered:>10} {total:>7}  {format_pct(covered, total)}")
 
     gate_covered, gate_total, gate_file_stats = summaries[args.threshold_area]
-    gate_pct = 100.0 * gate_covered / gate_total if gate_total else 100.0
 
     print(f"\nLowest-covered files in {args.threshold_area}:")
     print(f"{'Missed':>7} {'Total':>7} {'Cover':>7}  File")
     for missed, total, covered, path in gate_file_stats:
-        pct = 100.0 * covered / total if total else 100.0
-        print(f"{missed:>7} {total:>7}  {pct:>5.1f}%  {path}")
+        print(f"{missed:>7} {total:>7}  {format_pct(covered, total)}  {path}")
     print(
         f"\n{args.threshold_area} TOTAL: "
-        f"{gate_covered}/{gate_total} lines covered = {gate_pct:.2f}%"
+        f"{gate_covered}/{gate_total} lines covered = {format_pct(gate_covered, gate_total).strip()}"
     )
     print_changed_file_summary(merged, changed_files)
+
+    if gate_total == 0:
+        print(f"ERROR: {args.threshold_area} line coverage has no measured lines")
+        return 1
+    gate_pct = 100.0 * gate_covered / gate_total
 
     if gate_pct < args.threshold:
         print(

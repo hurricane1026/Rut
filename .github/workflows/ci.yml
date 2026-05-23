@@ -372,10 +372,13 @@ jobs:
           LLVM_PROFILE_FILE=build/test_metrics.profraw ./build/tests/test_metrics
           LLVM_PROFILE_FILE=build/test_chunked_parser.profraw ./build/tests/test_chunked_parser
           LLVM_PROFILE_FILE=build/test_rir.profraw ./build/tests/test_rir
+          LLVM_PROFILE_FILE=build/test_frontend.profraw ./build/tests/test_frontend
           LLVM_PROFILE_FILE=build/test_shard_control.profraw ./build/tests/test_shard_control
           LLVM_PROFILE_FILE=build/test_traffic_capture.profraw ./build/tests/test_traffic_capture
           LLVM_PROFILE_FILE=build/test_traffic_replay.profraw ./build/tests/test_traffic_replay
           LLVM_PROFILE_FILE=build/test_sim.profraw ./build/tests/test_sim
+          LLVM_PROFILE_FILE=build/test_jit.profraw ./build/tests/test_jit
+          LLVM_PROFILE_FILE=build/test_simulate_engine.profraw ./build/tests/test_simulate_engine
           LLVM_PROFILE_FILE=build/test_route_trie.profraw ./build/tests/test_route_trie
           LLVM_PROFILE_FILE=build/test_route_art.profraw ./build/tests/test_route_art
           LLVM_PROFILE_FILE=build/test_route_select.profraw ./build/tests/test_route_select
@@ -420,6 +423,9 @@ jobs:
             build/tests/test_metrics \
             build/tests/test_chunked_parser \
             build/tests/test_rir \
+            build/tests/test_frontend \
+            build/tests/test_jit \
+            build/tests/test_simulate_engine \
             build/tests/test_route_trie \
             build/tests/test_route_art \
             build/tests/test_route_select
