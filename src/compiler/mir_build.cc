@@ -2334,24 +2334,23 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         }
 
         if (fn.waits.len != 0 && module.routes[i].decorator_guard_count != 0) {
-            const u32 deco_count = module.routes[i].decorator_guard_count;
+            const u32 guard_count = module.routes[i].guards.len;
             const bool scope = module.routes[i].control.kind == HirControlKind::Direct &&
-                               module.routes[i].guards.len == deco_count &&
                                fn.waits.len <= MirFunction::kMaxWaits;
             if (!scope) return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
 
-            const u32 yield_index = deco_count;
+            const u32 yield_index = guard_count;
             const u32 terminal_index = yield_index + 1;
             u32 guard_fail_index[HirRoute::kMaxGuards]{};
             u32 fail_cursor = terminal_index + 1;
-            for (u32 gi = 0; gi < deco_count; gi++) {
+            for (u32 gi = 0; gi < guard_count; gi++) {
                 guard_fail_index[gi] = fail_cursor;
                 fail_cursor += guard_fail_block_count(module.routes[i].guards[gi]);
             }
             if (fail_cursor > MirFunction::kMaxBlocks)
                 return frontend_error(FrontendError::TooManyItems, fn.span);
 
-            for (u32 gi = 0; gi < deco_count; gi++) {
+            for (u32 gi = 0; gi < guard_count; gi++) {
                 const auto& guard = module.routes[i].guards[gi];
                 MirBlock guard_block{};
                 guard_block.label = gi == 0 ? entry_label() : cont_label();
@@ -2360,7 +2359,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 auto cond = mir_value(guard.cond, module, &fn);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard_block.term.cond = cond.value();
-                guard_block.term.then_block = gi + 1 < deco_count ? gi + 1 : yield_index;
+                guard_block.term.then_block = gi + 1 < guard_count ? gi + 1 : yield_index;
                 guard_block.term.else_block = guard_fail_index[gi];
                 if (!fn.blocks.push(guard_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
@@ -2382,7 +2381,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (!fn.blocks.push(terminal_block))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
 
-            for (u32 gi = 0; gi < deco_count; gi++) {
+            for (u32 gi = 0; gi < guard_count; gi++) {
                 auto emitted = emit_guard_fail(module.routes[i].guards[gi]);
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
