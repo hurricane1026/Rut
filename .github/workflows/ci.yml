@@ -384,14 +384,15 @@ jobs:
         run: |
           llvm-profdata merge build/*.profraw -o build/merged.profdata
 
-          # Report runtime coverage as the UNION across test binaries:
+          # Report first-party coverage areas as the UNION across test binaries:
           # a line counts as covered if any binary hits it. `llvm-cov
           # report` alone picks one binary's instantiation per line for
           # inline/template functions in headers, which undercounts
           # coverage dramatically (e.g. handle_jit_outcome<Loop> has
           # different instantiations in test_network vs test_integration
           # — whichever comes first wins the reporting slot). The helper
-          # walks per-binary JSON exports and max-merges per line.
+          # walks per-binary JSON exports and max-merges per line. The
+          # threshold still gates runtime coverage by default.
           #
           # io_uring_backend / epoll_backend are excluded: require
           # kernel features / permissions that are unreliable in CI.
