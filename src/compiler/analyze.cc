@@ -14024,6 +14024,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
+        bool user_guard_after_wait = false;
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
@@ -14181,6 +14182,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 continue;
             }
             if (stmt.kind == AstStmtKind::Guard) {
+                if (seen_wait) user_guard_after_wait = true;
                 if (si + 1 >= item.route.statements.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 HirGuard guard{};
@@ -14795,8 +14797,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::UnsupportedSyntax, route.locals[li].span);
                 }
             }
-            if (route.guards.len != route.decorator_guard_count ||
-                route.control.kind != HirControlKind::Direct || route.for_loops.len != 0) {
+            if (user_guard_after_wait || route.control.kind != HirControlKind::Direct ||
+                route.for_loops.len != 0) {
                 return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
             }
         }
