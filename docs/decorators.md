@@ -152,11 +152,11 @@ The decorator runs before the timer yield is armed:
 - If `auth` returns `401`, the handler immediately returns `401`.
 - If `auth` returns `0`, the handler yields the timer and resumes to `return 200`.
 
-Decorated `wait(...)` routes may include pre-wait `let` bindings and top-level
-`guard` statements before or after the wait. The decorator guards run first,
-then pre-wait user guards, then the wait is armed. Post-wait guards run after
-resume and may read request fields, but they cannot read user locals that were
-initialized before the wait:
+Decorated `wait(...)` routes may include pre-wait `let` bindings, and may use
+top-level `guard` statements before or after the wait. The decorator guards run
+first, then pre-wait user guards, then the wait is armed. Post-wait guards run
+after resume and may read request fields, but they cannot read user locals that
+were initialized before the wait:
 
 ```rut
 route {
