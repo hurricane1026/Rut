@@ -152,9 +152,11 @@ The decorator runs before the timer yield is armed:
 - If `auth` returns `401`, the handler immediately returns `401`.
 - If `auth` returns `0`, the handler yields the timer and resumes to `return 200`.
 
-Decorated `wait(...)` routes may include `let` bindings and top-level `guard`
-statements before the first wait. The decorator guards run first, then the
-pre-wait user guards, then the wait is armed:
+Decorated `wait(...)` routes may include pre-wait `let` bindings and top-level
+`guard` statements before or after the wait. The decorator guards run first,
+then pre-wait user guards, then the wait is armed. Post-wait guards run after
+resume and may read request fields, but they cannot read user locals that were
+initialized before the wait:
 
 ```rut
 route {
@@ -168,9 +170,21 @@ route {
 }
 ```
 
+```rut
+route {
+    @auth "*"
+    GET "/x" {
+        wait(50)
+        guard req.path == "/" else { return 404 }
+        return 204
+    }
+}
+```
+
 Current limitation: decorated `wait(...)` routes must still use direct terminal
-control, cannot contain user `let` bindings after a wait, and cannot bind wait
-results into locals. These forms are rejected today:
+control, cannot contain user `let` bindings after a wait, cannot bind wait
+results into locals, and cannot use post-wait guards that read pre-wait user
+locals. These forms are rejected today:
 
 ```rut
 route {
@@ -193,8 +207,20 @@ route {
 }
 ```
 
-Decorated wait routes with post-wait user guards or for-loops are also
-rejected. Those shapes need a fuller source-ordered state-machine lowering.
+```rut
+route {
+    @auth "*"
+    GET "/x" {
+        let allowed = req.path == "/"
+        wait(50)
+        guard allowed else { return 404 }
+        return 204
+    }
+}
+```
+
+Decorated wait routes with for-loops are also rejected. Those shapes need a
+fuller source-ordered state-machine lowering.
 
 ## Unsupported Today
 

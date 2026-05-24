@@ -7224,6 +7224,50 @@ static bool terminator_reads_any_local(const HirTerminator& term,
     return false;
 }
 
+static bool expr_reads_any_local(const HirExpr& expr, const HirLocal* locals, u32 local_count) {
+    if (expr.kind == HirExprKind::LocalRef) {
+        for (u32 li = 0; li < local_count; li++) {
+            if (locals[li].ref_index == expr.local_index) return true;
+        }
+    }
+    if (expr.lhs != nullptr && expr_reads_any_local(*expr.lhs, locals, local_count)) return true;
+    if (expr.rhs != nullptr && expr_reads_any_local(*expr.rhs, locals, local_count)) return true;
+    for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
+        if (expr.field_inits[fi].value != nullptr &&
+            expr_reads_any_local(*expr.field_inits[fi].value, locals, local_count))
+            return true;
+    }
+    for (u32 ai = 0; ai < expr.args.len; ai++) {
+        if (expr.args[ai] != nullptr && expr_reads_any_local(*expr.args[ai], locals, local_count))
+            return true;
+    }
+    return false;
+}
+
+static bool guard_reads_any_local(const HirGuard& guard,
+                                  const HirModule& mod,
+                                  const HirLocal* locals,
+                                  u32 local_count) {
+    if (expr_reads_any_local(guard.cond, locals, local_count)) return true;
+    if (terminator_reads_any_local(guard.fail_term, locals, local_count)) return true;
+    if (expr_reads_any_local(guard.fail_match_expr, locals, local_count)) return true;
+    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+        if (terminator_reads_any_local(
+                mod.guard_match_arms[guard.fail_match_start + ai].direct_term,
+                locals,
+                local_count))
+            return true;
+    }
+    for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
+        if (expr_reads_any_local(guard.fail_body.locals[li].init, locals, local_count))
+            return true;
+    }
+    if (expr_reads_any_local(guard.fail_body.cond, locals, local_count)) return true;
+    return terminator_reads_any_local(guard.fail_body.then_term, locals, local_count) ||
+           terminator_reads_any_local(guard.fail_body.else_term, locals, local_count) ||
+           terminator_reads_any_local(guard.fail_body.direct_term, locals, local_count);
+}
+
 static FrontendResult<void> analyze_guard_match_arms(
     const FixedVec<AstStatement::MatchArm, AstStatement::kMaxMatchArms>& ast_arms,
     const HirExpr& subject,
@@ -14036,7 +14080,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
-        bool user_guard_after_wait = false;
         for (u32 si = 0; si < item.route.statements.len; si++) {
             const auto& stmt = item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
@@ -14194,7 +14237,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 continue;
             }
             if (stmt.kind == AstStmtKind::Guard) {
-                if (seen_wait) user_guard_after_wait = true;
                 if (si + 1 >= item.route.statements.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 HirGuard guard{};
@@ -14815,9 +14857,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(FrontendError::UnsupportedSyntax, route.locals[li].span);
                 }
             }
-            if (user_guard_after_wait || route.control.kind != HirControlKind::Direct ||
-                route.for_loops.len != 0) {
+            if (route.control.kind != HirControlKind::Direct || route.for_loops.len != 0) {
                 return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+            }
+            for (u32 gi = route.decorator_guard_count; gi < route.guards.len; gi++) {
+                if (route.guards[gi].span.start > first_wait_start &&
+                    guard_reads_any_local(route.guards[gi],
+                                          mod,
+                                          route.locals.data,
+                                          user_local_count_before_decorators)) {
+                    return frontend_error(FrontendError::UnsupportedSyntax, route.guards[gi].span);
+                }
             }
             // The resumed terminal path skips pre-wait local initialization.
             // Keep decorated wait routes from reading user locals there.
