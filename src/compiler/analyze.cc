@@ -7253,14 +7253,11 @@ static bool guard_reads_any_local(const HirGuard& guard,
     if (expr_reads_any_local(guard.fail_match_expr, locals, local_count)) return true;
     for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
         if (terminator_reads_any_local(
-                mod.guard_match_arms[guard.fail_match_start + ai].direct_term,
-                locals,
-                local_count))
+                mod.guard_match_arms[guard.fail_match_start + ai].direct_term, locals, local_count))
             return true;
     }
     for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
-        if (expr_reads_any_local(guard.fail_body.locals[li].init, locals, local_count))
-            return true;
+        if (expr_reads_any_local(guard.fail_body.locals[li].init, locals, local_count)) return true;
     }
     if (expr_reads_any_local(guard.fail_body.cond, locals, local_count)) return true;
     return terminator_reads_any_local(guard.fail_body.then_term, locals, local_count) ||
