@@ -7252,9 +7252,9 @@ static bool guard_reads_any_local(const HirGuard& guard,
     if (terminator_reads_any_local(guard.fail_term, locals, local_count)) return true;
     if (expr_reads_any_local(guard.fail_match_expr, locals, local_count)) return true;
     for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
-        if (terminator_reads_any_local(
-                mod.guard_match_arms[guard.fail_match_start + ai].direct_term, locals, local_count))
-            return true;
+        const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
+        if (expr_reads_any_local(arm.pattern, locals, local_count)) return true;
+        if (terminator_reads_any_local(arm.direct_term, locals, local_count)) return true;
     }
     for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
         if (expr_reads_any_local(guard.fail_body.locals[li].init, locals, local_count)) return true;
@@ -14858,12 +14858,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
             }
             for (u32 gi = route.decorator_guard_count; gi < route.guards.len; gi++) {
-                if (route.guards[gi].span.start > first_wait_start &&
-                    guard_reads_any_local(route.guards[gi],
-                                          mod,
-                                          route.locals.data,
-                                          user_local_count_before_decorators)) {
-                    return frontend_error(FrontendError::UnsupportedSyntax, route.guards[gi].span);
+                const HirGuard& guard = route.guards[gi];
+                if (guard.span.start > first_wait_start) {
+                    if (guard.fail_body.locals.len != 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax, guard.span);
+                    if (guard_reads_any_local(
+                            guard, mod, route.locals.data, user_local_count_before_decorators)) {
+                        return frontend_error(FrontendError::UnsupportedSyntax, guard.span);
+                    }
                 }
             }
             // The resumed terminal path skips pre-wait local initialization.

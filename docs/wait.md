@@ -318,8 +318,13 @@ route {
 ```
 
 Decorator guards run before the first timer yield is armed. Decorated wait
-routes currently reject user `let` bindings, user top-level guards, for-loops,
-and non-direct terminal control such as `if` / `match`.
+routes may use pre-wait `let` bindings and top-level guards before or after the
+wait. Post-wait guards run after resume and may read request fields, but they
+cannot read user locals initialized before the wait and cannot contain
+fail-body `let` bindings. Decorated wait routes still reject user `let`
+bindings after a wait, wait-result locals, for-loops, and non-direct terminal
+control such as `if` / `match`. See [decorators.md](decorators.md) for the
+full decorated wait subset.
 
 For the current static for-loop subset, including the route-level restriction
 that rejects mixing `wait(...)` with static loop lowering, see
