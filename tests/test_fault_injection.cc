@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -164,14 +165,35 @@ TEST(syscall_fault, clock_gettime_fixed_time_can_match_all_clock_ids) {
     CHECK_EQ(monotonic_us(), 42123456ULL);
 }
 
+TEST(syscall_fault, clock_gettime_null_timespec_fails_with_efault) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_clock_id = kMatchAllClockIds;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    uintptr_t raw = static_cast<uintptr_t>(getpid());
+    raw -= raw;
+    auto* null_ts = reinterpret_cast<struct timespec*>(raw);
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime =
+        reinterpret_cast<ClockGettimeFn>(reinterpret_cast<void*>(&clock_gettime));
+    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, null_ts), -1);
+    CHECK_EQ(errno, EFAULT);
+}
+
 TEST(syscall_fault, access_log_time_helpers_fail_closed_on_clock_error) {
+    const u64 last_monotonic = monotonic_us();
+    REQUIRE(last_monotonic != 0);
+
     SyscallFaultConfig fault_config;
     fault_config.clock_gettime_errno = EIO;
     fault_config.clock_gettime_failures = 2;
 
     ScopedSyscallFault fault(fault_config);
     CHECK_EQ(realtime_us(), 0ULL);
-    CHECK_EQ(monotonic_us(), 0ULL);
+    CHECK_EQ(monotonic_us(), last_monotonic);
 }
 
 TEST(epoll_fault, init_reports_epoll_create_failure) {

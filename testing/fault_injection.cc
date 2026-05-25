@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -342,6 +343,14 @@ bool open_flags_require_mode(int flags) {
     if ((flags & O_TMPFILE) == O_TMPFILE) return true;
 #endif
     return false;
+}
+
+bool is_null_ptr(const void* ptr) {
+    uintptr_t bits = reinterpret_cast<uintptr_t>(ptr);
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : "+r"(bits));
+#endif
+    return bits == 0;
 }
 
 }  // namespace
@@ -783,6 +792,10 @@ extern "C" int unlink(const char* path) {
 
 extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+    if (rut::test_fault::is_null_ptr(ts)) {
+        errno = EFAULT;
+        return -1;
+    }
     if (rut::test_fault::consume_fault(rut::test_fault::g_clock_gettime_fail_count)) {
         errno =
             rut::test_fault::fail_errno_or_default(rut::test_fault::g_clock_gettime_errno, EINVAL);

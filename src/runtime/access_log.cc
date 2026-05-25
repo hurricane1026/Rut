@@ -14,6 +14,8 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
+static std::atomic<u64> g_last_monotonic_us{1};
+
 u64 realtime_us() {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
@@ -22,8 +24,12 @@ u64 realtime_us() {
 
 u64 monotonic_us() {
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return g_last_monotonic_us.load(std::memory_order_relaxed);
+    u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    if (now == 0) now = 1;
+    g_last_monotonic_us.store(now, std::memory_order_relaxed);
+    return now;
 }
 
 static u32 write_u64_dec(char* buf, u64 val) {
