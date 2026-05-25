@@ -14,6 +14,7 @@
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace rut::test_fault {
@@ -41,6 +42,7 @@ using Accept4Fn = int (*)(int, struct sockaddr*, socklen_t*, int);
 using OpenFn = int (*)(const char*, int, ...);
 using MkstempFn = int (*)(char*);
 using UnlinkFn = int (*)(const char*);
+using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
 
 MmapFn g_real_mmap = nullptr;
 MprotectFn g_real_mprotect = nullptr;
@@ -62,6 +64,7 @@ Accept4Fn g_real_accept4 = nullptr;
 OpenFn g_real_open = nullptr;
 MkstempFn g_real_mkstemp = nullptr;
 UnlinkFn g_real_unlink = nullptr;
+ClockGettimeFn g_real_clock_gettime = nullptr;
 pthread_once_t g_syscall_once = PTHREAD_ONCE_INIT;
 
 std::atomic<int> g_io_fault_fd{-1};
@@ -108,6 +111,12 @@ std::atomic<int> g_mkstemp_errno{0};
 std::atomic<int> g_mkstemp_fail_count{0};
 std::atomic<int> g_unlink_errno{0};
 std::atomic<int> g_unlink_fail_count{0};
+std::atomic<int> g_clock_gettime_errno{0};
+std::atomic<int> g_clock_gettime_fail_count{0};
+std::atomic<bool> g_clock_gettime_fixed{false};
+std::atomic<int> g_clock_gettime_clock_id{kMatchAllClockIds};
+std::atomic<long long> g_clock_gettime_sec{0};
+std::atomic<long> g_clock_gettime_nsec{0};
 
 void resolve_syscalls() {
     g_real_mmap = reinterpret_cast<MmapFn>(dlsym(RTLD_NEXT, "mmap"));
@@ -131,6 +140,7 @@ void resolve_syscalls() {
     g_real_open = reinterpret_cast<OpenFn>(dlsym(RTLD_NEXT, "open"));
     g_real_mkstemp = reinterpret_cast<MkstempFn>(dlsym(RTLD_NEXT, "mkstemp"));
     g_real_unlink = reinterpret_cast<UnlinkFn>(dlsym(RTLD_NEXT, "unlink"));
+    g_real_clock_gettime = reinterpret_cast<ClockGettimeFn>(dlsym(RTLD_NEXT, "clock_gettime"));
 }
 
 bool consume_fault(std::atomic<int>& counter) {
@@ -220,6 +230,13 @@ SyscallFaultConfig current_syscall_fault_config() {
     config.mkstemp_failures = g_mkstemp_fail_count.load(std::memory_order_relaxed);
     config.unlink_errno = g_unlink_errno.load(std::memory_order_relaxed);
     config.unlink_failures = g_unlink_fail_count.load(std::memory_order_relaxed);
+    config.clock_gettime_errno = g_clock_gettime_errno.load(std::memory_order_relaxed);
+    config.clock_gettime_failures = g_clock_gettime_fail_count.load(std::memory_order_relaxed);
+    config.clock_gettime_fixed = g_clock_gettime_fixed.load(std::memory_order_relaxed);
+    config.clock_gettime_clock_id = g_clock_gettime_clock_id.load(std::memory_order_relaxed);
+    config.clock_gettime_sec =
+        static_cast<time_t>(g_clock_gettime_sec.load(std::memory_order_relaxed));
+    config.clock_gettime_nsec = g_clock_gettime_nsec.load(std::memory_order_relaxed);
     return config;
 }
 
@@ -243,6 +260,13 @@ void apply_syscall_fault_config(const SyscallFaultConfig& config) {
     g_mkstemp_fail_count.store(config.mkstemp_failures, std::memory_order_relaxed);
     g_unlink_errno.store(config.unlink_errno, std::memory_order_relaxed);
     g_unlink_fail_count.store(config.unlink_failures, std::memory_order_relaxed);
+    g_clock_gettime_errno.store(config.clock_gettime_errno, std::memory_order_relaxed);
+    g_clock_gettime_fail_count.store(config.clock_gettime_failures, std::memory_order_relaxed);
+    g_clock_gettime_fixed.store(config.clock_gettime_fixed, std::memory_order_relaxed);
+    g_clock_gettime_clock_id.store(config.clock_gettime_clock_id, std::memory_order_relaxed);
+    g_clock_gettime_sec.store(static_cast<long long>(config.clock_gettime_sec),
+                              std::memory_order_relaxed);
+    g_clock_gettime_nsec.store(config.clock_gettime_nsec, std::memory_order_relaxed);
 }
 
 int fail_errno_or_default(std::atomic<int>& configured_errno, int default_errno) {
@@ -755,4 +779,27 @@ extern "C" int unlink(const char* path) {
         return -1;
     }
     return rut::test_fault::g_real_unlink(path);
+}
+
+extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
+    pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
+    if (rut::test_fault::consume_fault(rut::test_fault::g_clock_gettime_fail_count)) {
+        errno =
+            rut::test_fault::fail_errno_or_default(rut::test_fault::g_clock_gettime_errno, EINVAL);
+        return -1;
+    }
+    const int configured_clock =
+        rut::test_fault::g_clock_gettime_clock_id.load(std::memory_order_relaxed);
+    if (rut::test_fault::g_clock_gettime_fixed.load(std::memory_order_relaxed) &&
+        (configured_clock == rut::test_fault::kMatchAllClockIds || configured_clock == clockid)) {
+        ts->tv_sec = static_cast<time_t>(
+            rut::test_fault::g_clock_gettime_sec.load(std::memory_order_relaxed));
+        ts->tv_nsec = rut::test_fault::g_clock_gettime_nsec.load(std::memory_order_relaxed);
+        return 0;
+    }
+    if (!rut::test_fault::g_real_clock_gettime) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return rut::test_fault::g_real_clock_gettime(clockid, ts);
 }

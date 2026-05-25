@@ -1,4 +1,5 @@
 #include "fault_injection.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/epoll_backend.h"
 #include "rut/runtime/error.h"
 #include "test.h"
@@ -16,6 +17,7 @@
 
 using namespace rut;
 using rut::test_fault::IoFaultConfig;
+using rut::test_fault::kMatchAllClockIds;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
@@ -136,6 +138,40 @@ TEST(syscall_fault, mkstemp_and_unlink_failures_are_injected) {
     }
 
     unlink(path);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_is_injected_by_clock_id) {
+    SyscallFaultConfig realtime_config;
+    realtime_config.clock_gettime_fixed = true;
+    realtime_config.clock_gettime_clock_id = CLOCK_REALTIME;
+    realtime_config.clock_gettime_sec = 1711123456;
+    realtime_config.clock_gettime_nsec = 789123000;
+
+    ScopedSyscallFault realtime_fault(realtime_config);
+    CHECK_EQ(realtime_us(), 1711123456789123ULL);
+    CHECK(monotonic_us() > 0);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_can_match_all_clock_ids) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_clock_id = kMatchAllClockIds;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    CHECK_EQ(realtime_us(), 42123456ULL);
+    CHECK_EQ(monotonic_us(), 42123456ULL);
+}
+
+TEST(syscall_fault, access_log_time_helpers_fail_closed_on_clock_error) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_errno = EIO;
+    fault_config.clock_gettime_failures = 2;
+
+    ScopedSyscallFault fault(fault_config);
+    CHECK_EQ(realtime_us(), 0ULL);
+    CHECK_EQ(monotonic_us(), 0ULL);
 }
 
 TEST(epoll_fault, init_reports_epoll_create_failure) {

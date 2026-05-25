@@ -16,13 +16,13 @@ namespace rut {
 
 u64 realtime_us() {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
     return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
 }
 
 u64 monotonic_us() {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
 }
 
