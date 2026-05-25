@@ -9310,6 +9310,41 @@ TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
 }
 
+TEST(state_invariant, free_conn_clears_active_proxy_state) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    check_proxying_body_stream_invariant(_tc,
+                                         c,
+                                         nullptr,
+                                         &on_early_upstream_recvd_send_inflight<SmallLoop>,
+                                         &on_request_body_sent<SmallLoop>);
+
+    c->recv_armed = true;
+    c->send_armed = true;
+    c->upstream_recv_armed = true;
+    c->upstream_send_armed = true;
+    c->yield_armed = true;
+    c->yield_timeout_armed = true;
+    c->pending_handler_fn = &state_invariant_wait_recv_then_status;
+    c->pending_ops = 3;
+
+    loop.free_conn(*c);
+
+    check_idle_invariant(_tc, c);
+    CHECK_EQ(c->upstream_idx, 0u);
+    CHECK_EQ(c->recv_armed, false);
+    CHECK_EQ(c->send_armed, false);
+    CHECK_EQ(c->upstream_recv_armed, false);
+    CHECK_EQ(c->upstream_send_armed, false);
+    CHECK_EQ(c->yield_armed, false);
+    CHECK_EQ(c->yield_timeout_armed, false);
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->pending_ops, 0u);
+}
+
 TEST(state_invariant, jit_dispatch_classifies_all_event_yields) {
     struct Case {
         jit::YieldKind kind;
