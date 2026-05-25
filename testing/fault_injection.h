@@ -9,7 +9,6 @@ namespace rut::test_fault {
 
 inline constexpr int kNoIoFaultFd = -1;
 inline constexpr int kMatchAllIoFds = -2;
-inline constexpr int kMatchAllClockIds = -1;
 
 struct FaultState {
     int mmap_fail_call = 0;
@@ -74,7 +73,8 @@ struct SyscallFaultConfig {
     int clock_gettime_errno = 0;
     int clock_gettime_failures = 0;
     bool clock_gettime_fixed = false;
-    int clock_gettime_clock_id = kMatchAllClockIds;
+    bool clock_gettime_match_all = true;
+    clockid_t clock_gettime_clock_id = CLOCK_REALTIME;
     time_t clock_gettime_sec = 0;
     long clock_gettime_nsec = 0;
 };

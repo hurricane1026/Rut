@@ -18,7 +18,6 @@
 
 using namespace rut;
 using rut::test_fault::IoFaultConfig;
-using rut::test_fault::kMatchAllClockIds;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
@@ -144,6 +143,7 @@ TEST(syscall_fault, mkstemp_and_unlink_failures_are_injected) {
 TEST(syscall_fault, clock_gettime_fixed_time_is_injected_by_clock_id) {
     SyscallFaultConfig realtime_config;
     realtime_config.clock_gettime_fixed = true;
+    realtime_config.clock_gettime_match_all = false;
     realtime_config.clock_gettime_clock_id = CLOCK_REALTIME;
     realtime_config.clock_gettime_sec = 1711123456;
     realtime_config.clock_gettime_nsec = 789123000;
@@ -156,7 +156,6 @@ TEST(syscall_fault, clock_gettime_fixed_time_is_injected_by_clock_id) {
 TEST(syscall_fault, clock_gettime_fixed_time_can_match_all_clock_ids) {
     SyscallFaultConfig fault_config;
     fault_config.clock_gettime_fixed = true;
-    fault_config.clock_gettime_clock_id = kMatchAllClockIds;
     fault_config.clock_gettime_sec = 42;
     fault_config.clock_gettime_nsec = 123456000;
 
@@ -168,18 +167,13 @@ TEST(syscall_fault, clock_gettime_fixed_time_can_match_all_clock_ids) {
 TEST(syscall_fault, clock_gettime_null_timespec_fails_with_efault) {
     SyscallFaultConfig fault_config;
     fault_config.clock_gettime_fixed = true;
-    fault_config.clock_gettime_clock_id = kMatchAllClockIds;
     fault_config.clock_gettime_sec = 42;
     fault_config.clock_gettime_nsec = 123456000;
 
     ScopedSyscallFault fault(fault_config);
-    uintptr_t raw = static_cast<uintptr_t>(getpid());
-    raw -= raw;
-    auto* null_ts = reinterpret_cast<struct timespec*>(raw);
     using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
-    ClockGettimeFn injected_clock_gettime =
-        reinterpret_cast<ClockGettimeFn>(reinterpret_cast<void*>(&clock_gettime));
-    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, null_ts), -1);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, nullptr), -1);
     CHECK_EQ(errno, EFAULT);
 }
 
