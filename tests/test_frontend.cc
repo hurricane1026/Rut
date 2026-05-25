@@ -1743,14 +1743,63 @@ route {
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
 
-TEST(frontend, analyze_rejects_decorated_wait_with_post_wait_guard) {
+TEST(frontend, analyze_accepts_decorated_wait_with_post_wait_guard) {
     const char* src = R"rut(
 func auth(_ req: i32) -> i32 => 0
 route {
     @auth "*"
     GET "/x" {
         wait(50)
-        guard true else { return 405 }
+        guard req.path == "/" else { return 404 }
+        return 204
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].decorators.len, 1u);
+    REQUIRE_EQ(hir->routes[0].decorator_guard_count, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 2u);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+}
+
+TEST(frontend, analyze_rejects_decorated_wait_with_post_wait_guard_using_pre_wait_local) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" {
+        let allowed = req.path == "/"
+        wait(50)
+        guard allowed else { return 404 }
+        return 204
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, analyze_rejects_decorated_wait_with_post_wait_guard_fail_body_local) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 => 0
+route {
+    @auth "*"
+    GET "/x" {
+        wait(50)
+        guard req.path == "/" else {
+            let code = 404
+            if code == 404 { return 404 } else { return 500 }
+        }
         return 204
     }
 }
