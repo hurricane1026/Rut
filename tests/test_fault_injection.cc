@@ -192,6 +192,21 @@ TEST(syscall_fault, clock_gettime_invalid_timespec_fails_with_efault) {
     CHECK_EQ(errno, EFAULT);
 }
 
+TEST(syscall_fault, clock_gettime_fixed_time_preserves_invalid_clock_errno) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    struct timespec ts{};
+    errno = 0;
+    CHECK_EQ(injected_clock_gettime(static_cast<clockid_t>(-999999), &ts), -1);
+    CHECK_EQ(errno, EINVAL);
+}
+
 TEST(syscall_fault, access_log_time_helpers_fail_closed_on_clock_error) {
     const u64 last_monotonic = monotonic_us();
     REQUIRE(last_monotonic != 0);

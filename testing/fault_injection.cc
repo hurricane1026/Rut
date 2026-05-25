@@ -823,7 +823,7 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
         rut::test_fault::g_clock_gettime_clock_id.load(std::memory_order_relaxed);
     if (rut::test_fault::g_clock_gettime_fixed.load(std::memory_order_relaxed) &&
         (match_all || configured_clock == clockid)) {
-        if (syscall(SYS_clock_gettime, CLOCK_REALTIME, ts) != 0) {
+        if (syscall(SYS_clock_gettime, clockid, ts) != 0) {
             return -1;
         }
         ts->tv_sec = static_cast<time_t>(

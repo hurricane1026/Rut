@@ -1880,6 +1880,7 @@ TEST(epoll_metrics, accept_and_request_counted) {
     send_all(c, HTTP_REQ, HTTP_REQ_LEN);
     char buf[4096];
     recv_timeout(c, buf, sizeof(buf), 2000);
+    for (i32 i = 0; i < 200 && metrics.requests_total == 0; i++) usleep(1000);
     close(c);
     lt.stop();
     CHECK_GT(metrics.connections_total, 0u);
