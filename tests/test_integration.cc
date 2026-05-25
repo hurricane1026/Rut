@@ -1881,6 +1881,9 @@ TEST(epoll_metrics, accept_and_request_counted) {
     char buf[4096];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(n > 0);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
     close(c);
     lt.stop();
     CHECK_GT(metrics.connections_total, 0u);
