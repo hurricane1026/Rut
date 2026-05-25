@@ -826,9 +826,15 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
         if (syscall(SYS_clock_gettime, clockid, ts) != 0) {
             return -1;
         }
+        const long configured_nsec =
+            rut::test_fault::g_clock_gettime_nsec.load(std::memory_order_relaxed);
+        if (configured_nsec < 0 || configured_nsec >= 1000000000L) {
+            errno = EINVAL;
+            return -1;
+        }
         ts->tv_sec = static_cast<time_t>(
             rut::test_fault::g_clock_gettime_sec.load(std::memory_order_relaxed));
-        ts->tv_nsec = rut::test_fault::g_clock_gettime_nsec.load(std::memory_order_relaxed);
+        ts->tv_nsec = configured_nsec;
         return 0;
     }
     if (!rut::test_fault::g_real_clock_gettime) {

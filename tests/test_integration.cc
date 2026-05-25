@@ -1872,15 +1872,17 @@ TEST(epoll_metrics, accept_and_request_counted) {
     ShardMetrics metrics{};
     loop->metrics = &metrics;
     u16 port = get_port(lfd);
-    LoopThread lt = {loop, {}, 20};
+    LoopThread lt = {loop, {}, 3};
     lt.start();
     usleep(100000);
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
     send_all(c, HTTP_REQ, HTTP_REQ_LEN);
     char buf[4096];
-    recv_timeout(c, buf, sizeof(buf), 2000);
-    usleep(200000);
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
+    for (i32 i = 0; i < 200 && !lt.done.load(std::memory_order_acquire); i++) usleep(1000);
+    CHECK(lt.done.load(std::memory_order_acquire));
     close(c);
     lt.stop();
     CHECK_GT(metrics.connections_total, 0u);
@@ -2910,7 +2912,10 @@ struct ScopedProxyLoop {
             return false;
         }
         loop->config_ptr = active;
-        lt = {loop, {}, iters};
+        lt.loop = loop;
+        lt.thread = {};
+        lt.max_iters = iters;
+        lt.done.store(false, std::memory_order_release);
         lt.start();
         loop_started = true;
         return true;
