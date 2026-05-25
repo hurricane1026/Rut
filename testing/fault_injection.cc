@@ -809,10 +809,6 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
 #elif defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
-    if (ts_is_null) {
-        errno = EFAULT;
-        return -1;
-    }
     if (rut::test_fault::consume_fault(rut::test_fault::g_clock_gettime_fail_count)) {
         errno =
             rut::test_fault::fail_errno_or_default(rut::test_fault::g_clock_gettime_errno, EINVAL);
@@ -824,7 +820,12 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
         rut::test_fault::g_clock_gettime_clock_id.load(std::memory_order_relaxed);
     if (rut::test_fault::g_clock_gettime_fixed.load(std::memory_order_relaxed) &&
         (match_all || configured_clock == clockid)) {
-        if (syscall(SYS_clock_gettime, clockid, ts) != 0) {
+        struct timespec probe_ts{};
+        if (syscall(SYS_clock_gettime, clockid, &probe_ts) != 0) {
+            return -1;
+        }
+        if (ts_is_null) {
+            errno = EFAULT;
             return -1;
         }
         const long configured_nsec =
@@ -833,10 +834,17 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
             errno = EINVAL;
             return -1;
         }
+        if (syscall(SYS_clock_gettime, clockid, ts) != 0) {
+            return -1;
+        }
         ts->tv_sec = static_cast<time_t>(
             rut::test_fault::g_clock_gettime_sec.load(std::memory_order_relaxed));
         ts->tv_nsec = configured_nsec;
         return 0;
+    }
+    if (ts_is_null) {
+        errno = EFAULT;
+        return -1;
     }
     if (!rut::test_fault::g_real_clock_gettime) {
         errno = ENOSYS;
