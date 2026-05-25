@@ -351,6 +351,7 @@ bool open_flags_require_mode(int flags) {
 bool is_null_ptr(const void* ptr) {
     uintptr_t bits = reinterpret_cast<uintptr_t>(ptr);
 #if defined(__GNUC__) || defined(__clang__)
+    // Hide the value from nonnull-related optimizations so tests can exercise NULL safely.
     asm volatile("" : "+r"(bits));
 #endif
     return bits == 0;

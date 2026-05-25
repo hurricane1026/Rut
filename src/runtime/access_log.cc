@@ -24,6 +24,7 @@ u64 realtime_us() {
 
 u64 monotonic_us() {
     struct timespec ts;
+    // Preserve the nonzero in-flight sentinel even when the monotonic clock fails.
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return g_last_monotonic_us;
     u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
     if (now == 0) now = 1;
