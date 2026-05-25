@@ -22,6 +22,18 @@ using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
 
+namespace {
+
+struct timespec* opaque_null_timespec() {
+    uintptr_t bits = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : "+r"(bits));
+#endif
+    return reinterpret_cast<struct timespec*>(bits);
+}
+
+}  // namespace
+
 TEST(syscall_fault, close_and_fcntl_failures_are_injected) {
     i32 fd = dup(2);
     REQUIRE(fd >= 0);
@@ -173,7 +185,7 @@ TEST(syscall_fault, clock_gettime_null_timespec_fails_with_efault) {
     ScopedSyscallFault fault(fault_config);
     using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
     ClockGettimeFn injected_clock_gettime = &clock_gettime;
-    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, nullptr), -1);
+    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, opaque_null_timespec()), -1);
     CHECK_EQ(errno, EFAULT);
 }
 
@@ -247,6 +259,20 @@ TEST(syscall_fault, access_log_time_helpers_fail_closed_on_clock_error) {
     ScopedSyscallFault fault(fault_config);
     CHECK_EQ(realtime_us(), 0ULL);
     CHECK_EQ(monotonic_us(), last_monotonic);
+}
+
+TEST(syscall_fault, monotonic_us_clamps_first_success_after_clock_error) {
+    REQUIRE(monotonic_us() != 0);
+
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_errno = EIO;
+    fault_config.clock_gettime_failures = 1;
+
+    ScopedSyscallFault fault(fault_config);
+    const u64 failure_value = monotonic_us();
+    CHECK_NE(failure_value, 0ULL);
+    CHECK_EQ(monotonic_us(), failure_value);
+    CHECK_GE(monotonic_us(), failure_value);
 }
 
 TEST(epoll_fault, init_reports_epoll_create_failure) {

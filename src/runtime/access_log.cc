@@ -15,6 +15,7 @@ namespace rut {
 // --- Text formatting helpers (no stdlib) ---
 
 static thread_local u64 g_last_monotonic_us = 1;
+static thread_local bool g_last_monotonic_failed = false;
 
 u64 realtime_us() {
     struct timespec ts;
@@ -25,11 +26,16 @@ u64 realtime_us() {
 u64 monotonic_us() {
     struct timespec ts;
     // Preserve the nonzero in-flight sentinel even when the monotonic clock fails.
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return g_last_monotonic_us;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        g_last_monotonic_failed = true;
+        return g_last_monotonic_us;
+    }
     u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
     if (now == 0) now = 1;
+    const u64 result = g_last_monotonic_failed ? g_last_monotonic_us : now;
     g_last_monotonic_us = now;
-    return now;
+    g_last_monotonic_failed = false;
+    return result;
 }
 
 static u32 write_u64_dec(char* buf, u64 val) {

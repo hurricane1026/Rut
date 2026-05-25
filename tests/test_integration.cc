@@ -1872,7 +1872,7 @@ TEST(epoll_metrics, accept_and_request_counted) {
     ShardMetrics metrics{};
     loop->metrics = &metrics;
     u16 port = get_port(lfd);
-    LoopThread lt = {loop, {}, 3};
+    LoopThread lt = {loop, {}, 20};
     lt.start();
     usleep(100000);
     i32 c = connect_to(port);
@@ -1881,9 +1881,8 @@ TEST(epoll_metrics, accept_and_request_counted) {
     char buf[4096];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(n > 0);
-    loop->stop();
     close(c);
-    pthread_join(lt.thread, nullptr);
+    lt.stop();
     CHECK_GT(metrics.connections_total, 0u);
     CHECK_GT(metrics.requests_total, 0u);
     loop->shutdown();
