@@ -1881,10 +1881,9 @@ TEST(epoll_metrics, accept_and_request_counted) {
     char buf[4096];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(n > 0);
-    for (i32 i = 0; i < 200 && !lt.done.load(std::memory_order_acquire); i++) usleep(1000);
-    CHECK(lt.done.load(std::memory_order_acquire));
+    loop->stop();
     close(c);
-    lt.stop();
+    pthread_join(lt.thread, nullptr);
     CHECK_GT(metrics.connections_total, 0u);
     CHECK_GT(metrics.requests_total, 0u);
     loop->shutdown();
@@ -2915,7 +2914,6 @@ struct ScopedProxyLoop {
         lt.loop = loop;
         lt.thread = {};
         lt.max_iters = iters;
-        lt.done.store(false, std::memory_order_release);
         lt.start();
         loop_started = true;
         return true;

@@ -13,7 +13,6 @@
 #include "rut/runtime/socket.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/traffic_capture.h"
-#include <atomic>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -996,7 +995,6 @@ struct LoopThread {
     RealLoop* loop;
     pthread_t thread;
     i32 max_iters;
-    std::atomic<bool> done{false};
     static void* run(void* arg) {
         auto* lt = static_cast<LoopThread*>(arg);
         auto* lp = lt->loop;
@@ -1008,13 +1006,9 @@ struct LoopThread {
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
             if (++iters >= lt->max_iters) break;
         }
-        lt->done.store(true, std::memory_order_release);
         return nullptr;
     }
-    void start() {
-        done.store(false, std::memory_order_release);
-        pthread_create(&thread, nullptr, run, this);
-    }
+    void start() { pthread_create(&thread, nullptr, run, this); }
     void stop() {
         loop->stop();
         pthread_join(thread, nullptr);
@@ -1045,7 +1039,6 @@ struct TestServer {
         lt.loop = loop;
         lt.thread = {};
         lt.max_iters = iters;
-        lt.done.store(false, std::memory_order_release);
         lt.start();
         return true;
     }
