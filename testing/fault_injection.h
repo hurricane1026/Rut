@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 
 #include <stddef.h>
+#include <time.h>
 
 namespace rut::test_fault {
 
@@ -69,6 +70,13 @@ struct SyscallFaultConfig {
     int mkstemp_failures = 0;
     int unlink_errno = 0;
     int unlink_failures = 0;
+    int clock_gettime_errno = 0;
+    int clock_gettime_failures = 0;
+    bool clock_gettime_fixed = false;
+    bool clock_gettime_match_all = true;
+    clockid_t clock_gettime_clock_id = CLOCK_REALTIME;
+    time_t clock_gettime_sec = 0;
+    long clock_gettime_nsec = 0;
 };
 
 FaultState& state();

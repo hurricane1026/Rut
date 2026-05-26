@@ -20,6 +20,7 @@ Outstanding work items, prioritized for the next implementation passes.
 - [x] Malformed upstream E2E coverage drives real proxy sockets through malformed status, EOF, header, and framing failures.
 - [x] Replay/simulate route-action matrix coverage documents Static, Default, Proxy/JIT Forward, JIT ReturnStatus, mismatch, and malformed capture behavior.
 - [x] Coverage helper now keeps the runtime threshold gate while printing per-area summaries for runtime, compiler, replay/sim, JIT, and optional changed first-party files.
+- [x] Fault injection harness can now inject deterministic `clock_gettime` values and failures; access-log time helpers fail closed on clock errors.
 
 ## P0: State Invariant Coverage Follow-ups
 

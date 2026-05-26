@@ -13,7 +13,6 @@
 #include "rut/runtime/socket.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/traffic_capture.h"
-#include <atomic>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1037,7 +1036,9 @@ struct TestServer {
             destroy_real_loop(loop);
             return false;
         }
-        lt = {loop, {}, iters};
+        lt.loop = loop;
+        lt.thread = {};
+        lt.max_iters = iters;
         lt.start();
         return true;
     }

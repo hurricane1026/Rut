@@ -1877,9 +1877,13 @@ TEST(epoll_metrics, accept_and_request_counted) {
     usleep(100000);
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    send_all(c, HTTP_REQ, HTTP_REQ_LEN);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
-    recv_timeout(c, buf, sizeof(buf), 2000);
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0);
     close(c);
     lt.stop();
     CHECK_GT(metrics.connections_total, 0u);
@@ -2909,7 +2913,9 @@ struct ScopedProxyLoop {
             return false;
         }
         loop->config_ptr = active;
-        lt = {loop, {}, iters};
+        lt.loop = loop;
+        lt.thread = {};
+        lt.max_iters = iters;
         lt.start();
         loop_started = true;
         return true;

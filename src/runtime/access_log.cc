@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -14,16 +15,32 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
+static u64 raw_monotonic_us() {
+    struct timespec ts;
+    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) return 1;
+    u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    return now == 0 ? 1 : now;
+}
+
+static thread_local u64 g_last_monotonic_us = raw_monotonic_us();
+
 u64 realtime_us() {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
     return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
 }
 
 u64 monotonic_us() {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    // Preserve the nonzero in-flight sentinel even when the monotonic clock fails.
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return g_last_monotonic_us;
+    }
+    u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    if (now == 0) now = 1;
+    const u64 result = now < g_last_monotonic_us ? g_last_monotonic_us : now;
+    g_last_monotonic_us = result;
+    return result;
 }
 
 static u32 write_u64_dec(char* buf, u64 val) {

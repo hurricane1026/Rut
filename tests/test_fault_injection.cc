@@ -1,4 +1,5 @@
 #include "fault_injection.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/epoll_backend.h"
 #include "rut/runtime/error.h"
 #include "test.h"
@@ -6,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -19,6 +21,18 @@ using rut::test_fault::IoFaultConfig;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
+
+namespace {
+
+struct timespec* opaque_null_timespec() {
+    uintptr_t bits = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : "+r"(bits));
+#endif
+    return reinterpret_cast<struct timespec*>(bits);
+}
+
+}  // namespace
 
 TEST(syscall_fault, close_and_fcntl_failures_are_injected) {
     i32 fd = dup(2);
@@ -136,6 +150,164 @@ TEST(syscall_fault, mkstemp_and_unlink_failures_are_injected) {
     }
 
     unlink(path);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_is_injected_by_clock_id) {
+    SyscallFaultConfig realtime_config;
+    realtime_config.clock_gettime_fixed = true;
+    realtime_config.clock_gettime_match_all = false;
+    realtime_config.clock_gettime_clock_id = CLOCK_REALTIME;
+    realtime_config.clock_gettime_sec = 1711123456;
+    realtime_config.clock_gettime_nsec = 789123000;
+
+    ScopedSyscallFault realtime_fault(realtime_config);
+    CHECK_EQ(realtime_us(), 1711123456789123ULL);
+    CHECK(monotonic_us() > 0);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_can_match_all_clock_ids) {
+    const u64 fixed_us = monotonic_us() + 1000000ULL;
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = static_cast<time_t>(fixed_us / 1000000ULL);
+    fault_config.clock_gettime_nsec = static_cast<long>((fixed_us % 1000000ULL) * 1000ULL);
+
+    ScopedSyscallFault fault(fault_config);
+    CHECK_EQ(realtime_us(), fixed_us);
+    CHECK_EQ(monotonic_us(), fixed_us);
+}
+
+TEST(syscall_fault, clock_gettime_null_timespec_fails_with_efault) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    errno = 0;
+    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, opaque_null_timespec()), -1);
+    CHECK_EQ(errno, EFAULT);
+}
+
+TEST(syscall_fault, clock_gettime_invalid_timespec_fails_with_efault) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    errno = 0;
+    auto* invalid_ts = reinterpret_cast<struct timespec*>(static_cast<uintptr_t>(1));
+    CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, invalid_ts), -1);
+    CHECK_EQ(errno, EFAULT);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_preserves_invalid_clock_errno) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    struct timespec ts{};
+    errno = 0;
+    CHECK_EQ(injected_clock_gettime(static_cast<clockid_t>(-999999), &ts), -1);
+    CHECK_EQ(errno, EINVAL);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_validates_clock_before_null_timespec) {
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = 42;
+    fault_config.clock_gettime_nsec = 123456000;
+
+    ScopedSyscallFault fault(fault_config);
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    errno = 0;
+    CHECK_EQ(injected_clock_gettime(static_cast<clockid_t>(-999999), opaque_null_timespec()), -1);
+    CHECK_EQ(errno, EINVAL);
+}
+
+TEST(syscall_fault, clock_gettime_default_validates_clock_before_null_timespec) {
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    errno = 0;
+    CHECK_EQ(injected_clock_gettime(static_cast<clockid_t>(-999999), opaque_null_timespec()), -1);
+    CHECK_EQ(errno, EINVAL);
+}
+
+TEST(syscall_fault, clock_gettime_fixed_time_rejects_invalid_nsec) {
+    using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
+    ClockGettimeFn injected_clock_gettime = &clock_gettime;
+
+    {
+        SyscallFaultConfig fault_config;
+        fault_config.clock_gettime_fixed = true;
+        fault_config.clock_gettime_sec = 42;
+        fault_config.clock_gettime_nsec = 1000000000L;
+        ScopedSyscallFault fault(fault_config);
+        struct timespec ts{};
+        ts.tv_sec = 7;
+        ts.tv_nsec = 8;
+        errno = 0;
+        CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, &ts), -1);
+        CHECK_EQ(errno, EINVAL);
+        CHECK_EQ(ts.tv_sec, 7);
+        CHECK_EQ(ts.tv_nsec, 8);
+    }
+
+    {
+        SyscallFaultConfig fault_config;
+        fault_config.clock_gettime_fixed = true;
+        fault_config.clock_gettime_sec = 42;
+        fault_config.clock_gettime_nsec = -1;
+        ScopedSyscallFault fault(fault_config);
+        struct timespec ts{};
+        ts.tv_sec = 7;
+        ts.tv_nsec = 8;
+        errno = 0;
+        CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, &ts), -1);
+        CHECK_EQ(errno, EINVAL);
+        CHECK_EQ(ts.tv_sec, 7);
+        CHECK_EQ(ts.tv_nsec, 8);
+    }
+}
+
+TEST(syscall_fault, access_log_time_helpers_fail_closed_on_clock_error) {
+    const u64 last_monotonic = monotonic_us();
+    REQUIRE(last_monotonic != 0);
+
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_errno = EIO;
+    fault_config.clock_gettime_failures = 2;
+
+    ScopedSyscallFault fault(fault_config);
+    CHECK_EQ(realtime_us(), 0ULL);
+    CHECK_EQ(monotonic_us(), last_monotonic);
+}
+
+TEST(syscall_fault, monotonic_us_clamps_first_success_after_clock_error) {
+    const u64 last_monotonic = monotonic_us();
+    REQUIRE(last_monotonic != 0);
+
+    SyscallFaultConfig fault_config;
+    fault_config.clock_gettime_errno = EIO;
+    fault_config.clock_gettime_failures = 1;
+    fault_config.clock_gettime_fixed = true;
+    fault_config.clock_gettime_sec = static_cast<time_t>(last_monotonic / 1000000ULL + 10ULL);
+    fault_config.clock_gettime_nsec = static_cast<long>((last_monotonic % 1000000ULL) * 1000ULL);
+
+    ScopedSyscallFault fault(fault_config);
+    const u64 failure_value = monotonic_us();
+    CHECK_EQ(failure_value, last_monotonic);
+    CHECK_GT(monotonic_us(), failure_value);
 }
 
 TEST(epoll_fault, init_reports_epoll_create_failure) {
