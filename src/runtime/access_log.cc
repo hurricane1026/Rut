@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -14,7 +15,15 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
-static thread_local u64 g_last_monotonic_us = 1;
+static u64 raw_monotonic_us() {
+    struct timespec ts;
+    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) return 1;
+    u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    return now == 0 ? 1 : now;
+}
+
+static thread_local u64 g_last_monotonic_us = raw_monotonic_us();
+
 u64 realtime_us() {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;

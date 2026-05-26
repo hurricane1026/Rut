@@ -186,6 +186,7 @@ TEST(syscall_fault, clock_gettime_null_timespec_fails_with_efault) {
     ScopedSyscallFault fault(fault_config);
     using ClockGettimeFn = int (*)(clockid_t, struct timespec*);
     ClockGettimeFn injected_clock_gettime = &clock_gettime;
+    errno = 0;
     CHECK_EQ(injected_clock_gettime(CLOCK_REALTIME, opaque_null_timespec()), -1);
     CHECK_EQ(errno, EFAULT);
 }
