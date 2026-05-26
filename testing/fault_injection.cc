@@ -831,6 +831,10 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
         return 0;
     }
     if (ts_is_null) {
+        struct timespec probe_ts{};
+        if (syscall(SYS_clock_gettime, clockid, &probe_ts) != 0) {
+            return -1;
+        }
         errno = EFAULT;
         return -1;
     }
