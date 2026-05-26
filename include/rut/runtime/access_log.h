@@ -45,10 +45,13 @@ struct AccessLogEntry {
 static_assert(sizeof(AccessLogEntry) == 128, "AccessLogEntry must be 128 bytes");
 
 // Microsecond wall-clock timestamp (for access log timestamp field).
+// Returns 0 if CLOCK_REALTIME cannot be read.
 u64 realtime_us();
 
 // Monotonic microsecond clock (for elapsed duration measurement).
 // Immune to NTP adjustments and wall-clock jumps.
+// Returns a per-thread nonzero monotonic fallback if CLOCK_MONOTONIC fails; successful reads are
+// clamped to never move backward.
 u64 monotonic_us();
 
 // SPSC (single-producer, single-consumer) ring buffer for access log entries.

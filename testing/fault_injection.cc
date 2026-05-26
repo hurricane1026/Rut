@@ -796,19 +796,7 @@ extern "C" int unlink(const char* path) {
 
 extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnonnull-compare"
-#elif defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wnonnull-compare"
-#endif
-    const bool ts_is_null = ts == nullptr || rut::test_fault::is_null_ptr(ts);
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#elif defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
+    const bool ts_is_null = rut::test_fault::is_null_ptr(ts);
     if (rut::test_fault::consume_fault(rut::test_fault::g_clock_gettime_fail_count)) {
         errno =
             rut::test_fault::fail_errno_or_default(rut::test_fault::g_clock_gettime_errno, EINVAL);
