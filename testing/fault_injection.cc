@@ -835,8 +835,7 @@ extern "C" int clock_gettime(clockid_t clockid, struct timespec* ts) {
         return -1;
     }
     if (!rut::test_fault::g_real_clock_gettime) {
-        errno = ENOSYS;
-        return -1;
+        return static_cast<int>(syscall(SYS_clock_gettime, clockid, ts));
     }
     return rut::test_fault::g_real_clock_gettime(clockid, ts);
 }
