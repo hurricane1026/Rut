@@ -1,11 +1,13 @@
 // Arena tests — comprehensive code path coverage for both backends.
 // MmapArena: mmap-backed, variable-size blocks (compiler use).
 // SliceArena: SlicePool-backed, fixed 16KB blocks (runtime hot path).
+#include "fault_injection.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
 
 using namespace rut;
+using rut::test_fault::ScopedMemoryFault;
 
 // ============================================================
 // Block internals
@@ -88,6 +90,17 @@ TEST(arena, init_succeeds) {
     CHECK(a.current != nullptr);
     CHECK_GT(a.space_allocated(), 0u);
     a.destroy();
+}
+
+TEST(arena, init_reports_mmap_failure) {
+    ScopedMemoryFault fault(1);
+    MmapArena a;
+    auto rc = a.init(4096);
+    CHECK(!rc.has_value());
+    CHECK_EQ(rc.error().code, ENOMEM);
+    CHECK(rc.error().source == Error::Source::Arena);
+    CHECK(a.current == nullptr);
+    CHECK_EQ(a.space_allocated(), 0u);
 }
 
 TEST(arena, init_min_256) {
@@ -176,6 +189,26 @@ TEST(arena, overflow_to_new_block) {
     a.alloc(64);
     CHECK(a.current->prev != nullptr);
     CHECK_GE(a.space_allocated(), 256u * 2);
+    a.destroy();
+}
+
+TEST(arena, overflow_mmap_failure_keeps_existing_block_usable) {
+    MmapArena a;
+    REQUIRE(a.init(256).has_value());
+    MmapArena::Block* first = a.current;
+    const u64 initial_allocated = a.space_allocated();
+    REQUIRE(a.alloc(first->capacity()) != nullptr);
+
+    {
+        ScopedMemoryFault fault(1);
+        CHECK(a.alloc(64) == nullptr);
+    }
+
+    CHECK_EQ(a.current, first);
+    CHECK_EQ(a.space_allocated(), initial_allocated);
+    a.reset();
+    CHECK_EQ(a.current, first);
+    CHECK(a.alloc(32) != nullptr);
     a.destroy();
 }
 

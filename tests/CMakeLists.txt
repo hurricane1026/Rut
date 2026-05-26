@@ -70,7 +70,11 @@ add_dependencies(test_integration test_tls_fixtures)
 add_test(NAME test_integration COMMAND test_integration)
 set_tests_properties(test_integration PROPERTIES LABELS "integration;network")
 
-add_executable(test_arena test_arena.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+add_executable(test_arena
+    test_arena.cc
+    ${PROJECT_SOURCE_DIR}/src/placement_new.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
+)
 target_link_libraries(test_arena rut_runtime)
 target_include_directories(test_arena PRIVATE
     ${PROJECT_SOURCE_DIR}/include
