@@ -90,6 +90,9 @@ Coverage is in `tests/test_network.cc` under `route_coverage`:
 - `firewall_deny_rule_returns_403`
 - `firewall_allowlist_blocks_non_members`
 - `firewall_cidr_allow_and_deny_rules`
+- `firewall_string_ip_and_cidr_helpers`
+- `firewall_exact_ip_rules_use_host_order_storage`
+- `firewall_exact_ip_remove_roundtrip_with_network_peer_addr`
 - `firewall_clear_rules_recovers_capacity`
 - `firewall_remove_ip_and_cidr_rules`
 - `firewall_remove_rejects_missing_or_invalid_rules`
