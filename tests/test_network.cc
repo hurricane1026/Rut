@@ -8841,6 +8841,16 @@ static void check_reading_header_invariant(rut::test::TestCase* _tc, Connection*
     CHECK_EQ(c->on_upstream_send, nullptr);
 }
 
+static void check_jit_reading_body_invariant(rut::test::TestCase* _tc, Connection* c) {
+    CHECK_EQ(c->state, ConnState::ReadingBody);
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->on_recv, &on_jit_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->on_send, nullptr);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+    CHECK_GT(c->req_body_remaining, 0u);
+}
+
 static void check_sending_response_invariant(rut::test::TestCase* _tc, Connection* c) {
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK(c->fd >= 0);
@@ -8963,9 +8973,7 @@ TEST(state_invariant, jit_content_length_body_waits_until_full_buffer) {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
     append_and_dispatch(kHeadAndPartial, sizeof(kHeadAndPartial) - 1);
 
-    CHECK_EQ(c->state, ConnState::ReadingBody);
-    CHECK_EQ(c->on_recv, &on_jit_request_body_recvd<SmallLoop>);
-    CHECK_EQ(c->on_send, nullptr);
+    check_jit_reading_body_invariant(_tc, c);
     CHECK_EQ(c->req_body_remaining, 4u);
 
     append_and_dispatch("load", 4);
@@ -8973,6 +8981,33 @@ TEST(state_invariant, jit_content_length_body_waits_until_full_buffer) {
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->resp_status, 204u);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
+TEST(state_invariant, jit_request_body_eof_clears_body_read_slots) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_req_body_payload, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
+    loop.backend.inject(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    check_jit_reading_body_invariant(_tc, c);
+    CHECK_EQ(c->req_body_remaining, 4u);
+
+    const u32 cid = c->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 0));
+    check_idle_invariant(_tc, &loop.conns[cid]);
 }
 
 TEST(state_invariant, jit_content_length_without_body_dependency_runs_immediately) {
