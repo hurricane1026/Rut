@@ -11558,6 +11558,46 @@ TEST(route_coverage, firewall_exact_ip_remove_roundtrip_with_network_peer_addr) 
     CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
 }
 
+TEST(route_coverage, firewall_network_order_exact_ip_helpers_roundtrip) {
+    RouteConfig cfg;
+
+    const u32 kAllowHost = 0x7f000001;  // 127.0.0.1
+    const u32 kDenyHost = 0x0a010203;   // 10.1.2.3
+    const u32 kAllowNet = __builtin_bswap32(kAllowHost);
+    const u32 kDenyNet = __builtin_bswap32(kDenyHost);
+
+    REQUIRE(cfg.add_firewall_allow_ip_network_order(kAllowNet));
+    REQUIRE(cfg.add_firewall_deny_ip_network_order(kDenyNet));
+
+    CHECK(cfg.firewall_allows_peer(kAllowNet));
+    CHECK(!cfg.firewall_allows_peer(kDenyNet));
+
+    REQUIRE(cfg.remove_firewall_allow_ip_network_order(kAllowNet));
+    REQUIRE(cfg.remove_firewall_deny_ip_network_order(kDenyNet));
+
+    // No rules left => default allow.
+    CHECK(cfg.firewall_allows_peer(kAllowNet));
+    CHECK(cfg.firewall_allows_peer(kDenyNet));
+}
+
+TEST(route_coverage, firewall_network_order_cidr_helpers_roundtrip) {
+    RouteConfig cfg;
+
+    const u32 kAllow10Net = __builtin_bswap32(0x0a000000);  // 10.0.0.0/8
+    const u32 kDeny101Net = __builtin_bswap32(0x0a010000);  // 10.1.0.0/16
+    REQUIRE(cfg.add_firewall_allow_cidr_network_order(kAllow10Net, 8));
+    REQUIRE(cfg.add_firewall_deny_cidr_network_order(kDeny101Net, 16));
+
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));  // denied /16
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));   // allowed /8
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0xc0a80102)));  // outside allowlist
+
+    REQUIRE(cfg.remove_firewall_deny_cidr_network_order(kDeny101Net, 16));
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+    REQUIRE(cfg.remove_firewall_allow_cidr_network_order(kAllow10Net, 8));
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0xc0a80102)));
+}
+
 TEST(route_coverage, firewall_string_helpers_reject_invalid_input) {
     RouteConfig cfg;
     CHECK(!cfg.add_firewall_allow_ip(nullptr));
