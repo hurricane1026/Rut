@@ -43,6 +43,9 @@ Defined on `RouteConfig`:
 - `remove_firewall_deny_ip("a.b.c.d")`
 - `remove_firewall_allow_cidr("a.b.c.d/prefix")`
 - `remove_firewall_deny_cidr("a.b.c.d/prefix")`
+- `set_firewall_default_allow(bool allow)`
+- `set_firewall_default_deny()`
+- `firewall_default_is_allow()`
 - `clear_firewall_rules()`
 
 All `u32` IPv4 arguments are packed host-order values in the form
@@ -62,6 +65,8 @@ Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
 Remove APIs return `true` only when a matching rule exists and is deleted.
 `clear_firewall_rules()` clears all allow/deny exact and CIDR rules.
+Default policy is allow unless changed via `set_firewall_default_allow(false)`
+or `set_firewall_default_deny()`.
 
 ## Evaluation order
 
@@ -69,7 +74,7 @@ For each request:
 
 1. Any deny IP match => reject
 2. Any deny CIDR match => reject
-3. If no allow rules exist => allow
+3. If no allow rules exist => apply default policy (allow by default)
 4. Otherwise require allow IP or allow CIDR match
 
 In other words, deny rules always win over allow rules.
@@ -112,6 +117,7 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_remove_last_allow_keeps_deny_active`
 - `firewall_remove_last_allow_cidr_keeps_deny_cidr_active`
 - `firewall_remove_deny_restores_allow_match`
+- `firewall_default_deny_requires_explicit_allow`
 
 Current integration coverage in `tests/test_integration.cc` includes:
 
@@ -133,3 +139,4 @@ Current integration coverage in `tests/test_integration.cc` includes:
 - `firewall_remove_deny_ip_restores_allow_ip_real_socket`
 - `firewall_remove_last_allow_ip_keeps_deny_cidr_real_socket`
 - `firewall_remove_last_allow_cidr_keeps_deny_ip_real_socket`
+- `firewall_default_deny_real_socket`
