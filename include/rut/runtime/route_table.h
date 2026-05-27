@@ -514,10 +514,28 @@ struct RouteConfig {
         firewall_allow_ips[firewall_allow_count++] = __builtin_bswap32(ip);
         return true;
     }
+    bool add_firewall_allow_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return add_firewall_allow_ip(ip);
+    }
+    bool add_firewall_allow_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return add_firewall_allow_ip(cstr_as_str(ip_lit));
+    }
     bool add_firewall_deny_ip(u32 ip) {
         if (firewall_deny_count >= kMaxFirewallRules) return false;
         firewall_deny_ips[firewall_deny_count++] = __builtin_bswap32(ip);
         return true;
+    }
+    bool add_firewall_deny_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return add_firewall_deny_ip(ip);
+    }
+    bool add_firewall_deny_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return add_firewall_deny_ip(cstr_as_str(ip_lit));
     }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (firewall_allow_cidr_count >= kMaxFirewallRules) return false;
@@ -526,12 +544,32 @@ struct RouteConfig {
         firewall_allow_cidrs[firewall_allow_cidr_count++] = {ip & mask, mask};
         return true;
     }
+    bool add_firewall_allow_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return add_firewall_allow_cidr(ip, prefix_len);
+    }
+    bool add_firewall_allow_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return add_firewall_allow_cidr(cstr_as_str(cidr_lit));
+    }
     bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (firewall_deny_cidr_count >= kMaxFirewallRules) return false;
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
         firewall_deny_cidrs[firewall_deny_cidr_count++] = {ip & mask, mask};
         return true;
+    }
+    bool add_firewall_deny_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return add_firewall_deny_cidr(ip, prefix_len);
+    }
+    bool add_firewall_deny_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
     }
 
     // `peer_addr` must be in network byte order (same as getpeername()).
@@ -554,6 +592,60 @@ struct RouteConfig {
         }
         return false;
     }
+
+private:
+    static Str cstr_as_str(const char* s) {
+        u32 len = 0;
+        while (s[len]) len++;
+        return {s, len};
+    }
+
+    static bool parse_ipv4_dotted(Str s, u32& out_ip) {
+        u32 octets[4] = {0, 0, 0, 0};
+        u32 octet_idx = 0;
+        u32 digit_count = 0;
+        u32 cur = 0;
+        for (u32 i = 0; i < s.len; i++) {
+            const char c = s.ptr[i];
+            if (c == '.') {
+                if (digit_count == 0 || octet_idx >= 3) return false;
+                octets[octet_idx++] = cur;
+                cur = 0;
+                digit_count = 0;
+                continue;
+            }
+            if (c < '0' || c > '9') return false;
+            cur = cur * 10 + static_cast<u32>(c - '0');
+            if (cur > 255 || ++digit_count > 3) return false;
+        }
+        if (digit_count == 0 || octet_idx != 3) return false;
+        octets[3] = cur;
+        out_ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+        return true;
+    }
+
+    static bool parse_ipv4_cidr(Str s, u32& out_ip, u8& out_prefix_len) {
+        u32 slash_idx = 0xffffffffu;
+        for (u32 i = 0; i < s.len; i++) {
+            if (s.ptr[i] == '/') {
+                if (slash_idx != 0xffffffffu) return false;
+                slash_idx = i;
+            }
+        }
+        if (slash_idx == 0xffffffffu || slash_idx == 0 || slash_idx + 1 >= s.len) return false;
+        if (!parse_ipv4_dotted({s.ptr, slash_idx}, out_ip)) return false;
+        u32 prefix = 0;
+        for (u32 i = slash_idx + 1; i < s.len; i++) {
+            const char c = s.ptr[i];
+            if (c < '0' || c > '9') return false;
+            prefix = prefix * 10 + static_cast<u32>(c - '0');
+            if (prefix > 32) return false;
+        }
+        out_prefix_len = static_cast<u8>(prefix);
+        return true;
+    }
+
+public:
 
     // Match a request path. Semantics depend on the chosen dispatch
     // (`this->dispatch`), but the default linear-scan dispatch keeps

@@ -11133,6 +11133,29 @@ TEST(route_coverage, firewall_cidr_rejects_invalid_prefix) {
     CHECK(cfg.add_firewall_deny_cidr(0x0a000000, 0));
 }
 
+TEST(route_coverage, firewall_string_ip_and_cidr_helpers) {
+    RouteConfig cfg;
+    CHECK(cfg.add_firewall_allow_ip("127.0.0.1"));
+    CHECK(cfg.add_firewall_deny_ip("10.0.0.1"));
+    CHECK(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    CHECK(cfg.add_firewall_deny_cidr("10.1.0.0/16"));
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a000001)));
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+}
+
+TEST(route_coverage, firewall_string_helpers_reject_invalid_input) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_firewall_allow_ip(nullptr));
+    CHECK(!cfg.add_firewall_allow_ip(""));
+    CHECK(!cfg.add_firewall_allow_ip("256.0.0.1"));
+    CHECK(!cfg.add_firewall_deny_ip("1.2.3"));
+    CHECK(!cfg.add_firewall_allow_cidr("10.0.0.0"));
+    CHECK(!cfg.add_firewall_allow_cidr("10.0.0.0/"));
+    CHECK(!cfg.add_firewall_allow_cidr("/8"));
+    CHECK(!cfg.add_firewall_allow_cidr("10.0.0.0/33"));
+    CHECK(!cfg.add_firewall_deny_cidr("10.0.0.0/a"));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line

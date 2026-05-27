@@ -22,9 +22,15 @@ Defined on `RouteConfig`:
 - `add_firewall_deny_ip(u32 ip_host_order)`
 - `add_firewall_allow_cidr(u32 network_host_order, u8 prefix_len)`
 - `add_firewall_deny_cidr(u32 network_host_order, u8 prefix_len)`
+- `add_firewall_allow_ip("a.b.c.d")`
+- `add_firewall_deny_ip("a.b.c.d")`
+- `add_firewall_allow_cidr("a.b.c.d/prefix")`
+- `add_firewall_deny_cidr("a.b.c.d/prefix")`
 
 All `u32` IPv4 arguments are host-order (same convention as
 `UpstreamTarget::set_addr`).
+String overloads parse dotted IPv4/CIDR literals and return `false` on
+malformed input.
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
