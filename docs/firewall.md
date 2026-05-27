@@ -39,6 +39,7 @@ Defined on `RouteConfig`:
 
 All `u32` IPv4 arguments are host-order (same convention as
 `UpstreamTarget::set_addr`).
+Firewall tables also store rule IP values in host-order.
 String overloads parse dotted IPv4/CIDR literals and return `false` on
 malformed input.
 `Connection.peer_addr` comes from accept/getpeername in network byte order;

@@ -184,11 +184,9 @@ struct RouteConfig {
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
-    // Firewall rules.
-    // - exact IP rules are stored in network byte order (for direct compare
-    //   against Connection.peer_addr)
-    // - CIDR rules are stored in host byte order as (net, mask) pairs
-    //   and matched against bswap(peer_addr)
+    // Firewall rules (all in host byte order).
+    // Connection.peer_addr is network order; firewall_allows_peer converts it
+    // once to host order before rule evaluation.
     // Evaluation order:
     //   1) deny list (if hit => reject)
     //   2) allow list (if non-empty => require hit)
@@ -514,12 +512,11 @@ struct RouteConfig {
     // Firewall helpers.
     // `ip` is host-order IPv4 (for consistency with UpstreamTarget::set_addr).
     bool add_firewall_allow_ip(u32 ip) {
-        const u32 net_ip = __builtin_bswap32(ip);
         for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] == net_ip) return true;
+            if (firewall_allow_ips[i] == ip) return true;
         }
         if (firewall_allow_count >= kMaxFirewallRules) return false;
-        firewall_allow_ips[firewall_allow_count++] = net_ip;
+        firewall_allow_ips[firewall_allow_count++] = ip;
         return true;
     }
     bool add_firewall_allow_ip(Str ip_lit) {
@@ -532,9 +529,8 @@ struct RouteConfig {
         return add_firewall_allow_ip(cstr_as_str(ip_lit));
     }
     bool remove_firewall_allow_ip(u32 ip) {
-        const u32 net_ip = __builtin_bswap32(ip);
         for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] != net_ip) continue;
+            if (firewall_allow_ips[i] != ip) continue;
             for (u32 j = i + 1; j < firewall_allow_count; j++)
                 firewall_allow_ips[j - 1] = firewall_allow_ips[j];
             firewall_allow_ips[firewall_allow_count - 1] = 0;
@@ -553,12 +549,11 @@ struct RouteConfig {
         return remove_firewall_allow_ip(cstr_as_str(ip_lit));
     }
     bool add_firewall_deny_ip(u32 ip) {
-        const u32 net_ip = __builtin_bswap32(ip);
         for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] == net_ip) return true;
+            if (firewall_deny_ips[i] == ip) return true;
         }
         if (firewall_deny_count >= kMaxFirewallRules) return false;
-        firewall_deny_ips[firewall_deny_count++] = net_ip;
+        firewall_deny_ips[firewall_deny_count++] = ip;
         return true;
     }
     bool add_firewall_deny_ip(Str ip_lit) {
@@ -571,9 +566,8 @@ struct RouteConfig {
         return add_firewall_deny_ip(cstr_as_str(ip_lit));
     }
     bool remove_firewall_deny_ip(u32 ip) {
-        const u32 net_ip = __builtin_bswap32(ip);
         for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] != net_ip) continue;
+            if (firewall_deny_ips[i] != ip) continue;
             for (u32 j = i + 1; j < firewall_deny_count; j++)
                 firewall_deny_ips[j - 1] = firewall_deny_ips[j];
             firewall_deny_ips[firewall_deny_count - 1] = 0;
@@ -700,7 +694,7 @@ struct RouteConfig {
     bool firewall_allows_peer(u32 peer_addr) const {
         const u32 peer_host = __builtin_bswap32(peer_addr);
         for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] == peer_addr) return false;
+            if (firewall_deny_ips[i] == peer_host) return false;
         }
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
             const auto& r = firewall_deny_cidrs[i];
@@ -708,7 +702,7 @@ struct RouteConfig {
         }
         if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return true;
         for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] == peer_addr) return true;
+            if (firewall_allow_ips[i] == peer_host) return true;
         }
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
             const auto& r = firewall_allow_cidrs[i];
@@ -774,7 +768,6 @@ private:
     }
 
 public:
-
     // Match a request path. Semantics depend on the chosen dispatch
     // (`this->dispatch`), but the default linear-scan dispatch keeps
     // the historical contract: first-match-wins byte-prefix scan,
