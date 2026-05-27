@@ -80,3 +80,11 @@ Coverage is in `tests/test_network.cc` under `route_coverage`:
 - `firewall_deny_rule_returns_403`
 - `firewall_allowlist_blocks_non_members`
 - `firewall_cidr_allow_and_deny_rules`
+- `firewall_clear_rules_recovers_capacity`
+
+Integration coverage in `tests/test_integration.cc` includes:
+
+- `firewall_deny_localhost_real_socket`
+- `firewall_deny_localhost_cidr_real_socket`
+- `firewall_allowlist_cidr_localhost_real_socket`
+- `firewall_clear_rules_reenables_localhost_real_socket`
