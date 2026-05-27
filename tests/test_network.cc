@@ -11674,6 +11674,20 @@ TEST(route_coverage, firewall_remove_rejects_missing_or_invalid_rules) {
     CHECK_EQ(cfg.firewall_allow_cidr_count, 1u);
 }
 
+TEST(route_coverage, firewall_remove_cidr_u32_rejects_invalid_prefix) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_cidr(0x0a000000, 8));
+    REQUIRE(cfg.add_firewall_deny_cidr(0x0a010000, 16));
+
+    CHECK(!cfg.remove_firewall_allow_cidr(0x0a000000, 33));
+    CHECK(!cfg.remove_firewall_deny_cidr(0x0a010000, 40));
+
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 1u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 1u);
+    CHECK(cfg.firewall_allows_peer_host(0x0a020304));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+}
+
 TEST(route_coverage, firewall_remove_allow_rules_updates_policy_mode) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
