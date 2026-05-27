@@ -99,3 +99,4 @@ Integration coverage in `tests/test_integration.cc` includes:
 - `firewall_deny_localhost_cidr_real_socket`
 - `firewall_allowlist_cidr_localhost_real_socket`
 - `firewall_clear_rules_reenables_localhost_real_socket`
+- `firewall_remove_deny_rule_reenables_localhost_real_socket`
