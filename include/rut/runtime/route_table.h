@@ -204,6 +204,7 @@ struct RouteConfig {
     u32 firewall_deny_count = 0;
     u32 firewall_allow_cidr_count = 0;
     u32 firewall_deny_cidr_count = 0;
+    bool firewall_default_allow = true;
 
     // Reject route paths that aren't in origin-form. Required by the
     // segment trie (which would otherwise silently mismatch malformed
@@ -715,6 +716,9 @@ struct RouteConfig {
         firewall_allow_cidr_count = 0;
         firewall_deny_cidr_count = 0;
     }
+    void set_firewall_default_allow(bool allow) { firewall_default_allow = allow; }
+    void set_firewall_default_deny() { firewall_default_allow = false; }
+    bool firewall_default_is_allow() const { return firewall_default_allow; }
 
     // `peer_addr` must be in network byte order (same as getpeername()).
     // It is converted to packed host-order u32 before matching:
@@ -728,7 +732,7 @@ struct RouteConfig {
             const auto& r = firewall_deny_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return false;
         }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return true;
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return firewall_default_allow;
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] == peer_host) return true;
         }
