@@ -614,6 +614,10 @@ struct RouteConfig {
         }
         return false;
     }
+    // Convenience overload for host-order IPv4 callers.
+    bool firewall_allows_peer_host(u32 peer_host_addr) const {
+        return firewall_allows_peer(__builtin_bswap32(peer_host_addr));
+    }
 
 private:
     static Str cstr_as_str(const char* s) {

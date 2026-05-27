@@ -11189,6 +11189,15 @@ TEST(route_coverage, firewall_deny_precedence_over_allow) {
     CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));
 }
 
+TEST(route_coverage, firewall_allows_peer_host_helper) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(cfg.firewall_allows_peer_host(0x0a020304));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line

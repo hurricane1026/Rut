@@ -13,6 +13,7 @@ connections.
 - Allowlist + denylist precedence
 
 Rules are evaluated from `Connection.peer_addr` captured at accept-time.
+For host-order callers, `firewall_allows_peer_host(u32)` is also available.
 
 ## APIs
 
