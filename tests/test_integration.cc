@@ -732,7 +732,7 @@ TEST(loop, stop_from_outside) {
     REQUIRE(srv.setup(1000));
     i32 c = connect_to(srv.port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     recv_timeout(c, buf, sizeof(buf), 1000);
     srv.loop->stop();
