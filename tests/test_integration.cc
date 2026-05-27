@@ -658,7 +658,7 @@ TEST(error, send_no_read_close) {
     REQUIRE(srv.setup(20));
     i32 c = connect_to(srv.port);
     REQUIRE(c >= 0);
-    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     close(c);
     usleep(100000);
     i32 c2 = connect_to(srv.port);
@@ -1465,7 +1465,7 @@ TEST(shard, serves_requests) {
     usleep(50000);  // let shard start
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(n > 0);
@@ -1691,7 +1691,7 @@ TEST(shard, ephemeral_port_two_shards) {
     usleep(50000);
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     CHECK(recv_timeout(c, buf, sizeof(buf), 2000) > 0);
     close(c);
