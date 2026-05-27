@@ -2271,6 +2271,43 @@ TEST(route, firewall_deny_localhost_cidr_real_socket) {
     destroy_real_loop(loop);
 }
 
+TEST(route, firewall_deny_localhost_network_order_real_socket) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/health", 0, 200));
+    REQUIRE(cfg.add_firewall_deny_ip_network_order(__builtin_bswap32(0x7f000001)));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = -1;
+    for (i32 attempt = 0; attempt < 5 && lfd < 0; attempt++) {
+        lfd = create_listen_socket(0).value_or(-1);
+        if (lfd < 0) usleep(1000);
+    }
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    const u32 len = static_cast<u32>(n);
+    CHECK(buf_contains(buf, len, "HTTP/1.1 403 Forbidden", 22));
+    CHECK(buf_contains(buf, len, "Connection: close", 17));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 TEST(route, firewall_allowlist_exact_localhost_real_socket) {
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/health", 0, 200));
@@ -2423,6 +2460,42 @@ TEST(route, firewall_allowlist_cidr_localhost_real_socket) {
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    send_all(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    const u32 len = static_cast<u32>(n);
+    CHECK(buf_contains(buf, len, "HTTP/1.1 200 OK", 15));
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, firewall_allowlist_network_order_cidr_localhost_real_socket) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/health", 0, 200));
+    REQUIRE(cfg.add_firewall_allow_cidr_network_order(__builtin_bswap32(0x7f000000), 8));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    i32 lfd = -1;
+    for (i32 attempt = 0; attempt < 5 && lfd < 0; attempt++) {
+        lfd = create_listen_socket(0).value_or(-1);
+        if (lfd < 0) usleep(1000);
+    }
+    REQUIRE(lfd >= 0);
     u16 port = get_port(lfd);
     REQUIRE(loop->init(0, lfd).has_value());
     loop->config_ptr = &active;
