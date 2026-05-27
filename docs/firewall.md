@@ -23,10 +23,18 @@ Defined on `RouteConfig`:
 - `add_firewall_deny_ip(u32 ip_host_order)`
 - `add_firewall_allow_cidr(u32 ip_host_order, u8 prefix_len)`
 - `add_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
+- `remove_firewall_allow_ip(u32 ip_host_order)`
+- `remove_firewall_deny_ip(u32 ip_host_order)`
+- `remove_firewall_allow_cidr(u32 ip_host_order, u8 prefix_len)`
+- `remove_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
 - `add_firewall_allow_ip("a.b.c.d")`
 - `add_firewall_deny_ip("a.b.c.d")`
 - `add_firewall_allow_cidr("a.b.c.d/prefix")`
 - `add_firewall_deny_cidr("a.b.c.d/prefix")`
+- `remove_firewall_allow_ip("a.b.c.d")`
+- `remove_firewall_deny_ip("a.b.c.d")`
+- `remove_firewall_allow_cidr("a.b.c.d/prefix")`
+- `remove_firewall_deny_cidr("a.b.c.d/prefix")`
 - `clear_firewall_rules()`
 
 All `u32` IPv4 arguments are host-order (same convention as
@@ -40,6 +48,7 @@ Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
+Remove APIs return `true` only when a matching rule exists and is deleted.
 `clear_firewall_rules()` clears all allow/deny exact and CIDR rules.
 
 ## Evaluation order
@@ -81,6 +90,8 @@ Coverage is in `tests/test_network.cc` under `route_coverage`:
 - `firewall_allowlist_blocks_non_members`
 - `firewall_cidr_allow_and_deny_rules`
 - `firewall_clear_rules_recovers_capacity`
+- `firewall_remove_ip_and_cidr_rules`
+- `firewall_remove_rejects_missing_or_invalid_rules`
 
 Integration coverage in `tests/test_integration.cc` includes:
 

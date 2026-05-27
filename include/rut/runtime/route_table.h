@@ -531,6 +531,27 @@ struct RouteConfig {
         if (!ip_lit) return false;
         return add_firewall_allow_ip(cstr_as_str(ip_lit));
     }
+    bool remove_firewall_allow_ip(u32 ip) {
+        const u32 net_ip = __builtin_bswap32(ip);
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] != net_ip) continue;
+            for (u32 j = i + 1; j < firewall_allow_count; j++)
+                firewall_allow_ips[j - 1] = firewall_allow_ips[j];
+            firewall_allow_ips[firewall_allow_count - 1] = 0;
+            firewall_allow_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_allow_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return remove_firewall_allow_ip(ip);
+    }
+    bool remove_firewall_allow_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return remove_firewall_allow_ip(cstr_as_str(ip_lit));
+    }
     bool add_firewall_deny_ip(u32 ip) {
         const u32 net_ip = __builtin_bswap32(ip);
         for (u32 i = 0; i < firewall_deny_count; i++) {
@@ -548,6 +569,27 @@ struct RouteConfig {
     bool add_firewall_deny_ip(const char* ip_lit) {
         if (!ip_lit) return false;
         return add_firewall_deny_ip(cstr_as_str(ip_lit));
+    }
+    bool remove_firewall_deny_ip(u32 ip) {
+        const u32 net_ip = __builtin_bswap32(ip);
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] != net_ip) continue;
+            for (u32 j = i + 1; j < firewall_deny_count; j++)
+                firewall_deny_ips[j - 1] = firewall_deny_ips[j];
+            firewall_deny_ips[firewall_deny_count - 1] = 0;
+            firewall_deny_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_deny_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return remove_firewall_deny_ip(ip);
+    }
+    bool remove_firewall_deny_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return remove_firewall_deny_ip(cstr_as_str(ip_lit));
     }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -571,6 +613,31 @@ struct RouteConfig {
         if (!cidr_lit) return false;
         return add_firewall_allow_cidr(cstr_as_str(cidr_lit));
     }
+    bool remove_firewall_allow_cidr(u32 ip, u8 prefix_len) {
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if (r.net_addr != net_addr || r.mask != mask) continue;
+            for (u32 j = i + 1; j < firewall_allow_cidr_count; j++)
+                firewall_allow_cidrs[j - 1] = firewall_allow_cidrs[j];
+            firewall_allow_cidrs[firewall_allow_cidr_count - 1] = {0, 0};
+            firewall_allow_cidr_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_allow_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return remove_firewall_allow_cidr(ip, prefix_len);
+    }
+    bool remove_firewall_allow_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return remove_firewall_allow_cidr(cstr_as_str(cidr_lit));
+    }
     bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
@@ -592,6 +659,31 @@ struct RouteConfig {
     bool add_firewall_deny_cidr(const char* cidr_lit) {
         if (!cidr_lit) return false;
         return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
+    }
+    bool remove_firewall_deny_cidr(u32 ip, u8 prefix_len) {
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if (r.net_addr != net_addr || r.mask != mask) continue;
+            for (u32 j = i + 1; j < firewall_deny_cidr_count; j++)
+                firewall_deny_cidrs[j - 1] = firewall_deny_cidrs[j];
+            firewall_deny_cidrs[firewall_deny_cidr_count - 1] = {0, 0};
+            firewall_deny_cidr_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_deny_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return remove_firewall_deny_cidr(ip, prefix_len);
+    }
+    bool remove_firewall_deny_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return remove_firewall_deny_cidr(cstr_as_str(cidr_lit));
     }
     void clear_firewall_rules() {
         for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
