@@ -11533,6 +11533,18 @@ TEST(route_coverage, firewall_string_ip_and_cidr_helpers) {
     CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
 }
 
+TEST(route_coverage, firewall_exact_ip_rules_use_host_order_storage) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip(0x7f000001));
+    REQUIRE(cfg.add_firewall_deny_ip(0x0a010203));
+    CHECK_EQ(cfg.firewall_allow_ips[0], 0x7f000001u);
+    CHECK_EQ(cfg.firewall_deny_ips[0], 0x0a010203u);
+
+    // firewall_allows_peer() still takes network-order peer_addr.
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+}
+
 TEST(route_coverage, firewall_string_helpers_reject_invalid_input) {
     RouteConfig cfg;
     CHECK(!cfg.add_firewall_allow_ip(nullptr));
