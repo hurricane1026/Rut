@@ -594,6 +594,10 @@ struct RouteConfig {
         return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
     }
     void clear_firewall_rules() {
+        for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
+        for (u32 i = 0; i < firewall_deny_count; i++) firewall_deny_ips[i] = 0;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) firewall_allow_cidrs[i] = {0, 0};
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) firewall_deny_cidrs[i] = {0, 0};
         firewall_allow_count = 0;
         firewall_deny_count = 0;
         firewall_allow_cidr_count = 0;
