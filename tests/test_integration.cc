@@ -663,10 +663,10 @@ TEST(error, send_no_read_close) {
     usleep(100000);
     i32 c2 = connect_to(srv.port);
     REQUIRE(c2 >= 0);
-    const bool sent = send_all(c2, HTTP_REQ, HTTP_REQ_LEN);
-    CHECK(sent);
+    const bool ok = send_all(c2, HTTP_REQ, HTTP_REQ_LEN);
+    CHECK(ok);
     char buf[4096];
-    if (sent) CHECK(recv_timeout(c2, buf, sizeof(buf), 2000) > 0);
+    if (ok) CHECK(recv_timeout(c2, buf, sizeof(buf), 2000) > 0);
     close(c2);
     srv.teardown();
 }
