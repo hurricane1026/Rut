@@ -658,12 +658,12 @@ TEST(error, send_no_read_close) {
     REQUIRE(srv.setup(20));
     i32 c = connect_to(srv.port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     close(c);
     usleep(100000);
     i32 c2 = connect_to(srv.port);
     REQUIRE(c2 >= 0);
-    REQUIRE(send_all(c2, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c2, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     CHECK(recv_timeout(c2, buf, sizeof(buf), 2000) > 0);
     close(c2);
