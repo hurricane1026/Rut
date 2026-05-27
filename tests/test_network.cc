@@ -11285,6 +11285,28 @@ TEST(route_coverage, firewall_remove_rejects_missing_or_invalid_rules) {
     CHECK_EQ(cfg.firewall_allow_cidr_count, 1u);
 }
 
+TEST(route_coverage, firewall_remove_allow_rules_updates_policy_mode) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
+
+    // Allowlist mode: only allow-matched peers pass.
+    CHECK(cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001));
+    CHECK(!cfg.firewall_allows_peer_host(0xc0a80101));
+
+    // After removing CIDR allow, only exact-IP allow remains.
+    CHECK(cfg.remove_firewall_allow_cidr("10.0.0.0/8"));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001));
+    CHECK(!cfg.firewall_allows_peer_host(0xc0a80101));
+
+    // Removing final allow exits allowlist mode (default allow).
+    CHECK(cfg.remove_firewall_allow_ip("127.0.0.1"));
+    CHECK(cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(cfg.firewall_allows_peer_host(0xc0a80101));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
