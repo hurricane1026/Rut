@@ -11307,6 +11307,22 @@ TEST(route_coverage, firewall_remove_allow_rules_updates_policy_mode) {
     CHECK(cfg.firewall_allows_peer_host(0xc0a80101));
 }
 
+TEST(route_coverage, firewall_remove_last_allow_keeps_deny_active) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("10.0.0.1"));
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+
+    // Allowlist mode: unmatched peers are blocked, denied peer is blocked.
+    CHECK(cfg.firewall_allows_peer_host(0x0a000001));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(!cfg.firewall_allows_peer_host(0xc0a80101));
+
+    // Removing final allow exits allowlist mode, but deny rule must remain active.
+    CHECK(cfg.remove_firewall_allow_ip("10.0.0.1"));
+    CHECK(cfg.firewall_allows_peer_host(0xc0a80101));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+}
+
 TEST(route_coverage, firewall_remove_deny_restores_allow_match) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_ip("10.1.2.3"));
