@@ -11515,6 +11515,14 @@ TEST(route_coverage, firewall_clear_deny_rules_keeps_allow_mode) {
     CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
 }
 
+TEST(route_coverage, firewall_cidr_rejects_invalid_prefix) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_firewall_allow_cidr(0x0a000000, 33));
+    CHECK(!cfg.add_firewall_deny_cidr(0x0a000000, 33));
+    CHECK(cfg.add_firewall_allow_cidr(0x0a000000, 32));
+    CHECK(cfg.add_firewall_deny_cidr(0x0a000000, 0));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
