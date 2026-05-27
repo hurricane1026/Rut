@@ -27,6 +27,14 @@ Defined on `RouteConfig`:
 - `remove_firewall_deny_ip(u32 ip_host_order)`
 - `remove_firewall_allow_cidr(u32 ip_host_order, u8 prefix_len)`
 - `remove_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
+- `add_firewall_allow_ip_network_order(u32 ip_network_order)`
+- `add_firewall_deny_ip_network_order(u32 ip_network_order)`
+- `add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
+- `add_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
+- `remove_firewall_allow_ip_network_order(u32 ip_network_order)`
+- `remove_firewall_deny_ip_network_order(u32 ip_network_order)`
+- `remove_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
+- `remove_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
 - `add_firewall_allow_ip("a.b.c.d")`
 - `add_firewall_deny_ip("a.b.c.d")`
 - `add_firewall_allow_cidr("a.b.c.d/prefix")`
@@ -45,6 +53,8 @@ String overloads parse dotted IPv4/CIDR literals and return `false` on
 malformed input.
 `Connection.peer_addr` comes from accept/getpeername in network byte order;
 `firewall_allows_peer` converts it once to packed host-order before evaluation.
+For callers already holding network-order IPv4 (`in_addr.s_addr` style),
+`*_network_order` helper overloads convert to packed host-order internally.
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.

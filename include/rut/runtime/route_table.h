@@ -529,6 +529,10 @@ struct RouteConfig {
         if (!ip_lit) return false;
         return add_firewall_allow_ip(cstr_as_str(ip_lit));
     }
+    // `ip_network_order` uses in_addr.s_addr/getpeername representation.
+    bool add_firewall_allow_ip_network_order(u32 ip_network_order) {
+        return add_firewall_allow_ip(__builtin_bswap32(ip_network_order));
+    }
     bool remove_firewall_allow_ip(u32 ip) {
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] != ip) continue;
@@ -549,6 +553,9 @@ struct RouteConfig {
         if (!ip_lit) return false;
         return remove_firewall_allow_ip(cstr_as_str(ip_lit));
     }
+    bool remove_firewall_allow_ip_network_order(u32 ip_network_order) {
+        return remove_firewall_allow_ip(__builtin_bswap32(ip_network_order));
+    }
     bool add_firewall_deny_ip(u32 ip) {
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] == ip) return true;
@@ -565,6 +572,9 @@ struct RouteConfig {
     bool add_firewall_deny_ip(const char* ip_lit) {
         if (!ip_lit) return false;
         return add_firewall_deny_ip(cstr_as_str(ip_lit));
+    }
+    bool add_firewall_deny_ip_network_order(u32 ip_network_order) {
+        return add_firewall_deny_ip(__builtin_bswap32(ip_network_order));
     }
     bool remove_firewall_deny_ip(u32 ip) {
         for (u32 i = 0; i < firewall_deny_count; i++) {
@@ -585,6 +595,9 @@ struct RouteConfig {
     bool remove_firewall_deny_ip(const char* ip_lit) {
         if (!ip_lit) return false;
         return remove_firewall_deny_ip(cstr_as_str(ip_lit));
+    }
+    bool remove_firewall_deny_ip_network_order(u32 ip_network_order) {
+        return remove_firewall_deny_ip(__builtin_bswap32(ip_network_order));
     }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -607,6 +620,9 @@ struct RouteConfig {
     bool add_firewall_allow_cidr(const char* cidr_lit) {
         if (!cidr_lit) return false;
         return add_firewall_allow_cidr(cstr_as_str(cidr_lit));
+    }
+    bool add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return add_firewall_allow_cidr(__builtin_bswap32(ip_network_order), prefix_len);
     }
     bool remove_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -633,6 +649,9 @@ struct RouteConfig {
         if (!cidr_lit) return false;
         return remove_firewall_allow_cidr(cstr_as_str(cidr_lit));
     }
+    bool remove_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return remove_firewall_allow_cidr(__builtin_bswap32(ip_network_order), prefix_len);
+    }
     bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
@@ -654,6 +673,9 @@ struct RouteConfig {
     bool add_firewall_deny_cidr(const char* cidr_lit) {
         if (!cidr_lit) return false;
         return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
+    }
+    bool add_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return add_firewall_deny_cidr(__builtin_bswap32(ip_network_order), prefix_len);
     }
     bool remove_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -679,6 +701,9 @@ struct RouteConfig {
     bool remove_firewall_deny_cidr(const char* cidr_lit) {
         if (!cidr_lit) return false;
         return remove_firewall_deny_cidr(cstr_as_str(cidr_lit));
+    }
+    bool remove_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return remove_firewall_deny_cidr(__builtin_bswap32(ip_network_order), prefix_len);
     }
     void clear_firewall_rules() {
         for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
