@@ -706,15 +706,21 @@ struct RouteConfig {
     bool remove_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
         return remove_firewall_deny_cidr(ntohl(ip_network_order), prefix_len);
     }
-    void clear_firewall_rules() {
+    void clear_firewall_allow_rules() {
         for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
-        for (u32 i = 0; i < firewall_deny_count; i++) firewall_deny_ips[i] = 0;
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) firewall_allow_cidrs[i] = {0, 0};
-        for (u32 i = 0; i < firewall_deny_cidr_count; i++) firewall_deny_cidrs[i] = {0, 0};
         firewall_allow_count = 0;
-        firewall_deny_count = 0;
         firewall_allow_cidr_count = 0;
+    }
+    void clear_firewall_deny_rules() {
+        for (u32 i = 0; i < firewall_deny_count; i++) firewall_deny_ips[i] = 0;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) firewall_deny_cidrs[i] = {0, 0};
+        firewall_deny_count = 0;
         firewall_deny_cidr_count = 0;
+    }
+    void clear_firewall_rules() {
+        clear_firewall_allow_rules();
+        clear_firewall_deny_rules();
     }
     void set_firewall_default_allow(bool allow) { firewall_default_allow = allow; }
     void set_firewall_default_deny() { firewall_default_allow = false; }

@@ -43,6 +43,8 @@ Defined on `RouteConfig`:
 - `remove_firewall_deny_ip("a.b.c.d")`
 - `remove_firewall_allow_cidr("a.b.c.d/prefix")`
 - `remove_firewall_deny_cidr("a.b.c.d/prefix")`
+- `clear_firewall_allow_rules()`
+- `clear_firewall_deny_rules()`
 - `set_firewall_default_allow(bool allow)`
 - `set_firewall_default_deny()`
 - `firewall_default_is_allow()`
@@ -64,6 +66,8 @@ return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
 Remove APIs return `true` only when a matching rule exists and is deleted.
+`clear_firewall_allow_rules()` clears both allow exact-IP and allow CIDR tables.
+`clear_firewall_deny_rules()` clears both deny exact-IP and deny CIDR tables.
 `clear_firewall_rules()` clears all allow/deny exact and CIDR rules.
 Default policy is allow unless changed via `set_firewall_default_allow(false)`
 or `set_firewall_default_deny()`.
