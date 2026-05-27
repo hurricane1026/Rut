@@ -184,7 +184,11 @@ struct RouteConfig {
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
-    // Firewall rules (IPv4 exact-match and CIDR subnet, network byte order).
+    // Firewall rules.
+    // - exact IP rules are stored in network byte order (for direct compare
+    //   against Connection.peer_addr)
+    // - CIDR rules are stored in host byte order as (net, mask) pairs
+    //   and matched against bswap(peer_addr)
     // Evaluation order:
     //   1) deny list (if hit => reject)
     //   2) allow list (if non-empty => require hit)
