@@ -11173,6 +11173,22 @@ TEST(route_coverage, firewall_duplicate_rules_do_not_consume_capacity) {
     CHECK_EQ(cfg.firewall_allow_count, 2u);
 }
 
+TEST(route_coverage, firewall_deny_precedence_over_allow) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/ok", 0, 200));
+
+    // deny CIDR wins over allow exact
+    REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
+    REQUIRE(cfg.add_firewall_deny_cidr("127.0.0.0/8"));
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+
+    // deny exact wins over allow CIDR
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
