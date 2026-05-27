@@ -11635,6 +11635,45 @@ TEST(route_coverage, firewall_clear_rules_recovers_capacity) {
     CHECK(!cfg.firewall_allows_peer_host(0x0b000001));
 }
 
+TEST(route_coverage, firewall_remove_ip_and_cidr_rules) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("10.0.0.1"));
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+    REQUIRE(cfg.add_firewall_deny_cidr("10.2.0.0/16"));
+
+    CHECK_EQ(cfg.firewall_allow_count, 1u);
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 1u);
+    CHECK_EQ(cfg.firewall_deny_count, 1u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 1u);
+
+    CHECK(cfg.remove_firewall_allow_ip("10.0.0.1"));
+    CHECK(cfg.remove_firewall_allow_cidr("10.0.0.0/8"));
+    CHECK(cfg.remove_firewall_deny_ip("10.1.2.3"));
+    CHECK(cfg.remove_firewall_deny_cidr("10.2.0.0/16"));
+
+    CHECK_EQ(cfg.firewall_allow_count, 0u);
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 0u);
+    CHECK(cfg.firewall_allows_peer_host(0x0a010203));
+}
+
+TEST(route_coverage, firewall_remove_rejects_missing_or_invalid_rules) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+
+    CHECK(!cfg.remove_firewall_deny_ip("10.1.2.4"));
+    CHECK(!cfg.remove_firewall_allow_cidr("10.0.0.0/33"));
+    CHECK(!cfg.remove_firewall_allow_cidr("not-cidr"));
+    CHECK(!cfg.remove_firewall_allow_ip(nullptr));
+    CHECK(!cfg.remove_firewall_deny_cidr(nullptr));
+
+    CHECK_EQ(cfg.firewall_deny_count, 1u);
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 1u);
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
