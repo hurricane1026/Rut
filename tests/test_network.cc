@@ -11620,6 +11620,21 @@ TEST(route_coverage, firewall_clear_rules_then_readd) {
     CHECK(!cfg.firewall_allows_peer_host(0x7f000001));
 }
 
+TEST(route_coverage, firewall_clear_rules_recovers_capacity) {
+    RouteConfig cfg;
+    for (u32 i = 0; i < RouteConfig::kMaxFirewallRules; i++) {
+        REQUIRE(cfg.add_firewall_deny_ip(0x0a000000u + i));
+    }
+    CHECK_EQ(cfg.firewall_deny_count, RouteConfig::kMaxFirewallRules);
+    CHECK(!cfg.add_firewall_deny_ip(0x0b000001));
+
+    cfg.clear_firewall_rules();
+    CHECK_EQ(cfg.firewall_deny_count, 0u);
+    REQUIRE(cfg.add_firewall_deny_ip(0x0b000001));
+    CHECK_EQ(cfg.firewall_deny_count, 1u);
+    CHECK(!cfg.firewall_allows_peer_host(0x0b000001));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
