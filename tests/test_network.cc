@@ -11073,6 +11073,7 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK_EQ(blocked->resp_status, 403);
+    CHECK(!blocked->keep_alive);
 
     // member IP => route dispatch works
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));

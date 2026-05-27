@@ -2199,7 +2199,7 @@ TEST(route, post_put_patch_method_filter_real_socket) {
 
 TEST(route, firewall_deny_localhost_real_socket) {
     RouteConfig cfg;
-    cfg.add_static("/health", 0, 200);
+    REQUIRE(cfg.add_static("/health", 0, 200));
     REQUIRE(cfg.add_firewall_deny_ip(0x7f000001));  // 127.0.0.1
     const RouteConfig* active = &cfg;
 
@@ -2220,28 +2220,9 @@ TEST(route, firewall_deny_localhost_real_socket) {
     char buf[1024];
     i32 n = recv_timeout(c, buf, sizeof(buf), 500);
     CHECK_GT(n, 0);
-
-    bool found_403 = false;
-    bool found_close = false;
-    for (i32 i = 0; i < n - 2; i++) {
-        if (buf[i] == '4' && buf[i + 1] == '0' && buf[i + 2] == '3') found_403 = true;
-    }
-    const char kCloseHdr[] = "Connection: close";
-    for (i32 i = 0; i + static_cast<i32>(sizeof(kCloseHdr) - 1) <= n; i++) {
-        bool same = true;
-        for (u32 j = 0; j < sizeof(kCloseHdr) - 1; j++) {
-            if (buf[i + static_cast<i32>(j)] != kCloseHdr[j]) {
-                same = false;
-                break;
-            }
-        }
-        if (same) {
-            found_close = true;
-            break;
-        }
-    }
-    CHECK(found_403);
-    CHECK(found_close);
+    const u32 len = static_cast<u32>(n);
+    CHECK(buf_contains(buf, len, "HTTP/1.1 403 Forbidden", 22));
+    CHECK(buf_contains(buf, len, "Connection: close", 17));
 
     close(c);
     lt.stop();
