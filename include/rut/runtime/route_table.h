@@ -46,8 +46,8 @@ struct UpstreamTarget {
     void set_addr(u32 ip, u16 port) {
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = __builtin_bswap32(ip);
-        addr.sin_port = __builtin_bswap16(port);
+        addr.sin_addr.s_addr = htonl(ip);
+        addr.sin_port = htons(port);
     }
 };
 
@@ -531,7 +531,7 @@ struct RouteConfig {
     }
     // `ip_network_order` uses in_addr.s_addr/getpeername representation.
     bool add_firewall_allow_ip_network_order(u32 ip_network_order) {
-        return add_firewall_allow_ip(__builtin_bswap32(ip_network_order));
+        return add_firewall_allow_ip(ntohl(ip_network_order));
     }
     bool remove_firewall_allow_ip(u32 ip) {
         for (u32 i = 0; i < firewall_allow_count; i++) {
@@ -554,7 +554,7 @@ struct RouteConfig {
         return remove_firewall_allow_ip(cstr_as_str(ip_lit));
     }
     bool remove_firewall_allow_ip_network_order(u32 ip_network_order) {
-        return remove_firewall_allow_ip(__builtin_bswap32(ip_network_order));
+        return remove_firewall_allow_ip(ntohl(ip_network_order));
     }
     bool add_firewall_deny_ip(u32 ip) {
         for (u32 i = 0; i < firewall_deny_count; i++) {
@@ -574,7 +574,7 @@ struct RouteConfig {
         return add_firewall_deny_ip(cstr_as_str(ip_lit));
     }
     bool add_firewall_deny_ip_network_order(u32 ip_network_order) {
-        return add_firewall_deny_ip(__builtin_bswap32(ip_network_order));
+        return add_firewall_deny_ip(ntohl(ip_network_order));
     }
     bool remove_firewall_deny_ip(u32 ip) {
         for (u32 i = 0; i < firewall_deny_count; i++) {
@@ -597,7 +597,7 @@ struct RouteConfig {
         return remove_firewall_deny_ip(cstr_as_str(ip_lit));
     }
     bool remove_firewall_deny_ip_network_order(u32 ip_network_order) {
-        return remove_firewall_deny_ip(__builtin_bswap32(ip_network_order));
+        return remove_firewall_deny_ip(ntohl(ip_network_order));
     }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -622,7 +622,7 @@ struct RouteConfig {
         return add_firewall_allow_cidr(cstr_as_str(cidr_lit));
     }
     bool add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
-        return add_firewall_allow_cidr(__builtin_bswap32(ip_network_order), prefix_len);
+        return add_firewall_allow_cidr(ntohl(ip_network_order), prefix_len);
     }
     bool remove_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -650,7 +650,7 @@ struct RouteConfig {
         return remove_firewall_allow_cidr(cstr_as_str(cidr_lit));
     }
     bool remove_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
-        return remove_firewall_allow_cidr(__builtin_bswap32(ip_network_order), prefix_len);
+        return remove_firewall_allow_cidr(ntohl(ip_network_order), prefix_len);
     }
     bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -675,7 +675,7 @@ struct RouteConfig {
         return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
     }
     bool add_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
-        return add_firewall_deny_cidr(__builtin_bswap32(ip_network_order), prefix_len);
+        return add_firewall_deny_cidr(ntohl(ip_network_order), prefix_len);
     }
     bool remove_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
@@ -703,7 +703,7 @@ struct RouteConfig {
         return remove_firewall_deny_cidr(cstr_as_str(cidr_lit));
     }
     bool remove_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
-        return remove_firewall_deny_cidr(__builtin_bswap32(ip_network_order), prefix_len);
+        return remove_firewall_deny_cidr(ntohl(ip_network_order), prefix_len);
     }
     void clear_firewall_rules() {
         for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
@@ -720,7 +720,7 @@ struct RouteConfig {
     // It is converted to packed host-order u32 before matching:
     //   (a << 24) | (b << 16) | (c << 8) | d
     bool firewall_allows_peer(u32 peer_addr) const {
-        const u32 peer_host = __builtin_bswap32(peer_addr);
+        const u32 peer_host = ntohl(peer_addr);
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] == peer_host) return false;
         }
@@ -740,7 +740,7 @@ struct RouteConfig {
     }
     // Convenience overload for host-order IPv4 callers.
     bool firewall_allows_peer_host(u32 peer_host_addr) const {
-        return firewall_allows_peer(__builtin_bswap32(peer_host_addr));
+        return firewall_allows_peer(htonl(peer_host_addr));
     }
 
 private:
