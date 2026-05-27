@@ -698,14 +698,14 @@ TEST(error, fd_recycle_no_stale) {
     REQUIRE(srv.setup(30));
     i32 c1 = connect_to(srv.port);
     REQUIRE(c1 >= 0);
-    REQUIRE(send_all(c1, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c1, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     recv_timeout(c1, buf, sizeof(buf), 1000);
     close(c1);
     usleep(50000);
     i32 c2 = connect_to(srv.port);
     REQUIRE(c2 >= 0);
-    REQUIRE(send_all(c2, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c2, HTTP_REQ, HTTP_REQ_LEN));
     CHECK(recv_timeout(c2, buf, sizeof(buf), 2000) > 0);
     close(c2);
     srv.teardown();
@@ -1465,7 +1465,7 @@ TEST(shard, serves_requests) {
     usleep(50000);  // let shard start
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(n > 0);
@@ -1691,7 +1691,7 @@ TEST(shard, ephemeral_port_two_shards) {
     usleep(50000);
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     CHECK(recv_timeout(c, buf, sizeof(buf), 2000) > 0);
     close(c);
@@ -1852,7 +1852,7 @@ TEST(epoll_drain, drain_with_active_connections) {
     // Connect and send request
     i32 c = connect_to(srv.port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(n > 0);
@@ -1908,7 +1908,7 @@ TEST(epoll_epoch, epoch_increments_on_request) {
     usleep(10000);
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     recv_timeout(c, buf, sizeof(buf), 2000);
     close(c);
@@ -1988,7 +1988,7 @@ TEST(epoll_drain, drain_completes_naturally) {
     // Connect and send a request (creates active connection)
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
-    REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+    CHECK(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
     char buf[4096];
     recv_timeout(c, buf, sizeof(buf), 2000);
 
