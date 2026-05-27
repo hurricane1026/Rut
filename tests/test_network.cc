@@ -9010,6 +9010,33 @@ TEST(state_invariant, jit_request_body_eof_clears_body_read_slots) {
     check_idle_invariant(_tc, &loop.conns[cid]);
 }
 
+TEST(state_invariant, jit_request_body_error_clears_body_read_slots) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_req_body_payload, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
+    loop.backend.inject(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    check_jit_reading_body_invariant(_tc, c);
+    CHECK_EQ(c->req_body_remaining, 4u);
+
+    const u32 cid = c->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, -1));
+    check_idle_invariant(_tc, &loop.conns[cid]);
+}
+
 TEST(state_invariant, jit_content_length_without_body_dependency_runs_immediately) {
     SmallLoop loop;
     loop.setup();
