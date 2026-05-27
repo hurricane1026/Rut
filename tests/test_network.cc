@@ -11546,6 +11546,23 @@ TEST(route_coverage, firewall_string_helpers_reject_invalid_input) {
     CHECK(!cfg.add_firewall_deny_cidr("10.0.0.0/a"));
 }
 
+TEST(route_coverage, firewall_duplicate_rules_do_not_consume_capacity) {
+    RouteConfig cfg;
+    for (u32 i = 0; i < RouteConfig::kMaxFirewallRules; i++) {
+        REQUIRE(cfg.add_firewall_allow_ip(0x7f000001));
+    }
+    CHECK_EQ(cfg.firewall_allow_count, 1u);
+
+    for (u32 i = 0; i < RouteConfig::kMaxFirewallRules; i++) {
+        REQUIRE(cfg.add_firewall_deny_cidr("10.0.0.0/8"));
+    }
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 1u);
+
+    // Capacity remains available for distinct entries.
+    REQUIRE(cfg.add_firewall_allow_ip(0x7f000002));
+    CHECK_EQ(cfg.firewall_allow_count, 2u);
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
