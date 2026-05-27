@@ -78,9 +78,9 @@ On reject:
 ```cpp
 RouteConfig cfg;
 cfg.add_static("/ok", 0, 200);
-cfg.add_firewall_allow_cidr(0x0a000000, 8);   // 10.0.0.0/8
-cfg.add_firewall_deny_cidr(0x0a010000, 16);   // 10.1.0.0/16
-cfg.add_firewall_allow_ip(0x7f000001);        // 127.0.0.1
+cfg.add_firewall_allow_cidr(0x0a000000, 8);  // 10.0.0.0/8
+cfg.add_firewall_deny_cidr(0x0a010000, 16);  // 10.1.0.0/16
+cfg.add_firewall_allow_ip(0x7f000001);       // 127.0.0.1
 ```
 
 ## Tests
@@ -109,6 +109,7 @@ Integration coverage in `tests/test_integration.cc` includes:
 - `firewall_allowlist_exact_localhost_real_socket`
 - `firewall_deny_exact_over_allow_exact_real_socket`
 - `firewall_deny_exact_over_allow_cidr_real_socket`
+- `firewall_deny_cidr_over_allow_exact_real_socket`
 - `firewall_allowlist_cidr_localhost_real_socket`
 - `firewall_clear_rules_reenables_localhost_real_socket`
 - `firewall_remove_deny_rule_reenables_localhost_real_socket`
