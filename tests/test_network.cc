@@ -11035,7 +11035,7 @@ TEST(route_coverage, firewall_deny_rule_returns_403) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
-    c->peer_addr = __builtin_bswap32(0x7f000001);
+    c->peer_addr = htonl(0x7f000001);
     c->recv_buf.reset();
     const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
@@ -11062,7 +11062,7 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* blocked = loop.find_fd(42);
     REQUIRE(blocked != nullptr);
-    blocked->peer_addr = __builtin_bswap32(0x0a000001);  // 10.0.0.1
+    blocked->peer_addr = htonl(0x0a000001);  // 10.0.0.1
     blocked->recv_buf.reset();
     const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
     blocked->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
@@ -11079,7 +11079,7 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
     auto* allowed = loop.find_fd(43);
     REQUIRE(allowed != nullptr);
-    allowed->peer_addr = __builtin_bswap32(0x7f000001);  // 127.0.0.1
+    allowed->peer_addr = htonl(0x7f000001);  // 127.0.0.1
     allowed->recv_buf.reset();
     allowed->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
     IoEvent allowed_ev = {
@@ -11097,9 +11097,9 @@ TEST(route_coverage, firewall_cidr_allow_and_deny_rules) {
     REQUIRE(cfg.add_firewall_allow_cidr(0x0a000000, 8));
     REQUIRE(cfg.add_firewall_deny_cidr(0x0a010000, 16));
     // direct rule checks (network-order peer values)
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));  // deny subnet
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));   // allow subnet
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0xc0a80102)));  // outside allowlist
+    CHECK(!cfg.firewall_allows_peer(htonl(0x0a010203)));  // deny subnet
+    CHECK(cfg.firewall_allows_peer(htonl(0x0a020304)));   // allow subnet
+    CHECK(!cfg.firewall_allows_peer(htonl(0xc0a80102)));  // outside allowlist
     const RouteConfig* active = &cfg;
     const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
     IoEvent events[8];
@@ -11121,9 +11121,9 @@ TEST(route_coverage, firewall_cidr_allow_and_deny_rules) {
         CHECK_EQ(c->resp_status, expected);
     };
 
-    run_one(42, __builtin_bswap32(0x0a010203), 403);  // in deny /16
-    run_one(43, __builtin_bswap32(0x0a020304), 200);  // in allow /8
-    run_one(44, __builtin_bswap32(0xc0a80102), 403);  // outside allowlist
+    run_one(42, htonl(0x0a010203), 403);  // in deny /16
+    run_one(43, htonl(0x0a020304), 200);  // in allow /8
+    run_one(44, htonl(0xc0a80102), 403);  // outside allowlist
 }
 
 TEST(route_coverage, firewall_cidr_rejects_invalid_prefix) {
@@ -11140,8 +11140,8 @@ TEST(route_coverage, firewall_string_ip_and_cidr_helpers) {
     CHECK(cfg.add_firewall_deny_ip("10.0.0.1"));
     CHECK(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
     CHECK(cfg.add_firewall_deny_cidr("10.1.0.0/16"));
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a000001)));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+    CHECK(!cfg.firewall_allows_peer(htonl(0x0a000001)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x7f000001)));
 }
 
 TEST(route_coverage, firewall_exact_ip_rules_use_host_order_storage) {
@@ -11152,21 +11152,21 @@ TEST(route_coverage, firewall_exact_ip_rules_use_host_order_storage) {
     CHECK_EQ(cfg.firewall_deny_ips[0], 0x0a010203u);
 
     // firewall_allows_peer() still takes network-order peer_addr.
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x7f000001)));
+    CHECK(!cfg.firewall_allows_peer(htonl(0x0a010203)));
 }
 
 TEST(route_coverage, firewall_exact_ip_remove_roundtrip_with_network_peer_addr) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_ip(0x7f000001));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x7f000001)));
     REQUIRE(cfg.remove_firewall_allow_ip(0x7f000001));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x7f000001)));
 
     REQUIRE(cfg.add_firewall_deny_ip(0x0a010203));
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+    CHECK(!cfg.firewall_allows_peer(htonl(0x0a010203)));
     REQUIRE(cfg.remove_firewall_deny_ip(0x0a010203));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x0a010203)));
 }
 
 TEST(route_coverage, firewall_network_order_exact_ip_helpers_roundtrip) {
@@ -11174,8 +11174,8 @@ TEST(route_coverage, firewall_network_order_exact_ip_helpers_roundtrip) {
 
     const u32 kAllowHost = 0x7f000001;  // 127.0.0.1
     const u32 kDenyHost = 0x0a010203;   // 10.1.2.3
-    const u32 kAllowNet = __builtin_bswap32(kAllowHost);
-    const u32 kDenyNet = __builtin_bswap32(kDenyHost);
+    const u32 kAllowNet = htonl(kAllowHost);
+    const u32 kDenyNet = htonl(kDenyHost);
 
     REQUIRE(cfg.add_firewall_allow_ip_network_order(kAllowNet));
     REQUIRE(cfg.add_firewall_deny_ip_network_order(kDenyNet));
@@ -11194,19 +11194,19 @@ TEST(route_coverage, firewall_network_order_exact_ip_helpers_roundtrip) {
 TEST(route_coverage, firewall_network_order_cidr_helpers_roundtrip) {
     RouteConfig cfg;
 
-    const u32 kAllow10Net = __builtin_bswap32(0x0a000000);  // 10.0.0.0/8
-    const u32 kDeny101Net = __builtin_bswap32(0x0a010000);  // 10.1.0.0/16
+    const u32 kAllow10Net = htonl(0x0a000000);  // 10.0.0.0/8
+    const u32 kDeny101Net = htonl(0x0a010000);  // 10.1.0.0/16
     REQUIRE(cfg.add_firewall_allow_cidr_network_order(kAllow10Net, 8));
     REQUIRE(cfg.add_firewall_deny_cidr_network_order(kDeny101Net, 16));
 
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));  // denied /16
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));   // allowed /8
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0xc0a80102)));  // outside allowlist
+    CHECK(!cfg.firewall_allows_peer(htonl(0x0a010203)));  // denied /16
+    CHECK(cfg.firewall_allows_peer(htonl(0x0a020304)));   // allowed /8
+    CHECK(!cfg.firewall_allows_peer(htonl(0xc0a80102)));  // outside allowlist
 
     REQUIRE(cfg.remove_firewall_deny_cidr_network_order(kDeny101Net, 16));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x0a010203)));
     REQUIRE(cfg.remove_firewall_allow_cidr_network_order(kAllow10Net, 8));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0xc0a80102)));
+    CHECK(cfg.firewall_allows_peer(htonl(0xc0a80102)));
 }
 
 TEST(route_coverage, firewall_string_helpers_reject_invalid_input) {
@@ -11246,13 +11246,13 @@ TEST(route_coverage, firewall_deny_precedence_over_allow) {
     // deny CIDR wins over allow exact
     REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
     REQUIRE(cfg.add_firewall_deny_cidr("127.0.0.0/8"));
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x7f000001)));
+    CHECK(!cfg.firewall_allows_peer(htonl(0x7f000001)));
 
     // deny exact wins over allow CIDR
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
     REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
-    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));
-    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));
+    CHECK(!cfg.firewall_allows_peer(htonl(0x0a010203)));
+    CHECK(cfg.firewall_allows_peer(htonl(0x0a020304)));
 }
 
 TEST(route_coverage, firewall_allows_peer_host_helper) {

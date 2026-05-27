@@ -2274,7 +2274,7 @@ TEST(route, firewall_deny_localhost_cidr_real_socket) {
 TEST(route, firewall_deny_localhost_network_order_real_socket) {
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/health", 0, 200));
-    REQUIRE(cfg.add_firewall_deny_ip_network_order(__builtin_bswap32(0x7f000001)));
+    REQUIRE(cfg.add_firewall_deny_ip_network_order(htonl(0x7f000001)));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -2485,7 +2485,7 @@ TEST(route, firewall_allowlist_cidr_localhost_real_socket) {
 TEST(route, firewall_allowlist_network_order_cidr_localhost_real_socket) {
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/health", 0, 200));
-    REQUIRE(cfg.add_firewall_allow_cidr_network_order(__builtin_bswap32(0x7f000000), 8));
+    REQUIRE(cfg.add_firewall_allow_cidr_network_order(htonl(0x7f000000), 8));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
