@@ -11199,6 +11199,25 @@ TEST(route_coverage, firewall_allows_peer_host_helper) {
     CHECK(cfg.firewall_allows_peer_host(0x0a020304));
 }
 
+TEST(route_coverage, firewall_clear_rules_resets_policy) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
+    REQUIRE(cfg.add_firewall_deny_cidr("10.0.0.0/8"));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000001));
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001));
+    CHECK_EQ(cfg.firewall_allow_count, 1u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 1u);
+
+    cfg.clear_firewall_rules();
+    CHECK_EQ(cfg.firewall_allow_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_count, 0u);
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 0u);
+    // No allow/deny rules => default allow.
+    CHECK(cfg.firewall_allows_peer_host(0x0a000001));
+    CHECK(cfg.firewall_allows_peer_host(0xc0a80102));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line

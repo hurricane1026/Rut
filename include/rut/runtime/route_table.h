@@ -593,6 +593,12 @@ struct RouteConfig {
         if (!cidr_lit) return false;
         return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
     }
+    void clear_firewall_rules() {
+        firewall_allow_count = 0;
+        firewall_deny_count = 0;
+        firewall_allow_cidr_count = 0;
+        firewall_deny_cidr_count = 0;
+    }
 
     // `peer_addr` must be in network byte order (same as getpeername()).
     bool firewall_allows_peer(u32 peer_addr) const {

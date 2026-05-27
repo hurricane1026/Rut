@@ -27,6 +27,7 @@ Defined on `RouteConfig`:
 - `add_firewall_deny_ip("a.b.c.d")`
 - `add_firewall_allow_cidr("a.b.c.d/prefix")`
 - `add_firewall_deny_cidr("a.b.c.d/prefix")`
+- `clear_firewall_rules()`
 
 All `u32` IPv4 arguments are host-order (same convention as
 `UpstreamTarget::set_addr`).
@@ -39,6 +40,7 @@ Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
+`clear_firewall_rules()` clears all allow/deny exact and CIDR rules.
 
 ## Evaluation order
 
