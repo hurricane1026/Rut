@@ -11712,6 +11712,23 @@ TEST(route_coverage, firewall_remove_last_allow_keeps_deny_active) {
     CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
 }
 
+TEST(route_coverage, firewall_remove_last_allow_cidr_keeps_deny_cidr_active) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_deny_cidr("10.1.0.0/16"));
+
+    // Allowlist mode: only 10/8 can pass, except denied 10.1/16.
+    CHECK(cfg.firewall_allows_peer_host(0x0a020304));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(!cfg.firewall_allows_peer_host(0xc0a80101));
+
+    // Removing final allow CIDR exits allowlist mode, but deny CIDR remains active.
+    CHECK(cfg.remove_firewall_allow_cidr("10.0.0.0/8"));
+    CHECK(cfg.firewall_allows_peer_host(0xc0a80101));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(cfg.firewall_allows_peer_host(0x0a020304));
+}
+
 TEST(route_coverage, firewall_remove_deny_restores_allow_match) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_ip("10.1.2.3"));
