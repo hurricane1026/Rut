@@ -184,9 +184,10 @@ struct RouteConfig {
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
-    // Firewall rules (all in host byte order).
-    // Connection.peer_addr is network order; firewall_allows_peer converts it
-    // once to host order before rule evaluation.
+    // Firewall rules use packed host-order u32 IPv4 values:
+    //   ip = (a << 24) | (b << 16) | (c << 8) | d  for a.b.c.d
+    // Connection.peer_addr is stored in network byte order; firewall_allows_peer
+    // converts it once to the packed host-order representation before evaluation.
     // Evaluation order:
     //   1) deny list (if hit => reject)
     //   2) allow list (if non-empty => require hit)
@@ -691,6 +692,8 @@ struct RouteConfig {
     }
 
     // `peer_addr` must be in network byte order (same as getpeername()).
+    // It is converted to packed host-order u32 before matching:
+    //   (a << 24) | (b << 16) | (c << 8) | d
     bool firewall_allows_peer(u32 peer_addr) const {
         const u32 peer_host = __builtin_bswap32(peer_addr);
         for (u32 i = 0; i < firewall_deny_count; i++) {

@@ -37,13 +37,14 @@ Defined on `RouteConfig`:
 - `remove_firewall_deny_cidr("a.b.c.d/prefix")`
 - `clear_firewall_rules()`
 
-All `u32` IPv4 arguments are host-order (same convention as
+All `u32` IPv4 arguments are packed host-order values in the form
+`(a << 24) | (b << 16) | (c << 8) | d` for `a.b.c.d` (same convention as
 `UpstreamTarget::set_addr`).
 Firewall tables also store rule IP values in host-order.
 String overloads parse dotted IPv4/CIDR literals and return `false` on
 malformed input.
 `Connection.peer_addr` comes from accept/getpeername in network byte order;
-the runtime converts as needed during firewall evaluation.
+`firewall_allows_peer` converts it once to packed host-order before evaluation.
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
@@ -85,7 +86,7 @@ cfg.add_firewall_allow_ip(0x7f000001);       // 127.0.0.1
 
 ## Tests
 
-Coverage is in `tests/test_network.cc` under `route_coverage`:
+Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 
 - `firewall_deny_rule_returns_403`
 - `firewall_allowlist_blocks_non_members`
@@ -102,7 +103,7 @@ Coverage is in `tests/test_network.cc` under `route_coverage`:
 - `firewall_remove_last_allow_cidr_keeps_deny_cidr_active`
 - `firewall_remove_deny_restores_allow_match`
 
-Integration coverage in `tests/test_integration.cc` includes:
+Current integration coverage in `tests/test_integration.cc` includes:
 
 - `firewall_deny_localhost_real_socket`
 - `firewall_deny_localhost_cidr_real_socket`
