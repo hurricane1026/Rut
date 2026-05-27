@@ -46,8 +46,8 @@ struct UpstreamTarget {
     void set_addr(u32 ip, u16 port) {
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = __builtin_bswap32(ip);
-        addr.sin_port = __builtin_bswap16(port);
+        addr.sin_addr.s_addr = htonl(ip);
+        addr.sin_port = htons(port);
     }
 };
 
@@ -100,6 +100,9 @@ struct RouteConfig {
     // any risk of silent truncation. Must match the buffer size used
     // by handle_jit_outcome in callbacks_impl.h.
     static constexpr u32 kMaxHeadersPerSet = 32;
+    // Firewall IPv4 rule caps. Small fixed arrays keep match checks
+    // branch-predictable and allocation-free on the hot path.
+    static constexpr u32 kMaxFirewallRules = 64;
 
     // Non-copyable: the embedded `trie` stores non-owning Str views
     // pointing into routes[].path. A by-value copy would leave the
@@ -180,6 +183,27 @@ struct RouteConfig {
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Firewall rules use packed host-order u32 IPv4 values:
+    //   ip = (a << 24) | (b << 16) | (c << 8) | d  for a.b.c.d
+    // Connection.peer_addr is stored in network byte order; firewall_allows_peer
+    // converts it once to the packed host-order representation before evaluation.
+    // Evaluation order:
+    //   1) deny list (if hit => reject)
+    //   2) allow list (if non-empty => require hit)
+    //   3) default allow
+    u32 firewall_allow_ips[kMaxFirewallRules]{};
+    u32 firewall_deny_ips[kMaxFirewallRules]{};
+    struct FirewallCidrRule {
+        u32 net_addr;
+        u32 mask;
+    };
+    FirewallCidrRule firewall_allow_cidrs[kMaxFirewallRules]{};
+    FirewallCidrRule firewall_deny_cidrs[kMaxFirewallRules]{};
+    u32 firewall_allow_count = 0;
+    u32 firewall_deny_count = 0;
+    u32 firewall_allow_cidr_count = 0;
+    u32 firewall_deny_cidr_count = 0;
 
     // Reject route paths that aren't in origin-form. Required by the
     // segment trie (which would otherwise silently mismatch malformed
@@ -486,6 +510,292 @@ struct RouteConfig {
         return idx;
     }
 
+    // Firewall helpers.
+    // `ip` is host-order IPv4 (for consistency with UpstreamTarget::set_addr).
+    bool add_firewall_allow_ip(u32 ip) {
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == ip) return true;
+        }
+        if (firewall_allow_count >= kMaxFirewallRules) return false;
+        firewall_allow_ips[firewall_allow_count++] = ip;
+        return true;
+    }
+    bool add_firewall_allow_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return add_firewall_allow_ip(ip);
+    }
+    bool add_firewall_allow_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return add_firewall_allow_ip(cstr_as_str(ip_lit));
+    }
+    // `ip_network_order` uses in_addr.s_addr/getpeername representation.
+    bool add_firewall_allow_ip_network_order(u32 ip_network_order) {
+        return add_firewall_allow_ip(ntohl(ip_network_order));
+    }
+    bool remove_firewall_allow_ip(u32 ip) {
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] != ip) continue;
+            for (u32 j = i + 1; j < firewall_allow_count; j++)
+                firewall_allow_ips[j - 1] = firewall_allow_ips[j];
+            firewall_allow_ips[firewall_allow_count - 1] = 0;
+            firewall_allow_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_allow_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return remove_firewall_allow_ip(ip);
+    }
+    bool remove_firewall_allow_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return remove_firewall_allow_ip(cstr_as_str(ip_lit));
+    }
+    bool remove_firewall_allow_ip_network_order(u32 ip_network_order) {
+        return remove_firewall_allow_ip(ntohl(ip_network_order));
+    }
+    bool add_firewall_deny_ip(u32 ip) {
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == ip) return true;
+        }
+        if (firewall_deny_count >= kMaxFirewallRules) return false;
+        firewall_deny_ips[firewall_deny_count++] = ip;
+        return true;
+    }
+    bool add_firewall_deny_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return add_firewall_deny_ip(ip);
+    }
+    bool add_firewall_deny_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return add_firewall_deny_ip(cstr_as_str(ip_lit));
+    }
+    bool add_firewall_deny_ip_network_order(u32 ip_network_order) {
+        return add_firewall_deny_ip(ntohl(ip_network_order));
+    }
+    bool remove_firewall_deny_ip(u32 ip) {
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] != ip) continue;
+            for (u32 j = i + 1; j < firewall_deny_count; j++)
+                firewall_deny_ips[j - 1] = firewall_deny_ips[j];
+            firewall_deny_ips[firewall_deny_count - 1] = 0;
+            firewall_deny_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_deny_ip(Str ip_lit) {
+        u32 ip = 0;
+        if (!parse_ipv4_dotted(ip_lit, ip)) return false;
+        return remove_firewall_deny_ip(ip);
+    }
+    bool remove_firewall_deny_ip(const char* ip_lit) {
+        if (!ip_lit) return false;
+        return remove_firewall_deny_ip(cstr_as_str(ip_lit));
+    }
+    bool remove_firewall_deny_ip_network_order(u32 ip_network_order) {
+        return remove_firewall_deny_ip(ntohl(ip_network_order));
+    }
+    bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if (r.net_addr == net_addr && r.mask == mask) return true;
+        }
+        if (firewall_allow_cidr_count >= kMaxFirewallRules) return false;
+        firewall_allow_cidrs[firewall_allow_cidr_count++] = {net_addr, mask};
+        return true;
+    }
+    bool add_firewall_allow_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return add_firewall_allow_cidr(ip, prefix_len);
+    }
+    bool add_firewall_allow_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return add_firewall_allow_cidr(cstr_as_str(cidr_lit));
+    }
+    bool add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return add_firewall_allow_cidr(ntohl(ip_network_order), prefix_len);
+    }
+    bool remove_firewall_allow_cidr(u32 ip, u8 prefix_len) {
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if (r.net_addr != net_addr || r.mask != mask) continue;
+            for (u32 j = i + 1; j < firewall_allow_cidr_count; j++)
+                firewall_allow_cidrs[j - 1] = firewall_allow_cidrs[j];
+            firewall_allow_cidrs[firewall_allow_cidr_count - 1] = {0, 0};
+            firewall_allow_cidr_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_allow_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return remove_firewall_allow_cidr(ip, prefix_len);
+    }
+    bool remove_firewall_allow_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return remove_firewall_allow_cidr(cstr_as_str(cidr_lit));
+    }
+    bool remove_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return remove_firewall_allow_cidr(ntohl(ip_network_order), prefix_len);
+    }
+    bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if (r.net_addr == net_addr && r.mask == mask) return true;
+        }
+        if (firewall_deny_cidr_count >= kMaxFirewallRules) return false;
+        firewall_deny_cidrs[firewall_deny_cidr_count++] = {net_addr, mask};
+        return true;
+    }
+    bool add_firewall_deny_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return add_firewall_deny_cidr(ip, prefix_len);
+    }
+    bool add_firewall_deny_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return add_firewall_deny_cidr(cstr_as_str(cidr_lit));
+    }
+    bool add_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return add_firewall_deny_cidr(ntohl(ip_network_order), prefix_len);
+    }
+    bool remove_firewall_deny_cidr(u32 ip, u8 prefix_len) {
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if (r.net_addr != net_addr || r.mask != mask) continue;
+            for (u32 j = i + 1; j < firewall_deny_cidr_count; j++)
+                firewall_deny_cidrs[j - 1] = firewall_deny_cidrs[j];
+            firewall_deny_cidrs[firewall_deny_cidr_count - 1] = {0, 0};
+            firewall_deny_cidr_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_deny_cidr(Str cidr_lit) {
+        u32 ip = 0;
+        u8 prefix_len = 0;
+        if (!parse_ipv4_cidr(cidr_lit, ip, prefix_len)) return false;
+        return remove_firewall_deny_cidr(ip, prefix_len);
+    }
+    bool remove_firewall_deny_cidr(const char* cidr_lit) {
+        if (!cidr_lit) return false;
+        return remove_firewall_deny_cidr(cstr_as_str(cidr_lit));
+    }
+    bool remove_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
+        return remove_firewall_deny_cidr(ntohl(ip_network_order), prefix_len);
+    }
+    void clear_firewall_rules() {
+        for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
+        for (u32 i = 0; i < firewall_deny_count; i++) firewall_deny_ips[i] = 0;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) firewall_allow_cidrs[i] = {0, 0};
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) firewall_deny_cidrs[i] = {0, 0};
+        firewall_allow_count = 0;
+        firewall_deny_count = 0;
+        firewall_allow_cidr_count = 0;
+        firewall_deny_cidr_count = 0;
+    }
+
+    // `peer_addr` must be in network byte order (same as getpeername()).
+    // It is converted to packed host-order u32 before matching:
+    //   (a << 24) | (b << 16) | (c << 8) | d
+    bool firewall_allows_peer(u32 peer_addr) const {
+        const u32 peer_host = ntohl(peer_addr);
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == peer_host) return false;
+        }
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return false;
+        }
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return true;
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == peer_host) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return true;
+        }
+        return false;
+    }
+    // Convenience overload for host-order IPv4 callers.
+    bool firewall_allows_peer_host(u32 peer_host_addr) const {
+        return firewall_allows_peer(htonl(peer_host_addr));
+    }
+
+private:
+    static Str cstr_as_str(const char* s) {
+        u32 len = 0;
+        while (s[len]) len++;
+        return {s, len};
+    }
+
+    static bool parse_ipv4_dotted(Str s, u32& out_ip) {
+        u32 octets[4] = {0, 0, 0, 0};
+        u32 octet_idx = 0;
+        u32 digit_count = 0;
+        u32 cur = 0;
+        for (u32 i = 0; i < s.len; i++) {
+            const char c = s.ptr[i];
+            if (c == '.') {
+                if (digit_count == 0 || octet_idx >= 3) return false;
+                octets[octet_idx++] = cur;
+                cur = 0;
+                digit_count = 0;
+                continue;
+            }
+            if (c < '0' || c > '9') return false;
+            cur = cur * 10 + static_cast<u32>(c - '0');
+            if (cur > 255 || ++digit_count > 3) return false;
+        }
+        if (digit_count == 0 || octet_idx != 3) return false;
+        octets[3] = cur;
+        out_ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+        return true;
+    }
+
+    static bool parse_ipv4_cidr(Str s, u32& out_ip, u8& out_prefix_len) {
+        u32 slash_idx = 0xffffffffu;
+        for (u32 i = 0; i < s.len; i++) {
+            if (s.ptr[i] == '/') {
+                if (slash_idx != 0xffffffffu) return false;
+                slash_idx = i;
+            }
+        }
+        if (slash_idx == 0xffffffffu || slash_idx == 0 || slash_idx + 1 >= s.len) return false;
+        if (!parse_ipv4_dotted({s.ptr, slash_idx}, out_ip)) return false;
+        u32 prefix = 0;
+        for (u32 i = slash_idx + 1; i < s.len; i++) {
+            const char c = s.ptr[i];
+            if (c < '0' || c > '9') return false;
+            prefix = prefix * 10 + static_cast<u32>(c - '0');
+            if (prefix > 32) return false;
+        }
+        out_prefix_len = static_cast<u8>(prefix);
+        return true;
+    }
+
+public:
     // Match a request path. Semantics depend on the chosen dispatch
     // (`this->dispatch`), but the default linear-scan dispatch keeps
     // the historical contract: first-match-wins byte-prefix scan,

@@ -225,6 +225,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
+    if (config && !config->firewall_allows_peer(conn.peer_addr)) {
+        conn.state = ConnState::Sending;
+        conn.resp_status = 403;
+        format_static_response(conn, 403, /*keep_alive=*/false);
+        conn.keep_alive = false;
+        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
     const RouteEntry* route = nullptr;
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
