@@ -514,8 +514,12 @@ struct RouteConfig {
     // Firewall helpers.
     // `ip` is host-order IPv4 (for consistency with UpstreamTarget::set_addr).
     bool add_firewall_allow_ip(u32 ip) {
+        const u32 net_ip = __builtin_bswap32(ip);
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == net_ip) return true;
+        }
         if (firewall_allow_count >= kMaxFirewallRules) return false;
-        firewall_allow_ips[firewall_allow_count++] = __builtin_bswap32(ip);
+        firewall_allow_ips[firewall_allow_count++] = net_ip;
         return true;
     }
     bool add_firewall_allow_ip(Str ip_lit) {
@@ -528,8 +532,12 @@ struct RouteConfig {
         return add_firewall_allow_ip(cstr_as_str(ip_lit));
     }
     bool add_firewall_deny_ip(u32 ip) {
+        const u32 net_ip = __builtin_bswap32(ip);
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == net_ip) return true;
+        }
         if (firewall_deny_count >= kMaxFirewallRules) return false;
-        firewall_deny_ips[firewall_deny_count++] = __builtin_bswap32(ip);
+        firewall_deny_ips[firewall_deny_count++] = net_ip;
         return true;
     }
     bool add_firewall_deny_ip(Str ip_lit) {
@@ -542,10 +550,15 @@ struct RouteConfig {
         return add_firewall_deny_ip(cstr_as_str(ip_lit));
     }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
-        if (firewall_allow_cidr_count >= kMaxFirewallRules) return false;
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
-        firewall_allow_cidrs[firewall_allow_cidr_count++] = {ip & mask, mask};
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if (r.net_addr == net_addr && r.mask == mask) return true;
+        }
+        if (firewall_allow_cidr_count >= kMaxFirewallRules) return false;
+        firewall_allow_cidrs[firewall_allow_cidr_count++] = {net_addr, mask};
         return true;
     }
     bool add_firewall_allow_cidr(Str cidr_lit) {
@@ -559,10 +572,15 @@ struct RouteConfig {
         return add_firewall_allow_cidr(cstr_as_str(cidr_lit));
     }
     bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
-        if (firewall_deny_cidr_count >= kMaxFirewallRules) return false;
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
-        firewall_deny_cidrs[firewall_deny_cidr_count++] = {ip & mask, mask};
+        const u32 net_addr = ip & mask;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if (r.net_addr == net_addr && r.mask == mask) return true;
+        }
+        if (firewall_deny_cidr_count >= kMaxFirewallRules) return false;
+        firewall_deny_cidrs[firewall_deny_cidr_count++] = {net_addr, mask};
         return true;
     }
     bool add_firewall_deny_cidr(Str cidr_lit) {

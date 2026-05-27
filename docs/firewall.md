@@ -36,6 +36,8 @@ the runtime converts as needed during firewall evaluation.
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
+Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
+without consuming additional rule slots).
 
 ## Evaluation order
 
