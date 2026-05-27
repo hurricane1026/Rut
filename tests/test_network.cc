@@ -11307,6 +11307,19 @@ TEST(route_coverage, firewall_remove_allow_rules_updates_policy_mode) {
     CHECK(cfg.firewall_allows_peer_host(0xc0a80101));
 }
 
+TEST(route_coverage, firewall_remove_deny_restores_allow_match) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("10.1.2.3"));
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+
+    // Deny takes precedence while present.
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+
+    // Removing deny should expose allow-match again.
+    CHECK(cfg.remove_firewall_deny_ip("10.1.2.3"));
+    CHECK(cfg.firewall_allows_peer_host(0x0a010203));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
