@@ -184,15 +184,23 @@ struct RouteConfig {
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
-    // Firewall rules (IPv4 exact-match, network byte order).
+    // Firewall rules (IPv4 exact-match and CIDR subnet, network byte order).
     // Evaluation order:
     //   1) deny list (if hit => reject)
     //   2) allow list (if non-empty => require hit)
     //   3) default allow
     u32 firewall_allow_ips[kMaxFirewallRules]{};
     u32 firewall_deny_ips[kMaxFirewallRules]{};
+    struct FirewallCidrRule {
+        u32 net_addr;
+        u32 mask;
+    };
+    FirewallCidrRule firewall_allow_cidrs[kMaxFirewallRules]{};
+    FirewallCidrRule firewall_deny_cidrs[kMaxFirewallRules]{};
     u32 firewall_allow_count = 0;
     u32 firewall_deny_count = 0;
+    u32 firewall_allow_cidr_count = 0;
+    u32 firewall_deny_cidr_count = 0;
 
     // Reject route paths that aren't in origin-form. Required by the
     // segment trie (which would otherwise silently mismatch malformed
@@ -511,15 +519,38 @@ struct RouteConfig {
         firewall_deny_ips[firewall_deny_count++] = __builtin_bswap32(ip);
         return true;
     }
+    bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
+        if (firewall_allow_cidr_count >= kMaxFirewallRules) return false;
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        firewall_allow_cidrs[firewall_allow_cidr_count++] = {ip & mask, mask};
+        return true;
+    }
+    bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
+        if (firewall_deny_cidr_count >= kMaxFirewallRules) return false;
+        if (prefix_len > 32) return false;
+        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        firewall_deny_cidrs[firewall_deny_cidr_count++] = {ip & mask, mask};
+        return true;
+    }
 
     // `peer_addr` must be in network byte order (same as getpeername()).
     bool firewall_allows_peer(u32 peer_addr) const {
+        const u32 peer_host = __builtin_bswap32(peer_addr);
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] == peer_addr) return false;
         }
-        if (firewall_allow_count == 0) return true;
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return false;
+        }
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return true;
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] == peer_addr) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return true;
         }
         return false;
     }

@@ -11089,6 +11089,42 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     CHECK_EQ(allowed->resp_status, 200);
 }
 
+TEST(route_coverage, firewall_cidr_allow_and_deny_rules) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/ok", 0, 200));
+    // allow 10.0.0.0/8, deny 10.1.0.0/16
+    REQUIRE(cfg.add_firewall_allow_cidr(0x0a000000, 8));
+    REQUIRE(cfg.add_firewall_deny_cidr(0x0a010000, 16));
+    // direct rule checks (network-order peer values)
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0x0a010203)));  // deny subnet
+    CHECK(cfg.firewall_allows_peer(__builtin_bswap32(0x0a020304)));   // allow subnet
+    CHECK(!cfg.firewall_allows_peer(__builtin_bswap32(0xc0a80102)));  // outside allowlist
+    const RouteConfig* active = &cfg;
+    const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+    IoEvent events[8];
+
+    auto run_one = [&](i32 fd, u32 peer_addr, u16 expected) {
+        SmallLoop loop;
+        loop.setup();
+        loop.config_ptr = &active;
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, fd));
+        auto* c = loop.find_fd(fd);
+        REQUIRE(c != nullptr);
+        c->peer_addr = peer_addr;
+        c->recv_buf.reset();
+        c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+        IoEvent ev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+        loop.backend.inject(ev);
+        u32 n = loop.backend.wait(events, 8);
+        for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+        CHECK_EQ(c->resp_status, expected);
+    };
+
+    run_one(42, __builtin_bswap32(0x0a010203), 403);  // in deny /16
+    run_one(43, __builtin_bswap32(0x0a020304), 200);  // in allow /8
+    run_one(44, __builtin_bswap32(0xc0a80102), 403);  // outside allowlist
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
