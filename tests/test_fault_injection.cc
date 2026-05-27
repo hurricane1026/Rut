@@ -27,6 +27,8 @@ namespace {
 struct timespec* opaque_null_timespec() {
     uintptr_t bits = 0;
 #if defined(__GNUC__) || defined(__clang__)
+    // Prevent compilers from optimizing the nullptr value away before the call site.
+    // This keeps the wrapper under test from relying on compile-time nullness assumptions.
     asm volatile("" : "+r"(bits));
 #endif
     return reinterpret_cast<struct timespec*>(bits);
