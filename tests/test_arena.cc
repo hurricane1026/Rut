@@ -725,6 +725,57 @@ TEST_F(SliceArenaF, reset_then_reuse) {
 
 // --- Tests that need pre-init pool counts or custom pool configs stay as TEST() ---
 
+TEST(slice_arena, init_reports_pool_grow_failure) {
+    SlicePool pool;
+    REQUIRE(pool.init(2, 0).has_value());
+
+    ScopedMemoryFault fault(0, true);
+    SliceArena a;
+    auto rc = a.init(&pool);
+    CHECK(!rc.has_value());
+    CHECK_EQ(rc.error().code, ENOMEM);
+    CHECK(rc.error().source == Error::Source::Arena);
+    CHECK(a.current == nullptr);
+    CHECK_EQ(a.space_allocated(), 0u);
+    CHECK_EQ(pool.count, 0u);
+    CHECK_EQ(pool.available(), 0u);
+
+    pool.destroy();
+}
+
+TEST(slice_arena, overflow_pool_grow_failure_keeps_existing_slice_usable) {
+    SlicePool pool;
+    REQUIRE(pool.init(SlicePool::kGrowStep + 1, 0).has_value());
+
+    SliceArena a;
+    REQUIRE(a.init(&pool).has_value());
+    SliceArena::Block* first = a.current;
+    const u64 initial_allocated = a.space_allocated();
+    const u64 cap = first->capacity();
+
+    for (u32 i = 0; i < SlicePool::kGrowStep; i++) {
+        REQUIRE(a.alloc(cap) != nullptr);
+    }
+    CHECK_EQ(pool.available(), 0u);
+    CHECK_EQ(pool.count, SlicePool::kGrowStep);
+
+    {
+        ScopedMemoryFault fault(0, true);
+        CHECK(a.alloc(64) == nullptr);
+    }
+
+    CHECK_EQ(pool.count, SlicePool::kGrowStep);
+    CHECK_EQ(pool.available(), 0u);
+    CHECK(a.current != nullptr);
+    CHECK_EQ(a.space_allocated(), initial_allocated * SlicePool::kGrowStep);
+    a.reset();
+    CHECK_EQ(a.current, first);
+    CHECK(a.alloc(32) != nullptr);
+
+    a.destroy();
+    pool.destroy();
+}
+
 TEST(slice_arena, reset_returns_slices_to_pool) {
     PoolCtx pc;
     REQUIRE(pc.init());
