@@ -94,6 +94,7 @@ Coverage is in `tests/test_network.cc` under `route_coverage`:
 - `firewall_remove_rejects_missing_or_invalid_rules`
 - `firewall_remove_allow_rules_updates_policy_mode`
 - `firewall_remove_last_allow_keeps_deny_active`
+- `firewall_remove_last_allow_cidr_keeps_deny_cidr_active`
 - `firewall_remove_deny_restores_allow_match`
 
 Integration coverage in `tests/test_integration.cc` includes:
