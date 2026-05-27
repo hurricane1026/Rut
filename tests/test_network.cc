@@ -11125,6 +11125,14 @@ TEST(route_coverage, firewall_cidr_allow_and_deny_rules) {
     run_one(44, __builtin_bswap32(0xc0a80102), 403);  // outside allowlist
 }
 
+TEST(route_coverage, firewall_cidr_rejects_invalid_prefix) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_firewall_allow_cidr(0x0a000000, 33));
+    CHECK(!cfg.add_firewall_deny_cidr(0x0a000000, 33));
+    CHECK(cfg.add_firewall_allow_cidr(0x0a000000, 32));
+    CHECK(cfg.add_firewall_deny_cidr(0x0a000000, 0));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
