@@ -100,6 +100,9 @@ struct RouteConfig {
     // any risk of silent truncation. Must match the buffer size used
     // by handle_jit_outcome in callbacks_impl.h.
     static constexpr u32 kMaxHeadersPerSet = 32;
+    // Firewall IPv4 rule caps. Small fixed arrays keep match checks
+    // branch-predictable and allocation-free on the hot path.
+    static constexpr u32 kMaxFirewallRules = 64;
 
     // Non-copyable: the embedded `trie` stores non-owning Str views
     // pointing into routes[].path. A by-value copy would leave the
@@ -180,6 +183,16 @@ struct RouteConfig {
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Firewall rules (IPv4 exact-match, network byte order).
+    // Evaluation order:
+    //   1) deny list (if hit => reject)
+    //   2) allow list (if non-empty => require hit)
+    //   3) default allow
+    u32 firewall_allow_ips[kMaxFirewallRules]{};
+    u32 firewall_deny_ips[kMaxFirewallRules]{};
+    u32 firewall_allow_count = 0;
+    u32 firewall_deny_count = 0;
 
     // Reject route paths that aren't in origin-form. Required by the
     // segment trie (which would otherwise silently mismatch malformed
@@ -484,6 +497,31 @@ struct RouteConfig {
         upstreams[idx].set_name(name);
         upstreams[idx].set_addr(ip, port);
         return idx;
+    }
+
+    // Firewall helpers.
+    // `ip` is host-order IPv4 (for consistency with UpstreamTarget::set_addr).
+    bool add_firewall_allow_ip(u32 ip) {
+        if (firewall_allow_count >= kMaxFirewallRules) return false;
+        firewall_allow_ips[firewall_allow_count++] = __builtin_bswap32(ip);
+        return true;
+    }
+    bool add_firewall_deny_ip(u32 ip) {
+        if (firewall_deny_count >= kMaxFirewallRules) return false;
+        firewall_deny_ips[firewall_deny_count++] = __builtin_bswap32(ip);
+        return true;
+    }
+
+    // `peer_addr` must be in network byte order (same as getpeername()).
+    bool firewall_allows_peer(u32 peer_addr) const {
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == peer_addr) return false;
+        }
+        if (firewall_allow_count == 0) return true;
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == peer_addr) return true;
+        }
+        return false;
     }
 
     // Match a request path. Semantics depend on the chosen dispatch

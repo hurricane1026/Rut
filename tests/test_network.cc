@@ -11022,6 +11022,73 @@ TEST(route_coverage, with_metrics_and_access_log) {
     CHECK_EQ(log_ring.available(), 1u);
 }
 
+TEST(route_coverage, firewall_deny_rule_returns_403) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/ok", 0, 200));
+    REQUIRE(cfg.add_firewall_deny_ip(0x7f000001));  // 127.0.0.1
+    const RouteConfig* active = &cfg;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->peer_addr = __builtin_bswap32(0x7f000001);
+    c->recv_buf.reset();
+    const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->resp_status, 403);
+    CHECK(!c->keep_alive);
+}
+
+TEST(route_coverage, firewall_allowlist_blocks_non_members) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/ok", 0, 200));
+    REQUIRE(cfg.add_firewall_allow_ip(0x7f000001));  // 127.0.0.1
+    const RouteConfig* active = &cfg;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    // non-member IP => forbidden
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* blocked = loop.find_fd(42);
+    REQUIRE(blocked != nullptr);
+    blocked->peer_addr = __builtin_bswap32(0x0a000001);  // 10.0.0.1
+    blocked->recv_buf.reset();
+    const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+    blocked->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent blocked_ev = {
+        blocked->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(blocked_ev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(blocked->resp_status, 403);
+
+    // member IP => route dispatch works
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* allowed = loop.find_fd(43);
+    REQUIRE(allowed != nullptr);
+    allowed->peer_addr = __builtin_bswap32(0x7f000001);  // 127.0.0.1
+    allowed->recv_buf.reset();
+    allowed->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent allowed_ev = {
+        allowed->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(allowed_ev);
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(allowed->resp_status, 200);
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
