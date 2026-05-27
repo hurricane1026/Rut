@@ -543,6 +543,10 @@ struct RouteConfig {
             firewall_allow_count--;
             return true;
         }
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return true;
+        }
         return false;
     }
     bool remove_firewall_allow_ip(Str ip_lit) {
