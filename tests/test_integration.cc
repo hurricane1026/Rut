@@ -2585,6 +2585,91 @@ TEST(route, firewall_allowlist_range_localhost_real_socket) {
     destroy_real_loop(loop);
 }
 
+TEST(route, firewall_deny_localhost_source_port_real_socket) {
+    const i32 client_port = reserve_local_port();
+    REQUIRE_GT(client_port, 0);
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/health", 0, 200));
+    REQUIRE(cfg.add_firewall_deny_port(static_cast<u16>(client_port)));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 c = connect_to_from_port(port, static_cast<u16>(client_port));
+    REQUIRE(c >= 0);
+    send_all(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 500);
+    CHECK_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "HTTP/1.1 403 Forbidden", 22));
+    close(c);
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
+TEST(route, firewall_allowlist_source_port_real_socket) {
+    const i32 blocked_port = reserve_local_port();
+    REQUIRE_GT(blocked_port, 0);
+    i32 allowed_port = reserve_local_port();
+    for (i32 attempt = 0; attempt < 5 && allowed_port == blocked_port; attempt++) {
+        allowed_port = reserve_local_port();
+    }
+    REQUIRE_GT(allowed_port, 0);
+    REQUIRE_NE(blocked_port, allowed_port);
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/health", 0, 200));
+    REQUIRE(cfg.add_firewall_allow_port(static_cast<u16>(allowed_port)));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
+
+    i32 blocked = connect_to_from_port(port, static_cast<u16>(blocked_port));
+    REQUIRE(blocked >= 0);
+    send_all(blocked, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char blocked_buf[1024];
+    i32 blocked_n = recv_timeout(blocked, blocked_buf, sizeof(blocked_buf), 500);
+    CHECK_GT(blocked_n, 0);
+    CHECK(buf_contains(blocked_buf, static_cast<u32>(blocked_n), "HTTP/1.1 403 Forbidden", 22));
+    close(blocked);
+
+    i32 allowed = connect_to_from_port(port, static_cast<u16>(allowed_port));
+    REQUIRE(allowed >= 0);
+    send_all(allowed, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
+    char allowed_buf[1024];
+    i32 allowed_n = recv_timeout(allowed, allowed_buf, sizeof(allowed_buf), 500);
+    CHECK_GT(allowed_n, 0);
+    CHECK(buf_contains(allowed_buf, static_cast<u32>(allowed_n), "HTTP/1.1 200 OK", 15));
+    close(allowed);
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 TEST(route, firewall_clear_rules_reenables_localhost_real_socket) {
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/health", 0, 200));
