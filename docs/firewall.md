@@ -115,6 +115,7 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 
 - `firewall_deny_rule_returns_403`
 - `firewall_allowlist_blocks_non_members`
+- `firewall_port_rejects_in_request_path`
 - `firewall_cidr_allow_and_deny_rules`
 - `firewall_string_ip_and_cidr_helpers`
 - `firewall_exact_ip_rules_use_host_order_storage`
@@ -127,6 +128,8 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_remove_last_allow_keeps_deny_active`
 - `firewall_remove_last_allow_cidr_keeps_deny_cidr_active`
 - `firewall_remove_deny_restores_allow_match`
+- `firewall_port_allow_and_deny_rules`
+- `firewall_port_rule_remove_and_clear`
 - `firewall_default_deny_requires_explicit_allow`
 
 Current integration coverage in `tests/test_integration.cc` includes:
@@ -140,6 +143,8 @@ Current integration coverage in `tests/test_integration.cc` includes:
 - `firewall_deny_cidr_over_allow_exact_real_socket`
 - `firewall_allowlist_cidr_localhost_real_socket`
 - `firewall_allowlist_network_order_cidr_localhost_real_socket`
+- `firewall_deny_localhost_source_port_real_socket`
+- `firewall_allowlist_source_port_real_socket`
 - `firewall_clear_rules_reenables_localhost_real_socket`
 - `firewall_remove_deny_rule_reenables_localhost_real_socket`
 - `firewall_remove_deny_cidr_reenables_localhost_real_socket`
