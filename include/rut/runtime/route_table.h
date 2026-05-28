@@ -812,7 +812,9 @@ struct RouteConfig {
     void set_firewall_default_deny() { firewall_default_allow = false; }
     bool firewall_default_is_allow() const { return firewall_default_allow; }
 
-    FirewallDecision firewall_decision_impl(u32 peer_host, bool use_port_rules, u16 peer_port) const {
+    FirewallDecision firewall_decision_impl(u32 peer_host,
+                                            bool use_port_rules,
+                                            u16 peer_port) const {
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] == peer_host) return FirewallDecision::DenyDenyIp;
         }
@@ -825,9 +827,8 @@ struct RouteConfig {
                 if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DenyDenyPort;
             }
         }
-        const bool has_allow_rules =
-            firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
-            (use_port_rules && firewall_allow_port_count > 0);
+        const bool has_allow_rules = firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
+                                     (use_port_rules && firewall_allow_port_count > 0);
         if (!has_allow_rules) {
             return firewall_default_allow ? FirewallDecision::AllowDefault
                                           : FirewallDecision::DenyMissingAllowMatch;

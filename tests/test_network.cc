@@ -11406,8 +11406,7 @@ TEST(route_coverage, firewall_decision_host_helpers) {
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
     REQUIRE(cfg.add_firewall_deny_port(22));
 
-    CHECK_EQ(cfg.firewall_decision_host(0x0a010203),
-             RouteConfig::FirewallDecision::AllowAllowCidr);
+    CHECK_EQ(cfg.firewall_decision_host(0x0a010203), RouteConfig::FirewallDecision::AllowAllowCidr);
     CHECK_EQ(cfg.firewall_decision_host(0x0a010203, 22),
              RouteConfig::FirewallDecision::DenyDenyPort);
 }
