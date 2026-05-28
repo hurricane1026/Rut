@@ -11,9 +11,11 @@ connections.
 - Exact IP rules
 - CIDR subnet rules
 - Inclusive IP range rules
+- Source port rules
 - Allowlist + denylist precedence
 
-Rules are evaluated from `Connection.peer_addr` captured at accept-time.
+Rules are evaluated from `Connection.peer_addr` and `Connection.peer_port`
+captured at accept-time.
 For host-order callers, `firewall_allows_peer_host(u32)` is also available.
 
 ## APIs
@@ -26,12 +28,16 @@ Defined on `RouteConfig`:
 - `add_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
 - `add_firewall_allow_range(u32 start_ip_host_order, u32 end_ip_host_order)`
 - `add_firewall_deny_range(u32 start_ip_host_order, u32 end_ip_host_order)`
+- `add_firewall_allow_port(u16 peer_port_host_order)`
+- `add_firewall_deny_port(u16 peer_port_host_order)`
 - `remove_firewall_allow_ip(u32 ip_host_order)`
 - `remove_firewall_deny_ip(u32 ip_host_order)`
 - `remove_firewall_allow_cidr(u32 ip_host_order, u8 prefix_len)`
 - `remove_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
 - `remove_firewall_allow_range(u32 start_ip_host_order, u32 end_ip_host_order)`
 - `remove_firewall_deny_range(u32 start_ip_host_order, u32 end_ip_host_order)`
+- `remove_firewall_allow_port(u16 peer_port_host_order)`
+- `remove_firewall_deny_port(u16 peer_port_host_order)`
 - `add_firewall_allow_ip_network_order(u32 ip_network_order)`
 - `add_firewall_deny_ip_network_order(u32 ip_network_order)`
 - `add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
@@ -78,10 +84,11 @@ Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
+Port rules reject `0` (invalid TCP/UDP port).
 Remove APIs return `true` only when a matching rule exists and is deleted.
-`clear_firewall_allow_rules()` clears allow exact-IP, CIDR, and range tables.
-`clear_firewall_deny_rules()` clears deny exact-IP, CIDR, and range tables.
-`clear_firewall_rules()` clears all allow/deny exact, CIDR, and range rules.
+`clear_firewall_allow_rules()` clears allow exact-IP, CIDR, range, and port tables.
+`clear_firewall_deny_rules()` clears deny exact-IP, CIDR, range, and port tables.
+`clear_firewall_rules()` clears all allow/deny exact, CIDR, range, and port rules.
 Default policy is allow unless changed via `set_firewall_default_allow(false)`
 or `set_firewall_default_deny()`.
 
@@ -92,10 +99,14 @@ For each request:
 1. Any deny IP match => reject
 2. Any deny CIDR match => reject
 3. Any deny range match => reject
-4. If no allow rules exist => apply default policy (allow by default)
-5. Otherwise require allow IP, allow CIDR, or allow range match
+4. Any deny port match => reject
+5. If no allow rules exist => apply default policy (allow by default)
+6. Otherwise require allow IP, allow CIDR, allow range, or allow port match
 
 In other words, deny rules always win over allow rules.
+Allow-match semantics are OR across categories: if any allow IP, allow CIDR,
+allow range, or allow port rule matches, the request is allowed (unless denied
+earlier).
 
 ## Runtime behavior on reject
 

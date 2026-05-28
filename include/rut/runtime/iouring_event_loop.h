@@ -645,6 +645,7 @@ private:
         if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
             peer.sin_family == AF_INET) {
             c->peer_addr = peer.sin_addr.s_addr;
+            c->peer_port = ntohs(peer.sin_port);
         }
         c->state = ConnState::ReadingHeader;
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
@@ -668,6 +669,7 @@ private:
             if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
                 peer.sin_family == AF_INET) {
                 c->peer_addr = peer.sin_addr.s_addr;
+                c->peer_port = ntohs(peer.sin_port);
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);

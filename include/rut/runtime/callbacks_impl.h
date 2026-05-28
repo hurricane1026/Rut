@@ -225,7 +225,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
-    if (config && !config->firewall_allows_peer(conn.peer_addr)) {
+    if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
         conn.state = ConnState::Sending;
         conn.resp_status = 403;
         format_static_response(conn, 403, /*keep_alive=*/false);

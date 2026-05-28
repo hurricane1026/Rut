@@ -194,6 +194,8 @@ struct RouteConfig {
     //   3) default allow
     u32 firewall_allow_ips[kMaxFirewallRules]{};
     u32 firewall_deny_ips[kMaxFirewallRules]{};
+    u16 firewall_allow_ports[kMaxFirewallRules]{};
+    u16 firewall_deny_ports[kMaxFirewallRules]{};
     struct FirewallCidrRule {
         u32 net_addr;
         u32 mask;
@@ -212,6 +214,8 @@ struct RouteConfig {
     u32 firewall_deny_cidr_count = 0;
     u32 firewall_allow_range_count = 0;
     u32 firewall_deny_range_count = 0;
+    u32 firewall_allow_port_count = 0;
+    u32 firewall_deny_port_count = 0;
     bool firewall_default_allow = true;
 
     // Reject route paths that aren't in origin-form. Required by the
@@ -608,6 +612,46 @@ struct RouteConfig {
     bool remove_firewall_deny_ip_network_order(u32 ip_network_order) {
         return remove_firewall_deny_ip(ntohl(ip_network_order));
     }
+    bool add_firewall_allow_port(u16 port) {
+        if (port == 0) return false;
+        for (u32 i = 0; i < firewall_allow_port_count; i++) {
+            if (firewall_allow_ports[i] == port) return true;
+        }
+        if (firewall_allow_port_count >= kMaxFirewallRules) return false;
+        firewall_allow_ports[firewall_allow_port_count++] = port;
+        return true;
+    }
+    bool remove_firewall_allow_port(u16 port) {
+        for (u32 i = 0; i < firewall_allow_port_count; i++) {
+            if (firewall_allow_ports[i] != port) continue;
+            for (u32 j = i + 1; j < firewall_allow_port_count; j++)
+                firewall_allow_ports[j - 1] = firewall_allow_ports[j];
+            firewall_allow_ports[firewall_allow_port_count - 1] = 0;
+            firewall_allow_port_count--;
+            return true;
+        }
+        return false;
+    }
+    bool add_firewall_deny_port(u16 port) {
+        if (port == 0) return false;
+        for (u32 i = 0; i < firewall_deny_port_count; i++) {
+            if (firewall_deny_ports[i] == port) return true;
+        }
+        if (firewall_deny_port_count >= kMaxFirewallRules) return false;
+        firewall_deny_ports[firewall_deny_port_count++] = port;
+        return true;
+    }
+    bool remove_firewall_deny_port(u16 port) {
+        for (u32 i = 0; i < firewall_deny_port_count; i++) {
+            if (firewall_deny_ports[i] != port) continue;
+            for (u32 j = i + 1; j < firewall_deny_port_count; j++)
+                firewall_deny_ports[j - 1] = firewall_deny_ports[j];
+            firewall_deny_ports[firewall_deny_port_count - 1] = 0;
+            firewall_deny_port_count--;
+            return true;
+        }
+        return false;
+    }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
@@ -822,17 +866,21 @@ struct RouteConfig {
         for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) firewall_allow_cidrs[i] = {0, 0};
         for (u32 i = 0; i < firewall_allow_range_count; i++) firewall_allow_ranges[i] = {0, 0};
+        for (u32 i = 0; i < firewall_allow_port_count; i++) firewall_allow_ports[i] = 0;
         firewall_allow_count = 0;
         firewall_allow_cidr_count = 0;
         firewall_allow_range_count = 0;
+        firewall_allow_port_count = 0;
     }
     void clear_firewall_deny_rules() {
         for (u32 i = 0; i < firewall_deny_count; i++) firewall_deny_ips[i] = 0;
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) firewall_deny_cidrs[i] = {0, 0};
         for (u32 i = 0; i < firewall_deny_range_count; i++) firewall_deny_ranges[i] = {0, 0};
+        for (u32 i = 0; i < firewall_deny_port_count; i++) firewall_deny_ports[i] = 0;
         firewall_deny_count = 0;
         firewall_deny_cidr_count = 0;
         firewall_deny_range_count = 0;
+        firewall_deny_port_count = 0;
     }
     void clear_firewall_rules() {
         clear_firewall_allow_rules();
@@ -874,9 +922,48 @@ struct RouteConfig {
         }
         return false;
     }
+    bool firewall_allows_peer(u32 peer_addr, u16 peer_port) const {
+        const u32 peer_host = ntohl(peer_addr);
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == peer_host) return false;
+        }
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return false;
+        }
+        for (u32 i = 0; i < firewall_deny_range_count; i++) {
+            const auto& r = firewall_deny_ranges[i];
+            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return false;
+        }
+        for (u32 i = 0; i < firewall_deny_port_count; i++) {
+            if (firewall_deny_ports[i] == peer_port) return false;
+        }
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0 &&
+            firewall_allow_range_count == 0 &&
+            firewall_allow_port_count == 0)
+            return firewall_default_allow;
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == peer_host) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_range_count; i++) {
+            const auto& r = firewall_allow_ranges[i];
+            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_port_count; i++) {
+            if (firewall_allow_ports[i] == peer_port) return true;
+        }
+        return false;
+    }
     // Convenience overload for host-order IPv4 callers.
     bool firewall_allows_peer_host(u32 peer_host_addr) const {
         return firewall_allows_peer(htonl(peer_host_addr));
+    }
+    bool firewall_allows_peer_host(u32 peer_host_addr, u16 peer_port) const {
+        return firewall_allows_peer(htonl(peer_host_addr), peer_port);
     }
 
 private:
