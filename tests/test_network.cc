@@ -11362,7 +11362,6 @@ TEST(route_coverage, firewall_one_arg_allows_peer_ignores_port_rules) {
     REQUIRE(cfg.add_firewall_deny_ip("127.0.0.1"));
     CHECK(!cfg.firewall_allows_peer(htonl(0x7f000001)));
 }
-
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));

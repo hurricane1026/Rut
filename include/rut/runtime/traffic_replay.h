@@ -146,6 +146,8 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     }
     if (!conn) return result;
 
+    conn->peer_port = entry.peer_port;
+
     // Step 2: Write raw headers into recv_buf
     conn->recv_buf.reset();
     u32 hdr_len = entry.raw_header_len;

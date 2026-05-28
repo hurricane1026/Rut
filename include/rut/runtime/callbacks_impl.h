@@ -147,6 +147,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         cap.raw_header_len = conn.capture_header_len;
         cap.method = conn.req_method;
         cap.shard_id = conn.shard_id;
+        cap.peer_port = conn.peer_port;
         cap.flags =
             (conn.capture_header_len == CaptureEntry::kMaxHeaderLen) ? kCaptureFlagTruncated : 0;
         constexpr u32 kCopyLen = sizeof(conn.upstream_name) < sizeof(cap.upstream_name)

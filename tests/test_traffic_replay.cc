@@ -431,6 +431,30 @@ TEST(route, static_404) {
     CHECK(result.status_match);
 }
 
+TEST(route, firewall_source_port_replay_uses_entry_port) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/health", 0, 200));
+    REQUIRE(cfg.add_firewall_deny_port(5555));
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry blocked = make_captured_request("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 403);
+    blocked.peer_port = 5555;
+    CaptureEntry allowed = make_captured_request("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    allowed.peer_port = 6000;
+
+    ReplayResult blocked_result = replay_one(rl.loop, blocked, 42);
+    CHECK(blocked_result.replayed);
+    CHECK(blocked_result.status_match);
+    CHECK_EQ(blocked_result.actual_status, 403);
+
+    ReplayResult allowed_result = replay_one(rl.loop, allowed, 43);
+    CHECK(allowed_result.replayed);
+    CHECK(allowed_result.status_match);
+    CHECK_EQ(allowed_result.actual_status, 200);
+}
+
 TEST(route, no_match_default_200) {
     RouteConfig cfg;
     cfg.add_static("/api", 'G', 200);

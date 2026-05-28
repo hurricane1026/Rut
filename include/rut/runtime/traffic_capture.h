@@ -25,10 +25,11 @@ struct CaptureEntry {
     u16 raw_header_len;       // 2  — actual bytes in raw_headers[]
     u8 method;                // 1  — LogHttpMethod enum
     u8 shard_id;              // 1  — which shard captured this
+    u16 peer_port;            // 2  — source port observed at capture time (host order)
     u8 flags;                 // 1  — reserved (truncated, etc.)
     u8 _pad;                  // 1  — alignment
     char upstream_name[32];   // 32 — upstream target name (null-terminated)
-    u8 _reserved[8];          // 8  — future use
+    u8 _reserved[6];          // 6  — future use
     // Total metadata: 64 bytes
 
     // --- Raw request headers (method line + headers + \r\n\r\n) ---
