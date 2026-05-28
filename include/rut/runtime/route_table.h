@@ -835,6 +835,12 @@ struct RouteConfig {
         }
         return FirewallDecision::DenyMissingAllowMatch;
     }
+    FirewallDecision firewall_decision_host(u32 peer_host_addr) const {
+        return firewall_decision(htonl(peer_host_addr));
+    }
+    FirewallDecision firewall_decision_host(u32 peer_host_addr, u16 peer_port) const {
+        return firewall_decision(htonl(peer_host_addr), peer_port);
+    }
 
     // `peer_addr` must be in network byte order (same as getpeername()).
     // It is converted to packed host-order u32 before matching:

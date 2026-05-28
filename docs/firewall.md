@@ -56,6 +56,8 @@ Defined on `RouteConfig`:
 - `firewall_default_is_allow()`
 - `firewall_decision(u32 peer_addr_network_order)`
 - `firewall_decision(u32 peer_addr_network_order, u16 peer_port_host_order)`
+- `firewall_decision_host(u32 peer_addr_host_order)`
+- `firewall_decision_host(u32 peer_addr_host_order, u16 peer_port_host_order)`
 - `clear_firewall_rules()`
 
 All `u32` IPv4 arguments are packed host-order values in the form
@@ -143,6 +145,7 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_port_rule_remove_and_clear`
 - `firewall_decision_reports_precedence_reason`
 - `firewall_decision_reports_allow_reason_and_default_deny`
+- `firewall_decision_host_helpers`
 - `firewall_default_deny_requires_explicit_allow`
 
 Current integration coverage in `tests/test_integration.cc` includes:
