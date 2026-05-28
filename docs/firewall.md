@@ -152,6 +152,7 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_decision_reports_allow_reason_and_default_deny`
 - `firewall_decision_host_helpers`
 - `firewall_decision_allow_deny_classification_helpers`
+- `firewall_decision_name_helper`
 - `firewall_default_deny_requires_explicit_allow`
 
 Current integration coverage in `tests/test_integration.cc` includes:

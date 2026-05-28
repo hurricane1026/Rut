@@ -11428,6 +11428,19 @@ TEST(route_coverage, firewall_decision_allow_deny_classification_helpers) {
     CHECK(RouteConfig::firewall_decision_is_deny(D::DenyMissingAllowMatch));
 }
 
+TEST(route_coverage, firewall_decision_name_helper) {
+    using D = RouteConfig::FirewallDecision;
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowDefault), "allow_default");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowIp), "allow_allow_ip");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowCidr), "allow_allow_cidr");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowPort), "allow_allow_port");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyIp), "deny_deny_ip");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyCidr), "deny_deny_cidr");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyPort), "deny_deny_port");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyMissingAllowMatch),
+                "deny_missing_allow_match");
+}
+
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));

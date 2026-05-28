@@ -217,6 +217,27 @@ struct RouteConfig {
     static bool firewall_decision_is_deny(FirewallDecision d) {
         return !firewall_decision_is_allow(d);
     }
+    static const char* firewall_decision_name(FirewallDecision d) {
+        switch (d) {
+            case FirewallDecision::AllowDefault:
+                return "allow_default";
+            case FirewallDecision::AllowAllowIp:
+                return "allow_allow_ip";
+            case FirewallDecision::AllowAllowCidr:
+                return "allow_allow_cidr";
+            case FirewallDecision::AllowAllowPort:
+                return "allow_allow_port";
+            case FirewallDecision::DenyDenyIp:
+                return "deny_deny_ip";
+            case FirewallDecision::DenyDenyCidr:
+                return "deny_deny_cidr";
+            case FirewallDecision::DenyDenyPort:
+                return "deny_deny_port";
+            case FirewallDecision::DenyMissingAllowMatch:
+                return "deny_missing_allow_match";
+        }
+        return "unknown";
+    }
     FirewallCidrRule firewall_allow_cidrs[kMaxFirewallRules]{};
     FirewallCidrRule firewall_deny_cidrs[kMaxFirewallRules]{};
     u32 firewall_allow_count = 0;
