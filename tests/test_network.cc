@@ -11343,6 +11343,26 @@ TEST(route_coverage, firewall_port_rule_remove_and_clear) {
     CHECK_EQ(cfg.firewall_deny_port_count, 0u);
 }
 
+TEST(route_coverage, firewall_port_rules_reject_zero_port) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_firewall_allow_port(0));
+    CHECK(!cfg.add_firewall_deny_port(0));
+    CHECK_EQ(cfg.firewall_allow_port_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_port_count, 0u);
+}
+
+TEST(route_coverage, firewall_one_arg_allows_peer_ignores_port_rules) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_port(443));
+    REQUIRE(cfg.add_firewall_deny_port(22));
+
+    // Legacy one-arg overload should keep its old address-only behavior.
+    CHECK(cfg.firewall_allows_peer(htonl(0x7f000001)));
+
+    REQUIRE(cfg.add_firewall_deny_ip("127.0.0.1"));
+    CHECK(!cfg.firewall_allows_peer(htonl(0x7f000001)));
+}
+
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
