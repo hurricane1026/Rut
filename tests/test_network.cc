@@ -11117,6 +11117,32 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     CHECK_EQ(allowed->resp_status, 200);
 }
 
+TEST(route_coverage, firewall_port_rejects_in_request_path) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/ok", 0, 200));
+    REQUIRE(cfg.add_firewall_deny_port(5555));
+    const RouteConfig* active = &cfg;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->peer_addr = htonl(0x7f000001);
+    c->peer_port = 5555;
+    c->recv_buf.reset();
+    const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
+    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    loop.backend.inject(rev);
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK_EQ(c->resp_status, 403);
+}
+
 TEST(route_coverage, firewall_cidr_allow_and_deny_rules) {
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/ok", 0, 200));
@@ -11280,6 +11306,41 @@ TEST(route_coverage, firewall_deny_precedence_over_allow) {
     REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
     CHECK(!cfg.firewall_allows_peer(htonl(0x0a010203)));
     CHECK(cfg.firewall_allows_peer(htonl(0x0a020304)));
+}
+
+TEST(route_coverage, firewall_port_allow_and_deny_rules) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_port(443));
+    REQUIRE(cfg.add_firewall_deny_port(22));
+
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001, 443));
+    CHECK(!cfg.firewall_allows_peer_host(0x7f000001, 22));
+    CHECK(!cfg.firewall_allows_peer_host(0x7f000001, 8080));
+
+    // Deny precedence over allow for same port.
+    REQUIRE(cfg.add_firewall_allow_port(22));
+    CHECK(!cfg.firewall_allows_peer_host(0x7f000001, 22));
+}
+
+TEST(route_coverage, firewall_port_rule_remove_and_clear) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_port(8080));
+    REQUIRE(cfg.add_firewall_deny_port(9000));
+
+    CHECK(cfg.remove_firewall_allow_port(8080));
+    CHECK(cfg.remove_firewall_deny_port(9000));
+    CHECK(!cfg.remove_firewall_allow_port(8080));
+    CHECK(!cfg.remove_firewall_deny_port(9000));
+
+    CHECK_EQ(cfg.firewall_allow_port_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_port_count, 0u);
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001, 8080));
+
+    REQUIRE(cfg.add_firewall_allow_port(1234));
+    REQUIRE(cfg.add_firewall_deny_port(4321));
+    cfg.clear_firewall_rules();
+    CHECK_EQ(cfg.firewall_allow_port_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_port_count, 0u);
 }
 
 TEST(route_coverage, firewall_allows_peer_host_helper) {

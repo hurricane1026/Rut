@@ -182,6 +182,7 @@ struct ConnectionBase {
     u8 req_method;
     u32 req_size;
     u32 peer_addr;
+    u16 peer_port;
     char req_path[kMaxReqPathLen];
     // View into req_path covering the canonical-for-routing path slice
     // (leading '/' stripped, trailing '/' run trimmed, bytes after first
@@ -290,6 +291,7 @@ struct ConnectionBase {
         req_method = 0;
         req_size = 0;
         peer_addr = 0;
+        peer_port = 0;
         req_path[0] = '\0';
         req_path_canon = {nullptr, 0};
         upstream_us = 0;
