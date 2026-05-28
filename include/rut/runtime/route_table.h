@@ -210,6 +210,13 @@ struct RouteConfig {
         DenyDenyPort = 6,
         DenyMissingAllowMatch = 7,
     };
+    static bool firewall_decision_is_allow(FirewallDecision d) {
+        return d == FirewallDecision::AllowDefault || d == FirewallDecision::AllowAllowIp ||
+               d == FirewallDecision::AllowAllowCidr || d == FirewallDecision::AllowAllowPort;
+    }
+    static bool firewall_decision_is_deny(FirewallDecision d) {
+        return !firewall_decision_is_allow(d);
+    }
     FirewallCidrRule firewall_allow_cidrs[kMaxFirewallRules]{};
     FirewallCidrRule firewall_deny_cidrs[kMaxFirewallRules]{};
     u32 firewall_allow_count = 0;
@@ -847,13 +854,11 @@ struct RouteConfig {
     //   (a << 24) | (b << 16) | (c << 8) | d
     bool firewall_allows_peer(u32 peer_addr) const {
         const FirewallDecision d = firewall_decision(peer_addr);
-        return d == FirewallDecision::AllowDefault || d == FirewallDecision::AllowAllowIp ||
-               d == FirewallDecision::AllowAllowCidr;
+        return firewall_decision_is_allow(d);
     }
     bool firewall_allows_peer(u32 peer_addr, u16 peer_port) const {
         const FirewallDecision d = firewall_decision(peer_addr, peer_port);
-        return d == FirewallDecision::AllowDefault || d == FirewallDecision::AllowAllowIp ||
-               d == FirewallDecision::AllowAllowCidr || d == FirewallDecision::AllowAllowPort;
+        return firewall_decision_is_allow(d);
     }
     // Convenience overload for host-order IPv4 callers.
     bool firewall_allows_peer_host(u32 peer_host_addr) const {

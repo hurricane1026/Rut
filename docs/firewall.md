@@ -102,6 +102,11 @@ allow port rule matches, the request is allowed (unless denied earlier).
 - allow: `AllowDefault`, `AllowAllowIp`, `AllowAllowCidr`, `AllowAllowPort`
 - deny: `DenyDenyIp`, `DenyDenyCidr`, `DenyDenyPort`, `DenyMissingAllowMatch`
 
+For callers that just need category checks, use:
+
+- `RouteConfig::firewall_decision_is_allow(...)`
+- `RouteConfig::firewall_decision_is_deny(...)`
+
 ## Runtime behavior on reject
 
 Firewall checks run in `on_header_received` before route matching.
@@ -146,6 +151,7 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_decision_reports_precedence_reason`
 - `firewall_decision_reports_allow_reason_and_default_deny`
 - `firewall_decision_host_helpers`
+- `firewall_decision_allow_deny_classification_helpers`
 - `firewall_default_deny_requires_explicit_allow`
 
 Current integration coverage in `tests/test_integration.cc` includes:
