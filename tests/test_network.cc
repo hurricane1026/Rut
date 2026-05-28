@@ -11459,6 +11459,62 @@ TEST(route_coverage, firewall_remove_deny_restores_allow_match) {
     CHECK(cfg.firewall_allows_peer_host(0x0a010203));
 }
 
+TEST(route_coverage, firewall_default_deny_requires_explicit_allow) {
+    RouteConfig cfg;
+    cfg.set_firewall_default_deny();
+    CHECK(!cfg.firewall_default_is_allow());
+
+    // No allow rules + default deny => block.
+    CHECK(!cfg.firewall_allows_peer_host(0x7f000001));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+
+    // Explicit allow admits matched peers.
+    REQUIRE(cfg.add_firewall_allow_cidr("127.0.0.0/8"));
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+
+    // Deny still takes precedence over allow.
+    REQUIRE(cfg.add_firewall_deny_ip("127.0.0.1"));
+    CHECK(!cfg.firewall_allows_peer_host(0x7f000001));
+
+    // Clearing rules preserves default policy.
+    cfg.clear_firewall_rules();
+    CHECK(!cfg.firewall_allows_peer_host(0x7f000001));
+}
+
+TEST(route_coverage, firewall_clear_allow_rules_keeps_deny_active) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
+    REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_deny_ip("10.1.2.3"));
+    REQUIRE(cfg.add_firewall_deny_cidr("192.168.0.0/16"));
+
+    cfg.clear_firewall_allow_rules();
+
+    CHECK_EQ(cfg.firewall_allow_count, 0u);
+    CHECK_EQ(cfg.firewall_allow_cidr_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_count, 1u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 1u);
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+    CHECK(!cfg.firewall_allows_peer_host(0xc0a80102));
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001));
+}
+
+TEST(route_coverage, firewall_clear_deny_rules_keeps_allow_mode) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
+    REQUIRE(cfg.add_firewall_deny_ip("127.0.0.1"));
+    REQUIRE(cfg.add_firewall_deny_cidr("10.0.0.0/8"));
+
+    cfg.clear_firewall_deny_rules();
+
+    CHECK_EQ(cfg.firewall_deny_count, 0u);
+    CHECK_EQ(cfg.firewall_deny_cidr_count, 0u);
+    CHECK_EQ(cfg.firewall_allow_count, 1u);
+    CHECK(cfg.firewall_allows_peer_host(0x7f000001));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line
