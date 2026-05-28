@@ -812,6 +812,39 @@ struct RouteConfig {
     void set_firewall_default_deny() { firewall_default_allow = false; }
     bool firewall_default_is_allow() const { return firewall_default_allow; }
 
+    FirewallDecision firewall_decision(u32 peer_addr, u16 peer_port) const {
+        return firewall_decision_impl(ntohl(peer_addr), true, peer_port);
+    }
+    FirewallDecision firewall_decision(u32 peer_addr) const {
+        return firewall_decision_impl(ntohl(peer_addr), false, 0);
+    }
+    FirewallDecision firewall_decision_host(u32 peer_host_addr) const {
+        return firewall_decision(htonl(peer_host_addr));
+    }
+    FirewallDecision firewall_decision_host(u32 peer_host_addr, u16 peer_port) const {
+        return firewall_decision(htonl(peer_host_addr), peer_port);
+    }
+
+    // `peer_addr` must be in network byte order (same as getpeername()).
+    // It is converted to packed host-order u32 before matching:
+    //   (a << 24) | (b << 16) | (c << 8) | d
+    bool firewall_allows_peer(u32 peer_addr) const {
+        const FirewallDecision d = firewall_decision(peer_addr);
+        return firewall_decision_is_allow(d);
+    }
+    bool firewall_allows_peer(u32 peer_addr, u16 peer_port) const {
+        const FirewallDecision d = firewall_decision(peer_addr, peer_port);
+        return firewall_decision_is_allow(d);
+    }
+    // Convenience overload for host-order IPv4 callers.
+    bool firewall_allows_peer_host(u32 peer_host_addr) const {
+        return firewall_allows_peer(htonl(peer_host_addr));
+    }
+    bool firewall_allows_peer_host(u32 peer_host_addr, u16 peer_port) const {
+        return firewall_allows_peer(htonl(peer_host_addr), peer_port);
+    }
+
+private:
     FirewallDecision firewall_decision_impl(u32 peer_host,
                                             bool use_port_rules,
                                             u16 peer_port) const {
@@ -847,39 +880,7 @@ struct RouteConfig {
         }
         return FirewallDecision::DenyMissingAllowMatch;
     }
-    FirewallDecision firewall_decision(u32 peer_addr, u16 peer_port) const {
-        return firewall_decision_impl(ntohl(peer_addr), true, peer_port);
-    }
-    FirewallDecision firewall_decision(u32 peer_addr) const {
-        return firewall_decision_impl(ntohl(peer_addr), false, 0);
-    }
-    FirewallDecision firewall_decision_host(u32 peer_host_addr) const {
-        return firewall_decision(htonl(peer_host_addr));
-    }
-    FirewallDecision firewall_decision_host(u32 peer_host_addr, u16 peer_port) const {
-        return firewall_decision(htonl(peer_host_addr), peer_port);
-    }
 
-    // `peer_addr` must be in network byte order (same as getpeername()).
-    // It is converted to packed host-order u32 before matching:
-    //   (a << 24) | (b << 16) | (c << 8) | d
-    bool firewall_allows_peer(u32 peer_addr) const {
-        const FirewallDecision d = firewall_decision(peer_addr);
-        return firewall_decision_is_allow(d);
-    }
-    bool firewall_allows_peer(u32 peer_addr, u16 peer_port) const {
-        const FirewallDecision d = firewall_decision(peer_addr, peer_port);
-        return firewall_decision_is_allow(d);
-    }
-    // Convenience overload for host-order IPv4 callers.
-    bool firewall_allows_peer_host(u32 peer_host_addr) const {
-        return firewall_allows_peer(htonl(peer_host_addr));
-    }
-    bool firewall_allows_peer_host(u32 peer_host_addr, u16 peer_port) const {
-        return firewall_allows_peer(htonl(peer_host_addr), peer_port);
-    }
-
-private:
     static Str cstr_as_str(const char* s) {
         u32 len = 0;
         while (s[len]) len++;

@@ -76,6 +76,8 @@ Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
+Adding the same source port repeatedly is also idempotent (returns `true`
+without consuming additional rule slots).
 Port rules reject `0` (invalid TCP/UDP port).
 Remove APIs return `true` only when a matching rule exists and is deleted.
 `clear_firewall_allow_rules()` clears allow exact-IP/CIDR/port tables.
