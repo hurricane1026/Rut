@@ -11363,6 +11363,44 @@ TEST(route_coverage, firewall_one_arg_allows_peer_ignores_port_rules) {
     CHECK(!cfg.firewall_allows_peer(htonl(0x7f000001)));
 }
 
+TEST(route_coverage, firewall_decision_reports_precedence_reason) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
+    REQUIRE(cfg.add_firewall_allow_port(443));
+    REQUIRE(cfg.add_firewall_deny_cidr("127.0.0.0/8"));
+    REQUIRE(cfg.add_firewall_deny_port(443));
+
+    // deny-cidr runs before deny-port and all allow rules.
+    CHECK_EQ(cfg.firewall_decision(htonl(0x7f000001), 443),
+             RouteConfig::FirewallDecision::DenyDenyCidr);
+
+    CHECK_EQ(cfg.firewall_decision(htonl(0x0a000001), 443),
+             RouteConfig::FirewallDecision::DenyDenyPort);
+    CHECK_EQ(cfg.firewall_decision(htonl(0x0a000001), 80),
+             RouteConfig::FirewallDecision::DenyMissingAllowMatch);
+}
+
+TEST(route_coverage, firewall_decision_reports_allow_reason_and_default_deny) {
+    RouteConfig cfg;
+    CHECK_EQ(cfg.firewall_decision(htonl(0x0a000001), 80),
+             RouteConfig::FirewallDecision::AllowDefault);
+
+    cfg.set_firewall_default_deny();
+    CHECK_EQ(cfg.firewall_decision(htonl(0x0a000001), 80),
+             RouteConfig::FirewallDecision::DenyMissingAllowMatch);
+
+    REQUIRE(cfg.add_firewall_allow_ip("10.0.0.1"));
+    REQUIRE(cfg.add_firewall_allow_cidr("192.168.0.0/16"));
+    REQUIRE(cfg.add_firewall_allow_port(8443));
+
+    CHECK_EQ(cfg.firewall_decision(htonl(0x0a000001), 1234),
+             RouteConfig::FirewallDecision::AllowAllowIp);
+    CHECK_EQ(cfg.firewall_decision(htonl(0xc0a80102), 1234),
+             RouteConfig::FirewallDecision::AllowAllowCidr);
+    CHECK_EQ(cfg.firewall_decision(htonl(0x0b000001), 8443),
+             RouteConfig::FirewallDecision::AllowAllowPort);
+}
+
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));

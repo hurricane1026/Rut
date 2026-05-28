@@ -54,6 +54,8 @@ Defined on `RouteConfig`:
 - `set_firewall_default_allow(bool allow)`
 - `set_firewall_default_deny()`
 - `firewall_default_is_allow()`
+- `firewall_decision(u32 peer_addr_network_order)`
+- `firewall_decision(u32 peer_addr_network_order, u16 peer_port_host_order)`
 - `clear_firewall_rules()`
 
 All `u32` IPv4 arguments are packed host-order values in the form
@@ -92,6 +94,11 @@ For each request:
 In other words, deny rules always win over allow rules.
 Allow-match semantics are OR across categories: if any allow IP, allow CIDR, or
 allow port rule matches, the request is allowed (unless denied earlier).
+
+`firewall_decision(...)` returns a stable reason enum:
+
+- allow: `AllowDefault`, `AllowAllowIp`, `AllowAllowCidr`, `AllowAllowPort`
+- deny: `DenyDenyIp`, `DenyDenyCidr`, `DenyDenyPort`, `DenyMissingAllowMatch`
 
 ## Runtime behavior on reject
 
@@ -134,6 +141,8 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_remove_deny_restores_allow_match`
 - `firewall_port_allow_and_deny_rules`
 - `firewall_port_rule_remove_and_clear`
+- `firewall_decision_reports_precedence_reason`
+- `firewall_decision_reports_allow_reason_and_default_deny`
 - `firewall_default_deny_requires_explicit_allow`
 
 Current integration coverage in `tests/test_integration.cc` includes:
