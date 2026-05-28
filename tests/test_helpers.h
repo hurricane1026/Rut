@@ -974,6 +974,28 @@ inline i32 connect_to_from_port(u16 server_port, u16 client_port) {
     return fd;
 }
 
+inline i32 reserve_local_port() {
+    i32 fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = 0;  // kernel-assigned ephemeral port
+    a.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&a), sizeof(a)) < 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t l = sizeof(a);
+    if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&a), &l) < 0) {
+        close(fd);
+        return -1;
+    }
+    const i32 port = static_cast<i32>(__builtin_bswap16(a.sin_port));
+    close(fd);
+    return port;
+}
+
 inline bool send_all(i32 fd, const char* d, u32 len) {
     u32 sent = 0;
     while (sent < len) {
