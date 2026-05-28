@@ -2519,9 +2519,13 @@ TEST(route, firewall_allowlist_network_order_cidr_localhost_real_socket) {
 }
 
 TEST(route, firewall_deny_localhost_source_port_real_socket) {
+    const i32 deny_port_i32 = reserve_local_port();
+    REQUIRE(deny_port_i32 > 0);
+    const u16 deny_port = static_cast<u16>(deny_port_i32);
+
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/health", 0, 200));
-    REQUIRE(cfg.add_firewall_deny_port(41001));
+    REQUIRE(cfg.add_firewall_deny_port(deny_port));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -2535,7 +2539,7 @@ TEST(route, firewall_deny_localhost_source_port_real_socket) {
     LoopThread lt = {loop, {}, 20};
     lt.start();
 
-    i32 c = connect_to_from_port(port, 41001);
+    i32 c = connect_to_from_port(port, deny_port);
     REQUIRE(c >= 0);
     send_all(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
     char buf[1024];
@@ -2553,9 +2557,20 @@ TEST(route, firewall_deny_localhost_source_port_real_socket) {
 }
 
 TEST(route, firewall_allowlist_source_port_real_socket) {
+    const i32 blocked_port_i32 = reserve_local_port();
+    REQUIRE(blocked_port_i32 > 0);
+    const u16 blocked_port = static_cast<u16>(blocked_port_i32);
+    i32 allow_port_i32 = reserve_local_port();
+    REQUIRE(allow_port_i32 > 0);
+    while (allow_port_i32 == blocked_port_i32) {
+        allow_port_i32 = reserve_local_port();
+        REQUIRE(allow_port_i32 > 0);
+    }
+    const u16 allow_port = static_cast<u16>(allow_port_i32);
+
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/health", 0, 200));
-    REQUIRE(cfg.add_firewall_allow_port(41003));
+    REQUIRE(cfg.add_firewall_allow_port(allow_port));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -2569,7 +2584,7 @@ TEST(route, firewall_allowlist_source_port_real_socket) {
     LoopThread lt = {loop, {}, 20};
     lt.start();
 
-    i32 blocked = connect_to_from_port(port, 41002);
+    i32 blocked = connect_to_from_port(port, blocked_port);
     REQUIRE(blocked >= 0);
     send_all(blocked, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
     char blocked_buf[1024];
@@ -2578,7 +2593,7 @@ TEST(route, firewall_allowlist_source_port_real_socket) {
     CHECK(buf_contains(blocked_buf, static_cast<u32>(blocked_n), "HTTP/1.1 403 Forbidden", 22));
     close(blocked);
 
-    i32 allowed = connect_to_from_port(port, 41003);
+    i32 allowed = connect_to_from_port(port, allow_port);
     REQUIRE(allowed >= 0);
     send_all(allowed, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
     char allowed_buf[1024];
