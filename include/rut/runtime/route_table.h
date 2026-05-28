@@ -786,7 +786,8 @@ struct RouteConfig {
             const auto& r = firewall_deny_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return false;
         }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return firewall_default_allow;
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0)
+            return firewall_default_allow;
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] == peer_host) return true;
         }
