@@ -812,8 +812,7 @@ struct RouteConfig {
     void set_firewall_default_deny() { firewall_default_allow = false; }
     bool firewall_default_is_allow() const { return firewall_default_allow; }
 
-    FirewallDecision firewall_decision(u32 peer_addr, u16 peer_port) const {
-        const u32 peer_host = ntohl(peer_addr);
+    FirewallDecision firewall_decision_impl(u32 peer_host, bool use_port_rules, u16 peer_port) const {
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] == peer_host) return FirewallDecision::DenyDenyIp;
         }
@@ -821,11 +820,15 @@ struct RouteConfig {
             const auto& r = firewall_deny_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::DenyDenyCidr;
         }
-        for (u32 i = 0; i < firewall_deny_port_count; i++) {
-            if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DenyDenyPort;
+        if (use_port_rules) {
+            for (u32 i = 0; i < firewall_deny_port_count; i++) {
+                if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DenyDenyPort;
+            }
         }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0 &&
-            firewall_allow_port_count == 0) {
+        const bool has_allow_rules =
+            firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
+            (use_port_rules && firewall_allow_port_count > 0);
+        if (!has_allow_rules) {
             return firewall_default_allow ? FirewallDecision::AllowDefault
                                           : FirewallDecision::DenyMissingAllowMatch;
         }
@@ -836,32 +839,18 @@ struct RouteConfig {
             const auto& r = firewall_allow_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::AllowAllowCidr;
         }
-        for (u32 i = 0; i < firewall_allow_port_count; i++) {
-            if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowAllowPort;
+        if (use_port_rules) {
+            for (u32 i = 0; i < firewall_allow_port_count; i++) {
+                if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowAllowPort;
+            }
         }
         return FirewallDecision::DenyMissingAllowMatch;
     }
+    FirewallDecision firewall_decision(u32 peer_addr, u16 peer_port) const {
+        return firewall_decision_impl(ntohl(peer_addr), true, peer_port);
+    }
     FirewallDecision firewall_decision(u32 peer_addr) const {
-        const u32 peer_host = ntohl(peer_addr);
-        for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] == peer_host) return FirewallDecision::DenyDenyIp;
-        }
-        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
-            const auto& r = firewall_deny_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::DenyDenyCidr;
-        }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) {
-            return firewall_default_allow ? FirewallDecision::AllowDefault
-                                          : FirewallDecision::DenyMissingAllowMatch;
-        }
-        for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] == peer_host) return FirewallDecision::AllowAllowIp;
-        }
-        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
-            const auto& r = firewall_allow_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::AllowAllowCidr;
-        }
-        return FirewallDecision::DenyMissingAllowMatch;
+        return firewall_decision_impl(ntohl(peer_addr), false, 0);
     }
     FirewallDecision firewall_decision_host(u32 peer_host_addr) const {
         return firewall_decision(htonl(peer_host_addr));

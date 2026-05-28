@@ -15,7 +15,8 @@ connections.
 
 Rules are evaluated from `Connection.peer_addr` and `Connection.peer_port`
 captured at accept-time.
-For host-order callers, `firewall_allows_peer_host(u32)` is also available.
+For host-order callers, both `firewall_allows_peer_host(u32)` and
+`firewall_allows_peer_host(u32, u16)` are available.
 
 ## APIs
 
@@ -101,6 +102,11 @@ allow port rule matches, the request is allowed (unless denied earlier).
 
 - allow: `AllowDefault`, `AllowAllowIp`, `AllowAllowCidr`, `AllowAllowPort`
 - deny: `DenyDenyIp`, `DenyDenyCidr`, `DenyDenyPort`, `DenyMissingAllowMatch`
+
+`firewall_allows_peer(u32)` / `firewall_allows_peer_host(u32)` and
+`firewall_decision(u32)` / `firewall_decision_host(u32)` intentionally ignore
+port tables to preserve legacy address-only semantics. Use the `(addr, port)`
+overloads when source-port rules should be enforced.
 
 For callers that just need category checks, use:
 
