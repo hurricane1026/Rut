@@ -605,6 +605,7 @@ struct RouteConfig {
         return remove_firewall_deny_ip(ntohl(ip_network_order));
     }
     bool add_firewall_allow_port(u16 port) {
+        if (port == 0) return false;
         for (u32 i = 0; i < firewall_allow_port_count; i++) {
             if (firewall_allow_ports[i] == port) return true;
         }
@@ -624,6 +625,7 @@ struct RouteConfig {
         return false;
     }
     bool add_firewall_deny_port(u16 port) {
+        if (port == 0) return false;
         for (u32 i = 0; i < firewall_deny_port_count; i++) {
             if (firewall_deny_ports[i] == port) return true;
         }
@@ -775,7 +777,25 @@ struct RouteConfig {
     // `peer_addr` must be in network byte order (same as getpeername()).
     // It is converted to packed host-order u32 before matching:
     //   (a << 24) | (b << 16) | (c << 8) | d
-    bool firewall_allows_peer(u32 peer_addr) const { return firewall_allows_peer(peer_addr, 0); }
+    bool firewall_allows_peer(u32 peer_addr) const {
+        const u32 peer_host = ntohl(peer_addr);
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == peer_host) return false;
+        }
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return false;
+        }
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0) return firewall_default_allow;
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == peer_host) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return true;
+        }
+        return false;
+    }
     bool firewall_allows_peer(u32 peer_addr, u16 peer_port) const {
         const u32 peer_host = ntohl(peer_addr);
         for (u32 i = 0; i < firewall_deny_count; i++) {

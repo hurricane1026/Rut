@@ -13,7 +13,8 @@ connections.
 - Source port rules
 - Allowlist + denylist precedence
 
-Rules are evaluated from `Connection.peer_addr` captured at accept-time.
+Rules are evaluated from `Connection.peer_addr` and `Connection.peer_port`
+captured at accept-time.
 For host-order callers, `firewall_allows_peer_host(u32)` is also available.
 
 ## APIs
@@ -70,6 +71,7 @@ Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
+Port rules reject `0` (invalid TCP/UDP port).
 Remove APIs return `true` only when a matching rule exists and is deleted.
 `clear_firewall_allow_rules()` clears allow exact-IP/CIDR/port tables.
 `clear_firewall_deny_rules()` clears deny exact-IP/CIDR/port tables.
@@ -88,6 +90,8 @@ For each request:
 5. Otherwise require allow IP, allow CIDR, or allow port match
 
 In other words, deny rules always win over allow rules.
+Allow-match semantics are OR across categories: if any allow IP, allow CIDR, or
+allow port rule matches, the request is allowed (unless denied earlier).
 
 ## Runtime behavior on reject
 
