@@ -988,9 +988,9 @@ private:
                 if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DenyDenyPort;
             }
         }
-        const bool has_allow_rules =
-            firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
-            firewall_allow_range_count > 0 || (use_port_rules && firewall_allow_port_count > 0);
+        const bool has_allow_rules = firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
+                                     firewall_allow_range_count > 0 ||
+                                     (use_port_rules && firewall_allow_port_count > 0);
         if (!has_allow_rules) {
             return firewall_default_allow ? FirewallDecision::AllowDefault
                                           : FirewallDecision::DenyMissingAllowMatch;

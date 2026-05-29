@@ -27,7 +27,7 @@ struct CaptureEntry {
     u8 shard_id;              // 1  — which shard captured this
     u8 flags;                 // 1  — reserved (truncated, etc.)
     u8 _pad;                  // 1  — alignment
-    char upstream_name[32];    // 32 — upstream target name (null-terminated)
+    char upstream_name[32];   // 32 — upstream target name (null-terminated)
     u16 peer_port;            // 2  — peer source port (host order)
     u8 _reserved[6];          // 6  — future use
     // Total metadata: 64 bytes
