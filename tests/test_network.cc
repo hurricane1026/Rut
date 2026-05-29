@@ -11515,6 +11515,44 @@ TEST(route_coverage, firewall_clear_deny_rules_keeps_allow_mode) {
     CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
 }
 
+TEST(route_coverage, firewall_range_allow_and_deny_rules) {
+    RouteConfig cfg;
+    // allow 10.0.0.10 - 10.0.0.20
+    REQUIRE(cfg.add_firewall_allow_range(0x0a00000a, 0x0a000014));
+    // deny 10.0.0.15 - 10.0.0.17
+    REQUIRE(cfg.add_firewall_deny_range(0x0a00000f, 0x0a000011));
+
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000009));  // outside allow range
+    CHECK(cfg.firewall_allows_peer_host(0x0a00000a));   // allow range start
+    CHECK(cfg.firewall_allows_peer_host(0x0a000014));   // allow range end
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000010));  // denied sub-range
+}
+
+TEST(route_coverage, firewall_range_string_and_network_order_helpers) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_range("10.0.0.1-10.0.0.3"));
+    REQUIRE(cfg.add_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+
+    CHECK(cfg.firewall_allows_peer_host(0x0a000001));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000002));
+    CHECK(cfg.firewall_allows_peer_host(0x0a000003));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000004));
+
+    REQUIRE(cfg.remove_firewall_allow_range("10.0.0.1-10.0.0.3"));
+    REQUIRE(cfg.remove_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+}
+
+TEST(route_coverage, firewall_range_rejects_invalid_inputs) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_firewall_allow_range(0x0a000010, 0x0a00000f));  // start > end
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.2-10.0.0.1"));
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.1"));
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.1-"));
+    CHECK(!cfg.add_firewall_allow_range("-10.0.0.2"));
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.1-10.0.0.256"));
+    CHECK(!cfg.add_firewall_deny_range(nullptr));
+}
+
 // === AsyncSmallLoop coverage ===
 // These exercise callbacks.h template instantiations for AsyncSmallLoop,
 // covering the proxy body streaming paths that inflate uncovered line

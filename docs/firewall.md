@@ -10,6 +10,7 @@ connections.
 
 - Exact IP rules
 - CIDR subnet rules
+- Inclusive IP range rules
 - Allowlist + denylist precedence
 
 Rules are evaluated from `Connection.peer_addr` captured at accept-time.
@@ -23,26 +24,38 @@ Defined on `RouteConfig`:
 - `add_firewall_deny_ip(u32 ip_host_order)`
 - `add_firewall_allow_cidr(u32 ip_host_order, u8 prefix_len)`
 - `add_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
+- `add_firewall_allow_range(u32 start_ip_host_order, u32 end_ip_host_order)`
+- `add_firewall_deny_range(u32 start_ip_host_order, u32 end_ip_host_order)`
 - `remove_firewall_allow_ip(u32 ip_host_order)`
 - `remove_firewall_deny_ip(u32 ip_host_order)`
 - `remove_firewall_allow_cidr(u32 ip_host_order, u8 prefix_len)`
 - `remove_firewall_deny_cidr(u32 ip_host_order, u8 prefix_len)`
+- `remove_firewall_allow_range(u32 start_ip_host_order, u32 end_ip_host_order)`
+- `remove_firewall_deny_range(u32 start_ip_host_order, u32 end_ip_host_order)`
 - `add_firewall_allow_ip_network_order(u32 ip_network_order)`
 - `add_firewall_deny_ip_network_order(u32 ip_network_order)`
 - `add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
 - `add_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
+- `add_firewall_allow_range_network_order(u32 start_ip_network_order, u32 end_ip_network_order)`
+- `add_firewall_deny_range_network_order(u32 start_ip_network_order, u32 end_ip_network_order)`
 - `remove_firewall_allow_ip_network_order(u32 ip_network_order)`
 - `remove_firewall_deny_ip_network_order(u32 ip_network_order)`
 - `remove_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
 - `remove_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len)`
+- `remove_firewall_allow_range_network_order(u32 start_ip_network_order, u32 end_ip_network_order)`
+- `remove_firewall_deny_range_network_order(u32 start_ip_network_order, u32 end_ip_network_order)`
 - `add_firewall_allow_ip("a.b.c.d")`
 - `add_firewall_deny_ip("a.b.c.d")`
 - `add_firewall_allow_cidr("a.b.c.d/prefix")`
 - `add_firewall_deny_cidr("a.b.c.d/prefix")`
+- `add_firewall_allow_range("a.b.c.d-e.f.g.h")`
+- `add_firewall_deny_range("a.b.c.d-e.f.g.h")`
 - `remove_firewall_allow_ip("a.b.c.d")`
 - `remove_firewall_deny_ip("a.b.c.d")`
 - `remove_firewall_allow_cidr("a.b.c.d/prefix")`
 - `remove_firewall_deny_cidr("a.b.c.d/prefix")`
+- `remove_firewall_allow_range("a.b.c.d-e.f.g.h")`
+- `remove_firewall_deny_range("a.b.c.d-e.f.g.h")`
 - `clear_firewall_allow_rules()`
 - `clear_firewall_deny_rules()`
 - `set_firewall_default_allow(bool allow)`
@@ -66,9 +79,9 @@ return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
 Remove APIs return `true` only when a matching rule exists and is deleted.
-`clear_firewall_allow_rules()` clears both allow exact-IP and allow CIDR tables.
-`clear_firewall_deny_rules()` clears both deny exact-IP and deny CIDR tables.
-`clear_firewall_rules()` clears all allow/deny exact and CIDR rules.
+`clear_firewall_allow_rules()` clears allow exact-IP, CIDR, and range tables.
+`clear_firewall_deny_rules()` clears deny exact-IP, CIDR, and range tables.
+`clear_firewall_rules()` clears all allow/deny exact, CIDR, and range rules.
 Default policy is allow unless changed via `set_firewall_default_allow(false)`
 or `set_firewall_default_deny()`.
 
@@ -78,8 +91,9 @@ For each request:
 
 1. Any deny IP match => reject
 2. Any deny CIDR match => reject
-3. If no allow rules exist => apply default policy (allow by default)
-4. Otherwise require allow IP or allow CIDR match
+3. Any deny range match => reject
+4. If no allow rules exist => apply default policy (allow by default)
+5. Otherwise require allow IP, allow CIDR, or allow range match
 
 In other words, deny rules always win over allow rules.
 
@@ -122,6 +136,9 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_remove_last_allow_cidr_keeps_deny_cidr_active`
 - `firewall_remove_deny_restores_allow_match`
 - `firewall_default_deny_requires_explicit_allow`
+- `firewall_range_allow_and_deny_rules`
+- `firewall_range_string_and_network_order_helpers`
+- `firewall_range_rejects_invalid_inputs`
 
 Current integration coverage in `tests/test_integration.cc` includes:
 
@@ -144,3 +161,5 @@ Current integration coverage in `tests/test_integration.cc` includes:
 - `firewall_remove_last_allow_ip_keeps_deny_cidr_real_socket`
 - `firewall_remove_last_allow_cidr_keeps_deny_ip_real_socket`
 - `firewall_default_deny_real_socket`
+- `firewall_deny_localhost_range_real_socket`
+- `firewall_allowlist_range_localhost_real_socket`

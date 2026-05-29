@@ -198,12 +198,20 @@ struct RouteConfig {
         u32 net_addr;
         u32 mask;
     };
+    struct FirewallRangeRule {
+        u32 start_ip;
+        u32 end_ip;
+    };
     FirewallCidrRule firewall_allow_cidrs[kMaxFirewallRules]{};
     FirewallCidrRule firewall_deny_cidrs[kMaxFirewallRules]{};
+    FirewallRangeRule firewall_allow_ranges[kMaxFirewallRules]{};
+    FirewallRangeRule firewall_deny_ranges[kMaxFirewallRules]{};
     u32 firewall_allow_count = 0;
     u32 firewall_deny_count = 0;
     u32 firewall_allow_cidr_count = 0;
     u32 firewall_deny_cidr_count = 0;
+    u32 firewall_allow_range_count = 0;
+    u32 firewall_deny_range_count = 0;
     bool firewall_default_allow = true;
 
     // Reject route paths that aren't in origin-form. Required by the
@@ -625,6 +633,58 @@ struct RouteConfig {
     bool add_firewall_allow_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
         return add_firewall_allow_cidr(ntohl(ip_network_order), prefix_len);
     }
+    bool add_firewall_allow_range(u32 start_ip, u32 end_ip) {
+        if (start_ip > end_ip) return false;
+        for (u32 i = 0; i < firewall_allow_range_count; i++) {
+            const auto& r = firewall_allow_ranges[i];
+            if (r.start_ip == start_ip && r.end_ip == end_ip) return true;
+        }
+        if (firewall_allow_range_count >= kMaxFirewallRules) return false;
+        firewall_allow_ranges[firewall_allow_range_count++] = {start_ip, end_ip};
+        return true;
+    }
+    bool add_firewall_allow_range(Str range_lit) {
+        u32 start_ip = 0;
+        u32 end_ip = 0;
+        if (!parse_ipv4_range(range_lit, start_ip, end_ip)) return false;
+        return add_firewall_allow_range(start_ip, end_ip);
+    }
+    bool add_firewall_allow_range(const char* range_lit) {
+        if (!range_lit) return false;
+        return add_firewall_allow_range(cstr_as_str(range_lit));
+    }
+    bool add_firewall_allow_range_network_order(u32 start_ip_network_order,
+                                                u32 end_ip_network_order) {
+        return add_firewall_allow_range(ntohl(start_ip_network_order), ntohl(end_ip_network_order));
+    }
+    bool remove_firewall_allow_range(u32 start_ip, u32 end_ip) {
+        if (start_ip > end_ip) return false;
+        for (u32 i = 0; i < firewall_allow_range_count; i++) {
+            const auto& r = firewall_allow_ranges[i];
+            if (r.start_ip != start_ip || r.end_ip != end_ip) continue;
+            for (u32 j = i + 1; j < firewall_allow_range_count; j++)
+                firewall_allow_ranges[j - 1] = firewall_allow_ranges[j];
+            firewall_allow_ranges[firewall_allow_range_count - 1] = {0, 0};
+            firewall_allow_range_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_allow_range(Str range_lit) {
+        u32 start_ip = 0;
+        u32 end_ip = 0;
+        if (!parse_ipv4_range(range_lit, start_ip, end_ip)) return false;
+        return remove_firewall_allow_range(start_ip, end_ip);
+    }
+    bool remove_firewall_allow_range(const char* range_lit) {
+        if (!range_lit) return false;
+        return remove_firewall_allow_range(cstr_as_str(range_lit));
+    }
+    bool remove_firewall_allow_range_network_order(u32 start_ip_network_order,
+                                                   u32 end_ip_network_order) {
+        return remove_firewall_allow_range(ntohl(start_ip_network_order),
+                                           ntohl(end_ip_network_order));
+    }
     bool remove_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
@@ -678,6 +738,58 @@ struct RouteConfig {
     bool add_firewall_deny_cidr_network_order(u32 ip_network_order, u8 prefix_len) {
         return add_firewall_deny_cidr(ntohl(ip_network_order), prefix_len);
     }
+    bool add_firewall_deny_range(u32 start_ip, u32 end_ip) {
+        if (start_ip > end_ip) return false;
+        for (u32 i = 0; i < firewall_deny_range_count; i++) {
+            const auto& r = firewall_deny_ranges[i];
+            if (r.start_ip == start_ip && r.end_ip == end_ip) return true;
+        }
+        if (firewall_deny_range_count >= kMaxFirewallRules) return false;
+        firewall_deny_ranges[firewall_deny_range_count++] = {start_ip, end_ip};
+        return true;
+    }
+    bool add_firewall_deny_range(Str range_lit) {
+        u32 start_ip = 0;
+        u32 end_ip = 0;
+        if (!parse_ipv4_range(range_lit, start_ip, end_ip)) return false;
+        return add_firewall_deny_range(start_ip, end_ip);
+    }
+    bool add_firewall_deny_range(const char* range_lit) {
+        if (!range_lit) return false;
+        return add_firewall_deny_range(cstr_as_str(range_lit));
+    }
+    bool add_firewall_deny_range_network_order(u32 start_ip_network_order,
+                                               u32 end_ip_network_order) {
+        return add_firewall_deny_range(ntohl(start_ip_network_order), ntohl(end_ip_network_order));
+    }
+    bool remove_firewall_deny_range(u32 start_ip, u32 end_ip) {
+        if (start_ip > end_ip) return false;
+        for (u32 i = 0; i < firewall_deny_range_count; i++) {
+            const auto& r = firewall_deny_ranges[i];
+            if (r.start_ip != start_ip || r.end_ip != end_ip) continue;
+            for (u32 j = i + 1; j < firewall_deny_range_count; j++)
+                firewall_deny_ranges[j - 1] = firewall_deny_ranges[j];
+            firewall_deny_ranges[firewall_deny_range_count - 1] = {0, 0};
+            firewall_deny_range_count--;
+            return true;
+        }
+        return false;
+    }
+    bool remove_firewall_deny_range(Str range_lit) {
+        u32 start_ip = 0;
+        u32 end_ip = 0;
+        if (!parse_ipv4_range(range_lit, start_ip, end_ip)) return false;
+        return remove_firewall_deny_range(start_ip, end_ip);
+    }
+    bool remove_firewall_deny_range(const char* range_lit) {
+        if (!range_lit) return false;
+        return remove_firewall_deny_range(cstr_as_str(range_lit));
+    }
+    bool remove_firewall_deny_range_network_order(u32 start_ip_network_order,
+                                                  u32 end_ip_network_order) {
+        return remove_firewall_deny_range(ntohl(start_ip_network_order),
+                                          ntohl(end_ip_network_order));
+    }
     bool remove_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
         const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
@@ -709,14 +821,18 @@ struct RouteConfig {
     void clear_firewall_allow_rules() {
         for (u32 i = 0; i < firewall_allow_count; i++) firewall_allow_ips[i] = 0;
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) firewall_allow_cidrs[i] = {0, 0};
+        for (u32 i = 0; i < firewall_allow_range_count; i++) firewall_allow_ranges[i] = {0, 0};
         firewall_allow_count = 0;
         firewall_allow_cidr_count = 0;
+        firewall_allow_range_count = 0;
     }
     void clear_firewall_deny_rules() {
         for (u32 i = 0; i < firewall_deny_count; i++) firewall_deny_ips[i] = 0;
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) firewall_deny_cidrs[i] = {0, 0};
+        for (u32 i = 0; i < firewall_deny_range_count; i++) firewall_deny_ranges[i] = {0, 0};
         firewall_deny_count = 0;
         firewall_deny_cidr_count = 0;
+        firewall_deny_range_count = 0;
     }
     void clear_firewall_rules() {
         clear_firewall_allow_rules();
@@ -738,7 +854,12 @@ struct RouteConfig {
             const auto& r = firewall_deny_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return false;
         }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0)
+        for (u32 i = 0; i < firewall_deny_range_count; i++) {
+            const auto& r = firewall_deny_ranges[i];
+            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return false;
+        }
+        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0 &&
+            firewall_allow_range_count == 0)
             return firewall_default_allow;
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] == peer_host) return true;
@@ -746,6 +867,10 @@ struct RouteConfig {
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
             const auto& r = firewall_allow_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return true;
+        }
+        for (u32 i = 0; i < firewall_allow_range_count; i++) {
+            const auto& r = firewall_allow_ranges[i];
+            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return true;
         }
         return false;
     }
@@ -804,6 +929,20 @@ private:
         }
         out_prefix_len = static_cast<u8>(prefix);
         return true;
+    }
+    static bool parse_ipv4_range(Str s, u32& out_start_ip, u32& out_end_ip) {
+        u32 dash_idx = 0xffffffffu;
+        for (u32 i = 0; i < s.len; i++) {
+            if (s.ptr[i] == '-') {
+                if (dash_idx != 0xffffffffu) return false;
+                dash_idx = i;
+            }
+        }
+        if (dash_idx == 0xffffffffu || dash_idx == 0 || dash_idx + 1 >= s.len) return false;
+        if (!parse_ipv4_dotted({s.ptr, dash_idx}, out_start_ip)) return false;
+        if (!parse_ipv4_dotted({s.ptr + dash_idx + 1, s.len - dash_idx - 1}, out_end_ip))
+            return false;
+        return out_start_ip <= out_end_ip;
     }
 
 public:
