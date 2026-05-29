@@ -146,6 +146,8 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     }
     if (!conn) return result;
 
+    conn->peer_port = entry.peer_port;
+
     // Step 2: Write raw headers into recv_buf
     conn->recv_buf.reset();
     u32 hdr_len = entry.raw_header_len;
@@ -182,16 +184,21 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
         result.skipped = true;
         return result;
     }
-    IoEvent send_ev = {conn->id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
+    const u32 conn_id = conn->id;
+    const u16 actual_status = conn->resp_status;
+    const bool close_after_send = !conn->keep_alive;
+    IoEvent send_ev = {conn_id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
     loop.inject_and_dispatch(send_ev);
 
-    result.actual_status = conn->resp_status;
+    result.actual_status = actual_status;
     result.status_match = (result.expected_status == result.actual_status);
     result.replayed = true;
 
-    // Step 6: Close connection (inject EOF to free the slot)
-    IoEvent eof_ev = {conn->id, 0, 0, 0, IoEventType::Recv, 0};
-    loop.inject_and_dispatch(eof_ev);
+    // Step 6: Close keep-alive connections; non-keep-alive paths close in on_response_sent.
+    if (!close_after_send) {
+        IoEvent eof_ev = {conn_id, 0, 0, 0, IoEventType::Recv, 0};
+        loop.inject_and_dispatch(eof_ev);
+    }
 
     return result;
 }

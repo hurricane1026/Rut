@@ -490,6 +490,30 @@ TEST(route, multiple_routes_first_match_wins) {
     CHECK_EQ(replay_one(rl.loop, e3, 44).actual_status, 404);
 }
 
+TEST(route, firewall_port_from_capture_replay_is_applied) {
+    RouteConfig cfg;
+    cfg.add_static("/", 0, 200);
+    cfg.set_firewall_default_deny();
+    cfg.add_firewall_allow_port(30000);
+
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry allowed = make_captured_request("GET /any HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    allowed.peer_port = 30000;
+    ReplayResult allowed_result = replay_one(rl.loop, allowed, 42);
+    CHECK(allowed_result.replayed);
+    CHECK_EQ(allowed_result.actual_status, 200);
+    CHECK(allowed_result.status_match);
+
+    CaptureEntry denied = make_captured_request("GET /any HTTP/1.1\r\nHost: x\r\n\r\n", 403);
+    denied.peer_port = 30001;
+    ReplayResult denied_result = replay_one(rl.loop, denied, 43);
+    CHECK(denied_result.replayed);
+    CHECK_EQ(denied_result.actual_status, 403);
+    CHECK(denied_result.status_match);
+}
+
 TEST(route, replay_file_with_routing) {
     RouteConfig cfg;
     cfg.add_static("/health", 0, 200);
