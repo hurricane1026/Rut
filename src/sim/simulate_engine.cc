@@ -759,6 +759,7 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.req_method = src.req_method;
     dst.req_size = src.req_size;
     dst.peer_addr = src.peer_addr;
+    dst.peer_port = src.peer_port;
     copy_char_array(dst.req_path, src.req_path);
     dst.req_path_canon = copy_req_path_canon(src, dst);
     dst.upstream_us = src.upstream_us;
