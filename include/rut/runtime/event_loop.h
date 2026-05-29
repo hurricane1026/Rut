@@ -158,6 +158,7 @@ public:
     static constexpr u32 kMaxDeferredAccepts = 64;
     i32 deferred_accepts[kMaxDeferredAccepts];
     u32 deferred_accept_addrs[kMaxDeferredAccepts];
+    u16 deferred_accept_ports[kMaxDeferredAccepts];
     u32 deferred_accept_count;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
@@ -676,11 +677,13 @@ private:
         if (ev.result < 0) return;
         i32 fd = ev.result;
         u32 peer_addr = 0;
+        u16 peer_port = 0;
         struct sockaddr_in peer = {};
         socklen_t peer_len = sizeof(peer);
         if (::getpeername(fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
             peer.sin_family == AF_INET) {
             peer_addr = peer.sin_addr.s_addr;
+            peer_port = ntohs(peer.sin_port);
         }
         Connection* c = this->alloc_conn();
         if (!c) {
@@ -694,6 +697,7 @@ private:
                     if (deferred_accept_count < kMaxDeferredAccepts) {
                         deferred_accepts[deferred_accept_count] = fd;
                         deferred_accept_addrs[deferred_accept_count] = peer_addr;
+                        deferred_accept_ports[deferred_accept_count] = peer_port;
                         deferred_accept_count++;
                     } else {
                         ::close(fd);
@@ -707,6 +711,7 @@ private:
         }
         c->fd = fd;
         c->peer_addr = peer_addr;
+        c->peer_port = peer_port;
         if (tls_server) {
             auto tls_result = create_tls_server_ssl(tls_server, fd);
             if (!tls_result) {
@@ -740,6 +745,7 @@ private:
             }
             c->fd = fd;
             c->peer_addr = deferred_accept_addrs[i];
+            c->peer_port = deferred_accept_ports[i];
             if (tls_server) {
                 auto tls_result = create_tls_server_ssl(tls_server, fd);
                 if (!tls_result) {

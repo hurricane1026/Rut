@@ -615,6 +615,7 @@ private:
         if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
             peer.sin_family == AF_INET) {
             c->peer_addr = peer.sin_addr.s_addr;
+            c->peer_port = ntohs(peer.sin_port);
         }
         if (tls_server) {
             auto tls_result = create_tls_server_ssl(tls_server, c->fd);
