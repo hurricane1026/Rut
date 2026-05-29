@@ -11362,7 +11362,6 @@ TEST(route_coverage, firewall_one_arg_allows_peer_ignores_port_rules) {
     REQUIRE(cfg.add_firewall_deny_ip("127.0.0.1"));
     CHECK(!cfg.firewall_allows_peer(htonl(0x7f000001)));
 }
-
 TEST(route_coverage, firewall_decision_reports_precedence_reason) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_ip("127.0.0.1"));
@@ -11400,7 +11399,6 @@ TEST(route_coverage, firewall_decision_reports_allow_reason_and_default_deny) {
     CHECK_EQ(cfg.firewall_decision(htonl(0x0b000001), 8443),
              RouteConfig::FirewallDecision::AllowAllowPort);
 }
-
 TEST(route_coverage, firewall_decision_host_helpers) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
@@ -11410,36 +11408,38 @@ TEST(route_coverage, firewall_decision_host_helpers) {
     CHECK_EQ(cfg.firewall_decision_host(0x0a010203, 22),
              RouteConfig::FirewallDecision::DenyDenyPort);
 }
-
 TEST(route_coverage, firewall_decision_allow_deny_classification_helpers) {
     using D = RouteConfig::FirewallDecision;
     CHECK(RouteConfig::firewall_decision_is_allow(D::AllowDefault));
     CHECK(RouteConfig::firewall_decision_is_allow(D::AllowAllowIp));
     CHECK(RouteConfig::firewall_decision_is_allow(D::AllowAllowCidr));
     CHECK(RouteConfig::firewall_decision_is_allow(D::AllowAllowPort));
+    CHECK(RouteConfig::firewall_decision_is_allow(D::AllowAllowRange));
     CHECK(!RouteConfig::firewall_decision_is_allow(D::DenyDenyIp));
     CHECK(!RouteConfig::firewall_decision_is_allow(D::DenyDenyCidr));
     CHECK(!RouteConfig::firewall_decision_is_allow(D::DenyDenyPort));
+    CHECK(!RouteConfig::firewall_decision_is_allow(D::DenyDenyRange));
     CHECK(!RouteConfig::firewall_decision_is_allow(D::DenyMissingAllowMatch));
     CHECK(RouteConfig::firewall_decision_is_deny(D::DenyDenyIp));
     CHECK(RouteConfig::firewall_decision_is_deny(D::DenyDenyCidr));
     CHECK(RouteConfig::firewall_decision_is_deny(D::DenyDenyPort));
+    CHECK(RouteConfig::firewall_decision_is_deny(D::DenyDenyRange));
     CHECK(RouteConfig::firewall_decision_is_deny(D::DenyMissingAllowMatch));
 }
-
 TEST(route_coverage, firewall_decision_name_helper) {
     using D = RouteConfig::FirewallDecision;
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowDefault), "allow_default");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowIp), "allow_allow_ip");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowCidr), "allow_allow_cidr");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowPort), "allow_allow_port");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::AllowAllowRange), "allow_allow_range");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyIp), "deny_deny_ip");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyCidr), "deny_deny_cidr");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyPort), "deny_deny_port");
+    CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyDenyRange), "deny_deny_range");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DenyMissingAllowMatch),
                 "deny_missing_allow_match");
 }
-
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
@@ -11671,6 +11671,44 @@ TEST(route_coverage, firewall_clear_deny_rules_keeps_allow_mode) {
     CHECK_EQ(cfg.firewall_allow_count, 1u);
     CHECK(cfg.firewall_allows_peer_host(0x7f000001));
     CHECK(!cfg.firewall_allows_peer_host(0x0a010203));
+}
+
+TEST(route_coverage, firewall_range_allow_and_deny_rules) {
+    RouteConfig cfg;
+    // allow 10.0.0.10 - 10.0.0.20
+    REQUIRE(cfg.add_firewall_allow_range(0x0a00000a, 0x0a000014));
+    // deny 10.0.0.15 - 10.0.0.17
+    REQUIRE(cfg.add_firewall_deny_range(0x0a00000f, 0x0a000011));
+
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000009));  // outside allow range
+    CHECK(cfg.firewall_allows_peer_host(0x0a00000a));   // allow range start
+    CHECK(cfg.firewall_allows_peer_host(0x0a000014));   // allow range end
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000010));  // denied sub-range
+}
+
+TEST(route_coverage, firewall_range_string_and_network_order_helpers) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_firewall_allow_range("10.0.0.1-10.0.0.3"));
+    REQUIRE(cfg.add_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+
+    CHECK(cfg.firewall_allows_peer_host(0x0a000001));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000002));
+    CHECK(cfg.firewall_allows_peer_host(0x0a000003));
+    CHECK(!cfg.firewall_allows_peer_host(0x0a000004));
+
+    REQUIRE(cfg.remove_firewall_allow_range("10.0.0.1-10.0.0.3"));
+    REQUIRE(cfg.remove_firewall_deny_range_network_order(htonl(0x0a000002), htonl(0x0a000002)));
+}
+
+TEST(route_coverage, firewall_range_rejects_invalid_inputs) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_firewall_allow_range(0x0a000010, 0x0a00000f));  // start > end
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.2-10.0.0.1"));
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.1"));
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.1-"));
+    CHECK(!cfg.add_firewall_allow_range("-10.0.0.2"));
+    CHECK(!cfg.add_firewall_allow_range("10.0.0.1-10.0.0.256"));
+    CHECK(!cfg.add_firewall_deny_range(nullptr));
 }
 
 // === AsyncSmallLoop coverage ===
