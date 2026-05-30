@@ -197,7 +197,7 @@ Current integration coverage in `tests/test_integration.cc` includes:
 - `firewall_clear_rules_reenables_localhost_real_socket`
 - `firewall_remove_deny_rule_reenables_localhost_real_socket`
 - `firewall_remove_deny_cidr_reenables_localhost_real_socket`
-- `firewall_remove_allow_rule_reenables_default_allow_real_socket`
+- `firewall_remove_allow_rule_restores_default_allow_real_socket`
 - `firewall_remove_allow_cidr_restores_default_allow_real_socket`
 - `firewall_remove_deny_cidr_restores_allow_cidr_real_socket`
 - `firewall_remove_deny_ip_restores_allow_ip_real_socket`
