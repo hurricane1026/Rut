@@ -234,21 +234,7 @@ struct RouteConfig {
         return false;
     }
     static bool firewall_decision_is_deny(FirewallDecision d) {
-        switch (d) {
-            case FirewallDecision::AllowedDefault:
-            case FirewallDecision::AllowedByIp:
-            case FirewallDecision::AllowedByCidr:
-            case FirewallDecision::AllowedByPort:
-            case FirewallDecision::AllowedByRange:
-                return false;
-            case FirewallDecision::DeniedByIp:
-            case FirewallDecision::DeniedByCidr:
-            case FirewallDecision::DeniedByPort:
-            case FirewallDecision::DeniedByRange:
-            case FirewallDecision::DeniedByMissingAllowMatch:
-                return true;
-        }
-        return false;
+        return !firewall_decision_is_allow(d);
     }
     static const char* firewall_decision_name(FirewallDecision d) {
         switch (d) {
