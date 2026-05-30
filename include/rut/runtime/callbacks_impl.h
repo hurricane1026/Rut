@@ -145,6 +145,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         cap.resp_content_length = resp_size;
         cap.resp_status = status;
         cap.raw_header_len = conn.capture_header_len;
+        cap.peer_port = conn.peer_port;
         cap.method = conn.req_method;
         cap.shard_id = conn.shard_id;
         cap.flags =

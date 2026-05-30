@@ -948,10 +948,9 @@ inline i32 connect_to(u16 port) {
     return fd;
 }
 
-inline i32 connect_to_from_port(u16 server_port, u16 client_port) {
+inline i32 create_bound_client_socket(u16 client_port, u16* out_bound_port = nullptr) {
     i32 fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
-
     struct sockaddr_in local_addr;
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
@@ -961,7 +960,20 @@ inline i32 connect_to_from_port(u16 server_port, u16 client_port) {
         close(fd);
         return -1;
     }
+    if (out_bound_port != nullptr) {
+        struct sockaddr_in bound_addr;
+        memset(&bound_addr, 0, sizeof(bound_addr));
+        socklen_t l = sizeof(bound_addr);
+        if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&bound_addr), &l) < 0) {
+            close(fd);
+            return -1;
+        }
+        *out_bound_port = __builtin_bswap16(bound_addr.sin_port);
+    }
+    return fd;
+}
 
+inline bool connect_bound_client_socket(i32 fd, u16 server_port) {
     struct sockaddr_in remote_addr;
     memset(&remote_addr, 0, sizeof(remote_addr));
     remote_addr.sin_family = AF_INET;
@@ -969,31 +981,9 @@ inline i32 connect_to_from_port(u16 server_port, u16 client_port) {
     remote_addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&remote_addr), sizeof(remote_addr)) < 0) {
         close(fd);
-        return -1;
+        return false;
     }
-    return fd;
-}
-
-inline i32 reserve_local_port() {
-    i32 fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port = 0;  // kernel-assigned ephemeral port
-    a.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
-    if (bind(fd, reinterpret_cast<struct sockaddr*>(&a), sizeof(a)) < 0) {
-        close(fd);
-        return -1;
-    }
-    socklen_t l = sizeof(a);
-    if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&a), &l) < 0) {
-        close(fd);
-        return -1;
-    }
-    const i32 port = static_cast<i32>(__builtin_bswap16(a.sin_port));
-    close(fd);
-    return port;
+    return true;
 }
 
 inline bool send_all(i32 fd, const char* d, u32 len) {

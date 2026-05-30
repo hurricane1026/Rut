@@ -16,7 +16,8 @@ connections.
 
 Rules are evaluated from `Connection.peer_addr` and `Connection.peer_port`
 captured at accept-time.
-For host-order callers, `firewall_allows_peer_host(u32)` is also available.
+For host-order callers, both `firewall_allows_peer_host(u32)` and
+`firewall_allows_peer_host(u32, u16)` are available.
 
 ## APIs
 
@@ -67,6 +68,10 @@ Defined on `RouteConfig`:
 - `set_firewall_default_allow(bool allow)`
 - `set_firewall_default_deny()`
 - `firewall_default_is_allow()`
+- `firewall_decision(u32 peer_addr_network_order)`
+- `firewall_decision(u32 peer_addr_network_order, u16 peer_port_host_order)`
+- `firewall_decision_host(u32 peer_addr_host_order)`
+- `firewall_decision_host(u32 peer_addr_host_order, u16 peer_port_host_order)`
 - `clear_firewall_rules()`
 
 All `u32` IPv4 arguments are packed host-order values in the form
@@ -83,6 +88,8 @@ For callers already holding network-order IPv4 (`in_addr.s_addr` style),
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow or invalid CIDR prefix.
 Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
+without consuming additional rule slots).
+Adding the same source port repeatedly is also idempotent (returns `true`
 without consuming additional rule slots).
 Port rules reject `0` (invalid TCP/UDP port).
 Remove APIs return `true` only when a matching rule exists and is deleted.
@@ -107,6 +114,21 @@ In other words, deny rules always win over allow rules.
 Allow-match semantics are OR across categories: if any allow IP, allow CIDR,
 allow range, or allow port rule matches, the request is allowed (unless denied
 earlier).
+
+`firewall_decision(...)` returns a stable reason enum:
+
+- allow: `AllowedDefault`, `AllowedByIp`, `AllowedByCidr`, `AllowedByRange`, `AllowedByPort`
+- deny: `DeniedByIp`, `DeniedByCidr`, `DeniedByRange`, `DeniedByPort`, `DeniedByMissingAllowMatch`
+
+`firewall_allows_peer(u32)` / `firewall_allows_peer_host(u32)` and
+`firewall_decision(u32)` / `firewall_decision_host(u32)` intentionally ignore
+port tables to preserve legacy address-only semantics. Use the `(addr, port)`
+overloads when source-port rules should be enforced.
+
+For callers that just need category checks, use:
+
+- `RouteConfig::firewall_decision_is_allow(...)`
+- `RouteConfig::firewall_decision_is_deny(...)`
 
 ## Runtime behavior on reject
 
@@ -149,6 +171,11 @@ Current coverage in `tests/test_network.cc` (`route_coverage`) includes:
 - `firewall_remove_deny_restores_allow_match`
 - `firewall_port_allow_and_deny_rules`
 - `firewall_port_rule_remove_and_clear`
+- `firewall_decision_reports_precedence_reason`
+- `firewall_decision_reports_allow_reason_and_default_deny`
+- `firewall_decision_host_helpers`
+- `firewall_decision_allow_deny_classification_helpers`
+- `firewall_decision_name_helper`
 - `firewall_default_deny_requires_explicit_allow`
 - `firewall_range_allow_and_deny_rules`
 - `firewall_range_string_and_network_order_helpers`

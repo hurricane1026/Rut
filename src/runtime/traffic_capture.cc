@@ -17,14 +17,15 @@ void capture_file_header_init(CaptureFileHeader* hdr) {
     hdr->magic[5] = 'P';
     hdr->magic[6] = '0';
     hdr->magic[7] = '1';
-    hdr->version = 1;
+    hdr->version = kCaptureFileVersion;
     hdr->entry_size = sizeof(CaptureEntry);
 }
 
 bool capture_file_header_valid(const CaptureFileHeader* hdr) {
     return hdr->magic[0] == 'R' && hdr->magic[1] == 'U' && hdr->magic[2] == 'T' &&
            hdr->magic[3] == 'C' && hdr->magic[4] == 'A' && hdr->magic[5] == 'P' &&
-           hdr->magic[6] == '0' && hdr->magic[7] == '1' && hdr->version == 1 &&
+           hdr->magic[6] == '0' && hdr->magic[7] == '1' &&
+           (hdr->version == 1 || hdr->version == kCaptureFileVersion) &&
            hdr->entry_size == sizeof(CaptureEntry);
 }
 
@@ -58,6 +59,15 @@ i32 capture_read_entry(i32 fd, CaptureEntry& entry) {
         remaining -= static_cast<u32>(kBytesRead);
     }
     return 0;
+}
+
+i32 capture_read_entry_v1(i32 fd, CaptureEntry& entry) {
+    const i32 rc = capture_read_entry(fd, entry);
+    if (rc == 0) {
+        entry.peer_port = 0;
+        __builtin_memset(entry._reserved, 0, sizeof(entry._reserved));
+    }
+    return rc;
 }
 
 }  // namespace rut

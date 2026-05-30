@@ -44,6 +44,7 @@ struct ReplayReader {
     i32 fd = -1;
     CaptureFileHeader header{};
     u64 entries_read = 0;
+    u32 capture_file_version = kCaptureFileVersion;
 
     // Open a capture file. Returns 0 on success, -1 on error.
     // Closes any previously open fd to prevent leaks on re-open.
@@ -79,6 +80,7 @@ struct ReplayReader {
             fd = -1;
             return -1;
         }
+        capture_file_version = header.version;
         entries_read = 0;
         return 0;
     }
@@ -87,8 +89,11 @@ struct ReplayReader {
     i32 next(CaptureEntry& entry) {
         if (fd < 0) return -1;
         if (entries_read >= header.entry_count) return -1;
-        i32 rc = capture_read_entry(fd, entry);
-        if (rc == 0) entries_read++;
+        const i32 rc = (capture_file_version == 1) ? capture_read_entry_v1(fd, entry)
+                                                   : capture_read_entry(fd, entry);
+        if (rc == 0) {
+            entries_read++;
+        }
         return rc;
     }
 
@@ -146,6 +151,8 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     }
     if (!conn) return result;
 
+    conn->peer_port = entry.peer_port;
+
     // Step 2: Write raw headers into recv_buf
     conn->recv_buf.reset();
     u32 hdr_len = entry.raw_header_len;
@@ -182,15 +189,17 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
         result.skipped = true;
         return result;
     }
-    IoEvent send_ev = {conn->id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
+    const u16 actual_status = conn->resp_status;
+    const u32 conn_id = conn->id;
+    IoEvent send_ev = {conn_id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
     loop.inject_and_dispatch(send_ev);
 
-    result.actual_status = conn->resp_status;
+    result.actual_status = actual_status;
     result.status_match = (result.expected_status == result.actual_status);
     result.replayed = true;
 
-    // Step 6: Close connection (inject EOF to free the slot)
-    IoEvent eof_ev = {conn->id, 0, 0, 0, IoEventType::Recv, 0};
+    // Step 6: Close connection (inject EOF to free slot)
+    IoEvent eof_ev = {conn_id, 0, 0, 0, IoEventType::Recv, 0};
     loop.inject_and_dispatch(eof_ev);
 
     return result;

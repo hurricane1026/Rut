@@ -203,7 +203,7 @@ TEST(capture_file, header_init_valid) {
     CaptureFileHeader hdr;
     capture_file_header_init(&hdr);
     CHECK(capture_file_header_valid(&hdr));
-    CHECK_EQ(hdr.version, 1u);
+    CHECK_EQ(hdr.version, kCaptureFileVersion);
     CHECK_EQ(hdr.entry_size, static_cast<u32>(sizeof(CaptureEntry)));
     CHECK_EQ(hdr.entry_count, 0u);
 }
@@ -218,7 +218,7 @@ TEST(capture_file, header_invalid_magic) {
 TEST(capture_file, header_invalid_version) {
     CaptureFileHeader hdr;
     capture_file_header_init(&hdr);
-    hdr.version = 2;
+    hdr.version = 3;
     CHECK(!capture_file_header_valid(&hdr));
 }
 
@@ -2260,7 +2260,7 @@ TEST(capture_gap, metadata_fields) {
 TEST(capture_gap, file_header_wrong_version) {
     CaptureFileHeader hdr;
     capture_file_header_init(&hdr);
-    hdr.version = 2;
+    hdr.version = 3;
     CHECK(!capture_file_header_valid(&hdr));
 }
 

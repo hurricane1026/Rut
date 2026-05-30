@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"  // realtime_us()
 #include <atomic>
+#include <cstddef>
 
 namespace rut {
 
@@ -28,7 +29,8 @@ struct CaptureEntry {
     u8 flags;                 // 1  — reserved (truncated, etc.)
     u8 _pad;                  // 1  — alignment
     char upstream_name[32];   // 32 — upstream target name (null-terminated)
-    u8 _reserved[8];          // 8  — future use
+    u16 peer_port;            // 2  — peer source port (host order)
+    u8 _reserved[6];          // 6  — future use
     // Total metadata: 64 bytes
 
     // --- Raw request headers (method line + headers + \r\n\r\n) ---
@@ -36,6 +38,10 @@ struct CaptureEntry {
 };
 
 static_assert(sizeof(CaptureEntry) == 8256, "CaptureEntry must be 8256 bytes");
+static_assert(offsetof(CaptureEntry, peer_port) == 56, "peer_port offset must be 56 bytes");
+static_assert(offsetof(CaptureEntry, _reserved) == 58, "_reserved offset must be 58 bytes");
+static_assert(offsetof(CaptureEntry, raw_headers) == 64, "raw_headers offset must be 64 bytes");
+static_assert(sizeof(CaptureEntry::_reserved) == 6, "reserved bytes count must remain 6");
 
 // Flags for CaptureEntry::flags
 static constexpr u8 kCaptureFlagTruncated = 0x01;  // headers exceeded 8KB, truncated
@@ -43,13 +49,18 @@ static constexpr u8 kCaptureFlagTruncated = 0x01;  // headers exceeded 8KB, trun
 // Binary file header for capture files.
 // Written once at the start of the file, entry_count updated on close.
 struct CaptureFileHeader {
-    char magic[8];     // "RUTCAP01"
-    u32 version;       // 1
+    // Magic is stable across schema versions; entry schema/version is in version field.
+    char magic[8];  // "RUTCAP01"
+    // 1: original format (peer_port always 0, reserved bytes omitted in schema)
+    // 2: adds source-port in CaptureEntry::peer_port
+    u32 version;
     u32 flags;         // reserved
     u64 entry_count;   // total entries written (updated on close)
     u32 entry_size;    // sizeof(CaptureEntry), for forward compat
     u8 _reserved[36];  // pad to 64 bytes
 };
+
+static constexpr u32 kCaptureFileVersion = 2;
 
 static_assert(sizeof(CaptureFileHeader) == 64, "CaptureFileHeader must be 64 bytes");
 
@@ -125,5 +136,10 @@ i32 capture_write_entry(i32 fd, const CaptureEntry& entry);
 // Read one capture entry from fd at current position.
 // Returns 0 on success, -1 on error/EOF.
 i32 capture_read_entry(i32 fd, CaptureEntry& entry);
+
+// Read one version-1 capture entry.
+// Version 1 files keep legacy reserved bytes; migrate to current layout by
+// forcing peer_port/_reserved to the version-1 contract.
+i32 capture_read_entry_v1(i32 fd, CaptureEntry& entry);
 
 }  // namespace rut

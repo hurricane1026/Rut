@@ -204,6 +204,63 @@ struct RouteConfig {
         u32 start_ip;
         u32 end_ip;
     };
+    enum class FirewallDecision : u8 {
+        AllowedDefault = 0,
+        AllowedByIp = 1,
+        AllowedByCidr = 2,
+        AllowedByPort = 3,
+        AllowedByRange = 4,
+        DeniedByIp = 5,
+        DeniedByCidr = 6,
+        DeniedByPort = 7,
+        DeniedByRange = 8,
+        DeniedByMissingAllowMatch = 9,
+    };
+    static bool firewall_decision_is_allow(FirewallDecision d) {
+        switch (d) {
+            case FirewallDecision::AllowedDefault:
+            case FirewallDecision::AllowedByIp:
+            case FirewallDecision::AllowedByCidr:
+            case FirewallDecision::AllowedByPort:
+            case FirewallDecision::AllowedByRange:
+                return true;
+            case FirewallDecision::DeniedByIp:
+            case FirewallDecision::DeniedByCidr:
+            case FirewallDecision::DeniedByPort:
+            case FirewallDecision::DeniedByRange:
+            case FirewallDecision::DeniedByMissingAllowMatch:
+                return false;
+        }
+        return false;
+    }
+    static bool firewall_decision_is_deny(FirewallDecision d) {
+        return !firewall_decision_is_allow(d);
+    }
+    static const char* firewall_decision_name(FirewallDecision d) {
+        switch (d) {
+            case FirewallDecision::AllowedDefault:
+                return "allowed_default";
+            case FirewallDecision::AllowedByIp:
+                return "allowed_by_ip";
+            case FirewallDecision::AllowedByCidr:
+                return "allowed_by_cidr";
+            case FirewallDecision::AllowedByPort:
+                return "allowed_by_port";
+            case FirewallDecision::AllowedByRange:
+                return "allowed_by_range";
+            case FirewallDecision::DeniedByIp:
+                return "denied_by_ip";
+            case FirewallDecision::DeniedByCidr:
+                return "denied_by_cidr";
+            case FirewallDecision::DeniedByPort:
+                return "denied_by_port";
+            case FirewallDecision::DeniedByRange:
+                return "denied_by_range";
+            case FirewallDecision::DeniedByMissingAllowMatch:
+                return "denied_by_missing_allow_match";
+        }
+        return "unknown";
+    }
     FirewallCidrRule firewall_allow_cidrs[kMaxFirewallRules]{};
     FirewallCidrRule firewall_deny_cidrs[kMaxFirewallRules]{};
     FirewallRangeRule firewall_allow_ranges[kMaxFirewallRules]{};
@@ -890,72 +947,30 @@ struct RouteConfig {
     void set_firewall_default_deny() { firewall_default_allow = false; }
     bool firewall_default_is_allow() const { return firewall_default_allow; }
 
+    FirewallDecision firewall_decision(u32 peer_addr, u16 peer_port) const {
+        return firewall_decision_impl(ntohl(peer_addr), true, peer_port);
+    }
+    FirewallDecision firewall_decision(u32 peer_addr) const {
+        return firewall_decision_impl(ntohl(peer_addr), false, 0);
+    }
+    FirewallDecision firewall_decision_host(u32 peer_host_addr) const {
+        return firewall_decision(htonl(peer_host_addr));
+    }
+    FirewallDecision firewall_decision_host(u32 peer_host_addr, u16 peer_port) const {
+        return firewall_decision(htonl(peer_host_addr), peer_port);
+    }
+
     // `peer_addr` must be in network byte order (same as getpeername()).
     // It is converted to packed host-order u32 before matching:
     //   (a << 24) | (b << 16) | (c << 8) | d
+    // Address-only overloads ignore port rule tables by design (legacy behavior).
     bool firewall_allows_peer(u32 peer_addr) const {
-        const u32 peer_host = ntohl(peer_addr);
-        for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] == peer_host) return false;
-        }
-        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
-            const auto& r = firewall_deny_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return false;
-        }
-        for (u32 i = 0; i < firewall_deny_range_count; i++) {
-            const auto& r = firewall_deny_ranges[i];
-            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return false;
-        }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0 &&
-            firewall_allow_range_count == 0)
-            return firewall_default_allow;
-        for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] == peer_host) return true;
-        }
-        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
-            const auto& r = firewall_allow_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return true;
-        }
-        for (u32 i = 0; i < firewall_allow_range_count; i++) {
-            const auto& r = firewall_allow_ranges[i];
-            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return true;
-        }
-        return false;
+        const FirewallDecision d = firewall_decision(peer_addr);
+        return firewall_decision_is_allow(d);
     }
     bool firewall_allows_peer(u32 peer_addr, u16 peer_port) const {
-        const u32 peer_host = ntohl(peer_addr);
-        for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] == peer_host) return false;
-        }
-        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
-            const auto& r = firewall_deny_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return false;
-        }
-        for (u32 i = 0; i < firewall_deny_range_count; i++) {
-            const auto& r = firewall_deny_ranges[i];
-            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return false;
-        }
-        for (u32 i = 0; i < firewall_deny_port_count; i++) {
-            if (firewall_deny_ports[i] == peer_port) return false;
-        }
-        if (firewall_allow_count == 0 && firewall_allow_cidr_count == 0 &&
-            firewall_allow_range_count == 0 && firewall_allow_port_count == 0)
-            return firewall_default_allow;
-        for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] == peer_host) return true;
-        }
-        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
-            const auto& r = firewall_allow_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return true;
-        }
-        for (u32 i = 0; i < firewall_allow_range_count; i++) {
-            const auto& r = firewall_allow_ranges[i];
-            if (peer_host >= r.start_ip && peer_host <= r.end_ip) return true;
-        }
-        for (u32 i = 0; i < firewall_allow_port_count; i++) {
-            if (firewall_allow_ports[i] == peer_port) return true;
-        }
-        return false;
+        const FirewallDecision d = firewall_decision(peer_addr, peer_port);
+        return firewall_decision_is_allow(d);
     }
     // Convenience overload for host-order IPv4 callers.
     bool firewall_allows_peer_host(u32 peer_host_addr) const {
@@ -966,6 +981,53 @@ struct RouteConfig {
     }
 
 private:
+    FirewallDecision firewall_decision_impl(u32 peer_host,
+                                            bool use_port_rules,
+                                            u16 peer_port) const {
+        for (u32 i = 0; i < firewall_deny_count; i++) {
+            if (firewall_deny_ips[i] == peer_host) return FirewallDecision::DeniedByIp;
+        }
+        for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
+            const auto& r = firewall_deny_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::DeniedByCidr;
+        }
+        for (u32 i = 0; i < firewall_deny_range_count; i++) {
+            const auto& r = firewall_deny_ranges[i];
+            if (peer_host >= r.start_ip && peer_host <= r.end_ip)
+                return FirewallDecision::DeniedByRange;
+        }
+        if (use_port_rules) {
+            for (u32 i = 0; i < firewall_deny_port_count; i++) {
+                if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DeniedByPort;
+            }
+        }
+        const bool has_allow_rules = firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
+                                     firewall_allow_range_count > 0 ||
+                                     (use_port_rules && firewall_allow_port_count > 0);
+        if (!has_allow_rules) {
+            return firewall_default_allow ? FirewallDecision::AllowedDefault
+                                          : FirewallDecision::DeniedByMissingAllowMatch;
+        }
+        for (u32 i = 0; i < firewall_allow_count; i++) {
+            if (firewall_allow_ips[i] == peer_host) return FirewallDecision::AllowedByIp;
+        }
+        for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
+            const auto& r = firewall_allow_cidrs[i];
+            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::AllowedByCidr;
+        }
+        for (u32 i = 0; i < firewall_allow_range_count; i++) {
+            const auto& r = firewall_allow_ranges[i];
+            if (peer_host >= r.start_ip && peer_host <= r.end_ip)
+                return FirewallDecision::AllowedByRange;
+        }
+        if (use_port_rules) {
+            for (u32 i = 0; i < firewall_allow_port_count; i++) {
+                if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowedByPort;
+            }
+        }
+        return FirewallDecision::DeniedByMissingAllowMatch;
+    }
+
     static Str cstr_as_str(const char* s) {
         u32 len = 0;
         while (s[len]) len++;
