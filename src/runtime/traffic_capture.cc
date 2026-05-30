@@ -24,7 +24,8 @@ void capture_file_header_init(CaptureFileHeader* hdr) {
 bool capture_file_header_valid(const CaptureFileHeader* hdr) {
     return hdr->magic[0] == 'R' && hdr->magic[1] == 'U' && hdr->magic[2] == 'T' &&
            hdr->magic[3] == 'C' && hdr->magic[4] == 'A' && hdr->magic[5] == 'P' &&
-           hdr->magic[6] == '0' && hdr->magic[7] == '1' && (hdr->version == 1 || hdr->version == kCaptureFileVersion) &&
+           hdr->magic[6] == '0' && hdr->magic[7] == '1' &&
+           (hdr->version == 1 || hdr->version == kCaptureFileVersion) &&
            hdr->entry_size == sizeof(CaptureEntry);
 }
 

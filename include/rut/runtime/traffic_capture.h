@@ -44,7 +44,7 @@ static constexpr u8 kCaptureFlagTruncated = 0x01;  // headers exceeded 8KB, trun
 // Binary file header for capture files.
 // Written once at the start of the file, entry_count updated on close.
 struct CaptureFileHeader {
-    char magic[8];     // "RUTCAP01"
+    char magic[8];  // "RUTCAP01"
     // 1: original format (peer_port always 0, reserved bytes omitted in schema)
     // 2: adds source-port in CaptureEntry::peer_port
     u32 version;

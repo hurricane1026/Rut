@@ -44,7 +44,7 @@ struct ReplayReader {
     i32 fd = -1;
     CaptureFileHeader header{};
     u64 entries_read = 0;
-    u32 capture_file_version = 1;
+    u32 capture_file_version = kCaptureFileVersion;
 
     // Open a capture file. Returns 0 on success, -1 on error.
     // Closes any previously open fd to prevent leaks on re-open.

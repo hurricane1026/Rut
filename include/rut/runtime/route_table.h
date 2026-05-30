@@ -1019,7 +1019,7 @@ private:
                                      (use_port_rules && firewall_allow_port_count > 0);
         if (!has_allow_rules) {
             return firewall_default_allow ? FirewallDecision::AllowedDefault
-                                         : FirewallDecision::DeniedByMissingAllowMatch;
+                                          : FirewallDecision::DeniedByMissingAllowMatch;
         }
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] == peer_host) return FirewallDecision::AllowedByIp;

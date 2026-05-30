@@ -11400,6 +11400,7 @@ TEST(route_coverage, firewall_decision_reports_allow_reason_and_default_deny) {
     CHECK_EQ(cfg.firewall_decision(htonl(0x0b000001), 8443),
              RouteConfig::FirewallDecision::AllowedByPort);
 }
+
 TEST(route_coverage, firewall_decision_host_helpers) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
@@ -11409,6 +11410,7 @@ TEST(route_coverage, firewall_decision_host_helpers) {
     CHECK_EQ(cfg.firewall_decision_host(0x0a010203, 22),
              RouteConfig::FirewallDecision::DeniedByPort);
 }
+
 TEST(route_coverage, firewall_decision_allow_deny_classification_helpers) {
     using D = RouteConfig::FirewallDecision;
     CHECK(RouteConfig::firewall_decision_is_allow(D::AllowedDefault));
@@ -11440,8 +11442,9 @@ TEST(route_coverage, firewall_decision_name_helper) {
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DeniedByPort), "denied_by_port");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DeniedByRange), "denied_by_range");
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DeniedByMissingAllowMatch),
-                "deny_missing_allow_match");
+                "denied_by_missing_allow_match");
 }
+
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));
