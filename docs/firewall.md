@@ -87,9 +87,7 @@ For callers already holding network-order IPv4 (`in_addr.s_addr` style),
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
 return `false` on cap overflow, invalid CIDR prefix, or invalid IPv4 range.
-Adding the same exact IP, CIDR, range, or port repeatedly is idempotent (returns `true`
-without consuming additional rule slots).
-Adding the same source port repeatedly is also idempotent (returns `true`
+Adding the same exact IP, CIDR, range, or source port repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
 Port rules reject `0` (invalid TCP/UDP port).
 Remove APIs return `true` only when a matching rule exists and is deleted.
