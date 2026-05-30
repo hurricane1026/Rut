@@ -1002,15 +1002,15 @@ private:
             const auto& r = firewall_allow_cidrs[i];
             if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::AllowAllowCidr;
         }
-        if (use_port_rules) {
-            for (u32 i = 0; i < firewall_allow_port_count; i++) {
-                if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowAllowPort;
-            }
-        }
         for (u32 i = 0; i < firewall_allow_range_count; i++) {
             const auto& r = firewall_allow_ranges[i];
             if (peer_host >= r.start_ip && peer_host <= r.end_ip)
                 return FirewallDecision::AllowAllowRange;
+        }
+        if (use_port_rules) {
+            for (u32 i = 0; i < firewall_allow_port_count; i++) {
+                if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowAllowPort;
+            }
         }
         return FirewallDecision::DenyMissingAllowMatch;
     }

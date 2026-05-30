@@ -979,7 +979,11 @@ inline bool connect_bound_client_socket(i32 fd, u16 server_port) {
     remote_addr.sin_family = AF_INET;
     remote_addr.sin_port = __builtin_bswap16(server_port);
     remote_addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
-    return connect(fd, reinterpret_cast<struct sockaddr*>(&remote_addr), sizeof(remote_addr)) == 0;
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&remote_addr), sizeof(remote_addr)) < 0) {
+        close(fd);
+        return false;
+    }
+    return true;
 }
 
 inline bool send_all(i32 fd, const char* d, u32 len) {

@@ -2598,14 +2598,13 @@ TEST(route, firewall_deny_localhost_source_port_real_socket) {
     u16 port = get_port(lfd);
     REQUIRE(loop->init(0, lfd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 20};
-    lt.start();
-
     u16 deny_port = 0;
     i32 c = create_bound_client_socket(0, &deny_port);
     REQUIRE(c >= 0);
     REQUIRE(deny_port > 0);
     REQUIRE(cfg.add_firewall_deny_port(deny_port));
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
     REQUIRE(connect_bound_client_socket(c, port));
     send_all(c, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);
     char buf[1024];
@@ -2633,9 +2632,6 @@ TEST(route, firewall_allowlist_source_port_real_socket) {
     u16 port = get_port(lfd);
     REQUIRE(loop->init(0, lfd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 20};
-    lt.start();
-
     u16 blocked_port = 0;
     i32 blocked = create_bound_client_socket(0, &blocked_port);
     REQUIRE(blocked >= 0);
@@ -2646,6 +2642,8 @@ TEST(route, firewall_allowlist_source_port_real_socket) {
     REQUIRE(allow_port > 0);
     REQUIRE(allow_port != blocked_port);
     REQUIRE(cfg.add_firewall_allow_port(allow_port));
+    LoopThread lt = {loop, {}, 20};
+    lt.start();
 
     REQUIRE(connect_bound_client_socket(blocked, port));
     send_all(blocked, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 33);

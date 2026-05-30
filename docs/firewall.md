@@ -96,9 +96,6 @@ Remove APIs return `true` only when a matching rule exists and is deleted.
 `clear_firewall_allow_rules()` clears allow exact-IP, CIDR, range, and port tables.
 `clear_firewall_deny_rules()` clears deny exact-IP, CIDR, range, and port tables.
 `clear_firewall_rules()` clears all allow/deny exact, CIDR, range, and port rules.
-`clear_firewall_allow_rules()` clears allow exact-IP, CIDR, range, and port tables.
-`clear_firewall_deny_rules()` clears deny exact-IP, CIDR, range, and port tables.
-`clear_firewall_rules()` clears all allow/deny exact, CIDR, range, and port rules.
 Default policy is allow unless changed via `set_firewall_default_allow(false)`
 or `set_firewall_default_deny()`.
 
@@ -120,8 +117,8 @@ earlier).
 
 `firewall_decision(...)` returns a stable reason enum:
 
-- allow: `AllowDefault`, `AllowAllowIp`, `AllowAllowCidr`, `AllowAllowPort`
-- deny: `DenyDenyIp`, `DenyDenyCidr`, `DenyDenyPort`, `DenyMissingAllowMatch`
+- allow: `AllowDefault`, `AllowAllowIp`, `AllowAllowCidr`, `AllowAllowRange`, `AllowAllowPort`
+- deny: `DenyDenyIp`, `DenyDenyCidr`, `DenyDenyRange`, `DenyDenyPort`, `DenyMissingAllowMatch`
 
 `firewall_allows_peer(u32)` / `firewall_allows_peer_host(u32)` and
 `firewall_decision(u32)` / `firewall_decision_host(u32)` intentionally ignore
