@@ -61,4 +61,13 @@ i32 capture_read_entry(i32 fd, CaptureEntry& entry) {
     return 0;
 }
 
+i32 capture_read_entry_v1(i32 fd, CaptureEntry& entry) {
+    const i32 rc = capture_read_entry(fd, entry);
+    if (rc == 0) {
+        entry.peer_port = 0;
+        __builtin_memset(entry._reserved, 0, sizeof(entry._reserved));
+    }
+    return rc;
+}
+
 }  // namespace rut

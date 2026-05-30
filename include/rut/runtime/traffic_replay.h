@@ -89,9 +89,9 @@ struct ReplayReader {
     i32 next(CaptureEntry& entry) {
         if (fd < 0) return -1;
         if (entries_read >= header.entry_count) return -1;
-        i32 rc = capture_read_entry(fd, entry);
+        const i32 rc =
+            (capture_file_version == 1) ? capture_read_entry_v1(fd, entry) : capture_read_entry(fd, entry);
         if (rc == 0) {
-            if (capture_file_version == 1) entry.peer_port = 0;
             entries_read++;
         }
         return rc;

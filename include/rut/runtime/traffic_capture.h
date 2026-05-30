@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"  // realtime_us()
 #include <atomic>
+#include <cstddef>
 
 namespace rut {
 
@@ -37,6 +38,10 @@ struct CaptureEntry {
 };
 
 static_assert(sizeof(CaptureEntry) == 8256, "CaptureEntry must be 8256 bytes");
+static_assert(offsetof(CaptureEntry, peer_port) == 56, "peer_port offset must be 56 bytes");
+static_assert(offsetof(CaptureEntry, _reserved) == 58, "_reserved offset must be 58 bytes");
+static_assert(offsetof(CaptureEntry, raw_headers) == 64, "raw_headers offset must be 64 bytes");
+static_assert(sizeof(CaptureEntry::_reserved) == 6, "reserved bytes count must remain 6");
 
 // Flags for CaptureEntry::flags
 static constexpr u8 kCaptureFlagTruncated = 0x01;  // headers exceeded 8KB, truncated
@@ -131,5 +136,10 @@ i32 capture_write_entry(i32 fd, const CaptureEntry& entry);
 // Read one capture entry from fd at current position.
 // Returns 0 on success, -1 on error/EOF.
 i32 capture_read_entry(i32 fd, CaptureEntry& entry);
+
+// Read one version-1 capture entry.
+// Version 1 files keep legacy reserved bytes; migrate to current layout by
+// forcing peer_port/_reserved to the version-1 contract.
+i32 capture_read_entry_v1(i32 fd, CaptureEntry& entry);
 
 }  // namespace rut
