@@ -5,7 +5,7 @@ configuration (`RouteConfig`), independent of DSL parsing.
 
 ## Scope
 
-Current support is IPv4 source-address filtering on accepted downstream
+Current support is IPv4 source-address and source-port filtering on accepted downstream
 connections.
 
 - Exact IP rules
@@ -86,10 +86,8 @@ For callers already holding network-order IPv4 (`in_addr.s_addr` style),
 `*_network_order` helper overloads convert to packed host-order internally.
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
-return `false` on cap overflow or invalid CIDR prefix.
-Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
-without consuming additional rule slots).
-Adding the same source port repeatedly is also idempotent (returns `true`
+return `false` on cap overflow, invalid CIDR prefix, or invalid IPv4 range.
+Adding the same exact IP, CIDR, range, or source port repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
 Port rules reject `0` (invalid TCP/UDP port).
 Remove APIs return `true` only when a matching rule exists and is deleted.
