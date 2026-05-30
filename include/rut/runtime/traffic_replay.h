@@ -44,6 +44,7 @@ struct ReplayReader {
     i32 fd = -1;
     CaptureFileHeader header{};
     u64 entries_read = 0;
+    u32 capture_file_version = 1;
 
     // Open a capture file. Returns 0 on success, -1 on error.
     // Closes any previously open fd to prevent leaks on re-open.
@@ -79,6 +80,7 @@ struct ReplayReader {
             fd = -1;
             return -1;
         }
+        capture_file_version = header.version;
         entries_read = 0;
         return 0;
     }
@@ -88,7 +90,10 @@ struct ReplayReader {
         if (fd < 0) return -1;
         if (entries_read >= header.entry_count) return -1;
         i32 rc = capture_read_entry(fd, entry);
-        if (rc == 0) entries_read++;
+        if (rc == 0) {
+            if (capture_file_version == 1) entry.peer_port = 0;
+            entries_read++;
+        }
         return rc;
     }
 
@@ -186,7 +191,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     }
     const u32 conn_id = conn->id;
     const u16 actual_status = conn->resp_status;
-    const bool close_after_send = !conn->keep_alive;
+    const bool is_keep_alive = conn->keep_alive;
     IoEvent send_ev = {conn_id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
     loop.inject_and_dispatch(send_ev);
 
@@ -195,7 +200,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     result.replayed = true;
 
     // Step 6: Close keep-alive connections; non-keep-alive paths close in on_response_sent.
-    if (!close_after_send) {
+    if (is_keep_alive) {
         IoEvent eof_ev = {conn_id, 0, 0, 0, IoEventType::Recv, 0};
         loop.inject_and_dispatch(eof_ev);
     }

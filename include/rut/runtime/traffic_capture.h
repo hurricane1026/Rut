@@ -45,12 +45,16 @@ static constexpr u8 kCaptureFlagTruncated = 0x01;  // headers exceeded 8KB, trun
 // Written once at the start of the file, entry_count updated on close.
 struct CaptureFileHeader {
     char magic[8];     // "RUTCAP01"
-    u32 version;       // 1
+    // 1: original format (peer_port always 0, reserved bytes omitted in schema)
+    // 2: adds source-port in CaptureEntry::peer_port
+    u32 version;
     u32 flags;         // reserved
     u64 entry_count;   // total entries written (updated on close)
     u32 entry_size;    // sizeof(CaptureEntry), for forward compat
     u8 _reserved[36];  // pad to 64 bytes
 };
+
+static constexpr u32 kCaptureFileVersion = 2;
 
 static_assert(sizeof(CaptureFileHeader) == 64, "CaptureFileHeader must be 64 bytes");
 

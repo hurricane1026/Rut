@@ -117,8 +117,8 @@ earlier).
 
 `firewall_decision(...)` returns a stable reason enum:
 
-- allow: `AllowDefault`, `AllowAllowIp`, `AllowAllowCidr`, `AllowAllowRange`, `AllowAllowPort`
-- deny: `DenyDenyIp`, `DenyDenyCidr`, `DenyDenyRange`, `DenyDenyPort`, `DenyMissingAllowMatch`
+- allow: `AllowedDefault`, `AllowedByIp`, `AllowedByCidr`, `AllowedByRange`, `AllowedByPort`
+- deny: `DeniedByIp`, `DeniedByCidr`, `DeniedByRange`, `DeniedByPort`, `DeniedByMissingAllowMatch`
 
 `firewall_allows_peer(u32)` / `firewall_allows_peer_host(u32)` and
 `firewall_decision(u32)` / `firewall_decision_host(u32)` intentionally ignore

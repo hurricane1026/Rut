@@ -205,47 +205,73 @@ struct RouteConfig {
         u32 end_ip;
     };
     enum class FirewallDecision : u8 {
-        AllowDefault = 0,
-        AllowAllowIp = 1,
-        AllowAllowCidr = 2,
-        AllowAllowPort = 3,
-        AllowAllowRange = 4,
-        DenyDenyIp = 5,
-        DenyDenyCidr = 6,
-        DenyDenyPort = 7,
-        DenyDenyRange = 8,
-        DenyMissingAllowMatch = 9,
+        AllowedDefault = 0,
+        AllowedByIp = 1,
+        AllowedByCidr = 2,
+        AllowedByPort = 3,
+        AllowedByRange = 4,
+        DeniedByIp = 5,
+        DeniedByCidr = 6,
+        DeniedByPort = 7,
+        DeniedByRange = 8,
+        DeniedByMissingAllowMatch = 9,
     };
     static bool firewall_decision_is_allow(FirewallDecision d) {
-        return d == FirewallDecision::AllowDefault || d == FirewallDecision::AllowAllowIp ||
-               d == FirewallDecision::AllowAllowCidr || d == FirewallDecision::AllowAllowPort ||
-               d == FirewallDecision::AllowAllowRange;
+        switch (d) {
+            case FirewallDecision::AllowedDefault:
+            case FirewallDecision::AllowedByIp:
+            case FirewallDecision::AllowedByCidr:
+            case FirewallDecision::AllowedByPort:
+            case FirewallDecision::AllowedByRange:
+                return true;
+            case FirewallDecision::DeniedByIp:
+            case FirewallDecision::DeniedByCidr:
+            case FirewallDecision::DeniedByPort:
+            case FirewallDecision::DeniedByRange:
+            case FirewallDecision::DeniedByMissingAllowMatch:
+                return false;
+        }
+        return false;
     }
     static bool firewall_decision_is_deny(FirewallDecision d) {
-        return !firewall_decision_is_allow(d);
+        switch (d) {
+            case FirewallDecision::AllowedDefault:
+            case FirewallDecision::AllowedByIp:
+            case FirewallDecision::AllowedByCidr:
+            case FirewallDecision::AllowedByPort:
+            case FirewallDecision::AllowedByRange:
+                return false;
+            case FirewallDecision::DeniedByIp:
+            case FirewallDecision::DeniedByCidr:
+            case FirewallDecision::DeniedByPort:
+            case FirewallDecision::DeniedByRange:
+            case FirewallDecision::DeniedByMissingAllowMatch:
+                return true;
+        }
+        return false;
     }
     static const char* firewall_decision_name(FirewallDecision d) {
         switch (d) {
-            case FirewallDecision::AllowDefault:
-                return "allow_default";
-            case FirewallDecision::AllowAllowIp:
-                return "allow_allow_ip";
-            case FirewallDecision::AllowAllowCidr:
-                return "allow_allow_cidr";
-            case FirewallDecision::AllowAllowPort:
-                return "allow_allow_port";
-            case FirewallDecision::AllowAllowRange:
-                return "allow_allow_range";
-            case FirewallDecision::DenyDenyIp:
-                return "deny_deny_ip";
-            case FirewallDecision::DenyDenyCidr:
-                return "deny_deny_cidr";
-            case FirewallDecision::DenyDenyPort:
-                return "deny_deny_port";
-            case FirewallDecision::DenyDenyRange:
-                return "deny_deny_range";
-            case FirewallDecision::DenyMissingAllowMatch:
-                return "deny_missing_allow_match";
+            case FirewallDecision::AllowedDefault:
+                return "allowed_default";
+            case FirewallDecision::AllowedByIp:
+                return "allowed_by_ip";
+            case FirewallDecision::AllowedByCidr:
+                return "allowed_by_cidr";
+            case FirewallDecision::AllowedByPort:
+                return "allowed_by_port";
+            case FirewallDecision::AllowedByRange:
+                return "allowed_by_range";
+            case FirewallDecision::DeniedByIp:
+                return "denied_by_ip";
+            case FirewallDecision::DeniedByCidr:
+                return "denied_by_cidr";
+            case FirewallDecision::DeniedByPort:
+                return "denied_by_port";
+            case FirewallDecision::DeniedByRange:
+                return "denied_by_range";
+            case FirewallDecision::DeniedByMissingAllowMatch:
+                return "denied_by_missing_allow_match";
         }
         return "unknown";
     }
@@ -972,47 +998,47 @@ private:
                                             bool use_port_rules,
                                             u16 peer_port) const {
         for (u32 i = 0; i < firewall_deny_count; i++) {
-            if (firewall_deny_ips[i] == peer_host) return FirewallDecision::DenyDenyIp;
+            if (firewall_deny_ips[i] == peer_host) return FirewallDecision::DeniedByIp;
         }
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
             const auto& r = firewall_deny_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::DenyDenyCidr;
+            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::DeniedByCidr;
         }
         for (u32 i = 0; i < firewall_deny_range_count; i++) {
             const auto& r = firewall_deny_ranges[i];
             if (peer_host >= r.start_ip && peer_host <= r.end_ip)
-                return FirewallDecision::DenyDenyRange;
+                return FirewallDecision::DeniedByRange;
         }
         if (use_port_rules) {
             for (u32 i = 0; i < firewall_deny_port_count; i++) {
-                if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DenyDenyPort;
+                if (firewall_deny_ports[i] == peer_port) return FirewallDecision::DeniedByPort;
             }
         }
         const bool has_allow_rules = firewall_allow_count > 0 || firewall_allow_cidr_count > 0 ||
                                      firewall_allow_range_count > 0 ||
                                      (use_port_rules && firewall_allow_port_count > 0);
         if (!has_allow_rules) {
-            return firewall_default_allow ? FirewallDecision::AllowDefault
-                                          : FirewallDecision::DenyMissingAllowMatch;
+            return firewall_default_allow ? FirewallDecision::AllowedDefault
+                                         : FirewallDecision::DeniedByMissingAllowMatch;
         }
         for (u32 i = 0; i < firewall_allow_count; i++) {
-            if (firewall_allow_ips[i] == peer_host) return FirewallDecision::AllowAllowIp;
+            if (firewall_allow_ips[i] == peer_host) return FirewallDecision::AllowedByIp;
         }
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
             const auto& r = firewall_allow_cidrs[i];
-            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::AllowAllowCidr;
+            if ((peer_host & r.mask) == r.net_addr) return FirewallDecision::AllowedByCidr;
         }
         for (u32 i = 0; i < firewall_allow_range_count; i++) {
             const auto& r = firewall_allow_ranges[i];
             if (peer_host >= r.start_ip && peer_host <= r.end_ip)
-                return FirewallDecision::AllowAllowRange;
+                return FirewallDecision::AllowedByRange;
         }
         if (use_port_rules) {
             for (u32 i = 0; i < firewall_allow_port_count; i++) {
-                if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowAllowPort;
+                if (firewall_allow_ports[i] == peer_port) return FirewallDecision::AllowedByPort;
             }
         }
-        return FirewallDecision::DenyMissingAllowMatch;
+        return FirewallDecision::DeniedByMissingAllowMatch;
     }
 
     static Str cstr_as_str(const char* s) {
