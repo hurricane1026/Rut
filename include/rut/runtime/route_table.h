@@ -184,11 +184,11 @@ struct RouteConfig {
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
-    // Firewall rules use packed host-order u32 IPv4 values:
+    // Firewall rules support source IPv4 exact, CIDR, inclusive range, and
+    // source-port checks. IP values are packed host-order u32:
     //   ip = (a << 24) | (b << 16) | (c << 8) | d  for a.b.c.d
     // Connection.peer_addr is stored in network byte order; firewall_allows_peer
-    // converts it once to packed host-order before evaluation.
-    // Source-port rules use Connection.peer_port captured at accept-time.
+    // converts it once to the packed host-order representation before evaluation.
     // Evaluation order:
     //   1) deny exact IP / CIDR / range / port (any hit => reject)
     //   2) allow exact IP / CIDR / range / port (if any allow rules exist:

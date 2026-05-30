@@ -11444,7 +11444,6 @@ TEST(route_coverage, firewall_decision_name_helper) {
     CHECK_STREQ(RouteConfig::firewall_decision_name(D::DeniedByMissingAllowMatch),
                 "denied_by_missing_allow_match");
 }
-
 TEST(route_coverage, firewall_allows_peer_host_helper) {
     RouteConfig cfg;
     REQUIRE(cfg.add_firewall_allow_cidr("10.0.0.0/8"));

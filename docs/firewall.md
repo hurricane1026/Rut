@@ -5,7 +5,7 @@ configuration (`RouteConfig`), independent of DSL parsing.
 
 ## Scope
 
-Current support is IPv4 source-address filtering on accepted downstream
+Current support is IPv4 source-address and source-port filtering on accepted downstream
 connections.
 
 - Exact IP rules
@@ -86,8 +86,8 @@ For callers already holding network-order IPv4 (`in_addr.s_addr` style),
 `*_network_order` helper overloads convert to packed host-order internally.
 
 Each rule family currently has a fixed cap (`kMaxFirewallRules`), and add APIs
-return `false` on cap overflow or invalid CIDR prefix.
-Adding the same exact IP or same CIDR repeatedly is idempotent (returns `true`
+return `false` on cap overflow, invalid CIDR prefix, or invalid IPv4 range.
+Adding the same exact IP, CIDR, range, or port repeatedly is idempotent (returns `true`
 without consuming additional rule slots).
 Adding the same source port repeatedly is also idempotent (returns `true`
 without consuming additional rule slots).
@@ -197,7 +197,7 @@ Current integration coverage in `tests/test_integration.cc` includes:
 - `firewall_clear_rules_reenables_localhost_real_socket`
 - `firewall_remove_deny_rule_reenables_localhost_real_socket`
 - `firewall_remove_deny_cidr_reenables_localhost_real_socket`
-- `firewall_remove_allow_rule_restores_default_allow_real_socket`
+- `firewall_remove_allow_rule_reenables_default_allow_real_socket`
 - `firewall_remove_allow_cidr_restores_default_allow_real_socket`
 - `firewall_remove_deny_cidr_restores_allow_cidr_real_socket`
 - `firewall_remove_deny_ip_restores_allow_ip_real_socket`
