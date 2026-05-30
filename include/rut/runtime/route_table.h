@@ -977,6 +977,7 @@ struct RouteConfig {
     // `peer_addr` must be in network byte order (same as getpeername()).
     // It is converted to packed host-order u32 before matching:
     //   (a << 24) | (b << 16) | (c << 8) | d
+    // Address-only overloads ignore port rule tables by design (legacy behavior).
     bool firewall_allows_peer(u32 peer_addr) const {
         const FirewallDecision d = firewall_decision(peer_addr);
         return firewall_decision_is_allow(d);
