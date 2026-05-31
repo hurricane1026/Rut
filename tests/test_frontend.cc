@@ -2442,6 +2442,31 @@ route GET "/users" { if readBox(Box(value: 200)) == 200 { return 200 } else { re
     REQUIRE(hir);
 }
 
+TEST(frontend, analyze_imported_route_decorator_req_param_exposes_magic_request_fields) {
+    const std::string dir = "/tmp/rut_import_decorator_req_proxy";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func allow<T: Eq>(actual: T, expected: T) -> i32 => 0\n";
+        out << "func auth(_ req: i32) -> i32 => allow(req.method, GET)\n";
+    }
+    const auto src = R"rut(
+import "auth.rut"
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+}
+
 TEST(frontend, analyze_rejects_unknown_route_decorator) {
     const char* src = R"rut(
 route {
