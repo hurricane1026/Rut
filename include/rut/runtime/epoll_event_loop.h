@@ -527,75 +527,85 @@ public:
     // --- Dispatch ---
 
     void dispatch(const IoEvent& ev) {
-        if (ev.type == IoEventType::Accept) {
-            on_accept(ev);
-            return;
-        }
-        if (ev.type == IoEventType::HandlerTimer) {
-            // yield_timer_fd expired; drain all entries at/past the
-            // current clock.
-            drain_yield_heap();
-            return;
-        }
-        if (ev.type == IoEventType::Timeout) {
-            i32 ticks = ev.result > 0 ? ev.result : 1;
-            const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
-            if (ticks > max_ticks) ticks = max_ticks;
-            for (i32 t = 0; t < ticks; t++) {
-                timer.tick([this](Connection* c) {
-                    // A timer can now expire for two reasons:
-                    //   (1) keepalive — close the connection (existing).
-                    //   (2) a JIT handler yielded with wait(ms), or wait-any
-                    //       chose timeout as its completion event.
-                    if (c->pending_handler_fn &&
-                        (c->pending_yield_kind == jit::YieldKind::Timer ||
-                         (c->yield_armed &&
-                          yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
-                        c->yield_armed = false;
-                        c->resume_event_kind = jit::YieldKind::Timer;
-                        c->resume_event_result = 0;
-                        resume_jit_handler<EpollEventLoop>(this, *c);
-                    } else {
-                        this->close_conn(*c);
+        switch (ev.type) {
+            case IoEventType::Accept:
+                on_accept(ev);
+                break;
+            case IoEventType::HandlerTimer:
+                // yield_timer_fd expired; drain all entries at/past the
+                // current clock.
+                drain_yield_heap();
+                break;
+            case IoEventType::Timeout: {
+                i32 ticks = ev.result > 0 ? ev.result : 1;
+                const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+                if (ticks > max_ticks) ticks = max_ticks;
+                for (i32 t = 0; t < ticks; t++) {
+                    timer.tick([this](Connection* c) {
+                        // A timer can now expire for two reasons:
+                        //   (1) keepalive — close the connection (existing).
+                        //   (2) a JIT handler yielded with wait(ms), or wait-any
+                        //       chose timeout as its completion event.
+                        if (c->pending_handler_fn &&
+                            (c->pending_yield_kind == jit::YieldKind::Timer ||
+                             (c->yield_armed &&
+                              yield_kind_matches_event(
+                                  c->pending_yield_kind, IoEventType::Timeout)))) {
+                            c->yield_armed = false;
+                            c->resume_event_kind = jit::YieldKind::Timer;
+                            c->resume_event_result = 0;
+                            resume_jit_handler<EpollEventLoop>(this, *c);
+                        } else {
+                            this->close_conn(*c);
+                        }
+                    });
+                }
+                if (draining_.load(std::memory_order_acquire)) {
+                    u64 start = drain_start_.load(std::memory_order_relaxed);
+                    u32 period = drain_period_.load(std::memory_order_relaxed);
+                    u64 now = monotonic_secs();
+                    for (u32 i = 0; i < kMaxConns; i++) {
+                        if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
+                            should_drain_close(i, start, now, period)) {
+                            this->close_conn(conns[i]);
+                        }
                     }
-                });
+                }
+                break;
             }
-            if (draining_.load(std::memory_order_acquire)) {
-                u64 start = drain_start_.load(std::memory_order_relaxed);
-                u32 period = drain_period_.load(std::memory_order_relaxed);
-                u64 now = monotonic_secs();
-                for (u32 i = 0; i < kMaxConns; i++) {
-                    if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
-                        should_drain_close(i, start, now, period)) {
-                        this->close_conn(conns[i]);
+            case IoEventType::Recv:
+            case IoEventType::Send:
+            case IoEventType::UpstreamConnect:
+            case IoEventType::UpstreamRecv:
+            case IoEventType::UpstreamSend:
+                if (ev.conn_id < kMaxConns) {
+                    auto& conn = conns[ev.conn_id];
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                        conn.on_upstream_send) {
+                        timer.refresh(&conn, keepalive_timeout);
+                        this->dispatch_event(conn, ev);
+                    } else if (conn.pending_handler_fn) {
+                        if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                            disarm_yield_timer(conn);
+                            conn.resume_event_kind = yield_kind_from_event(ev.type);
+                            conn.resume_event_result = ev.result;
+                            resume_jit_handler<EpollEventLoop>(this, conn);
+                            break;
+                        }
+                        // Mid-yield (all callback slots null while the yield timer
+                        // owns the wakeup). Close on terminal recv (peer FIN / RST /
+                        // hang-up) so a client disconnect during wait(ms) can't
+                        // keep the slot allocated until the deadline fires.
+                        // close_conn takes the yield timer down via yield_heap
+                        // remove_by_conn in close_conn_impl.
+                        if (ev.type == IoEventType::Recv && ev.result <= 0) {
+                            this->close_conn(conn);
+                        }
                     }
                 }
-            }
-            return;
-        }
-        if (ev.conn_id < kMaxConns) {
-            auto& conn = conns[ev.conn_id];
-            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
-                timer.refresh(&conn, keepalive_timeout);
-                this->dispatch_event(conn, ev);
-            } else if (conn.pending_handler_fn) {
-                if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
-                    disarm_yield_timer(conn);
-                    conn.resume_event_kind = yield_kind_from_event(ev.type);
-                    conn.resume_event_result = ev.result;
-                    resume_jit_handler<EpollEventLoop>(this, conn);
-                    return;
-                }
-                // Mid-yield (all callback slots null while the yield timer
-                // owns the wakeup). Close on terminal recv (peer FIN / RST /
-                // hang-up) so a client disconnect during wait(ms) can't
-                // keep the slot allocated until the deadline fires.
-                // close_conn takes the yield timer down via yield_heap
-                // remove_by_conn in close_conn_impl.
-                if (ev.type == IoEventType::Recv && ev.result <= 0) {
-                    this->close_conn(conn);
-                }
-            }
+                break;
+            case IoEventType::_Count:
+                break;
         }
     }
 

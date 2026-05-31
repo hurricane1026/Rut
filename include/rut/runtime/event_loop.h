@@ -92,7 +92,10 @@ public:
             case IoEventType::UpstreamConnect:
                 if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
                 break;
-            default:
+            case IoEventType::Accept:
+            case IoEventType::Timeout:
+            case IoEventType::HandlerTimer:
+            case IoEventType::_Count:
                 break;
         }
     }
@@ -599,67 +602,77 @@ public:
     // --- Dispatch ---
 
     void dispatch(const IoEvent& ev) {
-        if (ev.type == IoEventType::Accept) {
-            // During drain: still accept queued connections so they get a
-            // proper response with Connection: close, rather than a TCP RST.
-            // on_accept() sets keep_alive=false when draining_ is true.
-            on_accept(ev);
-            return;
-        }
-        if (ev.type == IoEventType::Timeout) {
-            // ev.result carries timerfd tick count — may be >1 if loop stalled.
-            // Advance timer wheel once per accumulated tick to avoid skipping expirations.
-            i32 ticks = ev.result > 0 ? ev.result : 1;
-            const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
-            if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
-            for (i32 t = 0; t < ticks; t++) {
-                timer.tick([this](Connection* c) { this->close_conn(*c); });
-            }
+        switch (ev.type) {
+            case IoEventType::Accept:
+                // During drain: still accept queued connections so they get a
+                // proper response with Connection: close, rather than a TCP RST.
+                // on_accept() sets keep_alive=false when draining_ is true.
+                on_accept(ev);
+                break;
+            case IoEventType::Timeout: {
+                // ev.result carries timerfd tick count — may be >1 if loop stalled.
+                // Advance timer wheel once per accumulated tick to avoid skipping expirations.
+                i32 ticks = ev.result > 0 ? ev.result : 1;
+                const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+                if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
+                for (i32 t = 0; t < ticks; t++) {
+                    timer.tick([this](Connection* c) { this->close_conn(*c); });
+                }
 
-            // During drain: probabilistically close idle connections.
-            // ReadingHeader = waiting for next request on keep-alive (effectively idle).
-            if (draining_.load(std::memory_order_acquire)) {
-                u64 start = drain_start_.load(std::memory_order_relaxed);
-                u32 period = drain_period_.load(std::memory_order_relaxed);
-                u64 now = monotonic_secs();
-                for (u32 i = 0; i < kMaxConns; i++) {
-                    if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
-                        should_drain_close(i, start, now, period)) {
-                        this->close_conn(conns[i]);
+                // During drain: probabilistically close idle connections.
+                // ReadingHeader = waiting for next request on keep-alive (effectively idle).
+                if (draining_.load(std::memory_order_acquire)) {
+                    u64 start = drain_start_.load(std::memory_order_relaxed);
+                    u32 period = drain_period_.load(std::memory_order_relaxed);
+                    u64 now = monotonic_secs();
+                    for (u32 i = 0; i < kMaxConns; i++) {
+                        if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
+                            should_drain_close(i, start, now, period)) {
+                            this->close_conn(conns[i]);
+                        }
                     }
                 }
+                break;
             }
-            return;
-        }
-        if (ev.conn_id < kMaxConns) {
-            auto& conn = conns[ev.conn_id];
-            if constexpr (Backend::kAsyncIo) {
-                // Decrement pending_ops only on the final CQE for this op.
-                // Multishot recv (IORING_RECV_MULTISHOT) sets ev.more on
-                // intermediate CQEs — the SQE stays armed, so the op is
-                // still in-flight and must not be counted as complete.
-                if (!ev.more) {
-                    if (conn.pending_ops > 0) conn.pending_ops--;
-                    // Multishot recv ended — clear the armed flag using
-                    // event type (not state) to distinguish client vs upstream.
-                    if (ev.type == IoEventType::Recv) conn.recv_armed = false;
-                    if (ev.type == IoEventType::Send) conn.send_armed = false;
-                    if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
-                    if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+            case IoEventType::Recv:
+            case IoEventType::Send:
+            case IoEventType::UpstreamConnect:
+            case IoEventType::UpstreamRecv:
+            case IoEventType::UpstreamSend:
+            case IoEventType::HandlerTimer:
+                if (ev.conn_id < kMaxConns) {
+                    auto& conn = conns[ev.conn_id];
+                    if constexpr (Backend::kAsyncIo) {
+                        // Decrement pending_ops only on the final CQE for this op.
+                        // Multishot recv (IORING_RECV_MULTISHOT) sets ev.more on
+                        // intermediate CQEs — the SQE stays armed, so the op is
+                        // still in-flight and must not be counted as complete.
+                        if (!ev.more) {
+                            if (conn.pending_ops > 0) conn.pending_ops--;
+                            // Multishot recv ended — clear the armed flag using
+                            // event type (not state) to distinguish client vs upstream.
+                            if (ev.type == IoEventType::Recv) conn.recv_armed = false;
+                            if (ev.type == IoEventType::Send) conn.send_armed = false;
+                            if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                            if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+                        }
+                    }
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
+                        timer.refresh(&conn, keepalive_timeout);
+                        this->dispatch_event(conn, ev);
+                    } else if constexpr (Backend::kAsyncIo) {
+                        // Stale CQE for a closed connection. If all ops are now
+                        // complete, reclaim the slot immediately so a later Accept
+                        // in the same batch can reuse it (avoids dropping connections
+                        // at saturation).
+                        if (conn.pending_ops == 0) {
+                            reclaim_slot(ev.conn_id);
+                        }
+                    }
                 }
-            }
-            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
-                timer.refresh(&conn, keepalive_timeout);
-                this->dispatch_event(conn, ev);
-            } else if constexpr (Backend::kAsyncIo) {
-                // Stale CQE for a closed connection. If all ops are now
-                // complete, reclaim the slot immediately so a later Accept
-                // in the same batch can reuse it (avoids dropping connections
-                // at saturation).
-                if (conn.pending_ops == 0) {
-                    reclaim_slot(ev.conn_id);
-                }
-            }
+                break;
+            case IoEventType::_Count:
+                break;
         }
     }
 

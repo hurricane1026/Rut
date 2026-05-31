@@ -231,53 +231,63 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     }
 
     void dispatch(const IoEvent& ev) {
-        if (ev.type == IoEventType::Accept) {
-            if (ev.result < 0) return;
-            Connection* c = this->alloc_conn();
-            if (!c) return;
-            c->fd = ev.result;
-            c->state = ConnState::ReadingHeader;
-            c->on_recv = &on_header_received<SmallLoop>;
-            timer.add(c, keepalive_timeout);
-            this->submit_recv(*c);
-            return;
-        }
-        if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) {
-                // Mirror EpollEventLoop/IoUringEventLoop: a tick can
-                // represent either keepalive expiry (close) or a JIT
-                // yield fallback (resume). schedule_yield_timer on
-                // this mock uses the wheel, so tests exercising
-                // wait(...) reach this branch.
-                if (c->pending_handler_fn &&
-                    (c->pending_yield_kind == jit::YieldKind::Timer ||
-                     (c->yield_armed &&
-                      yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
-                    c->yield_armed = false;
-                    c->resume_event_kind = jit::YieldKind::Timer;
-                    c->resume_event_result = 0;
-                    resume_jit_handler<SmallLoop>(this, *c);
-                } else {
-                    this->close_conn(*c);
+        switch (ev.type) {
+            case IoEventType::Accept:
+                if (ev.result < 0) return;
+                Connection* c = this->alloc_conn();
+                if (!c) return;
+                c->fd = ev.result;
+                c->state = ConnState::ReadingHeader;
+                c->on_recv = &on_header_received<SmallLoop>;
+                timer.add(c, keepalive_timeout);
+                this->submit_recv(*c);
+                break;
+            case IoEventType::Timeout:
+                timer.tick([this](Connection* c) {
+                    // Mirror EpollEventLoop/IoUringEventLoop: a tick can
+                    // represent either keepalive expiry (close) or a JIT
+                    // yield fallback (resume). schedule_yield_timer on
+                    // this mock uses the wheel, so tests exercising
+                    // wait(...) reach this branch.
+                    if (c->pending_handler_fn &&
+                        (c->pending_yield_kind == jit::YieldKind::Timer ||
+                         (c->yield_armed &&
+                          yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
+                        c->yield_armed = false;
+                        c->resume_event_kind = jit::YieldKind::Timer;
+                        c->resume_event_result = 0;
+                        resume_jit_handler<SmallLoop>(this, *c);
+                    } else {
+                        this->close_conn(*c);
+                    }
+                });
+                break;
+            case IoEventType::Recv:
+            case IoEventType::Send:
+            case IoEventType::UpstreamConnect:
+            case IoEventType::UpstreamRecv:
+            case IoEventType::UpstreamSend:
+                if (ev.conn_id < kMaxConns) {
+                    auto& conn = conns[ev.conn_id];
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                        conn.on_upstream_send) {
+                        timer.refresh(&conn, keepalive_timeout);
+                        this->dispatch_event(conn, ev);
+                    } else if (conn.pending_handler_fn &&
+                               yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                        if (conn.yield_armed) {
+                            conn.yield_armed = false;
+                            timer.remove(&conn);
+                        }
+                        conn.resume_event_kind = yield_kind_from_event(ev.type);
+                        conn.resume_event_result = ev.result;
+                        resume_jit_handler<SmallLoop>(this, conn);
+                    }
                 }
-            });
-            return;
-        }
-        if (ev.conn_id < kMaxConns) {
-            auto& conn = conns[ev.conn_id];
-            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
-                timer.refresh(&conn, keepalive_timeout);
-                this->dispatch_event(conn, ev);
-            } else if (conn.pending_handler_fn &&
-                       yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
-                if (conn.yield_armed) {
-                    conn.yield_armed = false;
-                    timer.remove(&conn);
-                }
-                conn.resume_event_kind = yield_kind_from_event(ev.type);
-                conn.resume_event_result = ev.result;
-                resume_jit_handler<SmallLoop>(this, conn);
-            }
+                break;
+            case IoEventType::HandlerTimer:
+            case IoEventType::_Count:
+                break;
         }
     }
 
@@ -639,87 +649,95 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     }
 
     void dispatch(const IoEvent& ev) {
-        if (ev.type == IoEventType::Accept) {
-            if (ev.result < 0) return;
-            Connection* c = this->alloc_conn();
-            if (!c) return;
-            c->fd = ev.result;
-            c->state = ConnState::ReadingHeader;
-            c->on_recv = &on_header_received<AsyncSmallLoop>;
-            timer.add(c, keepalive_timeout);
-            this->submit_recv(*c);
-            return;
-        }
-        if (ev.type == IoEventType::HandlerTimer) {
-            if (ev.conn_id < kMaxConns) {
-                auto& conn = conns[ev.conn_id];
-                if (conn.pending_ops > 0) conn.pending_ops--;
-                const bool matching_generation =
-                    ev.result == static_cast<i32>(conn.yield_timer_gen);
-                const bool was_yield_armed = conn.yield_armed;
-                if (matching_generation) {
-                    conn.yield_armed = false;
-                    timer.remove(&conn);
+        switch (ev.type) {
+            case IoEventType::Accept:
+                if (ev.result < 0) return;
+                Connection* c = this->alloc_conn();
+                if (!c) return;
+                c->fd = ev.result;
+                c->state = ConnState::ReadingHeader;
+                c->on_recv = &on_header_received<AsyncSmallLoop>;
+                timer.add(c, keepalive_timeout);
+                this->submit_recv(*c);
+                break;
+            case IoEventType::HandlerTimer:
+                if (ev.conn_id < kMaxConns) {
+                    auto& conn = conns[ev.conn_id];
+                    if (conn.pending_ops > 0) conn.pending_ops--;
+                    const bool matching_generation =
+                        ev.result == static_cast<i32>(conn.yield_timer_gen);
+                    const bool was_yield_armed = conn.yield_armed;
+                    if (matching_generation) {
+                        conn.yield_armed = false;
+                        timer.remove(&conn);
+                    }
+                    if (conn.pending_handler_fn && matching_generation &&
+                        (conn.pending_yield_kind == jit::YieldKind::Timer ||
+                         (was_yield_armed &&
+                          yield_kind_matches_event(conn.pending_yield_kind,
+                                                   IoEventType::HandlerTimer)))) {
+                        conn.resume_event_kind = jit::YieldKind::Timer;
+                        conn.resume_event_result = 0;
+                        resume_jit_handler<AsyncSmallLoop>(this, conn);
+                    } else if (conn.pending_ops == 0 && !conn.pending_handler_fn && conn.fd < 0) {
+                        reclaim_slot(ev.conn_id);
+                    }
                 }
-                if (conn.pending_handler_fn && matching_generation &&
-                    (conn.pending_yield_kind == jit::YieldKind::Timer ||
-                     (was_yield_armed && yield_kind_matches_event(conn.pending_yield_kind,
-                                                                  IoEventType::HandlerTimer)))) {
-                    conn.resume_event_kind = jit::YieldKind::Timer;
-                    conn.resume_event_result = 0;
-                    resume_jit_handler<AsyncSmallLoop>(this, conn);
-                } else if (conn.pending_ops == 0 && !conn.pending_handler_fn && conn.fd < 0) {
-                    reclaim_slot(ev.conn_id);
+                break;
+            case IoEventType::Timeout:
+                timer.tick([this](Connection* c) {
+                    // See SmallLoop: a tick resumes yielded JIT handlers and
+                    // otherwise closes on keepalive expiry.
+                    if (c->pending_handler_fn &&
+                        (c->pending_yield_kind == jit::YieldKind::Timer ||
+                         (c->yield_armed &&
+                          yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
+                        c->yield_armed = false;
+                        c->resume_event_kind = jit::YieldKind::Timer;
+                        c->resume_event_result = 0;
+                        resume_jit_handler<AsyncSmallLoop>(this, *c);
+                    } else {
+                        this->close_conn(*c);
+                    }
+                });
+                break;
+            case IoEventType::Recv:
+            case IoEventType::Send:
+            case IoEventType::UpstreamConnect:
+            case IoEventType::UpstreamRecv:
+            case IoEventType::UpstreamSend:
+                if (ev.conn_id < kMaxConns) {
+                    auto& conn = conns[ev.conn_id];
+                    // Async CQE accounting: decrement pending_ops on final CQE.
+                    if (!ev.more) {
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (ev.type == IoEventType::Recv) conn.recv_armed = false;
+                        if (ev.type == IoEventType::Send) conn.send_armed = false;
+                        if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                        if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+                    }
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
+                        timer.refresh(&conn, keepalive_timeout);
+                        this->dispatch_event(conn, ev);
+                    } else if (conn.pending_handler_fn &&
+                               yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                        if (conn.yield_armed) {
+                            conn.yield_armed = false;
+                            timer.remove(&conn);
+                        }
+                        conn.resume_event_kind = yield_kind_from_event(ev.type);
+                        conn.resume_event_result = ev.result;
+                        resume_jit_handler<AsyncSmallLoop>(this, conn);
+                    } else {
+                        // Stale CQE: if all ops complete, reclaim immediately.
+                        if (conn.pending_ops == 0) {
+                            reclaim_slot(ev.conn_id);
+                        }
+                    }
                 }
-            }
-            return;
-        }
-        if (ev.type == IoEventType::Timeout) {
-            timer.tick([this](Connection* c) {
-                // See SmallLoop: a tick resumes yielded JIT handlers and
-                // otherwise closes on keepalive expiry.
-                if (c->pending_handler_fn &&
-                    (c->pending_yield_kind == jit::YieldKind::Timer ||
-                     (c->yield_armed &&
-                      yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
-                    c->yield_armed = false;
-                    c->resume_event_kind = jit::YieldKind::Timer;
-                    c->resume_event_result = 0;
-                    resume_jit_handler<AsyncSmallLoop>(this, *c);
-                } else {
-                    this->close_conn(*c);
-                }
-            });
-            return;
-        }
-        if (ev.conn_id < kMaxConns) {
-            auto& conn = conns[ev.conn_id];
-            // Async CQE accounting: decrement pending_ops on final CQE.
-            if (!ev.more) {
-                if (conn.pending_ops > 0) conn.pending_ops--;
-                if (ev.type == IoEventType::Recv) conn.recv_armed = false;
-                if (ev.type == IoEventType::Send) conn.send_armed = false;
-                if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
-                if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
-            }
-            if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
-                timer.refresh(&conn, keepalive_timeout);
-                this->dispatch_event(conn, ev);
-            } else if (conn.pending_handler_fn &&
-                       yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
-                if (conn.yield_armed) {
-                    conn.yield_armed = false;
-                    timer.remove(&conn);
-                }
-                conn.resume_event_kind = yield_kind_from_event(ev.type);
-                conn.resume_event_result = ev.result;
-                resume_jit_handler<AsyncSmallLoop>(this, conn);
-            } else {
-                // Stale CQE: if all ops complete, reclaim immediately.
-                if (conn.pending_ops == 0) {
-                    reclaim_slot(ev.conn_id);
-                }
-            }
+                break;
+            case IoEventType::_Count:
+                break;
         }
     }
 

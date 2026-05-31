@@ -9089,6 +9089,37 @@ TEST(state_invariant, jit_req_body_chunked_request_is_rejected) {
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
+TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_wait_recv_then_status, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
+    c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+
+    check_jit_reading_body_invariant(_tc, c);
+    CHECK_EQ(c->req_body_remaining, 4u);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    check_exec_handler_yield_invariant(_tc, c, &state_invariant_wait_recv_then_status, 0);
+    CHECK_EQ(static_cast<u8>(c->pending_yield_kind), static_cast<u8>(jit::YieldKind::Recv));
+
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 12));
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 204u);
+    check_sending_response_invariant(_tc, c);
+}
+
 TEST(state_invariant, static_dispatch_keeps_slots_consistent) {
     SmallLoop loop;
     loop.setup();
@@ -9438,34 +9469,58 @@ TEST(state_invariant, jit_dispatch_classifies_all_event_yields) {
 }
 
 TEST(state_invariant, jit_event_helpers_map_runtime_events) {
-    CHECK(yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Recv));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Send));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::UpstreamConnect));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::UpstreamRecv));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::UpstreamSend));
-    CHECK(yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Timeout));
-    CHECK(yield_kind_matches_event(jit::YieldKind::Any, IoEventType::HandlerTimer));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Accept));
+    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::_Count); ++raw) {
+        const IoEventType type = static_cast<IoEventType>(raw);
 
-    CHECK(yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::Recv));
-    CHECK(yield_kind_matches_event(jit::YieldKind::Send, IoEventType::Send));
-    CHECK(yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::UpstreamConnect));
-    CHECK(yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::UpstreamRecv));
-    CHECK(yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::UpstreamSend));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::Recv));
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Any, type),
+                 (type == IoEventType::Recv || type == IoEventType::Timeout ||
+                  type == IoEventType::HandlerTimer));
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Recv, type), type == IoEventType::Recv);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Send, type), type == IoEventType::Send);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::UpstreamConnect, type),
+                 type == IoEventType::UpstreamConnect);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::UpstreamRecv, type),
+                 type == IoEventType::UpstreamRecv);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::UpstreamSend, type),
+                 type == IoEventType::UpstreamSend);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Timer, type), false);
 
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Recv)),
-             static_cast<u8>(jit::YieldKind::Recv));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Send)),
-             static_cast<u8>(jit::YieldKind::Send));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::UpstreamConnect)),
-             static_cast<u8>(jit::YieldKind::UpstreamConnect));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::UpstreamRecv)),
-             static_cast<u8>(jit::YieldKind::UpstreamRecv));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::UpstreamSend)),
-             static_cast<u8>(jit::YieldKind::UpstreamSend));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Timeout)),
-             static_cast<u8>(jit::YieldKind::Timer));
+        jit::YieldKind expected = jit::YieldKind::HttpGet;
+        switch (type) {
+            case IoEventType::Recv:
+                expected = jit::YieldKind::Recv;
+                break;
+            case IoEventType::Send:
+                expected = jit::YieldKind::Send;
+                break;
+            case IoEventType::UpstreamConnect:
+                expected = jit::YieldKind::UpstreamConnect;
+                break;
+            case IoEventType::UpstreamRecv:
+                expected = jit::YieldKind::UpstreamRecv;
+                break;
+            case IoEventType::UpstreamSend:
+                expected = jit::YieldKind::UpstreamSend;
+                break;
+            case IoEventType::Timeout:
+            case IoEventType::HandlerTimer:
+                expected = jit::YieldKind::Timer;
+                break;
+            default:
+                break;
+        }
+        CHECK_EQ(static_cast<u8>(yield_kind_from_event(type)), static_cast<u8>(expected));
+    }
+
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::_Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::_Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::_Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::_Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::_Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::_Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::_Count));
+    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::_Count)),
+             static_cast<u8>(jit::YieldKind::HttpGet));
 }
 
 TEST(state_invariant, iouring_user_data_preserves_full_timer_generation) {
@@ -10157,6 +10212,33 @@ TEST(state_transition, proxy_keepalive_to_reading_header) {
     loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
+// JIT path: Read body → complete → resume handler state.
+TEST(state_transition, jit_body_complete_enters_exec_handler) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &state_invariant_wait_recv_then_status, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
+    c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+
+    CHECK_EQ(c->state, ConnState::ReadingBody);
+    CHECK_EQ(c->req_body_remaining, 4u);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    CHECK_EQ(c->state, ConnState::ExecHandler);
+    CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
 }
 
 // ==========================================================================
