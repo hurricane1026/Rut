@@ -9576,6 +9576,40 @@ static FrontendResult<void> load_imported_modules(
     const std::vector<Str>& route_decorator_names) {
     if (source_path.len == 0) return {};
     const auto base_dir = std::filesystem::path(str_to_std_string(source_path)).parent_path();
+    auto collect_imported_decorator_names =
+        [&](const AstImportDecl& target_decl,
+            const std::string& target_normalized) -> std::vector<Str> {
+        std::vector<Str> imported_decorator_names;
+        for (u32 ii = 0; ii < file.items.len; ii++) {
+            const auto& other_item = file.items[ii];
+            if (other_item.kind != AstItemKind::Import) continue;
+            const auto other_normalized =
+                (base_dir / str_to_std_string(other_item.import_decl.path))
+                    .lexically_normal()
+                    .string();
+            if (other_normalized != target_normalized ||
+                other_item.import_decl.has_namespace_alias != target_decl.has_namespace_alias ||
+                (other_item.import_decl.has_namespace_alias &&
+                 !other_item.import_decl.namespace_alias.eq(target_decl.namespace_alias)))
+                continue;
+            for (const auto& decorator_name : route_decorator_names) {
+                if (!other_item.import_decl.selective) {
+                    if (!other_item.import_decl.has_namespace_alias &&
+                        !contains_str(imported_decorator_names, decorator_name))
+                        imported_decorator_names.push_back(decorator_name);
+                    continue;
+                }
+                for (u32 si = 0; si < other_item.import_decl.selected_names.len; si++) {
+                    const auto& selected = other_item.import_decl.selected_names[si];
+                    const Str visible = selected.has_alias ? selected.alias : selected.name;
+                    if (visible.eq(decorator_name) &&
+                        !contains_str(imported_decorator_names, selected.name))
+                        imported_decorator_names.push_back(selected.name);
+                }
+            }
+        }
+        return imported_decorator_names;
+    };
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Import) continue;
@@ -9633,22 +9667,8 @@ static FrontendResult<void> load_imported_modules(
         std::unique_ptr<AstFile> ast_owned(ast.value());
         auto kept_path = stash_owned_string(owned_strings, normalized);
         g_import_analysis_counter++;
-        std::vector<Str> imported_decorator_names;
-        for (const auto& decorator_name : route_decorator_names) {
-            if (!item.import_decl.selective) {
-                if (!item.import_decl.has_namespace_alias &&
-                    !contains_str(imported_decorator_names, decorator_name))
-                    imported_decorator_names.push_back(decorator_name);
-                continue;
-            }
-            for (u32 si = 0; si < item.import_decl.selected_names.len; si++) {
-                const auto& selected = item.import_decl.selected_names[si];
-                const Str visible = selected.has_alias ? selected.alias : selected.name;
-                if (visible.eq(decorator_name) &&
-                    !contains_str(imported_decorator_names, selected.name))
-                    imported_decorator_names.push_back(selected.name);
-            }
-        }
+        std::vector<Str> imported_decorator_names =
+            collect_imported_decorator_names(item.import_decl, normalized);
         auto imported = analyze_file_internal(
             *ast_owned, kept_path, import_stack, &owned_strings, imported_decorator_names);
         if (!imported) return core::make_unexpected(imported.error());
