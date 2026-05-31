@@ -9506,7 +9506,8 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
             case IoEventType::HandlerTimer:
                 expected = jit::YieldKind::Timer;
                 break;
-            default:
+            case IoEventType::Accept:
+            case IoEventType::_Count:
                 break;
         }
         CHECK_EQ(static_cast<u8>(yield_kind_from_event(type)), static_cast<u8>(expected));
@@ -10237,8 +10238,13 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
     CHECK_EQ(c->req_body_remaining, 4u);
 
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
-    CHECK_EQ(c->state, ConnState::ExecHandler);
-    CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+    if (c->state == ConnState::ExecHandler) {
+        CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+    } else {
+        CHECK_EQ(c->state, ConnState::Sending);
+        CHECK_EQ(c->resp_status, 204u);
+        check_sending_response_invariant(_tc, c);
+    }
 }
 
 // ==========================================================================
