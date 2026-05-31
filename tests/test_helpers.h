@@ -289,8 +289,6 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
             case IoEventType::HandlerTimer:
             case IoEventType::_Count:
                 break;
-            default:
-                break;
         }
     }
 
@@ -742,8 +740,6 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                 }
                 break;
             case IoEventType::_Count:
-                break;
-            default:
                 break;
         }
     }
