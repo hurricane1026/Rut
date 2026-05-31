@@ -6100,7 +6100,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.type = HirTypeKind::Bool;
             out.lhs = lhs_ptr;
             out.rhs = true_ptr;
-            if (!out.args.push(rhs_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!out.args.push(rhs_ptr))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
             out.shape_index = rhs->shape_index;
             out.variant_index = rhs->variant_index;
             out.struct_index = rhs->struct_index;
@@ -6252,7 +6253,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         out.lhs = lhs_ptr;
         out.rhs = rhs_ptr;
-        if (!out.args.push(false_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!out.args.push(false_ptr))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         out.may_nil = false;
         out.may_error = false;
         out.error_struct_index = rhs->error_struct_index;
@@ -6724,8 +6726,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.may_nil = false;
         out.may_error = lhs->may_error || rhs->may_error;
         out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
-        out.error_variant_index = rhs->may_error ? rhs->error_variant_index
-                                                : lhs->error_variant_index;
+        out.error_variant_index =
+            rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
         return out;
     }
 
@@ -6780,10 +6782,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         fallback.span = expr.span;
         fallback.may_nil = false;
         fallback.may_error = lhs->may_error || rhs->may_error;
-        fallback.error_struct_index = rhs->may_error ? rhs->error_struct_index
-                                                  : lhs->error_struct_index;
-        fallback.error_variant_index = rhs->may_error ? rhs->error_variant_index
-                                                     : lhs->error_variant_index;
+        fallback.error_struct_index =
+            rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
+        fallback.error_variant_index =
+            rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
         fallback.lhs = lhs_ptr;
         if (!route->exprs.push(fallback))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -6795,12 +6797,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.span = expr.span;
         out.lhs = cond_ptr;
         out.rhs = rhs_ptr;
-        if (!out.args.push(fallback_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!out.args.push(fallback_ptr))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
         out.may_nil = false;
         out.may_error = lhs->may_error || rhs->may_error;
         out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
-        out.error_variant_index = rhs->may_error ? rhs->error_variant_index
-                                                : lhs->error_variant_index;
+        out.error_variant_index =
+            rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
         return out;
     }
 
