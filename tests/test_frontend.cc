@@ -11700,7 +11700,7 @@ TEST(frontend, lower_to_rir_supports_runtime_any_optional_query_value_eagerly_wi
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
-    REQUIRE_GE(rir.module.function_count, 1u);
+    REQUIRE_GE(rir.module.func_count, 1u);
     const auto& fn = rir.module.functions[0];
     REQUIRE_GE(fn.block_count, 1u);
     CHECK(block_op_count(fn.blocks[0], rir::Opcode::Select) >= 1u);
@@ -11727,7 +11727,7 @@ TEST(frontend, lower_to_rir_supports_runtime_all_optional_query_fallback_call_ea
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
-    REQUIRE_GE(rir.module.function_count, 1u);
+    REQUIRE_GE(rir.module.func_count, 1u);
     const auto& fn = rir.module.functions[0];
     REQUIRE_GE(fn.block_count, 1u);
     CHECK(block_op_count(fn.blocks[0], rir::Opcode::OptIsNil) >= 1u);
