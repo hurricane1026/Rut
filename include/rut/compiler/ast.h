@@ -101,6 +101,7 @@ enum class AstExprKind : u8 {
     Eq,
     Lt,
     Gt,
+    And,
     Or,
     Pipe,
     Wait,

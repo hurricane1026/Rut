@@ -6100,6 +6100,91 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.error_variant_index = 0xffffffffu;
         return out;
     }
+    if (expr.kind == AstExprKind::And) {
+        auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        if (lhs->type != HirTypeKind::Bool || rhs->type != HirTypeKind::Bool || lhs->may_nil ||
+            lhs->may_error || rhs->may_nil || rhs->may_error) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        if (lhs->kind == HirExprKind::BoolLit) {
+            if (!lhs->bool_value) {
+                HirExpr folded{};
+                folded.kind = HirExprKind::BoolLit;
+                folded.type = HirTypeKind::Bool;
+                folded.bool_value = false;
+                folded.shape_index = rhs->shape_index;
+                folded.variant_index = rhs->variant_index;
+                folded.struct_index = rhs->struct_index;
+                folded.tuple_len = rhs->tuple_len;
+                for (u32 i = 0; i < rhs->tuple_len; i++) {
+                    folded.tuple_types[i] = rhs->tuple_types[i];
+                    folded.tuple_variant_indices[i] = rhs->tuple_variant_indices[i];
+                    folded.tuple_struct_indices[i] = rhs->tuple_struct_indices[i];
+                }
+                folded.may_nil = false;
+                folded.may_error = false;
+                folded.error_struct_index = rhs->error_struct_index;
+                folded.error_variant_index = rhs->error_variant_index;
+                folded.span = expr.span;
+                return folded;
+            }
+            HirExpr folded = rhs.value();
+            folded.span = expr.span;
+            return folded;
+        }
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(rhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
+        HirExpr false_expr{};
+        false_expr.kind = HirExprKind::BoolLit;
+        false_expr.type = HirTypeKind::Bool;
+        false_expr.bool_value = false;
+        false_expr.shape_index = rhs->shape_index;
+        false_expr.variant_index = rhs->variant_index;
+        false_expr.struct_index = rhs->struct_index;
+        false_expr.tuple_len = rhs->tuple_len;
+        for (u32 i = 0; i < rhs->tuple_len; i++) {
+            false_expr.tuple_types[i] = rhs->tuple_types[i];
+            false_expr.tuple_variant_indices[i] = rhs->tuple_variant_indices[i];
+            false_expr.tuple_struct_indices[i] = rhs->tuple_struct_indices[i];
+        }
+        false_expr.may_nil = false;
+        false_expr.may_error = false;
+        false_expr.error_struct_index = rhs->error_struct_index;
+        false_expr.error_variant_index = rhs->error_variant_index;
+        false_expr.span = expr.span;
+        if (!route->exprs.push(false_expr))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* false_ptr = &route->exprs[route->exprs.len - 1];
+
+        HirExpr out{};
+        out.kind = HirExprKind::IfElse;
+        out.type = HirTypeKind::Bool;
+        out.shape_index = rhs->shape_index;
+        out.variant_index = rhs->variant_index;
+        out.struct_index = rhs->struct_index;
+        out.tuple_len = rhs->tuple_len;
+        for (u32 i = 0; i < rhs->tuple_len; i++) {
+            out.tuple_types[i] = rhs->tuple_types[i];
+            out.tuple_variant_indices[i] = rhs->tuple_variant_indices[i];
+            out.tuple_struct_indices[i] = rhs->tuple_struct_indices[i];
+        }
+        out.lhs = lhs_ptr;
+        out.rhs = rhs_ptr;
+        if (!out.args.push(false_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.may_nil = false;
+        out.may_error = false;
+        out.error_struct_index = rhs->error_struct_index;
+        out.error_variant_index = rhs->error_variant_index;
+        out.span = expr.span;
+        return out;
+    }
     if (expr.kind == AstExprKind::Pipe) {
         if (expr.lhs == nullptr || expr.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -6487,6 +6572,118 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs) {
+    const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
+        dst->type = src.type;
+        dst->generic_index = src.generic_index;
+        dst->associated_name = src.associated_name;
+        dst->generic_has_error_constraint = src.generic_has_error_constraint;
+        dst->generic_has_eq_constraint = src.generic_has_eq_constraint;
+        dst->generic_has_ord_constraint = src.generic_has_ord_constraint;
+        dst->generic_protocol_index = src.generic_protocol_index;
+        dst->generic_protocol_count = src.generic_protocol_count;
+        for (u32 cpi = 0; cpi < src.generic_protocol_count; cpi++)
+            dst->generic_protocol_indices[cpi] = src.generic_protocol_indices[cpi];
+        dst->variant_index = src.variant_index;
+        dst->struct_index = src.struct_index;
+        dst->shape_index = src.shape_index;
+        dst->tuple_len = src.tuple_len;
+        for (u32 i = 0; i < src.tuple_len; i++) {
+            dst->tuple_types[i] = src.tuple_types[i];
+            dst->tuple_variant_indices[i] = src.tuple_variant_indices[i];
+            dst->tuple_struct_indices[i] = src.tuple_struct_indices[i];
+        }
+    };
+
+    if (expr.name.eq({"any", 3})) {
+        if (expr.args.len != 2) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        if (expr.args[0] == nullptr || expr.args[1] == nullptr) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        AstExpr any_expr{};
+        any_expr.kind = AstExprKind::Or;
+        any_expr.lhs = expr.args[0];
+        any_expr.rhs = expr.args[1];
+        any_expr.span = expr.span;
+        return analyze_expr(any_expr, route, mod, locals, local_count, binding);
+    }
+
+    if (expr.name.eq({"all", 3})) {
+        if (expr.args.len != 2) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        if (expr.args[0] == nullptr || expr.args[1] == nullptr) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        auto lhs = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!rhs) return core::make_unexpected(rhs.error());
+
+        if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
+            !same_hir_type_shape(mod, lhs.value(), rhs.value())) {
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+
+        const auto lhs_state = known_value_state(lhs.value(), locals, local_count, 0);
+        if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
+            HirExpr folded = lhs.value();
+            folded.span = expr.span;
+            return folded;
+        }
+        if (!lhs->may_nil && !lhs->may_error) {
+            HirExpr folded = rhs.value();
+            folded.span = expr.span;
+            return folded;
+        }
+
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
+
+        HirExpr cond{};
+        cond.kind = HirExprKind::HasValue;
+        cond.type = HirTypeKind::Bool;
+        cond.span = expr.span;
+        cond.lhs = lhs_ptr;
+        if (!route->exprs.push(cond)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
+
+        if (!route->exprs.push(rhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
+
+        HirExpr fallback{};
+        fallback.kind = HirExprKind::MissingOf;
+        copy_hir_shape(&fallback, rhs.value());
+        fallback.span = expr.span;
+        fallback.may_nil = lhs->may_nil || rhs->may_nil;
+        fallback.may_error = lhs->may_error || rhs->may_error;
+        fallback.error_struct_index = rhs->may_error ? rhs->error_struct_index
+                                                  : lhs->error_struct_index;
+        fallback.error_variant_index = rhs->may_error ? rhs->error_variant_index
+                                                     : lhs->error_variant_index;
+        fallback.lhs = lhs_ptr;
+        if (!route->exprs.push(fallback))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr* fallback_ptr = &route->exprs[route->exprs.len - 1];
+
+        HirExpr out{};
+        out.kind = HirExprKind::IfElse;
+        copy_hir_shape(&out, rhs.value());
+        out.span = expr.span;
+        out.lhs = cond_ptr;
+        out.rhs = rhs_ptr;
+        if (!out.args.push(fallback_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.may_nil = lhs->may_nil || rhs->may_nil;
+        out.may_error = lhs->may_error || rhs->may_error;
+        out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
+        out.error_variant_index = rhs->may_error ? rhs->error_variant_index
+                                                : lhs->error_variant_index;
+        return out;
+    }
+
     const Str callee_name = resolve_alias_target_leaf(mod, expr.name);
     const u32 fn_index = find_function_index(mod, callee_name);
     const auto fail_call =
