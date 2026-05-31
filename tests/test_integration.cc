@@ -5158,7 +5158,8 @@ TEST(route, req_cookie_jit_handler_real_socket) {
 TEST(route, req_cookie_all_requires_present_value_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/session\" { let sid = req.cookie(\"sid\") let sid = all(sid, any(sid, \"ok\")) if sid == \"ok\" { "
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let sid = all(sid, any(sid, "
+        "\"ok\")) if sid == \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5236,7 +5237,8 @@ TEST(route, req_cookie_all_requires_present_value_real_socket) {
 TEST(route, req_header_all_requires_present_value_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let host = all(host, any(host, \"fallback\")) if host == "
+        "route GET \"/users\" { let host = req.header(\"Host\") let host = all(host, any(host, "
+        "\"fallback\")) if host == "
         "\"localhost\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5312,7 +5314,8 @@ TEST(route, req_header_all_requires_present_value_real_socket) {
 TEST(route, req_query_all_requires_present_value_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, any(q, \"rut\")) if value == "
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, any(q, \"rut\")) if "
+        "value == "
         "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5540,7 +5543,8 @@ TEST(route, req_query_all_allows_expected_alternative) {
 TEST(route, req_query_rejects_or_function_call_form) {
     using namespace rut;
     const char* src =
-        "route GET \"/search\" { let q = req.query(\"q\") let value = or(q, \"\") if value == \"rut\" { return 204 } else { return 401 } }\n";
+        "route GET \"/search\" { let q = req.query(\"q\") let value = or(q, \"\") if value == "
+        "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -5551,7 +5555,8 @@ TEST(route, req_query_rejects_or_function_call_form) {
 TEST(route, req_query_rejects_and_function_call_form) {
     using namespace rut;
     const char* src =
-        "route GET \"/search\" { let q = req.query(\"q\") let value = and(q, \"\") if value == \"rut\" { return 204 } else { return 401 } }\n";
+        "route GET \"/search\" { let q = req.query(\"q\") let value = and(q, \"\") if value == "
+        "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -5562,7 +5567,8 @@ TEST(route, req_query_rejects_and_function_call_form) {
 TEST(route, req_header_rejects_or_function_call_form) {
     using namespace rut;
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"\") if value == \"localhost\" { "
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"\") if "
+        "value == \"localhost\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5574,7 +5580,8 @@ TEST(route, req_header_rejects_or_function_call_form) {
 TEST(route, req_header_rejects_and_function_call_form) {
     using namespace rut;
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let value = and(host, \"\") if value == \"localhost\" { "
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = and(host, \"\") if "
+        "value == \"localhost\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5586,7 +5593,8 @@ TEST(route, req_header_rejects_and_function_call_form) {
 TEST(route, req_cookie_rejects_or_function_call_form) {
     using namespace rut;
     const char* src =
-        "route GET \"/session\" { let sid = req.cookie(\"sid\") let value = or(sid, \"\") if value == \"ok\" { "
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let value = or(sid, \"\") if value "
+        "== \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5598,7 +5606,8 @@ TEST(route, req_cookie_rejects_or_function_call_form) {
 TEST(route, req_cookie_rejects_and_function_call_form) {
     using namespace rut;
     const char* src =
-        "route GET \"/session\" { let sid = req.cookie(\"sid\") let value = and(sid, \"\") if value == \"ok\" { "
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let value = and(sid, \"\") if "
+        "value == \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5610,7 +5619,8 @@ TEST(route, req_cookie_rejects_and_function_call_form) {
 TEST(route, req_query_rejects_double_ampersand_operator) {
     using namespace rut;
     const char* src =
-        "route GET \"/search\" { let value = true && false if value { return 204 } else { return 401 } }\n";
+        "route GET \"/search\" { let value = true && false if value { return 204 } else { return "
+        "401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE_FALSE(lexed);
     CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
@@ -5619,7 +5629,8 @@ TEST(route, req_query_rejects_double_ampersand_operator) {
 TEST(route, req_query_rejects_double_pipe_operator) {
     using namespace rut;
     const char* src =
-        "route GET \"/search\" { let value = true || false if value { return 204 } else { return 401 } }\n";
+        "route GET \"/search\" { let value = true || false if value { return 204 } else { return "
+        "401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -5796,7 +5807,8 @@ TEST(route, req_query_all_non_short_circuit_eager_rhs_is_observed_real_socket) {
     using namespace rut;
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) if value == "
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) if value "
+        "== "
         "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5873,7 +5885,8 @@ TEST(route, req_query_any_non_short_circuit_eager_rhs_is_observed_real_socket) {
     using namespace rut;
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) if value == "
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) if value "
+        "== "
         "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -6262,7 +6275,8 @@ TEST(route, req_query_string_all_non_short_circuit_eager_rhs_is_observed_real_so
     using namespace rut;
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/search\" { let value = all(req.queryString, fallback()) if value == \"q=rut\" { "
+        "route GET \"/search\" { let value = all(req.queryString, fallback()) if value == "
+        "\"q=rut\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -6337,7 +6351,8 @@ TEST(route, req_query_string_any_non_short_circuit_eager_rhs_is_observed_real_so
     using namespace rut;
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/search\" { let value = any(req.queryString, fallback()) if value == \"q=rut\" { "
+        "route GET \"/search\" { let value = any(req.queryString, fallback()) if value == "
+        "\"q=rut\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);

@@ -263,7 +263,8 @@ TEST(jit, return_200) {
 
 TEST(jit, frontend_req_header_any_fallback) {
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, \"fallback\") "
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, "
+        "\"fallback\") "
         "return 200 }\n";
 
     auto lexed = lex(lit(src));
@@ -337,13 +338,13 @@ TEST(jit, frontend_req_header_all_requires_present_value) {
     CHECK(hit.action == HandlerAction::ReturnStatus);
     CHECK_EQ(hit.status_code, 204u);
 
-    static const char missing_host_request[] = "GET /api/users HTTP/1.1\r\nUser-Agent: curl\r\n\r\n";
-    auto miss = HandlerResult::unpack(
-        handler(nullptr,
-                nullptr,
-                reinterpret_cast<const u8*>(missing_host_request),
-                sizeof(missing_host_request) - 1,
-                nullptr));
+    static const char missing_host_request[] =
+        "GET /api/users HTTP/1.1\r\nUser-Agent: curl\r\n\r\n";
+    auto miss = HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(missing_host_request),
+                                              sizeof(missing_host_request) - 1,
+                                              nullptr));
     CHECK(miss.action == HandlerAction::ReturnStatus);
     CHECK_EQ(miss.status_code, 401u);
 
@@ -567,22 +568,20 @@ TEST(jit, frontend_req_query_all_requires_present_value) {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    auto hit = HandlerResult::unpack(handler(
-        nullptr,
-        nullptr,
-        reinterpret_cast<const u8*>(kGetApiQueryRequest),
-        sizeof(kGetApiQueryRequest) - 1,
-        nullptr));
+    auto hit = HandlerResult::unpack(handler(nullptr,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(kGetApiQueryRequest),
+                                             sizeof(kGetApiQueryRequest) - 1,
+                                             nullptr));
     CHECK(hit.action == HandlerAction::ReturnStatus);
     CHECK_EQ(hit.status_code, 204u);
 
     static const char missing_query_request[] = "GET /search HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto miss = HandlerResult::unpack(
-        handler(nullptr,
-                nullptr,
-                reinterpret_cast<const u8*>(missing_query_request),
-                sizeof(missing_query_request) - 1,
-                nullptr));
+    auto miss = HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(missing_query_request),
+                                              sizeof(missing_query_request) - 1,
+                                              nullptr));
     CHECK(miss.action == HandlerAction::ReturnStatus);
     CHECK_EQ(miss.status_code, 401u);
 
@@ -619,24 +618,29 @@ TEST(jit, frontend_req_header_all_requires_present_value) {
     REQUIRE(handler != nullptr);
 
     static const char present_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto present = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(present_request), sizeof(present_request) - 1, nullptr));
+    auto present = HandlerResult::unpack(handler(nullptr,
+                                                 nullptr,
+                                                 reinterpret_cast<const u8*>(present_request),
+                                                 sizeof(present_request) - 1,
+                                                 nullptr));
     CHECK(present.action == HandlerAction::ReturnStatus);
     CHECK_EQ(present.status_code, 204u);
 
     static const char mismatch_request[] = "GET /users HTTP/1.1\r\nHost: api.local\r\n\r\n";
-    auto mismatch = HandlerResult::unpack(handler(
-        nullptr,
-        nullptr,
-        reinterpret_cast<const u8*>(mismatch_request),
-        sizeof(mismatch_request) - 1,
-        nullptr));
+    auto mismatch = HandlerResult::unpack(handler(nullptr,
+                                                  nullptr,
+                                                  reinterpret_cast<const u8*>(mismatch_request),
+                                                  sizeof(mismatch_request) - 1,
+                                                  nullptr));
     CHECK(mismatch.action == HandlerAction::ReturnStatus);
     CHECK_EQ(mismatch.status_code, 401u);
 
     static const char missing_request[] = "GET /users HTTP/1.1\r\nUser-Agent: curl\r\n\r\n";
-    auto missing = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_request), sizeof(missing_request) - 1, nullptr));
+    auto missing = HandlerResult::unpack(handler(nullptr,
+                                                 nullptr,
+                                                 reinterpret_cast<const u8*>(missing_request),
+                                                 sizeof(missing_request) - 1,
+                                                 nullptr));
     CHECK(missing.action == HandlerAction::ReturnStatus);
     CHECK_EQ(missing.status_code, 401u);
 
@@ -673,14 +677,21 @@ TEST(jit, frontend_req_query_all_non_short_circuit_evaluates_rhs_when_missing_qu
     REQUIRE(handler != nullptr);
 
     static const char missing_query_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto no_query = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_query_request), sizeof(missing_query_request) - 1, nullptr));
+    auto no_query =
+        HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(missing_query_request),
+                                      sizeof(missing_query_request) - 1,
+                                      nullptr));
     CHECK(no_query.action == HandlerAction::ReturnStatus);
     CHECK_EQ(no_query.status_code, 204u);
 
     static const char query_request[] = "GET /users?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto with_query = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(query_request), sizeof(query_request) - 1, nullptr));
+    auto with_query = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(query_request),
+                                                    sizeof(query_request) - 1,
+                                                    nullptr));
     CHECK(with_query.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_query.status_code, 401u);
 
@@ -718,21 +729,30 @@ TEST(jit, frontend_req_cookie_all_requires_present_value) {
 
     static const char present_request[] =
         "GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
-    auto hit = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(present_request), sizeof(present_request) - 1, nullptr));
+    auto hit = HandlerResult::unpack(handler(nullptr,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(present_request),
+                                             sizeof(present_request) - 1,
+                                             nullptr));
     CHECK(hit.action == HandlerAction::ReturnStatus);
     CHECK_EQ(hit.status_code, 204u);
 
     static const char mismatch_request[] =
         "GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: theme=dark; sid=nope; lang=en\r\n\r\n";
-    auto miss = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(mismatch_request), sizeof(mismatch_request) - 1, nullptr));
+    auto miss = HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(mismatch_request),
+                                              sizeof(mismatch_request) - 1,
+                                              nullptr));
     CHECK(miss.action == HandlerAction::ReturnStatus);
     CHECK_EQ(miss.status_code, 401u);
 
     static const char missing_request[] = "GET /session HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto no_cookie = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_request), sizeof(missing_request) - 1, nullptr));
+    auto no_cookie = HandlerResult::unpack(handler(nullptr,
+                                                   nullptr,
+                                                   reinterpret_cast<const u8*>(missing_request),
+                                                   sizeof(missing_request) - 1,
+                                                   nullptr));
     CHECK(no_cookie.action == HandlerAction::ReturnStatus);
     CHECK_EQ(no_cookie.status_code, 401u);
 
@@ -770,14 +790,21 @@ TEST(jit, frontend_req_query_all_non_short_circuit_eager_rhs_is_observed_with_pr
     REQUIRE(handler != nullptr);
 
     static const char missing_query_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto no_query = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_query_request), sizeof(missing_query_request) - 1, nullptr));
+    auto no_query =
+        HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(missing_query_request),
+                                      sizeof(missing_query_request) - 1,
+                                      nullptr));
     CHECK(no_query.action == HandlerAction::ReturnStatus);
     CHECK_EQ(no_query.status_code, 500u);
 
     static const char query_request[] = "GET /users?x=x HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto with_query = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(query_request), sizeof(query_request) - 1, nullptr));
+    auto with_query = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(query_request),
+                                                    sizeof(query_request) - 1,
+                                                    nullptr));
     CHECK(with_query.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_query.status_code, 500u);
 
@@ -815,14 +842,21 @@ TEST(jit, frontend_req_query_any_non_short_circuit_eager_rhs_is_observed_with_pr
     REQUIRE(handler != nullptr);
 
     static const char missing_query_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto no_query = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_query_request), sizeof(missing_query_request) - 1, nullptr));
+    auto no_query =
+        HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(missing_query_request),
+                                      sizeof(missing_query_request) - 1,
+                                      nullptr));
     CHECK(no_query.action == HandlerAction::ReturnStatus);
     CHECK_EQ(no_query.status_code, 500u);
 
     static const char query_request[] = "GET /users?x=x HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto with_query = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(query_request), sizeof(query_request) - 1, nullptr));
+    auto with_query = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(query_request),
+                                                    sizeof(query_request) - 1,
+                                                    nullptr));
     CHECK(with_query.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_query.status_code, 500u);
 
@@ -833,7 +867,8 @@ TEST(jit, frontend_req_query_any_non_short_circuit_eager_rhs_is_observed_with_pr
 TEST(jit, frontend_req_header_all_non_short_circuit_eager_rhs_is_observed_with_present_header) {
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/users\" { let value = all(req.header(\"X-Foo\"), fallback()) if value == \"x\" "
+        "route GET \"/users\" { let value = all(req.header(\"X-Foo\"), fallback()) if value == "
+        "\"x\" "
         "{ return 204 } else { return 401 } }\n";
 
     auto lexed = lex(lit(src));
@@ -860,14 +895,22 @@ TEST(jit, frontend_req_header_all_non_short_circuit_eager_rhs_is_observed_with_p
     REQUIRE(handler != nullptr);
 
     static const char missing_header_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto no_header = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_header_request), sizeof(missing_header_request) - 1, nullptr));
+    auto no_header =
+        HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(missing_header_request),
+                                      sizeof(missing_header_request) - 1,
+                                      nullptr));
     CHECK(no_header.action == HandlerAction::ReturnStatus);
     CHECK_EQ(no_header.status_code, 500u);
 
-    static const char header_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\nX-Foo: x\r\n\r\n";
-    auto with_header = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(header_request), sizeof(header_request) - 1, nullptr));
+    static const char header_request[] =
+        "GET /users HTTP/1.1\r\nHost: localhost\r\nX-Foo: x\r\n\r\n";
+    auto with_header = HandlerResult::unpack(handler(nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(header_request),
+                                                     sizeof(header_request) - 1,
+                                                     nullptr));
     CHECK(with_header.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_header.status_code, 500u);
 
@@ -878,7 +921,8 @@ TEST(jit, frontend_req_header_all_non_short_circuit_eager_rhs_is_observed_with_p
 TEST(jit, frontend_req_header_any_non_short_circuit_eager_rhs_is_observed_with_present_header) {
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/users\" { let value = any(req.header(\"X-Foo\"), fallback()) if value == \"x\" "
+        "route GET \"/users\" { let value = any(req.header(\"X-Foo\"), fallback()) if value == "
+        "\"x\" "
         "{ return 204 } else { return 401 } }\n";
 
     auto lexed = lex(lit(src));
@@ -905,14 +949,22 @@ TEST(jit, frontend_req_header_any_non_short_circuit_eager_rhs_is_observed_with_p
     REQUIRE(handler != nullptr);
 
     static const char missing_header_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto no_header = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_header_request), sizeof(missing_header_request) - 1, nullptr));
+    auto no_header =
+        HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(missing_header_request),
+                                      sizeof(missing_header_request) - 1,
+                                      nullptr));
     CHECK(no_header.action == HandlerAction::ReturnStatus);
     CHECK_EQ(no_header.status_code, 500u);
 
-    static const char header_request[] = "GET /users HTTP/1.1\r\nHost: localhost\r\nX-Foo: x\r\n\r\n";
-    auto with_header = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(header_request), sizeof(header_request) - 1, nullptr));
+    static const char header_request[] =
+        "GET /users HTTP/1.1\r\nHost: localhost\r\nX-Foo: x\r\n\r\n";
+    auto with_header = HandlerResult::unpack(handler(nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(header_request),
+                                                     sizeof(header_request) - 1,
+                                                     nullptr));
     CHECK(with_header.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_header.status_code, 500u);
 
@@ -950,15 +1002,21 @@ TEST(jit, frontend_req_cookie_all_non_short_circuit_eager_rhs_is_observed_with_p
     REQUIRE(handler != nullptr);
 
     static const char missing_cookie[] = "GET /session HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto miss_cookie = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_cookie), sizeof(missing_cookie) - 1, nullptr));
+    auto miss_cookie = HandlerResult::unpack(handler(nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(missing_cookie),
+                                                     sizeof(missing_cookie) - 1,
+                                                     nullptr));
     CHECK(miss_cookie.action == HandlerAction::ReturnStatus);
     CHECK_EQ(miss_cookie.status_code, 500u);
 
     static const char hit_cookie[] =
         "GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
-    auto with_cookie = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(hit_cookie), sizeof(hit_cookie) - 1, nullptr));
+    auto with_cookie = HandlerResult::unpack(handler(nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(hit_cookie),
+                                                     sizeof(hit_cookie) - 1,
+                                                     nullptr));
     CHECK(with_cookie.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_cookie.status_code, 500u);
 
@@ -996,15 +1054,21 @@ TEST(jit, frontend_req_cookie_any_non_short_circuit_eager_rhs_is_observed_with_p
     REQUIRE(handler != nullptr);
 
     static const char missing_cookie[] = "GET /session HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto miss_cookie = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(missing_cookie), sizeof(missing_cookie) - 1, nullptr));
+    auto miss_cookie = HandlerResult::unpack(handler(nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(missing_cookie),
+                                                     sizeof(missing_cookie) - 1,
+                                                     nullptr));
     CHECK(miss_cookie.action == HandlerAction::ReturnStatus);
     CHECK_EQ(miss_cookie.status_code, 500u);
 
     static const char hit_cookie[] =
         "GET /session HTTP/1.1\r\nHost: localhost\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
-    auto with_cookie = HandlerResult::unpack(handler(
-        nullptr, nullptr, reinterpret_cast<const u8*>(hit_cookie), sizeof(hit_cookie) - 1, nullptr));
+    auto with_cookie = HandlerResult::unpack(handler(nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(hit_cookie),
+                                                     sizeof(hit_cookie) - 1,
+                                                     nullptr));
     CHECK(with_cookie.action == HandlerAction::ReturnStatus);
     CHECK_EQ(with_cookie.status_code, 500u);
 
@@ -1058,7 +1122,8 @@ TEST(jit, frontend_req_query_and_requires_both_operands) {
 
 TEST(jit, frontend_req_query_or_requires_either_operand) {
     const char* src =
-        "route GET \"/users\" { if req.pathOnly == \"/admin\" or req.queryString == \"q=1\" { return "
+        "route GET \"/users\" { if req.pathOnly == \"/admin\" or req.queryString == \"q=1\" { "
+        "return "
         "204 } else { return 401 } }\n";
 
     auto lexed = lex(lit(src));
@@ -1098,11 +1163,7 @@ TEST(jit, frontend_req_query_or_requires_either_operand) {
 
     static const char miss2[] = "GET /users?q=2 HTTP/1.1\r\nHost: localhost\r\n\r\n";
     auto miss2_r = HandlerResult::unpack(
-        handler(nullptr,
-                nullptr,
-                reinterpret_cast<const u8*>(miss2),
-                sizeof(miss2) - 1,
-                nullptr));
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss2), sizeof(miss2) - 1, nullptr));
     CHECK(miss2_r.action == HandlerAction::ReturnStatus);
     CHECK_EQ(miss2_r.status_code, 401u);
 
@@ -1139,18 +1200,22 @@ TEST(jit, frontend_req_query_all_requires_expected_alternative) {
     REQUIRE(handler != nullptr);
 
     static const char hit_by_value[] = "GET /search?q=rut HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto hit_by_value_res = HandlerResult::unpack(
-        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit_by_value), sizeof(hit_by_value) - 1, nullptr));
+    auto hit_by_value_res = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(hit_by_value),
+                                                          sizeof(hit_by_value) - 1,
+                                                          nullptr));
     CHECK(hit_by_value_res.action == HandlerAction::ReturnStatus);
     CHECK_EQ(hit_by_value_res.status_code, 204u);
 
-    static const char hit_by_query_string[] = "GET /search?q=admin HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    auto hit_by_query_string_res = HandlerResult::unpack(handler(
-        nullptr,
-        nullptr,
-        reinterpret_cast<const u8*>(hit_by_query_string),
-        sizeof(hit_by_query_string) - 1,
-        nullptr));
+    static const char hit_by_query_string[] =
+        "GET /search?q=admin HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto hit_by_query_string_res =
+        HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(hit_by_query_string),
+                                      sizeof(hit_by_query_string) - 1,
+                                      nullptr));
     CHECK(hit_by_query_string_res.action == HandlerAction::ReturnStatus);
     CHECK_EQ(hit_by_query_string_res.status_code, 204u);
 
@@ -16180,9 +16245,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(
-        lit("pipe method stage with nil/error propagation must return bool, "
-            "i32, str, variant, or struct")));
+    CHECK(
+        hir.error().detail.eq(lit("pipe method stage with nil/error propagation must return bool, "
+                                  "i32, str, variant, or struct")));
 }
 TEST(jit, frontend_pipe_method_stage_slot_two_is_rejected) {
     const auto src = R"(
@@ -16288,9 +16353,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(
-        lit("pipe method stage with nil/error propagation must return bool, "
-            "i32, str, variant, or struct")));
+    CHECK(
+        hir.error().detail.eq(lit("pipe method stage with nil/error propagation must return bool, "
+                                  "i32, str, variant, or struct")));
 }
 TEST(jit, frontend_pipe_method_stage_known_error_tuple_return_is_rejected) {
     const auto src = R"(
@@ -16312,9 +16377,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(
-        lit("pipe method stage with nil/error propagation must return bool, "
-            "i32, str, variant, or struct")));
+    CHECK(
+        hir.error().detail.eq(lit("pipe method stage with nil/error propagation must return bool, "
+                                  "i32, str, variant, or struct")));
 }
 TEST(jit, frontend_pipe_different_error_variants_in_method_stage_is_rejected) {
     const auto src = R"(
