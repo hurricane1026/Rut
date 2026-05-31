@@ -716,7 +716,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                         if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                        conn.on_upstream_send) {
                         timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn &&
