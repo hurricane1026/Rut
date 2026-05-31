@@ -2447,6 +2447,7 @@ TEST(frontend, analyze_imported_route_decorator_req_param_exposes_magic_request_
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/auth.rut", std::ios::binary);
+        out << "func req() -> i32 => 0\n";
         out << "func allow<T: Eq>(actual: T, expected: T) -> i32 => 0\n";
         out << "func auth(_ req: i32) -> i32 => allow(req.method, GET)\n";
     }

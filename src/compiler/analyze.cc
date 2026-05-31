@@ -3199,9 +3199,13 @@ static bool user_bound_req_name(const HirModule& mod,
                                 u32 local_count,
                                 const MatchPayloadBinding* binding) {
     if (binding && binding->subject && binding->name.eq({"req", 3})) return true;
+    bool has_magic_request_proxy = false;
     for (u32 i = 0; i < local_count; i++) {
-        if (locals[i].name.eq({"req", 3}) && !locals[i].is_magic_request_proxy) return true;
+        if (!locals[i].name.eq({"req", 3})) continue;
+        if (!locals[i].is_magic_request_proxy) return true;
+        has_magic_request_proxy = true;
     }
+    if (has_magic_request_proxy) return false;
     for (u32 i = 0; i < mod.variants.len; i++) {
         if (mod.variants[i].name.eq({"req", 3})) return true;
     }
