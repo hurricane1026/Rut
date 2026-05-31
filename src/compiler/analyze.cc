@@ -6040,8 +6040,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (rhs->may_nil || rhs->may_error)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.rhs->span);
+        if (lhs->may_nil || lhs->may_error || rhs->may_nil || rhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  lhs->may_nil || lhs->may_error ? expr.lhs->span
+                                                                 : expr.rhs->span);
         const bool is_bool_or = lhs->type == HirTypeKind::Bool && rhs->type == HirTypeKind::Bool;
         if (is_bool_or) {
             if (lhs->kind == HirExprKind::BoolLit) {
@@ -6118,63 +6120,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.span = expr.span;
             return out;
         }
-        if (lhs->type != HirTypeKind::Unknown &&
-            !same_hir_type_shape(mod, lhs.value(), rhs.value()))
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        if (lhs->kind == HirExprKind::Nil) {
-            HirExpr folded = rhs.value();
-            folded.span = expr.span;
-            folded.may_nil = false;
-            folded.may_error = false;
-            return folded;
-        }
-        if (lhs->kind == HirExprKind::Error) {
-            HirExpr folded = rhs.value();
-            folded.span = expr.span;
-            folded.may_nil = false;
-            folded.may_error = false;
-            return folded;
-        }
-        const auto lhs_state = known_value_state(lhs.value(), locals, local_count, 0);
-        if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
-            HirExpr folded = rhs.value();
-            folded.span = expr.span;
-            folded.may_nil = false;
-            folded.may_error = false;
-            return folded;
-        }
-        if (lhs_state == KnownValueState::Available) {
-            HirExpr folded = lhs.value();
-            folded.span = expr.span;
-            return folded;
-        }
-        if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
-        if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
-        out.kind = HirExprKind::Or;
-        out.type = lhs->type == HirTypeKind::Unknown ? rhs->type : lhs->type;
-        out.lhs = lhs_ptr;
-        out.rhs = rhs_ptr;
-        auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
-                                           out.type,
-                                           out.generic_index,
-                                           out.variant_index,
-                                           out.struct_index,
-                                           out.tuple_len,
-                                           out.tuple_types,
-                                           out.tuple_variant_indices,
-                                           out.tuple_struct_indices,
-                                           expr.span);
-        if (!shape) return core::make_unexpected(shape.error());
-        out.shape_index = shape.value();
-        out.may_nil = false;
-        out.may_error = false;
-        out.error_struct_index = 0xffffffffu;
-        out.error_variant_index = 0xffffffffu;
-        return out;
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
     if (expr.kind == AstExprKind::And) {
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
@@ -6682,6 +6628,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (rhs->may_nil || rhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.args[1]->span);
 
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
             !same_hir_type_shape(mod, lhs.value(), rhs.value())) {
@@ -6724,10 +6672,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.rhs = lhs_ptr;
         if (!out.args.push(rhs_ptr)) return frontend_error(FrontendError::TooManyItems, expr.span);
         out.may_nil = false;
-        out.may_error = lhs->may_error || rhs->may_error;
-        out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
-        out.error_variant_index =
-            rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
+        out.may_error = rhs->may_error;
+        out.error_struct_index = rhs->error_struct_index;
+        out.error_variant_index = rhs->error_variant_index;
         return out;
     }
 
@@ -6742,6 +6689,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (rhs->may_nil || rhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.args[1]->span);
 
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
             !same_hir_type_shape(mod, lhs.value(), rhs.value())) {
@@ -6799,7 +6748,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.rhs = rhs_ptr;
         if (!out.args.push(fallback_ptr))
             return frontend_error(FrontendError::TooManyItems, expr.span);
-        out.may_nil = false;
+        out.may_nil = lhs->may_nil;
         out.may_error = lhs->may_error || rhs->may_error;
         out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
         out.error_variant_index =
