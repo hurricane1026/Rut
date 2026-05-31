@@ -19,6 +19,10 @@ using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
 
+namespace rut::simd {
+u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out);
+}
+
 // === Accept ===
 
 TEST(accept, basic) {
@@ -2321,6 +2325,12 @@ TEST(route, configure_route_dispatch_refuses_after_route_add) {
 }
 
 TEST(route, segment_trie_matches_param_path) {
+    RouteTrie trie;
+    trie.clear();
+    REQUIRE(trie.insert(Str{"/health", 7}, 'G', 7));
+    CHECK_EQ(trie.match(Str{"/health", 7}, 'G'), 7u);
+    CHECK_EQ(trie.match_key(Str{"/health", 7}, kRouteMethodGet), 7u);
+
     RouteConfig cfg;
     REQUIRE(cfg.use_segment_trie());
     CHECK(cfg.add_static("/users/:id", 0, 201));
@@ -5673,6 +5683,9 @@ TEST(route_method, key_helpers_cover_all_runtime_methods) {
     CHECK_EQ(route_method_slot('C'), kRouteMethodConnect);
     CHECK_EQ(route_method_slot('T'), kRouteMethodTrace);
     CHECK_EQ(route_method_slot('?'), kRouteMethodSlotInvalid);
+
+    Str invalid_method = http_method_str(static_cast<HttpMethod>(255));
+    CHECK(invalid_method.eq({"UNKNOWN", 7}));
 }
 
 // === Coverage: parse_log_method_fallback ===
@@ -5937,6 +5950,15 @@ TEST(util, ascii_ci_eq_basic) {
     CHECK(ascii_ci_eq(reinterpret_cast<const u8*>("Connection"), "connection", 10));
     CHECK(ascii_ci_eq(reinterpret_cast<const u8*>("CONNECTION"), "connection", 10));
     CHECK(!ascii_ci_eq(reinterpret_cast<const u8*>("Different1"), "connection", 10));
+}
+
+TEST(util, simd_scan_uri_long_query_without_space) {
+    static const u8 kUri[] = "/abcdefgh?ijklmnopqr";
+    u32 canon_end = 0;
+    const u32 end = sizeof(kUri) - 1;
+
+    CHECK_EQ(simd::scan_uri(kUri, 0, end, &canon_end), end);
+    CHECK_EQ(canon_end, 9u);
 }
 
 // === Coverage: epoll_event_loop init and helpers ===
@@ -8811,6 +8833,101 @@ TEST(dispatch_isolation, upstream_send_reaches_upstream_send_slot) {
     CHECK(g_callback_invoked);
 }
 
+TEST(dispatch_event, dispatch_event_handles_unhandled_and_terminal_branches) {
+    SmallLoop loop;
+    loop.setup();
+    auto* recv_conn = loop.alloc_conn();
+    REQUIRE(recv_conn != nullptr);
+    recv_conn->fd = 1000;
+    recv_conn->state = ConnState::ReadingHeader;
+    recv_conn->recv_armed = false;
+    recv_conn->on_recv = nullptr;
+    recv_conn->on_send = nullptr;
+    recv_conn->on_upstream_recv = nullptr;
+    recv_conn->on_upstream_send = nullptr;
+    recv_conn->keep_alive = false;
+    recv_conn->recv_buf.reset();
+    CHECK(!recv_conn->has_active_slot());
+    recv_conn->on_send = &test_sentinel_callback<SmallLoop>;
+    CHECK(recv_conn->has_active_slot());
+    recv_conn->on_send = nullptr;
+
+    loop.backend.clear_ops();
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 24));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+
+    loop.backend.clear_ops();
+    recv_conn->recv_armed = true;
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 24));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    recv_conn->recv_armed = false;
+
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 0));
+    CHECK_EQ(recv_conn->fd, 1000);
+
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, -105));
+    CHECK_EQ(recv_conn->fd, -1);
+
+    auto* up_conn = loop.alloc_conn();
+    REQUIRE(up_conn != nullptr);
+    up_conn->fd = 1001;
+    up_conn->state = ConnState::ReadingHeader;
+    up_conn->on_upstream_recv = nullptr;
+    up_conn->on_recv = nullptr;
+    up_conn->on_send = nullptr;
+    up_conn->on_upstream_send = nullptr;
+    up_conn->recv_armed = false;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, 16));
+    CHECK(!g_callback_invoked);
+
+    up_conn->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, 16));
+    CHECK(g_callback_invoked);
+
+    g_callback_invoked = false;
+    up_conn->on_upstream_recv = nullptr;
+    up_conn->state = ConnState::ReadingHeader;
+    up_conn->fd = 1002;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, -105));
+    CHECK(!g_callback_invoked);
+    CHECK_EQ(up_conn->fd, 1002);
+
+    g_callback_invoked = false;
+    up_conn->state = ConnState::Sending;
+    up_conn->fd = 1003;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, -105));
+    CHECK(g_callback_invoked == false);
+    CHECK_EQ(up_conn->fd, -1);
+
+    auto* up_send_conn = loop.alloc_conn();
+    REQUIRE(up_send_conn != nullptr);
+    up_send_conn->fd = 1004;
+    up_send_conn->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    up_send_conn->on_recv = nullptr;
+    up_send_conn->on_send = nullptr;
+    up_send_conn->on_upstream_recv = nullptr;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::UpstreamConnect, 0));
+    CHECK(g_callback_invoked);
+
+    up_send_conn->on_upstream_send = nullptr;
+    up_send_conn->on_send = &test_sentinel_callback<SmallLoop>;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Send, 0));
+    CHECK(g_callback_invoked);
+
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Accept, 0));
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Timeout, 0));
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::HandlerTimer, 0));
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::kNumEventTypes, 0));
+    CHECK(!g_callback_invoked);
+
+    loop.dispatch(make_ev(up_send_conn->id, IoEventType::kNumEventTypes, 0));
+}
+
 // ==========================================================================
 // State transition exhaustive tests: verify all 4 slot values after
 // each reachable state transition.
@@ -9510,7 +9627,7 @@ TEST(state_invariant, jit_dispatch_classifies_all_event_yields) {
 }
 
 TEST(state_invariant, jit_event_helpers_map_runtime_events) {
-    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::_Count); ++raw) {
+    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::kNumEventTypes); ++raw) {
         const IoEventType type = static_cast<IoEventType>(raw);
 
         CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Any, type),
@@ -9548,20 +9665,20 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
                 expected = jit::YieldKind::Timer;
                 break;
             case IoEventType::Accept:
-            case IoEventType::_Count:
+            case IoEventType::kNumEventTypes:
                 break;
         }
         CHECK_EQ(static_cast<u8>(yield_kind_from_event(type)), static_cast<u8>(expected));
     }
 
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::_Count));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::_Count)),
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::kNumEventTypes));
+    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::kNumEventTypes)),
              static_cast<u8>(jit::YieldKind::HttpGet));
 }
 

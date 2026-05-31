@@ -95,7 +95,7 @@ public:
             case IoEventType::Accept:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
-            case IoEventType::_Count:
+            case IoEventType::kNumEventTypes:
                 break;
         }
     }
@@ -674,7 +674,7 @@ public:
                     }
                 }
                 break;
-            case IoEventType::_Count:
+            case IoEventType::kNumEventTypes:
                 break;
         }
     }

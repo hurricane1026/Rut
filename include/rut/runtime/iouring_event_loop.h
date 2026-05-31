@@ -625,7 +625,7 @@ public:
                     }
                 }
                 break;
-            case IoEventType::_Count:
+            case IoEventType::kNumEventTypes:
                 break;
         }
     }
