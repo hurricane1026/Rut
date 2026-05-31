@@ -19,7 +19,11 @@ enum class IoEventType : u8 {
                    // epoll:   shared one-shot timerfd — event is a global
                    //   notification; conn_id is unused, the event loop
                    //   drains its min-heap to find which conns to resume.
+    kNumEventTypes,
 };
+
+static_assert(static_cast<u8>(IoEventType::kNumEventTypes) == 8u,
+              "IoEventType should keep all runtime event tags and remain small");
 
 // Unified completion event — field order optimized for minimal padding.
 struct IoEvent {

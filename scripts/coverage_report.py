@@ -251,14 +251,18 @@ def main() -> int:
         print(f"ERROR: {args.threshold_area} line coverage has no measured lines")
         return 1
     gate_pct = 100.0 * gate_covered / gate_total
+    # Match the comparison precision to the percentage shown in the report.
+    # Otherwise values such as 96.998% print as 97.00% while still failing a
+    # 97.0 threshold, which makes the gate output contradictory.
+    gate_pct_for_gate = round(gate_pct, 2)
 
-    if gate_pct < args.threshold:
+    if gate_pct_for_gate < args.threshold:
         print(
-            f"ERROR: {args.threshold_area} line coverage {gate_pct:.2f}% "
+            f"ERROR: {args.threshold_area} line coverage {gate_pct_for_gate:.2f}% "
             f"is below {args.threshold}% threshold"
         )
         return 1
-    print(f"Coverage OK: {args.threshold_area} {gate_pct:.2f}% >= {args.threshold}%")
+    print(f"Coverage OK: {args.threshold_area} {gate_pct_for_gate:.2f}% >= {args.threshold}%")
     return 0
 
 

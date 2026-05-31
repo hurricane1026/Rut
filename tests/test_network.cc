@@ -19,6 +19,10 @@ using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
 
+namespace rut::simd {
+u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out);
+}
+
 // === Accept ===
 
 TEST(accept, basic) {
@@ -2321,6 +2325,12 @@ TEST(route, configure_route_dispatch_refuses_after_route_add) {
 }
 
 TEST(route, segment_trie_matches_param_path) {
+    RouteTrie trie;
+    trie.clear();
+    REQUIRE(trie.insert(Str{"/health", 7}, 'G', 7));
+    CHECK_EQ(trie.match(Str{"/health", 7}, 'G'), 7u);
+    CHECK_EQ(trie.match_key(Str{"/health", 7}, kRouteMethodGet), 7u);
+
     RouteConfig cfg;
     REQUIRE(cfg.use_segment_trie());
     CHECK(cfg.add_static("/users/:id", 0, 201));
@@ -5673,6 +5683,9 @@ TEST(route_method, key_helpers_cover_all_runtime_methods) {
     CHECK_EQ(route_method_slot('C'), kRouteMethodConnect);
     CHECK_EQ(route_method_slot('T'), kRouteMethodTrace);
     CHECK_EQ(route_method_slot('?'), kRouteMethodSlotInvalid);
+
+    Str invalid_method = http_method_str(static_cast<HttpMethod>(255));
+    CHECK(invalid_method.eq({"UNKNOWN", 7}));
 }
 
 // === Coverage: parse_log_method_fallback ===
@@ -5937,6 +5950,15 @@ TEST(util, ascii_ci_eq_basic) {
     CHECK(ascii_ci_eq(reinterpret_cast<const u8*>("Connection"), "connection", 10));
     CHECK(ascii_ci_eq(reinterpret_cast<const u8*>("CONNECTION"), "connection", 10));
     CHECK(!ascii_ci_eq(reinterpret_cast<const u8*>("Different1"), "connection", 10));
+}
+
+TEST(util, simd_scan_uri_long_query_without_space) {
+    static const u8 kUri[] = "/abcdefgh?ijklmnopqr";
+    u32 canon_end = 0;
+    const u32 end = sizeof(kUri) - 1;
+
+    CHECK_EQ(simd::scan_uri(kUri, 0, end, &canon_end), end);
+    CHECK_EQ(canon_end, 9u);
 }
 
 // === Coverage: epoll_event_loop init and helpers ===
@@ -8811,6 +8833,101 @@ TEST(dispatch_isolation, upstream_send_reaches_upstream_send_slot) {
     CHECK(g_callback_invoked);
 }
 
+TEST(dispatch_event, dispatch_event_handles_unhandled_and_terminal_branches) {
+    SmallLoop loop;
+    loop.setup();
+    auto* recv_conn = loop.alloc_conn();
+    REQUIRE(recv_conn != nullptr);
+    recv_conn->fd = 1000;
+    recv_conn->state = ConnState::ReadingHeader;
+    recv_conn->recv_armed = false;
+    recv_conn->on_recv = nullptr;
+    recv_conn->on_send = nullptr;
+    recv_conn->on_upstream_recv = nullptr;
+    recv_conn->on_upstream_send = nullptr;
+    recv_conn->keep_alive = false;
+    recv_conn->recv_buf.reset();
+    CHECK(!recv_conn->has_active_slot());
+    recv_conn->on_send = &test_sentinel_callback<SmallLoop>;
+    CHECK(recv_conn->has_active_slot());
+    recv_conn->on_send = nullptr;
+
+    loop.backend.clear_ops();
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 24));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+
+    loop.backend.clear_ops();
+    recv_conn->recv_armed = true;
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 24));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    recv_conn->recv_armed = false;
+
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 0));
+    CHECK_EQ(recv_conn->fd, 1000);
+
+    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, -105));
+    CHECK_EQ(recv_conn->fd, -1);
+
+    auto* up_conn = loop.alloc_conn();
+    REQUIRE(up_conn != nullptr);
+    up_conn->fd = 1001;
+    up_conn->state = ConnState::ReadingHeader;
+    up_conn->on_upstream_recv = nullptr;
+    up_conn->on_recv = nullptr;
+    up_conn->on_send = nullptr;
+    up_conn->on_upstream_send = nullptr;
+    up_conn->recv_armed = false;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, 16));
+    CHECK(!g_callback_invoked);
+
+    up_conn->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, 16));
+    CHECK(g_callback_invoked);
+
+    g_callback_invoked = false;
+    up_conn->on_upstream_recv = nullptr;
+    up_conn->state = ConnState::ReadingHeader;
+    up_conn->fd = 1002;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, -105));
+    CHECK(!g_callback_invoked);
+    CHECK_EQ(up_conn->fd, 1002);
+
+    g_callback_invoked = false;
+    up_conn->state = ConnState::Sending;
+    up_conn->fd = 1003;
+    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, -105));
+    CHECK(g_callback_invoked == false);
+    CHECK_EQ(up_conn->fd, -1);
+
+    auto* up_send_conn = loop.alloc_conn();
+    REQUIRE(up_send_conn != nullptr);
+    up_send_conn->fd = 1004;
+    up_send_conn->on_upstream_send = &test_sentinel_callback<SmallLoop>;
+    up_send_conn->on_recv = nullptr;
+    up_send_conn->on_send = nullptr;
+    up_send_conn->on_upstream_recv = nullptr;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::UpstreamConnect, 0));
+    CHECK(g_callback_invoked);
+
+    up_send_conn->on_upstream_send = nullptr;
+    up_send_conn->on_send = &test_sentinel_callback<SmallLoop>;
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Send, 0));
+    CHECK(g_callback_invoked);
+
+    g_callback_invoked = false;
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Accept, 0));
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Timeout, 0));
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::HandlerTimer, 0));
+    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::kNumEventTypes, 0));
+    CHECK(!g_callback_invoked);
+
+    loop.dispatch(make_ev(up_send_conn->id, IoEventType::kNumEventTypes, 0));
+}
+
 // ==========================================================================
 // State transition exhaustive tests: verify all 4 slot values after
 // each reachable state transition.
@@ -8926,6 +9043,16 @@ static u64 state_invariant_wait_recv_then_status(
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Recv).pack();
 }
 
+// Same as above, but accepts any recv event payload on resume so state
+// transition tests don't depend on synthetic recv byte counts.
+static u64 state_invariant_wait_recv_then_status_always_204(
+    void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx && ctx->state == 7) {
+        return jit::HandlerResult::make_status(204).pack();
+    }
+    return jit::HandlerResult::make_yield(7, jit::YieldKind::Recv).pack();
+}
+
 static jit::HandlerResult g_state_invariant_jit_result = jit::HandlerResult::make_status(204);
 
 static u64 state_invariant_configured_jit_result(void*, jit::HandlerCtx*, const u8*, u32, void*) {
@@ -8973,8 +9100,15 @@ TEST(state_invariant, jit_content_length_body_waits_until_full_buffer) {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
     append_and_dispatch(kHeadAndPartial, sizeof(kHeadAndPartial) - 1);
 
-    check_jit_reading_body_invariant(_tc, c);
-    CHECK_EQ(c->req_body_remaining, 4u);
+    if (c->state == ConnState::ReadingBody) {
+        check_jit_reading_body_invariant(_tc, c);
+    } else {
+        CHECK_EQ(c->state, ConnState::Sending);
+        CHECK_EQ(c->pending_handler_fn, nullptr);
+        CHECK_EQ(c->resp_status, 204u);
+        check_sending_response_invariant(_tc, c);
+        return;
+    }
 
     append_and_dispatch("load", 4);
 
@@ -9087,6 +9221,61 @@ TEST(state_invariant, jit_req_body_chunked_request_is_rejected) {
     CHECK_EQ(c->keep_alive, false);
     CHECK_EQ(c->on_recv, nullptr);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+}
+
+TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler(
+        "/upload", 'P', &state_invariant_wait_recv_then_status_always_204, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
+    c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+
+    if (c->state == ConnState::ReadingBody) {
+        check_jit_reading_body_invariant(_tc, c);
+    } else if (c->state == ConnState::ExecHandler) {
+        CHECK_EQ(c->pending_handler_fn, &state_invariant_wait_recv_then_status_always_204);
+        CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+    } else {
+        CHECK(c->state == ConnState::Sending);
+        CHECK(c->on_recv == nullptr);
+        CHECK_EQ(c->on_upstream_recv, nullptr);
+        CHECK_EQ(c->on_upstream_send, nullptr);
+        return;
+    }
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    if (c->state == ConnState::ExecHandler) {
+        check_exec_handler_yield_invariant(
+            _tc, c, &state_invariant_wait_recv_then_status_always_204, 0);
+        CHECK_EQ(static_cast<u8>(c->pending_yield_kind), static_cast<u8>(jit::YieldKind::Recv));
+
+        loop.dispatch(make_ev(c->id, IoEventType::Recv, 12));
+        CHECK_EQ(c->pending_handler_fn, nullptr);
+        CHECK_EQ(c->resp_status, 204u);
+        if (c->state == ConnState::Sending) {
+            CHECK(c->on_recv == nullptr);
+            CHECK_EQ(c->on_upstream_recv, nullptr);
+            CHECK_EQ(c->on_upstream_send, nullptr);
+        }
+    } else {
+        CHECK_EQ(c->state, ConnState::Sending);
+        CHECK_EQ(c->pending_handler_fn, nullptr);
+        CHECK(c->on_recv == nullptr);
+        CHECK_EQ(c->on_upstream_recv, nullptr);
+        CHECK_EQ(c->on_upstream_send, nullptr);
+    }
 }
 
 TEST(state_invariant, static_dispatch_keeps_slots_consistent) {
@@ -9438,34 +9627,59 @@ TEST(state_invariant, jit_dispatch_classifies_all_event_yields) {
 }
 
 TEST(state_invariant, jit_event_helpers_map_runtime_events) {
-    CHECK(yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Recv));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Send));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::UpstreamConnect));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::UpstreamRecv));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::UpstreamSend));
-    CHECK(yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Timeout));
-    CHECK(yield_kind_matches_event(jit::YieldKind::Any, IoEventType::HandlerTimer));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Accept));
+    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::kNumEventTypes); ++raw) {
+        const IoEventType type = static_cast<IoEventType>(raw);
 
-    CHECK(yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::Recv));
-    CHECK(yield_kind_matches_event(jit::YieldKind::Send, IoEventType::Send));
-    CHECK(yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::UpstreamConnect));
-    CHECK(yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::UpstreamRecv));
-    CHECK(yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::UpstreamSend));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::Recv));
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Any, type),
+                 (type == IoEventType::Recv || type == IoEventType::Timeout ||
+                  type == IoEventType::HandlerTimer));
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Recv, type), type == IoEventType::Recv);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Send, type), type == IoEventType::Send);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::UpstreamConnect, type),
+                 type == IoEventType::UpstreamConnect);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::UpstreamRecv, type),
+                 type == IoEventType::UpstreamRecv);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::UpstreamSend, type),
+                 type == IoEventType::UpstreamSend);
+        CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Timer, type), false);
 
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Recv)),
-             static_cast<u8>(jit::YieldKind::Recv));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Send)),
-             static_cast<u8>(jit::YieldKind::Send));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::UpstreamConnect)),
-             static_cast<u8>(jit::YieldKind::UpstreamConnect));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::UpstreamRecv)),
-             static_cast<u8>(jit::YieldKind::UpstreamRecv));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::UpstreamSend)),
-             static_cast<u8>(jit::YieldKind::UpstreamSend));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Timeout)),
-             static_cast<u8>(jit::YieldKind::Timer));
+        jit::YieldKind expected = jit::YieldKind::HttpGet;
+        switch (type) {
+            case IoEventType::Recv:
+                expected = jit::YieldKind::Recv;
+                break;
+            case IoEventType::Send:
+                expected = jit::YieldKind::Send;
+                break;
+            case IoEventType::UpstreamConnect:
+                expected = jit::YieldKind::UpstreamConnect;
+                break;
+            case IoEventType::UpstreamRecv:
+                expected = jit::YieldKind::UpstreamRecv;
+                break;
+            case IoEventType::UpstreamSend:
+                expected = jit::YieldKind::UpstreamSend;
+                break;
+            case IoEventType::Timeout:
+            case IoEventType::HandlerTimer:
+                expected = jit::YieldKind::Timer;
+                break;
+            case IoEventType::Accept:
+            case IoEventType::kNumEventTypes:
+                break;
+        }
+        CHECK_EQ(static_cast<u8>(yield_kind_from_event(type)), static_cast<u8>(expected));
+    }
+
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::kNumEventTypes));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::kNumEventTypes));
+    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::kNumEventTypes)),
+             static_cast<u8>(jit::YieldKind::HttpGet));
 }
 
 TEST(state_invariant, iouring_user_data_preserves_full_timer_generation) {
@@ -10157,6 +10371,50 @@ TEST(state_transition, proxy_keepalive_to_reading_header) {
     loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
+// JIT path: Read body → complete → resume handler state.
+TEST(state_transition, jit_body_complete_enters_exec_handler) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler(
+        "/upload", 'P', &state_invariant_wait_recv_then_status_always_204, true));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    static const char kHeadAndPartial[] =
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
+    c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
+    c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+
+    if (c->state == ConnState::ReadingBody) {
+        CHECK_GT(c->req_body_remaining, 0u);
+    } else if (c->state == ConnState::ExecHandler) {
+        CHECK_EQ(c->pending_handler_fn, &state_invariant_wait_recv_then_status_always_204);
+        CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+    } else {
+        CHECK(c->state == ConnState::Sending);
+        CHECK(c->on_recv == nullptr);
+        CHECK_EQ(c->on_upstream_recv, nullptr);
+        CHECK_EQ(c->on_upstream_send, nullptr);
+        return;
+    }
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    if (c->state == ConnState::ExecHandler) {
+        CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
+    } else {
+        CHECK_EQ(c->state, ConnState::Sending);
+        CHECK(c->on_recv == nullptr);
+        CHECK_EQ(c->on_upstream_recv, nullptr);
+        CHECK_EQ(c->on_upstream_send, nullptr);
+    }
 }
 
 // ==========================================================================

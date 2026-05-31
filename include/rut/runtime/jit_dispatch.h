@@ -77,24 +77,48 @@ inline u32 timer_seconds_from_ms(u32 ms) {
 }
 
 inline bool yield_kind_matches_event(jit::YieldKind kind, IoEventType type) {
-    if (kind == jit::YieldKind::Any) {
-        return type == IoEventType::Recv || type == IoEventType::Timeout ||
-               type == IoEventType::HandlerTimer;
+    switch (kind) {
+        case jit::YieldKind::Any:
+            return type == IoEventType::Recv || type == IoEventType::Timeout ||
+                   type == IoEventType::HandlerTimer;
+        case jit::YieldKind::Recv:
+            return type == IoEventType::Recv;
+        case jit::YieldKind::Send:
+            return type == IoEventType::Send;
+        case jit::YieldKind::UpstreamConnect:
+            return type == IoEventType::UpstreamConnect;
+        case jit::YieldKind::UpstreamRecv:
+            return type == IoEventType::UpstreamRecv;
+        case jit::YieldKind::UpstreamSend:
+            return type == IoEventType::UpstreamSend;
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+        case jit::YieldKind::Timer:
+            return false;
     }
-    if (kind == jit::YieldKind::Recv) return type == IoEventType::Recv;
-    if (kind == jit::YieldKind::Send) return type == IoEventType::Send;
-    if (kind == jit::YieldKind::UpstreamConnect) return type == IoEventType::UpstreamConnect;
-    if (kind == jit::YieldKind::UpstreamRecv) return type == IoEventType::UpstreamRecv;
-    if (kind == jit::YieldKind::UpstreamSend) return type == IoEventType::UpstreamSend;
     return false;
 }
 
 inline jit::YieldKind yield_kind_from_event(IoEventType type) {
-    if (type == IoEventType::Recv) return jit::YieldKind::Recv;
-    if (type == IoEventType::Send) return jit::YieldKind::Send;
-    if (type == IoEventType::UpstreamConnect) return jit::YieldKind::UpstreamConnect;
-    if (type == IoEventType::UpstreamRecv) return jit::YieldKind::UpstreamRecv;
-    if (type == IoEventType::UpstreamSend) return jit::YieldKind::UpstreamSend;
+    switch (type) {
+        case IoEventType::Recv:
+            return jit::YieldKind::Recv;
+        case IoEventType::Send:
+            return jit::YieldKind::Send;
+        case IoEventType::UpstreamConnect:
+            return jit::YieldKind::UpstreamConnect;
+        case IoEventType::UpstreamRecv:
+            return jit::YieldKind::UpstreamRecv;
+        case IoEventType::UpstreamSend:
+            return jit::YieldKind::UpstreamSend;
+        case IoEventType::Timeout:
+        case IoEventType::HandlerTimer:
+            return jit::YieldKind::Timer;
+        case IoEventType::Accept:
+        case IoEventType::kNumEventTypes:
+            return jit::YieldKind::HttpGet;
+    }
     return jit::YieldKind::Timer;
 }
 
@@ -140,22 +164,26 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
         case jit::HandlerAction::Yield:
             out.next_state = r.next_state;
             out.yield_kind = r.yield_kind;
-            if (r.yield_kind == jit::YieldKind::Timer) {
-                out.kind = JitDispatchOutcome::Kind::TimerYield;
-                out.timer_ms = r.yield_payload_u32();
-                return out;
+            switch (r.yield_kind) {
+                case jit::YieldKind::Timer:
+                    out.kind = JitDispatchOutcome::Kind::TimerYield;
+                    out.timer_ms = r.yield_payload_u32();
+                    return out;
+                case jit::YieldKind::Any:
+                case jit::YieldKind::Recv:
+                case jit::YieldKind::Send:
+                case jit::YieldKind::UpstreamConnect:
+                case jit::YieldKind::UpstreamRecv:
+                case jit::YieldKind::UpstreamSend:
+                    out.kind = JitDispatchOutcome::Kind::EventYield;
+                    out.timer_ms = r.yield_payload_u32();
+                    return out;
+                case jit::YieldKind::HttpGet:
+                case jit::YieldKind::HttpPost:
+                case jit::YieldKind::Forward:
+                    return out;
             }
-            if (r.yield_kind == jit::YieldKind::Any || r.yield_kind == jit::YieldKind::Recv ||
-                r.yield_kind == jit::YieldKind::Send ||
-                r.yield_kind == jit::YieldKind::UpstreamConnect ||
-                r.yield_kind == jit::YieldKind::UpstreamRecv ||
-                r.yield_kind == jit::YieldKind::UpstreamSend) {
-                out.kind = JitDispatchOutcome::Kind::EventYield;
-                out.timer_ms = r.yield_payload_u32();
-                return out;
-            }
-            // HttpGet/HttpPost/Forward yields — future slices.
-            return out;  // Kind::Error
+            return out;
     }
     return out;  // unreachable; leaves Kind::Error
 }

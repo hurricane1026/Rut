@@ -36,19 +36,21 @@ struct ConnDebugSnapshot {
 };
 
 inline const char* conn_state_name(ConnState state) {
-    switch (state) {
-        case ConnState::Idle:
-            return "Idle";
-        case ConnState::ReadingHeader:
-            return "ReadingHeader";
-        case ConnState::ReadingBody:
-            return "ReadingBody";
-        case ConnState::ExecHandler:
-            return "ExecHandler";
-        case ConnState::Proxying:
-            return "Proxying";
-        case ConnState::Sending:
-            return "Sending";
+    static constexpr const char* kConnStateNames[static_cast<u8>(ConnState::kNumStates)] = {
+        "Idle",
+        "ReadingHeader",
+        "ReadingBody",
+        "ExecHandler",
+        "Proxying",
+        "Sending",
+    };
+    static_assert(sizeof(kConnStateNames) / sizeof(*kConnStateNames) ==
+                      static_cast<u8>(ConnState::kNumStates),
+                  "conn_state_name table must cover all ConnState values");
+
+    const auto idx = static_cast<u8>(state);
+    if (idx < static_cast<u8>(ConnState::kNumStates)) {
+        return kConnStateNames[idx];
     }
     return "Unknown";
 }

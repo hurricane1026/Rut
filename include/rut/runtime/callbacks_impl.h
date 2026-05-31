@@ -386,6 +386,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     conn.state = ConnState::ExecHandler;
     conn.handler_state = 0;
+    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
     auto* ctx = conn.reset_jit_ctx();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
