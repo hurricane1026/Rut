@@ -6643,12 +6643,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
 
         const auto lhs_state = known_value_state(lhs.value(), locals, local_count, 0);
-        if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
+        if ((lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) &&
+            !rhs->may_error) {
             HirExpr folded = rhs.value();
             folded.span = expr.span;
             return folded;
         }
-        if (!lhs->may_nil && !lhs->may_error) {
+        if (!lhs->may_nil && !lhs->may_error && !rhs->may_error) {
             HirExpr folded = lhs.value();
             folded.span = expr.span;
             return folded;
@@ -6718,7 +6719,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
 
         const auto lhs_state = known_value_state(lhs.value(), locals, local_count, 0);
-        if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
+        if ((lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) &&
+            !rhs->may_error) {
             HirExpr folded = lhs.value();
             folded.span = expr.span;
             return folded;
