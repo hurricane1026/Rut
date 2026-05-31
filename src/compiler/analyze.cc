@@ -8560,7 +8560,26 @@ static FrontendResult<HirModule*> analyze_file_internal(
     const AstFile& file,
     Str source_path,
     std::vector<std::string>& import_stack,
-    std::deque<std::string>* shared_owned_strings);
+    std::deque<std::string>* shared_owned_strings,
+    const std::vector<Str>& external_decorator_names);
+
+static bool contains_str(const std::vector<Str>& names, Str needle) {
+    for (const auto& name : names) {
+        if (name.eq(needle)) return true;
+    }
+    return false;
+}
+
+static void collect_route_decorator_names(const AstFile& file, std::vector<Str>& out) {
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Route) continue;
+        for (u32 di = 0; di < item.route.decorators.len; di++) {
+            const Str name = item.route.decorators[di].name;
+            if (!contains_str(out, name)) out.push_back(name);
+        }
+    }
+}
 
 static Str import_visible_name(const ImportedModuleInfo& imported, Str original_name) {
     if (imported.has_namespace_alias) {
@@ -9549,7 +9568,8 @@ static FrontendResult<void> load_imported_modules(
     Str source_path,
     std::deque<std::string>& owned_strings,
     std::vector<std::string>& import_stack,
-    std::vector<std::unique_ptr<HirModule>>& imported_storage) {
+    std::vector<std::unique_ptr<HirModule>>& imported_storage,
+    const std::vector<Str>& route_decorator_names) {
     if (source_path.len == 0) return {};
     const auto base_dir = std::filesystem::path(str_to_std_string(source_path)).parent_path();
     for (u32 i = 0; i < file.items.len; i++) {
@@ -9609,7 +9629,24 @@ static FrontendResult<void> load_imported_modules(
         std::unique_ptr<AstFile> ast_owned(ast.value());
         auto kept_path = stash_owned_string(owned_strings, normalized);
         g_import_analysis_counter++;
-        auto imported = analyze_file_internal(*ast_owned, kept_path, import_stack, &owned_strings);
+        std::vector<Str> imported_decorator_names;
+        for (const auto& decorator_name : route_decorator_names) {
+            if (!item.import_decl.selective) {
+                if (!item.import_decl.has_namespace_alias &&
+                    !contains_str(imported_decorator_names, decorator_name))
+                    imported_decorator_names.push_back(decorator_name);
+                continue;
+            }
+            for (u32 si = 0; si < item.import_decl.selected_names.len; si++) {
+                const auto& selected = item.import_decl.selected_names[si];
+                const Str visible = selected.has_alias ? selected.alias : selected.name;
+                if (visible.eq(decorator_name) &&
+                    !contains_str(imported_decorator_names, selected.name))
+                    imported_decorator_names.push_back(selected.name);
+            }
+        }
+        auto imported = analyze_file_internal(
+            *ast_owned, kept_path, import_stack, &owned_strings, imported_decorator_names);
         if (!imported) return core::make_unexpected(imported.error());
         imported_storage.push_back(std::unique_ptr<HirModule>(imported.value()));
         ImportedModuleInfo info{};
@@ -10931,7 +10968,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     const AstFile& file,
     Str source_path,
     std::vector<std::string>& import_stack,
-    std::deque<std::string>* shared_owned_strings) {
+    std::deque<std::string>* shared_owned_strings,
+    const std::vector<Str>& external_decorator_names) {
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
     mod.has_package_decl = file.has_package_decl;
@@ -11075,10 +11113,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
     auto* owned_strings =
         shared_owned_strings != nullptr ? shared_owned_strings : &mod.owned_strings;
+    std::vector<Str> route_decorator_names = external_decorator_names;
+    collect_route_decorator_names(file, route_decorator_names);
     std::vector<std::unique_ptr<HirModule>> imported_storage;
     FixedVec<ImportedModuleInfo, AstFile::kMaxItems> imported_modules;
-    auto loaded_imports = load_imported_modules(
-        imported_modules, file, source_path, *owned_strings, import_stack, imported_storage);
+    auto loaded_imports = load_imported_modules(imported_modules,
+                                                file,
+                                                source_path,
+                                                *owned_strings,
+                                                import_stack,
+                                                imported_storage,
+                                                route_decorator_names);
     if (!loaded_imports) return core::make_unexpected(loaded_imports.error());
     auto validated_namespaces = validate_import_namespaces(imported_modules);
     if (!validated_namespaces) return core::make_unexpected(validated_namespaces.error());
@@ -12491,14 +12536,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     };
 
     auto is_route_decorator_function_name = [&](Str name) -> bool {
-        for (u32 ii = 0; ii < file.items.len; ii++) {
-            const auto& route_item = file.items[ii];
-            if (route_item.kind != AstItemKind::Route) continue;
-            for (u32 di = 0; di < route_item.route.decorators.len; di++) {
-                if (route_item.route.decorators[di].name.eq(name)) return true;
-            }
-        }
-        return false;
+        return contains_str(route_decorator_names, name);
     };
 
     for (u32 i = 0; i < file.items.len; i++) {
@@ -14902,7 +14940,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
 FrontendResult<HirModule*> analyze_file(const AstFile& file, Str source_path) {
     std::vector<std::string> import_stack;
-    return analyze_file_internal(file, source_path, import_stack, nullptr);
+    const std::vector<Str> external_decorator_names;
+    return analyze_file_internal(
+        file, source_path, import_stack, nullptr, external_decorator_names);
 }
 
 FrontendResult<HirModule*> analyze_file(const AstFile& file) {
