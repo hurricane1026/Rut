@@ -5158,7 +5158,7 @@ TEST(route, req_cookie_jit_handler_real_socket) {
 TEST(route, req_cookie_all_requires_present_value_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/session\" { let sid = all(req.cookie(\"sid\"), \"ok\") if sid == \"ok\" { "
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let sid = all(sid, any(sid, \"ok\")) if sid == \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5236,7 +5236,7 @@ TEST(route, req_cookie_all_requires_present_value_real_socket) {
 TEST(route, req_header_all_requires_present_value_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/users\" { let host = all(req.header(\"Host\"), \"fallback\") if host == "
+        "route GET \"/users\" { let host = req.header(\"Host\") let host = all(host, any(host, \"fallback\")) if host == "
         "\"localhost\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5312,7 +5312,7 @@ TEST(route, req_header_all_requires_present_value_real_socket) {
 TEST(route, req_query_all_requires_present_value_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, \"\") if value == "
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, any(q, \"rut\")) if value == "
         "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
