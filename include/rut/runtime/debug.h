@@ -36,7 +36,7 @@ struct ConnDebugSnapshot {
 };
 
 inline const char* conn_state_name(ConnState state) {
-    static constexpr const char* kConnStateNames[static_cast<u8>(ConnState::_Count)] = {
+    static constexpr const char* kConnStateNames[static_cast<u8>(ConnState::Count)] = {
         "Idle",
         "ReadingHeader",
         "ReadingBody",
@@ -45,11 +45,11 @@ inline const char* conn_state_name(ConnState state) {
         "Sending",
     };
     static_assert(
-        sizeof(kConnStateNames) / sizeof(*kConnStateNames) == static_cast<u8>(ConnState::_Count),
+        sizeof(kConnStateNames) / sizeof(*kConnStateNames) == static_cast<u8>(ConnState::Count),
         "conn_state_name table must cover all ConnState values");
 
     const auto idx = static_cast<u8>(state);
-    if (idx < static_cast<u8>(ConnState::_Count)) {
+    if (idx < static_cast<u8>(ConnState::Count)) {
         return kConnStateNames[idx];
     }
     return "Unknown";

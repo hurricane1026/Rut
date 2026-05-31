@@ -304,11 +304,11 @@ struct Instruction {
     // Note: DESIGN.md shows nil checks as `%v.is_nil` (sugar), but this
     // IR uses an explicit `OptIsNil` opcode for uniformity.
     bool is_yield() const {
-        switch (op) {
-            case Opcode::YieldHttpGet:
-            case Opcode::YieldHttpPost:
-            case Opcode::YieldForward:
-            case Opcode::YieldTimer:
+        switch (static_cast<u16>(op)) {
+            case static_cast<u16>(Opcode::YieldHttpGet):
+            case static_cast<u16>(Opcode::YieldHttpPost):
+            case static_cast<u16>(Opcode::YieldForward):
+            case static_cast<u16>(Opcode::YieldTimer):
                 return true;
             default:
                 return false;
@@ -318,11 +318,11 @@ struct Instruction {
     // Is this a block-ending instruction? Uses explicit switch rather
     // than range check so opcode reordering can't silently break semantics.
     bool is_terminator() const {
-        switch (op) {
-            case Opcode::Br:
-            case Opcode::Jmp:
-            case Opcode::RetStatus:
-            case Opcode::RetForward:
+        switch (static_cast<u16>(op)) {
+            case static_cast<u16>(Opcode::Br):
+            case static_cast<u16>(Opcode::Jmp):
+            case static_cast<u16>(Opcode::RetStatus):
+            case static_cast<u16>(Opcode::RetForward):
                 return true;
             default:
                 return is_yield();

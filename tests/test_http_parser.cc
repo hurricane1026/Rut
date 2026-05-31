@@ -1,4 +1,5 @@
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/simd/simd.h"
 #include "test.h"
 
 using namespace rut;
@@ -53,6 +54,25 @@ static bool find_header(const ParsedRequest& req, const char* name, Str* out_val
         }
     }
     return false;
+}
+
+TEST(Util, ScanUriNoSpaceReturnsEnd) {
+    const u8 uri[] = "/hello/world?mode=fast";
+    u32 canon_end = 0xffffffffu;
+    CHECK_EQ(simd::scan_uri(uri,
+                            0,
+                            static_cast<u32>(__builtin_strlen(reinterpret_cast<const char*>(uri))),
+                            &canon_end),
+             static_cast<u32>(__builtin_strlen(reinterpret_cast<const char*>(uri))));
+    CHECK_EQ(canon_end, 12u);
+}
+
+TEST(Util, ScanUriNoSpaceWithoutQueryReturnsEnd) {
+    const u8 uri[] = "/hello/world";
+    u32 canon_end = 0xffffffffu;
+    const u32 len = static_cast<u32>(__builtin_strlen(reinterpret_cast<const char*>(uri)));
+    CHECK_EQ(simd::scan_uri(uri, 0, len, &canon_end), len);
+    CHECK_EQ(canon_end, len);
 }
 
 // ============================================================================

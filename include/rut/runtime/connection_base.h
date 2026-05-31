@@ -28,10 +28,10 @@ enum class ConnState : u8 {
     ExecHandler,
     Proxying,
     Sending,
-    _Count,
+    Count,
 };
 
-static_assert(static_cast<u8>(ConnState::_Count) == 6u,
+static_assert(static_cast<u8>(ConnState::Count) == 6u,
               "ConnState count is part of the static network state contract");
 
 struct ConnectionBase {

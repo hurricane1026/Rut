@@ -302,7 +302,7 @@ TEST(jit, frontend_req_header_any_fallback) {
     rir.destroy();
 }
 
-TEST(jit, frontend_req_header_all_requires_present_value) {
+TEST(jit, frontend_req_header_all_requires_present_value_present_or_missing) {
     const char* src =
         "route GET \"/users\" { let host = all(req.header(\"Host\"), \"fallback\") if host == "
         "\"localhost\" { return 204 } else { return 401 } }\n";
@@ -589,7 +589,7 @@ TEST(jit, frontend_req_query_all_requires_present_value) {
     rir.destroy();
 }
 
-TEST(jit, frontend_req_header_all_requires_present_value) {
+TEST(jit, frontend_req_header_all_requires_present_value_request_matrix) {
     const char* src =
         "route GET \"/users\" { let host = all(req.header(\"Host\"), \"fallback\") if host == "
         "\"localhost\" { return 204 } else { return 401 } }\n";
@@ -699,7 +699,7 @@ TEST(jit, frontend_req_query_all_non_short_circuit_evaluates_rhs_when_missing_qu
     rir.destroy();
 }
 
-TEST(jit, frontend_req_cookie_all_requires_present_value) {
+TEST(jit, frontend_req_cookie_all_requires_present_value_present_or_missing) {
     const char* src =
         "route GET \"/session\" { let sid = all(req.cookie(\"sid\"), \"ok\") if sid == \"ok\" "
         "{ return 204 } else { return 401 } }\n";
@@ -1613,7 +1613,7 @@ TEST(jit, frontend_req_cookie_any_fallback) {
     rir.destroy();
 }
 
-TEST(jit, frontend_req_cookie_all_requires_present_value) {
+TEST(jit, frontend_req_cookie_all_requires_present_value_request_matrix) {
     const char* src =
         "route GET \"/session\" { let sid = all(req.cookie(\"sid\"), \"ok\") if sid == \"ok\" { "
         "return 204 } else { return 401 } }\n";
@@ -16427,7 +16427,7 @@ route GET "/users" {
     CHECK(hir->routes[0].locals[1].may_error);
     CHECK_EQ(hir->routes[0].locals[1].error_variant_index,
              hir->routes[0].locals[0].error_variant_index);
-    CHECK_EQ(hir->routes[0].locals[2].type == HirTypeKind::I32);
+    CHECK(hir->routes[0].locals[2].type == HirTypeKind::I32);
     CHECK_FALSE(hir->routes[0].locals[2].may_error);
 }
 TEST(jit, frontend_pipe_method_stage_known_error_dispatches_value_method_shape) {

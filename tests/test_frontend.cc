@@ -11131,15 +11131,19 @@ TEST(frontend, analyze_rejects_or_with_mismatched_types) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
-TEST(frontend, analyze_rejects_or_with_fallible_fallback) {
+TEST(frontend, analyze_allows_any_with_fallible_fallback) {
     const char* src = "route GET \"/users\" { let code = any(nil, error(7)) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Error));
+    CHECK(hir->routes[0].locals[0].init.may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].init.may_nil);
 }
 TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
     const char* src =

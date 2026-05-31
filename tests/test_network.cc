@@ -5,6 +5,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/upstream_pool.h"
@@ -6000,6 +6001,14 @@ TEST(epoll_loop, clear_upstream_fd_noop) {
     destroy_real_loop(loop);
 }
 
+TEST(util, ScanUriNoSpaceWithQueryReturnsEnd) {
+    const u8 uri[] = "/hello/world?mode=fast";
+    u32 canon_end = 0xffffffffu;
+    const u32 len = static_cast<u32>(__builtin_strlen(reinterpret_cast<const char*>(uri)));
+    CHECK_EQ(simd::scan_uri(uri, 0, len, &canon_end), len);
+    CHECK_EQ(canon_end, 12u);
+}
+
 TEST(epoll_loop, stop_and_is_running) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -9138,6 +9147,12 @@ TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
         return;
     }
 
+    static const char kBodyChunk[] = "load";
+    u8* recv_dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < sizeof(kBodyChunk) - 1; j++) {
+        recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
+    }
+    c->recv_buf.commit(sizeof(kBodyChunk) - 1);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
     if (c->state == ConnState::ExecHandler) {
         check_exec_handler_yield_invariant(
@@ -9510,7 +9525,7 @@ TEST(state_invariant, jit_dispatch_classifies_all_event_yields) {
 }
 
 TEST(state_invariant, jit_event_helpers_map_runtime_events) {
-    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::_Count); ++raw) {
+    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::Count); ++raw) {
         const IoEventType type = static_cast<IoEventType>(raw);
 
         CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Any, type),
@@ -9548,20 +9563,20 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
                 expected = jit::YieldKind::Timer;
                 break;
             case IoEventType::Accept:
-            case IoEventType::_Count:
+            case IoEventType::Count:
                 break;
         }
         CHECK_EQ(static_cast<u8>(yield_kind_from_event(type)), static_cast<u8>(expected));
     }
 
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::_Count));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::_Count));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::_Count)),
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::Count));
+    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Count)),
              static_cast<u8>(jit::YieldKind::HttpGet));
 }
 
@@ -10289,6 +10304,11 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
         return;
     }
 
+    recv_dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < sizeof(kBodyChunk) - 1; j++) {
+        recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
+    }
+    c->recv_buf.commit(sizeof(kBodyChunk) - 1);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
     if (c->state == ConnState::ExecHandler) {
         CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
