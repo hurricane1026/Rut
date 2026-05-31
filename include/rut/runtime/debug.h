@@ -44,10 +44,9 @@ inline const char* conn_state_name(ConnState state) {
         "Proxying",
         "Sending",
     };
-    static_assert(sizeof(kConnStateNames) /
-                      sizeof(*kConnStateNames) ==
-                  static_cast<u8>(ConnState::_Count),
-                  "conn_state_name table must cover all ConnState values");
+    static_assert(
+        sizeof(kConnStateNames) / sizeof(*kConnStateNames) == static_cast<u8>(ConnState::_Count),
+        "conn_state_name table must cover all ConnState values");
 
     const auto idx = static_cast<u8>(state);
     if (idx < static_cast<u8>(ConnState::_Count)) {
