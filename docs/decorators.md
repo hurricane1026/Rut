@@ -32,7 +32,7 @@ surface, so decorator bodies can use `req.header(...)`, `req.path`, or
 
 ```rut
 func auth(_ req: i32) -> i32 {
-    if or(req.header("Authorization"), "") == "ok" { 0 } else { 401 }
+    if req.method == GET { 0 } else { 405 }
 }
 ```
 

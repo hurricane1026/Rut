@@ -2428,6 +2428,20 @@ route {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
 }
 
+TEST(frontend, analyze_non_decorator_req_param_still_shadows_magic_request) {
+    const char* src = R"rut(
+struct Box { value: i32 }
+func readBox(_ req: Box) -> i32 => req.value
+route GET "/users" { if readBox(Box(value: 200)) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, analyze_rejects_unknown_route_decorator) {
     const char* src = R"rut(
 route {

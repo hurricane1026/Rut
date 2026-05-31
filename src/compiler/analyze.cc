@@ -12221,8 +12221,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].name = fn.params[pi].name;
             param_locals[pi].ref_index = pi;
             param_locals[pi].type = fn.params[pi].type;
-            param_locals[pi].is_magic_request_proxy =
-                pi == 0 && fn.params[pi].has_underscore_label && fn.params[pi].name.eq({"req", 3});
             param_locals[pi].generic_index = fn.params[pi].generic_index;
             param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =
@@ -12490,6 +12488,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!target_type) return core::make_unexpected(target_type.error());
         out_type = target_type.value();
         return {};
+    };
+
+    auto is_route_decorator_function_name = [&](Str name) -> bool {
+        for (u32 ii = 0; ii < file.items.len; ii++) {
+            const auto& route_item = file.items[ii];
+            if (route_item.kind != AstItemKind::Route) continue;
+            for (u32 di = 0; di < route_item.route.decorators.len; di++) {
+                if (route_item.route.decorators[di].name.eq(name)) return true;
+            }
+        }
+        return false;
     };
 
     for (u32 i = 0; i < file.items.len; i++) {
@@ -13748,7 +13757,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].ref_index = pi;
             param_locals[pi].type = fn.params[pi].type;
             param_locals[pi].is_magic_request_proxy =
-                pi == 0 && fn.params[pi].has_underscore_label && fn.params[pi].name.eq({"req", 3});
+                is_route_decorator_function_name(fn.name) && pi == 0 &&
+                fn.params[pi].has_underscore_label && fn.params[pi].name.eq({"req", 3});
             param_locals[pi].generic_index = fn.params[pi].generic_index;
             param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =
