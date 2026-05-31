@@ -24,11 +24,20 @@ Rules:
 - Returning any non-zero value short-circuits the route and returns that value
   as the HTTP status code.
 
-The first parameter is currently a placeholder. A real runtime `Request` type is
-not implemented yet. If a decorator needs the magic request expression surface
-such as `req.header(...)`, `req.path`, or `req.method`, do not name the
-placeholder parameter `req`; a user-bound parameter or local named `req` shadows
-the magic request object.
+The first parameter is currently a placeholder value rather than a real runtime
+`Request` type. If the omitted-label parameter is named `req`, the compiler
+also treats it as a magic request receiver for the existing request expression
+surface, so decorator bodies can use `req.header(...)`, `req.path`, or
+`req.method`.
+
+```rut
+func auth(_ req: i32) -> i32 {
+    if or(req.header("Authorization"), "") == "ok" { 0 } else { 401 }
+}
+```
+
+A user-bound local named `req` inside the function still shadows the magic
+request object.
 
 ## Execution Order
 

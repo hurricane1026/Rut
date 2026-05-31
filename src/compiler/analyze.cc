@@ -3200,7 +3200,7 @@ static bool user_bound_req_name(const HirModule& mod,
                                 const MatchPayloadBinding* binding) {
     if (binding && binding->subject && binding->name.eq({"req", 3})) return true;
     for (u32 i = 0; i < local_count; i++) {
-        if (locals[i].name.eq({"req", 3})) return true;
+        if (locals[i].name.eq({"req", 3}) && !locals[i].is_magic_request_proxy) return true;
     }
     for (u32 i = 0; i < mod.variants.len; i++) {
         if (mod.variants[i].name.eq({"req", 3})) return true;
@@ -12221,6 +12221,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].name = fn.params[pi].name;
             param_locals[pi].ref_index = pi;
             param_locals[pi].type = fn.params[pi].type;
+            param_locals[pi].is_magic_request_proxy =
+                pi == 0 && fn.params[pi].has_underscore_label && fn.params[pi].name.eq({"req", 3});
             param_locals[pi].generic_index = fn.params[pi].generic_index;
             param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =
@@ -13745,6 +13747,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].name = fn.params[pi].name;
             param_locals[pi].ref_index = pi;
             param_locals[pi].type = fn.params[pi].type;
+            param_locals[pi].is_magic_request_proxy =
+                pi == 0 && fn.params[pi].has_underscore_label && fn.params[pi].name.eq({"req", 3});
             param_locals[pi].generic_index = fn.params[pi].generic_index;
             param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =

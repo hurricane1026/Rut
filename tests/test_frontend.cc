@@ -2386,6 +2386,48 @@ route {
     CHECK_EQ(hir->routes[0].decorators[0].function_index, 0u);  // auth is the only func
 }
 
+TEST(frontend, analyze_route_decorator_req_param_exposes_magic_request_fields) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 { if req.method == GET { 0 } else { 405 } }
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE(hir->routes[0].locals[0].init.lhs != nullptr);
+    REQUIRE(hir->routes[0].locals[0].init.lhs->lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.lhs->lhs->kind),
+             static_cast<u8>(HirExprKind::ReqMethod));
+}
+
+TEST(frontend, analyze_route_decorator_req_param_exposes_magic_request_methods) {
+    const char* src = R"rut(
+func auth(_ req: i32) -> i32 { if or(req.header("Authorization"), "") == "ok" { 0 } else { 401 } }
+route {
+    @auth "*"
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+}
+
 TEST(frontend, analyze_rejects_unknown_route_decorator) {
     const char* src = R"rut(
 route {
