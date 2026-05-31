@@ -22,7 +22,7 @@ enum class IoEventType : u8 {
     _Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::_Count) == 7u,
+static_assert(static_cast<u8>(IoEventType::_Count) == 8u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Unified completion event — field order optimized for minimal padding.
