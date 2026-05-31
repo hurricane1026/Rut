@@ -232,7 +232,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
-            case IoEventType::Accept: {
+            case IoEventType::Accept:
                 if (ev.result < 0) return;
                 Connection* c = this->alloc_conn();
                 if (!c) return;
@@ -242,7 +242,6 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 timer.add(c, keepalive_timeout);
                 this->submit_recv(*c);
                 break;
-            }
             case IoEventType::Timeout:
                 timer.tick([this](Connection* c) {
                     // Mirror EpollEventLoop/IoUringEventLoop: a tick can
@@ -287,7 +286,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 }
                 break;
             case IoEventType::HandlerTimer:
-            case IoEventType::kNumEventTypes:
+            case IoEventType::_Count:
                 break;
         }
     }
@@ -651,7 +650,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
 
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
-            case IoEventType::Accept: {
+            case IoEventType::Accept:
                 if (ev.result < 0) return;
                 Connection* c = this->alloc_conn();
                 if (!c) return;
@@ -661,7 +660,6 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                 timer.add(c, keepalive_timeout);
                 this->submit_recv(*c);
                 break;
-            }
             case IoEventType::HandlerTimer:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
@@ -718,8 +716,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                         if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                        conn.on_upstream_send) {
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                         timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn &&
@@ -739,7 +736,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                     }
                 }
                 break;
-            case IoEventType::kNumEventTypes:
+            case IoEventType::_Count:
                 break;
         }
     }

@@ -548,8 +548,9 @@ public:
                         //       chose timeout as its completion event.
                         if (c->pending_handler_fn &&
                             (c->pending_yield_kind == jit::YieldKind::Timer ||
-                             (c->yield_armed && yield_kind_matches_event(c->pending_yield_kind,
-                                                                         IoEventType::Timeout)))) {
+                             (c->yield_armed &&
+                              yield_kind_matches_event(
+                                  c->pending_yield_kind, IoEventType::Timeout)))) {
                             c->yield_armed = false;
                             c->resume_event_kind = jit::YieldKind::Timer;
                             c->resume_event_result = 0;
@@ -603,7 +604,7 @@ public:
                     }
                 }
                 break;
-            case IoEventType::kNumEventTypes:
+            case IoEventType::_Count:
                 break;
         }
     }

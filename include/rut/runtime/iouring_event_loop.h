@@ -499,8 +499,7 @@ public:
                 if (ev.conn_id < kMaxConns) {
                     auto& c = conns[ev.conn_id];
                     if (c.pending_ops > 0) c.pending_ops--;
-                    const bool matching_generation =
-                        ev.result == static_cast<i32>(c.yield_timer_gen);
+                    const bool matching_generation = ev.result == static_cast<i32>(c.yield_timer_gen);
                     const bool was_yield_armed = c.yield_armed;
                     if (matching_generation) {
                         c.yield_armed = false;
@@ -531,8 +530,8 @@ public:
                         // wait(ms), or wait-any timeout completion.
                         if (c->pending_handler_fn &&
                             (c->pending_yield_kind == jit::YieldKind::Timer ||
-                             (c->yield_armed && yield_kind_matches_event(c->pending_yield_kind,
-                                                                         IoEventType::Timeout)))) {
+                             (c->yield_armed &&
+                              yield_kind_matches_event(c->pending_yield_kind, IoEventType::Timeout)))) {
                             c->yield_armed = false;
                             c->yield_timeout_armed = false;
                             c->resume_event_kind = jit::YieldKind::Timer;
@@ -571,8 +570,7 @@ public:
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                         if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                        conn.on_upstream_send) {
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                         timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
@@ -605,9 +603,9 @@ public:
                         //     hot-spin on repeated error CQEs until the yield
                         //     deadline fires. Close unconditionally.
                         const bool kRecvError = (ev.type == IoEventType::Recv && ev.result < 0 &&
-                                                 ev.result != -ECANCELED);
-                        const bool kPeerClose =
-                            (ev.type == IoEventType::Recv && !ev.more && ev.result == 0);
+                                                ev.result != -ECANCELED);
+                        const bool kPeerClose = (ev.type == IoEventType::Recv && !ev.more &&
+                                                ev.result == 0);
                         if (kRecvError || kPeerClose) {
                             this->close_conn(conn);
                         } else if (ev.type == IoEventType::Recv && !ev.more && ev.result > 0) {
@@ -625,7 +623,7 @@ public:
                     }
                 }
                 break;
-            case IoEventType::kNumEventTypes:
+            case IoEventType::_Count:
                 break;
         }
     }

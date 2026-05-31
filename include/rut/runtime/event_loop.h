@@ -95,7 +95,7 @@ public:
             case IoEventType::Accept:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
-            case IoEventType::kNumEventTypes:
+            case IoEventType::_Count:
                 break;
         }
     }
@@ -653,14 +653,11 @@ public:
                             // event type (not state) to distinguish client vs upstream.
                             if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                             if (ev.type == IoEventType::Send) conn.send_armed = false;
-                            if (ev.type == IoEventType::UpstreamSend)
-                                conn.upstream_send_armed = false;
-                            if (ev.type == IoEventType::UpstreamRecv)
-                                conn.upstream_recv_armed = false;
+                            if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                            if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                         }
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
-                        conn.on_upstream_send) {
+                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv || conn.on_upstream_send) {
                         timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if constexpr (Backend::kAsyncIo) {
@@ -674,7 +671,7 @@ public:
                     }
                 }
                 break;
-            case IoEventType::kNumEventTypes:
+            case IoEventType::_Count:
                 break;
         }
     }
