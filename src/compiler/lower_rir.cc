@@ -1821,9 +1821,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                             error_scalar_infos,
                                             error_variant_infos,
                                             error_struct_infos);
-            const bool eager_missing_fallback = value.lhs != nullptr &&
-                                                value.lhs->kind == MirValueKind::HasValue &&
-                                                !value.is_pipe_conditional;
+            const bool eager_missing_fallback =
+                value.lhs != nullptr && !value.is_pipe_conditional &&
+                (value.lhs->kind == MirValueKind::HasValue ||
+                 (value.is_eager_fallback && value.lhs->kind == MirValueKind::BoolConst &&
+                  value.lhs->bool_value));
             auto wrap_error_branch = [&](const MirValue& branch,
                                          rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
                 if (branch.may_error) {
@@ -3298,7 +3300,11 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         }
         auto local_needs_error_prelude = [](const MirLocal& local) -> bool {
             return local.may_error && local.init.kind == MirValueKind::IfElse &&
-                   local.init.lhs != nullptr && local.init.lhs->kind == MirValueKind::HasValue &&
+                   local.init.lhs != nullptr &&
+                   (local.init.lhs->kind == MirValueKind::HasValue ||
+                    (local.init.is_eager_fallback &&
+                     local.init.lhs->kind == MirValueKind::BoolConst &&
+                     local.init.lhs->bool_value)) &&
                    !local.init.is_pipe_conditional;
         };
 

@@ -4884,7 +4884,10 @@ static bool run_jit_real_socket_status_cases(const char* src,
     std::unique_ptr<MirModule> mir_owned(mir.value());
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(*mir_owned, rir);
-    if (!lowered) return false;
+    if (!lowered) {
+        rir.destroy();
+        return false;
+    }
 
     jit::JitEngine engine;
     if (!engine.init()) {

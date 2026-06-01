@@ -10075,6 +10075,7 @@ TEST(frontend, any_builtin_present_lhs_fallible_rhs_preserves_lhs_shape_and_rhs_
     CHECK_EQ(static_cast<u8>(init.lhs->kind), static_cast<u8>(HirExprKind::BoolLit));
     CHECK_EQ(static_cast<u8>(init.rhs->kind), static_cast<u8>(HirExprKind::IntLit));
     CHECK(init.args[0]->may_error);
+    CHECK(init.is_eager_fallback);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);

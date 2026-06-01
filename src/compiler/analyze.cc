@@ -6827,6 +6827,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.may_error = rhs->may_error;
             out.error_struct_index = rhs->error_struct_index;
             out.error_variant_index = rhs->error_variant_index;
+            out.is_eager_fallback = true;
             return out;
         }
 
