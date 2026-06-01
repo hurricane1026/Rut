@@ -624,6 +624,7 @@ struct HirLocal {
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
     bool is_wait_result = false;
+    bool is_magic_request_proxy = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u32 wait_index = 0xffffffffu;
