@@ -8021,6 +8021,93 @@ TEST(legacy_loop, sync_submit_and_close_paths) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, dispatch_event_unhandled_recv_paths) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    u32 cid = c->id;
+
+    c->recv_buf.write_ptr()[0] = 'x';
+    c->recv_buf.commit(1);
+    c->keep_alive = false;
+    loop->backend.clear_ops();
+    loop->dispatch_event(*c, make_ev(cid, IoEventType::Recv, 12));
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 1u);
+    CHECK(c->fd >= 0);
+
+    loop->backend.clear_ops();
+    loop->dispatch_event(*c, make_ev(cid, IoEventType::Recv, 0));
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 0u);
+    CHECK(c->fd >= 0);
+
+    loop->dispatch_event(*c, make_ev(cid, IoEventType::Recv, -105));
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, dispatch_event_unhandled_upstream_recv_paths) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    auto* stale = loop->alloc_conn();
+    REQUIRE(stale != nullptr);
+    stale->fd = dup(2);
+    REQUIRE(stale->fd >= 0);
+    stale->state = ConnState::ReadingHeader;
+    loop->dispatch_event(*stale, make_ev(stale->id, IoEventType::UpstreamRecv, -105));
+    CHECK(stale->fd >= 0);
+    loop->free_conn(*stale);
+
+    auto* active = loop->alloc_conn();
+    REQUIRE(active != nullptr);
+    active->fd = dup(2);
+    REQUIRE(active->fd >= 0);
+    active->state = ConnState::Proxying;
+    u32 cid = active->id;
+    loop->dispatch_event(*active, make_ev(cid, IoEventType::UpstreamRecv, -105));
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, poll_command_updates_control_slots) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    ShardControlBlock control;
+    RouteConfig config{};
+    const RouteConfig* current_config = nullptr;
+    int jit_target = 0;
+    void* current_jit = nullptr;
+    ShardEpoch epoch;
+    loop->control = &control;
+    loop->config_ptr = &current_config;
+    loop->jit_code_ptr = &current_jit;
+    loop->epoch = &epoch;
+
+    control.pending_config.store(&config, std::memory_order_release);
+    control.pending_jit.store(&jit_target, std::memory_order_release);
+    control.pending_capture.store(kCaptureDisable, std::memory_order_release);
+    loop->poll_command();
+    CHECK_EQ(current_config, &config);
+    CHECK_EQ(current_jit, &jit_target);
+    CHECK_EQ(loop->capture_ring, nullptr);
+    CHECK_EQ(control.pending_config.load(std::memory_order_acquire), nullptr);
+    CHECK_EQ(control.pending_jit.load(std::memory_order_acquire), nullptr);
+    CHECK_EQ(control.pending_capture.load(std::memory_order_acquire), nullptr);
+
+    loop->epoch_enter();
+    loop->epoch_leave();
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    loop->shutdown();
+}
+
 TEST(legacy_loop, async_submit_and_close_paths) {
     auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
     auto initialized = loop->init(0, -1);
