@@ -6425,6 +6425,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     then_expr->may_error ? then_expr->error_struct_index : lhs->error_struct_index;
                 out.error_variant_index = then_expr->may_error ? then_expr->error_variant_index
                                                                : lhs->error_variant_index;
+                out.is_pipe_conditional = true;
                 out.lhs = cond_ptr;
                 out.rhs = then_ptr;
                 if (!out.args.push(else_ptr))
@@ -7387,6 +7388,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 then_expr->may_error ? then_expr->error_struct_index : pipe_lhs->error_struct_index;
             out.error_variant_index = then_expr->may_error ? then_expr->error_variant_index
                                                            : pipe_lhs->error_variant_index;
+            out.is_pipe_conditional = true;
             out.lhs = cond_ptr;
             out.rhs = then_ptr;
             if (!out.args.push(else_ptr))

@@ -539,6 +539,23 @@ struct Ctx {
                 return ptr_ty;
         }
     }
+
+    LLVMValueRef build_select_value(LLVMValueRef cond, LLVMValueRef then_v, LLVMValueRef else_v) {
+        LLVMTypeRef ty = LLVMTypeOf(then_v);
+        if (LLVMGetTypeKind(ty) != LLVMStructTypeKind) {
+            return LLVMBuildSelect(builder, cond, then_v, else_v, "sel");
+        }
+
+        LLVMValueRef out = LLVMGetUndef(ty);
+        const u32 field_count = LLVMCountStructElementTypes(ty);
+        for (u32 i = 0; i < field_count; i++) {
+            LLVMValueRef then_field = LLVMBuildExtractValue(builder, then_v, i, "sel.then");
+            LLVMValueRef else_field = LLVMBuildExtractValue(builder, else_v, i, "sel.else");
+            LLVMValueRef selected = build_select_value(cond, then_field, else_field);
+            out = LLVMBuildInsertValue(builder, out, selected, i, "sel.field");
+        }
+        return out;
+    }
 };
 
 // ── Instruction Emission ───────────────────────────────────────────
@@ -1125,7 +1142,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef cond = c.get_value(inst.operands[0]);
             LLVMValueRef then_v = c.get_value(inst.operands[1]);
             LLVMValueRef else_v = c.get_value(inst.operands[2]);
-            LLVMValueRef v = LLVMBuildSelect(c.builder, cond, then_v, else_v, "sel");
+            LLVMValueRef v = c.build_select_value(cond, then_v, else_v);
             c.set_value(inst.result, v);
             break;
         }
