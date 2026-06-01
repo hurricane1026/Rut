@@ -10053,6 +10053,37 @@ TEST(frontend, any_builtin_over_optional_query_source_preserves_rhs_call) {
     CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
 }
 
+TEST(frontend, any_builtin_present_lhs_fallible_rhs_preserves_lhs_shape_and_rhs_call) {
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    auto& init = hir->routes[0].locals[0].init;
+    CHECK_EQ(static_cast<u8>(init.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK_EQ(init.type, HirTypeKind::I32);
+    CHECK(init.may_error);
+    REQUIRE_NE(init.lhs, nullptr);
+    REQUIRE_NE(init.rhs, nullptr);
+    REQUIRE_EQ(init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(init.lhs->kind), static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_EQ(static_cast<u8>(init.rhs->kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK(init.args[0]->may_error);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
 TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, \"\") "
