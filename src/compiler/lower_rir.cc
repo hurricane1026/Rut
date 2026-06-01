@@ -1893,21 +1893,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                 cond.value(), then_wrapped.value(), else_wrapped.value(), {span.line, span.col});
             if (!selected) return frontend_error(FrontendError::OutOfMemory, span);
             if (!eager_missing_fallback) return selected.value();
-            auto branch_has_error =
-                [&](rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
-                auto err = b.emit_struct_field(branch_id,
-                                               error_field_name(),
-                                               err_info.error_opt_type,
-                                               {span.line, span.col});
+            auto branch_has_error = [&](rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
+                auto err = b.emit_struct_field(
+                    branch_id, error_field_name(), err_info.error_opt_type, {span.line, span.col});
                 if (!err) return frontend_error(FrontendError::OutOfMemory, span);
                 auto err_is_nil = b.emit_opt_is_nil(err.value(), {span.line, span.col});
                 if (!err_is_nil) return frontend_error(FrontendError::OutOfMemory, span);
                 auto false_v = b.emit_const_bool(false, {span.line, span.col});
                 if (!false_v) return frontend_error(FrontendError::OutOfMemory, span);
-                auto has_error = b.emit_cmp(rir::Opcode::CmpEq,
-                                            err_is_nil.value(),
-                                            false_v.value(),
-                                            {span.line, span.col});
+                auto has_error = b.emit_cmp(
+                    rir::Opcode::CmpEq, err_is_nil.value(), false_v.value(), {span.line, span.col});
                 if (!has_error) return frontend_error(FrontendError::OutOfMemory, span);
                 return has_error.value();
             };
@@ -3432,9 +3427,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     out.destroy();
                     return frontend_error(FrontendError::OutOfMemory, local.span);
                 }
-                const rir::BlockId next_block =
-                    error_index + 1 < error_local_count ? error_check_blocks[error_index]
-                                                        : block_ids[0];
+                const rir::BlockId next_block = error_index + 1 < error_local_count
+                                                    ? error_check_blocks[error_index]
+                                                    : block_ids[0];
                 if (!b.emit_br(no_error.value(),
                                next_block,
                                error_return_block,

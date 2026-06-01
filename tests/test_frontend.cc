@@ -655,8 +655,7 @@ TEST(frontend, analyze_preserves_optional_any_as_or_value) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
              static_cast<u8>(HirExprKind::ReqQuery));
     CHECK(hir->routes[0].locals[1].name.eq(lit("code")));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
-             static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
     REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
@@ -2932,7 +2931,7 @@ route {
 
 TEST(frontend, analyze_route_decorator_req_param_exposes_magic_request_methods) {
     const char* src = R"rut(
-func auth(_ req: i32) -> i32 { if or(req.header("Authorization"), "") == "ok" { 0 } else { 401 } }
+func auth(_ req: i32) -> i32 { if any(req.header("Authorization"), "") == "ok" { 0 } else { 401 } }
 route {
     @auth "*"
     GET "/users" { return 200 }
@@ -10019,8 +10018,7 @@ TEST(frontend, any_builtin_over_optional_query_source_becomes_or) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
-             static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
     auto& fallback_expr = hir->routes[0].locals[1].init;
@@ -10067,8 +10065,7 @@ TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
-             static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
     CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
     auto& fallback_expr = hir->routes[0].locals[1].init;
     REQUIRE_NE(fallback_expr.lhs, nullptr);
@@ -10115,8 +10112,7 @@ TEST(frontend, any_builtin_over_optional_cookie_source_becomes_or) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
-             static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
     CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
     auto& fallback_expr = hir->routes[0].locals[1].init;
     REQUIRE_NE(fallback_expr.lhs, nullptr);

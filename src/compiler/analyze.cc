@@ -6555,7 +6555,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             cmp.lhs = lhs_operand->value;
             cmp.rhs = rhs_operand->value;
             cmp.span = expr.span;
-            if (!route->exprs.push(cmp)) return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!route->exprs.push(cmp))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* cmp_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr false_expr{};

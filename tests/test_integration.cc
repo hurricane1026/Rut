@@ -4863,8 +4863,7 @@ static bool real_socket_response_has_status(u16 port,
     if (n <= 0) return false;
 
     for (i32 i = 0; i + 2 < n; i++) {
-        if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2])
-            return true;
+        if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) return true;
     }
     return false;
 }
