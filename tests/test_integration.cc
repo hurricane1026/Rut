@@ -4862,10 +4862,9 @@ static bool real_socket_response_has_status(u16 port,
     close(c);
     if (n <= 0) return false;
 
-    for (i32 i = 0; i + 2 < n; i++) {
-        if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) return true;
-    }
-    return false;
+    return n >= 12 && buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P' &&
+           buf[4] == '/' && buf[8] == ' ' && buf[9] == status[0] && buf[10] == status[1] &&
+           buf[11] == status[2];
 }
 
 static bool run_jit_real_socket_status_cases(const char* src,
@@ -4887,14 +4886,14 @@ static bool run_jit_real_socket_status_cases(const char* src,
     auto lowered = lower_to_rir(*mir_owned, rir);
     if (!lowered) return false;
 
-    auto cg = jit::codegen(rir.module);
-    if (!cg.ok) {
+    jit::JitEngine engine;
+    if (!engine.init()) {
         rir.destroy();
         return false;
     }
-
-    jit::JitEngine engine;
-    if (!engine.init()) {
+    auto cg = jit::codegen(rir.module);
+    if (!cg.ok) {
+        engine.shutdown();
         rir.destroy();
         return false;
     }

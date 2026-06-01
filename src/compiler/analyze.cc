@@ -6575,6 +6575,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.rhs = cmp_ptr;
             if (!out.args.push(false_ptr))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.may_error = (lhs->kind != HirExprKind::LocalRef && lhs->may_error) ||
+                            (rhs->kind != HirExprKind::LocalRef && rhs->may_error);
+            out.error_struct_index =
+                rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
+            out.error_variant_index =
+                rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
             out.span = expr.span;
             return out;
         }
@@ -6810,7 +6816,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
         HirExpr then_expr{};
         then_expr.kind = HirExprKind::ValueOf;
-        copy_hir_shape(&then_expr, rhs.value());
+        copy_hir_shape(&then_expr, lhs.value());
         then_expr.lhs = lhs_ptr;
         then_expr.may_nil = false;
         then_expr.may_error = false;
@@ -6824,6 +6830,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         HirExpr out{};
         out.kind = HirExprKind::IfElse;
         copy_hir_shape(&out, rhs.value());
+        if (out.type == HirTypeKind::Unknown || out.shape_index == 0xffffffffu)
+            copy_hir_shape(&out, lhs.value());
         out.span = expr.span;
         out.lhs = cond_ptr;
         out.rhs = then_ptr;

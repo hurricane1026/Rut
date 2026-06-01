@@ -268,7 +268,7 @@ TEST(route_art, root_grows_node48_to_node256_at_fanout_49) {
     }
 }
 
-TEST(route_art, nested_node16_child_dispatches_and_reads_header) {
+TEST(route_art, nested_node16_child_dispatches_by_next_byte) {
     ArtTrie t;
     char paths[5][4];
     for (u32 i = 0; i < 5; i++) {
@@ -284,7 +284,7 @@ TEST(route_art, nested_node16_child_dispatches_and_reads_header) {
     CHECK_EQ(t.match(S("/az"), 0), TrieNode::kInvalidRoute);
 }
 
-TEST(route_art, nested_node256_child_dispatches_and_reads_header) {
+TEST(route_art, nested_node256_child_dispatches_by_next_byte) {
     ArtTrie t;
     char paths[49][4];
     for (u32 i = 0; i < 49; i++) {
