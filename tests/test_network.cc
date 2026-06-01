@@ -8140,6 +8140,61 @@ TEST(legacy_loop, async_submit_and_close_paths) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, async_reclaim_pending_reclaims_ready_slots) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* ready = loop->alloc_conn();
+    REQUIRE(ready != nullptr);
+    auto* busy = loop->alloc_conn();
+    REQUIRE(busy != nullptr);
+    u32 ready_id = ready->id;
+    u32 busy_id = busy->id;
+
+    ready->fd = -1;
+    ready->pending_ops = 0;
+    busy->fd = -1;
+    busy->pending_ops = 1;
+    loop->pending_free[0] = ready_id;
+    loop->pending_free[1] = busy_id;
+    loop->pending_free_count = 2;
+
+    loop->reclaim_pending();
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->pending_free[0], busy_id);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns - 1);
+    CHECK_EQ(loop->conns[ready_id].recv_slice, nullptr);
+    CHECK_EQ(loop->conns[ready_id].send_slice, nullptr);
+
+    busy->pending_ops = 0;
+    loop->reclaim_pending();
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_dispatch_stale_cqe_reclaims_slot) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = -1;
+    c->pending_ops = 1;
+    c->recv_armed = true;
+    loop->pending_free[0] = cid;
+    loop->pending_free_count = 1;
+
+    loop->dispatch(make_ev(cid, IoEventType::Recv, 0));
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
+    CHECK_EQ(loop->conns[cid].pending_ops, 0u);
+    CHECK_EQ(loop->conns[cid].recv_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].send_slice, nullptr);
+    loop->shutdown();
+}
+
 TEST(legacy_loop, event_yield_fails_fast) {
     auto loop = std::make_unique<EventLoop<MockBackend>>();
     auto initialized = loop->init(0, -1);
