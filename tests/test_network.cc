@@ -6001,7 +6001,7 @@ TEST(epoll_loop, clear_upstream_fd_noop) {
     destroy_real_loop(loop);
 }
 
-TEST(util, ScanUriNoSpaceWithQueryReturnsEnd) {
+TEST(util, scan_uri_no_space_with_query_returns_end) {
     const u8 uri[] = "/hello/world?mode=fast";
     u32 canon_end = 0xffffffffu;
     const u32 len = static_cast<u32>(__builtin_strlen(reinterpret_cast<const char*>(uri)));
@@ -10304,7 +10304,8 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
         return;
     }
 
-    recv_dst = c->recv_buf.write_ptr();
+    static const char kBodyChunk[] = "load";
+    u8* recv_dst = c->recv_buf.write_ptr();
     for (u32 j = 0; j < sizeof(kBodyChunk) - 1; j++) {
         recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
     }

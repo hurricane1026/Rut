@@ -445,8 +445,8 @@ route GET "/users" {
 
     bool saw_or = false;
     for (u32 fi = 0; fi < mir->functions.len; fi++) {
-        for (u32 vi = 0; vi < mir->functions[fi].values.len; vi++) {
-            if (mir->functions[fi].values[vi].kind == MirValueKind::Or) {
+        for (u32 li = 0; li < mir->functions[fi].locals.len; li++) {
+            if (mir->functions[fi].locals[li].init.kind == MirValueKind::Or) {
                 saw_or = true;
                 break;
             }
@@ -641,7 +641,8 @@ TEST(frontend, analyze_constant_folds_any_when_lhs_present) {
 
 TEST(frontend, analyze_preserves_optional_any_as_or_value) {
     const char* src =
-        "route GET \"/users\" { let maybe = nil let code = any(maybe, 200) return 200 }\n";
+        "route GET \"/users\" { let maybe = req.query(\"code\") let code = any(maybe, "
+        "\"fallback\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -652,18 +653,19 @@ TEST(frontend, analyze_preserves_optional_any_as_or_value) {
     CHECK(hir->routes[0].locals[0].name.eq(lit("maybe")));
     CHECK(hir->routes[0].locals[0].may_nil);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
-             static_cast<u8>(HirExprKind::Nil));
+             static_cast<u8>(HirExprKind::ReqQuery));
     CHECK(hir->routes[0].locals[1].name.eq(lit("code")));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::Or));
     REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
              static_cast<u8>(HirExprKind::LocalRef));
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::IntLit));
+             static_cast<u8>(HirExprKind::StrLit));
     CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
     CHECK_FALSE(hir->routes[0].locals[1].init.may_nil);
-    CHECK_EQ(hir->routes[0].locals[1].init.rhs->int_value, 200);
+    CHECK(hir->routes[0].locals[1].init.rhs->str_value.eq(lit("fallback")));
 }
 
 TEST(frontend, analyze_preserves_optional_all_as_if_else) {
@@ -9918,8 +9920,7 @@ TEST(frontend, all_builtin_over_optional_query_source_preserves_rhs_call) {
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
              static_cast<u8>(HirExprKind::HasValue));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::Call));
+    CHECK(hir->routes[0].locals[1].init.rhs->may_error);
     CHECK(hir->routes[0].locals[1].init.may_error);
 }
 
@@ -9934,14 +9935,15 @@ TEST(frontend, any_builtin_over_optional_query_source_becomes_or) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::Or));
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
-    auto& or_expr = hir->routes[0].locals[1].init;
-    REQUIRE_NE(or_expr.lhs, nullptr);
-    REQUIRE_NE(or_expr.rhs, nullptr);
-    CHECK_EQ(static_cast<u8>(or_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
-    CHECK_EQ(static_cast<u8>(or_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
+    auto& fallback_expr = hir->routes[0].locals[1].init;
+    REQUIRE_NE(fallback_expr.lhs, nullptr);
+    REQUIRE_NE(fallback_expr.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(fallback_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(fallback_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
 }
 
 TEST(frontend, any_builtin_over_optional_query_source_preserves_rhs_call) {
@@ -9957,13 +9959,16 @@ TEST(frontend, any_builtin_over_optional_query_source_preserves_rhs_call) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
     REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    REQUIRE_EQ(hir->routes[0].locals[1].init.args.len, 1u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
-             static_cast<u8>(HirExprKind::LocalRef));
+             static_cast<u8>(HirExprKind::HasValue));
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::Call));
+             static_cast<u8>(HirExprKind::ValueOf));
+    CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
 }
 
 TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
@@ -9978,13 +9983,14 @@ TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::Or));
     CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
-    auto& or_expr = hir->routes[0].locals[1].init;
-    REQUIRE_NE(or_expr.lhs, nullptr);
-    REQUIRE_NE(or_expr.rhs, nullptr);
-    CHECK_EQ(static_cast<u8>(or_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
-    CHECK_EQ(static_cast<u8>(or_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
+    auto& fallback_expr = hir->routes[0].locals[1].init;
+    REQUIRE_NE(fallback_expr.lhs, nullptr);
+    REQUIRE_NE(fallback_expr.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(fallback_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(fallback_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
 }
 
 TEST(frontend, any_builtin_over_optional_header_source_preserves_rhs_call) {
@@ -10000,13 +10006,16 @@ TEST(frontend, any_builtin_over_optional_header_source_preserves_rhs_call) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
     REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    REQUIRE_EQ(hir->routes[0].locals[1].init.args.len, 1u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
-             static_cast<u8>(HirExprKind::LocalRef));
+             static_cast<u8>(HirExprKind::HasValue));
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::Call));
+             static_cast<u8>(HirExprKind::ValueOf));
+    CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
 }
 
 TEST(frontend, any_builtin_over_optional_cookie_source_becomes_or) {
@@ -10022,13 +10031,14 @@ TEST(frontend, any_builtin_over_optional_cookie_source_becomes_or) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::Or));
     CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
-    auto& or_expr = hir->routes[0].locals[1].init;
-    REQUIRE_NE(or_expr.lhs, nullptr);
-    REQUIRE_NE(or_expr.rhs, nullptr);
-    CHECK_EQ(static_cast<u8>(or_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
-    CHECK_EQ(static_cast<u8>(or_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
+    auto& fallback_expr = hir->routes[0].locals[1].init;
+    REQUIRE_NE(fallback_expr.lhs, nullptr);
+    REQUIRE_NE(fallback_expr.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(fallback_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(fallback_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
 }
 
 TEST(frontend, any_builtin_over_optional_cookie_source_preserves_rhs_call) {
@@ -10044,13 +10054,16 @@ TEST(frontend, any_builtin_over_optional_cookie_source_preserves_rhs_call) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
     REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    REQUIRE_EQ(hir->routes[0].locals[1].init.args.len, 1u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
-             static_cast<u8>(HirExprKind::LocalRef));
+             static_cast<u8>(HirExprKind::HasValue));
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::Call));
+             static_cast<u8>(HirExprKind::ValueOf));
+    CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
 }
 
 TEST(frontend, all_builtin_over_optional_header_source_preserves_rhs_call) {
@@ -10072,8 +10085,7 @@ TEST(frontend, all_builtin_over_optional_header_source_preserves_rhs_call) {
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
              static_cast<u8>(HirExprKind::HasValue));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::Call));
+    CHECK(hir->routes[0].locals[1].init.rhs->may_error);
     CHECK(hir->routes[0].locals[1].init.may_error);
 }
 
@@ -10130,8 +10142,7 @@ TEST(frontend, all_builtin_over_optional_cookie_source_preserves_rhs_call) {
     REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
              static_cast<u8>(HirExprKind::HasValue));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
-             static_cast<u8>(HirExprKind::Call));
+    CHECK(hir->routes[0].locals[1].init.rhs->may_error);
     CHECK(hir->routes[0].locals[1].init.may_error);
 }
 
@@ -11688,9 +11699,8 @@ TEST(frontend, lower_to_rir_supports_runtime_all_int_value) {
 TEST(frontend, lower_to_rir_supports_runtime_any_optional_query_value_eagerly_with_rhs_call) {
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) return "
-        "value "
-        "== \"ok\" }\n";
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) let ok = "
+        "value == \"ok\" return 204 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11708,16 +11718,14 @@ TEST(frontend, lower_to_rir_supports_runtime_any_optional_query_value_eagerly_wi
     const auto& fn = rir.module.functions[0];
     REQUIRE_GE(fn.block_count, 1u);
     CHECK(block_op_count(fn.blocks[0], rir::Opcode::Select) >= 1u);
-    CHECK_FALSE(function_has_op(fn, rir::Opcode::Br));
-    CHECK_FALSE(function_has_op(fn, rir::Opcode::Jmp));
     rir.destroy();
 }
 
 TEST(frontend, lower_to_rir_supports_runtime_all_optional_query_fallback_call_eagerly) {
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
-        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) return "
-        "value == \"ok\" }\n";
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) let ok = "
+        "value == \"ok\" return 204 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11736,8 +11744,6 @@ TEST(frontend, lower_to_rir_supports_runtime_all_optional_query_fallback_call_ea
     REQUIRE_GE(fn.block_count, 1u);
     CHECK(block_op_count(fn.blocks[0], rir::Opcode::OptIsNil) >= 1u);
     CHECK(block_op_count(fn.blocks[0], rir::Opcode::Select) >= 1u);
-    CHECK_FALSE(function_has_op(fn, rir::Opcode::Br));
-    CHECK_FALSE(function_has_op(fn, rir::Opcode::Jmp));
     rir.destroy();
 }
 

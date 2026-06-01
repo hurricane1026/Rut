@@ -185,6 +185,18 @@ static Str error_line_field_name() {
     return lit("line");
 }
 
+static Str error_check_label() {
+    return lit("error_check");
+}
+
+static Str error_return_label() {
+    return lit("error_return");
+}
+
+static Str prelude_label() {
+    return lit("prelude");
+}
+
 static bool copy_str(MmapArena& arena, Str src, Str* out) {
     char* mem = arena.alloc_array<char>(src.len + 1);
     if (!mem) return false;
@@ -1809,6 +1821,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                             error_scalar_infos,
                                             error_variant_infos,
                                             error_struct_infos);
+            const bool eager_missing_fallback =
+                value.lhs != nullptr && value.lhs->kind == MirValueKind::HasValue;
             auto wrap_error_branch = [&](const MirValue& branch,
                                          rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
                 if (branch.may_error) {
@@ -1878,7 +1892,40 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             auto selected = b.emit_select(
                 cond.value(), then_wrapped.value(), else_wrapped.value(), {span.line, span.col});
             if (!selected) return frontend_error(FrontendError::OutOfMemory, span);
-            return selected.value();
+            if (!eager_missing_fallback) return selected.value();
+            auto branch_has_error =
+                [&](rir::ValueId branch_id) -> FrontendResult<rir::ValueId> {
+                auto err = b.emit_struct_field(branch_id,
+                                               error_field_name(),
+                                               err_info.error_opt_type,
+                                               {span.line, span.col});
+                if (!err) return frontend_error(FrontendError::OutOfMemory, span);
+                auto err_is_nil = b.emit_opt_is_nil(err.value(), {span.line, span.col});
+                if (!err_is_nil) return frontend_error(FrontendError::OutOfMemory, span);
+                auto false_v = b.emit_const_bool(false, {span.line, span.col});
+                if (!false_v) return frontend_error(FrontendError::OutOfMemory, span);
+                auto has_error = b.emit_cmp(rir::Opcode::CmpEq,
+                                            err_is_nil.value(),
+                                            false_v.value(),
+                                            {span.line, span.col});
+                if (!has_error) return frontend_error(FrontendError::OutOfMemory, span);
+                return has_error.value();
+            };
+            auto then_has_error = branch_has_error(then_wrapped.value());
+            if (!then_has_error) return core::make_unexpected(then_has_error.error());
+            auto else_has_error = branch_has_error(else_wrapped.value());
+            if (!else_has_error) return core::make_unexpected(else_has_error.error());
+            auto selected_or_else_error = b.emit_select(else_has_error.value(),
+                                                        else_wrapped.value(),
+                                                        selected.value(),
+                                                        {span.line, span.col});
+            if (!selected_or_else_error) return frontend_error(FrontendError::OutOfMemory, span);
+            auto selected_or_error = b.emit_select(then_has_error.value(),
+                                                   then_wrapped.value(),
+                                                   selected_or_else_error.value(),
+                                                   {span.line, span.col});
+            if (!selected_or_error) return frontend_error(FrontendError::OutOfMemory, span);
+            return selected_or_error.value();
         }
         if (value.may_nil) {
             auto inner = make_inner_type(value_shape);
@@ -3253,6 +3300,26 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
             }
         }
+        auto local_needs_error_prelude = [](const MirLocal& local) -> bool {
+            return local.may_error && local.init.kind == MirValueKind::IfElse &&
+                   local.init.lhs != nullptr && local.init.lhs->kind == MirValueKind::HasValue;
+        };
+
+        u32 error_local_count = 0;
+        for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+            if (local_needs_error_prelude(mir.functions[i].locals[li])) error_local_count++;
+        }
+        const bool has_error_prelude = error_local_count != 0;
+        rir::BlockId prelude_block{};
+        if (has_error_prelude) {
+            auto block = b.create_block(fn.value(), prelude_label());
+            if (!block) {
+                out.destroy();
+                return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+            }
+            prelude_block = block.value();
+        }
+
         rir::BlockId block_ids[MirFunction::kMaxBlocks]{};
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
             auto block = b.create_block(fn.value(), mir.functions[i].blocks[bi].label);
@@ -3292,7 +3359,26 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
             }
         }
-        b.set_insert_point(fn.value(), block_ids[0]);
+        rir::BlockId error_return_block{};
+        rir::BlockId error_check_blocks[MirFunction::kMaxLocals]{};
+        if (has_error_prelude) {
+            auto error_block = b.create_block(fn.value(), error_return_label());
+            if (!error_block) {
+                out.destroy();
+                return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+            }
+            error_return_block = error_block.value();
+            for (u32 ei = 1; ei < error_local_count; ei++) {
+                auto check_block = b.create_block(fn.value(), error_check_label());
+                if (!check_block) {
+                    out.destroy();
+                    return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+                }
+                error_check_blocks[ei - 1] = check_block.value();
+            }
+        }
+
+        b.set_insert_point(fn.value(), has_error_prelude ? prelude_block : block_ids[0]);
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
@@ -3316,6 +3402,55 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return core::make_unexpected(val.error());
             }
             local_vals[mir.functions[i].locals[li].ref_index] = val.value();
+        }
+
+        if (has_error_prelude) {
+            u32 error_index = 0;
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                const auto& local = mir.functions[i].locals[li];
+                if (!local_needs_error_prelude(local)) continue;
+                if (local.ref_index >= MirFunction::kMaxLocals) {
+                    out.destroy();
+                    return frontend_error(FrontendError::UnsupportedSyntax, local.span);
+                }
+                const auto local_shape = resolved_shape(mir, local);
+                auto& err_info = error_info_for(local_shape,
+                                                local.error_struct_index,
+                                                error_scalar_infos,
+                                                error_variant_infos,
+                                                error_struct_infos);
+                auto err = b.emit_struct_field(local_vals[local.ref_index],
+                                               error_field_name(),
+                                               err_info.error_opt_type,
+                                               {local.span.line, local.span.col});
+                if (!err) {
+                    out.destroy();
+                    return frontend_error(FrontendError::OutOfMemory, local.span);
+                }
+                auto no_error = b.emit_opt_is_nil(err.value(), {local.span.line, local.span.col});
+                if (!no_error) {
+                    out.destroy();
+                    return frontend_error(FrontendError::OutOfMemory, local.span);
+                }
+                const rir::BlockId next_block =
+                    error_index + 1 < error_local_count ? error_check_blocks[error_index]
+                                                        : block_ids[0];
+                if (!b.emit_br(no_error.value(),
+                               next_block,
+                               error_return_block,
+                               {local.span.line, local.span.col})) {
+                    out.destroy();
+                    return frontend_error(FrontendError::OutOfMemory, local.span);
+                }
+                error_index++;
+                if (error_index < error_local_count)
+                    b.set_insert_point(fn.value(), error_check_blocks[error_index - 1]);
+            }
+            b.set_insert_point(fn.value(), error_return_block);
+            if (!b.emit_ret_status(500, {mir.functions[i].span.line, mir.functions[i].span.col})) {
+                out.destroy();
+                return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+            }
         }
 
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {

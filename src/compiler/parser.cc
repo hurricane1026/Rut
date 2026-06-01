@@ -445,7 +445,7 @@ struct Parser {
                 }
                 index = index * 10 + static_cast<i32>(ch - '0');
             }
-            if (all_digits && index > 0) {
+            if (all_digits) {
                 if (index > 10)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*ident.value()),

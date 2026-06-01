@@ -1,310 +1,272 @@
-#Pipe Expressions
+# Pipe Expressions
 
 Pipe expressions pass the value on the left into a function call on the right.
 They are useful for writing small, named transformation steps in route logic
 without nesting calls.
 
 Pipe is resolved during analysis. After type checking, a pipe becomes an
-ordinary inlined function-call expression;
-it does not introduce a separate MIR / RIR opcode.
+ordinary inlined function-call expression; it does not introduce a separate
+MIR/RIR opcode.
 
-                                       Use `or` / `and` as boolean operators only;
-function - call forms `or (...)` and
-`and (...)` are not supported.Also, `&&` and `||` are rejected at parse time.For optional
-                                                     / error fallback in expressions,
-    use `any(...)` (fallback on nil / error) and `all(...)` (fallback only when value is present)
-                                                     .
+Use `or` and `and` as boolean operators only. Function-call forms `or(...)` and
+`and(...)` are not supported, and `&&` / `||` are rejected at parse time. For
+optional/error fallback in expressions, use `any(...)` for nil/error fallback
+and `all(...)` for present-only fallback.
 
-                                                 ##Operator precedence notes
+## Operator Precedence Notes
 
 `and` and `or` are parsed before `|`.
 
-                                        - `A and B
-                  | C` parses as `(A and B) | C`.- `A
-        or B | C` parses as `(A or B) | C`.- `A | B and C` is rejected unless you add parentheses,
-    because `and` appears on the right side of `|`.- `A | B
-        or C` is also rejected unless you add parentheses.
+- `A and B | C` parses as `(A and B) | C`.
+- `A or B | C` parses as `(A or B) | C`.
+- `A | B and C` is rejected unless you add parentheses, because `and` appears
+  on the right side of `|`.
+- `A | B or C` is also rejected unless you add parentheses.
 
-           Write either
+Write either:
 
-```rut let x = (A | B) or C
+```rut
+let x = (A | B) or C
 ```
 
-                or
+or:
 
-```rut let x = A | (B or C)
+```rut
+let x = A | (B or C)
 ```
 
-                        to make the intended grouping explicit.
+to make the intended grouping explicit.
 
-                        ##Lowering And Inlining
+## Lowering And Inlining
 
-                        Pipe is a source
-                        - level convenience,
-            not a runtime abstraction.A pipeline such as :
+Pipe is a source-level convenience, not a runtime abstraction. A pipeline such
+as:
 
-```rut let code = 204 | normalize_status(_) |
-                   mask_internal_error(_)
+```rut
+let code = 204 | normalize_status(_) | mask_internal_error(_)
 ```
 
-                   is analyzed as nested stage application,
-            and each stage function body is instantiated at the use site.By the time MIR
-                / RIR are built,
-            there is no
-`Pipe` node, no call chain,
-            and no pipe dispatch.The route contains the ordinary expression
-                instructions produced by the stage bodies,
-            such as constants, comparisons, selects, tuple - slot projections, optional unwraps,
-            and terminal branches.
+is analyzed as nested stage application, and each stage function body is
+instantiated at the use site. By the time MIR/RIR are built, there is no
+`Pipe` node, no call chain, and no pipe dispatch. The route contains the
+ordinary expression instructions produced by the stage bodies, such as
+constants, comparisons, selects, tuple-slot projections, optional unwraps, and
+terminal branches.
 
-                For runtime optional
-                / error values,
-            the analyzer still inlines the stage body but wraps it with presence checks :
+For runtime optional/error values, the analyzer still inlines the stage body but
+wraps it with presence checks:
 
-```rut let host = req.header("Host") | tenant_from_host(_)
+```rut
+let host = req.header("Host") | tenant_from_host(_)
 ```
 
-                   lowers conceptually like :
+lowers conceptually like:
 
-```rut if has_value (req.header("Host")) {
+```rut
+if has_value(req.header("Host")) {
     tenant_from_host(value_of(req.header("Host")))
-}
-else {
+} else {
     missing_of(req.header("Host"))
 }
 ```
 
-    where `tenant_from_host(...)` is also expanded into ordinary expression IR.
+where `tenant_from_host(...)` is also expanded into ordinary expression IR.
 
-    ##Basic Use
+## Basic Use
 
-    The right
-    -
-    hand side must be a function call stage. `_` and `_1` both mean "the
-    whole value from the left
-    -
-    hand side ":
+The right-hand side must be a function call stage. `_` and `_1` both mean "the
+whole value from the left-hand side":
 
-```rut func normalize_status(code : i32)->i32 {
-    if code
-        == 204 {200} else {
-            code
-        }
+```rut
+func normalize_status(code: i32) -> i32 {
+    if code == 204 { 200 } else { code }
 }
 
 route GET "/health" {
-    let code = 204 | normalize_status(_) if code == 200 {return 200} else {return 500}
+    let code = 204 | normalize_status(_)
+    if code == 200 { return 200 } else { return 500 }
 }
 ```
 
-    The same call can use `_1`:
+The same call can use `_1`:
 
-```rut let code = 204 | normalize_status(_1)
+```rut
+let code = 204 | normalize_status(_1)
 ```
 
-                             If a function -
-                             call stage has no placeholder,
-            the left - hand value is passed as the first argument :
+If a function-call stage has no placeholder, the left-hand value is passed as
+the first argument:
 
-```rut let code = 204 | normalize_status()
+```rut
+let code = 204 | normalize_status()
 ```
 
-                         ##Chaining
+## Chaining
 
-                             Each stage receives the previous
-                                 stage's output. This keeps request policy code readable when
-                                     several small decisions are applied in order :
+Each stage receives the previous stage's output. This keeps request policy code
+readable when several small decisions are applied in order:
 
-```rut func status_for_path(path : str) -> i32 {
-    if path
-        == "/users" {200} else {404}
+```rut
+func status_for_path(path: str) -> i32 {
+    if path == "/users" { 200 } else { 404 }
 }
 
-func mask_internal_error(code : i32) -> i32 {
-    if code
-        == 500 {503} else {
-            code
-        }
+func mask_internal_error(code: i32) -> i32 {
+    if code == 500 { 503 } else { code }
 }
 
 route GET "/users" {
-    let code = req.path | status_for_path(_) |
-               mask_internal_error(_) if code == 200 {return 200} else {return 404}
+    let code = req.path | status_for_path(_) | mask_internal_error(_)
+    if code == 200 { return 200 } else { return 404 }
 }
 ```
 
-    Route terminal control should still spell out the statuses it returns :
+Route terminal control should still spell out the statuses it returns:
 
-```rut route GET "/users" {
-    let code = req.path | status_for_path(_) |
-               mask_internal_error(_) if code == 200 {return 200} else {return 404}
+```rut
+route GET "/users" {
+    let code = req.path | status_for_path(_) | mask_internal_error(_)
+    if code == 200 { return 200 } else { return 404 }
 }
 ```
 
-    ##Placeholder Position
+## Placeholder Position
 
-        The placeholder can appear in any argument position.This is useful when a stage needs
-            constants or
-    policy values alongside the piped value :
+The placeholder can appear in any argument position. This is useful when a stage
+needs constants or policy values alongside the piped value:
 
-```rut func allow_if_token(token : str, expected : str, ok_status : i32) -> i32 {
-    if token
-        == expected {
-            ok_status
-        }
-    else {
-        401
-    }
+```rut
+func allow_if_token(token: str, expected: str, ok_status: i32) -> i32 {
+    if token == expected { ok_status } else { 401 }
 }
 
 route GET "/admin" {
-    let code = req.header("Authorization") | allow_if_token(_, "Bearer root", 200) let safe =
-                   any(code, 401) if safe == 200 {return 200} else {return 401}
+    let code = req.header("Authorization") | allow_if_token(_, "Bearer root", 200)
+    let safe = any(code, 401)
+    if safe == 200 { return 200 } else { return 401 }
 }
 ```
 
-    ##Method Stages
+## Method Stages
 
-        The placeholder can also be the receiver of a method -
-    call stage :
+The placeholder can also be the receiver of a method-call stage:
 
-```rut route GET "/method-stage" {
-    let ok = 200 | _.eq(200) if ok{return 200} else {return 500}
+```rut
+route GET "/method-stage" {
+    let ok = 200 | _.eq(200)
+    if ok { return 200 } else { return 500 }
 }
 ```
 
-`_` and `_1` are accepted as method receivers.Tuple - slot receivers such as
-`_2.method(...)` are still rejected;
-use a function stage with tuple - slot arguments when a pipeline needs to project tuple slots
-                                      .
+`_` and `_1` are accepted as method receivers. Tuple-slot receivers such as
+`_2.method(...)` are still rejected; use a function stage with tuple-slot
+arguments when a pipeline needs to project tuple slots.
 
-                                  ##Optional Header Flow
+## Optional Header Flow
 
-`req.header(...)` returns an optional string.A pipe stage only runs when the header is present;
-missing values flow through as `nil` and can be handled with
-`any(...)`
-    .
+`req.header(...)` returns an optional string. A pipe stage only runs when the
+header is present; missing values flow through as `nil` and can be handled with
+`any(...)`.
 
-```rut func tenant_from_host(host : str)
-    ->str {
-    if host
-        == "api.example.com" {"api"} else {"unknown"}
+```rut
+func tenant_from_host(host: str) -> str {
+    if host == "api.example.com" { "api" } else { "unknown" }
 }
 
-func status_for_tenant(tenant : str) -> i32 {
-    if tenant
-        == "api" {200} else {404}
+func status_for_tenant(tenant: str) -> i32 {
+    if tenant == "api" { 200 } else { 404 }
 }
 
 route GET "/tenant" {
-    let code = req.header("Host") | tenant_from_host(_) | status_for_tenant(_) let safe =
-                   any(code, 404) if safe == 200 {return 200} else {return 404}
+    let code = req.header("Host") | tenant_from_host(_) | status_for_tenant(_)
+    let safe = any(code, 404)
+    if safe == 200 { return 200 } else { return 404 }
 }
 ```
 
-    ##Error Flow
+## Error Flow
 
-        Error values also flow through a pipe without calling later stages
-            .Downstream
-`any(...)` can turn the error into a concrete fallback :
+Error values also flow through a pipe without calling later stages. Downstream
+`any(...)` can turn the error into a concrete fallback:
 
-```rut func parse_mode(raw : str)
-            ->i32 {
-    if raw
-        == "fast" {1} else {
-            error(.bad_mode)
-        }
+```rut
+func parse_mode(raw: str) -> i32 {
+    if raw == "fast" { 1 } else { error(.bad_mode) }
 }
 
-func status_for_mode(mode : i32) -> i32 {
-    if mode
-        == 1 {200} else {400}
+func status_for_mode(mode: i32) -> i32 {
+    if mode == 1 { 200 } else { 400 }
 }
 
 route GET "/mode" {
-    let code = req.header("X-Mode") | parse_mode(_) | status_for_mode(_) let safe =
-                   any(code, 400) if safe == 200 {return 200} else {return 400}
+    let code = req.header("X-Mode") | parse_mode(_) | status_for_mode(_)
+    let safe = any(code, 400)
+    if safe == 200 { return 200 } else { return 400 }
 }
 ```
 
 Known `nil` and known `error(...)` left-hand values are folded at analysis time
 and do not call the stage.
 
-`any(...)` and `all(...)` currently use conditional selection at runtime, so both
-operands are materialized before selection. If you need strict short-circuiting
-for side-effectful expressions, write it as an explicit `if` branch.
+`any(...)` and `all(...)` use conditional selection at runtime, so both operands
+are materialized before selection. If you need strict short-circuiting for
+side-effectful expressions, write it as an explicit `if` branch.
 
-`all(...)` is the inverse fallback form:
+`all(...)` is the present-only fallback form:
 
 ```rut
-route GET "/and" {
-    let token = req.query("x-token") let safe =
-        all(token, "") if safe == "" {return 401} else {return 200}
+route GET "/all" {
+    let token = req.query("x-token")
+    let safe = all(token, any(token, ""))
+    if safe == "" { return 401 } else { return 200 }
 }
 ```
 
-    Use `all(...)` when you want the right
-    - hand value to apply only when the left -
-    hand value is present.
+Use `all(...)` when you want the right-hand value to apply only when the
+left-hand value is present.
 
-    ##Tuple Slots
+## Tuple Slots
 
-    When the left
-    - hand side is a tuple,
-    numbered placeholders select tuple slots.Indexes are 1 - based :
+When the left-hand side is a tuple, numbered placeholders select tuple slots.
+Indexes are 1-based:
 
-```rut func status_from_policy(auth_status : i32, default_status : i32)->i32 {
-    if auth_status
-        == 200 {
-            auth_status
-        }
-    else {
-        default_status
-    }
+```rut
+func status_from_policy(auth_status: i32, default_status: i32) -> i32 {
+    if auth_status == 200 { auth_status } else { default_status }
 }
 
 route GET "/tuple-policy" {
-    let policy = (200, 401)let code =
-        policy | status_from_policy(_1, _2) if code == 200 {return 200} else {return 401}
+    let policy = (200, 401)
+    let code = policy | status_from_policy(_1, _2)
+    if code == 200 { return 200 } else { return 401 }
 }
 ```
 
-    Tuple slots can be reordered :
+Tuple slots can be reordered:
 
-```rut func
-    prefer_second(primary : i32, secondary : i32) -> i32 = > secondary
+```rut
+func prefer_second(primary: i32, secondary: i32) -> i32 => secondary
 
-                                                           route GET "/tuple-reorder" {
-    let code = (500, 200) | prefer_second(_1, _2) if code == 200 {return 200} else {return 500}
+route GET "/tuple-reorder" {
+    let code = (500, 200) | prefer_second(_1, _2)
+    if code == 200 { return 200 } else { return 500 }
 }
 ```
 
-    Tuple slots can also come from tuple -
-    returning functions :
+Tuple slots can also come from tuple-returning functions:
 
-```rut func route_policy(path : str) {
-    if path
-        == "/tuple-stage" {
-            (200, 401)
-        }
-    else {
-        (404, 401)
-    }
+```rut
+func route_policy(path: str) {
+    if path == "/tuple-stage" { (200, 401) } else { (404, 401) }
 }
 
-func choose_policy(primary : i32, fallback : i32) -> i32 {
-    if primary
-        == 200 {
-            primary
-        }
-    else {
-        fallback
-    }
+func choose_policy(primary: i32, fallback: i32) -> i32 {
+    if primary == 200 { primary } else { fallback }
 }
 
 route GET "/tuple-stage" {
-    let code = req.path | route_policy(_) |
-               choose_policy(_1, _2) if code == 200 {return 200} else {return 401}
+    let code = req.path | route_policy(_) | choose_policy(_1, _2)
+    if code == 200 { return 200 } else { return 401 }
 }
 ```
 
@@ -317,14 +279,16 @@ to be unwrapped before tuple slots can be safely projected.
 
 ## Generic Stages
 
-Generic functions can be used as pipe stages when the type shape can be inferred:
+Generic functions can be used as pipe stages when the type shape can be
+inferred:
 
 ```rut
 func keep<T>(x: T) -> T => x
 func status_for_code(code: i32) -> i32 => code
 
 route GET "/generic" {
-    let code = 200 | keep(_) | status_for_code(_) if code == 200 {return 200} else {return 500}
+    let code = 200 | keep(_) | status_for_code(_)
+    if code == 200 { return 200 } else { return 500 }
 }
 ```
 
@@ -349,5 +313,5 @@ The following are future work rather than current behavior:
 
 - Tuple-slot placeholders for runtime optional/error left-hand values beyond
   `_` / `_1`.
-- A dedicated MIR/RIR pipe representation;
-current lowering intentionally rewrites pipe into ordinary expressions before MIR.
+- A dedicated MIR/RIR pipe representation; current lowering intentionally
+  rewrites pipe into ordinary expressions before MIR.
