@@ -17574,6 +17574,54 @@ route {
     rir.destroy();
 }
 
+TEST(jit, frontend_route_decorator_wait_state_zero_enters_error_prelude) {
+    const auto src = R"rut(
+func passing(_ req: i32) -> i32 => 0
+func fallback() -> i32 => error(.timeout)
+route {
+    @passing "*"
+    GET "/sleep" {
+        let value = any(200, fallback())
+        guard value == 200 else { return 401 }
+        wait(1000)
+        return 204
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
+    ctx.state = 0;
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           &ctx,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK_EQ(static_cast<u8>(r.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r.status_code, 500);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_route_decorator_passes_then_waits) {
     const auto src = R"rut(
 func passing(_ req: i32) -> i32 => 0

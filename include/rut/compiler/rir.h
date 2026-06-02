@@ -361,6 +361,7 @@ struct Function {
     // Yield point count (determines state machine states).
     u32 yield_count;
     bool state_zero_enters_entry;
+    u32 state_zero_entry_block;
     u32 resume_terminal_block;
     bool has_explicit_resume_blocks;
     static constexpr u32 kMaxResumeBlocks = 8;

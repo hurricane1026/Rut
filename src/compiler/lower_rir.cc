@@ -3454,7 +3454,8 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         } else if (mir.functions[i].state_zero_enters_entry) {
             if (mir.functions[i].resume_terminal_block >= mir.functions[i].blocks.len ||
                 !b.set_state_zero_entry_resume(fn.value(),
-                                               block_ids[mir.functions[i].resume_terminal_block])) {
+                                               block_ids[mir.functions[i].resume_terminal_block],
+                                               has_error_prelude ? prelude_block : block_ids[0])) {
                 out.destroy();
                 return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
             }

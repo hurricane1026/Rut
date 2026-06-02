@@ -1403,7 +1403,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
                 LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), c.block_map[fn.resume_blocks[si]]);
             }
         } else if (fn.state_zero_enters_entry) {
-            LLVMAddCase(sw, LLVMConstInt(c.i16_ty, 0, 0), c.block_map[fn.blocks[0].id.id]);
+            LLVMAddCase(sw, LLVMConstInt(c.i16_ty, 0, 0), c.block_map[fn.state_zero_entry_block]);
         }
 
         const u32 first_prologue_yield = fn.state_zero_enters_entry ? 1 : 0;

@@ -113,6 +113,7 @@ struct Builder {
         fn->http_method = http_method;
         fn->yield_count = 0;
         fn->state_zero_enters_entry = false;
+        fn->state_zero_entry_block = 0;
         fn->resume_terminal_block = 0;
         fn->has_explicit_resume_blocks = false;
         for (u32 i = 0; i < Function::kMaxResumeBlocks; i++) fn->resume_blocks[i] = 0;
@@ -156,9 +157,13 @@ struct Builder {
         return {};
     }
 
-    VoidResult set_state_zero_entry_resume(Function* fn, BlockId terminal_block) {
-        if (!fn || terminal_block.id >= fn->block_count) return err(RirError::InvalidState);
+    VoidResult set_state_zero_entry_resume(Function* fn,
+                                           BlockId terminal_block,
+                                           BlockId entry_block) {
+        if (!fn || terminal_block.id >= fn->block_count || entry_block.id >= fn->block_count)
+            return err(RirError::InvalidState);
         fn->state_zero_enters_entry = true;
+        fn->state_zero_entry_block = entry_block.id;
         fn->resume_terminal_block = terminal_block.id;
         return {};
     }
@@ -172,6 +177,7 @@ struct Builder {
         for (u32 i = count; i < Function::kMaxResumeBlocks; i++) fn->resume_blocks[i] = 0;
         fn->has_explicit_resume_blocks = true;
         fn->state_zero_enters_entry = true;
+        fn->state_zero_entry_block = count != 0 ? blocks[0].id : 0;
         fn->resume_terminal_block = count != 0 ? blocks[count - 1].id : 0;
         return {};
     }
