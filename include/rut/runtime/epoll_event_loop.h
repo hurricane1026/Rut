@@ -603,7 +603,7 @@ public:
                     }
                 }
                 break;
-            case IoEventType::kNumEventTypes:
+            case IoEventType::Count:
                 break;
         }
     }

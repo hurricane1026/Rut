@@ -304,29 +304,15 @@ struct Instruction {
     // Note: DESIGN.md shows nil checks as `%v.is_nil` (sugar), but this
     // IR uses an explicit `OptIsNil` opcode for uniformity.
     bool is_yield() const {
-        switch (op) {
-            case Opcode::YieldHttpGet:
-            case Opcode::YieldHttpPost:
-            case Opcode::YieldForward:
-            case Opcode::YieldTimer:
-                return true;
-            default:
-                return false;
-        }
+        return op == Opcode::YieldHttpGet || op == Opcode::YieldHttpPost ||
+               op == Opcode::YieldForward || op == Opcode::YieldTimer;
     }
 
     // Is this a block-ending instruction? Uses explicit switch rather
     // than range check so opcode reordering can't silently break semantics.
     bool is_terminator() const {
-        switch (op) {
-            case Opcode::Br:
-            case Opcode::Jmp:
-            case Opcode::RetStatus:
-            case Opcode::RetForward:
-                return true;
-            default:
-                return is_yield();
-        }
+        return op == Opcode::Br || op == Opcode::Jmp || op == Opcode::RetStatus ||
+               op == Opcode::RetForward || is_yield();
     }
 };
 
@@ -375,6 +361,7 @@ struct Function {
     // Yield point count (determines state machine states).
     u32 yield_count;
     bool state_zero_enters_entry;
+    u32 state_zero_entry_block;
     u32 resume_terminal_block;
     bool has_explicit_resume_blocks;
     static constexpr u32 kMaxResumeBlocks = 8;

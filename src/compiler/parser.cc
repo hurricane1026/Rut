@@ -224,27 +224,6 @@ struct Parser {
             expr.span = Span{start.start, case_name.value()->end, start.line, start.col};
             return expr;
         }
-        if (take(TokenType::KwOr)) {
-            auto lparen = expect(TokenType::LParen);
-            if (!lparen) return core::make_unexpected(lparen.error());
-            auto lhs = parse_expr();
-            if (!lhs) return core::make_unexpected(lhs.error());
-            auto comma = expect(TokenType::Comma);
-            if (!comma) return core::make_unexpected(comma.error());
-            auto rhs = parse_expr();
-            if (!rhs) return core::make_unexpected(rhs.error());
-            auto rparen = expect(TokenType::RParen);
-            if (!rparen) return core::make_unexpected(rparen.error());
-            auto lhs_ptr = alloc_expr(lhs.value());
-            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
-            auto rhs_ptr = alloc_expr(rhs.value());
-            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
-            expr.kind = AstExprKind::Or;
-            expr.lhs = lhs_ptr.value();
-            expr.rhs = rhs_ptr.value();
-            expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
-            return expr;
-        }
         if (take(TokenType::KwWait)) {
             auto lparen = expect(TokenType::LParen);
             if (!lparen) return core::make_unexpected(lparen.error());
@@ -711,8 +690,34 @@ struct Parser {
         return expr;
     }
 
-    FrontendResult<AstExpr> parse_expr() {
+    FrontendResult<AstExpr> parse_or_expr() {
         auto lhs = parse_eq_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (true) {
+            const auto op = [&]() -> TokenType {
+                if (take(TokenType::KwAnd)) return TokenType::KwAnd;
+                if (take(TokenType::KwOr)) return TokenType::KwOr;
+                return TokenType::Error;
+            }();
+            if (op == TokenType::Error) break;
+            auto rhs = parse_eq_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = op == TokenType::KwAnd ? AstExprKind::And : AstExprKind::Or;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
+    }
+
+    FrontendResult<AstExpr> parse_expr() {
+        auto lhs = parse_or_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         while (take(TokenType::Pipe)) {
             auto rhs = parse_eq_expr();

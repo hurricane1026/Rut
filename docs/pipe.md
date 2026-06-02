@@ -8,6 +8,30 @@ Pipe is resolved during analysis. After type checking, a pipe becomes an
 ordinary inlined function-call expression; it does not introduce a separate
 MIR/RIR opcode.
 
+Use `or` and `and` as boolean operators only. Function-call forms `or(...)` and
+`and(...)` are not supported, and `&&` / `||` are rejected at parse time. For
+optional/error fallback in expressions, use `any(...)` for nil/error fallback
+and `all(...)` for present-only fallback.
+
+## Operator Precedence Notes
+
+`and` and `or` are parsed before `|`.
+
+- `A and B | C` parses as `(A and B) | C`.
+- `A or B | C` parses as `(A or B) | C`.
+- `A | B and C` is rejected because `and` appears on the right side of `|`;
+  the pipe RHS must be a call stage such as `f(...)` or `_.method(...)`.
+- `A | B or C` is rejected for the same reason.
+
+Write:
+
+```rut
+let x = (A | B) or C
+```
+
+to make the valid pipe stage grouping explicit before applying boolean
+operators.
+
 ## Lowering And Inlining
 
 Pipe is a source-level convenience, not a runtime abstraction. A pipeline such
@@ -113,7 +137,7 @@ func allow_if_token(token: str, expected: str, ok_status: i32) -> i32 {
 
 route GET "/admin" {
     let code = req.header("Authorization") | allow_if_token(_, "Bearer root", 200)
-    let safe = or(code, 401)
+    let safe = any(code, 401)
     if safe == 200 { return 200 } else { return 401 }
 }
 ```
@@ -137,7 +161,7 @@ arguments when a pipeline needs to project tuple slots.
 
 `req.header(...)` returns an optional string. A pipe stage only runs when the
 header is present; missing values flow through as `nil` and can be handled with
-`or(...)`.
+`any(...)`.
 
 ```rut
 func tenant_from_host(host: str) -> str {
@@ -150,7 +174,7 @@ func status_for_tenant(tenant: str) -> i32 {
 
 route GET "/tenant" {
     let code = req.header("Host") | tenant_from_host(_) | status_for_tenant(_)
-    let safe = or(code, 404)
+    let safe = any(code, 404)
     if safe == 200 { return 200 } else { return 404 }
 }
 ```
@@ -158,7 +182,7 @@ route GET "/tenant" {
 ## Error Flow
 
 Error values also flow through a pipe without calling later stages. Downstream
-`or(...)` can turn the error into a concrete fallback:
+`any(...)` can turn the error into a concrete fallback:
 
 ```rut
 func parse_mode(raw: str) -> i32 {
@@ -171,13 +195,30 @@ func status_for_mode(mode: i32) -> i32 {
 
 route GET "/mode" {
     let code = req.header("X-Mode") | parse_mode(_) | status_for_mode(_)
-    let safe = or(code, 400)
+    let safe = any(code, 400)
     if safe == 200 { return 200 } else { return 400 }
 }
 ```
 
 Known `nil` and known `error(...)` left-hand values are folded at analysis time
 and do not call the stage.
+
+`any(...)` and `all(...)` use conditional selection at runtime, so both operands
+are materialized before selection. If you need strict short-circuiting for
+side-effectful expressions, write it as an explicit `if` branch.
+
+`all(...)` is the present-only fallback form:
+
+```rut
+route GET "/all" {
+    let token = req.query("x-token")
+    let safe = all(token, any(token, ""))
+    if safe == "" { return 401 } else { return 200 }
+}
+```
+
+Use `all(...)` when you want the right-hand value to apply only when the
+left-hand value is present.
 
 ## Tuple Slots
 
@@ -233,7 +274,8 @@ to be unwrapped before tuple slots can be safely projected.
 
 ## Generic Stages
 
-Generic functions can be used as pipe stages when the type shape can be inferred:
+Generic functions can be used as pipe stages when the type shape can be
+inferred:
 
 ```rut
 func keep<T>(x: T) -> T => x

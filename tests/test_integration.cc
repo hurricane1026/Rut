@@ -4843,6 +4843,120 @@ TEST(route, populate_route_config_rejects_pre_bound_over_long_name) {
 }
 
 #if RUT_ENABLE_JIT_TESTS
+struct RealSocketStatusCase {
+    const char* req;
+    u32 req_len;
+    const char* status;
+};
+
+static bool real_socket_response_has_status(u16 port,
+                                            const char* req,
+                                            u32 req_len,
+                                            const char* status) {
+    i32 c = connect_to(port);
+    if (c < 0) return false;
+
+    bool ok = send_all(c, req, req_len);
+    char buf[1024];
+    i32 n = ok ? recv_timeout(c, buf, sizeof(buf), 2000) : -1;
+    close(c);
+    if (n <= 0) return false;
+
+    return n >= 12 && buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P' &&
+           buf[4] == '/' && buf[8] == ' ' && buf[9] == status[0] && buf[10] == status[1] &&
+           buf[11] == status[2];
+}
+
+static bool run_jit_real_socket_status_cases(const char* src,
+                                             const RealSocketStatusCase* cases,
+                                             u32 case_count) {
+    using namespace rut;
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    if (!lexed) return false;
+    auto ast = parse_file(lexed.value());
+    if (!ast) return false;
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    if (!hir) return false;
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    if (!mir) return false;
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    if (!lowered) {
+        rir.destroy();
+        return false;
+    }
+
+    jit::JitEngine engine;
+    if (!engine.init()) {
+        rir.destroy();
+        return false;
+    }
+    auto cg = jit::codegen(rir.module);
+    if (!cg.ok) {
+        engine.shutdown();
+        rir.destroy();
+        return false;
+    }
+    if (!engine.compile(cg.mod, cg.ctx)) {
+        engine.shutdown();
+        rir.destroy();
+        return false;
+    }
+
+    RouteConfig cfg{};
+    if (!populate_route_config(cfg, rir.module) || !register_jit_routes(cfg, rir.module, engine)) {
+        engine.shutdown();
+        rir.destroy();
+        return false;
+    }
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    if (loop == nullptr) {
+        engine.shutdown();
+        rir.destroy();
+        return false;
+    }
+    auto lfd_result = create_listen_socket(0);
+    if (!lfd_result.has_value()) {
+        destroy_real_loop(loop);
+        engine.shutdown();
+        rir.destroy();
+        return false;
+    }
+
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    if (!loop->init(0, lfd).has_value()) {
+        close(lfd);
+        destroy_real_loop(loop);
+        engine.shutdown();
+        rir.destroy();
+        return false;
+    }
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    bool ok = true;
+    for (u32 i = 0; i < case_count; i++) {
+        if (!real_socket_response_has_status(port, cases[i].req, cases[i].req_len, cases[i].status))
+            ok = false;
+    }
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+    return ok;
+}
+
 TEST(route, register_jit_routes_selects_segment_trie_and_adds_param_route) {
     using namespace rut;
     const char* src =
@@ -5004,7 +5118,7 @@ TEST(route, req_param_jit_handler_real_socket) {
 TEST(route, req_header_jit_handler_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/auth\" { let token = or(req.header(\"Authorization\"), \"\") if token == "
+        "route GET \"/auth\" { let token = any(req.header(\"Authorization\"), \"\") if token == "
         "\"Bearer ok\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5080,7 +5194,7 @@ TEST(route, req_header_jit_handler_real_socket) {
 TEST(route, req_cookie_jit_handler_real_socket) {
     using namespace rut;
     const char* src =
-        "route GET \"/session\" { let sid = or(req.cookie(\"sid\"), \"\") if sid == \"ok\" { "
+        "route GET \"/session\" { let sid = any(req.cookie(\"sid\"), \"\") if sid == \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -5155,10 +5269,398 @@ TEST(route, req_cookie_jit_handler_real_socket) {
     rir.destroy();
 }
 
-TEST(route, req_query_jit_handler_real_socket) {
+TEST(route, req_cookie_all_requires_present_value_real_socket) {
+    const char* src =
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let sid = all(sid, any(sid, "
+        "\"ok\")) if sid == \"ok\" { "
+        "return 204 } else { return 401 } }\n";
+    const char kHitReq[] =
+        "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
+    const char kBadReq[] =
+        "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=nope\r\n\r\n";
+    const char kMissingReq[] = "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark\r\n\r\n";
+    const RealSocketStatusCase cases[] = {
+        {kHitReq, sizeof(kHitReq) - 1, "204"},
+        {kBadReq, sizeof(kBadReq) - 1, "401"},
+        {kMissingReq, sizeof(kMissingReq) - 1, "401"},
+    };
+    REQUIRE(run_jit_real_socket_status_cases(src, cases, 3));
+}
+
+TEST(route, req_header_all_requires_present_value_real_socket) {
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let host = all(host, any(host, "
+        "\"fallback\")) if host == "
+        "\"localhost\" { return 204 } else { return 401 } }\n";
+    const char kHitReq[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const char kBadReq[] = "GET /users HTTP/1.1\r\nHost: api.local\r\n\r\n";
+    const char kMissingReq[] = "GET /users HTTP/1.1\r\nUser-Agent: curl\r\n\r\n";
+    const RealSocketStatusCase cases[] = {
+        {kHitReq, sizeof(kHitReq) - 1, "204"},
+        {kBadReq, sizeof(kBadReq) - 1, "401"},
+        {kMissingReq, sizeof(kMissingReq) - 1, "401"},
+    };
+    REQUIRE(run_jit_real_socket_status_cases(src, cases, 3));
+}
+
+TEST(route, req_query_all_requires_present_value_real_socket) {
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, any(q, \"rut\")) if "
+        "value == "
+        "\"rut\" { return 204 } else { return 401 } }\n";
+    const char kHitReq[] = "GET /search?q=rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char kMissReq[] = "GET /search?q=cpp HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char kMissingReq[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    const RealSocketStatusCase cases[] = {
+        {kHitReq, sizeof(kHitReq) - 1, "204"},
+        {kMissReq, sizeof(kMissReq) - 1, "401"},
+        {kMissingReq, sizeof(kMissingReq) - 1, "401"},
+    };
+    REQUIRE(run_jit_real_socket_status_cases(src, cases, 3));
+}
+
+TEST(route, req_query_or_allows_expected_alternative) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, \"\") if value == "
+        "\"rut\" or req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitByValue[] = "GET /search?q=rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitByValue, sizeof(kHitByValue) - 1, "204");
+    const char kHitByQueryString[] = "GET /search?q=admin HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitByQueryString, sizeof(kHitByQueryString) - 1, "204");
+    const char kMiss[] = "GET /search?q=cpp HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kMiss, sizeof(kMiss) - 1, "401");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_all_allows_expected_alternative) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, \"rut\") if value == "
+        "\"rut\" or req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitByValue[] = "GET /search?q=rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitByValue, sizeof(kHitByValue) - 1, "204");
+    const char kHitByQueryString[] = "GET /search?q=admin HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitByQueryString, sizeof(kHitByQueryString) - 1, "204");
+    const char kMiss[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kMiss, sizeof(kMiss) - 1, "401");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_rejects_or_function_call_form) {
     using namespace rut;
     const char* src =
         "route GET \"/search\" { let q = req.query(\"q\") let value = or(q, \"\") if value == "
+        "\"rut\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_query_rejects_and_function_call_form) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = and(q, \"\") if value == "
+        "\"rut\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_header_rejects_or_function_call_form) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"\") if "
+        "value == \"localhost\" { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_header_rejects_and_function_call_form) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = and(host, \"\") if "
+        "value == \"localhost\" { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_cookie_rejects_or_function_call_form) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let value = or(sid, \"\") if value "
+        "== \"ok\" { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_cookie_rejects_and_function_call_form) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/session\" { let sid = req.cookie(\"sid\") let value = and(sid, \"\") if "
+        "value == \"ok\" { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_query_rejects_double_ampersand_operator) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/search\" { let value = true && false if value { return 204 } else { return "
+        "401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE_FALSE(lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
+}
+
+TEST(route, req_query_rejects_double_pipe_operator) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/search\" { let value = true || false if value { return 204 } else { return "
+        "401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_query_rejects_pipe_rhs_with_bool_operator) {
+    using namespace rut;
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/search\" { let value = req.http11 | pass_bool(_) or false if value { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(route, req_query_accepts_parenthesized_pipe_with_bool_operator_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/search\" { let value = (req.http11 | pass_bool(_)) or false if value "
+        "{ return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "204");
+    const char kMissReq[] = "GET /search HTTP/1.0\r\nHost: x\r\n\r\n";
+    check_status(kMissReq, sizeof(kMissReq) - 1, "401");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_jit_handler_real_socket) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, \"\") if value == "
         "\"rut\" { return 204 } else { "
         "return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
@@ -5223,6 +5725,626 @@ TEST(route, req_query_jit_handler_real_socket) {
     check_status(kMissReq, sizeof(kMissReq) - 1, "401");
     const char kMissingReq[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
     check_status(kMissingReq, sizeof(kMissingReq) - 1, "401");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_all_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) if value "
+        "== "
+        "\"rut\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] = "GET /search?q=rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "500");
+    const char kMissReq[] = "GET /search?q=cpp HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kMissReq, sizeof(kMissReq) - 1, "500");
+    const char kMissingReq[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kMissingReq, sizeof(kMissingReq) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_any_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) if value "
+        "== "
+        "\"rut\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] = "GET /search?q=rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "500");
+    const char kMissReq[] = "GET /search?q=cpp HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kMissReq, sizeof(kMissReq) - 1, "500");
+    const char kMissingReq[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kMissingReq, sizeof(kMissingReq) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_header_all_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/users\" { let host = all(req.header(\"Host\"), fallback()) if host == "
+        "\"localhost\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "500");
+    const char kBadReq[] = "GET /users HTTP/1.1\r\nHost: api.local\r\n\r\n";
+    check_status(kBadReq, sizeof(kBadReq) - 1, "500");
+    const char kMissingReq[] = "GET /users HTTP/1.1\r\nUser-Agent: curl\r\n\r\n";
+    check_status(kMissingReq, sizeof(kMissingReq) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_header_any_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/users\" { let host = any(req.header(\"Host\"), fallback()) if host == "
+        "\"localhost\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "500");
+    const char kBadReq[] = "GET /users HTTP/1.1\r\nHost: api.local\r\n\r\n";
+    check_status(kBadReq, sizeof(kBadReq) - 1, "500");
+    const char kMissingReq[] = "GET /users HTTP/1.1\r\nUser-Agent: curl\r\n\r\n";
+    check_status(kMissingReq, sizeof(kMissingReq) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_cookie_all_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/session\" { let sid = all(req.cookie(\"sid\"), fallback()) if sid == "
+        "\"ok\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] =
+        "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "500");
+    const char kBadReq[] =
+        "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=nope\r\n\r\n";
+    check_status(kBadReq, sizeof(kBadReq) - 1, "500");
+    const char kMissingReq[] = "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark\r\n\r\n";
+    check_status(kMissingReq, sizeof(kMissingReq) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_cookie_any_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/session\" { let sid = any(req.cookie(\"sid\"), fallback()) if sid == "
+        "\"ok\" { return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kHitReq[] =
+        "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=ok; lang=en\r\n\r\n";
+    check_status(kHitReq, sizeof(kHitReq) - 1, "500");
+    const char kBadReq[] =
+        "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=nope\r\n\r\n";
+    check_status(kBadReq, sizeof(kBadReq) - 1, "500");
+    const char kMissingReq[] = "GET /session HTTP/1.1\r\nHost: x\r\nCookie: theme=dark\r\n\r\n";
+    check_status(kMissingReq, sizeof(kMissingReq) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_string_all_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let value = all(req.queryString, fallback()) if value == "
+        "\"q=rut\" { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kReqWithQuery[] = "GET /search?q=rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kReqWithQuery, sizeof(kReqWithQuery) - 1, "500");
+    const char kReqMissingQuery[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kReqMissingQuery, sizeof(kReqMissingQuery) - 1, "500");
+
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(route, req_query_string_any_non_short_circuit_eager_rhs_is_observed_real_socket) {
+    using namespace rut;
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(req.queryString, fallback()) if value == "
+        "\"q=rut\" { "
+        "return 204 } else { return 401 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    auto check_status = [&](const char* req, u32 req_len, const char* status) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        REQUIRE(send_all(c, req, req_len));
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        CHECK_GT(n, 0);
+        bool found = false;
+        for (i32 i = 0; i + 2 < n; i++) {
+            if (buf[i] == status[0] && buf[i + 1] == status[1] && buf[i + 2] == status[2]) {
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+        close(c);
+    };
+
+    const char kReqWithQuery[] = "GET /search?q=admin HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kReqWithQuery, sizeof(kReqWithQuery) - 1, "500");
+    const char kReqMissingQuery[] = "GET /search HTTP/1.1\r\nHost: x\r\n\r\n";
+    check_status(kReqMissingQuery, sizeof(kReqMissingQuery) - 1, "500");
 
     lt.stop();
     loop->shutdown();

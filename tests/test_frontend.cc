@@ -26,6 +26,12 @@ static u32 block_op_count(const rir::Block& block, rir::Opcode op) {
     }
     return count;
 }
+static bool function_has_op(const rir::Function& fn, rir::Opcode op) {
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        if (block_has_op(fn.blocks[bi], op)) return true;
+    }
+    return false;
+}
 // RAII wrapper for FrontendResult<T*>. The frontend APIs (parse_file,
 // analyze_file, build_mir) all .release() a unique_ptr and hand back a raw
 // pointer. Tests allocated hundreds of these without ever deleting; before
@@ -189,6 +195,519 @@ TEST(frontend, lex_regex_literal_reports_trailing_escape_at_literal_start) {
     CHECK_EQ(lexed.error().code, FrontendError::UnterminatedString);
     CHECK_EQ(lexed.error().span.start, 0u);
     CHECK_EQ(lexed.error().span.col, 1u);
+}
+
+TEST(frontend, lex_recognizes_and_or_keywords) {
+    const char* src = "a and b or c";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 6u);  // a, and, b, or, c, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::KwAnd));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::KwOr));
+}
+
+TEST(frontend, parse_supports_infix_or_expression) {
+    const char* src = "route GET \"/x\" { let x = true or false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(route.statements[0].expr.kind), static_cast<u8>(AstExprKind::Or));
+}
+
+TEST(frontend, parse_supports_infix_and_expression) {
+    const char* src = "route GET \"/x\" { let x = true and false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(route.statements[0].expr.kind), static_cast<u8>(AstExprKind::And));
+}
+
+TEST(frontend, parse_supports_all_function_call_form) {
+    const char* src = "route GET \"/x\" { let x = all(200, 400) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
+    auto& let_expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(let_expr.kind), static_cast<u8>(AstExprKind::Call));
+    CHECK(let_expr.name.eq({"all", 3}));
+}
+
+TEST(frontend, parse_supports_any_function_call_form) {
+    const char* src = "route GET \"/x\" { let x = any(nil, 200) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
+    auto& let_expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(let_expr.kind), static_cast<u8>(AstExprKind::Call));
+    CHECK(let_expr.name.eq({"any", 3}));
+}
+
+TEST(frontend, parse_infix_and_or_is_left_associative) {
+    const char* src = "route GET \"/x\" { let x = true and false or false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    auto& expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
+    CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::And));
+    CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
+}
+
+TEST(frontend, parse_rejects_double_ampersand_operator) {
+    const char* src = "route GET \"/x\" { let x = true && false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
+}
+
+TEST(frontend, parse_rejects_double_pipe_operator) {
+    const char* src = "route GET \"/x\" { let x = true || false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_or_function_call_form) {
+    const char* src = "route GET \"/x\" { let x = or(maybe(), 200) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_or_function_call_form_with_header) {
+    const char* src =
+        "route GET \"/x\" { let host = req.header(\"Host\") let x = or(host, \"fallback\") return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
+    const char* src =
+        "route GET \"/x\" { let sid = req.cookie(\"sid\") let x = or(sid, \"fallback\") return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_and_function_call_form) {
+    const char* src = "route GET \"/x\" { let x = and(maybe(), 200) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_and_function_call_form_with_header) {
+    const char* src =
+        "route GET \"/x\" { let host = req.header(\"Host\") let x = and(host, \"fallback\") return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
+    const char* src =
+        "route GET \"/x\" { let sid = req.cookie(\"sid\") let x = and(sid, \"fallback\") return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_rejects_pipe_with_bool_operator_rhs) {
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/x\" { let x = true | pass_bool(_) or false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, parse_allows_parenthesized_pipe_with_or) {
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/x\" { let x = (true | pass_bool(_)) or false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE_EQ(ast->items[1].kind, AstItemKind::Route);
+    auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    auto& expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
+    REQUIRE(expr.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::Pipe));
+    CHECK_EQ(static_cast<u8>(expr.lhs->rhs->kind), static_cast<u8>(AstExprKind::Call));
+}
+
+TEST(frontend, parse_supports_and_expr_before_pipe) {
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/x\" { let x = true and false | pass_bool(_) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE_EQ(ast->items[1].kind, AstItemKind::Route);
+    auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    auto& expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Pipe));
+    REQUIRE(expr.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::And));
+}
+
+TEST(frontend, parse_supports_or_expr_before_pipe) {
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/x\" { let x = true or false | pass_bool(_) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    REQUIRE_EQ(ast->items[1].kind, AstItemKind::Route);
+    auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    auto& expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Pipe));
+    REQUIRE(expr.lhs != nullptr);
+    CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::Or));
+}
+
+TEST(frontend, build_mir_preserves_runtime_any_value) {
+    const char* src = R"(
+route GET "/users" {
+    let host = req.header("Host")
+    let safe = any(host, "fallback")
+    if safe == "fallback" { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    bool saw_or = false;
+    for (u32 fi = 0; fi < mir->functions.len; fi++) {
+        for (u32 li = 0; li < mir->functions[fi].locals.len; li++) {
+            if (mir->functions[fi].locals[li].init.kind == MirValueKind::Or) {
+                saw_or = true;
+                break;
+            }
+        }
+        if (saw_or) break;
+    }
+    CHECK(saw_or);
+}
+
+TEST(frontend, parse_rejects_pipe_with_unclear_and_operand) {
+    const char* src =
+        "func pass_bool(v: bool) -> bool { v }\n"
+        "route GET \"/x\" { let x = true | pass_bool(_) and false return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+}
+
+TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
+    const char* lhs_mismatch = "route GET \"/users\" { let code = 200 and true return 200 }\n";
+    auto lexed = lex(lit(lhs_mismatch));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto lhs = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(lhs);
+    CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+
+    const char* rhs_mismatch =
+        "route GET \"/users\" { let code = true and \"fallback\" return 200 }\n";
+    lexed = lex(lit(rhs_mismatch));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto rhs = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rhs);
+    CHECK_EQ(static_cast<u8>(rhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_and_with_fallible_operands) {
+    const char* lhs_fallible = "route GET \"/users\" { let code = error(7) and true return 200 }\n";
+    auto lexed = lex(lit(lhs_fallible));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto lhs = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(lhs);
+    CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+
+    const char* rhs_fallible = "route GET \"/users\" { let code = true and error(7) return 200 }\n";
+    lexed = lex(lit(rhs_fallible));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto rhs = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rhs);
+    CHECK_EQ(static_cast<u8>(rhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_and_with_nil_operands) {
+    const char* lhs_optional = "route GET \"/users\" { let code = nil and true return 200 }\n";
+    auto lexed = lex(lit(lhs_optional));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto lhs = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(lhs);
+    CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+
+    const char* rhs_optional =
+        "route GET \"/users\" { let maybe = nil let code = true and maybe return 200 }\n";
+    lexed = lex(lit(rhs_optional));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto rhs = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(rhs);
+    CHECK_EQ(static_cast<u8>(rhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_constant_folds_and_with_false) {
+    const char* src =
+        "route GET \"/users\" { let code = false and false if code { return 200 } else { return "
+        "401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(hir->routes[0].locals[0].init.bool_value);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+}
+
+TEST(frontend, analyze_constant_folds_and_with_true_to_rhs) {
+    const char* src =
+        "route GET \"/users\" { let code = true and true if code { return 200 } else { return 401 "
+        "} "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK(hir->routes[0].locals[0].init.bool_value);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+}
+
+TEST(frontend, analyze_preserves_non_constant_and_as_if_else) {
+    const char* src =
+        "func gate(left: bool, right: bool) -> bool => left and right\n"
+        "route GET \"/users\" { return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->functions[0].body.lhs, nullptr);
+    REQUIRE_NE(hir->functions[0].body.rhs, nullptr);
+    CHECK_EQ(hir->functions[0].body.lhs->type, HirTypeKind::Bool);
+    CHECK_EQ(hir->functions[0].body.rhs->type, HirTypeKind::Bool);
+}
+
+TEST(frontend, analyze_constant_folds_or_with_true) {
+    const char* src =
+        "route GET \"/users\" { let code = false or true if code { return 200 } else { return 401 "
+        "} "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK(hir->routes[0].locals[0].init.bool_value);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+}
+
+TEST(frontend, analyze_constant_folds_or_with_false) {
+    const char* src =
+        "route GET \"/users\" { let code = false or false if code { return 200 } else { return "
+        "401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(hir->routes[0].locals[0].init.bool_value);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+}
+
+TEST(frontend, analyze_constant_folds_any_when_lhs_present) {
+    const char* src =
+        "route GET \"/users\" { let code = any(200, 500) if code == 200 { return 200 } else { "
+        "return 401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 200);
+    CHECK_FALSE(hir->routes[0].locals[0].init.may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].init.may_nil);
+}
+
+TEST(frontend, analyze_preserves_optional_any_as_or_value) {
+    const char* src =
+        "route GET \"/users\" { let maybe = req.query(\"code\") let code = any(maybe, "
+        "\"fallback\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("maybe")));
+    CHECK(hir->routes[0].locals[0].may_nil);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqQuery));
+    CHECK(hir->routes[0].locals[1].name.eq(lit("code")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
+             static_cast<u8>(HirExprKind::StrLit));
+    CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
+    CHECK_FALSE(hir->routes[0].locals[1].init.may_nil);
+    CHECK(hir->routes[0].locals[1].init.rhs->str_value.eq(lit("fallback")));
+}
+
+TEST(frontend, analyze_preserves_optional_all_as_if_else) {
+    const char* src =
+        "route GET \"/users\" { let query = req.query(\"x\") let value = all(query, \"fallback\") "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("value")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    CHECK_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    CHECK_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
+             static_cast<u8>(HirExprKind::StrLit));
+    CHECK(hir->routes[0].locals[1].init.may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
+}
+
+TEST(frontend, analyze_preserves_non_constant_or_as_if_else) {
+    const char* src =
+        "func gate(left: bool, right: bool) -> bool => left or right\n"
+        "route GET \"/users\" { return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->functions[0].body.kind), static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->functions[0].body.lhs, nullptr);
+    REQUIRE_NE(hir->functions[0].body.rhs, nullptr);
+    CHECK_EQ(hir->functions[0].body.lhs->type, HirTypeKind::Bool);
+    CHECK_EQ(hir->functions[0].body.rhs->type, HirTypeKind::Bool);
 }
 
 TEST(frontend, parse_return_response_status_only) {
@@ -2412,7 +2931,7 @@ route {
 
 TEST(frontend, analyze_route_decorator_req_param_exposes_magic_request_methods) {
     const char* src = R"rut(
-func auth(_ req: i32) -> i32 { if or(req.header("Authorization"), "") == "ok" { 0 } else { 401 } }
+func auth(_ req: i32) -> i32 { if any(req.header("Authorization"), "") == "ok" { 0 } else { 401 } }
 route {
     @auth "*"
     GET "/users" { return 200 }
@@ -3451,7 +3970,7 @@ TEST(frontend,
     }
     const auto src = R"rut(
 import "proto.rut"
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
 )rut";
     auto lexed = lex(lit(src));
@@ -3474,7 +3993,7 @@ TEST(frontend,
     }
     const auto src = R"rut(
 import "proto.rut"
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
 )rut";
     auto lexed = lex(lit(src));
@@ -5989,7 +6508,7 @@ TEST(frontend, import_relative_file_preserves_imported_function_body_shape_indic
         out << "func makeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { Box(value: 500) } "
                "}\n";
         out << "func maybe(ok: bool) { if ok { 200 } else { nil } }\n";
-        out << "func pickOr(ok: bool) -> i32 => or(maybe(ok), 500)\n";
+        out << "func pickOr(ok: bool) -> i32 => any(maybe(ok), 500)\n";
         out << "func pickMatch(x: Result) -> i32 {\n";
         out << "    match x {\n";
         out << "        case .ok => 200\n";
@@ -6118,8 +6637,8 @@ TEST(frontend,
     }
     const auto src = R"rut(
 import "proto.rut"
-func runOpt<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
-func runErr<T: MaybeFail>(x: T) -> i32 => or(x.code(), 200)
+func runOpt<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
+func runErr<T: MaybeFail>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" {
     if runOpt(Box(value: 1)) == 200 { return 200 } else { return 500 }
 }
@@ -6174,8 +6693,8 @@ TEST(
     }
     const auto src = R"rut(
 import "proto.rut"
-func runOpt<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
-func runErr<T: MaybeFail>(x: T) -> i32 => or(x.code(), 200)
+func runOpt<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
+func runErr<T: MaybeFail>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" {
     let a = runOpt(Box(value: 1))
     let b = runErr(Box(value: 1))
@@ -6352,7 +6871,7 @@ TEST(frontend, lower_to_rir_supports_imported_function_body_or) {
     {
         std::ofstream out(dir + "/proto.rut", std::ios::binary);
         out << "func maybe(ok: bool) { if ok { 200 } else { nil } }\n";
-        out << "func pick(ok: bool) -> i32 => or(maybe(ok), 500)\n";
+        out << "func pick(ok: bool) -> i32 => any(maybe(ok), 500)\n";
     }
     const auto src = R"rut(
 import "proto.rut"
@@ -6387,7 +6906,7 @@ TEST(frontend,
     }
     const auto src = R"rut(
 import "proto.rut"
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
 )rut";
     auto lexed = lex(lit(src));
@@ -6416,7 +6935,7 @@ TEST(frontend,
     }
     const auto src = R"rut(
 import "proto.rut"
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 500 } }
 )rut";
     auto lexed = lex(lit(src));
@@ -7019,7 +7538,7 @@ TEST(frontend, error_message_is_preserved_for_explicit_error_variant) {
 }
 TEST(frontend, lower_to_rir_emits_standard_error_struct) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = or(failed, "
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = any(failed, "
         "200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -7050,7 +7569,7 @@ TEST(frontend, lower_to_rir_emits_standard_error_struct) {
 }
 TEST(frontend, lower_to_rir_uses_module_name_for_error_file_field) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = or(failed, "
+        "route GET \"/users\" { let failed = error(.timeout, \"timed out\") let code = any(failed, "
         "200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -7084,7 +7603,7 @@ TEST(frontend, custom_error_struct_lowers_with_standard_error_metadata) {
     const char* src =
         "struct AuthError { err: Error }\n"
         "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") let code = "
-        "or(failed, 200) return 200 }\n";
+        "any(failed, 200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7127,7 +7646,7 @@ TEST(frontend, custom_error_struct_extra_fields_enter_runtime_lowering) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
         "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
-        "\"abc\", retry: 3) let code = or(failed, 200) return 200 }\n";
+        "\"abc\", retry: 3) let code = any(failed, 200) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -8196,6 +8715,71 @@ TEST(frontend, if_const_selects_then_without_checking_else) {
              static_cast<u8>(HirTerminatorKind::ReturnStatus));
     CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
 }
+
+TEST(frontend, if_const_folds_constant_local_boolean_or) {
+    const char* src =
+        "route GET \"/users\" { let flag = true if const flag or false { return 200 } else { "
+        "return forward(missing) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+
+TEST(frontend, if_const_folds_constant_local_boolean_and) {
+    const char* src =
+        "route GET \"/users\" { let flag = false if const flag and true { return forward(missing) "
+        "} else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+
+TEST(frontend, if_const_folds_const_comparison_boolean_or) {
+    const char* src =
+        "route GET \"/users\" { if const (POST == GET) or true { return 200 } else { return "
+        "forward(missing) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+
+TEST(frontend, if_const_folds_const_comparison_boolean_and) {
+    const char* src =
+        "route GET \"/users\" { if const (POST == GET) and true { return forward(missing) } else { "
+        "return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+
 TEST(frontend, if_const_rejects_runtime_condition) {
     const char* src =
         "route GET \"/users\" { if const req.header(\"Host\") { return 200 } else { return 500 } "
@@ -8649,9 +9233,9 @@ TEST(frontend, equality_expression_lowers_to_cmp_eq) {
              static_cast<u8>(rir::Opcode::Br));
     rir.destroy();
 }
-TEST(frontend, or_builtin_falls_back_from_nil) {
+TEST(frontend, any_builtin_falls_back_from_nil) {
     const char* src =
-        "route GET \"/users\" { let code = or(nil, 200) if code == 200 { return 200 } else { "
+        "route GET \"/users\" { let code = any(nil, 200) if code == 200 { return 200 } else { "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -8660,8 +9244,9 @@ TEST(frontend, or_builtin_falls_back_from_nil) {
     REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
     CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].kind),
              static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
-             static_cast<u8>(AstExprKind::Or));
+    auto& any_expr = ast->items[0].route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(any_expr.kind), static_cast<u8>(AstExprKind::Call));
+    CHECK(any_expr.name.eq({"any", 3}));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
@@ -8672,9 +9257,22 @@ TEST(frontend, or_builtin_falls_back_from_nil) {
              static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[0].init.int_value, 200);
 }
+
+TEST(frontend, any_builtin_rejects_mismatched_types) {
+    const char* src = "route GET \"/users\" { let code = any(200, true) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, req_header_flows_as_optional_str) {
     const char* src =
-        "route GET \"/users\" { let host = req.header(\"Host\") let value = or(host, \"fallback\") "
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, "
+        "\"fallback\") "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -8723,7 +9321,7 @@ TEST(frontend, req_standard_header_alias_flows_as_optional_str) {
         "req.contentType let lang = req.acceptLanguage let enc = req.acceptEncoding let cache = "
         "req.cacheControl let ref = req.referer let fwd = req.forwarded let xff = "
         "req.xForwardedFor let proto = req.xForwardedProto let real = req.xRealIp let rid = "
-        "req.xRequestId let value = or(auth, \"\") return 200 }\n";
+        "req.xRequestId let value = any(auth, \"\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -8930,7 +9528,7 @@ TEST(frontend, req_route_param_field_requires_full_param_segment) {
 
 TEST(frontend, req_query_flows_as_optional_str) {
     const char* src =
-        "route GET \"/search\" { let q = req.query(\"q\") let value = or(q, \"\") if value == "
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, \"\") if value == "
         "\"rut\" { return 200 } else { "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
@@ -8966,7 +9564,7 @@ TEST(frontend, req_query_flows_as_optional_str) {
 
 TEST(frontend, req_query_string_flows_as_optional_str) {
     const char* src =
-        "route GET \"/search\" { let raw = req.queryString let value = or(raw, \"\") if value == "
+        "route GET \"/search\" { let raw = req.queryString let value = any(raw, \"\") if value == "
         "\"q=rut\" { return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9247,7 +9845,7 @@ TEST(frontend, req_content_length_and_remote_addr_equality_lower_to_rir) {
 
 TEST(frontend, req_cookie_flows_as_optional_str) {
     const char* src =
-        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = or(sid, \"fallback\") "
+        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = any(sid, \"fallback\") "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9280,7 +9878,7 @@ TEST(frontend, req_cookie_flows_as_optional_str) {
 TEST(frontend, req_header_alias_flows_as_optional_str) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let alias = host let value = "
-        "or(alias, \"fallback\") return 200 }\n";
+        "any(alias, \"fallback\") return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9311,9 +9909,9 @@ TEST(frontend, req_header_alias_flows_as_optional_str) {
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::ConstStr));
     rir.destroy();
 }
-TEST(frontend, or_builtin_falls_back_from_nil_local) {
+TEST(frontend, any_builtin_falls_back_from_nil_local) {
     const char* src =
-        "route GET \"/users\" { let maybe = nil let code = or(maybe, 200) if code == 200 { return "
+        "route GET \"/users\" { let maybe = nil let code = any(maybe, 200) if code == 200 { return "
         "200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9336,9 +9934,9 @@ TEST(frontend, or_builtin_falls_back_from_nil_local) {
     REQUIRE(mir);
     REQUIRE_EQ(mir->functions[0].locals.len, 2u);
 }
-TEST(frontend, or_builtin_falls_back_from_error_local) {
+TEST(frontend, any_builtin_falls_back_from_error_local) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) let code = or(failed, 200) if code == 200 { "
+        "route GET \"/users\" { let failed = error(7) let code = any(failed, 200) if code == 200 { "
         "return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9359,9 +9957,10 @@ TEST(frontend, or_builtin_falls_back_from_error_local) {
              static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[1].init.int_value, 200);
 }
-TEST(frontend, or_builtin_falls_back_from_error_alias) {
+TEST(frontend, any_builtin_falls_back_from_error_alias) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) let alias = failed let code = or(alias, 200) "
+        "route GET \"/users\" { let failed = error(7) let alias = failed let code = any(alias, "
+        "200) "
         "if code == 200 { return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9377,6 +9976,588 @@ TEST(frontend, or_builtin_falls_back_from_error_alias) {
              static_cast<u8>(HirExprKind::IntLit));
     CHECK_EQ(hir->routes[0].locals[2].init.int_value, 200);
 }
+
+TEST(frontend, all_builtin_skips_rhs_when_primary_is_nil) {
+    const char* src = "route GET \"/users\" { let code = all(nil, 200) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Nil));
+}
+
+TEST(frontend, all_builtin_skips_rhs_when_primary_is_error) {
+    const char* src =
+        "route GET \"/users\" { let failed = error(7) let code = all(failed, 200) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::Error));
+}
+
+TEST(frontend, all_builtin_uses_fallback_when_primary_has_value) {
+    const char* src = "route GET \"/users\" { let code = all(200, 400) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 400);
+}
+
+TEST(frontend, all_builtin_over_optional_source_becomes_if_else) {
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let code = all(host, \"fallback\") "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    CHECK(hir->routes[0].locals[1].may_nil);
+}
+
+TEST(frontend, all_builtin_over_optional_query_source_becomes_if_else) {
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, \"\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    CHECK(hir->routes[0].locals[1].may_nil);
+}
+
+TEST(frontend, all_builtin_over_optional_query_source_preserves_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK(hir->routes[0].locals[1].init.rhs->may_error);
+    CHECK(hir->routes[0].locals[1].init.may_error);
+}
+
+TEST(frontend, any_builtin_over_optional_query_source_becomes_or) {
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, \"\") return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+    auto& fallback_expr = hir->routes[0].locals[1].init;
+    REQUIRE_NE(fallback_expr.lhs, nullptr);
+    REQUIRE_NE(fallback_expr.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(fallback_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(fallback_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
+}
+
+TEST(frontend, any_builtin_over_optional_query_source_preserves_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    REQUIRE_EQ(hir->routes[0].locals[1].init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
+             static_cast<u8>(HirExprKind::ValueOf));
+    CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
+}
+
+TEST(frontend, any_builtin_present_lhs_fallible_rhs_preserves_lhs_shape_and_rhs_call) {
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    auto& init = hir->routes[0].locals[0].init;
+    CHECK_EQ(static_cast<u8>(init.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK_EQ(init.type, HirTypeKind::I32);
+    CHECK(init.may_error);
+    REQUIRE_NE(init.lhs, nullptr);
+    REQUIRE_NE(init.rhs, nullptr);
+    REQUIRE_EQ(init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(init.lhs->kind), static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_EQ(static_cast<u8>(init.rhs->kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK(init.args[0]->may_error);
+    CHECK(init.is_eager_fallback);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
+TEST(frontend, all_builtin_present_lhs_fallible_rhs_preserves_rhs_error) {
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = all(200, fallback()) return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    auto& init = hir->routes[0].locals[0].init;
+    CHECK_EQ(static_cast<u8>(init.kind), static_cast<u8>(HirExprKind::IfElse));
+    CHECK_EQ(init.type, HirTypeKind::I32);
+    CHECK(init.may_error);
+    REQUIRE_NE(init.lhs, nullptr);
+    REQUIRE_NE(init.rhs, nullptr);
+    REQUIRE_EQ(init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(init.lhs->kind), static_cast<u8>(HirExprKind::BoolLit));
+    CHECK(init.rhs->may_error);
+    CHECK_EQ(static_cast<u8>(init.args[0]->kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK(init.is_eager_fallback);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
+TEST(frontend, all_builtin_fallible_unknown_rhs_preserves_lhs_shape) {
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, error(.timeout)) "
+        "if value == \"rut\" { return 200 } else { return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[1].init.type, HirTypeKind::Str);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
+TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
+    const char* src =
+        "route GET \"/search\" {\n"
+        "  let host = req.header(\"Host\") | any(_, \"missing\")\n"
+        "  let gated = req.header(\"Host\") | all(_, \"present\")\n"
+        "  let injected_host = req.header(\"Host\") | any(\"missing\")\n"
+        "  let injected_gated = req.header(\"Host\") | all(\"present\")\n"
+        "  return 200\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
+TEST(frontend, any_all_builtin_pipe_rejects_placeholder_free_extra_args) {
+    const char* src =
+        "route GET \"/search\" {\n"
+        "  let host = req.header(\"Host\") | any(\"ignored\", \"missing\")\n"
+        "  return 200\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("pipe call missing placeholder")));
+}
+
+TEST(frontend, any_all_builtin_pipe_rejects_numbered_placeholder_for_conditional_tuple_source) {
+    const char* cases[] = {
+        "func maybe_pair(ok: bool) -> (i32, i32) {\n"
+        "  if ok { (200, 401) } else { nil }\n"
+        "}\n"
+        "route GET \"/search\" {\n"
+        "  let pair = maybe_pair(req.http11)\n"
+        "  let code = pair | any(_2, 500)\n"
+        "  return 200\n"
+        "}\n",
+        "func maybe_pair(ok: bool) -> (i32, i32) {\n"
+        "  if ok { (200, 401) } else { error(.timeout) }\n"
+        "}\n"
+        "route GET \"/search\" {\n"
+        "  let pair = maybe_pair(req.http11)\n"
+        "  let code = pair | all(_2, 500)\n"
+        "  return 200\n"
+        "}\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK(hir.error().detail.eq(lit("placeholder value in conditional pipe must be 1")));
+    }
+}
+
+TEST(frontend, any_builtin_preserves_lhs_error_carrier_for_nonfallible_fallback) {
+    const char* src =
+        "struct AuthError { err: Error }\n"
+        "func maybefail(ok: bool) -> i32 {\n"
+        "  if ok { 200 } else { error(AuthError, .timeout, \"timed out\") }\n"
+        "}\n"
+        "route GET \"/search\" { let value = maybefail(req.http11) let safe = any(value, 200) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->structs.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    auto& init = hir->routes[0].locals[1].init;
+    CHECK_EQ(static_cast<u8>(init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(init.error_struct_index, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::Or));
+    CHECK_EQ(mir->functions[0].locals[1].init.error_struct_index, 0u);
+}
+
+TEST(frontend, all_builtin_rejects_mixed_error_carriers) {
+    const char* src =
+        "struct AuthError { err: Error }\n"
+        "func custom(ok: bool) -> i32 {\n"
+        "  if ok { 200 } else { error(AuthError, .timeout, \"timed out\") }\n"
+        "}\n"
+        "func plain(ok: bool) -> i32 {\n"
+        "  if ok { 200 } else { error(.timeout) }\n"
+        "}\n"
+        "route GET \"/search\" {\n"
+        "  let lhs = custom(req.http11)\n"
+        "  let value = all(lhs, plain(req.http10))\n"
+        "  return 200\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("all cannot combine different propagated error variants")));
+}
+
+TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, \"\") "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
+    auto& fallback_expr = hir->routes[0].locals[1].init;
+    REQUIRE_NE(fallback_expr.lhs, nullptr);
+    REQUIRE_NE(fallback_expr.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(fallback_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(fallback_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
+}
+
+TEST(frontend, any_builtin_over_optional_header_source_preserves_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, fallback()) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    REQUIRE_EQ(hir->routes[0].locals[1].init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
+             static_cast<u8>(HirExprKind::ValueOf));
+    CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
+}
+
+TEST(frontend, any_builtin_over_optional_cookie_source_becomes_or) {
+    const char* src =
+        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = any(sid, \"\") return "
+        "200 "
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_FALSE(hir->routes[0].locals[1].init.may_error);
+    auto& fallback_expr = hir->routes[0].locals[1].init;
+    REQUIRE_NE(fallback_expr.lhs, nullptr);
+    REQUIRE_NE(fallback_expr.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(fallback_expr.lhs->kind), static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(static_cast<u8>(fallback_expr.rhs->kind), static_cast<u8>(HirExprKind::StrLit));
+}
+
+TEST(frontend, any_builtin_over_optional_cookie_source_preserves_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = any(sid, fallback()) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    REQUIRE_EQ(hir->routes[0].locals[1].init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.rhs->kind),
+             static_cast<u8>(HirExprKind::ValueOf));
+    CHECK(hir->routes[0].locals[1].init.args[0]->may_error);
+}
+
+TEST(frontend, all_builtin_over_optional_header_source_preserves_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/admin\" { let host = req.header(\"Host\") let value = all(host, fallback()) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK(hir->routes[0].locals[1].init.rhs->may_error);
+    CHECK(hir->routes[0].locals[1].init.may_error);
+}
+
+TEST(frontend, all_builtin_over_optional_header_source_becomes_if_else) {
+    const char* src =
+        "route GET \"/users\" { let host = req.header(\"Host\") let value = all(host, "
+        "\"fallback\") "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    CHECK(hir->routes[0].locals[1].may_nil);
+}
+
+TEST(frontend, all_builtin_over_optional_cookie_source_becomes_if_else) {
+    const char* src =
+        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = all(sid, \"fallback\") "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    CHECK(hir->routes[0].locals[1].may_nil);
+}
+
+TEST(frontend, all_builtin_over_optional_cookie_source_preserves_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/users\" { let sid = req.cookie(\"sid\") let value = all(sid, fallback()) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+    REQUIRE_NE(hir->routes[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(hir->routes[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.lhs->kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    CHECK(hir->routes[0].locals[1].init.rhs->may_error);
+    CHECK(hir->routes[0].locals[1].init.may_error);
+}
+
+TEST(frontend, all_builtin_rejects_non_binary_arity) {
+    const char* missing_rhs = "route GET \"/users\" { let code = all(200) return 200 }\n";
+    auto lexed = lex(lit(missing_rhs));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    const char* extra_arg = "route GET \"/users\" { let code = all(200, 401, 500) return 200 }\n";
+    lexed = lex(lit(extra_arg));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, all_builtin_rejects_mismatched_types) {
+    const char* src = "route GET \"/users\" { let code = all(200, true) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, any_builtin_rejects_non_binary_arity) {
+    const char* missing_rhs = "route GET \"/users\" { let code = any(200) return 200 }\n";
+    auto lexed = lex(lit(missing_rhs));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    const char* extra_arg = "route GET \"/users\" { let code = any(200, 400, 500) return 200 }\n";
+    lexed = lex(lit(extra_arg));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, analyze_rejects_unknown_upstream) {
     const char* src = "route GET \"/users\" { return forward(api) }\n";
     auto lexed = lex(lit(src));
@@ -10313,7 +11494,7 @@ TEST(frontend, analyze_rejects_match_pattern_type_mismatch) {
 }
 TEST(frontend, analyze_rejects_or_with_mismatched_types) {
     const char* src =
-        "route GET \"/users\" { let code = 200 let fallback = or(code, true) return 200 }\n";
+        "route GET \"/users\" { let code = 200 let fallback = any(code, true) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -10322,15 +11503,19 @@ TEST(frontend, analyze_rejects_or_with_mismatched_types) {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
-TEST(frontend, analyze_rejects_or_with_fallible_fallback) {
-    const char* src = "route GET \"/users\" { let code = or(nil, error(7)) return 200 }\n";
+TEST(frontend, analyze_allows_any_with_fallible_fallback) {
+    const char* src = "route GET \"/users\" { let code = any(nil, error(7)) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::Error));
+    CHECK(hir->routes[0].locals[0].init.may_error);
+    CHECK_FALSE(hir->routes[0].locals[0].init.may_nil);
 }
 TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
     const char* src =
@@ -10407,6 +11592,85 @@ TEST(frontend, build_mir_preserves_runtime_or_value) {
              static_cast<u8>(MirValueKind::LocalRef));
     CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.rhs->kind),
              static_cast<u8>(MirValueKind::IntConst));
+}
+
+TEST(frontend, build_mir_preserves_runtime_all_value) {
+    auto* hir = new HirModule{};
+    HirRoute route{};
+    route.span = {1, 1, 1, 1};
+    route.method = 'G';
+    route.path = lit("/users");
+    HirLocal maybe{};
+    maybe.span = {1, 1, 1, 1};
+    maybe.name = lit("maybe");
+    maybe.type = HirTypeKind::I32;
+    maybe.may_nil = true;
+    maybe.init.kind = HirExprKind::IntLit;
+    maybe.init.type = HirTypeKind::I32;
+    maybe.init.int_value = 123;
+    REQUIRE(route.locals.push(maybe));
+
+    HirExpr lhs_ref{};
+    lhs_ref.kind = HirExprKind::LocalRef;
+    lhs_ref.type = HirTypeKind::I32;
+    lhs_ref.may_nil = true;
+    lhs_ref.local_index = 0;
+    REQUIRE(route.exprs.push(lhs_ref));
+
+    HirExpr cond{};
+    cond.kind = HirExprKind::HasValue;
+    cond.type = HirTypeKind::Bool;
+    cond.lhs = &route.exprs[0];
+
+    HirExpr rhs{};
+    rhs.kind = HirExprKind::IntLit;
+    rhs.type = HirTypeKind::I32;
+    rhs.int_value = 200;
+
+    HirExpr fallback{};
+    fallback.kind = HirExprKind::MissingOf;
+    fallback.type = HirTypeKind::I32;
+    fallback.lhs = &route.exprs[0];
+    fallback.may_nil = true;
+
+    HirLocal code{};
+    code.span = {1, 1, 1, 1};
+    code.name = lit("code");
+    code.type = HirTypeKind::I32;
+    code.init.kind = HirExprKind::IfElse;
+    code.init.type = HirTypeKind::I32;
+    code.init.may_nil = true;
+    REQUIRE(route.exprs.push(cond));
+    HirExpr* cond_ptr = &route.exprs[1];
+    REQUIRE(route.exprs.push(rhs));
+    HirExpr* rhs_ptr = &route.exprs[2];
+    REQUIRE(route.exprs.push(fallback));
+    HirExpr* fallback_ptr = &route.exprs[3];
+    code.init.lhs = cond_ptr;
+    code.init.rhs = rhs_ptr;
+    REQUIRE(code.init.args.push(fallback_ptr));
+    REQUIRE(route.locals.push(code));
+
+    route.control.kind = HirControlKind::Direct;
+    route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+    route.control.direct_term.status_code = 200;
+    REQUIRE(hir->routes.push(route));
+
+    auto mir = build_mir(*hir);
+    REQUIRE(mir);
+    REQUIRE_EQ(mir.value()->functions.len, 1u);
+    REQUIRE_EQ(mir.value()->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::IfElse));
+    REQUIRE_NE(mir.value()->functions[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(mir.value()->functions[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.lhs->kind),
+             static_cast<u8>(MirValueKind::HasValue));
+    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.rhs->kind),
+             static_cast<u8>(MirValueKind::IntConst));
+    REQUIRE_EQ(mir.value()->functions[0].locals[1].init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.args[0]->kind),
+             static_cast<u8>(MirValueKind::MissingOf));
 }
 TEST(frontend, build_mir_preserves_runtime_no_error_guard) {
     auto* hir = new HirModule{};
@@ -10508,6 +11772,8 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_or_value) {
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[4].op), static_cast<u8>(rir::Opcode::OptUnwrap));
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[5].op), static_cast<u8>(rir::Opcode::Select));
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[6].op), static_cast<u8>(rir::Opcode::RetStatus));
+    CHECK_FALSE(function_has_op(fn, rir::Opcode::Br));
+    CHECK_FALSE(function_has_op(fn, rir::Opcode::Jmp));
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_error_or_value) {
@@ -10571,6 +11837,8 @@ TEST(frontend, lower_to_rir_supports_runtime_error_or_value) {
     REQUIRE(out_fn.blocks[0].inst_count > 0);
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[out_fn.blocks[0].inst_count - 1].op),
              static_cast<u8>(rir::Opcode::RetStatus));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Br));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Jmp));
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_optional_error_or_value) {
@@ -10635,6 +11903,8 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_error_or_value) {
     REQUIRE(out_fn.blocks[0].inst_count > 0);
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[out_fn.blocks[0].inst_count - 1].op),
              static_cast<u8>(rir::Opcode::RetStatus));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Br));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Jmp));
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_optional_str_or_value) {
@@ -10699,8 +11969,145 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_str_or_value) {
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[5].op), static_cast<u8>(rir::Opcode::Select));
     CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[6].op),
              static_cast<u8>(rir::Opcode::RetStatus));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Br));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Jmp));
     rir.destroy();
 }
+TEST(frontend, lower_to_rir_supports_runtime_all_int_value) {
+    auto* mir = new MirModule{};
+    MirFunction fn{};
+    fn.span = Span{0, 0, 1, 1};
+    fn.method = 'G';
+    fn.path = lit("/users");
+    fn.name = lit("route");
+    MirLocal maybe{};
+    maybe.span = fn.span;
+    maybe.name = lit("maybe");
+    maybe.type = MirTypeKind::I32;
+    maybe.may_nil = true;
+    maybe.init.kind = MirValueKind::IntConst;
+    maybe.init.type = MirTypeKind::I32;
+    maybe.init.int_value = 123;
+    REQUIRE(fn.locals.push(maybe));
+
+    MirValue lhs{};
+    lhs.kind = MirValueKind::LocalRef;
+    lhs.type = MirTypeKind::I32;
+    lhs.may_nil = true;
+    lhs.local_index = 0;
+    REQUIRE(fn.values.push(lhs));
+
+    MirValue cond{};
+    cond.kind = MirValueKind::HasValue;
+    cond.type = MirTypeKind::Bool;
+    cond.lhs = &fn.values[0];
+    REQUIRE(fn.values.push(cond));
+
+    MirValue rhs{};
+    rhs.kind = MirValueKind::IntConst;
+    rhs.type = MirTypeKind::I32;
+    rhs.int_value = 200;
+    REQUIRE(fn.values.push(rhs));
+
+    MirValue missing{};
+    missing.kind = MirValueKind::MissingOf;
+    missing.type = MirTypeKind::I32;
+    missing.lhs = &fn.values[0];
+    missing.may_nil = true;
+    REQUIRE(fn.values.push(missing));
+
+    MirValue allv{};
+    allv.kind = MirValueKind::IfElse;
+    allv.type = MirTypeKind::I32;
+    allv.lhs = &fn.values[1];
+    allv.rhs = &fn.values[2];
+    allv.may_nil = true;
+    REQUIRE(allv.args.push(&fn.values[3]));
+    REQUIRE(fn.values.push(allv));
+
+    MirLocal code{};
+    code.span = fn.span;
+    code.name = lit("code");
+    code.type = MirTypeKind::I32;
+    code.init = fn.values[4];
+    code.may_nil = true;
+    REQUIRE(fn.locals.push(code));
+
+    MirBlock entry{};
+    entry.label = lit("entry");
+    entry.term.kind = MirTerminatorKind::ReturnStatus;
+    entry.term.span = fn.span;
+    entry.term.status_code = 200;
+    REQUIRE(fn.blocks.push(entry));
+
+    REQUIRE(mir->functions.push(fn));
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir, rir);
+    REQUIRE(lowered);
+
+    const auto& out_fn = rir.module.functions[0];
+    REQUIRE_EQ(out_fn.block_count, 1u);
+    CHECK(block_has_op(out_fn.blocks[0], rir::Opcode::OptIsNil));
+    CHECK(block_has_op(out_fn.blocks[0], rir::Opcode::Select));
+    REQUIRE(out_fn.blocks[0].inst_count > 0);
+    CHECK_EQ(static_cast<u8>(out_fn.blocks[0].insts[out_fn.blocks[0].inst_count - 1].op),
+             static_cast<u8>(rir::Opcode::RetStatus));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Br));
+    CHECK_FALSE(function_has_op(out_fn, rir::Opcode::Jmp));
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_runtime_any_optional_query_value_eagerly_with_rhs_call) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, fallback()) let ok = "
+        "value == \"ok\" return 204 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_GE(rir.module.func_count, 1u);
+    const auto& fn = rir.module.functions[0];
+    REQUIRE_GE(fn.block_count, 1u);
+    CHECK(block_op_count(fn.blocks[0], rir::Opcode::Select) >= 1u);
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_supports_runtime_all_optional_query_fallback_call_eagerly) {
+    const char* src =
+        "func fallback() -> str => error(.timeout)\n"
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, fallback()) let ok = "
+        "value == \"ok\" return 204 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_GE(rir.module.func_count, 1u);
+    const auto& fn = rir.module.functions[0];
+    REQUIRE_GE(fn.block_count, 1u);
+    CHECK(block_op_count(fn.blocks[0], rir::Opcode::OptIsNil) >= 1u);
+    CHECK(block_op_count(fn.blocks[0], rir::Opcode::Select) >= 1u);
+    rir.destroy();
+}
+
 TEST(frontend, lower_to_rir_supports_runtime_no_error_guard) {
     auto* hir = new HirModule{};
     HirRoute route{};
@@ -11034,7 +12441,7 @@ TEST(frontend, source_generic_function_accepts_explicit_return_type_argument) {
     const auto src = R"rut(
 func make<T>() -> T => nil
 route GET "/users" {
-    let code = or(make<i32>(), 200)
+    let code = any(make<i32>(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )rut";
@@ -13692,7 +15099,7 @@ protocol MaybeCode { func code() -> i32 => nil }
 struct Box { value: i32 }
 Box impl MaybeCode {}
 route GET "/users" {
-    let code = or(Box(value: 7).code(), 200)
+    let code = any(Box(value: 7).code(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )rut";
@@ -13709,7 +15116,7 @@ protocol MaybeCode { func code() -> i32 => error(.timeout) }
 struct Box { value: i32 }
 Box impl MaybeCode {}
 route GET "/users" {
-    let code = or(Box(value: 7).code(), 200)
+    let code = any(Box(value: 7).code(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )rut";
@@ -13948,7 +15355,7 @@ protocol MaybeCode { func code() -> i32 => nil }
 struct Box { value: i32 }
 Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
 route GET "/users" {
-    let code = or(Box(value: 7).code(), 200)
+    let code = any(Box(value: 7).code(), 200)
     if code == 7 { return 200 } else { return 500 }
 }
 )rut";
@@ -13965,7 +15372,7 @@ protocol MaybeCode { func code() -> i32 => error(.timeout) }
 struct Box { value: i32 }
 Box impl MaybeCode { func code(self: Box) -> i32 => self.value }
 route GET "/users" {
-    let code = or(Box(value: 7).code(), 200)
+    let code = any(Box(value: 7).code(), 200)
     if code == 7 { return 200 } else { return 500 }
 }
 )rut";
@@ -14070,7 +15477,7 @@ TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_
     const auto src = R"rut(
 import "proto.rut"
 route GET "/users" {
-    let code = or(Box(value: 7).code(), 200)
+    let code = any(Box(value: 7).code(), 200)
     if code == 7 { return 200 } else { return 500 }
 }
 )rut";
@@ -14093,7 +15500,7 @@ TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_
     const auto src = R"rut(
 import "proto.rut"
 route GET "/users" {
-    let code = or(Box(value: 7).code(), 200)
+    let code = any(Box(value: 7).code(), 200)
     if code == 7 { return 200 } else { return 500 }
 }
 )rut";
@@ -14259,7 +15666,7 @@ TEST(frontend,
 protocol MaybeCode { func code() -> i32 => nil }
 struct Box<T> { value: T }
 Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" {
     if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
 }
@@ -14277,7 +15684,7 @@ TEST(frontend,
 protocol MaybeCode { func code() -> i32 => error(.timeout) }
 struct Box<T> { value: T }
 Box<T> impl MaybeCode { func code(self: Box<T>) -> i32 => 7 }
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" {
     if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
 }
@@ -14395,7 +15802,7 @@ TEST(
     }
     const auto src = R"rut(
 import "proto.rut"
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" {
     if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
 }
@@ -14421,7 +15828,7 @@ TEST(
     }
     const auto src = R"rut(
 import "proto.rut"
-func run<T: MaybeCode>(x: T) -> i32 => or(x.code(), 200)
+func run<T: MaybeCode>(x: T) -> i32 => any(x.code(), 200)
 route GET "/users" {
     if run(Box(value: 123)) == 7 { return 200 } else { return 500 }
 }
@@ -16695,7 +18102,7 @@ TEST(frontend, source_function_call_propagates_optional_value_flow) {
     const auto src = R"(
 func maybe() -> i32 => nil
 route GET "/users" {
-    let code = or(maybe(), 200)
+    let code = any(maybe(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -16717,7 +18124,7 @@ func maybe() -> i32 {
     nil
 }
 route GET "/users" {
-    let code = or(maybe(), 200)
+    let code = any(maybe(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -16739,7 +18146,7 @@ func maybe(ok: bool) {
     if ok { 200 } else { nil }
 }
 route GET "/users" {
-    let code = or(maybe(true), 200)
+    let code = any(maybe(true), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -16758,7 +18165,7 @@ TEST(frontend, source_function_call_propagates_error_value_flow) {
     const auto src = R"(
 func fail() -> i32 => error(.timeout)
 route GET "/users" {
-    let code = or(fail(), 200)
+    let code = any(fail(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -16780,7 +18187,7 @@ func fail() -> i32 {
     error(.timeout)
 }
 route GET "/users" {
-    let code = or(fail(), 200)
+    let code = any(fail(), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -16802,7 +18209,7 @@ func maybefail(ok: bool) {
     if ok { 200 } else { error(.timeout) }
 }
 route GET "/users" {
-    let code = or(maybefail(true), 200)
+    let code = any(maybefail(true), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -16823,7 +18230,7 @@ func maybe(ok: bool) -> i32 {
     if ok { nil } else { nil }
 }
 route GET "/users" {
-    let code = or(maybe(true), 200)
+    let code = any(maybe(true), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -17432,7 +18839,7 @@ func pick(x: Result) {
     }
 }
 route GET "/users" {
-    let code = or(pick(Result.ok), 200)
+    let code = any(pick(Result.ok), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -17457,7 +18864,7 @@ func pick(x: Result) {
     }
 }
 route GET "/users" {
-    let code = or(pick(Result.ok), 200)
+    let code = any(pick(Result.ok), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -17482,7 +18889,7 @@ func pick(x: Result) -> i32 {
     }
 }
 route GET "/users" {
-    let code = or(pick(Result.ok), 200)
+    let code = any(pick(Result.ok), 200)
     if code == 200 { return 200 } else { return 500 }
 }
 )";
@@ -17619,11 +19026,11 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::Bool);
 }
-TEST(frontend, source_pipe_method_stage_runtime_optional_lhs_flows_via_or) {
+TEST(frontend, source_pipe_method_stage_runtime_optional_lhs_flows_via_any) {
     const auto src = R"(
 route GET "/users" {
     let ok = req.header("Host") | _.eq("example.com")
-    let safe = or(ok, false)
+    let safe = any(ok, false)
     if safe { return 200 } else { return 404 }
 }
 )";
@@ -17641,12 +19048,12 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_placeholder_free_runtime_optional_lhs_flows_via_or) {
+TEST(frontend, source_pipe_placeholder_free_runtime_optional_lhs_flows_via_any) {
     const auto src = R"(
 func id(x: str) -> str => x
 route GET "/users" {
     let host = req.header("Host") | id()
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -17708,11 +19115,11 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_method_stage_known_nil_falls_back_via_or) {
+TEST(frontend, source_pipe_method_stage_known_nil_falls_back_via_any) {
     const auto src = R"(
 route GET "/users" {
     let ok = nil | _.eq(200)
-    let safe = or(ok, false)
+    let safe = any(ok, false)
     if safe { return 200 } else { return 404 }
 }
 )";
@@ -17740,7 +19147,7 @@ Box impl MaybeCode {
 route GET "/users" {
     let box: Box = nil
     let code = box | _.code()
-    let safe = or(code, 500)
+    let safe = any(code, 500)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -17770,7 +19177,7 @@ func maybeBox(ok: bool) -> Box {
 }
 route GET "/users" {
     let code = maybeBox(req.http11) | _.code()
-    let safe = or(code, 500)
+    let safe = any(code, 500)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -17793,7 +19200,7 @@ TEST(frontend, source_pipe_method_stage_known_error_preserves_error_variant) {
 route GET "/users" {
     let failed = error(.timeout)
     let ok = failed | _.eq(200)
-    let safe = or(ok, false)
+    let safe = any(ok, false)
     if safe { return 200 } else { return 500 }
 }
 )";
@@ -17817,7 +19224,7 @@ TEST(frontend, source_pipe_method_stage_known_error_accesses_standard_error_fiel
 route GET "/users" {
     let failed = error(.timeout)
     let code = failed | _.code()
-    let safe = or(code, 500)
+    let safe = any(code, 500)
     if safe == 500 { return 200 } else { return 500 }
 }
 )";
@@ -17845,7 +19252,7 @@ Box impl MaybeMsg {
 route GET "/users" {
     let box: Box = error(.timeout)
     let code = box | _.msg()
-    let safe = or(code, 500)
+    let safe = any(code, 500)
     if safe == 500 { return 200 } else { return 500 }
 }
 )";
@@ -17868,7 +19275,7 @@ TEST(frontend, source_pipe_method_stage_known_nil_validates_regex) {
     const auto src = R"(
 route GET "/users" {
     let ok = nil | _.matches(re"[")
-    let safe = or(ok, false)
+    let safe = any(ok, false)
     if safe { return 200 } else { return 500 }
 }
 )";
@@ -18001,6 +19408,7 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("non-tuple source with non-unit placeholder")));
 }
 TEST(frontend, source_pipe_accepts_tuple_literal_multi_slot_placeholders) {
     const auto src = R"(
@@ -18073,12 +19481,56 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
 }
+TEST(frontend, source_pipe_tuple_stage_then_method_stage) {
+    const auto src = R"(
+protocol HasValue { func as_value() -> i32 }
+struct Box { value: i32 }
+Box impl HasValue {
+    func as_value(self: Box) -> i32 => self.value
+}
+func build_box(a: i32, b: i32) -> Box => Box(value: b)
+route GET "/users" {
+    let code = (200, 500) | build_box(_1, _2) | _.as_value()
+    if code == 500 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+}
+TEST(frontend, source_pipe_tuple_slot_reuse_keeps_placeholder_semantics) {
+    const auto src = R"(
+protocol HasValue { func as_value() -> i32 }
+struct Box { value: i32 }
+Box impl HasValue {
+    func as_value(self: Box) -> i32 => self.value
+}
+func build_box(a: i32, b: i32) -> Box => Box(value: a)
+route GET "/users" {
+    let code = (200, 500) | build_box(_1, _1) | _.as_value()
+    if code == 200 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+}
 TEST(frontend, source_pipe_propagates_known_nil_as_optional_value_flow) {
     const auto src = R"(
 func id(x: i32) -> i32 => x
 route GET "/users" {
     let code = nil | id(_)
-    let safe = or(code, 200)
+    let safe = any(code, 200)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -18103,7 +19555,7 @@ func id(x: i32) -> i32 => x
 route GET "/users" {
     let failed = error(.timeout)
     let code = failed | id(_)
-    let safe = or(code, 200)
+    let safe = any(code, 200)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -18169,6 +19621,60 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("non-tuple source with non-unit placeholder")));
+}
+TEST(frontend, analyze_rejects_pipe_with_placeholder_slot_exceeds_tuple_arity) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = (200, 500) | id(_3)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("placeholder slot exceeds tuple arity")));
+}
+TEST(frontend, source_pipe_keeps_placeholder_slot_zero_as_identifier) {
+    const auto src = R"(
+func second(x: i32, y: i32) -> i32 => y
+route GET "/users" {
+    let _0 = 204
+    let code = 200 | second(_, _0)
+    if code == 204 { return 200 } else { return 500 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("_0")));
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
+}
+TEST(frontend, analyze_rejects_conditional_pipe_with_non_unit_placeholder) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = req.header("Host") | id(_2)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("placeholder value in conditional pipe must be 1")));
 }
 TEST(frontend, analyze_rejects_pipe_runtime_fallible_lhs_with_placeholder_slot_two) {
     const auto src = R"(
@@ -18185,6 +19691,49 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("placeholder value in conditional pipe must be 1")));
+}
+TEST(frontend, analyze_rejects_conditional_pipe_return_type_unsupported) {
+    const auto src = R"(
+func may_fail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func pair(x: i32) -> (i32, i32) => (x, 500)
+route GET "/users" {
+    let code = may_fail(req.http11) | pair(_)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("pipe return type unsupported")));
+}
+TEST(frontend, analyze_rejects_conditional_pipe_error_variant_mismatch) {
+    const auto src = R"(
+func may_fail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func maybe_forbidden(x: i32) -> i32 {
+    if x == 200 { x } else { error(.forbidden) }
+}
+route GET "/users" {
+    let code = may_fail(req.http11) | maybe_forbidden(_)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("pipe error variant mismatch")));
 }
 TEST(frontend, parse_rejects_pipe_with_placeholder_slot_eleven) {
     const auto src = R"(
@@ -18201,12 +19750,12 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("placeholder index must be between _1 and _10")));
 }
-TEST(frontend, source_pipe_runtime_optional_lhs_flows_via_or) {
+TEST(frontend, source_pipe_runtime_optional_lhs_flows_via_any) {
     const auto src = R"(
 func id(x: str) -> str => x
 route GET "/users" {
     let host = req.header("Host") | id(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18247,13 +19796,13 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
-TEST(frontend, source_pipe_runtime_error_lhs_flows_via_or) {
+TEST(frontend, source_pipe_runtime_error_lhs_flows_via_any) {
     const auto src = R"(
 func fail() -> i32 => error(.timeout)
 func id(x: i32) -> i32 => x
 route GET "/users" {
     let code = fail() | id(_)
-    let safe = or(code, 200)
+    let safe = any(code, 200)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -18271,7 +19820,7 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_runtime_optional_error_lhs_flows_via_or) {
+TEST(frontend, source_pipe_runtime_optional_error_lhs_flows_via_any) {
     const auto src = R"(
 func maybefail(ok: bool) -> i32 {
     if ok { nil } else { error(.timeout) }
@@ -18279,7 +19828,7 @@ func maybefail(ok: bool) -> i32 {
 func id(x: i32) -> i32 => x
 route GET "/users" {
     let code = maybefail(true) | id(_)
-    let safe = or(code, 200)
+    let safe = any(code, 200)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -18297,12 +19846,12 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_optional_stage_via_or) {
+TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_optional_stage_via_any) {
     const auto src = R"(
 func drop(x: str) -> str { nil }
 route GET "/users" {
     let host = req.header("Host") | drop(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18320,12 +19869,12 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_error_stage_via_or) {
+TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_error_stage_via_any) {
     const auto src = R"(
 func failstage(x: str) -> str => error(.timeout)
 route GET "/users" {
     let host = req.header("Host") | failstage(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18343,13 +19892,13 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_runtime_error_lhs_flows_into_optional_stage_via_or) {
+TEST(frontend, source_pipe_runtime_error_lhs_flows_into_optional_stage_via_any) {
     const auto src = R"(
 func fail() -> str => error(.timeout)
 func drop(x: str) -> str { nil }
 route GET "/users" {
     let host = fail() | drop(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18367,13 +19916,13 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_runtime_error_lhs_flows_into_error_stage_via_or) {
+TEST(frontend, source_pipe_runtime_error_lhs_flows_into_error_stage_via_any) {
     const auto src = R"(
 func fail() -> str => error(.timeout)
 func failstage(x: str) -> str => error(.timeout)
 route GET "/users" {
     let host = fail() | failstage(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18417,14 +19966,14 @@ route GET "/users" {
     CHECK(hir.error().detail.eq(
         lit("pipe method stage cannot combine different propagated error variants")));
 }
-TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_optional_error_stage_via_or) {
+TEST(frontend, source_pipe_runtime_optional_lhs_flows_into_optional_error_stage_via_any) {
     const auto src = R"(
 func tri(x: str) -> str {
     if x == "host" { nil } else { error(.timeout) }
 }
 route GET "/users" {
     let host = req.header("Host") | tri(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18442,7 +19991,7 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
-TEST(frontend, source_pipe_runtime_error_lhs_flows_into_optional_error_stage_via_or) {
+TEST(frontend, source_pipe_runtime_error_lhs_flows_into_optional_error_stage_via_any) {
     const auto src = R"(
 func fail() -> str => error(.timeout)
 func tri(x: str) -> str {
@@ -18450,7 +19999,7 @@ func tri(x: str) -> str {
 }
 route GET "/users" {
     let host = fail() | tri(_)
-    let safe = or(host, "missing")
+    let safe = any(host, "missing")
     return 200
 }
 )";
@@ -18476,7 +20025,7 @@ func maybefail(ok: bool) -> i32 {
 func id(x: i32) -> i32 => x
 route GET "/users" {
     let code = maybefail(true) | id(_)
-    let safe = or(code, 200)
+    let safe = any(code, 200)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";
@@ -18535,7 +20084,7 @@ func maybefail(ok: bool) -> i32 {
 }
 route GET "/users" {
     let code = maybefail(true)
-    let safe = or(code, 200)
+    let safe = any(code, 200)
     if safe == 200 { return 200 } else { return 500 }
 }
 )";

@@ -172,6 +172,8 @@ struct MirValue {
     u32 error_case_index = 0xffffffffu;
     MirValue* lhs = nullptr;
     MirValue* rhs = nullptr;
+    bool is_pipe_conditional = false;
+    bool is_eager_fallback = false;
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;

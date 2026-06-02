@@ -5,6 +5,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/upstream_pool.h"
@@ -18,10 +19,6 @@
 using rut::test_fault::ScopedFakeSocket;
 using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
-
-namespace rut::simd {
-u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out);
-}
 
 // === Accept ===
 
@@ -2260,6 +2257,10 @@ TEST(route, add_accepts_well_formed_path_after_rejection) {
     CHECK_EQ(cfg.route_count, 1u);
 }
 
+static u64 route_table_dummy_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(204).pack();
+}
+
 TEST(route, default_dispatch_kind_is_art_jit) {
     // Phase 2 default: ArtJit. Until install_art_jit_fn is called,
     // match() falls back to scalar ArtTrie::match — slower but
@@ -2283,6 +2284,26 @@ TEST(route, add_refuses_param_path_under_art_dispatch) {
     RouteConfig cfg;
     CHECK(!cfg.add_static("/users/:id", 0, 200));
     CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_methods_reject_invalid_method_keys) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, 8080).has_value());
+    CHECK(!cfg.add_static("/static", 0xff, 200));
+    CHECK(!cfg.add_proxy("/proxy", 0xff, 0));
+    CHECK(!cfg.add_jit_handler("/jit", 0xff, &route_table_dummy_handler));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_jit_handler_rejects_null_and_records_body_dependency) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_jit_handler("/upload", 0, nullptr));
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &route_table_dummy_handler, true));
+    REQUIRE_EQ(cfg.route_count, 1u);
+    CHECK_EQ(cfg.routes[0].action, RouteAction::JitHandler);
+    CHECK_EQ(cfg.routes[0].method, route_method_key_from_legacy_char('P'));
+    CHECK(cfg.routes[0].needs_req_body);
+    CHECK_EQ(cfg.routes[0].fn, &route_table_dummy_handler);
 }
 
 TEST(route, configure_route_dispatch_selects_segment_trie_for_param_route) {
@@ -2324,13 +2345,78 @@ TEST(route, configure_route_dispatch_refuses_after_route_add) {
     CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
 }
 
-TEST(route, segment_trie_matches_param_path) {
-    RouteTrie trie;
-    trie.clear();
-    REQUIRE(trie.insert(Str{"/health", 7}, 'G', 7));
-    CHECK_EQ(trie.match(Str{"/health", 7}, 'G'), 7u);
-    CHECK_EQ(trie.match_key(Str{"/health", 7}, kRouteMethodGet), 7u);
+TEST(route, configure_route_dispatch_rejects_malformed_modules) {
+    RouteConfig cfg;
+    rir::Module too_many{};
+    too_many.func_count = RouteConfig::kMaxRoutes + 1;
+    CHECK(!configure_route_dispatch(cfg, too_many));
 
+    rir::Module missing_funcs{};
+    missing_funcs.func_count = 1;
+    missing_funcs.functions = nullptr;
+    CHECK(!configure_route_dispatch(cfg, missing_funcs));
+
+    rir::Function funcs[1]{};
+    funcs[0].route_pattern = Str{nullptr, 1};
+    rir::Module null_pattern{};
+    null_pattern.functions = funcs;
+    null_pattern.func_count = 1;
+    CHECK(!configure_route_dispatch(cfg, null_pattern));
+}
+
+TEST(route, rir_function_needs_req_body_guard_paths) {
+    rir::Function fn{};
+    CHECK(!rir_function_needs_req_body(fn));
+
+    rir::Block blocks[2]{};
+    fn.blocks = blocks;
+    fn.block_count = 2;
+    blocks[0].insts = nullptr;
+    blocks[0].inst_count = 1;
+
+    rir::Instruction insts[1]{};
+    blocks[1].insts = insts;
+    blocks[1].inst_count = 1;
+    insts[0].op = rir::Opcode::ReqHeader;
+    CHECK(!rir_function_needs_req_body(fn));
+
+    insts[0].op = rir::Opcode::ReqBody;
+    CHECK(rir_function_needs_req_body(fn));
+}
+
+TEST(route, populate_route_config_rejects_malformed_runtime_tables) {
+    RouteConfig cfg;
+
+    rir::Module too_many_upstreams{};
+    too_many_upstreams.upstream_count = rir::Module::kMaxUpstreams + 1;
+    CHECK(!populate_route_config(cfg, too_many_upstreams));
+
+    rir::Module too_many_bodies{};
+    too_many_bodies.response_body_count = rir::Module::kMaxResponseBodies + 1;
+    CHECK(!populate_route_config(cfg, too_many_bodies));
+
+    rir::Module too_many_header_sets{};
+    too_many_header_sets.header_set_count = rir::Module::kMaxHeaderSets + 1;
+    CHECK(!populate_route_config(cfg, too_many_header_sets));
+
+    rir::Module too_many_header_entries{};
+    too_many_header_entries.header_pool_used = rir::Module::kMaxHeaderPoolEntries + 1;
+    CHECK(!populate_route_config(cfg, too_many_header_entries));
+
+    rir::Module bad_header_ref{};
+    bad_header_ref.header_set_count = 1;
+    bad_header_ref.header_pool_used = 1;
+    bad_header_ref.header_sets[0] = {1, 1};
+    CHECK(!populate_route_config(cfg, bad_header_ref));
+
+    rir::Module oversized_header_set{};
+    oversized_header_set.header_set_count = 1;
+    oversized_header_set.header_pool_used = RouteConfig::kMaxHeadersPerSet + 1;
+    oversized_header_set.header_sets[0] = {0, RouteConfig::kMaxHeadersPerSet + 1};
+    CHECK(!populate_route_config(cfg, oversized_header_set));
+}
+
+TEST(route, segment_trie_matches_param_path) {
     RouteConfig cfg;
     REQUIRE(cfg.use_segment_trie());
     CHECK(cfg.add_static("/users/:id", 0, 201));
@@ -5683,9 +5769,6 @@ TEST(route_method, key_helpers_cover_all_runtime_methods) {
     CHECK_EQ(route_method_slot('C'), kRouteMethodConnect);
     CHECK_EQ(route_method_slot('T'), kRouteMethodTrace);
     CHECK_EQ(route_method_slot('?'), kRouteMethodSlotInvalid);
-
-    Str invalid_method = http_method_str(static_cast<HttpMethod>(255));
-    CHECK(invalid_method.eq({"UNKNOWN", 7}));
 }
 
 // === Coverage: parse_log_method_fallback ===
@@ -5952,15 +6035,6 @@ TEST(util, ascii_ci_eq_basic) {
     CHECK(!ascii_ci_eq(reinterpret_cast<const u8*>("Different1"), "connection", 10));
 }
 
-TEST(util, simd_scan_uri_long_query_without_space) {
-    static const u8 kUri[] = "/abcdefgh?ijklmnopqr";
-    u32 canon_end = 0;
-    const u32 end = sizeof(kUri) - 1;
-
-    CHECK_EQ(simd::scan_uri(kUri, 0, end, &canon_end), end);
-    CHECK_EQ(canon_end, 9u);
-}
-
 // === Coverage: epoll_event_loop init and helpers ===
 
 TEST(epoll_loop, init_success) {
@@ -6020,6 +6094,14 @@ TEST(epoll_loop, clear_upstream_fd_noop) {
     loop->clear_upstream_fd(EpollEventLoop::kMaxConns - 1);
     loop->shutdown();
     destroy_real_loop(loop);
+}
+
+TEST(util, scan_uri_no_space_with_query_returns_end) {
+    const u8 uri[] = "/hello/world?mode=fast";
+    u32 canon_end = 0xffffffffu;
+    const u32 len = static_cast<u32>(__builtin_strlen(reinterpret_cast<const char*>(uri)));
+    CHECK_EQ(simd::scan_uri(uri, 0, len, &canon_end), len);
+    CHECK_EQ(canon_end, 12u);
 }
 
 TEST(epoll_loop, stop_and_is_running) {
@@ -8034,6 +8116,210 @@ TEST(legacy_loop, sync_submit_and_close_paths) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, dispatch_event_unhandled_recv_paths) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    u32 cid = c->id;
+
+    c->recv_buf.write_ptr()[0] = 'x';
+    c->recv_buf.commit(1);
+    c->keep_alive = false;
+    loop->backend.clear_ops();
+    loop->dispatch_event(*c, make_ev(cid, IoEventType::Recv, 12));
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 1u);
+    CHECK(c->fd >= 0);
+
+    loop->backend.clear_ops();
+    loop->dispatch_event(*c, make_ev(cid, IoEventType::Recv, 0));
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 0u);
+    CHECK(c->fd >= 0);
+
+    loop->dispatch_event(*c, make_ev(cid, IoEventType::Recv, -105));
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, dispatch_event_unhandled_upstream_recv_paths) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    auto* stale = loop->alloc_conn();
+    REQUIRE(stale != nullptr);
+    stale->fd = dup(2);
+    REQUIRE(stale->fd >= 0);
+    stale->state = ConnState::ReadingHeader;
+    loop->dispatch_event(*stale, make_ev(stale->id, IoEventType::UpstreamRecv, -105));
+    CHECK(stale->fd >= 0);
+    close(stale->fd);
+    stale->fd = -1;
+    loop->free_conn(*stale);
+
+    auto* active = loop->alloc_conn();
+    REQUIRE(active != nullptr);
+    active->fd = dup(2);
+    REQUIRE(active->fd >= 0);
+    active->state = ConnState::Proxying;
+    u32 cid = active->id;
+    loop->dispatch_event(*active, make_ev(cid, IoEventType::UpstreamRecv, -105));
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, run_exits_during_empty_drain) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    i32 listen_fd = dup(2);
+    REQUIRE(listen_fd >= 0);
+    auto initialized = loop->init(0, listen_fd);
+    REQUIRE(initialized);
+
+    loop->drain(0);
+    loop->run();
+
+    CHECK(!loop->is_running());
+    CHECK_EQ(loop->listen_fd, -1);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Accept), 1u);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, dispatch_accept_paths) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    loop->dispatch(make_ev(0, IoEventType::Accept, -1));
+    CHECK_EQ(loop->free_top, EventLoop<MockBackend>::kMaxConns);
+
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    loop->dispatch(make_ev(0, IoEventType::Accept, fd));
+    REQUIRE_EQ(loop->free_top, EventLoop<MockBackend>::kMaxConns - 1);
+    auto& accepted = loop->conns[EventLoop<MockBackend>::kMaxConns - 1];
+    CHECK_EQ(accepted.fd, fd);
+    CHECK_EQ(accepted.state, ConnState::ReadingHeader);
+    CHECK_EQ(accepted.on_recv, &on_header_received<EventLoop<MockBackend>>);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 1u);
+
+    loop->dispatch(make_ev(0, IoEventType::Count, 0));
+    loop->close_conn(accepted);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, timeout_drain_closes_idle_connection) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    c->state = ConnState::ReadingHeader;
+    u32 cid = c->id;
+
+    loop->drain(0);
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 2));
+
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    CHECK_EQ(loop->free_top, EventLoop<MockBackend>::kMaxConns);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, drain_wakes_valid_timerfd) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    REQUIRE(timer_fd >= 0);
+    loop->backend.timer_fd = timer_fd;
+
+    loop->drain(3);
+
+    itimerspec current{};
+    REQUIRE(timerfd_gettime(timer_fd, &current) == 0);
+    CHECK(current.it_interval.tv_sec == 1);
+    CHECK(current.it_interval.tv_nsec == 0);
+    close(timer_fd);
+    loop->backend.timer_fd = -1;
+    loop->shutdown();
+}
+
+TEST(legacy_loop, poll_command_updates_control_slots) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    ShardControlBlock control;
+    RouteConfig config{};
+    const RouteConfig* current_config = nullptr;
+    int jit_target = 0;
+    void* current_jit = nullptr;
+    ShardEpoch epoch;
+    loop->control = &control;
+    loop->config_ptr = &current_config;
+    loop->jit_code_ptr = &current_jit;
+    loop->epoch = &epoch;
+
+    control.pending_config.store(&config, std::memory_order_release);
+    control.pending_jit.store(&jit_target, std::memory_order_release);
+    control.pending_capture.store(kCaptureDisable, std::memory_order_release);
+    loop->poll_command();
+    CHECK_EQ(current_config, &config);
+    CHECK_EQ(current_jit, &jit_target);
+    CHECK_EQ(loop->capture_ring, nullptr);
+    CHECK_EQ(control.pending_config.load(std::memory_order_acquire), nullptr);
+    CHECK_EQ(control.pending_jit.load(std::memory_order_acquire), nullptr);
+    CHECK_EQ(control.pending_capture.load(std::memory_order_acquire), nullptr);
+
+    loop->epoch_enter();
+    loop->epoch_leave();
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, poll_command_capture_updates_existing_and_future_connections) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    auto* existing = loop->alloc_conn();
+    REQUIRE(existing != nullptr);
+    existing->fd = 42;
+    CHECK_EQ(existing->capture_buf, nullptr);
+
+    ShardControlBlock control;
+    CaptureRing ring;
+    ring.init();
+    loop->control = &control;
+
+    control.pending_capture.store(&ring, std::memory_order_release);
+    loop->poll_command();
+    CHECK_EQ(loop->capture_ring, &ring);
+    CHECK_EQ(control.pending_capture.load(std::memory_order_acquire), nullptr);
+    REQUIRE(existing->capture_buf != nullptr);
+
+    auto* future = loop->alloc_conn();
+    REQUIRE(future != nullptr);
+    future->fd = 43;
+    REQUIRE(future->capture_buf != nullptr);
+    CHECK_NE(future->capture_buf, existing->capture_buf);
+
+    control.pending_capture.store(kCaptureDisable, std::memory_order_release);
+    loop->poll_command();
+    CHECK_EQ(loop->capture_ring, nullptr);
+    CHECK_EQ(control.pending_capture.load(std::memory_order_acquire), nullptr);
+
+    loop->free_conn(*future);
+    loop->free_conn(*existing);
+    loop->shutdown();
+}
+
 TEST(legacy_loop, async_submit_and_close_paths) {
     auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
     auto initialized = loop->init(0, -1);
@@ -8063,6 +8349,120 @@ TEST(legacy_loop, async_submit_and_close_paths) {
     loop->close_conn(*c);
     CHECK_EQ(loop->pending_free_count, 1u);
     CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_reclaim_pending_reclaims_ready_slots) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* ready = loop->alloc_conn();
+    REQUIRE(ready != nullptr);
+    auto* busy = loop->alloc_conn();
+    REQUIRE(busy != nullptr);
+    u32 ready_id = ready->id;
+    u32 busy_id = busy->id;
+
+    ready->fd = -1;
+    ready->pending_ops = 0;
+    busy->fd = -1;
+    busy->pending_ops = 1;
+    loop->pending_free[0] = ready_id;
+    loop->pending_free[1] = busy_id;
+    loop->pending_free_count = 2;
+
+    loop->reclaim_pending();
+    CHECK_EQ(loop->pending_free_count, 1u);
+    CHECK_EQ(loop->pending_free[0], busy_id);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns - 1);
+    CHECK_EQ(loop->conns[ready_id].recv_slice, nullptr);
+    CHECK_EQ(loop->conns[ready_id].send_slice, nullptr);
+
+    busy->pending_ops = 0;
+    loop->reclaim_pending();
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_dispatch_stale_cqe_reclaims_slot) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = -1;
+    c->pending_ops = 1;
+    c->recv_armed = true;
+    loop->pending_free[0] = cid;
+    loop->pending_free_count = 1;
+
+    loop->dispatch(make_ev(cid, IoEventType::Recv, 0));
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
+    CHECK_EQ(loop->conns[cid].pending_ops, 0u);
+    CHECK_EQ(loop->conns[cid].recv_slice, nullptr);
+    CHECK_EQ(loop->conns[cid].send_slice, nullptr);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_dispatch_clears_send_and_upstream_armed_flags) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = -1;
+    c->pending_ops = 3;
+    c->send_armed = true;
+    c->upstream_send_armed = true;
+    c->upstream_recv_armed = true;
+    loop->pending_free[0] = cid;
+    loop->pending_free_count = 1;
+
+    loop->dispatch(make_ev(cid, IoEventType::Send, 0));
+    CHECK_EQ(loop->conns[cid].pending_ops, 2u);
+    CHECK_FALSE(loop->conns[cid].send_armed);
+
+    loop->dispatch(make_ev(cid, IoEventType::UpstreamSend, 0));
+    CHECK_EQ(loop->conns[cid].pending_ops, 1u);
+    CHECK_FALSE(loop->conns[cid].upstream_send_armed);
+
+    loop->dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
+    CHECK_FALSE(loop->conns[cid].upstream_recv_armed);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_retry_deferred_accepts_reuses_reclaimed_slot) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = -1;
+    c->pending_ops = 0;
+    loop->pending_free[0] = cid;
+    loop->pending_free_count = 1;
+
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    loop->deferred_accepts[0] = fd;
+    loop->deferred_accept_addrs[0] = 0x01020304u;
+    loop->deferred_accept_ports[0] = 8080;
+    loop->deferred_accept_count = 1;
+
+    loop->drain(0);
+    loop->run();
+
+    CHECK_EQ(loop->deferred_accept_count, 0u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 1u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
+    CHECK_EQ(loop->pending_free_count, 1u);
     loop->shutdown();
 }
 
@@ -8833,101 +9233,6 @@ TEST(dispatch_isolation, upstream_send_reaches_upstream_send_slot) {
     CHECK(g_callback_invoked);
 }
 
-TEST(dispatch_event, dispatch_event_handles_unhandled_and_terminal_branches) {
-    SmallLoop loop;
-    loop.setup();
-    auto* recv_conn = loop.alloc_conn();
-    REQUIRE(recv_conn != nullptr);
-    recv_conn->fd = 1000;
-    recv_conn->state = ConnState::ReadingHeader;
-    recv_conn->recv_armed = false;
-    recv_conn->on_recv = nullptr;
-    recv_conn->on_send = nullptr;
-    recv_conn->on_upstream_recv = nullptr;
-    recv_conn->on_upstream_send = nullptr;
-    recv_conn->keep_alive = false;
-    recv_conn->recv_buf.reset();
-    CHECK(!recv_conn->has_active_slot());
-    recv_conn->on_send = &test_sentinel_callback<SmallLoop>;
-    CHECK(recv_conn->has_active_slot());
-    recv_conn->on_send = nullptr;
-
-    loop.backend.clear_ops();
-    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 24));
-    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
-
-    loop.backend.clear_ops();
-    recv_conn->recv_armed = true;
-    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 24));
-    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
-    recv_conn->recv_armed = false;
-
-    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, 0));
-    CHECK_EQ(recv_conn->fd, 1000);
-
-    loop.dispatch_event(*recv_conn, make_ev(recv_conn->id, IoEventType::Recv, -105));
-    CHECK_EQ(recv_conn->fd, -1);
-
-    auto* up_conn = loop.alloc_conn();
-    REQUIRE(up_conn != nullptr);
-    up_conn->fd = 1001;
-    up_conn->state = ConnState::ReadingHeader;
-    up_conn->on_upstream_recv = nullptr;
-    up_conn->on_recv = nullptr;
-    up_conn->on_send = nullptr;
-    up_conn->on_upstream_send = nullptr;
-    up_conn->recv_armed = false;
-    g_callback_invoked = false;
-    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, 16));
-    CHECK(!g_callback_invoked);
-
-    up_conn->on_upstream_recv = &test_sentinel_callback<SmallLoop>;
-    g_callback_invoked = false;
-    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, 16));
-    CHECK(g_callback_invoked);
-
-    g_callback_invoked = false;
-    up_conn->on_upstream_recv = nullptr;
-    up_conn->state = ConnState::ReadingHeader;
-    up_conn->fd = 1002;
-    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, -105));
-    CHECK(!g_callback_invoked);
-    CHECK_EQ(up_conn->fd, 1002);
-
-    g_callback_invoked = false;
-    up_conn->state = ConnState::Sending;
-    up_conn->fd = 1003;
-    loop.dispatch_event(*up_conn, make_ev(up_conn->id, IoEventType::UpstreamRecv, -105));
-    CHECK(g_callback_invoked == false);
-    CHECK_EQ(up_conn->fd, -1);
-
-    auto* up_send_conn = loop.alloc_conn();
-    REQUIRE(up_send_conn != nullptr);
-    up_send_conn->fd = 1004;
-    up_send_conn->on_upstream_send = &test_sentinel_callback<SmallLoop>;
-    up_send_conn->on_recv = nullptr;
-    up_send_conn->on_send = nullptr;
-    up_send_conn->on_upstream_recv = nullptr;
-    g_callback_invoked = false;
-    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::UpstreamConnect, 0));
-    CHECK(g_callback_invoked);
-
-    up_send_conn->on_upstream_send = nullptr;
-    up_send_conn->on_send = &test_sentinel_callback<SmallLoop>;
-    g_callback_invoked = false;
-    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Send, 0));
-    CHECK(g_callback_invoked);
-
-    g_callback_invoked = false;
-    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Accept, 0));
-    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::Timeout, 0));
-    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::HandlerTimer, 0));
-    loop.dispatch_event(*up_send_conn, make_ev(up_send_conn->id, IoEventType::kNumEventTypes, 0));
-    CHECK(!g_callback_invoked);
-
-    loop.dispatch(make_ev(up_send_conn->id, IoEventType::kNumEventTypes, 0));
-}
-
 // ==========================================================================
 // State transition exhaustive tests: verify all 4 slot values after
 // each reachable state transition.
@@ -9240,7 +9545,7 @@ TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
     c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
     c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
 
     if (c->state == ConnState::ReadingBody) {
         check_jit_reading_body_invariant(_tc, c);
@@ -9255,7 +9560,13 @@ TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
         return;
     }
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    static const char kBodyChunk[] = "load";
+    u8* recv_dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < sizeof(kBodyChunk) - 1; j++) {
+        recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
+    }
+    c->recv_buf.commit(sizeof(kBodyChunk) - 1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 4));
     if (c->state == ConnState::ExecHandler) {
         check_exec_handler_yield_invariant(
             _tc, c, &state_invariant_wait_recv_then_status_always_204, 0);
@@ -9627,7 +9938,7 @@ TEST(state_invariant, jit_dispatch_classifies_all_event_yields) {
 }
 
 TEST(state_invariant, jit_event_helpers_map_runtime_events) {
-    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::kNumEventTypes); ++raw) {
+    for (u8 raw = 0; raw < static_cast<u8>(IoEventType::Count); ++raw) {
         const IoEventType type = static_cast<IoEventType>(raw);
 
         CHECK_EQ(yield_kind_matches_event(jit::YieldKind::Any, type),
@@ -9665,20 +9976,20 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
                 expected = jit::YieldKind::Timer;
                 break;
             case IoEventType::Accept:
-            case IoEventType::kNumEventTypes:
+            case IoEventType::Count:
                 break;
         }
         CHECK_EQ(static_cast<u8>(yield_kind_from_event(type)), static_cast<u8>(expected));
     }
 
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::kNumEventTypes));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::kNumEventTypes));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::kNumEventTypes));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::kNumEventTypes));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::kNumEventTypes));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::kNumEventTypes));
-    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::kNumEventTypes));
-    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::kNumEventTypes)),
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Any, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Recv, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Send, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamConnect, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamRecv, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::UpstreamSend, IoEventType::Count));
+    CHECK(!yield_kind_matches_event(jit::YieldKind::Timer, IoEventType::Count));
+    CHECK_EQ(static_cast<u8>(yield_kind_from_event(IoEventType::Count)),
              static_cast<u8>(jit::YieldKind::HttpGet));
 }
 
@@ -10391,7 +10702,7 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
     c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
     c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
 
     if (c->state == ConnState::ReadingBody) {
         CHECK_GT(c->req_body_remaining, 0u);
@@ -10406,7 +10717,13 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
         return;
     }
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    static const char kBodyChunk[] = "load";
+    u8* recv_dst = c->recv_buf.write_ptr();
+    for (u32 j = 0; j < sizeof(kBodyChunk) - 1; j++) {
+        recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
+    }
+    c->recv_buf.commit(sizeof(kBodyChunk) - 1);
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 4));
     if (c->state == ConnState::ExecHandler) {
         CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
     } else {

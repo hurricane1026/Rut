@@ -535,6 +535,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.struct_index = expr.struct_index;
         v.error_struct_index = expr.error_struct_index;
         v.error_variant_index = expr.error_variant_index;
+        v.is_pipe_conditional = expr.is_pipe_conditional;
+        v.is_eager_fallback = expr.is_eager_fallback;
         apply_expr_shape_if_available(module, expr, &v);
         return v;
     }
@@ -555,6 +557,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.rhs = rhs_ptr;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
+        v.error_struct_index = expr.error_struct_index;
         v.error_variant_index = expr.error_variant_index;
         apply_expr_shape_if_available(module, expr, &v);
         return v;
