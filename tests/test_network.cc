@@ -9635,8 +9635,7 @@ TEST(state_invariant, proxy_connect_started_keeps_slots_consistent) {
     c->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<SmallLoop>);
     loop.submit_connect(*c, nullptr, 0);
 
-    check_proxying_upstream_send_only_invariant(
-        _tc, c, &on_upstream_connected<SmallLoop>);
+    check_proxying_upstream_send_only_invariant(_tc, c, &on_upstream_connected<SmallLoop>);
 }
 
 TEST(state_invariant, body_streaming_slots_match_proxying_state) {
