@@ -6039,6 +6039,20 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
+    const auto known_bool_value = [&](const HirExpr& value, bool& out_value) -> bool {
+        if (value.kind == HirExprKind::BoolLit) {
+            out_value = value.bool_value;
+            return true;
+        }
+        if (value.kind == HirExprKind::LocalRef && value.local_index < local_count) {
+            const HirLocal& local = locals[value.local_index];
+            if (!local.may_nil && !local.may_error && local.init.kind == HirExprKind::BoolLit) {
+                out_value = local.init.bool_value;
+                return true;
+            }
+        }
+        return false;
+    };
     if (expr.kind == AstExprKind::Or) {
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!lhs) return core::make_unexpected(lhs.error());
@@ -6051,8 +6065,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         const bool is_bool_or = lhs->type == HirTypeKind::Bool && rhs->type == HirTypeKind::Bool;
         if (is_bool_or) {
-            if (lhs->kind == HirExprKind::BoolLit) {
-                if (!lhs->bool_value) {
+            bool lhs_bool_value = false;
+            if (known_bool_value(lhs.value(), lhs_bool_value)) {
+                if (!lhs_bool_value) {
                     HirExpr out = rhs.value();
                     out.span = expr.span;
                     return out;
@@ -6141,8 +6156,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             lhs->may_error || rhs->may_nil || rhs->may_error) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
-        if (lhs->kind == HirExprKind::BoolLit) {
-            if (!lhs->bool_value) {
+        bool lhs_bool_value = false;
+        if (known_bool_value(lhs.value(), lhs_bool_value)) {
+            if (!lhs_bool_value) {
                 HirExpr folded{};
                 folded.kind = HirExprKind::BoolLit;
                 folded.type = HirTypeKind::Bool;
