@@ -64,6 +64,28 @@ struct ConnectionBase {
         on_upstream_send = up_send;
     }
 
+    void clear_slots() { set_slots(nullptr, nullptr, nullptr, nullptr); }
+
+    void transition_to_reading_header(Callback recv) {
+        state = ConnState::ReadingHeader;
+        set_slots(recv, nullptr, nullptr, nullptr);
+    }
+
+    void transition_to_reading_body(Callback recv) {
+        state = ConnState::ReadingBody;
+        set_slots(recv, nullptr, nullptr, nullptr);
+    }
+
+    void transition_to_sending(Callback send) {
+        state = ConnState::Sending;
+        set_slots(nullptr, send, nullptr, nullptr);
+    }
+
+    void transition_to_exec_handler_wait() {
+        state = ConnState::ExecHandler;
+        clear_slots();
+    }
+
     // Check if any slot is active (for dispatch guard).
     bool has_active_slot() const {
         return on_recv || on_send || on_upstream_recv || on_upstream_send;
