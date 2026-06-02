@@ -10216,6 +10216,38 @@ TEST(frontend, any_all_builtin_pipe_rejects_placeholder_free_extra_args) {
     CHECK(hir.error().detail.eq(lit("pipe call missing placeholder")));
 }
 
+TEST(frontend, any_all_builtin_pipe_rejects_numbered_placeholder_for_conditional_tuple_source) {
+    const char* cases[] = {
+        "func maybe_pair(ok: bool) -> (i32, i32) {\n"
+        "  if ok { (200, 401) } else { nil }\n"
+        "}\n"
+        "route GET \"/search\" {\n"
+        "  let pair = maybe_pair(req.http11)\n"
+        "  let code = pair | any(_2, 500)\n"
+        "  return 200\n"
+        "}\n",
+        "func maybe_pair(ok: bool) -> (i32, i32) {\n"
+        "  if ok { (200, 401) } else { error(.timeout) }\n"
+        "}\n"
+        "route GET \"/search\" {\n"
+        "  let pair = maybe_pair(req.http11)\n"
+        "  let code = pair | all(_2, 500)\n"
+        "  return 200\n"
+        "}\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK(hir.error().detail.eq(lit("placeholder value in conditional pipe must be 1")));
+    }
+}
+
 TEST(frontend, any_builtin_preserves_lhs_error_carrier_for_nonfallible_fallback) {
     const char* src =
         "struct AuthError { err: Error }\n"

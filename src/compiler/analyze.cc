@@ -6845,6 +6845,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!route->exprs.push(*pipe_lhs))
             return frontend_error(FrontendError::TooManyItems, arg.span);
         HirExpr* source = &route->exprs[route->exprs.len - 1];
+        if ((source->may_nil || source->may_error) && arg.int_value != 1)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("placeholder value in conditional pipe must be 1"));
         if (source->type != HirTypeKind::Tuple) {
             if (arg.int_value != 1)
                 return frontend_error(FrontendError::UnsupportedSyntax,
