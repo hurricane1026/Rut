@@ -9623,6 +9623,22 @@ TEST(state_invariant, proxy_dispatch_keeps_slots_consistent) {
     check_reading_header_invariant(_tc, c);
 }
 
+TEST(state_invariant, proxy_connect_started_keeps_slots_consistent) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->upstream_fd = 100;
+    c->state = ConnState::Proxying;
+    c->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<SmallLoop>);
+    loop.submit_connect(*c, nullptr, 0);
+
+    check_proxying_upstream_send_only_invariant(
+        _tc, c, &on_upstream_connected<SmallLoop>);
+}
+
 TEST(state_invariant, body_streaming_slots_match_proxying_state) {
     SmallLoop loop;
     loop.setup();

@@ -5,7 +5,7 @@ EXTENDS Naturals
 \* @rut.slots: Recv Send UpstreamRecv UpstreamSend
 \* @rut.action AcceptToReadingHeader: on_accept check_reading_header_invariant
 \* @rut.action HeaderStaticToSending: static_dispatch_keeps_slots_consistent check_sending_response_invariant
-\* @rut.action HeaderProxyConnectToProxying: proxy_dispatch_keeps_slots_consistent check_proxying_upstream_wait_invariant
+\* @rut.action HeaderProxyConnectStartedToProxying: proxy_connect_started_keeps_slots_consistent check_proxying_upstream_send_only_invariant
 \* @rut.action HeaderJitBodyToReadingBody: jit_content_length_body_waits_until_full_buffer check_jit_reading_body_invariant
 \* @rut.action HeaderJitYieldToExecHandler: jit_body_completion_enters_exec_handler_before_resume check_exec_handler_yield_invariant
 \* @rut.action BodyCompleteToExecHandler: jit_body_completion_enters_exec_handler_before_resume check_exec_handler_yield_invariant
@@ -27,7 +27,7 @@ Actions == {
     "Init",
     "AcceptToReadingHeader",
     "HeaderStaticToSending",
-    "HeaderProxyConnectToProxying",
+    "HeaderProxyConnectStartedToProxying",
     "HeaderJitBodyToReadingBody",
     "HeaderJitYieldToExecHandler",
     "BodyCompleteToExecHandler",
@@ -166,7 +166,7 @@ HeaderStaticToSending ==
     /\ pendingOps' \in 0..1
     /\ lastAction' = "HeaderStaticToSending"
 
-HeaderProxyConnectToProxying ==
+HeaderProxyConnectStartedToProxying ==
     /\ state = "ReadingHeader"
     /\ state' = "Proxying"
     /\ slots' = {"UpstreamSend"}
@@ -176,7 +176,7 @@ HeaderProxyConnectToProxying ==
     /\ handlerState' = 0
     /\ yieldArmed' = FALSE
     /\ pendingOps' \in 0..1
-    /\ lastAction' = "HeaderProxyConnectToProxying"
+    /\ lastAction' = "HeaderProxyConnectStartedToProxying"
 
 HeaderJitBodyToReadingBody ==
     /\ state = "ReadingHeader"
@@ -349,7 +349,7 @@ CloseToIdle ==
 Next ==
     \/ AcceptToReadingHeader
     \/ HeaderStaticToSending
-    \/ HeaderProxyConnectToProxying
+    \/ HeaderProxyConnectStartedToProxying
     \/ HeaderJitBodyToReadingBody
     \/ HeaderJitYieldToExecHandler
     \/ BodyCompleteToExecHandler

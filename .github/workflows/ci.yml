@@ -74,9 +74,12 @@ jobs:
 
       - name: Download TLA+ tools
         run: |
+          TLA2TOOLS_VERSION=v1.7.4
+          TLA2TOOLS_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
           curl --fail --location --retry 3 \
             --output /tmp/tla2tools.jar \
-            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA2TOOLS_VERSION}/tla2tools.jar"
+          printf '%s  %s\n' "$TLA2TOOLS_SHA256" /tmp/tla2tools.jar | sha256sum --check
 
       - name: Check runtime state model
         run: TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 scripts/check_runtime_state_model.py
