@@ -6746,6 +6746,59 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             dst->tuple_struct_indices[i] = src.tuple_struct_indices[i];
         }
     };
+    auto analyze_builtin_arg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
+        if (arg.kind != AstExprKind::Placeholder)
+            return analyze_expr(arg, route, mod, locals, local_count, binding);
+        if (pipe_lhs == nullptr)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, arg.span, lit_str("placeholder outside pipe"));
+        if (arg.int_value <= 0 || arg.int_value > static_cast<i32>(kMaxTupleSlots))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("placeholder slot out of range"));
+        if (!route->exprs.push(*pipe_lhs))
+            return frontend_error(FrontendError::TooManyItems, arg.span);
+        HirExpr* source = &route->exprs[route->exprs.len - 1];
+        if (source->type != HirTypeKind::Tuple) {
+            if (arg.int_value != 1)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg.span,
+                                      lit_str("non-tuple source with non-unit placeholder"));
+            return *source;
+        }
+        if (arg.int_value > static_cast<i32>(source->tuple_len))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("placeholder slot exceeds tuple arity"));
+        const u32 slot_index = static_cast<u32>(arg.int_value - 1);
+        if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
+            return *source->args[slot_index];
+        HirExpr out{};
+        out.kind = HirExprKind::TupleSlot;
+        out.type = source->tuple_types[slot_index];
+        if (out.type == HirTypeKind::Generic)
+            out.generic_index = source->tuple_struct_indices[slot_index];
+        else if (out.type == HirTypeKind::Struct)
+            out.struct_index = source->tuple_struct_indices[slot_index];
+        else if (out.type == HirTypeKind::Variant)
+            out.variant_index = source->tuple_variant_indices[slot_index];
+        auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                           out.type,
+                                           out.generic_index,
+                                           out.variant_index,
+                                           out.struct_index,
+                                           out.tuple_len,
+                                           out.tuple_types,
+                                           out.tuple_variant_indices,
+                                           out.tuple_struct_indices,
+                                           arg.span);
+        if (!shape) return core::make_unexpected(shape.error());
+        out.shape_index = shape.value();
+        out.span = arg.span;
+        out.int_value = static_cast<i32>(slot_index);
+        out.lhs = source;
+        return out;
+    };
 
     if (expr.name.eq({"any", 3})) {
         if (expr.args.len != 2) {
@@ -6754,9 +6807,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (expr.args[0] == nullptr || expr.args[1] == nullptr) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
-        auto lhs = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        auto lhs = analyze_builtin_arg(*expr.args[0]);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        auto rhs = analyze_builtin_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (rhs->may_nil)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.args[1]->span);
@@ -6879,9 +6932,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (expr.args[0] == nullptr || expr.args[1] == nullptr) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
-        auto lhs = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        auto lhs = analyze_builtin_arg(*expr.args[0]);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        auto rhs = analyze_builtin_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (rhs->may_nil)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.args[1]->span);

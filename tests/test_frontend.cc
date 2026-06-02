@@ -10117,6 +10117,30 @@ TEST(frontend, all_builtin_present_lhs_fallible_rhs_preserves_rhs_error) {
     rir.destroy();
 }
 
+TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
+    const char* src =
+        "route GET \"/search\" {\n"
+        "  let host = req.header(\"Host\") | any(_, \"missing\")\n"
+        "  let gated = req.header(\"Host\") | all(_, \"present\")\n"
+        "  return 200\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
 TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, \"\") "
