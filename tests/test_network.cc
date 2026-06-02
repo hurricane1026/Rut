@@ -8209,6 +8209,26 @@ TEST(legacy_loop, dispatch_accept_paths) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, timeout_drain_closes_idle_connection) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    c->state = ConnState::ReadingHeader;
+    u32 cid = c->id;
+
+    loop->drain(0);
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 2));
+
+    CHECK_EQ(loop->conns[cid].fd, -1);
+    CHECK_EQ(loop->free_top, EventLoop<MockBackend>::kMaxConns);
+    loop->shutdown();
+}
+
 TEST(legacy_loop, poll_command_updates_control_slots) {
     auto loop = std::make_unique<EventLoop<MockBackend>>();
     auto initialized = loop->init(0, -1);
@@ -8363,6 +8383,36 @@ TEST(legacy_loop, async_dispatch_stale_cqe_reclaims_slot) {
     CHECK_EQ(loop->conns[cid].pending_ops, 0u);
     CHECK_EQ(loop->conns[cid].recv_slice, nullptr);
     CHECK_EQ(loop->conns[cid].send_slice, nullptr);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_dispatch_clears_send_and_upstream_armed_flags) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = -1;
+    c->pending_ops = 3;
+    c->send_armed = true;
+    c->upstream_send_armed = true;
+    c->upstream_recv_armed = true;
+    loop->pending_free[0] = cid;
+    loop->pending_free_count = 1;
+
+    loop->dispatch(make_ev(cid, IoEventType::Send, 0));
+    CHECK_EQ(loop->conns[cid].pending_ops, 2u);
+    CHECK_FALSE(loop->conns[cid].send_armed);
+
+    loop->dispatch(make_ev(cid, IoEventType::UpstreamSend, 0));
+    CHECK_EQ(loop->conns[cid].pending_ops, 1u);
+    CHECK_FALSE(loop->conns[cid].upstream_send_armed);
+
+    loop->dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
+    CHECK_FALSE(loop->conns[cid].upstream_recv_armed);
     loop->shutdown();
 }
 
