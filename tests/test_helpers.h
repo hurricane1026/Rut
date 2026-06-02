@@ -316,6 +316,7 @@ struct AsyncMockBackend {
     static constexpr u32 kMaxOps = 256;
     MockOp ops[kMaxOps];
     u32 op_count = 0;
+    i32 timer_fd = -1;
     bool fail_connect = false;
     bool fail_upstream_recv = false;
     bool fail_upstream_send = false;
@@ -327,6 +328,7 @@ struct AsyncMockBackend {
     core::Expected<void, Error> init(u32 /*shard_id*/, i32 /*listen_fd*/) {
         op_count = 0;
         pending_count = 0;
+        timer_fd = -1;
         fail_connect = false;
         fail_upstream_recv = false;
         fail_upstream_send = false;

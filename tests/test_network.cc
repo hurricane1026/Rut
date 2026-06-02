@@ -8229,6 +8229,26 @@ TEST(legacy_loop, timeout_drain_closes_idle_connection) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, drain_wakes_valid_timerfd) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    REQUIRE(timer_fd >= 0);
+    loop->backend.timer_fd = timer_fd;
+
+    loop->drain(3);
+
+    itimerspec current{};
+    REQUIRE(timerfd_gettime(timer_fd, &current) == 0);
+    CHECK(current.it_interval.tv_sec == 1);
+    CHECK(current.it_value.tv_sec == 0);
+    CHECK(current.it_value.tv_nsec > 0);
+    close(timer_fd);
+    loop->backend.timer_fd = -1;
+    loop->shutdown();
+}
+
 TEST(legacy_loop, poll_command_updates_control_slots) {
     auto loop = std::make_unique<EventLoop<MockBackend>>();
     auto initialized = loop->init(0, -1);
@@ -8413,6 +8433,35 @@ TEST(legacy_loop, async_dispatch_clears_send_and_upstream_armed_flags) {
     CHECK_EQ(loop->pending_free_count, 0u);
     CHECK_EQ(loop->free_top, EventLoop<AsyncMockBackend>::kMaxConns);
     CHECK_FALSE(loop->conns[cid].upstream_recv_armed);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, async_retry_deferred_accepts_reuses_reclaimed_slot) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    u32 cid = c->id;
+    c->fd = -1;
+    c->pending_ops = 0;
+    loop->pending_free[0] = cid;
+    loop->pending_free_count = 1;
+
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    loop->deferred_accepts[0] = fd;
+    loop->deferred_accept_addrs[0] = 0x01020304u;
+    loop->deferred_accept_ports[0] = 8080;
+    loop->deferred_accept_count = 1;
+
+    loop->drain(0);
+    loop->run();
+
+    CHECK_EQ(loop->deferred_accept_count, 0u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 1u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Cancel), 1u);
+    CHECK_EQ(loop->pending_free_count, 1u);
     loop->shutdown();
 }
 
