@@ -300,6 +300,52 @@ TEST(route_art, nested_node256_child_dispatches_by_next_byte) {
     CHECK_EQ(t.match(S("/a!"), 0), TrieNode::kInvalidRoute);
 }
 
+TEST(route_art, split_node48_edge_preserves_existing_children) {
+    ArtTrie t;
+    char paths[17][9];
+    for (u32 i = 0; i < 17; i++) {
+        paths[i][0] = '/';
+        paths[i][1] = 'a';
+        paths[i][2] = 'b';
+        paths[i][3] = 'c';
+        paths[i][4] = 'd';
+        paths[i][5] = 'e';
+        paths[i][6] = 'f';
+        paths[i][7] = static_cast<char>('A' + i);
+        paths[i][8] = '\0';
+        REQUIRE(t.insert(Str{paths[i], 8}, 0, static_cast<u16>(100 + i)));
+    }
+    REQUIRE_GE(t.n48_count(), 1u);
+
+    REQUIRE(t.insert(S("/abcxyz"), 0, 500));
+    CHECK_EQ(t.match(S("/abcxyz"), 0), 500u);
+    CHECK_EQ(t.match(Str{paths[0], 8}, 0), 100u);
+    CHECK_EQ(t.match(Str{paths[16], 8}, 0), 116u);
+}
+
+TEST(route_art, split_node256_edge_preserves_existing_children) {
+    ArtTrie t;
+    char paths[49][9];
+    for (u32 i = 0; i < 49; i++) {
+        paths[i][0] = '/';
+        paths[i][1] = 'a';
+        paths[i][2] = 'b';
+        paths[i][3] = 'c';
+        paths[i][4] = 'd';
+        paths[i][5] = 'e';
+        paths[i][6] = 'f';
+        paths[i][7] = static_cast<char>(0x40 + i);
+        paths[i][8] = '\0';
+        REQUIRE(t.insert(Str{paths[i], 8}, 0, static_cast<u16>(200 + i)));
+    }
+    REQUIRE_GE(t.n256_count(), 1u);
+
+    REQUIRE(t.insert(S("/abcxyz"), 0, 600));
+    CHECK_EQ(t.match(S("/abcxyz"), 0), 600u);
+    CHECK_EQ(t.match(Str{paths[0], 8}, 0), 200u);
+    CHECK_EQ(t.match(Str{paths[48], 8}, 0), 248u);
+}
+
 TEST(route_art, match_canonical_key_rejects_invalid_method_key) {
     ArtTrie t;
     REQUIRE(t.insert(S("/x"), 0, 7));
