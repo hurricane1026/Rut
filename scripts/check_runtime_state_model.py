@@ -106,9 +106,9 @@ def maybe_run_tlc() -> None:
     tlc = shutil.which("tlc")
     tla2tools = os.environ.get("TLA2TOOLS_JAR")
     if tlc:
-        cmd = [tlc, "-deadlock", str(CFG)]
+        cmd = [tlc, "-deadlock", "-config", CFG.name, SPEC.stem]
     elif tla2tools and shutil.which("java"):
-        cmd = ["java", "-cp", tla2tools, "tlc2.TLC", "-deadlock", str(CFG)]
+        cmd = ["java", "-cp", tla2tools, "tlc2.TLC", "-deadlock", "-config", CFG.name, SPEC.stem]
     else:
         print("TLC not found; skipped model checking after static consistency checks")
         return

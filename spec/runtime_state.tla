@@ -1,4 +1,4 @@
----- MODULE RutRuntimeState ----
+---- MODULE runtime_state ----
 EXTENDS Naturals
 
 \* @rut.states: Idle ReadingHeader ReadingBody ExecHandler Proxying Sending
