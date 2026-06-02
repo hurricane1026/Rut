@@ -193,6 +193,10 @@ static Str error_return_label() {
     return lit("error_return");
 }
 
+static Str branch_cond_payload_label() {
+    return lit("branch_cond_payload");
+}
+
 static Str prelude_label() {
     return lit("prelude");
 }
@@ -2536,6 +2540,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                       ErrorLoweringInfo* error_struct_infos,
                                       const rir::StructDef* const* user_struct_defs,
                                       rir::Builder& b,
+                                      rir::Function* fn,
                                       const rir::BlockId* block_ids,
                                       const rir::ValueId* locals,
                                       u32 local_count) {
@@ -2686,11 +2691,33 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                                 error_scalar_infos,
                                                 error_variant_infos,
                                                 error_struct_infos);
+                auto err = b.emit_struct_field(cond.value(),
+                                               error_field_name(),
+                                               err_info.error_opt_type,
+                                               {term.span.line, term.span.col});
+                if (!err) return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto err_is_nil = b.emit_opt_is_nil(err.value(), {term.span.line, term.span.col});
+                if (!err_is_nil) return frontend_error(FrontendError::OutOfMemory, term.span);
                 auto payload = b.emit_struct_field(cond.value(),
                                                    error_payload_field_name(),
                                                    err_info.payload_opt_type,
                                                    {term.span.line, term.span.col});
                 if (!payload) return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto payload_block = b.create_block(fn, branch_cond_payload_label());
+                if (!payload_block) return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto error_block = b.create_block(fn, error_return_label());
+                if (!error_block) return frontend_error(FrontendError::OutOfMemory, term.span);
+                if (!b.emit_br(err_is_nil.value(),
+                               payload_block.value(),
+                               error_block.value(),
+                               {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::OutOfMemory, term.span);
+
+                b.set_insert_point(fn, error_block.value());
+                if (!b.emit_ret_status(500, {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::OutOfMemory, term.span);
+
+                b.set_insert_point(fn, payload_block.value());
                 auto bool_ty = b.make_type(rir::TypeKind::Bool);
                 if (!bool_ty) return frontend_error(FrontendError::OutOfMemory, term.span);
                 auto unwrapped = b.emit_opt_unwrap(
@@ -3524,6 +3551,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                                      error_struct_infos,
                                      user_struct_defs,
                                      b,
+                                     fn.value(),
                                      block_ids,
                                      local_vals,
                                      MirFunction::kMaxLocals);
