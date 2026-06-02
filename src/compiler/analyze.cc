@@ -6591,8 +6591,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.rhs = cmp_ptr;
             if (!out.args.push(false_ptr))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            out.may_error = (lhs->kind != HirExprKind::LocalRef && lhs->may_error) ||
-                            (rhs->kind != HirExprKind::LocalRef && rhs->may_error);
+            out.may_error = lhs->may_error || rhs->may_error;
             out.error_struct_index =
                 rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
             out.error_variant_index =

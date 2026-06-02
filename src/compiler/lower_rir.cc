@@ -2679,7 +2679,27 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                           local_count,
                                           term.span);
             if (!cond) return core::make_unexpected(cond.error());
-            cond_id = cond.value();
+            if (term.cond.may_error) {
+                const auto cond_shape = resolved_shape(mir, term.cond);
+                auto& err_info = error_info_for(cond_shape,
+                                                term.cond.error_struct_index,
+                                                error_scalar_infos,
+                                                error_variant_infos,
+                                                error_struct_infos);
+                auto payload = b.emit_struct_field(cond.value(),
+                                                   error_payload_field_name(),
+                                                   err_info.payload_opt_type,
+                                                   {term.span.line, term.span.col});
+                if (!payload) return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto bool_ty = b.make_type(rir::TypeKind::Bool);
+                if (!bool_ty) return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto unwrapped = b.emit_opt_unwrap(
+                    payload.value(), bool_ty.value(), {term.span.line, term.span.col});
+                if (!unwrapped) return frontend_error(FrontendError::OutOfMemory, term.span);
+                cond_id = unwrapped.value();
+            } else {
+                cond_id = cond.value();
+            }
         }
         if (!b.emit_br(cond_id,
                        block_ids[term.then_block],
@@ -3298,14 +3318,26 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
             }
         }
-        auto local_needs_error_prelude = [](const MirLocal& local) -> bool {
+        auto local_ref_matches = [](const MirValue* value, u32 local_index) -> bool {
+            return value != nullptr && value->kind == MirValueKind::LocalRef &&
+                   value->local_index == local_index;
+        };
+        auto has_recovering_or_use = [&](u32 local_index) -> bool {
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                const auto& init = mir.functions[i].locals[li].init;
+                if (init.kind == MirValueKind::Or && local_ref_matches(init.lhs, local_index))
+                    return true;
+            }
+            return false;
+        };
+        auto local_needs_error_prelude = [&](const MirLocal& local) -> bool {
             return local.may_error && local.init.kind == MirValueKind::IfElse &&
                    local.init.lhs != nullptr &&
                    (local.init.lhs->kind == MirValueKind::HasValue ||
                     (local.init.is_eager_fallback &&
                      local.init.lhs->kind == MirValueKind::BoolConst &&
                      local.init.lhs->bool_value)) &&
-                   !local.init.is_pipe_conditional;
+                   !local.init.is_pipe_conditional && !has_recovering_or_use(local.ref_index);
         };
 
         u32 error_local_count = 0;
