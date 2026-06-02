@@ -60,6 +60,27 @@ jobs:
             ! -path '*/simd/sve.cc' | \
             xargs clang-tidy -p build --warnings-as-errors='bugprone-*,performance-*'
 
+  runtime-state-model:
+    name: Runtime state model
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download TLA+ tools
+        run: |
+          curl --fail --location --retry 3 \
+            --output /tmp/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+
+      - name: Check runtime state model
+        run: TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 scripts/check_runtime_state_model.py
+
   test:
     name: Build & Test
     runs-on: ubuntu-24.04
