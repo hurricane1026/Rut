@@ -8170,6 +8170,45 @@ TEST(legacy_loop, dispatch_event_unhandled_upstream_recv_paths) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, run_exits_during_empty_drain) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    i32 listen_fd = dup(2);
+    REQUIRE(listen_fd >= 0);
+    auto initialized = loop->init(0, listen_fd);
+    REQUIRE(initialized);
+
+    loop->drain(0);
+    loop->run();
+
+    CHECK(!loop->is_running());
+    CHECK_EQ(loop->listen_fd, -1);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Accept), 1u);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, dispatch_accept_paths) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    loop->dispatch(make_ev(0, IoEventType::Accept, -1));
+    CHECK_EQ(loop->free_top, EventLoop<MockBackend>::kMaxConns);
+
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    loop->dispatch(make_ev(0, IoEventType::Accept, fd));
+    REQUIRE_EQ(loop->free_top, EventLoop<MockBackend>::kMaxConns - 1);
+    auto& accepted = loop->conns[EventLoop<MockBackend>::kMaxConns - 1];
+    CHECK_EQ(accepted.fd, fd);
+    CHECK_EQ(accepted.state, ConnState::ReadingHeader);
+    CHECK_EQ(accepted.on_recv, &on_header_received<EventLoop<MockBackend>>);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 1u);
+
+    loop->dispatch(make_ev(0, IoEventType::Count, 0));
+    loop->close_conn(accepted);
+    loop->shutdown();
+}
+
 TEST(legacy_loop, poll_command_updates_control_slots) {
     auto loop = std::make_unique<EventLoop<MockBackend>>();
     auto initialized = loop->init(0, -1);
