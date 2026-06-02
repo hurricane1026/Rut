@@ -2257,6 +2257,10 @@ TEST(route, add_accepts_well_formed_path_after_rejection) {
     CHECK_EQ(cfg.route_count, 1u);
 }
 
+static u64 route_table_dummy_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(204).pack();
+}
+
 TEST(route, default_dispatch_kind_is_art_jit) {
     // Phase 2 default: ArtJit. Until install_art_jit_fn is called,
     // match() falls back to scalar ArtTrie::match — slower but
@@ -2280,6 +2284,26 @@ TEST(route, add_refuses_param_path_under_art_dispatch) {
     RouteConfig cfg;
     CHECK(!cfg.add_static("/users/:id", 0, 200));
     CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_methods_reject_invalid_method_keys) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, 8080).has_value());
+    CHECK(!cfg.add_static("/static", 0xff, 200));
+    CHECK(!cfg.add_proxy("/proxy", 0xff, 0));
+    CHECK(!cfg.add_jit_handler("/jit", 0xff, &route_table_dummy_handler));
+    CHECK_EQ(cfg.route_count, 0u);
+}
+
+TEST(route, add_jit_handler_rejects_null_and_records_body_dependency) {
+    RouteConfig cfg;
+    CHECK(!cfg.add_jit_handler("/upload", 0, nullptr));
+    REQUIRE(cfg.add_jit_handler("/upload", 'P', &route_table_dummy_handler, true));
+    REQUIRE_EQ(cfg.route_count, 1u);
+    CHECK_EQ(cfg.routes[0].action, RouteAction::JitHandler);
+    CHECK_EQ(cfg.routes[0].method, route_method_key_from_legacy_char('P'));
+    CHECK(cfg.routes[0].needs_req_body);
+    CHECK_EQ(cfg.routes[0].fn, &route_table_dummy_handler);
 }
 
 TEST(route, configure_route_dispatch_selects_segment_trie_for_param_route) {
@@ -2319,6 +2343,77 @@ TEST(route, configure_route_dispatch_refuses_after_route_add) {
     REQUIRE(cfg.add_static("/health", 0, 200));
     CHECK(!configure_route_dispatch(cfg, mod));
     CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
+}
+
+TEST(route, configure_route_dispatch_rejects_malformed_modules) {
+    RouteConfig cfg;
+    rir::Module too_many{};
+    too_many.func_count = RouteConfig::kMaxRoutes + 1;
+    CHECK(!configure_route_dispatch(cfg, too_many));
+
+    rir::Module missing_funcs{};
+    missing_funcs.func_count = 1;
+    missing_funcs.functions = nullptr;
+    CHECK(!configure_route_dispatch(cfg, missing_funcs));
+
+    rir::Function funcs[1]{};
+    funcs[0].route_pattern = Str{nullptr, 1};
+    rir::Module null_pattern{};
+    null_pattern.functions = funcs;
+    null_pattern.func_count = 1;
+    CHECK(!configure_route_dispatch(cfg, null_pattern));
+}
+
+TEST(route, rir_function_needs_req_body_guard_paths) {
+    rir::Function fn{};
+    CHECK(!rir_function_needs_req_body(fn));
+
+    rir::Block blocks[2]{};
+    fn.blocks = blocks;
+    fn.block_count = 2;
+    blocks[0].insts = nullptr;
+    blocks[0].inst_count = 1;
+
+    rir::Instruction insts[1]{};
+    blocks[1].insts = insts;
+    blocks[1].inst_count = 1;
+    insts[0].op = rir::Opcode::ReqHeader;
+    CHECK(!rir_function_needs_req_body(fn));
+
+    insts[0].op = rir::Opcode::ReqBody;
+    CHECK(rir_function_needs_req_body(fn));
+}
+
+TEST(route, populate_route_config_rejects_malformed_runtime_tables) {
+    RouteConfig cfg;
+
+    rir::Module too_many_upstreams{};
+    too_many_upstreams.upstream_count = rir::Module::kMaxUpstreams + 1;
+    CHECK(!populate_route_config(cfg, too_many_upstreams));
+
+    rir::Module too_many_bodies{};
+    too_many_bodies.response_body_count = rir::Module::kMaxResponseBodies + 1;
+    CHECK(!populate_route_config(cfg, too_many_bodies));
+
+    rir::Module too_many_header_sets{};
+    too_many_header_sets.header_set_count = rir::Module::kMaxHeaderSets + 1;
+    CHECK(!populate_route_config(cfg, too_many_header_sets));
+
+    rir::Module too_many_header_entries{};
+    too_many_header_entries.header_pool_used = rir::Module::kMaxHeaderPoolEntries + 1;
+    CHECK(!populate_route_config(cfg, too_many_header_entries));
+
+    rir::Module bad_header_ref{};
+    bad_header_ref.header_set_count = 1;
+    bad_header_ref.header_pool_used = 1;
+    bad_header_ref.header_sets[0] = {1, 1};
+    CHECK(!populate_route_config(cfg, bad_header_ref));
+
+    rir::Module oversized_header_set{};
+    oversized_header_set.header_set_count = 1;
+    oversized_header_set.header_pool_used = RouteConfig::kMaxHeadersPerSet + 1;
+    oversized_header_set.header_sets[0] = {0, RouteConfig::kMaxHeadersPerSet + 1};
+    CHECK(!populate_route_config(cfg, oversized_header_set));
 }
 
 TEST(route, segment_trie_matches_param_path) {
@@ -8105,6 +8200,43 @@ TEST(legacy_loop, poll_command_updates_control_slots) {
     loop->epoch_enter();
     loop->epoch_leave();
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, poll_command_capture_updates_existing_and_future_connections) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto initialized = loop->init(0, -1);
+    REQUIRE(initialized);
+
+    auto* existing = loop->alloc_conn();
+    REQUIRE(existing != nullptr);
+    existing->fd = 42;
+    CHECK_EQ(existing->capture_buf, nullptr);
+
+    ShardControlBlock control;
+    CaptureRing ring;
+    ring.init();
+    loop->control = &control;
+
+    control.pending_capture.store(&ring, std::memory_order_release);
+    loop->poll_command();
+    CHECK_EQ(loop->capture_ring, &ring);
+    CHECK_EQ(control.pending_capture.load(std::memory_order_acquire), nullptr);
+    REQUIRE(existing->capture_buf != nullptr);
+
+    auto* future = loop->alloc_conn();
+    REQUIRE(future != nullptr);
+    future->fd = 43;
+    REQUIRE(future->capture_buf != nullptr);
+    CHECK_NE(future->capture_buf, existing->capture_buf);
+
+    control.pending_capture.store(kCaptureDisable, std::memory_order_release);
+    loop->poll_command();
+    CHECK_EQ(loop->capture_ring, nullptr);
+    CHECK_EQ(control.pending_capture.load(std::memory_order_acquire), nullptr);
+
+    loop->free_conn(*future);
+    loop->free_conn(*existing);
     loop->shutdown();
 }
 
