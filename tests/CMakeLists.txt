@@ -21,6 +21,7 @@ add_test(NAME test_network COMMAND test_network)
 set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
 find_package(Threads REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
@@ -304,8 +305,15 @@ if(RUT_ENABLE_JIT)
     set_tests_properties(test_simulate_engine PROPERTIES LABELS "unit;sim;jit")
 endif()
 
+add_test(
+    NAME test_runtime_state_model
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
+)
+set_tests_properties(test_runtime_state_model PROPERTIES LABELS "unit;model")
+
 if(RUT_ENABLE_JIT)
     add_custom_target(check
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_integration>
         COMMAND $<TARGET_FILE:test_arena>
@@ -335,6 +343,7 @@ if(RUT_ENABLE_JIT)
     )
 else()
     add_custom_target(check
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_integration>
         COMMAND $<TARGET_FILE:test_arena>
