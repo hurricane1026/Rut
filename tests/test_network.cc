@@ -9406,7 +9406,7 @@ TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
     c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
     c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
 
     if (c->state == ConnState::ReadingBody) {
         check_jit_reading_body_invariant(_tc, c);
@@ -9427,7 +9427,7 @@ TEST(state_invariant, jit_body_completion_enters_exec_handler_before_resume) {
         recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
     }
     c->recv_buf.commit(sizeof(kBodyChunk) - 1);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 4));
     if (c->state == ConnState::ExecHandler) {
         check_exec_handler_yield_invariant(
             _tc, c, &state_invariant_wait_recv_then_status_always_204, 0);
@@ -10563,7 +10563,7 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npay";
     c->recv_buf.write(reinterpret_cast<const u8*>(kHeadAndPartial), sizeof(kHeadAndPartial) - 1);
     c->recv_buf.commit(sizeof(kHeadAndPartial) - 1);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, sizeof(kHeadAndPartial) - 1));
 
     if (c->state == ConnState::ReadingBody) {
         CHECK_GT(c->req_body_remaining, 0u);
@@ -10584,7 +10584,7 @@ TEST(state_transition, jit_body_complete_enters_exec_handler) {
         recv_dst[j] = static_cast<u8>(kBodyChunk[j]);
     }
     c->recv_buf.commit(sizeof(kBodyChunk) - 1);
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 4));
+    loop.dispatch(make_ev(c->id, IoEventType::Recv, 4));
     if (c->state == ConnState::ExecHandler) {
         CHECK_SLOTS(c, nullptr, nullptr, nullptr, nullptr);
     } else {

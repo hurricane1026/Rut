@@ -6901,7 +6901,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             folded.span = expr.span;
             return folded;
         }
-        if (!lhs->may_nil && !lhs->may_error) {
+        if (!lhs->may_nil && !lhs->may_error && !rhs->may_error) {
             HirExpr folded = rhs.value();
             folded.span = expr.span;
             return folded;
@@ -6910,6 +6910,36 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!route->exprs.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
+
+        if (!lhs->may_nil && !lhs->may_error) {
+            HirExpr true_expr{};
+            true_expr.kind = HirExprKind::BoolLit;
+            true_expr.type = HirTypeKind::Bool;
+            true_expr.bool_value = true;
+            true_expr.span = expr.span;
+            if (!route->exprs.push(true_expr))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr* true_ptr = &route->exprs[route->exprs.len - 1];
+
+            if (!route->exprs.push(rhs.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
+
+            HirExpr out{};
+            out.kind = HirExprKind::IfElse;
+            copy_hir_shape(&out, rhs.value());
+            out.span = expr.span;
+            out.lhs = true_ptr;
+            out.rhs = rhs_ptr;
+            if (!out.args.push(lhs_ptr))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.may_nil = false;
+            out.may_error = rhs->may_error;
+            out.error_struct_index = rhs->error_struct_index;
+            out.error_variant_index = rhs->error_variant_index;
+            out.is_eager_fallback = true;
+            return out;
+        }
 
         HirExpr cond{};
         cond.kind = HirExprKind::HasValue;
