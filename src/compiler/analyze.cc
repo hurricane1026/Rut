@@ -6850,8 +6850,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.rhs = rhs_ptr;
             out.may_nil = false;
             out.may_error = false;
-            out.error_struct_index = rhs->error_struct_index;
-            out.error_variant_index = rhs->error_variant_index;
+            out.error_struct_index =
+                lhs->may_error ? lhs->error_struct_index : rhs->error_struct_index;
+            out.error_variant_index =
+                lhs->may_error ? lhs->error_variant_index : rhs->error_variant_index;
             return out;
         }
         if (!lhs->may_nil && !lhs->may_error) {

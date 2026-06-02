@@ -10141,6 +10141,35 @@ TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
     rir.destroy();
 }
 
+TEST(frontend, any_builtin_preserves_lhs_error_carrier_for_nonfallible_fallback) {
+    const char* src =
+        "struct AuthError { err: Error }\n"
+        "func maybefail(ok: bool) -> i32 {\n"
+        "  if ok { 200 } else { error(AuthError, .timeout, \"timed out\") }\n"
+        "}\n"
+        "route GET \"/search\" { let value = maybefail(req.http11) let safe = any(value, 200) "
+        "return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->structs.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    auto& init = hir->routes[0].locals[1].init;
+    CHECK_EQ(static_cast<u8>(init.kind), static_cast<u8>(HirExprKind::Or));
+    CHECK_EQ(init.error_struct_index, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::Or));
+    CHECK_EQ(mir->functions[0].locals[1].init.error_struct_index, 0u);
+}
+
 TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, \"\") "
