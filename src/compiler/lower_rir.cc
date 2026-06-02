@@ -3354,6 +3354,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 const auto& init = mir.functions[i].locals[li].init;
                 if (init.kind == MirValueKind::Or && local_ref_matches(init.lhs, local_index))
                     return true;
+                if (init.kind == MirValueKind::IfElse && init.lhs != nullptr &&
+                    init.lhs->kind == MirValueKind::HasValue &&
+                    local_ref_matches(init.lhs->lhs, local_index) && init.rhs != nullptr &&
+                    init.rhs->kind == MirValueKind::ValueOf &&
+                    local_ref_matches(init.rhs->lhs, local_index))
+                    return true;
             }
             return false;
         };
