@@ -16012,12 +16012,13 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(hir.error().detail.eq(lit("non-tuple source with non-unit placeholder")));
 }
-TEST(jit, frontend_pipe_with_placeholder_slot_zero_is_rejected_scalar) {
+TEST(jit, frontend_pipe_keeps_placeholder_slot_zero_identifier_scalar) {
     const auto src = R"(
-func id(x: i32) -> i32 => x
+func second(x: i32, y: i32) -> i32 => y
 route GET "/users" {
-    let code = 200 | id(_0)
-    return 200
+    let _0 = 204
+    let code = 200 | second(_, _0)
+    if code == 204 { return 200 } else { return 500 }
 }
 )";
     auto lexed = lex(lit(src));
@@ -16025,9 +16026,27 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(lit("placeholder slot out of range")));
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
 }
 TEST(jit, frontend_pipe_with_tuple_placeholder_slot_exceeds_tuple_arity_is_rejected) {
     const auto src = R"(
@@ -16046,12 +16065,13 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(hir.error().detail.eq(lit("placeholder slot exceeds tuple arity")));
 }
-TEST(jit, frontend_pipe_with_placeholder_slot_zero_is_rejected) {
+TEST(jit, frontend_pipe_keeps_placeholder_slot_zero_identifier_tuple) {
     const auto src = R"(
-func id(x: i32) -> i32 => x
+func second(x: i32, y: i32) -> i32 => y
 route GET "/users" {
-    let code = (200, 500) | id(_0)
-    return 200
+    let _0 = 204
+    let code = (200, 500) | second(_1, _0)
+    if code == 204 { return 200 } else { return 500 }
 }
 )";
     auto lexed = lex(lit(src));
@@ -16059,9 +16079,27 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(lit("placeholder slot out of range")));
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit, frontend_pipe_runtime_fallible_lhs_slot_two_is_rejected) {
@@ -16156,12 +16194,14 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(hir.error().detail.eq(lit("placeholder value in conditional pipe must be 1")));
 }
-TEST(jit, frontend_pipe_conditional_with_placeholder_slot_zero_is_rejected) {
+TEST(jit, frontend_pipe_conditional_keeps_placeholder_slot_zero_identifier) {
     const auto src = R"(
-func id(x: i32) -> i32 => x
+func choose(x: str, y: str) -> str => y
 route GET "/users" {
-    let code = req.header("Host") | id(_0)
-    return 200
+    let _0 = "fallback"
+    let value = req.header("Host") | choose(_, _0)
+    let safe = any(value, "")
+    if safe == "fallback" { return 200 } else { return 500 }
 }
 )";
     auto lexed = lex(lit(src));
@@ -16169,9 +16209,27 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(lit("placeholder value in conditional pipe must be 1")));
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 200);
+    engine.shutdown();
+    rir.destroy();
 }
 TEST(jit, frontend_pipe_conditional_missing_later_custom_constraint_is_rejected) {
     const auto src = R"(
