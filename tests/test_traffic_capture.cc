@@ -17,6 +17,8 @@
 using namespace rut;
 using rut::test_fault::IoFaultConfig;
 using rut::test_fault::ScopedIoFault;
+using rut::test_fault::single_read_eintr;
+using rut::test_fault::single_write_eintr;
 
 // Compile-time interface checks: every EventLoop type that callbacks.h
 // templates instantiate for MUST have capture_ring and set_capture().
@@ -341,10 +343,7 @@ TEST(capture_file, write_entry_retries_eintr) {
     entry.raw_headers[3] = 'D';
 
     {
-        IoFaultConfig fault_config;
-        fault_config.fd = fd;
-        fault_config.write_eintrs = 1;
-        ScopedIoFault fault(fault_config);
+        ScopedIoFault fault(single_write_eintr(fd));
         CHECK_EQ(capture_write_entry(fd, entry), 0);
         CHECK_EQ(fault.remaining_write_eintrs(), 0);
     }
@@ -379,10 +378,7 @@ TEST(capture_file, read_entry_retries_eintr) {
     lseek(fd, 0, SEEK_SET);
     CaptureEntry out{};
     {
-        IoFaultConfig fault_config;
-        fault_config.fd = fd;
-        fault_config.read_eintrs = 1;
-        ScopedIoFault fault(fault_config);
+        ScopedIoFault fault(single_read_eintr(fd));
         CHECK_EQ(capture_read_entry(fd, out), 0);
         CHECK_EQ(fault.remaining_read_eintrs(), 0);
     }

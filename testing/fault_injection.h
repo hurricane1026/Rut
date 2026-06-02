@@ -50,6 +50,24 @@ struct IoFaultConfig {
     int fcntl_failures = 0;
 };
 
+inline IoFaultConfig io_fault_for_fd(int fd) {
+    IoFaultConfig config;
+    config.fd = fd;
+    return config;
+}
+
+inline IoFaultConfig single_read_eintr(int fd) {
+    IoFaultConfig config = io_fault_for_fd(fd);
+    config.read_eintrs = 1;
+    return config;
+}
+
+inline IoFaultConfig single_write_eintr(int fd) {
+    IoFaultConfig config = io_fault_for_fd(fd);
+    config.write_eintrs = 1;
+    return config;
+}
+
 struct SyscallFaultConfig {
     int epoll_create1_errno = 0;
     int epoll_create1_failures = 0;
