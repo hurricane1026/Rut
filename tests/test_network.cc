@@ -8157,6 +8157,8 @@ TEST(legacy_loop, dispatch_event_unhandled_upstream_recv_paths) {
     stale->state = ConnState::ReadingHeader;
     loop->dispatch_event(*stale, make_ev(stale->id, IoEventType::UpstreamRecv, -105));
     CHECK(stale->fd >= 0);
+    close(stale->fd);
+    stale->fd = -1;
     loop->free_conn(*stale);
 
     auto* active = loop->alloc_conn();

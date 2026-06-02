@@ -19,23 +19,18 @@ and `all(...)` for present-only fallback.
 
 - `A and B | C` parses as `(A and B) | C`.
 - `A or B | C` parses as `(A or B) | C`.
-- `A | B and C` is rejected unless you add parentheses, because `and` appears
-  on the right side of `|`.
-- `A | B or C` is also rejected unless you add parentheses.
+- `A | B and C` is rejected because `and` appears on the right side of `|`;
+  the pipe RHS must be a call stage such as `f(...)` or `_.method(...)`.
+- `A | B or C` is rejected for the same reason.
 
-Write either:
+Write:
 
 ```rut
 let x = (A | B) or C
 ```
 
-or:
-
-```rut
-let x = A | (B or C)
-```
-
-to make the intended grouping explicit.
+to make the valid pipe stage grouping explicit before applying boolean
+operators.
 
 ## Lowering And Inlining
 
