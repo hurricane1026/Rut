@@ -304,8 +304,15 @@ if(RUT_ENABLE_JIT)
     set_tests_properties(test_simulate_engine PROPERTIES LABELS "unit;sim;jit")
 endif()
 
+add_test(
+    NAME test_runtime_state_model
+    COMMAND python3 ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
+)
+set_tests_properties(test_runtime_state_model PROPERTIES LABELS "unit;model")
+
 if(RUT_ENABLE_JIT)
     add_custom_target(check
+        COMMAND python3 ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_integration>
         COMMAND $<TARGET_FILE:test_arena>
@@ -335,6 +342,7 @@ if(RUT_ENABLE_JIT)
     )
 else()
     add_custom_target(check
+        COMMAND python3 ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_integration>
         COMMAND $<TARGET_FILE:test_arena>
