@@ -6501,6 +6501,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         if (expr.kind == AstExprKind::Eq && (lhs_maybe_missing || rhs_maybe_missing)) {
             struct CmpOperand {
+                HirExpr* base;
                 HirExpr* value;
                 HirExpr* cond;
             };
@@ -6509,7 +6510,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 if (!route->exprs.push(analyzed))
                     return frontend_error(FrontendError::TooManyItems, expr.span);
                 HirExpr* base_ptr = &route->exprs[route->exprs.len - 1];
-                if (!maybe_missing) return CmpOperand{base_ptr, nullptr};
+                if (!maybe_missing) return CmpOperand{base_ptr, base_ptr, nullptr};
 
                 HirExpr cond{};
                 cond.kind = HirExprKind::HasValue;
@@ -6530,7 +6531,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 if (!route->exprs.push(value))
                     return frontend_error(FrontendError::TooManyItems, expr.span);
                 HirExpr* value_ptr = &route->exprs[route->exprs.len - 1];
-                return CmpOperand{value_ptr, cond_ptr};
+                return CmpOperand{base_ptr, value_ptr, cond_ptr};
             };
 
             auto lhs_operand = make_operand(lhs.value(), lhs_maybe_missing);
@@ -6591,12 +6592,82 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.rhs = cmp_ptr;
             if (!out.args.push(false_ptr))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            out.may_error = lhs->may_error || rhs->may_error;
-            out.error_struct_index =
-                rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
-            out.error_variant_index =
-                rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
             out.span = expr.span;
+            if (!route->exprs.push(out))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr* result_ptr = &route->exprs[route->exprs.len - 1];
+
+            auto wrap_error_propagation = [&](HirExpr* current,
+                                              HirExpr* source) -> FrontendResult<HirExpr*> {
+                HirExpr no_error{};
+                no_error.kind = HirExprKind::NoError;
+                no_error.type = HirTypeKind::Bool;
+                no_error.span = expr.span;
+                no_error.lhs = source;
+                if (!route->exprs.push(no_error))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr* no_error_ptr = &route->exprs[route->exprs.len - 1];
+
+                HirExpr missing{};
+                missing.kind = HirExprKind::MissingOf;
+                missing.type = HirTypeKind::Bool;
+                auto bool_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                                        HirTypeKind::Bool,
+                                                        0xffffffffu,
+                                                        0xffffffffu,
+                                                        0xffffffffu,
+                                                        0,
+                                                        nullptr,
+                                                        nullptr,
+                                                        nullptr,
+                                                        expr.span);
+                if (!bool_shape) return core::make_unexpected(bool_shape.error());
+                missing.shape_index = bool_shape.value();
+                missing.span = expr.span;
+                missing.may_error = true;
+                missing.error_struct_index = source->error_struct_index;
+                missing.error_variant_index = source->error_variant_index;
+                missing.lhs = source;
+                if (!route->exprs.push(missing))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr* missing_ptr = &route->exprs[route->exprs.len - 1];
+
+                HirExpr wrapped{};
+                wrapped.kind = HirExprKind::IfElse;
+                wrapped.type = HirTypeKind::Bool;
+                wrapped.shape_index = bool_shape.value();
+                wrapped.span = expr.span;
+                wrapped.lhs = no_error_ptr;
+                wrapped.rhs = current;
+                if (!wrapped.args.push(missing_ptr))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                wrapped.may_error = true;
+                wrapped.error_struct_index = source->error_struct_index;
+                wrapped.error_variant_index = source->error_variant_index;
+                if (!route->exprs.push(wrapped))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                return &route->exprs[route->exprs.len - 1];
+            };
+
+            if (lhs->may_error && rhs->may_error &&
+                (lhs->error_struct_index != rhs->error_struct_index ||
+                 lhs->error_variant_index != rhs->error_variant_index)) {
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("comparison cannot combine different propagated "
+                                              "error variants"));
+            }
+            if (rhs->may_error) {
+                auto wrapped = wrap_error_propagation(result_ptr, rhs_operand->base);
+                if (!wrapped) return core::make_unexpected(wrapped.error());
+                result_ptr = wrapped.value();
+            }
+            if (lhs->may_error) {
+                auto wrapped = wrap_error_propagation(result_ptr, lhs_operand->base);
+                if (!wrapped) return core::make_unexpected(wrapped.error());
+                result_ptr = wrapped.value();
+            }
+            out = *result_ptr;
             return out;
         }
         if (!route->exprs.push(lhs.value()))
@@ -6865,7 +6936,6 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             !same_hir_type_shape(mod, *lhs, *rhs)) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
-
         const auto lhs_state = known_value_state(*lhs, locals, local_count, 0);
         if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
             HirExpr folded = *rhs;
@@ -6984,6 +7054,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
             !same_hir_type_shape(mod, *lhs, *rhs)) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
+        if (lhs->may_error && rhs->may_error &&
+            (lhs->error_struct_index != rhs->error_struct_index ||
+             lhs->error_variant_index != rhs->error_variant_index)) {
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("all cannot combine different propagated error variants"));
         }
 
         const auto lhs_state = known_value_state(*lhs, locals, local_count, 0);

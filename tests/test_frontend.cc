@@ -10245,6 +10245,31 @@ TEST(frontend, any_builtin_preserves_lhs_error_carrier_for_nonfallible_fallback)
     CHECK_EQ(mir->functions[0].locals[1].init.error_struct_index, 0u);
 }
 
+TEST(frontend, all_builtin_rejects_mixed_error_carriers) {
+    const char* src =
+        "struct AuthError { err: Error }\n"
+        "func custom(ok: bool) -> i32 {\n"
+        "  if ok { 200 } else { error(AuthError, .timeout, \"timed out\") }\n"
+        "}\n"
+        "func plain(ok: bool) -> i32 {\n"
+        "  if ok { 200 } else { error(.timeout) }\n"
+        "}\n"
+        "route GET \"/search\" {\n"
+        "  let lhs = custom(req.http11)\n"
+        "  let value = all(lhs, plain(req.http10))\n"
+        "  return 200\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("all cannot combine different propagated error variants")));
+}
+
 TEST(frontend, any_builtin_over_optional_header_source_becomes_or) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, \"\") "
