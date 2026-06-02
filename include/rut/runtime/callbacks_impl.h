@@ -164,7 +164,7 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn) {
-    conn.state = ConnState::ReadingHeader;
+    conn.transition_to_reading_header(&on_header_received<Loop>);
     // Refresh keepalive timer — synthetic dispatch skips the normal
     // EventLoop::dispatch() which calls timer.refresh().
     loop->timer.refresh(&conn, loop->keepalive_timeout);
@@ -198,8 +198,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             ParseStatus::Incomplete) {
             // Keep pipeline_depth > 0 so subsequent recvs also check for
             // Incomplete (multi-packet reassembly of the pipelined request).
-            conn.state = ConnState::ReadingHeader;
-            conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
+            conn.transition_to_reading_header(&on_header_received<Loop>);
             loop->submit_recv(conn);
             return;
         }
@@ -227,11 +226,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
-        conn.state = ConnState::Sending;
         conn.resp_status = 403;
         format_static_response(conn, 403, /*keep_alive=*/false);
         conn.keep_alive = false;
-        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        conn.transition_to_sending(&on_response_sent<Loop>);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
@@ -264,11 +262,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
         const i32 kUpstreamFd = UpstreamPool::create_socket();
         if (kUpstreamFd < 0) {
-            conn.state = ConnState::Sending;
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false);
             conn.keep_alive = false;
-            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            conn.transition_to_sending(&on_response_sent<Loop>);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
@@ -281,40 +278,36 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_fd = -1;
             conn.upstream_idx = 0;
             loop->clear_upstream_fd(conn.id);
-            conn.state = ConnState::Sending;
             conn.resp_status = kStatusBadGateway;
             format_static_response(conn, 502, false);
             conn.keep_alive = false;
-            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            conn.transition_to_sending(&on_response_sent<Loop>);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
     } else if (route && route->action == RouteAction::Static) {
-        conn.state = ConnState::Sending;
         conn.resp_status = route->status_code;
         format_static_response(conn, route->status_code, kKeepAlive);
-        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        conn.transition_to_sending(&on_response_sent<Loop>);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
         if (route->needs_req_body) {
             if (conn.req_body_mode == BodyMode::Chunked) {
-                conn.state = ConnState::Sending;
                 conn.resp_status = 400;
                 format_static_response(conn, 400, /*keep_alive=*/false);
                 conn.keep_alive = false;
-                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                conn.transition_to_sending(&on_response_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
             if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) {
-                conn.state = ConnState::ReadingBody;
-                conn.set_slots(&on_jit_request_body_recvd<Loop>, nullptr, nullptr, nullptr);
+                conn.transition_to_reading_body(&on_jit_request_body_recvd<Loop>);
                 loop->submit_recv(conn);
                 return;
             }
         }
-        conn.state = ConnState::ExecHandler;
         conn.handler_state = 0;  // entry state
+        conn.transition_to_exec_handler_wait();
         auto* ctx = conn.reset_jit_ctx();
         ctx->state = 0;
         ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
@@ -329,7 +322,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                           /*arena=*/nullptr);
         handle_jit_outcome<Loop>(loop, conn, outcome, route->fn, kKeepAlive);
     } else {
-        conn.state = ConnState::Sending;
         conn.resp_status = kStatusOK;
         conn.send_buf.reset();
         if (kKeepAlive)
@@ -337,7 +329,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         else
             conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
                                 kResponse200CloseLen);
-        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        conn.transition_to_sending(&on_response_sent<Loop>);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
     }
 }
@@ -364,8 +356,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         conn.req_header_end + (conn.req_content_length - conn.req_body_remaining);
 
     if (conn.req_body_remaining > 0) {
-        conn.state = ConnState::ReadingBody;
-        conn.set_slots(&on_jit_request_body_recvd<Loop>, nullptr, nullptr, nullptr);
+        conn.transition_to_reading_body(&on_jit_request_body_recvd<Loop>);
         loop->submit_recv(conn);
         return;
     }
@@ -384,9 +375,8 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.state = ConnState::ExecHandler;
     conn.handler_state = 0;
-    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    conn.transition_to_exec_handler_wait();
     auto* ctx = conn.reset_jit_ctx();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
@@ -406,7 +396,7 @@ template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     // Send complete — clear all slots (will set on_recv for keep-alive below).
-    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    conn.clear_slots();
 
     if (ev.result < 0) {
         loop->close_conn(conn);
@@ -443,8 +433,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.pipeline_depth = 0;
     conn.recv_buf.reset();
-    conn.state = ConnState::ReadingHeader;
-    conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
+    conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);
 }
 
@@ -457,7 +446,6 @@ void handle_jit_outcome(Loop* loop,
     switch (outcome.kind) {
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
-            conn.state = ConnState::Sending;
             conn.resp_status = outcome.status_code;
             // ABI: upstream_id is a 1-based index into the pinned
             // route config's response_bodies table (0 = use default
@@ -526,7 +514,7 @@ void handle_jit_outcome(Loop* loop,
             } else {
                 format_static_response(conn, outcome.status_code, keep_alive);
             }
-            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            conn.transition_to_sending(&on_response_sent<Loop>);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
@@ -540,19 +528,17 @@ void handle_jit_outcome(Loop* loop,
             conn.pending_handler_fn = fn;
             conn.handler_state = outcome.next_state;
             conn.pending_yield_kind = jit::YieldKind::Timer;
-            conn.state = ConnState::ExecHandler;
-            conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+            conn.transition_to_exec_handler_wait();
             if (loop->schedule_yield_timer(conn, outcome.timer_ms)) return;
             // Couldn't schedule faithfully (SQ / heap catastrophically
             // pressured AND wait too long for the wheel fallback). Fail
             // the request rather than resume early and silently violate
             // wait(ms) semantics.
             conn.pending_handler_fn = nullptr;
-            conn.state = ConnState::Sending;
             conn.resp_status = 500;
             format_static_response(conn, 500, /*keep_alive=*/false);
             conn.keep_alive = false;
-            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            conn.transition_to_sending(&on_response_sent<Loop>);
             // schedule_yield_timer already called timer.remove(&conn);
             // re-arm keepalive before the send so a stalled response
             // (client backpressure) can't leak the slot indefinitely.
@@ -566,24 +552,21 @@ void handle_jit_outcome(Loop* loop,
             conn.pending_handler_fn = fn;
             conn.handler_state = outcome.next_state;
             conn.pending_yield_kind = outcome.yield_kind;
-            conn.state = ConnState::ExecHandler;
-            conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+            conn.transition_to_exec_handler_wait();
             auto send_bad_gateway = [&]() {
                 conn.pending_handler_fn = nullptr;
-                conn.state = ConnState::Sending;
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
-                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                conn.transition_to_sending(&on_response_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             };
             auto send_internal_error = [&]() {
                 conn.pending_handler_fn = nullptr;
-                conn.state = ConnState::Sending;
                 conn.resp_status = 500;
                 format_static_response(conn, 500, /*keep_alive=*/false);
                 conn.keep_alive = false;
-                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                conn.transition_to_sending(&on_response_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             };
             auto upstream_target_matches = [&]() {
@@ -606,11 +589,10 @@ void handle_jit_outcome(Loop* loop,
                 const u32 upstream_id = outcome.timer_ms - 1;
                 if (!config || upstream_id >= config->upstream_count) {
                     conn.pending_handler_fn = nullptr;
-                    conn.state = ConnState::Sending;
                     conn.resp_status = kStatusBadGateway;
                     format_static_response(conn, 502, /*keep_alive=*/false);
                     conn.keep_alive = false;
-                    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                    conn.transition_to_sending(&on_response_sent<Loop>);
                     loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
                 }
@@ -618,11 +600,10 @@ void handle_jit_outcome(Loop* loop,
                 const i32 kUpstreamFd = UpstreamPool::create_socket();
                 if (kUpstreamFd < 0) {
                     conn.pending_handler_fn = nullptr;
-                    conn.state = ConnState::Sending;
                     conn.resp_status = kStatusBadGateway;
                     format_static_response(conn, 502, /*keep_alive=*/false);
                     conn.keep_alive = false;
-                    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                    conn.transition_to_sending(&on_response_sent<Loop>);
                     loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
                 }
@@ -714,11 +695,10 @@ void handle_jit_outcome(Loop* loop,
                 // Unresolvable upstream id — handler returned a value
                 // the config doesn't know. Fail closed with 502 rather
                 // than hanging or silently discarding the request.
-                conn.state = ConnState::Sending;
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
-                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                conn.transition_to_sending(&on_response_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
@@ -740,11 +720,10 @@ void handle_jit_outcome(Loop* loop,
             }
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
-                conn.state = ConnState::Sending;
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
-                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                conn.transition_to_sending(&on_response_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
@@ -759,11 +738,10 @@ void handle_jit_outcome(Loop* loop,
             // Handler returned an unsupported action kind (or nullptr fn);
             // fail closed with 500 rather than hang.
             conn.pending_handler_fn = nullptr;
-            conn.state = ConnState::Sending;
             conn.resp_status = 500;
             format_static_response(conn, 500, /*keep_alive=*/false);
             conn.keep_alive = false;
-            conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+            conn.transition_to_sending(&on_response_sent<Loop>);
             loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
             return;
     }
@@ -802,10 +780,9 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             "Bad Gateway";
         conn.send_buf.reset();
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
-        conn.state = ConnState::Sending;
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
-        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+        conn.transition_to_sending(&on_response_sent<Loop>);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
@@ -968,8 +945,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     conn.resp_body_sent += send_len;
     conn.upstream_send_len = send_len;
-    conn.set_slots(nullptr, &on_response_body_sent<Loop>, nullptr, nullptr);
-    conn.state = ConnState::Sending;
+    conn.transition_to_sending(&on_response_body_sent<Loop>);
     loop->submit_send(conn, conn.upstream_recv_buf.data(), send_len);
 }
 
@@ -982,7 +958,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    conn.clear_slots();
     const u32 kRemaining = consume_upstream_sent(conn);
 
     bool body_done = false;
@@ -1043,8 +1019,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.pipeline_depth = 0;
         conn.recv_buf.reset();
-        conn.state = ConnState::ReadingHeader;
-        conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
+        conn.transition_to_reading_header(&on_header_received<Loop>);
         loop->submit_recv(conn);
         return;
     }
@@ -1301,8 +1276,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
-        conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
-        conn.state = ConnState::Sending;
+        conn.transition_to_sending(&on_response_sent<Loop>);
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
@@ -1384,8 +1358,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
-                conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
-                conn.state = ConnState::Sending;
+                conn.transition_to_sending(&on_response_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
@@ -1448,11 +1421,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                      conn.resp_body_remaining == 0) ||
                     (conn.resp_body_mode == BodyMode::Chunked && chunked_done);
                 if (!kDrainBodyDone) {
-                    conn.set_slots(nullptr, &on_response_header_sent<Loop>, nullptr, nullptr);
+                    conn.transition_to_sending(&on_response_header_sent<Loop>);
                 } else {
-                    conn.set_slots(nullptr, &on_response_sent<Loop>, nullptr, nullptr);
+                    conn.transition_to_sending(&on_response_sent<Loop>);
                 }
-                conn.state = ConnState::Sending;
                 conn.upstream_send_len = conn.upstream_recv_buf.len();
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -1481,13 +1453,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     conn.resp_body_sent = initial_send_len;
     conn.upstream_send_len = initial_send_len;
-    conn.state = ConnState::Sending;
 
     if (body_complete) {
-        conn.set_slots(nullptr, &on_proxy_response_sent<Loop>, nullptr, nullptr);
+        conn.transition_to_sending(&on_proxy_response_sent<Loop>);
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     } else {
-        conn.set_slots(nullptr, &on_response_header_sent<Loop>, nullptr, nullptr);
+        conn.transition_to_sending(&on_response_header_sent<Loop>);
         loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
     }
 }
@@ -1495,7 +1466,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    conn.set_slots(nullptr, nullptr, nullptr, nullptr);
+    conn.clear_slots();
 
     if (ev.result < 0) {
         loop->close_conn(conn);
@@ -1552,8 +1523,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.pipeline_depth = 0;
     conn.recv_buf.reset();
-    conn.state = ConnState::ReadingHeader;
-    conn.set_slots(&on_header_received<Loop>, nullptr, nullptr, nullptr);
+    conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);
 }
 
