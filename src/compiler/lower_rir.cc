@@ -3445,6 +3445,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 }
                 resume_blocks[ri] = block_ids[mir.functions[i].resume_blocks[ri]];
             }
+            if (has_error_prelude) resume_blocks[0] = prelude_block;
             if (!b.set_explicit_resume_blocks(
                     fn.value(), resume_blocks, mir.functions[i].waits.len + 1)) {
                 out.destroy();

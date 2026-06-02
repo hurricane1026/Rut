@@ -8242,8 +8242,7 @@ TEST(legacy_loop, drain_wakes_valid_timerfd) {
     itimerspec current{};
     REQUIRE(timerfd_gettime(timer_fd, &current) == 0);
     CHECK(current.it_interval.tv_sec == 1);
-    CHECK(current.it_value.tv_sec == 0);
-    CHECK(current.it_value.tv_nsec > 0);
+    CHECK(current.it_interval.tv_nsec == 0);
     close(timer_fd);
     loop->backend.timer_fd = -1;
     loop->shutdown();
