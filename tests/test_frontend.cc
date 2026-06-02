@@ -10150,6 +10150,29 @@ TEST(frontend, all_builtin_present_lhs_fallible_rhs_preserves_rhs_error) {
     rir.destroy();
 }
 
+TEST(frontend, all_builtin_fallible_unknown_rhs_preserves_lhs_shape) {
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, error(.timeout)) "
+        "if value == \"rut\" { return 200 } else { return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[1].init.type, HirTypeKind::Str);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered.has_value());
+    rir.destroy();
+}
+
 TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
     const char* src =
         "route GET \"/search\" {\n"

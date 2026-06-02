@@ -6998,6 +6998,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             HirExpr out{};
             out.kind = HirExprKind::IfElse;
             copy_hir_shape(&out, rhs.value());
+            if (out.type == HirTypeKind::Unknown || out.shape_index == 0xffffffffu)
+                copy_hir_shape(&out, lhs.value());
             out.span = expr.span;
             out.lhs = true_ptr;
             out.rhs = rhs_ptr;
@@ -7026,6 +7028,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         HirExpr fallback{};
         fallback.kind = HirExprKind::MissingOf;
         copy_hir_shape(&fallback, rhs.value());
+        if (fallback.type == HirTypeKind::Unknown || fallback.shape_index == 0xffffffffu)
+            copy_hir_shape(&fallback, lhs.value());
         fallback.span = expr.span;
         fallback.may_nil = lhs->may_nil;
         fallback.may_error = lhs->may_error;
@@ -7039,6 +7043,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         HirExpr out{};
         out.kind = HirExprKind::IfElse;
         copy_hir_shape(&out, rhs.value());
+        if (out.type == HirTypeKind::Unknown || out.shape_index == 0xffffffffu)
+            copy_hir_shape(&out, lhs.value());
         out.span = expr.span;
         out.lhs = cond_ptr;
         out.rhs = rhs_ptr;
