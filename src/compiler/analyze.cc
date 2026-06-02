@@ -6040,18 +6040,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
     const auto known_bool_value = [&](const HirExpr& value, bool& out_value) -> bool {
-        if (value.kind == HirExprKind::BoolLit) {
-            out_value = value.bool_value;
-            return true;
-        }
-        if (value.kind == HirExprKind::LocalRef && value.local_index < local_count) {
-            const HirLocal& local = locals[value.local_index];
-            if (!local.may_nil && !local.may_error && local.init.kind == HirExprKind::BoolLit) {
-                out_value = local.init.bool_value;
-                return true;
-            }
-        }
-        return false;
+        ConstValue known{};
+        if (!const_eval_expr(value, locals, local_count, &known, 0) ||
+            known.type != HirTypeKind::Bool)
+            return false;
+        out_value = known.bool_value;
+        return true;
     };
     if (expr.kind == AstExprKind::Or) {
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);

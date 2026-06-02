@@ -8748,6 +8748,38 @@ TEST(frontend, if_const_folds_constant_local_boolean_and) {
     CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
 }
 
+TEST(frontend, if_const_folds_const_comparison_boolean_or) {
+    const char* src =
+        "route GET \"/users\" { if const (POST == GET) or true { return 200 } else { return "
+        "forward(missing) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+
+TEST(frontend, if_const_folds_const_comparison_boolean_and) {
+    const char* src =
+        "route GET \"/users\" { if const (POST == GET) and true { return forward(missing) } else { "
+        "return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.direct_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 200);
+}
+
 TEST(frontend, if_const_rejects_runtime_condition) {
     const char* src =
         "route GET \"/users\" { if const req.header(\"Host\") { return 200 } else { return 500 } "
