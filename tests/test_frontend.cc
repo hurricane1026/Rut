@@ -19532,12 +19532,13 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(hir.error().detail.eq(lit("placeholder slot exceeds tuple arity")));
 }
-TEST(frontend, analyze_rejects_pipe_with_placeholder_slot_zero) {
+TEST(frontend, source_pipe_keeps_placeholder_slot_zero_as_identifier) {
     const auto src = R"(
-func id(x: i32) -> i32 => x
+func second(x: i32, y: i32) -> i32 => y
 route GET "/users" {
-    let code = (200, 500) | id(_0)
-    return 200
+    let _0 = 204
+    let code = 200 | second(_, _0)
+    if code == 204 { return 200 } else { return 500 }
 }
 )";
     auto lexed = lex(lit(src));
@@ -19545,9 +19546,10 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(lit("placeholder slot out of range")));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("_0")));
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::I32);
 }
 TEST(frontend, analyze_rejects_conditional_pipe_with_non_unit_placeholder) {
     const auto src = R"(
