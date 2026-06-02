@@ -6814,8 +6814,29 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.lhs = source;
         return out;
     };
-
-    if (expr.name.eq({"any", 3})) {
+    auto analyze_fallback_builtin_args = [&](HirExpr* out_lhs,
+                                             HirExpr* out_rhs) -> FrontendResult<void> {
+        u32 pipe_placeholder_count = 0;
+        if (pipe_lhs != nullptr) {
+            for (u32 i = 0; i < expr.args.len; i++) {
+                if (expr.args[i] != nullptr && expr.args[i]->kind == AstExprKind::Placeholder)
+                    pipe_placeholder_count++;
+            }
+        }
+        if (pipe_lhs != nullptr && pipe_placeholder_count == 0) {
+            if (expr.args.len != 1) {
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("pipe call missing placeholder"));
+            }
+            if (expr.args[0] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            *out_lhs = *pipe_lhs;
+            auto rhs = analyze_builtin_arg(*expr.args[0]);
+            if (!rhs) return core::make_unexpected(rhs.error());
+            *out_rhs = rhs.value();
+            return {};
+        }
         if (expr.args.len != 2) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
@@ -6826,40 +6847,50 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_builtin_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
-        if (rhs->may_nil)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.args[1]->span);
+        *out_lhs = lhs.value();
+        *out_rhs = rhs.value();
+        return {};
+    };
+
+    if (expr.name.eq({"any", 3})) {
+        HirExpr lhs_value{};
+        HirExpr rhs_value{};
+        auto args = analyze_fallback_builtin_args(&lhs_value, &rhs_value);
+        if (!args) return core::make_unexpected(args.error());
+        HirExpr* lhs = &lhs_value;
+        HirExpr* rhs = &rhs_value;
+        if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
-            !same_hir_type_shape(mod, lhs.value(), rhs.value())) {
+            !same_hir_type_shape(mod, *lhs, *rhs)) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
 
-        const auto lhs_state = known_value_state(lhs.value(), locals, local_count, 0);
+        const auto lhs_state = known_value_state(*lhs, locals, local_count, 0);
         if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
-            HirExpr folded = rhs.value();
+            HirExpr folded = *rhs;
             folded.span = expr.span;
             return folded;
         }
         if (!lhs->may_nil && !lhs->may_error && !rhs->may_error) {
-            HirExpr folded = lhs.value();
+            HirExpr folded = *lhs;
             folded.span = expr.span;
             return folded;
         }
 
-        if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*lhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
         if (!rhs->may_error) {
-            if (!route->exprs.push(rhs.value()))
+            if (!route->exprs.push(*rhs))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
             out.kind = HirExprKind::Or;
-            copy_hir_shape(&out, rhs.value());
+            copy_hir_shape(&out, *rhs);
             if (out.shape_index == 0xffffffffu && lhs->shape_index != 0xffffffffu)
-                copy_hir_shape(&out, lhs.value());
+                copy_hir_shape(&out, *lhs);
             out.span = expr.span;
             out.lhs = lhs_ptr;
             out.rhs = rhs_ptr;
@@ -6881,13 +6912,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* true_ptr = &route->exprs[route->exprs.len - 1];
 
-            if (!route->exprs.push(rhs.value()))
+            if (!route->exprs.push(*rhs))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
             out.kind = HirExprKind::IfElse;
-            copy_hir_shape(&out, lhs.value());
+            copy_hir_shape(&out, *lhs);
             out.span = expr.span;
             out.lhs = true_ptr;
             out.rhs = lhs_ptr;
@@ -6909,13 +6940,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!route->exprs.push(cond)) return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
-        if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*rhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr then_expr{};
         then_expr.kind = HirExprKind::ValueOf;
-        copy_hir_shape(&then_expr, lhs.value());
+        copy_hir_shape(&then_expr, *lhs);
         then_expr.lhs = lhs_ptr;
         then_expr.may_nil = false;
         then_expr.may_error = false;
@@ -6928,9 +6958,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
         HirExpr out{};
         out.kind = HirExprKind::IfElse;
-        copy_hir_shape(&out, rhs.value());
+        copy_hir_shape(&out, *rhs);
         if (out.type == HirTypeKind::Unknown || out.shape_index == 0xffffffffu)
-            copy_hir_shape(&out, lhs.value());
+            copy_hir_shape(&out, *lhs);
         out.span = expr.span;
         out.lhs = cond_ptr;
         out.rhs = then_ptr;
@@ -6943,42 +6973,36 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
 
     if (expr.name.eq({"all", 3})) {
-        if (expr.args.len != 2) {
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        }
-        if (expr.args[0] == nullptr || expr.args[1] == nullptr) {
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        }
-        auto lhs = analyze_builtin_arg(*expr.args[0]);
-        if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = analyze_builtin_arg(*expr.args[1]);
-        if (!rhs) return core::make_unexpected(rhs.error());
-        if (rhs->may_nil)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.args[1]->span);
+        HirExpr lhs_value{};
+        HirExpr rhs_value{};
+        auto args = analyze_fallback_builtin_args(&lhs_value, &rhs_value);
+        if (!args) return core::make_unexpected(args.error());
+        HirExpr* lhs = &lhs_value;
+        HirExpr* rhs = &rhs_value;
+        if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
-            !same_hir_type_shape(mod, lhs.value(), rhs.value())) {
+            !same_hir_type_shape(mod, *lhs, *rhs)) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         }
 
-        const auto lhs_state = known_value_state(lhs.value(), locals, local_count, 0);
+        const auto lhs_state = known_value_state(*lhs, locals, local_count, 0);
         if (lhs_state == KnownValueState::Nil || lhs_state == KnownValueState::Error) {
-            HirExpr folded = lhs.value();
+            HirExpr folded = *lhs;
             if (lhs_state == KnownValueState::Error) {
-                if (const HirExpr* err = known_error_expr(lhs.value(), locals, local_count, 0))
+                if (const HirExpr* err = known_error_expr(*lhs, locals, local_count, 0))
                     folded = *err;
             }
             folded.span = expr.span;
             return folded;
         }
         if (!lhs->may_nil && !lhs->may_error && !rhs->may_error) {
-            HirExpr folded = rhs.value();
+            HirExpr folded = *rhs;
             folded.span = expr.span;
             return folded;
         }
 
-        if (!route->exprs.push(lhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*lhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* lhs_ptr = &route->exprs[route->exprs.len - 1];
 
         if (!lhs->may_nil && !lhs->may_error) {
@@ -6991,15 +7015,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* true_ptr = &route->exprs[route->exprs.len - 1];
 
-            if (!route->exprs.push(rhs.value()))
+            if (!route->exprs.push(*rhs))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
             HirExpr out{};
             out.kind = HirExprKind::IfElse;
-            copy_hir_shape(&out, rhs.value());
+            copy_hir_shape(&out, *rhs);
             if (out.type == HirTypeKind::Unknown || out.shape_index == 0xffffffffu)
-                copy_hir_shape(&out, lhs.value());
+                copy_hir_shape(&out, *lhs);
             out.span = expr.span;
             out.lhs = true_ptr;
             out.rhs = rhs_ptr;
@@ -7021,15 +7045,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (!route->exprs.push(cond)) return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* cond_ptr = &route->exprs[route->exprs.len - 1];
 
-        if (!route->exprs.push(rhs.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!route->exprs.push(*rhs)) return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr* rhs_ptr = &route->exprs[route->exprs.len - 1];
 
         HirExpr fallback{};
         fallback.kind = HirExprKind::MissingOf;
-        copy_hir_shape(&fallback, rhs.value());
+        copy_hir_shape(&fallback, *rhs);
         if (fallback.type == HirTypeKind::Unknown || fallback.shape_index == 0xffffffffu)
-            copy_hir_shape(&fallback, lhs.value());
+            copy_hir_shape(&fallback, *lhs);
         fallback.span = expr.span;
         fallback.may_nil = lhs->may_nil;
         fallback.may_error = lhs->may_error;
@@ -7042,9 +7065,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
         HirExpr out{};
         out.kind = HirExprKind::IfElse;
-        copy_hir_shape(&out, rhs.value());
+        copy_hir_shape(&out, *rhs);
         if (out.type == HirTypeKind::Unknown || out.shape_index == 0xffffffffu)
-            copy_hir_shape(&out, lhs.value());
+            copy_hir_shape(&out, *lhs);
         out.span = expr.span;
         out.lhs = cond_ptr;
         out.rhs = rhs_ptr;

@@ -10178,6 +10178,8 @@ TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
         "route GET \"/search\" {\n"
         "  let host = req.header(\"Host\") | any(_, \"missing\")\n"
         "  let gated = req.header(\"Host\") | all(_, \"present\")\n"
+        "  let injected_host = req.header(\"Host\") | any(\"missing\")\n"
+        "  let injected_gated = req.header(\"Host\") | all(\"present\")\n"
         "  return 200\n"
         "}\n";
 
@@ -10187,7 +10189,7 @@ TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -10195,6 +10197,23 @@ TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
     auto lowered = lower_to_rir(mir.value(), rir);
     CHECK(lowered.has_value());
     rir.destroy();
+}
+
+TEST(frontend, any_all_builtin_pipe_rejects_placeholder_free_extra_args) {
+    const char* src =
+        "route GET \"/search\" {\n"
+        "  let host = req.header(\"Host\") | any(\"ignored\", \"missing\")\n"
+        "  return 200\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("pipe call missing placeholder")));
 }
 
 TEST(frontend, any_builtin_preserves_lhs_error_carrier_for_nonfallible_fallback) {

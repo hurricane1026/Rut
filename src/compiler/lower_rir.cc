@@ -3345,20 +3345,51 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
             }
         }
-        auto local_ref_matches = [](const MirValue* value, u32 local_index) -> bool {
-            return value != nullptr && value->kind == MirValueKind::LocalRef &&
-                   value->local_index == local_index;
+        struct RecoveryScan {
+            static bool local_ref_matches(const MirValue* value, u32 local_index) {
+                return value != nullptr && value->kind == MirValueKind::LocalRef &&
+                       value->local_index == local_index;
+            }
+
+            static bool is_recovering_use(const MirValue* value, u32 local_index) {
+                if (value == nullptr) return false;
+                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, local_index))
+                    return true;
+                if (value->kind == MirValueKind::IfElse && value->lhs != nullptr &&
+                    value->lhs->kind == MirValueKind::HasValue &&
+                    local_ref_matches(value->lhs->lhs, local_index) && value->rhs != nullptr &&
+                    value->rhs->kind == MirValueKind::ValueOf &&
+                    local_ref_matches(value->rhs->lhs, local_index))
+                    return true;
+                return false;
+            }
+
+            static bool contains_recovering_use(const MirValue* value, u32 local_index) {
+                if (value == nullptr) return false;
+                if (is_recovering_use(value, local_index)) return true;
+                if (contains_recovering_use(value->lhs, local_index)) return true;
+                if (contains_recovering_use(value->rhs, local_index)) return true;
+                for (u32 ai = 0; ai < value->args.len; ai++) {
+                    if (contains_recovering_use(value->args[ai], local_index)) return true;
+                }
+                for (u32 fi = 0; fi < value->field_inits.len; fi++) {
+                    if (contains_recovering_use(value->field_inits[fi].value, local_index))
+                        return true;
+                }
+                return false;
+            }
         };
         auto has_recovering_or_use = [&](u32 local_index) -> bool {
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
-                const auto& init = mir.functions[i].locals[li].init;
-                if (init.kind == MirValueKind::Or && local_ref_matches(init.lhs, local_index))
+                if (RecoveryScan::contains_recovering_use(&mir.functions[i].locals[li].init,
+                                                          local_index))
                     return true;
-                if (init.kind == MirValueKind::IfElse && init.lhs != nullptr &&
-                    init.lhs->kind == MirValueKind::HasValue &&
-                    local_ref_matches(init.lhs->lhs, local_index) && init.rhs != nullptr &&
-                    init.rhs->kind == MirValueKind::ValueOf &&
-                    local_ref_matches(init.rhs->lhs, local_index))
+            }
+            for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
+                const auto& term = mir.functions[i].blocks[bi].term;
+                if (RecoveryScan::contains_recovering_use(&term.cond, local_index) ||
+                    RecoveryScan::contains_recovering_use(&term.lhs, local_index) ||
+                    RecoveryScan::contains_recovering_use(&term.rhs, local_index))
                     return true;
             }
             return false;

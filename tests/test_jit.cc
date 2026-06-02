@@ -16884,6 +16884,42 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_eager_error_local_can_be_recovered_in_terminator) {
+    const auto src = R"(
+func fail() -> i32 => error(.timeout)
+route GET "/users" {
+    let code = any(200, fail())
+    if any(code, 204) == 204 { return 204 } else { return 401 }
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetRootRequest),
+                                           sizeof(kGetRootRequest) - 1,
+                                           nullptr));
+    CHECK(r.status_code == 204);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_fallible_bool_condition_returns_error_status) {
     const auto src = R"(
 func fallback() -> bool => error(.timeout)
