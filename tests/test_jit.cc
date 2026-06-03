@@ -18462,6 +18462,7 @@ TEST(jit, frontend_route_wait_event_predicate_fields_drive_control_flow) {
         YieldKind resume_kind;
     };
     const Case cases[] = {
+        {"wait(250)", "timer", YieldKind::Timer},
         {"wait(downstream.recv())", "recv", YieldKind::Recv},
         {"wait(downstream.recv())", "send", YieldKind::Send},
         {"wait(upstream(api).connect())", "upstream_connect", YieldKind::UpstreamConnect},
