@@ -383,6 +383,19 @@ static bool compile_to_rir(const char* src, FrontendRirModule& rir) {
     return true;
 }
 
+#define REQUIRE_WAIT_ANY_EXPRESSION_UNSUPPORTED(src)                 \
+    do {                                                             \
+        auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});   \
+        REQUIRE(lexed);                                              \
+        auto ast = parse_file(lexed.value());                        \
+        REQUIRE(ast);                                                \
+        std::unique_ptr<AstFile> ast_owned(ast.value());             \
+        auto hir = analyze_file(*ast_owned);                         \
+        REQUIRE_FALSE(hir);                                          \
+        CHECK_EQ(static_cast<u8>(hir.error().code),                  \
+                 static_cast<u8>(FrontendError::UnsupportedSyntax)); \
+    } while (0)
+
 TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
     // Source handler: one wait(500) then return 204. The simulate engine
     // must drive the yield chain to completion offline (skipping the
@@ -584,16 +597,14 @@ TEST(simulate_engine, wait_any_expression_is_rejected) {
     const char* src =
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
         "return 408 } else { return 204 } }\n";
-    FrontendRirModule rir{};
-    REQUIRE_FALSE(compile_to_rir(src, rir));
+    REQUIRE_WAIT_ANY_EXPRESSION_UNSUPPORTED(src);
 }
 
 TEST(simulate_engine, wait_any_expression_recv_predicate_is_rejected) {
     const char* src =
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.recv { "
         "return 204 } else { return 408 } }\n";
-    FrontendRirModule rir{};
-    REQUIRE_FALSE(compile_to_rir(src, rir));
+    REQUIRE_WAIT_ANY_EXPRESSION_UNSUPPORTED(src);
 }
 
 TEST(simulate_engine, nested_wait_any_expression_is_rejected) {
@@ -604,8 +615,7 @@ TEST(simulate_engine, nested_wait_any_expression_is_rejected) {
         "let second = wait(any(downstream.recv(), timer(50))) "
         "if second.recv { return 204 } else { return 409 } "
         "}\n";
-    FrontendRirModule rir{};
-    REQUIRE_FALSE(compile_to_rir(src, rir));
+    REQUIRE_WAIT_ANY_EXPRESSION_UNSUPPORTED(src);
 }
 
 TEST(simulate_engine, wait_any_prefers_terminal_mismatch_over_failed_candidate) {
