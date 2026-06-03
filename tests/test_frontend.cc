@@ -20233,26 +20233,6 @@ TEST(frontend, parse_for_loop_basic) {
     CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
 }
 
-TEST(frontend, parse_plain_for_loop_basic) {
-    // `for item in [1, 2, 3] { return 200 }` — canonical static-loop syntax.
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& route = ast->items[0].route;
-    REQUIRE_EQ(route.statements.len, 2u);
-    const auto& for_stmt = route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("item")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
-    REQUIRE_EQ(for_stmt.expr.args.len, 3u);
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    // Body is single-stmt `return 200` in parse representation.
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
-}
-
 TEST(frontend, parse_inline_identifier_is_not_reserved) {
     const char* src =
         "route GET \"/x\" { let inline = 1 guard inline == 1 else { return 400 } "
@@ -20291,142 +20271,12 @@ TEST(frontend, parse_for_loop_field_access_source) {
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
 }
 
-TEST(frontend, parse_plain_for_field_access_source) {
-    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("server")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
-}
-
-TEST(frontend, parse_for_field_access_source) {
-    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("server")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
-}
-
-TEST(frontend, parse_plain_for_loop_field_access_source) {
-    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("server")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
-}
-
 TEST(frontend, parse_for_loop_multi_stmt_body) {
     // Body with multiple statements — parse_braced_stmt_body returns a Block
     // wrapping them; then_stmt points to that Block.
     const char* src =
         "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 "
         "} } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
-    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
-             static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
-             static_cast<u8>(AstStmtKind::Guard));
-}
-
-TEST(frontend, parse_plain_for_without_inline_marker) {
-    const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("item")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
-    REQUIRE_EQ(for_stmt.expr.args.len, 2u);
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
-    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
-             static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
-             static_cast<u8>(AstStmtKind::Guard));
-}
-
-TEST(frontend, parse_for_without_inline_marker) {
-    const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 "
-        "} } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("item")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
-    REQUIRE_EQ(for_stmt.expr.args.len, 2u);
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
-    REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[0]->kind),
-             static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->block_stmts[1]->kind),
-             static_cast<u8>(AstStmtKind::Guard));
-}
-
-TEST(frontend, parse_plain_for_single_stmt_body) {
-    const char* src = "route GET \"/x\" { for item in [1] { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("item")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
-}
-
-TEST(frontend, parse_for_single_stmt_body) {
-    const char* src = "route GET \"/x\" { for item in [1] { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("item")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
-}
-
-TEST(frontend, parse_plain_for_loop_multi_stmt_body) {
-    // Plain `for` keeps multi-statement block behavior stable.
-    const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26694,18 +26544,6 @@ TEST(frontend, analyze_plain_for_loop_body_let_scoped_to_body) {
 
 TEST(frontend, parse_for_loop_rejects_missing_in) {
     // Missing `in` is reported at the iterator name, not at the following expression.
-    const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loop expects 'in' after iterator name")));
-    CHECK_EQ(ast.error().span.col, 22u);
-}
-
-TEST(frontend, parse_plain_for_loop_rejects_missing_in) {
-    // Missing `in` is reported at the iterator name.
     const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
