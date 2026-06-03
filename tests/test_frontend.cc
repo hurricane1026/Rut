@@ -206,6 +206,20 @@ TEST(frontend, lex_recognizes_and_or_keywords) {
     CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::KwOr));
 }
 
+TEST(frontend, lex_rejects_non_core_optional_symbols) {
+    const char* sources[] = {
+        "route GET \"/x\" { let name = req.query(\"name\") ?? \"anonymous\" return 200 }\n",
+        "route GET \"/x\" { let ok = req.authorization?.hasPrefix(\"Bearer\") return 200 }\n",
+        "route GET \"/x\" { guard !req.path.contains(\"/../\") else { return 403 } return 200 "
+        "}\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(!lexed);
+        CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
+    }
+}
+
 TEST(frontend, parse_supports_infix_or_expression) {
     const char* src = "route GET \"/x\" { let x = true or false return 200 }\n";
     auto lexed = lex(lit(src));
@@ -2472,7 +2486,7 @@ TEST(frontend, analyze_wait_result_fields) {
              static_cast<u8>(HirExprKind::WaitField));
 }
 
-TEST(frontend, analyze_wait_result_event_predicate_fields) {
+TEST(frontend, analyze_rejects_wait_any_expression_event_predicates) {
     const char* src =
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(250))) "
         "guard ev.timer else { return 500 } guard ev.recv else { return 501 } "
@@ -2484,14 +2498,8 @@ TEST(frontend, analyze_wait_result_event_predicate_fields) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].guards.len, 6u);
-    for (u32 i = 0; i < hir->routes[0].guards.len; i++) {
-        CHECK_EQ(static_cast<u8>(hir->routes[0].guards[i].cond.kind),
-                 static_cast<u8>(HirExprKind::WaitField));
-        CHECK_EQ(static_cast<u8>(hir->routes[0].guards[i].cond.type),
-                 static_cast<u8>(HirTypeKind::Bool));
-    }
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, analyze_rejects_unbound_wait_result_field) {
@@ -2652,7 +2660,7 @@ TEST(frontend, analyze_wait_connect_argument_records_upstream_payload) {
     CHECK_EQ(hir->routes[0].waits[0].ms, 1u);
 }
 
-TEST(frontend, analyze_wait_any_records_event_payload) {
+TEST(frontend, analyze_rejects_wait_any_expression) {
     const char* src =
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(250))) return 204 }\n";
     auto lexed = lex(lit(src));
@@ -2660,10 +2668,8 @@ TEST(frontend, analyze_wait_any_records_event_payload) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
-    CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::Any);
-    CHECK_EQ(hir->routes[0].waits[0].ms, 250u);
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, analyze_rejects_timer_only_wait_any) {
