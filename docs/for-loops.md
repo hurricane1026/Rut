@@ -19,19 +19,8 @@ route GET "/x" {
 }
 ```
 
-`inline for` is accepted as a compatibility spelling:
-
-```rut
-route GET "/x" {
-    inline for item in [1, 2, 3] {
-        guard item > 0 else { return 400 }
-    }
-    return 200
-}
-```
-
-`inline` is contextual here and is not a globally reserved identifier. It does
-not change lowering behavior; both spellings use the same static unroll path.
+`inline for` was an older compatibility spelling. It is no longer accepted in
+Rut Core; use plain `for` so static loops have one canonical form.
 
 ## Iterator Sources
 
