@@ -63,7 +63,15 @@ This file currently remains the umbrella design doc until that split happens.
 
 - Replace nginx configuration files and OpenResty Lua with a single strongly-typed language
 - Catch most errors at compile time (type errors, route conflicts, invalid values)
-- Easy for LLMs to generate and understand
+- Keep the language low-ambiguity: the same gateway problem should usually have
+  one obvious solution, and at most one or two accepted idioms
+- Make programs mechanically inspectable: control flow, IO waits, routing, and
+  failure behavior should be reducible to a small state machine
+- Make correctness testable by replay and simulation: captured traffic should
+  exercise the same route semantics as production execution
+- Be safe for LLM-assisted generation: prefer constrained constructs,
+  deterministic diagnostics, and verifier-friendly semantics over expressive
+  freedom that creates plausible but wrong code
 - High performance: C100K+ capable, minimal latency overhead
 - Hot reload without downtime
 - Minimal dependencies, maximal control
@@ -74,6 +82,10 @@ This file currently remains the umbrella design doc until that split happens.
 - L4 load balancer (this is L7 HTTP only)
 - DPDK / kernel bypass networking (not worth the trade-off in cloud environments)
 - Compatibility with nginx configuration format
+- Multiple equivalent language surfaces for the same operation
+- Accepting ambiguous code and relying on style guides, runtime behavior, or LLM
+  prompts to resolve intent
+- Requiring external general-purpose formal tools to validate normal user code
 
 ---
 
@@ -132,13 +144,30 @@ status matrix above.
 
 ### 3.1 Design Principles
 
-- **Swift-inspired syntax**: guard statements, named parameters, optional chaining, string interpolation — clean and readable, high LLM generation accuracy
+- **Low ambiguity first**: every feature should have a narrow role, predictable
+  grammar, and a small number of accepted idioms. If two constructs solve the
+  same common problem equally well, one should usually be removed or made
+  clearly secondary.
+- **LLM-safe by construction**: Rut should reduce the blast radius of generated
+  code by constraining the language, making invalid intent easy to diagnose, and
+  avoiding clever surface forms that look plausible but mean different things.
+- **Swift-inspired syntax where it reduces ambiguity**: guard statements, named
+  parameters, optional chaining, string interpolation — clean and readable, but
+  only when the semantics remain mechanically simple.
 - **HTTP concepts are native objects**: methods, status codes, headers, URLs, CIDR, media types are first-class language constructs, not strings
 - **All functions inline at compile time**: no runtime function calls, each route compiles to a single flat state machine
 - **Async is invisible**: no async/await/future/promise — user writes sequential code, compiler finds I/O points and generates state machines automatically
 - **Strong typing with domain types**: Duration, ByteSize, StatusCode, IP, CIDR, MediaType with compile-time validation
 - **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
+- **Replay and simulation are first-class**: route semantics should be
+  deterministic enough that captured traffic can be replayed through the same
+  decision logic used in production, with differences treated as bugs or
+  explicitly modeled environment effects.
+- **Verifier-friendly semantics**: user code should lower to a compact control
+  graph with explicit terminal responses, waits, forwards, and failure paths.
+  Features that cannot be represented in that graph should be rejected, bounded,
+  or isolated behind explicit escape hatches.
 - **Three-layer model**: `listen` (downstream/client) → .rut file (gateway logic) → `upstream` (backend). No `gateway` or `downstream` keyword — the .rut file IS the gateway, `listen` IS the downstream config
 - **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
 
