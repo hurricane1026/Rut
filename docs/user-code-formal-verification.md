@@ -1,41 +1,71 @@
-# User Code Formal Verification
+# User Code Verification
 
-Rut can use the runtime TLA+ model as the start of a broader verification
-pipeline, but the useful target is narrower than "prove arbitrary user code is
-correct." The tractable target is:
+Rut can use the runtime TLA+ model as a reference point, but TLA+/TLC should not
+be the primary verification engine for user code. It is too general for Rut's
+hot path: it brings a Java dependency, explores more machinery than Rut needs,
+and is not shaped around fast per-route feedback.
 
-> Generate an abstract model from Rut's user-code IR and check that it preserves
-> the runtime protocol: legal state transitions, callback-slot hygiene, yielded
-> handler wakeups, fail-closed behavior, and progress under explicit fairness
-> assumptions.
+The tractable product direction is a Rut-specific verifier:
+
+> Compile Rut user-code IR into a small verification automaton and run a
+> purpose-built checker that proves Rut protocol properties: legal state
+> transitions, callback-slot hygiene, yielded handler wakeups, fail-closed
+> behavior, deadlock freedom, and progress under explicit fairness assumptions.
 
 ## Source of Truth
 
-The model should be generated from Rut's DSL/RIR, not from generated C++ or JIT
-machine code. The IR should be the single semantic source for:
+The verifier should consume Rut's DSL/RIR, not generated C++ or JIT machine
+code. The IR should be the single semantic source for:
 
 - generated runtime/JIT code,
-- generated TLA+ handler actions,
+- generated verification automata,
 - a manifest that maps IR operations to runtime transitions.
 
 This avoids reverse-engineering implementation details and gives the checker a
 small, stable language to reason about.
 
-## What to Model
+## Why Not TLA+ as the Main Engine
+
+TLA+ remains useful for the runtime's abstract design, but it is not the right
+execution engine for checking every user route:
+
+- It depends on TLC and Java in developer/CI environments.
+- It is optimized for general state-space exploration, not Rut's restricted
+  event-machine shape.
+- The generated specs would still require a translator, so the trusted boundary
+  does not disappear.
+- Liveness and fairness configuration is easy to make too weak, too strong, or
+  too slow.
+- The feedback loop should be close to parser/type-checker speed for common
+  routes.
+
+Rut should instead keep the TLA+ model as an oracle for validating the checker
+design and a source of test vectors for the custom engine.
+
+## Verification Automaton
 
 The first useful handler model can be a finite automaton:
 
 - handler state/basic-block id,
 - terminal responses,
 - `wait(ms)` and event waits,
-- `wait(any(...))` arms,
+- `wait any { ... }` race arms,
 - upstream connect/send/recv waits,
 - `forward` actions,
 - fail-closed error responses.
 
-The generated TLA+ module can compose this handler automaton with
-`spec/runtime_state.tla`. TLC then checks the combined state space instead of
-only the generic runtime state machine.
+The verifier should compose this handler automaton with a built-in model of the
+Rut runtime protocol. This model should be small enough to live in native code
+and run deterministically without external solvers.
+
+Each automaton node should carry:
+
+- the handler program point,
+- the abstract runtime state,
+- active callback slots,
+- pending yield kind and target,
+- pending runtime operation class,
+- bounded symbolic facts needed by Rut's control-flow rules.
 
 ## Properties to Check
 
@@ -67,16 +97,31 @@ Fairness must be explicit. Without assumptions such as "an armed timer
 eventually fires" or "a submitted send eventually succeeds or fails," any
 network program can be modeled as not making progress.
 
+## Custom Checker Shape
+
+The checker can be much simpler than a general-purpose model checker:
+
+- Use an explicit-state graph over Rut's finite protocol state.
+- Represent callback slots and pending operations as compact bitsets/enums.
+- Use worklist reachability for safety and deadlock checks.
+- Use strongly connected components for livelock/progress checks.
+- Run route-local checks first, then optionally compose multiple routes only
+  where shared runtime resources matter.
+- Emit counterexample traces in Rut terms, not TLA+ terms.
+
+This should make checks fast enough for normal CI and eventually for local
+developer feedback during compilation.
+
 ## Infinite Loops
 
-TLA+ can find finite-state livelocks and cycles in the abstract handler
-automaton. It cannot prove termination for arbitrary native code.
+The custom checker can find finite-state livelocks and cycles in the abstract
+handler automaton. It cannot prove termination for arbitrary native code.
 
 Rut should therefore split the problem:
 
 - Static CFG checks reject handler cycles that contain no `yield`, `return`,
   `forward`, or provably bounded progress.
-- TLA+ liveness checks verify the remaining event-driven cycles under fairness.
+- The verifier checks the remaining event-driven cycles under fairness.
 - Runtime watchdogs or fuel limits remain necessary for any native or
   insufficiently restricted user-code escape hatch.
 
@@ -87,11 +132,12 @@ This is not a full C++ verifier. It does not prove:
 - arbitrary arithmetic or string manipulation correctness,
 - memory safety or absence of undefined behavior in generated native code,
 - every kernel/network behavior,
-- correctness of the IR-to-TLA+ translator by itself.
+- correctness of the IR-to-automaton translator by itself.
 
 The translator risk should be reduced by generation discipline: both runtime
-code and TLA+ should come from the same IR, and CI should compare the generated
-manifest against runtime transition APIs and modeled TLA+ actions.
+code and verification automata should come from the same IR, and CI should
+compare the generated manifest against runtime transition APIs and checked
+automaton actions.
 
 ## Prior Art
 
@@ -110,21 +156,30 @@ Useful reference points:
 
 The closest shape for Rut is a mix of P's event-machine discipline, PlusCal or
 Quint's generated model-checkable actions, and Dafny's single-source semantic
-discipline.
+discipline. The implementation should be closer to P's specialized checker than
+to invoking TLC for every route.
 
 ## Incremental Plan
 
 1. Define a small handler-verification IR covering terminal responses, timers,
    event waits, upstream waits, and forward.
-2. Generate a TLA+ handler module plus an action manifest from that IR.
-3. Compose the generated handler module with `spec/runtime_state.tla`.
-4. Add TLC checks for deadlock, slot invariants, wait/resume legality, and a
-   small liveness property under explicit fairness assumptions.
-5. Compare the manifest against runtime transition helper names and generated
+2. Generate a compact handler automaton plus an action manifest from that IR.
+3. Implement a native explicit-state checker for safety and deadlock checks.
+4. Add SCC-based progress checks for Rut-specific liveness properties under
+   explicit fairness assumptions.
+5. Cross-check the checker against small TLA+ reference cases while the engine
+   is young.
+6. Compare the manifest against runtime transition helper names and generated
    JIT metadata in CI.
-6. Extend the IR only when the corresponding abstract semantics and checks are
+7. Extend the IR only when the corresponding abstract semantics and checks are
    clear.
 
 The first prototype should model one or two representative handlers, not the
-whole language. A good initial target is a handler with `wait(any(...))`, a
+whole language. A good initial target is a handler with `wait any { ... }`, a
 timer timeout branch, and an upstream connect/send/recv path.
+
+## TLA+ Role
+
+TLA+ should stay in the project for design-level runtime invariants and for
+validating the custom checker's semantics. It should not be required to verify
+normal Rut user code.

@@ -3,11 +3,11 @@
 `wait(...)` pauses a JIT route handler and resumes the same handler state
 machine when the requested timer or IO completion event occurs.
 
-## Event Model
+## Core Event Model
 
 The handler can suspend for three classes of events:
 
-- Any currently supported `wait(any(...))` arm: downstream recv or a timer.
+- A race declared with statement-form `wait any { ... }`.
 - A specific IO completion such as downstream recv/send or upstream
   connect/send/recv.
 - A timer deadline.
@@ -23,7 +23,6 @@ wait(downstream.recv())
 wait(upstream(api).connect())
 wait(upstream(api).recv())
 wait(upstream(api).send(req.body))
-wait(any(downstream.recv(), timer(250)))
 wait any {
     downstream.recv() => { return 204 }
     timer(250) => { return 408 }
@@ -42,13 +41,10 @@ The forms are either operation-start waits or completion waits:
 - `wait(upstream(api).send(req.body))` sends the current request buffer
   upstream and waits for the send completion.
 
-`wait(any(...))` resumes on any declared supported arm. Today that means
-`downstream.recv()` plus an optional `timer(N)` timeout arm; `N` is
-milliseconds.
-
-When the route needs different control flow for each winning arm, prefer
-statement-form `wait any`. The first slice supports a downstream recv arm and a
-timer arm, with direct terminal branch bodies:
+`wait any` is the canonical race form. Each winning arm has explicit route
+logic, which makes the generated state machine and verifier trace easier to
+read. The first slice supports a downstream recv arm and a timer arm, with
+direct terminal branch bodies:
 
 ```rut
 route POST "/upload" {
@@ -130,13 +126,13 @@ available after later waits:
 
 ```rut
 route POST "/upload" {
-    let first = wait(any(downstream.recv(), timer(2000)))
-    let second = wait(downstream.recv())
-    if first.timer {
-        return 408
-    } else {
-        guard second.ok else { return 400 }
-        return 204
+    wait any {
+        timer(2000) => { return 408 }
+        downstream.recv() => {
+            let second = wait(downstream.recv())
+            guard second.ok else { return 400 }
+            return 204
+        }
     }
 }
 ```
@@ -146,7 +142,7 @@ the ordered wait/guard sequence.
 
 ## Race Waits
 
-`wait any` is the clearest form when each winning event should run different
+`wait any` is the canonical form when each winning event should run different
 route logic:
 
 ```rut
@@ -158,7 +154,8 @@ route POST "/upload" {
 }
 ```
 
-The older `wait(any(...))` expression form remains available and returns the same result surface as other event waits:
+The older `wait(any(...))` expression form remains available as legacy syntax
+while existing examples and tests migrate, but it is not the Rut Core race form:
 
 ```rut
 route POST "/upload" {

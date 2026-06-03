@@ -63,7 +63,15 @@ This file currently remains the umbrella design doc until that split happens.
 
 - Replace nginx configuration files and OpenResty Lua with a single strongly-typed language
 - Catch most errors at compile time (type errors, route conflicts, invalid values)
-- Easy for LLMs to generate and understand
+- Keep the language low-ambiguity: the same gateway problem should usually have
+  one obvious solution, and at most one or two accepted idioms
+- Make programs mechanically inspectable: control flow, IO waits, routing, and
+  failure behavior should be reducible to a small state machine
+- Make correctness testable by replay and simulation: captured traffic should
+  exercise the same route semantics as production execution
+- Be safe for LLM-assisted generation: prefer constrained constructs,
+  deterministic diagnostics, and verifier-friendly semantics over expressive
+  freedom that creates plausible but wrong code
 - High performance: C100K+ capable, minimal latency overhead
 - Hot reload without downtime
 - Minimal dependencies, maximal control
@@ -74,6 +82,10 @@ This file currently remains the umbrella design doc until that split happens.
 - L4 load balancer (this is L7 HTTP only)
 - DPDK / kernel bypass networking (not worth the trade-off in cloud environments)
 - Compatibility with nginx configuration format
+- Multiple equivalent language surfaces for the same operation
+- Accepting ambiguous code and relying on style guides, runtime behavior, or LLM
+  prompts to resolve intent
+- Requiring external general-purpose formal tools to validate normal user code
 
 ---
 
@@ -132,13 +144,34 @@ status matrix above.
 
 ### 3.1 Design Principles
 
-- **Swift-inspired syntax**: guard statements, named parameters, optional chaining, string interpolation — clean and readable, high LLM generation accuracy
+- **Low ambiguity first**: every feature should have a narrow role, predictable
+  grammar, and a small number of accepted idioms. If two constructs solve the
+  same common problem equally well, one should usually be removed or made
+  clearly secondary.
+- **LLM-safe by construction**: Rut should reduce the blast radius of generated
+  code by constraining the language, making invalid intent easy to diagnose, and
+  avoiding clever surface forms that look plausible but mean different things.
+- **Swift-inspired syntax where it reduces ambiguity**: guard statements, named
+  parameters, and string interpolation are useful when their semantics remain
+  mechanically simple. Symbol-heavy convenience forms stay non-core until they
+  prove clearer than named forms.
 - **HTTP concepts are native objects**: methods, status codes, headers, URLs, CIDR, media types are first-class language constructs, not strings
 - **All functions inline at compile time**: no runtime function calls, each route compiles to a single flat state machine
-- **Async is invisible**: no async/await/future/promise — user writes sequential code, compiler finds I/O points and generates state machines automatically
+- **Async suspension is explicit**: no async/await/future/promise, but every
+  operation that can suspend a handler must be visible as `wait`, `forward`, or
+  another explicit async boundary. The compiler lowers these points into state
+  machines; ordinary helper functions should not hide new yield points.
 - **Strong typing with domain types**: Duration, ByteSize, StatusCode, IP, CIDR, MediaType with compile-time validation
 - **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
+- **Replay and simulation are first-class**: route semantics should be
+  deterministic enough that captured traffic can be replayed through the same
+  decision logic used in production, with differences treated as bugs or
+  explicitly modeled environment effects.
+- **Verifier-friendly semantics**: user code should lower to a compact control
+  graph with explicit terminal responses, waits, forwards, and failure paths.
+  Features that cannot be represented in that graph should be rejected, bounded,
+  or isolated behind explicit escape hatches.
 - **Three-layer model**: `listen` (downstream/client) → .rut file (gateway logic) → `upstream` (backend). No `gateway` or `downstream` keyword — the .rut file IS the gateway, `listen` IS the downstream config
 - **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
 
@@ -189,13 +222,21 @@ and   or   not                  // boolean (keywords)
 ==  !=  <  >  <=  >=           // comparison
 =                               // assignment
 ?                               // nil check postfix (x?)
-?.                              // optional chaining (x?.method)
-??                              // null coalescing (x ?? default)
-!                               // logical not (alias for not)
 @                               // decorator prefix
 =>                              // single-expression body / branch result
 ->                              // function return type
 ```
+
+Rut Core intentionally avoids symbolic optional chaining and null-coalescing as
+the primary surface. Use named fallback and explicit binding instead:
+
+- `value.or(default)` for "usable value or fallback"
+- `guard let x = expr else { ... }` when absence/failure must stop the route
+- `match` when the reason for absence/failure matters
+
+The symbolic forms `?.`, `??`, and `!` remain non-core/reserved until there is
+evidence that they reduce ambiguity for humans, diagnostics, and LLM-generated
+code.
 
 ### 3.2.2 Core Control-Flow Surface
 
@@ -750,13 +791,13 @@ short forms therefore work on the value channel and naturally see failure as `ni
 Users who care about the precise error reason enter an explicit error-handling path
 with `guard` (and later possibly `match`).
 
-**Value-flow operators**
+**Value-flow surface**
 
 | Syntax | Meaning |
 |--------|---------|
 | `x?` | nil check on the usable value channel |
-| `x?.field` / `x?.method()` | continue only if a usable value exists |
-| `x ?? default` | provide a default when no usable value exists |
+| `x.or(default)` | provide a fallback when no usable value exists |
+| `guard let x = expr else { ... }` | bind usable value or terminate |
 | `a | f(_, ...)` | pipeline over the usable value channel |
 
 These operators intentionally optimize for the common case: keep the normal logic
@@ -766,9 +807,10 @@ That means a pipeline or optional-style expression may ignore detailed error cau
 and simply continue in terms of "value present" vs "value absent":
 
 ```swift
-let name = req.query("name") ?? "anonymous"
+let name = req.query("name").or("anonymous")
 let parts = req.path | trimPrefix("/api", _) | split(_, "/")
-let userName = findUser(id)?.profile?.name ?? "guest"
+let user = findUser(id).or(GuestUser)
+let userName = user.profileName.or("guest")
 ```
 
 When a caller needs to care about the failure reason rather than just the absence
@@ -792,7 +834,8 @@ only project tuple slots; they do not introduce a separate error model.
 Rut `guard` is intentionally narrower than Swift-style optional unwrapping:
 
 - `guard` handles **error**, not `nil`
-- `nil` remains part of the normal value channel and is handled by `?`, `?.`, `??`, and `or(...)`
+- `nil` remains part of the normal value channel and is handled by `?`,
+  `.or(...)`, `guard let`, or `match`
 - `guard ... else { ... }` must terminate control flow in the `else` block
 - `guard let x = expr else { ... }` binds the success value of `expr`, but does not implicitly unwrap optional payloads inside that success value
 
@@ -817,7 +860,8 @@ Examples:
 ```swift
 let page = req.query("page").or("1")
 let n = parseInt(raw).or(0)
-let name = findUser(id)?.profile?.name.or("guest")
+let user = findUser(id).or(GuestUser)
+let name = user.profileName.or("guest")
 ```
 
 `or(...)` is deliberately value-oriented. It does not expose or classify the error.
@@ -1308,7 +1352,7 @@ func waf(_ req: Request) {
     guard !path.contains("/../") else { return 403, "path traversal" }
     guard !urlDecode(path).contains("/../") else { return 403, "encoded traversal" }
 
-    let input = "\(path) \(req.queryString ?? "")"
+    let input = "\(path) \(req.queryString.or(""))"
     guard !input.matches(re"(?i)UNION\s+SELECT|DROP\s+TABLE|<script|javascript:") else {
         log.warn("waf blocked", { addr: req.remoteAddr })
         return 403
@@ -2192,7 +2236,7 @@ matches all patterns simultaneously.
 ```swift
 // User writes N separate checks:
 func waf(_ req: Request) {
-    let input = "\(req.path) \(req.queryString ?? "")"
+    let input = "\(req.path) \(req.queryString.or(""))"
     guard !input.matches(re"(?i)UNION\s+SELECT") else { return 403 }
     guard !input.matches(re"(?i)DROP\s+TABLE") else { return 403 }
     guard !input.matches(re"<script") else { return 403 }
@@ -2816,13 +2860,13 @@ Bit operations: & | ^ << >> ~
 | Header spell | `req.athorization` | "warning: did you mean authorization?" |
 | Indirect call | `let f = auth; f(req)` | "functions cannot be assigned to variables" |
 | guard exhaustive | `guard expr else { ... }` with non-terminating or missing `else` | "guard must have else clause" |
-| Optional access | `req.authorization.hasPrefix("B")` | "value may be nil, use ?, ?., ??, or or(...)" |
+| Optional access | `req.authorization.hasPrefix("B")` | "value may be nil, use guard let, match, or .or(default)" |
 | Response middleware | `func f(_ resp: Response)` applied where only pre-middleware expected | "signature contains Response — this is a post-middleware, will run after handler" (info) |
 | TLS without host | `tls "x.com"` but no `x.com { }` in route | warning: "TLS cert declared but no routes for x.com" |
 | Host without TLS | `x.com { }` in route but no `tls "x.com"` and listen uses TLS | "no TLS certificate for host x.com" |
 | Duplicate TLS | two `tls "x.com"` declarations | "duplicate TLS declaration for x.com" |
 | Host pattern | `x.y.z { }` in route with invalid domain chars | "invalid host pattern" |
-| Error-capable value ignored | `let x = req.body(User)` and later code assumes a usable value without fallback/guard | "expression may fail; use guard, match, or a value fallback such as or(...)" |
+| Error-capable value ignored | `let x = req.body(User)` and later code assumes a usable value without fallback/guard | "expression may fail; use guard, match, or a value fallback such as .or(default)" |
 | Error/nil confusion | treating an error-capable value as plain Optional without an explicit value-flow operation | "failure and nil are distinct; use guard/match for error handling or value-flow operators to treat failure as no value" |
 | Regex syntax | `re"[unclosed"` | "invalid regex: unclosed bracket" |
 | Regex capture | `m[3]` but pattern has 2 groups | "regex has 2 capture groups, index 3 out of range" |
@@ -2882,7 +2926,7 @@ func auth(_ req: Request, role: string) -> User {
 | `guard ... else` | `guard jwtDecode(token, secret: key) else { return 401 }` | Perfect for middleware "reject or continue" pattern |
 | Named parameters | `auth(req, role: "user")` | Self-documenting calls, LLMs generate correct argument order |
 | `_` unlabeled param | `func auth(_ req: Request, role: string)` | First param (always req) doesn't need label |
-| Optional chaining | `req.authorization?.hasPrefix("Bearer ")` | Safe navigation on nullable headers |
+| Named fallback | `req.authorization.or("")` | Core optional fallback surface; symbolic chaining remains non-core/reserved |
 | `let` / `var` | `let x = ...` (immutable), `var x = ...` (mutable) | `var` only inside func/handler, not at top level |
 | String interpolation | `"\(req.method)\n\(req.path)"` | Cleaner than concatenation |
 | `.enumCase` | `balance: .leastConn` | Concise enum values |
@@ -3216,7 +3260,7 @@ null dereference) **must never take down the shard**.
 The compiler eliminates most crash sources:
 - Division by zero → compiler inserts check before every `/`, returns 500 if divisor is 0
 - Array out of bounds → compiler inserts bounds check on every `[]` access
-- Null/nil access → use `?`, `?.`, `??`, or `or(...)`; use `guard` only for explicit error handling
+- Null/nil access → use `?`, `.or(default)`, `guard let`, or `match`
 - Infinite loops → no `while`, no recursion, `for` only on finite collections
 - Stack overflow → all functions inline, no call stack depth
 
@@ -5489,12 +5533,12 @@ The semantic distinction still matters:
 - `error(...)` is structured failure information
 - HIR is allowed to preserve and analyze that failure information explicitly
 
-But the ergonomic operators of the language intentionally work in terms of the
-value channel:
+But the ergonomic value-flow surface intentionally works in terms of the value
+channel:
 
-- `|`, `?`, `?.`, and `??` are value-oriented syntax
+- `|`, `?`, and `.or(default)` are value-oriented syntax
 - they optimize for "keep going if a usable value exists"
-- in those forms, failure behaves like "no usable value", so the expression flows as `nil`
+- in these forms, failure behaves like "no usable value", so the expression flows as `nil`
 
 This is a deliberate usability tradeoff for gateway-style code, where many failures
 are tolerated locally and only need logging, counting, or fallback behavior.
