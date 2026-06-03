@@ -5062,38 +5062,8 @@ static bool wait_timer_call_ms(const AstExpr& op, u32& ms) {
     return true;
 }
 
-static FrontendResult<WaitSpec> analyze_wait_any_call(const AstExpr& call,
-                                                      const HirModule& mod,
-                                                      u32& ms) {
-    if (call.kind != AstExprKind::Call || !call.name.eq({"any", 3}) || call.args.len == 0)
-        return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-    bool saw_event = false;
-    bool saw_timer = false;
-    for (u32 ai = 0; ai < call.args.len; ai++) {
-        const AstExpr* arg = call.args[ai];
-        if (arg == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-        u32 timer_ms = 0;
-        if (wait_timer_call_ms(*arg, timer_ms)) {
-            if (saw_timer) return frontend_error(FrontendError::UnsupportedSyntax, arg->span);
-            saw_timer = true;
-            ms = timer_ms;
-            continue;
-        }
-        if (arg->kind == AstExprKind::MethodCall && arg->args.len != 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, arg->span);
-        auto event_spec = analyze_wait_io_op_spec(*arg, mod);
-        if (!event_spec) return core::make_unexpected(event_spec.error());
-        if (event_spec->payload != 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, arg->span);
-        if (event_spec->kind != WaitEventKind::Recv)
-            return frontend_error(FrontendError::UnsupportedSyntax, arg->span);
-        saw_event = true;
-    }
-    if (!saw_event) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-    WaitSpec spec{};
-    spec.kind = WaitEventKind::Any;
-    spec.payload = ms;
-    return spec;
+static FrontendResult<WaitSpec> analyze_wait_any_call(const AstExpr& call, const HirModule&, u32&) {
+    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
 }
 
 static FrontendResult<WaitSpec> analyze_wait_value_spec(const AstExpr& expr,
