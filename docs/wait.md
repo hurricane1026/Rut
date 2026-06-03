@@ -154,17 +154,14 @@ route POST "/upload" {
 }
 ```
 
-The older `wait(any(...))` expression form remains available as legacy syntax
-while existing examples and tests migrate, but it is not the Rut Core race form:
+The older `wait(any(...))` expression form is no longer Rut Core syntax. Use
+`wait any { ... }` when a route needs to branch on the winning race event:
 
 ```rut
 route POST "/upload" {
-    let ev = wait(any(downstream.recv(), timer(2000)))
-    if ev.timer {
-        return 408
-    } else {
-        guard ev.ok else { return 400 }
-        return 200
+    wait any {
+        downstream.recv() => { return 200 }
+        timer(2000) => { return 408 }
     }
 }
 ```
@@ -229,9 +226,9 @@ For this slice, "completion wait" is the important boundary:
   upstream and waits for its completion.
 - Upstream recv/send waits preserve the named upstream target and fail closed
   if the current upstream socket was opened for a different target.
-- `wait(any(downstream.recv(), timer(250)))` waits for downstream recv and also
-  resumes with `kind = 3` when the timeout fires. Upstream arms inside
-  `any(...)` are rejected until the arm list is carried through lowering.
+- `wait any { downstream.recv() => { ... } timer(250) => { ... } }` waits for
+  downstream recv or the timer, then runs the winning arm. The legacy
+  expression form `wait(any(...))` is rejected.
 
 ## Supported Route Shape
 
@@ -336,10 +333,10 @@ The following are future work rather than current behavior:
 - Response starts inside `wait(downstream.send(response(...)))`; use terminal
   `return response(...)` for downstream responses until route completion can
   model "send and finish" without a second terminal response.
-- Exact event subsets inside `wait(any(...))`; today it uses current-connection `Any`
+- Exact event subsets inside `wait any`; today it uses current-connection `Any`
   once the listed forms validate.
-- Parameterized IO starts inside `wait(any(...))`; start the operation before a
-  later race wait until that payload has a richer representation.
+- Parameterized IO starts inside `wait any`; start the operation before a later
+  race wait until that payload has a richer representation.
 - `wait any` arm result binding such as `r = downstream.recv() => { ... }`.
 - Non-wait `let` bindings after a `wait(...)`.
 - Waits inside nested blocks, loops, branches, or decorator bodies.

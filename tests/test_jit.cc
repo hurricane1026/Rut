@@ -18070,7 +18070,6 @@ TEST(jit, frontend_route_event_waits_emit_event_yield_kinds) {
     };
     const Case cases[] = {
         {"wait()", YieldKind::Any, 0},
-        {"wait(any(downstream.recv(), timer(250)))", YieldKind::Any, 250},
         {"wait(downstream.recv())", YieldKind::Recv, 0},
         {"wait(upstream(api).connect())", YieldKind::UpstreamConnect, 1},
         {"wait(upstream(api).recv())", YieldKind::UpstreamRecv, 1},
@@ -18463,7 +18462,7 @@ TEST(jit, frontend_route_wait_event_predicate_fields_drive_control_flow) {
         YieldKind resume_kind;
     };
     const Case cases[] = {
-        {"wait(any(downstream.recv(), timer(250)))", "timer", YieldKind::Timer},
+        {"wait(250)", "timer", YieldKind::Timer},
         {"wait(downstream.recv())", "recv", YieldKind::Recv},
         {"wait(downstream.recv())", "send", YieldKind::Send},
         {"wait(upstream(api).connect())", "upstream_connect", YieldKind::UpstreamConnect},
@@ -18536,7 +18535,7 @@ TEST(jit, frontend_route_wait_event_predicate_fields_drive_control_flow) {
     }
 }
 
-TEST(jit, frontend_route_wait_result_fields_survive_later_waits) {
+TEST(jit, frontend_route_wait_any_expression_result_fields_are_rejected) {
     const auto src = R"rut(
 route GET "/x" {
     let first = wait(any(downstream.recv(), timer(250)))
@@ -18553,55 +18552,8 @@ route GET "/x" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    REQUIRE(lowered);
-    auto cg = codegen(rir.module);
-    REQUIRE(cg.ok);
-    JitEngine engine;
-    REQUIRE(engine.init());
-    REQUIRE(engine.compile(cg.mod, cg.ctx));
-    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
-    REQUIRE(handler != nullptr);
-
-    TestHandlerCtxFrame frame{};
-    HandlerCtx& ctx = frame.ctx;
-    ctx.state = 0;
-    auto first_yield = HandlerResult::unpack(handler(nullptr,
-                                                     &ctx,
-                                                     reinterpret_cast<const u8*>(kGetRootRequest),
-                                                     sizeof(kGetRootRequest) - 1,
-                                                     nullptr));
-    REQUIRE_EQ(static_cast<u8>(first_yield.action), static_cast<u8>(HandlerAction::Yield));
-    CHECK_EQ(static_cast<u8>(first_yield.yield_kind), static_cast<u8>(YieldKind::Any));
-
-    ctx.state = first_yield.next_state;
-    ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
-    ctx.resume_event_result = 0;
-    auto second_yield = HandlerResult::unpack(handler(nullptr,
-                                                      &ctx,
-                                                      reinterpret_cast<const u8*>(kGetRootRequest),
-                                                      sizeof(kGetRootRequest) - 1,
-                                                      nullptr));
-    REQUIRE_EQ(static_cast<u8>(second_yield.action), static_cast<u8>(HandlerAction::Yield));
-    CHECK_EQ(static_cast<u8>(second_yield.yield_kind), static_cast<u8>(YieldKind::Recv));
-
-    ctx.state = second_yield.next_state;
-    ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
-    ctx.resume_event_result = 8;
-    auto done = HandlerResult::unpack(handler(nullptr,
-                                              &ctx,
-                                              reinterpret_cast<const u8*>(kGetRootRequest),
-                                              sizeof(kGetRootRequest) - 1,
-                                              nullptr));
-    CHECK_EQ(static_cast<u8>(done.action), static_cast<u8>(HandlerAction::ReturnStatus));
-    CHECK_EQ(done.status_code, 204);
-
-    engine.shutdown();
-    rir.destroy();
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(jit, frontend_route_multiple_waits_chain_through_states) {
