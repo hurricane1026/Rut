@@ -122,13 +122,14 @@ TEST(frontend, lex_emits_at_token_for_decorator_prefix) {
 }
 
 TEST(frontend, lex_keeps_inline_contextual) {
-    const char* src = "inline for";
+    const char* src = "inline item";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     REQUIRE_EQ(lexed->tokens.len, 3u);
     CHECK_EQ(static_cast<u8>(lexed->tokens[0].type), static_cast<u8>(TokenType::Ident));
     CHECK(lexed->tokens[0].text.eq(lit("inline")));
-    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::KwFor));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::Ident));
+    CHECK(lexed->tokens[1].text.eq(lit("item")));
 }
 
 TEST(frontend, lex_recognizes_lowercase_http_methods) {
@@ -2702,9 +2703,9 @@ TEST(frontend, analyze_rejects_parameterized_wait_any_arms_until_rich_payloads) 
 
 TEST(frontend, analyze_rejects_wait_after_for_loop) {
     const char* sources[] = {
-        "route GET \"/x\" { inline for item in [1] { guard item > 0 else { return 400 } } "
+        "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
         "wait(50) return 204 }\n",
-        "route GET \"/x\" { inline for item in [1] { guard item > 0 else { return 400 } } "
+        "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
         "let ev = wait(downstream.recv()) return 204 }\n",
         "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
         "wait(50) return 204 }\n",
@@ -2726,9 +2727,9 @@ TEST(frontend, analyze_rejects_wait_after_for_loop) {
 
 TEST(frontend, analyze_rejects_for_loop_after_wait) {
     const char* sources[] = {
-        "route GET \"/x\" { wait(50) inline for item in [1] { guard item > 0 else { return 400 } "
+        "route GET \"/x\" { wait(50) for item in [1] { guard item > 0 else { return 400 } "
         "} return 204 }\n",
-        "route GET \"/x\" { let ev = wait(downstream.recv()) inline for item in [1] { guard item "
+        "route GET \"/x\" { let ev = wait(downstream.recv()) for item in [1] { guard item "
         "> 0 else { return 400 } } return 204 }\n",
         "route GET \"/x\" { wait(50) for item in [1] { guard item > 0 else { return 400 } "
         "} return 204 }\n",
@@ -11310,7 +11311,7 @@ TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
 
 TEST(frontend, analyze_rejects_alias_chain_partially_used_outside_for_iter) {
     const char* src =
-        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums inline for item in alias "
+        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums for item in alias "
         "{ return 200 } let leaked = nums return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11336,7 +11337,7 @@ TEST(frontend, analyze_plain_for_rejects_alias_chain_partially_used_outside_for_
 
 TEST(frontend, analyze_for_rejects_alias_chain_partially_used_outside_for_iter) {
     const char* src =
-        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums inline for item in alias "
+        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums for item in alias "
         "{ return 200 } let leaked = nums return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11350,7 +11351,7 @@ TEST(frontend, analyze_for_rejects_alias_chain_partially_used_outside_for_iter) 
 TEST(frontend, analyze_rejects_typed_array_local_call_as_for_iter) {
     const char* src =
         "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs: [i32] = make() inline for item in xs { return 200 } "
+        "route GET \"/x\" { let xs: [i32] = make() for item in xs { return 200 } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11378,7 +11379,7 @@ TEST(frontend, analyze_plain_for_rejects_typed_array_local_call_as_for_iter) {
 TEST(frontend, analyze_for_rejects_typed_array_local_call_as_for_iter) {
     const char* src =
         "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs: [i32] = make() inline for item in xs { return 200 } "
+        "route GET \"/x\" { let xs: [i32] = make() for item in xs { return 200 } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11391,7 +11392,7 @@ TEST(frontend, analyze_for_rejects_typed_array_local_call_as_for_iter) {
 
 TEST(frontend, analyze_accepts_typed_array_alias_chain_for_for_iter) {
     const char* src =
-        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs inline for item in ys { return "
+        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs for item in ys { return "
         "200 } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
@@ -11429,7 +11430,7 @@ TEST(frontend, analyze_plain_for_accepts_typed_array_alias_chain_for_for_iter) {
 
 TEST(frontend, analyze_for_accepts_typed_array_alias_chain_for_for_iter) {
     const char* src =
-        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs inline for item in ys { return "
+        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs for item in ys { return "
         "200 } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
@@ -20209,12 +20210,11 @@ TEST(frontend, parse_array_lit_nested_type) {
 }
 
 TEST(frontend, parse_for_loop_basic) {
-    // `inline for item in xs { return 200 }` — loop variable stored in `name`,
+    // `for item in xs { return 200 }` — loop variable stored in `name`,
     // iteration source in `expr`, body block in `then_stmt`. Intentionally
     // parse-only: asserts AST shape independent of analyze (full-pipeline
     // coverage lives in analyze_for_loop_* tests below).
-    const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -20223,7 +20223,6 @@ TEST(frontend, parse_for_loop_basic) {
     REQUIRE_EQ(route.statements.len, 2u);
     const auto& for_stmt = route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE_EQ(for_stmt.expr.args.len, 3u);
@@ -20235,8 +20234,7 @@ TEST(frontend, parse_for_loop_basic) {
 }
 
 TEST(frontend, parse_plain_for_loop_basic) {
-    // `for item in [1, 2, 3] { return 200 }` — same AST shape as inline, except
-    // the `is_inline` marker stays false.
+    // `for item in [1, 2, 3] { return 200 }` — canonical static-loop syntax.
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20246,7 +20244,6 @@ TEST(frontend, parse_plain_for_loop_basic) {
     REQUIRE_EQ(route.statements.len, 2u);
     const auto& for_stmt = route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(!for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE_EQ(for_stmt.expr.args.len, 3u);
@@ -20268,19 +20265,28 @@ TEST(frontend, parse_inline_identifier_is_not_reserved) {
     REQUIRE(hir);
 }
 
+TEST(frontend, parse_rejects_inline_for_compat_spelling) {
+    const char* src =
+        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("use 'for', not 'inline for'")));
+}
+
 TEST(frontend, parse_for_loop_field_access_source) {
-    // `inline for server in up.servers` — iteration source is a field access expr,
+    // `for server in up.servers` — iteration source is a field access expr,
     // not a literal. Exercises parse_expr → parse_primary_expr → Field path
     // inside the for's iter-expr slot.
-    const char* src =
-        "route GET \"/x\" { inline for server in up.servers { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("server")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
 }
@@ -20293,21 +20299,18 @@ TEST(frontend, parse_plain_for_field_access_source) {
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(!for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("server")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
 }
 
 TEST(frontend, parse_for_field_access_source) {
-    const char* src =
-        "route GET \"/x\" { inline for server in up.servers { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for server in up.servers { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("server")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
 }
@@ -20320,7 +20323,6 @@ TEST(frontend, parse_plain_for_loop_field_access_source) {
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(!for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("server")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
 }
@@ -20329,7 +20331,7 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
     // Body with multiple statements — parse_braced_stmt_body returns a Block
     // wrapping them; then_stmt points to that Block.
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { let n = item guard n > 0 else { return 400 "
+        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 "
         "} } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
@@ -20337,7 +20339,6 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK(for_stmt.is_inline);
     REQUIRE(for_stmt.then_stmt != nullptr);
     CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
     REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
@@ -20357,7 +20358,6 @@ TEST(frontend, parse_plain_for_without_inline_marker) {
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(!for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE_EQ(for_stmt.expr.args.len, 2u);
@@ -20372,7 +20372,7 @@ TEST(frontend, parse_plain_for_without_inline_marker) {
 
 TEST(frontend, parse_for_without_inline_marker) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { let n = item guard n > 0 else { return 400 "
+        "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 "
         "} } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
@@ -20381,7 +20381,6 @@ TEST(frontend, parse_for_without_inline_marker) {
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE_EQ(for_stmt.expr.args.len, 2u);
@@ -20402,7 +20401,6 @@ TEST(frontend, parse_plain_for_single_stmt_body) {
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(!for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE(for_stmt.then_stmt != nullptr);
@@ -20411,14 +20409,13 @@ TEST(frontend, parse_plain_for_single_stmt_body) {
 }
 
 TEST(frontend, parse_for_single_stmt_body) {
-    const char* src = "route GET \"/x\" { inline for item in [1] { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in [1] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.is_inline);
     CHECK(for_stmt.name.eq(lit("item")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE(for_stmt.then_stmt != nullptr);
@@ -20427,7 +20424,7 @@ TEST(frontend, parse_for_single_stmt_body) {
 }
 
 TEST(frontend, parse_plain_for_loop_multi_stmt_body) {
-    // Plain `for` keeps multi-statement block behavior identical to inline.
+    // Plain `for` keeps multi-statement block behavior stable.
     const char* src =
         "route GET \"/x\" { for item in [1, 2] { let n = item guard n > 0 else { return 400 } } "
         "return 200 }\n";
@@ -20436,7 +20433,6 @@ TEST(frontend, parse_plain_for_loop_multi_stmt_body) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     const auto& for_stmt = ast->items[0].route.statements[0];
-    CHECK(for_stmt.is_inline == false);
     REQUIRE(for_stmt.then_stmt != nullptr);
     CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
     REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
@@ -20448,7 +20444,7 @@ TEST(frontend, parse_plain_for_loop_multi_stmt_body) {
 
 TEST(frontend, analyze_rejects_array_lit_at_route_let_rhs) {
     // A route-level array `let` is only accepted when used as a later
-    // inlined `for` as static iterable source.
+    // static `for` iterable source.
     const char* src = "route GET \"/x\" { let xs: [i32] = [1, 2, 3] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20472,7 +20468,7 @@ TEST(frontend, analyze_array_lit_heterogeneous_rejected) {
 
 TEST(frontend, analyze_array_lit_empty_rejected) {
     // Bare `[]` leaves element type unresolvable with Rutlang's no-push rule.
-    const char* src = "route GET \"/x\" { inline for item in [] { return 201 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in [] { return 201 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -20507,8 +20503,7 @@ TEST(frontend, analyze_for_loop_terminator_body) {
     // Phase 3b: body is a single `return` terminator. Analyze must produce a
     // HirForLoop on route.for_loops with iter_expr typed Array<I32>, loop_var
     // bound to I32, and body.term populated (has_term = true).
-    const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -20568,7 +20563,7 @@ TEST(frontend, analyze_plain_for_static_array_uses_compiler_unroll_path) {
 }
 
 TEST(frontend, analyze_for_static_array_uses_compiler_unroll_path) {
-    const char* src = "route GET \"/x\" { inline for item in [1, 2] { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -20614,7 +20609,7 @@ TEST(frontend, mir_unrolls_plain_for_from_static_array_alias) {
 
 TEST(frontend, mir_unrolls_for_from_static_array_alias) {
     const char* src =
-        "route GET \"/x\" { let xs = [1, 2] let ys = xs inline for item in ys { guard item > 0 "
+        "route GET \"/x\" { let xs = [1, 2] let ys = xs for item in ys { guard item > 0 "
         "else { "
         "return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -20679,7 +20674,7 @@ TEST(frontend, mir_skips_plain_for_from_typed_empty_array_alias) {
 
 TEST(frontend, mir_skips_for_from_typed_empty_array_alias) {
     const char* src =
-        "route GET \"/x\" { let base: [i32] = [] let xs = base inline for item in xs { return 201 "
+        "route GET \"/x\" { let base: [i32] = [] let xs = base for item in xs { return 201 "
         "} "
         "return 200 }\n";
     auto lexed = lex(lit(src));
@@ -20735,7 +20730,7 @@ TEST(frontend, analyze_guard_fail_body_local_scoped_to_fail_body) {
 
 TEST(frontend, mir_for_loop_wildcard_only_match_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case _: { guard false else { "
+        "route GET \"/x\" { for item in [1] { match item { case _: { guard false else { "
         "return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20782,7 +20777,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_wildcard_only_match_enters_prelude_gua
 
 TEST(frontend, mir_unrolls_for_loop_wildcard_only_match_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case _: { guard false else { "
+        "route GET \"/x\" { for item in [1] { match item { case _: { guard false else { "
         "return 400 } "
         "return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
@@ -20806,7 +20801,7 @@ TEST(frontend, mir_unrolls_for_loop_wildcard_only_match_enters_prelude_guard) {
 
 TEST(frontend, mir_for_loop_wildcard_fallthrough_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [2] { match item { case 1: return 201 case _: { "
+        "route GET \"/x\" { for item in [2] { match item { case 1: return 201 case _: { "
         "guard false else { return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20852,7 +20847,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_wildcard_fallthrough_enters_prelude_gu
 
 TEST(frontend, mir_unrolls_for_loop_wildcard_fallthrough_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [2] { match item { case 1: return 201 case _: { "
+        "route GET \"/x\" { for item in [2] { match item { case 1: return 201 case _: { "
         "guard false else { return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20875,7 +20870,7 @@ TEST(frontend, mir_unrolls_for_loop_wildcard_fallthrough_enters_prelude_guard) {
 
 TEST(frontend, analyze_for_loop_body_if_rejects_fallible_bool) {
     const char* src =
-        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { if ok { "
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { if ok { "
         "return 200 } else { return 400 } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20913,7 +20908,7 @@ TEST(frontend, analyze_plain_for_body_if_rejects_fallible_bool) {
 
 TEST(frontend, analyze_for_body_if_rejects_fallible_bool) {
     const char* src =
-        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { if ok { return "
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { if ok { return "
         "200 } "
         "else { return 400 } } return 204 }\n";
     auto lexed = lex(lit(src));
@@ -20926,7 +20921,7 @@ TEST(frontend, analyze_for_body_if_rejects_fallible_bool) {
 
 TEST(frontend, analyze_for_loop_match_arm_if_rejects_fallible_bool) {
     const char* src =
-        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { match item { "
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
         "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20965,7 +20960,7 @@ TEST(frontend, analyze_plain_for_match_arm_if_rejects_fallible_bool) {
 
 TEST(frontend, analyze_for_match_arm_if_rejects_fallible_bool) {
     const char* src =
-        "route GET \"/x\" { let ok: bool = error(.timeout) inline for item in [1] { match item { "
+        "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
         "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -20977,7 +20972,7 @@ TEST(frontend, analyze_for_match_arm_if_rejects_fallible_bool) {
 
 TEST(frontend, analyze_for_loop_nested_match_arm_if_rejects_fallible_bool) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let ok: bool = error(.timeout) match item { "
+        "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
         "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
         "} "
         "case _: return 204 } } return 500 }\n";
@@ -21019,7 +21014,7 @@ TEST(frontend, analyze_plain_for_nested_match_arm_if_rejects_fallible_bool) {
 
 TEST(frontend, analyze_for_nested_match_arm_if_rejects_fallible_bool) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let ok: bool = error(.timeout) match item { "
+        "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
         "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
         "} "
         "case _: return 204 } } return 500 }\n";
@@ -21036,7 +21031,7 @@ TEST(frontend, analyze_for_loop_guard_body) {
     // that short-circuits the handler. The loop var (`n`) must be in scope
     // inside the guard's condition.
     const char* src =
-        "route GET \"/x\" { inline for n in [1, 2, 3] { guard n > 0 else { return 400 } } return "
+        "route GET \"/x\" { for n in [1, 2, 3] { guard n > 0 else { return 400 } } return "
         "200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21069,7 +21064,7 @@ TEST(frontend, analyze_for_loop_unsupported_body_stmt_has_clear_detail) {
 }
 
 TEST(frontend, analyze_plain_for_loop_guard_body) {
-    // Same guard-only shape as inline form, but using plain `for`.
+    // Guard-only loop bodies are accepted for static `for`.
     const char* src =
         "route GET \"/x\" { for n in [1, 2, 3] { guard n > 0 else { return 400 } } return "
         "200 }\n";
@@ -21094,7 +21089,7 @@ TEST(frontend, analyze_for_loop_var_scoped_to_body) {
     // The loop variable must NOT leak to code after the for-loop. Writing
     // `item` in a post-loop let should fail to resolve (Ident unknown).
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } "
+        "route GET \"/x\" { for item in [1, 2, 3] { return 200 } "
         "let x = item return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21134,7 +21129,7 @@ TEST(frontend, analyze_for_var_scoped_to_body) {
     // The loop variable must NOT leak to code after the for-loop. Writing
     // `item` in a post-loop let should fail to resolve (Ident unknown).
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } "
+        "route GET \"/x\" { for item in [1, 2, 3] { return 200 } "
         "let x = item return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21155,7 +21150,7 @@ TEST(frontend, analyze_plain_for_iter_not_array_rejected) {
 }
 
 TEST(frontend, analyze_for_iter_not_array_rejected) {
-    const char* src = "route GET \"/x\" { inline for item in 42 { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21166,7 +21161,7 @@ TEST(frontend, analyze_for_iter_not_array_rejected) {
 
 TEST(frontend, analyze_for_loop_iter_not_array_rejected) {
     // Iter source must be Array<T>; iterating a scalar is a type error.
-    const char* src = "route GET \"/x\" { inline for item in 42 { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21189,7 +21184,7 @@ TEST(frontend, analyze_plain_for_loop_iter_not_array_rejected) {
 TEST(frontend, analyze_rejects_non_static_for_loop_iter) {
     const char* src =
         "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { inline for item in make() { return 200 } return 200 }\n";
+        "route GET \"/x\" { for item in make() { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21213,7 +21208,7 @@ TEST(frontend, analyze_plain_for_rejects_non_static_for_loop_iter) {
 TEST(frontend, analyze_for_rejects_non_static_for_loop_iter) {
     const char* src =
         "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { inline for item in make() { return 200 } return 200 }\n";
+        "route GET \"/x\" { for item in make() { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21259,7 +21254,7 @@ TEST(frontend, analyze_for_loop_reject_details_name_iterator_shape) {
 TEST(frontend, analyze_rejects_non_static_for_loop_iter_via_alias_chain) {
     const char* src =
         "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs = make() let ys = xs inline for item in ys { return 200 } "
+        "route GET \"/x\" { let xs = make() let ys = xs for item in ys { return 200 } "
         "return "
         "200 }\n";
     auto lexed = lex(lit(src));
@@ -21286,7 +21281,7 @@ TEST(frontend, analyze_plain_for_rejects_non_static_for_loop_iter_via_alias_chai
 TEST(frontend, analyze_for_rejects_non_static_for_loop_iter_via_alias_chain) {
     const char* src =
         "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs = make() let ys = xs inline for item in ys { return 200 } "
+        "route GET \"/x\" { let xs = make() let ys = xs for item in ys { return 200 } "
         "return "
         "200 }\n";
     auto lexed = lex(lit(src));
@@ -21300,7 +21295,7 @@ TEST(frontend, analyze_for_rejects_non_static_for_loop_iter_via_alias_chain) {
 TEST(frontend, analyze_rejects_field_access_for_loop_iter) {
     const char* src =
         "struct Upstream { servers: [i32] }\n"
-        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) inline for server in up.servers "
+        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) for server in up.servers "
         "{ return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21326,7 +21321,7 @@ TEST(frontend, analyze_plain_for_rejects_field_access_for_loop_iter) {
 TEST(frontend, analyze_for_rejects_field_access_for_loop_iter) {
     const char* src =
         "struct Upstream { servers: [i32] }\n"
-        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) inline for server in up.servers "
+        "route GET \"/x\" { let up = Upstream(servers: [1, 2, 3]) for server in up.servers "
         "{ return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21345,7 +21340,7 @@ TEST(frontend, mir_unrolls_for_loop_scope_a_basic) {
     //   block[4..6] = fail blocks (`return 400` from the body guard's else)
     // Total: 7 blocks.
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21433,12 +21428,12 @@ TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_control) {
 TEST(frontend, mir_unrolls_for_loop_substitutes_element_in_cond) {
     // The heart of the unroll: each iteration's virtual guard should test
     // the element value directly, not a LocalRef to the loop variable.
-    // For `inline for item in [1, 2, 3] { guard item > 0 ...}`, block[0].term.cond
+    // For `for item in [1, 2, 3] { guard item > 0 ...}`, block[0].term.cond
     // must be Gt with lhs = IntConst(1), block[1] lhs = IntConst(2),
     // block[2] lhs = IntConst(3). A regression that forgets to substitute
     // would leave lhs as a LocalRef to the loop var's synthetic init.
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21461,7 +21456,7 @@ TEST(frontend, mir_unrolls_for_loop_substitutes_element_in_cond) {
 
 TEST(frontend, mir_unrolls_for_substitutes_element_in_cond) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21531,8 +21526,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_substitutes_element_in_cond) {
 TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
     // A body terminator exits the route during the first iteration, so later
     // iterations are unreachable under normal loop semantics.
-    const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21565,7 +21559,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_with_body_terminator) {
 
 TEST(frontend, mir_unrolls_for_loop_guard_before_body_terminator) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } return 200 } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21630,7 +21624,7 @@ TEST(frontend, mir_for_loop_lowers_through_rir_without_synthetic_local) {
     // zero locals (the only HIR local was the loop var, which must have
     // been skipped).
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21671,7 +21665,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_lowers_through_rir_without_synthetic_l
 
 TEST(frontend, mir_unrolls_for_loop_lowers_through_rir_without_synthetic_local) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
         "return 200 "
         "}\n";
     auto lexed = lex(lit(src));
@@ -21692,7 +21686,7 @@ TEST(frontend, mir_unrolls_for_loop_lowers_through_rir_without_synthetic_local) 
 
 TEST(frontend, mir_unrolls_for_loop_from_array_local) {
     const char* src =
-        "route GET \"/x\" { let xs = [1, 2, 3] inline for item in xs { guard item > 0 else "
+        "route GET \"/x\" { let xs = [1, 2, 3] for item in xs { guard item > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21756,7 +21750,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_from_array_local) {
 
 TEST(frontend, mir_unrolls_for_loop_from_array_local_alias) {
     const char* src =
-        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs inline for item in ys { guard item > "
+        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs for item in ys { guard item > "
         "0 else { return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21824,7 +21818,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_from_array_local_alias) {
 TEST(frontend, mir_unrolls_for_loop_over_struct_array_field_access) {
     const char* src =
         "struct Box { value: i32 }\n"
-        "route GET \"/x\" { let boxes = [Box(value: 1), Box(value: 2)] inline for box in boxes { "
+        "route GET \"/x\" { let boxes = [Box(value: 1), Box(value: 2)] for box in boxes { "
         "guard box.value > 0 else { return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21887,7 +21881,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_over_struct_array_field_access) {
 TEST(frontend, mir_unrolls_for_loop_over_variant_array_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for state in [Result.ok(1)] { match state { case .ok(code): "
+        "route GET \"/x\" { for state in [Result.ok(1)] { match state { case .ok(code): "
         "return 201 case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21948,7 +21942,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_over_variant_array_match) {
 TEST(frontend, mir_unrolls_for_loop_over_tuple_array_pipe_slots) {
     const char* src =
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/x\" { inline for pair in [(200, 1), (200, 2)] { let code = pair | "
+        "route GET \"/x\" { for pair in [(200, 1), (200, 2)] { let code = pair | "
         "second(_2, _1) guard code == 200 else { return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22010,7 +22004,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_over_tuple_array_pipe_slots) {
 
 TEST(frontend, mir_skips_zero_iteration_for_loop_from_typed_empty_array) {
     const char* src =
-        "route GET \"/x\" { let xs: [i32] = [] inline for item in xs { return 201 } return 200 "
+        "route GET \"/x\" { let xs: [i32] = [] for item in xs { return 201 } return 200 "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22070,7 +22064,7 @@ TEST(frontend, mir_skips_zero_iteration_plain_for_loop_from_typed_empty_array) {
 
 TEST(frontend, mir_unrolls_for_loop_from_array_local_alias_chain) {
     const char* src =
-        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs let zs = ys inline for item in zs { "
+        "route GET \"/x\" { let xs = [1, 2, 3] let ys = xs let zs = ys for item in zs { "
         "guard "
         "item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -22165,7 +22159,7 @@ TEST(frontend, mir_skips_zero_iteration_plain_for_loop_from_typed_empty_array_al
 
 TEST(frontend, mir_skips_zero_iteration_for_loop_from_typed_empty_array_alias) {
     const char* src =
-        "route GET \"/x\" { let base: [i32] = [] let xs = base inline for item in xs { return "
+        "route GET \"/x\" { let base: [i32] = [] let xs = base for item in xs { return "
         "201 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22193,8 +22187,8 @@ TEST(frontend, mir_skips_zero_iteration_for_loop_from_typed_empty_array_alias) {
 TEST(frontend, mir_unrolls_multiple_for_loops) {
     const char* src =
         "route GET \"/x\" { "
-        "inline for a in [1, 2] { guard a > 0 else { return 400 } } "
-        "inline for b in [3, 4] { guard b > 0 else { return 401 } } "
+        "for a in [1, 2] { guard a > 0 else { return 400 } } "
+        "for b in [3, 4] { guard b > 0 else { return 401 } } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22257,8 +22251,8 @@ TEST(frontend, mir_unrolls_plain_for_multiple_for_loops) {
 TEST(frontend, mir_unrolls_for_multiple_for_loops) {
     const char* src =
         "route GET \"/x\" { "
-        "inline for a in [1, 2] { guard a > 0 else { return 400 } } "
-        "inline for b in [3, 4] { guard b > 0 else { return 401 } } "
+        "for a in [1, 2] { guard a > 0 else { return 400 } } "
+        "for b in [3, 4] { guard b > 0 else { return 401 } } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22294,7 +22288,7 @@ TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     // later `fn.blocks.push`. N=8, M=1 → 2T+1 = 17 > 16. Analyze accepts
     // this shape (kMaxArgs=8), so the reject must live in MIR's pre-check.
     const char* src =
-        "route GET \"/x\" { inline for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
+        "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
         "guard n > 0 else { return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22337,7 +22331,7 @@ TEST(frontend, mir_unrolls_for_loop_with_route_level_guard) {
     //   block[5..8] = one fail block per guard
     const char* src =
         "route GET \"/x\" { guard true else { return 403 } "
-        "inline for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
+        "for item in [1, 2, 3] { guard item > 0 else { return 400 } } "
         "return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22362,7 +22356,7 @@ TEST(frontend, mir_unrolls_for_loop_with_route_level_guard) {
 }
 
 TEST(frontend, mir_unrolls_plain_for_loop_with_route_level_guard) {
-    // Same guard-chain ordering as inline form, but with plain `for`.
+    // Guard-chain ordering is preserved with static `for`.
     const char* src =
         "route GET \"/x\" { guard true else { return 403 } for item in [1, 2, 3] { guard item > "
         "0 else { return 400 } } return 200 }\n";
@@ -22392,7 +22386,7 @@ TEST(frontend, mir_unrolls_for_loop_before_later_route_level_guard) {
     // The mixed chain is sorted by source span, so a route guard after the
     // loop runs after every virtual loop guard.
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { guard item > 0 else { return 400 } } "
+        "route GET \"/x\" { for item in [1, 2] { guard item > 0 else { return 400 } } "
         "guard true else { return 403 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22437,7 +22431,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_before_later_route_level_guard) {
 
 TEST(frontend, mir_unrolls_for_loop_into_route_if_control) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { guard item > 0 else { return 400 } } "
+        "route GET \"/x\" { for item in [1, 2] { guard item > 0 else { return 400 } } "
         "if true { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22469,7 +22463,7 @@ TEST(frontend, mir_unrolls_for_loop_into_route_if_control) {
 
 TEST(frontend, mir_unrolls_for_loop_into_route_match_control) {
     const char* src =
-        "route GET \"/x\" { let path = \"/x\" inline for item in [1, 2] { guard item > 0 else "
+        "route GET \"/x\" { let path = \"/x\" for item in [1, 2] { guard item > 0 else "
         "{ return 400 } } match path { case \"/x\": return 200 case _: return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22499,7 +22493,7 @@ TEST(frontend, mir_unrolls_for_loop_into_route_match_control) {
 
 TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_guard) {
     const char* src =
-        "route GET \"/x\" { let path = \"/x\" let allow = true inline for item in [1, 2] { guard "
+        "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
         "item > 0 else { return 400 } } match path { case \"/x\" if allow: return 200 case _: "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
@@ -22543,7 +22537,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_arm_guard) {
 
 TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_if_body) {
     const char* src =
-        "route GET \"/x\" { let path = \"/x\" let allow = true inline for item in [1, 2] { guard "
+        "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
         "item > 0 else { return 400 } } match path { case \"/x\": if allow { return 200 } else { "
         "return 201 } case _: return 404 } }\n";
     auto lexed = lex(lit(src));
@@ -22622,7 +22616,7 @@ TEST(frontend, analyze_for_loop_rejects_guard_after_terminator) {
     // of the already-fired return. Analyze rejects to preserve source
     // semantics until lowering is order-aware.
     const char* src =
-        "route GET \"/x\" { inline for x in [1] { return 200 guard x > 0 else "
+        "route GET \"/x\" { for x in [1] { return 200 guard x > 0 else "
         "{ return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22663,7 +22657,7 @@ TEST(frontend, analyze_plain_for_rejects_guard_after_terminator) {
 
 TEST(frontend, analyze_for_rejects_guard_after_terminator) {
     const char* src =
-        "route GET \"/x\" { inline for x in [1] { return 200 guard x > 0 else "
+        "route GET \"/x\" { for x in [1] { return 200 guard x > 0 else "
         "{ return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22679,7 +22673,7 @@ TEST(frontend, analyze_for_loop_rejects_shadowing_outer_local) {
     // binding win in the body — producing wrong guard behavior under MIR
     // unroll. Analyze rejects the collision outright.
     const char* src =
-        "route GET \"/x\" { let item = 1 inline for item in [2, 3] { guard item > 1 else "
+        "route GET \"/x\" { let item = 1 for item in [2, 3] { guard item > 1 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22720,7 +22714,7 @@ TEST(frontend, analyze_plain_for_rejects_shadowing_outer_local) {
 
 TEST(frontend, analyze_for_rejects_shadowing_outer_local) {
     const char* src =
-        "route GET \"/x\" { let item = 1 inline for item in [2, 3] { guard item > 1 else "
+        "route GET \"/x\" { let item = 1 for item in [2, 3] { guard item > 1 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22733,7 +22727,7 @@ TEST(frontend, analyze_for_rejects_shadowing_outer_local) {
 TEST(frontend, mir_unrolls_for_loop_body_let) {
     // Body-local lets are expanded per iteration and can feed later guards.
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { let n = item guard n > 0 else "
+        "route GET \"/x\" { for item in [1, 2, 3] { let n = item guard n > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22787,8 +22781,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_let) {
 }
 
 TEST(frontend, mir_allows_for_loop_body_let_only_as_noop) {
-    const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { let n = item } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { let n = item } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22829,7 +22822,7 @@ TEST(frontend, mir_allows_plain_for_loop_body_let_only_as_noop) {
 
 TEST(frontend, analyze_for_loop_body_local_named_error_gets_hidden_variant) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let failed = error(.timeout) } return 200 "
+        "route GET \"/x\" { for item in [1] { let failed = error(.timeout) } return 200 "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -22886,7 +22879,7 @@ TEST(frontend, analyze_plain_for_body_local_named_error_gets_hidden_variant) {
 
 TEST(frontend, analyze_for_body_local_named_error_gets_hidden_variant) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let failed = error(.timeout) } return 200 }\n";
+        "route GET \"/x\" { for item in [1] { let failed = error(.timeout) } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22935,7 +22928,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_let_chain) {
 
 TEST(frontend, mir_unrolls_for_loop_body_let_chain) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { let n = item let m = n guard m > 0 else "
+        "route GET \"/x\" { for item in [1, 2, 3] { let n = item let m = n guard m > 0 else "
         "{ return 400 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23077,7 +23070,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_with_body_local_subject) {
 
 TEST(frontend, mir_unrolls_for_loop_body_guard_let) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2, 3] { guard let n = item else "
+        "route GET \"/x\" { for item in [1, 2, 3] { guard let n = item else "
         "{ return 400 } guard n > 0 else { return 401 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23116,7 +23109,7 @@ TEST(frontend, mir_unrolls_for_loop_body_guard_let) {
 
 TEST(frontend, mir_unrolls_for_loop_body_guard_fail_if_with_loop_var) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { guard item < 0 else { if item > 0 "
+        "route GET \"/x\" { for item in [1] { guard item < 0 else { if item > 0 "
         "{ return 401 } else { return 402 } } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23176,7 +23169,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_guard_fail_if_with_loop_var) {
 
 TEST(frontend, mir_unrolls_for_loop_body_guard_fail_block_let) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { guard item < 0 else { let code = item if code "
+        "route GET \"/x\" { for item in [1] { guard item < 0 else { let code = item if code "
         "> 0 { return 401 } else { return 402 } } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23234,7 +23227,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_guard_fail_block_let) {
 
 TEST(frontend, mir_unrolls_for_loop_body_if_with_body_local_cond) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { let n = item if n > 0 { return 201 } else "
+        "route GET \"/x\" { for item in [1, 2] { let n = item if n > 0 { return 201 } else "
         "{ return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23267,7 +23260,7 @@ TEST(frontend, mir_unrolls_for_loop_body_if_with_body_local_cond) {
 
 TEST(frontend, analyze_for_loop_rejects_statement_after_body_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { if item > 0 { return 201 } else { return 402 "
+        "route GET \"/x\" { for item in [1] { if item > 0 { return 201 } else { return 402 "
         "} guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23303,7 +23296,7 @@ TEST(frontend, analyze_plain_for_rejects_statement_after_body_if) {
 
 TEST(frontend, analyze_for_rejects_statement_after_body_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { if item > 0 { return 201 } else { return 402 "
+        "route GET \"/x\" { for item in [1] { if item > 0 { return 201 } else { return 402 "
         "} guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23315,7 +23308,7 @@ TEST(frontend, analyze_for_rejects_statement_after_body_if) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_with_body_local_subject) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { let n = item match n { case 1: return 201 "
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: return 201 "
         "case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23352,7 +23345,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_with_body_local_subject) {
 
 TEST(frontend, analyze_for_loop_rejects_statement_after_body_match) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
         "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23376,7 +23369,7 @@ TEST(frontend, analyze_plain_for_loop_rejects_statement_after_body_match) {
 
 TEST(frontend, analyze_for_rejects_statement_after_body_match) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
         "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23400,7 +23393,7 @@ TEST(frontend, analyze_plain_for_rejects_statement_after_body_match) {
 
 TEST(frontend, analyze_for_loop_rejects_statement_after_terminating_nested_for) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { inline for inner in [2] { return 200 } "
+        "route GET \"/x\" { for item in [1] { for inner in [2] { return 200 } "
         "return 201 } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23424,7 +23417,7 @@ TEST(frontend, analyze_plain_for_loop_rejects_statement_after_terminating_nested
 
 TEST(frontend, analyze_for_loop_allows_statement_after_empty_terminating_nested_for) {
     const char* src =
-        "route GET \"/x\" { let xs: [i32] = [] inline for item in [1] { inline for inner in xs { "
+        "route GET \"/x\" { let xs: [i32] = [] for item in [1] { for inner in xs { "
         "return 200 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23450,7 +23443,7 @@ TEST(frontend, analyze_plain_for_loop_allows_statement_after_empty_terminating_n
 
 TEST(frontend, mir_unrolls_nested_for_loop_uses_outer_and_inner_vars) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { inline for inner in [3, 4] { "
+        "route GET \"/x\" { for item in [1, 2] { for inner in [3, 4] { "
         "guard inner > item else { return 400 } } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23508,7 +23501,7 @@ TEST(frontend, mir_unrolls_plain_nested_for_loop_uses_outer_and_inner_vars) {
 
 TEST(frontend, mir_unrolls_nested_for_iter_with_outer_loop_var) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { inline for inner in [item] { "
+        "route GET \"/x\" { for item in [1, 2] { for inner in [item] { "
         "guard inner == item else { return 400 } } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23564,7 +23557,7 @@ TEST(frontend, mir_unrolls_plain_nested_for_iter_with_outer_loop_var) {
 
 TEST(frontend, analyze_accepts_array_local_used_by_nested_for_iter) {
     const char* src =
-        "route GET \"/x\" { let xs = [1, 2] inline for outer in [0] { inline for item in xs { "
+        "route GET \"/x\" { let xs = [1, 2] for outer in [0] { for item in xs { "
         "guard "
         "item > outer else { return 400 } } } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -23591,7 +23584,7 @@ TEST(frontend, analyze_plain_for_accepts_array_local_used_by_nested_for_iter) {
 
 TEST(frontend, mir_preserves_nested_for_before_later_parent_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { inline for inner in [1] { guard inner == 2 "
+        "route GET \"/x\" { for item in [1] { for inner in [1] { guard inner == 2 "
         "else { return 401 } } guard item == 2 else { return 402 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23643,7 +23636,7 @@ TEST(frontend, mir_plain_for_preserves_nested_for_before_later_parent_guard) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1, 2] { let n = item match n { case 1: if n > 0 "
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: if n > 0 "
         "{ return 201 } else { return 202 } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23719,7 +23712,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_if) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let ok = n "
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
         "> 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23804,7 +23797,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_if) {
 TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_block_let_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): { let ok = code > 0 if ok { return 201 } else { return 202 } } case _: "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -23889,7 +23882,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_bloc
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_chain_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let a = n "
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let a = n "
         "let ok = a > 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
@@ -23975,7 +23968,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_chain_if) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_prefix) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let ok = n "
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
         "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } case _: "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24066,7 +24059,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_prefix) {
 TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_block_guard_prefix) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
         "else { return 202 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24153,7 +24146,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_bloc
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_let_prefix) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: { guard let n = item "
+        "route GET \"/x\" { for item in [1] { match item { case 1: { guard let n = item "
         "else { return 498 } if n == 1 { return 201 } else { return 202 } } case _: "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24243,7 +24236,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_let_prefix)
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_match_prefix) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let failed = "
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let failed = "
         "error(.timeout) guard match failed else { case .timeout: return 498 case _: return 499 } "
         "if item == 1 { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24337,7 +24330,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_match_prefi
 
 TEST(frontend, analyze_rejects_for_loop_body_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { guard match item > 0 else { case true: return "
+        "route GET \"/x\" { for item in [1] { guard match item > 0 else { case true: return "
         "498 case _: return 499 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24364,7 +24357,7 @@ TEST(frontend, analyze_plain_for_rejects_for_loop_body_guard_match_on_non_error_
 
 TEST(frontend, analyze_for_rejects_for_loop_body_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { guard match item > 0 else { case true: return "
+        "route GET \"/x\" { for item in [1] { guard match item > 0 else { case true: return "
         "498 case _: return 499 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24377,7 +24370,7 @@ TEST(frontend, analyze_for_rejects_for_loop_body_guard_match_on_non_error_value)
 
 TEST(frontend, analyze_rejects_for_loop_after_loop_body_return) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { return 200 inline for other in [2] { return "
+        "route GET \"/x\" { for item in [1] { return 200 for other in [2] { return "
         "201 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24403,7 +24396,7 @@ TEST(frontend, analyze_plain_for_rejects_for_loop_after_loop_body_return) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_fail_body) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let ok = item > 1 "
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let ok = item > 1 "
         "guard ok else { let fail = item == 1 if fail { return 498 } else { return 499 } } "
         "return 201 } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24495,7 +24488,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_fail_body) 
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
         "match path { case \"/users\": return 201 case _: return 404 } case _: return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24579,7 +24572,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
         "match path { case \"/users\": if item == 1 { return 201 } else { return 202 } case _: "
         "return 404 } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24667,7 +24660,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_if) {
 
 TEST(frontend, analyze_for_loop_body_nested_match_preserves_outer_arm_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1 if false: match item { "
+        "route GET \"/x\" { for item in [1] { match item { case 1 if false: match item { "
         "case 1: return 201 case _: return 202 } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24727,7 +24720,7 @@ TEST(frontend, analyze_plain_for_loop_body_nested_match_preserves_outer_arm_guar
 
 TEST(frontend, analyze_for_loop_nested_match_rejects_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: match item { case 1: { "
+        "route GET \"/x\" { for item in [1] { match item { case 1: match item { case 1: { "
         "guard match item > 0 else { case true: return 401 case _: return 402 } return 201 } case "
         "_: return 404 } case _: return 500 } } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -24756,7 +24749,7 @@ TEST(frontend, analyze_plain_for_loop_nested_match_rejects_guard_match_on_non_er
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_variant_match) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
         "match state { case .ok: return 201 case _: return 404 } case _: return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
@@ -24845,7 +24838,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_variant_match) {
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_arm_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
         "match path { case \"/users\" if true: return 201 case _: return 404 } case _: return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24872,7 +24865,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_payload_binding) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match item { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match item { "
         "case 1: match state { case .ok(code): return 201 case _: return 404 } case _: return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24899,7 +24892,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_missing_inner_wildcard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
         "match path { case \"/users\": return 201 } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24923,7 +24916,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_missin
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_wildcard_before_last) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
         "match path { case _: return 404 case \"/users\": return 201 } case _: return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24950,7 +24943,7 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_bool_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let allowed = true match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let allowed = true match item { case 1: "
         "match allowed { case true: return 201 case true: return 202 case _: return 404 } case _: "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -24977,7 +24970,7 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_int_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let code = 1 match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let code = 1 match item { case 1: "
         "match code { case 1: return 201 case 1: return 202 case _: return 404 } case _: return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25004,7 +24997,7 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_string_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
         "match path { case \"/users\": return 201 case \"/users\": return 202 case _: return "
         "404 } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25032,7 +25025,7 @@ TEST(frontend,
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_variant_case) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
         "match state { case .ok: return 201 case .ok: return 202 case _: return 404 } case _: "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25062,7 +25055,7 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_foreign_inne
     const char* src =
         "variant Result { ok, err }\n"
         "variant Other { ok, err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok match item { case 1: "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
         "match state { case Other.ok: return 201 case _: return 404 } case _: return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25092,7 +25085,7 @@ TEST(frontend,
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_fallible_inner_subject) {
     const char* src =
         "func maybe_path(ok: bool) -> str { if ok { \"/users\" } else { error(.timeout) } }\n"
-        "route GET \"/x\" { inline for item in [1] { let path = maybe_path(false) match item { "
+        "route GET \"/x\" { for item in [1] { let path = maybe_path(false) match item { "
         "case 1: match path { case \"/users\": return 201 case _: return 404 } case _: return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25119,7 +25112,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_fallib
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let path = "
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
         "\"/users\" match path { case \"/users\": return 201 case _: return 404 } } case _: "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25208,7 +25201,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match)
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_variant_match) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let state = Result.ok "
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let state = Result.ok "
         "match state { case .ok: return 201 case _: return 404 } } case _: return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
@@ -25301,7 +25294,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_varian
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match_if) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: { let path = "
+        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
         "\"/users\" match path { case \"/users\": if item == 1 { return 201 } else { return 202 } "
         "case _: return 404 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25392,7 +25385,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match_
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_nested_match_on_payload) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): { match code { case 1: return 201 case _: return 404 } } case _: return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25470,7 +25463,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_on_p
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_on_payload) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): match code { case 1: return 201 case _: return 404 } case _: return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25546,7 +25539,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_on_payload
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_payload_then_nested_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): { guard code > 0 else { return 499 } match code { case 1: return 201 "
         "case _: return 404 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25662,7 +25655,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_payload_the
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_nested_match_if_uses_payload) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): { let path = \"/users\" match path { case \"/users\": if code > 0 { "
         "return 201 } else { return 202 } case _: return 404 } } case _: return 402 } } return "
         "500 }\n";
@@ -25745,7 +25738,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_if_u
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_nested_match) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let path = \"/users\" match item { case 1: { "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: { "
         "guard item == 1 else { return 499 } match path { case \"/users\": return 201 case _: "
         "return 404 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25893,7 +25886,7 @@ TEST(frontend,
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_multiple_guard_prefixes) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1: { let ok = n "
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
         "> 0 let still_ok = ok guard ok else { return 498 } guard still_ok else { return 499 } if "
         "still_ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -25982,7 +25975,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_multiple_guard_pr
 TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code): if code > 0 { return 201 } else { return 202 } case _: return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
@@ -26063,7 +26056,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_if) 
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_guard) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1 if n > 0: "
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if n > 0: "
         "return 201 case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26136,7 +26129,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_guard) {
 TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code) if code > 0: return 201 case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26222,7 +26215,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_guar
 TEST(frontend, analyze_for_loop_body_match_rejects_payload_binding_on_payloadless_case) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.err match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.err match state { "
         "case .err(code): return 201 case _: return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26248,7 +26241,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_rejects_payload_binding_on_payl
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_variant_case_falls_through_to_same_case) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { inline for item in [1] { let state = Result.ok(item) match state { "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
         "case .ok(code) if code > 200: return 200 case .ok(code): return 201 case _: return 404 "
         "} } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -26334,7 +26327,7 @@ TEST(frontend,
 
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let flag = true match flag { case true if "
+        "route GET \"/x\" { for item in [1] { let flag = true match flag { case true if "
         "item > 1: return 201 case true: return 202 case _: return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26412,7 +26405,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_bool_case_falls_thr
 
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_int_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item match n { case 1 if item > 1: "
+        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if item > 1: "
         "return 201 case 1: return 202 case _: return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26486,7 +26479,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_int_case_falls_thro
 
 TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_string_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let s = \"a\" match s { case \"a\": return "
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\": return "
         "201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26510,7 +26503,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_str
 
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let s = \"a\" match s { case \"a\" if item "
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\" if item "
         "> 1: return 201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26585,7 +26578,7 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_int_case) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { match item { case 1: return 201 case 1: "
+        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case 1: "
         "return 202 case _: return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26610,7 +26603,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_int
 TEST(frontend, mir_unrolls_for_loop_body_guard_match_with_body_local_subject) {
     const char* src = R"(
 route GET "/x" {
-    inline for item in [1] {
+    for item in [1] {
         let failed = error(.timeout)
         guard match failed else { case .timeout: return 401 case _: return 402 }
     }
@@ -26677,7 +26670,7 @@ route GET "/x" {
 
 TEST(frontend, analyze_for_loop_body_let_scoped_to_body) {
     const char* src =
-        "route GET \"/x\" { inline for item in [1] { let n = item guard n > 0 else "
+        "route GET \"/x\" { for item in [1] { let n = item guard n > 0 else "
         "{ return 400 } } let x = n return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26701,18 +26694,18 @@ TEST(frontend, analyze_plain_for_loop_body_let_scoped_to_body) {
 
 TEST(frontend, parse_for_loop_rejects_missing_in) {
     // Missing `in` is reported at the iterator name, not at the following expression.
-    const char* src = "route GET \"/x\" { inline for item [1, 2, 3] { return 200 } return 200 }\n";
+    const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("for loop expects 'in' after iterator name")));
-    CHECK_EQ(ast.error().span.col, 29u);
+    CHECK_EQ(ast.error().span.col, 22u);
 }
 
 TEST(frontend, parse_plain_for_loop_rejects_missing_in) {
-    // Plain `for` uses the same missing-`in` diagnostic as `inline for`.
+    // Missing `in` is reported at the iterator name.
     const char* src = "route GET \"/x\" { for item [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

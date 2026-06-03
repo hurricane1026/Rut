@@ -29,21 +29,18 @@ enum class AstStmtKind : u8 {
     Block,
     Wait,  // `wait(N)` / `wait(2s)` — suspend handler for a timer duration.
     WaitAny,
-    // `for <name> in <expr> { <body> }` and
-    // `inline for <name> in <expr> { <body> }`. Fields reused from
-    // AstStatement:
+    // `for <name> in <expr> { <body> }`. Fields reused from AstStatement:
     //   - name        = loop variable identifier (e.g., "item" in `for item in xs`)
     //   - expr        = iteration source expression (must type-check as Array<T>)
     //   - then_stmt   = body block (via parse_braced_stmt_body; may be a single
     //                   stmt if the block contained exactly one stmt)
-    //   - is_inline   = source used the compatibility `inline for` spelling.
     // No break / continue / else / labels (spec §3.3.9: every iteration runs
     // to completion). Analyze (Phase 3b) enforces the iteration source is
-    // array-typed and compile-time-sized and builds a HirForLoop. `inline`
-    // is retained in the AST for source fidelity; the compiler, not this
-    // marker, decides whether the loop can use the static unroll path. MIR
-    // build unrolls supported static for-loops into a source-ordered route
-    // step chain for Direct, if, and match route control — see mir_build.cc.
+    // array-typed and compile-time-sized and builds a HirForLoop. `inline for`
+    // is not accepted as a compatibility spelling; static `for` is the single
+    // canonical loop surface. MIR build unrolls supported static for-loops into
+    // a source-ordered route step chain for Direct, if, and match route control
+    // — see mir_build.cc.
     // Runtime iterables remain later work.
     For,
 };
@@ -158,7 +155,6 @@ struct AstStatement {
     Str name{};
     bool bind_value = false;
     bool is_const = false;
-    bool is_inline = false;
     bool has_type = false;
     AstTypeRef type{};
     AstExpr expr{};
