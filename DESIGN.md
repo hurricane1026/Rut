@@ -156,7 +156,10 @@ status matrix above.
   only when the semantics remain mechanically simple.
 - **HTTP concepts are native objects**: methods, status codes, headers, URLs, CIDR, media types are first-class language constructs, not strings
 - **All functions inline at compile time**: no runtime function calls, each route compiles to a single flat state machine
-- **Async is invisible**: no async/await/future/promise — user writes sequential code, compiler finds I/O points and generates state machines automatically
+- **Async suspension is explicit**: no async/await/future/promise, but every
+  operation that can suspend a handler must be visible as `wait`, `forward`, or
+  another explicit async boundary. The compiler lowers these points into state
+  machines; ordinary helper functions should not hide new yield points.
 - **Strong typing with domain types**: Duration, ByteSize, StatusCode, IP, CIDR, MediaType with compile-time validation
 - **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard

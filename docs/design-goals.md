@@ -9,6 +9,10 @@ Rut should avoid multiple equivalent ways to express the same common operation.
 When a feature is added, it should have a narrow role and a clear interaction
 with existing constructs.
 
+Necessary gateway capabilities should not be removed merely because they add
+language surface. Instead, Rut should refine them into one canonical form with a
+small, explicit state-machine meaning.
+
 Guidelines:
 
 - Prefer one canonical construct for each common gateway task.
@@ -37,6 +41,11 @@ should be able to identify:
 Features that cannot be represented in this model should be rejected, bounded,
 or isolated behind an explicit escape hatch with weaker guarantees.
 
+Suspension points should be explicit in the source. Rut can still let users
+write sequential code, but IO that can yield must be declared through constructs
+such as `wait`, `forward`, or an explicitly asynchronous operation. Ordinary
+helper functions should not hide new runtime yield points.
+
 ## Verifier-Oriented Semantics
 
 Rut should not depend on general-purpose formal tools for normal user-code
@@ -53,6 +62,11 @@ The verifier should focus on Rut-specific properties:
 
 TLA+ can remain as a design-level reference for runtime invariants and checker
 validation, but Java/TLC should not be required to verify ordinary user code.
+
+The verifier should prefer a small set of capability-specific models over one
+large universal model. For example, cross-shard state can start with the modes
+Rut needs for production and grow only when replay, simulation, and verifier
+semantics are clear.
 
 ## Replay and Simulation
 
@@ -84,6 +98,7 @@ Useful constraints:
 - domain-specific types,
 - no unbounded loops or recursion,
 - explicit `guard`, `match`, `wait`, and `forward` semantics,
+- explicit async declarations for operations that can suspend,
 - deterministic formatting and diagnostics,
 - route-local verification feedback.
 
@@ -105,3 +120,23 @@ part of the core surface:
 
 If the answer is unclear, the feature should stay experimental or be expressed
 as a lower-level escape hatch rather than added to the main language.
+
+## Current Review Decisions
+
+The current design review keeps the following direction:
+
+- Required gateway capabilities should stay in the roadmap, but each one needs a
+  canonical, verifier-friendly form.
+- Async behavior should be explicit at the source boundary. The compiler may
+  lower sequential syntax into states, but it should not discover hidden yield
+  points inside ordinary helper code.
+- Decorator execution ordering and magic request binding are known risks, but
+  are deferred. They should be revisited before decorators become part of the
+  stable core surface.
+- State consistency should be simplified to the production modes Rut actually
+  needs first. Additional consistency/backing-store modes should wait until
+  their replay and verifier contracts are precise.
+- Optional/fallback syntax remains open. Symbolic forms such as `?.` and `??`
+  are concise but may be less clear to new users and LLMs than named forms. The
+  core language should prefer whichever form yields the most deterministic
+  diagnostics and least ambiguity in generated code.
