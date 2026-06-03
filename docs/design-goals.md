@@ -136,7 +136,7 @@ The current design review keeps the following direction:
 - State consistency should be simplified to the production modes Rut actually
   needs first. Additional consistency/backing-store modes should wait until
   their replay and verifier contracts are precise.
-- Optional/fallback syntax remains open. Symbolic forms such as `?.` and `??`
-  are concise but may be less clear to new users and LLMs than named forms. The
-  core language should prefer whichever form yields the most deterministic
-  diagnostics and least ambiguity in generated code.
+- Optional/fallback syntax should prefer named forms in Rut Core. Use
+  `.or(default)`, `guard let`, or `match`; keep symbolic forms such as `?.` and
+  `??` non-core/reserved until they prove clearer for users, diagnostics, and
+  LLM-generated code.

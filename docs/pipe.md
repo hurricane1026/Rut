@@ -10,8 +10,9 @@ MIR/RIR opcode.
 
 Use `or` and `and` as boolean operators only. Function-call forms `or(...)` and
 `and(...)` are not supported, and `&&` / `||` are rejected at parse time. For
-optional/error fallback in expressions, use `any(...)` for nil/error fallback
-and `all(...)` for present-only fallback.
+optional/error fallback in expressions, Rut Core uses the named value method
+`.or(default)`. The names `any` and `all` are reserved for concurrent/race
+semantics rather than ordinary value fallback.
 
 ## Operator Precedence Notes
 
@@ -137,7 +138,7 @@ func allow_if_token(token: str, expected: str, ok_status: i32) -> i32 {
 
 route GET "/admin" {
     let code = req.header("Authorization") | allow_if_token(_, "Bearer root", 200)
-    let safe = any(code, 401)
+    let safe = code.or(401)
     if safe == 200 { return 200 } else { return 401 }
 }
 ```
@@ -161,7 +162,7 @@ arguments when a pipeline needs to project tuple slots.
 
 `req.header(...)` returns an optional string. A pipe stage only runs when the
 header is present; missing values flow through as `nil` and can be handled with
-`any(...)`.
+`.or(default)`.
 
 ```rut
 func tenant_from_host(host: str) -> str {
@@ -174,7 +175,7 @@ func status_for_tenant(tenant: str) -> i32 {
 
 route GET "/tenant" {
     let code = req.header("Host") | tenant_from_host(_) | status_for_tenant(_)
-    let safe = any(code, 404)
+    let safe = code.or(404)
     if safe == 200 { return 200 } else { return 404 }
 }
 ```
@@ -182,7 +183,7 @@ route GET "/tenant" {
 ## Error Flow
 
 Error values also flow through a pipe without calling later stages. Downstream
-`any(...)` can turn the error into a concrete fallback:
+`.or(default)` can turn the error into a concrete fallback:
 
 ```rut
 func parse_mode(raw: str) -> i32 {
@@ -195,7 +196,7 @@ func status_for_mode(mode: i32) -> i32 {
 
 route GET "/mode" {
     let code = req.header("X-Mode") | parse_mode(_) | status_for_mode(_)
-    let safe = any(code, 400)
+    let safe = code.or(400)
     if safe == 200 { return 200 } else { return 400 }
 }
 ```
@@ -203,22 +204,21 @@ route GET "/mode" {
 Known `nil` and known `error(...)` left-hand values are folded at analysis time
 and do not call the stage.
 
-`any(...)` and `all(...)` use conditional selection at runtime, so both operands
-are materialized before selection. If you need strict short-circuiting for
-side-effectful expressions, write it as an explicit `if` branch.
+Legacy fallback helpers such as `any(...)` and `all(...)` should not be used for
+ordinary value-flow code in Rut Core. If a fallback must be computed lazily or a
+side effect must short-circuit, write an explicit `if` branch.
 
-`all(...)` is the present-only fallback form:
+The present-only fallback shape should be spelled explicitly:
 
 ```rut
 route GET "/all" {
     let token = req.query("x-token")
-    let safe = all(token, any(token, ""))
+    let safe = if token? { token.or("") } else { "" }
     if safe == "" { return 401 } else { return 200 }
 }
 ```
 
-Use `all(...)` when you want the right-hand value to apply only when the
-left-hand value is present.
+Use explicit branching when the fallback rule is not simple "value or default".
 
 ## Tuple Slots
 

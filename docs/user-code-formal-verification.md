@@ -49,7 +49,7 @@ The first useful handler model can be a finite automaton:
 - handler state/basic-block id,
 - terminal responses,
 - `wait(ms)` and event waits,
-- `wait(any(...))` arms,
+- `wait any { ... }` race arms,
 - upstream connect/send/recv waits,
 - `forward` actions,
 - fail-closed error responses.
@@ -175,7 +175,7 @@ to invoking TLC for every route.
    clear.
 
 The first prototype should model one or two representative handlers, not the
-whole language. A good initial target is a handler with `wait(any(...))`, a
+whole language. A good initial target is a handler with `wait any { ... }`, a
 timer timeout branch, and an upstream connect/send/recv path.
 
 ## TLA+ Role
