@@ -585,7 +585,7 @@ TEST(simulate_engine, wait_any_expression_is_rejected) {
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.timer { "
         "return 408 } else { return 204 } }\n";
     FrontendRirModule rir{};
-    CHECK(!compile_to_rir(src, rir));
+    REQUIRE_FALSE(compile_to_rir(src, rir));
 }
 
 TEST(simulate_engine, wait_any_expression_recv_predicate_is_rejected) {
@@ -593,7 +593,7 @@ TEST(simulate_engine, wait_any_expression_recv_predicate_is_rejected) {
         "route GET \"/x\" { let ev = wait(any(downstream.recv(), timer(50))) if ev.recv { "
         "return 204 } else { return 408 } }\n";
     FrontendRirModule rir{};
-    CHECK(!compile_to_rir(src, rir));
+    REQUIRE_FALSE(compile_to_rir(src, rir));
 }
 
 TEST(simulate_engine, nested_wait_any_expression_is_rejected) {
@@ -605,7 +605,7 @@ TEST(simulate_engine, nested_wait_any_expression_is_rejected) {
         "if second.recv { return 204 } else { return 409 } "
         "}\n";
     FrontendRirModule rir{};
-    CHECK(!compile_to_rir(src, rir));
+    REQUIRE_FALSE(compile_to_rir(src, rir));
 }
 
 TEST(simulate_engine, wait_any_prefers_terminal_mismatch_over_failed_candidate) {
