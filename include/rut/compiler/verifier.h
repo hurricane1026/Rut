@@ -20,6 +20,7 @@ enum class VerifyIssueCode : u8 {
     InvalidStateZeroEntry,
     InvalidResumeBlock,
     MissingYieldMetadata,
+    UnsupportedYieldTerminator,
     InvalidYieldKind,
     InvalidYieldNextState,
     YieldMetadataMismatch,
@@ -173,6 +174,14 @@ inline VerifyResult verify_function(const Function* fn,
                                    term.imm.block_targets[0].id);
             }
         } else if (term.is_yield()) {
+            if (term.op != Opcode::YieldTimer) {
+                return verify_fail(summary,
+                                   VerifyIssueCode::UnsupportedYieldTerminator,
+                                   function_index,
+                                   bi,
+                                   block.inst_count - 1,
+                                   static_cast<u32>(term.op));
+            }
             if (term.op == Opcode::YieldTimer) {
                 const u8 kind = verify_yield_timer_kind(term);
                 if (!verify_valid_yield_kind(kind)) {

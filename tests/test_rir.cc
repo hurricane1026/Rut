@@ -586,6 +586,33 @@ TEST(RirVerifier, RejectsYieldCountMismatch) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsNonLoweredYieldTerminator) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+
+    b.set_insert_point(fn, entry);
+    V(b.emit_yield_http_get(lit("http://auth/verify"), kNoValue));
+
+    u32 payloads[1] = {0};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::HttpGet)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::UnsupportedYieldTerminator));
+    CHECK_EQ(result.issue.block_index, entry.id);
+    CHECK_EQ(result.issue.target_index, static_cast<u32>(Opcode::YieldHttpGet));
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, TreatsExplicitYieldResumeBlockAsReachable) {
     TestContext ctx;
     REQUIRE(ctx.init());
