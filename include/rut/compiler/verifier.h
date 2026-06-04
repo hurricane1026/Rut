@@ -28,6 +28,7 @@ enum class VerifyIssueCode : u8 {
     DuplicateYieldNextState,
     MissingYieldNextState,
     YieldMetadataMismatch,
+    InvalidYieldRuntimeProtocol,
     YieldCountMismatch,
     TooManyYieldStates,
     TooManyBlocks,
@@ -90,6 +91,52 @@ inline bool verify_valid_yield_kind(u8 kind) {
         case jit::YieldKind::UpstreamRecv:
         case jit::YieldKind::UpstreamSend:
             return true;
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+            return false;
+    }
+    return false;
+}
+
+enum class VerifyYieldRuntimeClass : u8 {
+    Timer,
+    Event,
+    Unsupported,
+};
+
+inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
+    switch (static_cast<jit::YieldKind>(kind)) {
+        case jit::YieldKind::Timer:
+            return VerifyYieldRuntimeClass::Timer;
+        case jit::YieldKind::Any:
+        case jit::YieldKind::Recv:
+        case jit::YieldKind::UpstreamConnect:
+        case jit::YieldKind::UpstreamRecv:
+        case jit::YieldKind::UpstreamSend:
+            return VerifyYieldRuntimeClass::Event;
+        case jit::YieldKind::Send:
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+            return VerifyYieldRuntimeClass::Unsupported;
+    }
+    return VerifyYieldRuntimeClass::Unsupported;
+}
+
+inline bool verify_valid_yield_runtime_protocol(u8 kind, u32 payload) {
+    if (verify_yield_runtime_class(kind) == VerifyYieldRuntimeClass::Unsupported) return false;
+
+    switch (static_cast<jit::YieldKind>(kind)) {
+        case jit::YieldKind::Timer:
+        case jit::YieldKind::Any:
+        case jit::YieldKind::Recv:
+            return true;
+        case jit::YieldKind::UpstreamConnect:
+        case jit::YieldKind::UpstreamRecv:
+        case jit::YieldKind::UpstreamSend:
+            return payload != 0;
+        case jit::YieldKind::Send:
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
         case jit::YieldKind::Forward:
@@ -237,6 +284,14 @@ inline VerifyResult verify_function(const Function* fn,
                 }
                 const u32 yi = static_cast<u32>(next_state - 1);
                 const u32 payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
+                if (!verify_valid_yield_runtime_protocol(kind, payload)) {
+                    return verify_fail(summary,
+                                       VerifyIssueCode::InvalidYieldRuntimeProtocol,
+                                       function_index,
+                                       bi,
+                                       block.inst_count - 1,
+                                       kind);
+                }
                 if (fn->yield_kinds[yi] != kind || fn->yield_payload[yi] != payload) {
                     return verify_fail(summary,
                                        VerifyIssueCode::YieldMetadataMismatch,
@@ -444,6 +499,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "MissingYieldNextState";
         case VerifyIssueCode::YieldMetadataMismatch:
             return "YieldMetadataMismatch";
+        case VerifyIssueCode::InvalidYieldRuntimeProtocol:
+            return "InvalidYieldRuntimeProtocol";
         case VerifyIssueCode::YieldCountMismatch:
             return "YieldCountMismatch";
         case VerifyIssueCode::TooManyYieldStates:
