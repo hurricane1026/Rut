@@ -20,6 +20,7 @@ enum class VerifyIssueCode : u8 {
     InvalidJumpTarget,
     InvalidStateZeroEntry,
     InvalidResumeBlock,
+    MissingYieldResumeMapping,
     MissingYieldMetadata,
     UnsupportedYieldTerminator,
     InvalidYieldKind,
@@ -256,6 +257,9 @@ inline VerifyResult verify_function(const Function* fn,
     }
     summary.yield_count = fn->yield_count;
 
+    if (fn->yield_count > 0 && !fn->has_explicit_resume_blocks && !fn->state_zero_enters_entry) {
+        return verify_fail(summary, VerifyIssueCode::MissingYieldResumeMapping, function_index);
+    }
     if (fn->state_zero_enters_entry) {
         if (fn->state_zero_entry_block >= fn->block_count ||
             fn->resume_terminal_block >= fn->block_count) {
@@ -404,6 +408,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidStateZeroEntry";
         case VerifyIssueCode::InvalidResumeBlock:
             return "InvalidResumeBlock";
+        case VerifyIssueCode::MissingYieldResumeMapping:
+            return "MissingYieldResumeMapping";
         case VerifyIssueCode::MissingYieldMetadata:
             return "MissingYieldMetadata";
         case VerifyIssueCode::UnsupportedYieldTerminator:

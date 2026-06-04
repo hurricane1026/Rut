@@ -644,6 +644,31 @@ TEST(RirVerifier, TreatsExplicitYieldResumeBlockAsReachable) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsYieldWithoutResumeMapping) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::MissingYieldResumeMapping));
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsInvalidYieldNextState) {
     TestContext ctx;
     REQUIRE(ctx.init());

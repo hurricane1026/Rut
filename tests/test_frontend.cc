@@ -302,6 +302,26 @@ TEST(frontend, rir_verifier_e2e_reports_invalid_resume_block) {
     rir.destroy();
 }
 
+TEST(frontend, rir_verifier_e2e_reports_missing_yield_resume_mapping) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE_GT(fn.yield_count, 0u);
+    REQUIRE(fn.has_explicit_resume_blocks || fn.state_zero_enters_entry);
+
+    fn.has_explicit_resume_blocks = false;
+    fn.state_zero_enters_entry = false;
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::MissingYieldResumeMapping));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: MissingYieldResumeMapping") != std::string::npos);
+
+    rir.destroy();
+}
+
 TEST(frontend, lex_parse_return_route) {
     const char* src = "upstream api\nroute GET \"/users\" { return 200 }\n";
     auto lexed = lex(lit(src));
