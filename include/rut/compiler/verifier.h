@@ -265,6 +265,14 @@ inline VerifyResult verify_function(const Function* fn,
             fn->resume_terminal_block >= fn->block_count) {
             return verify_fail(summary, VerifyIssueCode::InvalidStateZeroEntry, function_index);
         }
+        if (!fn->has_explicit_resume_blocks && fn->state_zero_entry_block != fn->blocks[0].id.id) {
+            return verify_fail(summary,
+                               VerifyIssueCode::InvalidStateZeroEntry,
+                               function_index,
+                               0,
+                               0,
+                               fn->state_zero_entry_block);
+        }
     }
     if (fn->has_explicit_resume_blocks) {
         if (fn->yield_count >= Function::kMaxResumeBlocks) {

@@ -323,6 +323,30 @@ TEST(frontend, rir_verifier_e2e_reports_invalid_state_zero_resume_target) {
     rir.destroy();
 }
 
+TEST(frontend, rir_verifier_e2e_reports_invalid_non_explicit_state_zero_entry) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE(fn.has_explicit_resume_blocks);
+    REQUIRE_GT(fn.yield_count, 0u);
+    REQUIRE_NE(fn.resume_blocks[fn.yield_count], fn.blocks[0].id.id);
+
+    fn.has_explicit_resume_blocks = false;
+    fn.state_zero_enters_entry = true;
+    fn.state_zero_entry_block = fn.resume_blocks[fn.yield_count];
+    fn.resume_terminal_block = fn.resume_blocks[fn.yield_count];
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidStateZeroEntry));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidStateZeroEntry") != std::string::npos);
+    CHECK(text.find("target=") != std::string::npos);
+
+    rir.destroy();
+}
+
 TEST(frontend, rir_verifier_e2e_reports_missing_yield_resume_mapping) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));

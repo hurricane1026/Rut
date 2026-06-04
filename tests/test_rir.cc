@@ -677,6 +677,41 @@ TEST(RirVerifier, RejectsExplicitResumeStateZeroDifferentFromEntry) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsNonExplicitStateZeroDifferentFromEntry) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto stale_entry = V(b.create_block(fn, lit("stale_entry")));
+    auto terminal = V(b.create_block(fn, lit("terminal")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    VOK(b.set_state_zero_entry_resume(fn, terminal, stale_entry));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    b.set_insert_point(fn, stale_entry);
+    VOK(b.emit_ret_status(202));
+
+    b.set_insert_point(fn, terminal);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidStateZeroEntry));
+    CHECK_EQ(result.issue.target_index, stale_entry.id);
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsYieldWithoutResumeMapping) {
     TestContext ctx;
     REQUIRE(ctx.init());
