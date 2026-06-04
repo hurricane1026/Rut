@@ -81,7 +81,21 @@ inline VerifyResult verify_fail(VerifySummary summary,
 }
 
 inline bool verify_valid_yield_kind(u8 kind) {
-    return kind <= static_cast<u8>(jit::YieldKind::UpstreamSend);
+    switch (static_cast<jit::YieldKind>(kind)) {
+        case jit::YieldKind::Timer:
+        case jit::YieldKind::Any:
+        case jit::YieldKind::Recv:
+        case jit::YieldKind::Send:
+        case jit::YieldKind::UpstreamConnect:
+        case jit::YieldKind::UpstreamRecv:
+        case jit::YieldKind::UpstreamSend:
+            return true;
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+            return false;
+    }
+    return false;
 }
 
 inline bool verify_valid_block_target(const Function& fn, BlockId target) {

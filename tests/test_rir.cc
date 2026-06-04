@@ -805,6 +805,38 @@ TEST(RirVerifier, RejectsInvalidEncodedYieldKind) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsUnsupportedLoweredYieldKind) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::HttpPost)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::HttpPost), 50, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidYieldKind));
+    CHECK_EQ(result.issue.target_index, static_cast<u32>(jit::YieldKind::HttpPost));
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsYieldTerminatorMetadataMismatch) {
     TestContext ctx;
     REQUIRE(ctx.init());
