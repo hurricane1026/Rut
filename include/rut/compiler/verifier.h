@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/compiler/rir.h"
+#include "rut/compiler/rir_printer.h"
 #include "rut/jit/handler_abi.h"
 
 namespace rut {
@@ -352,6 +353,76 @@ inline VerifyResult verify_module(const Module& mod, VerifyOptions options = {})
     result.ok = true;
     result.summary = summary;
     return result;
+}
+
+inline const char* verify_issue_code_name(VerifyIssueCode code) {
+    switch (code) {
+        case VerifyIssueCode::None:
+            return "None";
+        case VerifyIssueCode::MissingFunction:
+            return "MissingFunction";
+        case VerifyIssueCode::MissingBlocks:
+            return "MissingBlocks";
+        case VerifyIssueCode::MissingEntry:
+            return "MissingEntry";
+        case VerifyIssueCode::BlockIdMismatch:
+            return "BlockIdMismatch";
+        case VerifyIssueCode::MissingInstructions:
+            return "MissingInstructions";
+        case VerifyIssueCode::MissingTerminator:
+            return "MissingTerminator";
+        case VerifyIssueCode::TerminatorBeforeEnd:
+            return "TerminatorBeforeEnd";
+        case VerifyIssueCode::InvalidBranchTarget:
+            return "InvalidBranchTarget";
+        case VerifyIssueCode::InvalidJumpTarget:
+            return "InvalidJumpTarget";
+        case VerifyIssueCode::InvalidStateZeroEntry:
+            return "InvalidStateZeroEntry";
+        case VerifyIssueCode::InvalidResumeBlock:
+            return "InvalidResumeBlock";
+        case VerifyIssueCode::MissingYieldMetadata:
+            return "MissingYieldMetadata";
+        case VerifyIssueCode::UnsupportedYieldTerminator:
+            return "UnsupportedYieldTerminator";
+        case VerifyIssueCode::InvalidYieldKind:
+            return "InvalidYieldKind";
+        case VerifyIssueCode::InvalidYieldNextState:
+            return "InvalidYieldNextState";
+        case VerifyIssueCode::YieldMetadataMismatch:
+            return "YieldMetadataMismatch";
+        case VerifyIssueCode::YieldCountMismatch:
+            return "YieldCountMismatch";
+        case VerifyIssueCode::TooManyBlocks:
+            return "TooManyBlocks";
+        case VerifyIssueCode::UnreachableBlock:
+            return "UnreachableBlock";
+    }
+    return "Unknown";
+}
+
+inline void format_verify_result(PrintBuf& buf, const VerifyResult& result) {
+    buf.put_cstr("rir verifier: ");
+    if (result.ok) {
+        buf.put_cstr("ok");
+        return;
+    }
+
+    buf.put_cstr(verify_issue_code_name(result.issue.code));
+    buf.put_cstr(" function=");
+    buf.put_u32(result.issue.function_index);
+    buf.put_cstr(" block=");
+    buf.put_u32(result.issue.block_index);
+    buf.put_cstr(" inst=");
+    buf.put_u32(result.issue.inst_index);
+
+    if (result.issue.code == VerifyIssueCode::UnsupportedYieldTerminator) {
+        buf.put_cstr(" opcode=");
+        print_opcode(buf, static_cast<Opcode>(result.issue.target_index));
+    } else {
+        buf.put_cstr(" target=");
+        buf.put_u32(result.issue.target_index);
+    }
 }
 
 }  // namespace rir

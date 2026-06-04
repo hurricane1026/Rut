@@ -3,10 +3,12 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/verifier.h"
 #include "test.h"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <string>
 using namespace rut;
 static Str lit(const char* s) {
     u32 n = 0;
@@ -32,6 +34,19 @@ static bool function_has_op(const rir::Function& fn, rir::Opcode op) {
     }
     return false;
 }
+
+static bool replace_first_op(rir::Function& fn, rir::Opcode from, rir::Opcode to) {
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++) {
+            if (fn.blocks[bi].insts[ii].op == from) {
+                fn.blocks[bi].insts[ii].op = to;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // RAII wrapper for FrontendResult<T*>. The frontend APIs (parse_file,
 // analyze_file, build_mir) all .release() a unique_ptr and hand back a raw
 // pointer. Tests allocated hundreds of these without ever deleting; before
@@ -96,6 +111,48 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
 }
+
+TEST(frontend, rir_verifier_e2e_reports_non_lowered_yield_terminator) {
+    const char* src = "route GET \"/sleep\" { wait(1) return 204 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    REQUIRE(function_has_op(rir.module.functions[0], rir::Opcode::YieldTimer));
+
+    // Simulate a stale lowering/codegen boundary bug: the source went through
+    // the full frontend pipeline, but the RIR handed to verifier still contains
+    // a non-lowered yield opcode that current JIT codegen cannot execute.
+    REQUIRE(replace_first_op(
+        rir.module.functions[0], rir::Opcode::YieldTimer, rir::Opcode::YieldHttpGet));
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::UnsupportedYieldTerminator));
+
+    char msg_data[256];
+    rir::PrintBuf msg;
+    msg.init(msg_data, sizeof(msg_data), -1);
+    rir::format_verify_result(msg, verified);
+    const std::string text(msg.data, msg.len);
+    CHECK(text.find("rir verifier: UnsupportedYieldTerminator") != std::string::npos);
+    CHECK(text.find("function=0") != std::string::npos);
+    CHECK(text.find("opcode=yield.http_get") != std::string::npos);
+
+    rir.destroy();
+}
+
 TEST(frontend, lex_parse_return_route) {
     const char* src = "upstream api\nroute GET \"/users\" { return 200 }\n";
     auto lexed = lex(lit(src));
