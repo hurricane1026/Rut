@@ -586,6 +586,137 @@ TEST(RirVerifier, RejectsYieldCountMismatch) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, TreatsExplicitYieldResumeBlockAsReachable) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(result.ok);
+    CHECK_EQ(result.summary.reachable_block_count, 2u);
+    CHECK_EQ(result.summary.branch_edge_count, 1u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsInvalidYieldNextState) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+    fn->blocks[entry.id].insts[0].imm.i64_val =
+        (static_cast<i64>(jit::YieldKind::Timer) << 48) | (static_cast<i64>(2) << 32) | 50;
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidYieldNextState));
+    CHECK_EQ(result.issue.target_index, 2u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsInvalidEncodedYieldKind) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+    fn->blocks[entry.id].insts[0].imm.i64_val =
+        (static_cast<i64>(99) << 48) | (static_cast<i64>(1) << 32) | 50;
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidYieldKind));
+    CHECK_EQ(result.issue.target_index, 99u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsYieldTerminatorMetadataMismatch) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 75, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::YieldMetadataMismatch));
+    CHECK_EQ(result.issue.target_index, 1u);
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsUnreachableBlockByDefault) {
     TestContext ctx;
     REQUIRE(ctx.init());

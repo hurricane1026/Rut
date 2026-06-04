@@ -21,6 +21,8 @@ enum class VerifyIssueCode : u8 {
     InvalidResumeBlock,
     MissingYieldMetadata,
     InvalidYieldKind,
+    InvalidYieldNextState,
+    YieldMetadataMismatch,
     YieldCountMismatch,
     TooManyBlocks,
     UnreachableBlock,
@@ -78,6 +80,18 @@ inline bool verify_valid_yield_kind(u8 kind) {
 
 inline bool verify_valid_block_target(const Function& fn, BlockId target) {
     return target != kNoBlock && target.id < fn.block_count;
+}
+
+inline u8 verify_yield_timer_kind(const Instruction& inst) {
+    const u64 packed = static_cast<u64>(inst.imm.i64_val);
+    u8 kind = static_cast<u8>((packed >> 48) & 0xffu);
+    if (kind == 0) kind = static_cast<u8>(jit::YieldKind::Timer);
+    return kind;
+}
+
+inline u16 verify_yield_timer_next_state(const Instruction& inst) {
+    const u64 packed = static_cast<u64>(inst.imm.i64_val);
+    return static_cast<u16>((packed >> 32) & 0xffffu);
 }
 
 inline VerifyResult verify_function(const Function* fn,
@@ -159,6 +173,27 @@ inline VerifyResult verify_function(const Function* fn,
                                    term.imm.block_targets[0].id);
             }
         } else if (term.is_yield()) {
+            if (term.op == Opcode::YieldTimer) {
+                const u8 kind = verify_yield_timer_kind(term);
+                if (!verify_valid_yield_kind(kind)) {
+                    return verify_fail(summary,
+                                       VerifyIssueCode::InvalidYieldKind,
+                                       function_index,
+                                       bi,
+                                       block.inst_count - 1,
+                                       kind);
+                }
+
+                const u16 next_state = verify_yield_timer_next_state(term);
+                if (next_state == 0 || next_state > fn->yield_count) {
+                    return verify_fail(summary,
+                                       VerifyIssueCode::InvalidYieldNextState,
+                                       function_index,
+                                       bi,
+                                       block.inst_count - 1,
+                                       next_state);
+                }
+            }
             seen_yield_terminators++;
         } else {
             summary.terminal_block_count++;
@@ -195,7 +230,10 @@ inline VerifyResult verify_function(const Function* fn,
         }
     }
     if (fn->has_explicit_resume_blocks) {
-        for (u32 i = 0; i < fn->yield_count && i < Function::kMaxResumeBlocks; i++) {
+        if (fn->yield_count >= Function::kMaxResumeBlocks) {
+            return verify_fail(summary, VerifyIssueCode::InvalidResumeBlock, function_index);
+        }
+        for (u32 i = 0; i <= fn->yield_count; i++) {
             if (fn->resume_blocks[i] >= fn->block_count) {
                 return verify_fail(summary,
                                    VerifyIssueCode::InvalidResumeBlock,
@@ -227,6 +265,44 @@ inline VerifyResult verify_function(const Function* fn,
             if (!reachable[target]) {
                 reachable[target] = true;
                 worklist[work_end++] = target;
+            }
+        } else if (term.op == Opcode::YieldTimer) {
+            const u16 next_state = verify_yield_timer_next_state(term);
+            const u8 kind = verify_yield_timer_kind(term);
+            const u32 payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
+
+            if (next_state == 0 || next_state > fn->yield_count) {
+                return verify_fail(summary,
+                                   VerifyIssueCode::InvalidYieldNextState,
+                                   function_index,
+                                   bi,
+                                   block.inst_count - 1,
+                                   next_state);
+            }
+            const u32 yi = static_cast<u32>(next_state - 1);
+            if (fn->yield_kinds[yi] != kind || fn->yield_payload[yi] != payload) {
+                return verify_fail(summary,
+                                   VerifyIssueCode::YieldMetadataMismatch,
+                                   function_index,
+                                   bi,
+                                   block.inst_count - 1,
+                                   next_state);
+            }
+
+            if (fn->has_explicit_resume_blocks) {
+                const u32 target = fn->resume_blocks[next_state];
+                summary.branch_edge_count++;
+                if (!reachable[target]) {
+                    reachable[target] = true;
+                    worklist[work_end++] = target;
+                }
+            } else if (fn->state_zero_enters_entry) {
+                const u32 target = fn->resume_terminal_block;
+                summary.branch_edge_count++;
+                if (!reachable[target]) {
+                    reachable[target] = true;
+                    worklist[work_end++] = target;
+                }
             }
         }
     }
