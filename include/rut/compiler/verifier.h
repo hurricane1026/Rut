@@ -146,9 +146,6 @@ inline VerifyResult verify_function(const Function* fn,
     u32 work_start = 0;
     u32 work_end = 0;
 
-    reachable[0] = true;
-    worklist[work_end++] = 0;
-
     u32 seen_yield_terminators = 0;
     bool seen_yield_next_state[Function::kMaxResumeBlocks]{};
 
@@ -279,14 +276,6 @@ inline VerifyResult verify_function(const Function* fn,
             fn->resume_terminal_block >= fn->block_count) {
             return verify_fail(summary, VerifyIssueCode::InvalidStateZeroEntry, function_index);
         }
-        if (!fn->has_explicit_resume_blocks && fn->state_zero_entry_block != fn->blocks[0].id.id) {
-            return verify_fail(summary,
-                               VerifyIssueCode::InvalidStateZeroEntry,
-                               function_index,
-                               0,
-                               0,
-                               fn->state_zero_entry_block);
-        }
     }
     if (fn->has_explicit_resume_blocks) {
         if (fn->yield_count >= Function::kMaxResumeBlocks) {
@@ -302,15 +291,16 @@ inline VerifyResult verify_function(const Function* fn,
                                    fn->resume_blocks[i]);
             }
         }
-        if (fn->resume_blocks[0] != fn->blocks[0].id.id) {
-            return verify_fail(summary,
-                               VerifyIssueCode::InvalidStateZeroEntry,
-                               function_index,
-                               0,
-                               0,
-                               fn->resume_blocks[0]);
-        }
     }
+
+    u32 reachable_root = fn->blocks[0].id.id;
+    if (fn->has_explicit_resume_blocks) {
+        reachable_root = fn->resume_blocks[0];
+    } else if (fn->state_zero_enters_entry) {
+        reachable_root = fn->state_zero_entry_block;
+    }
+    reachable[reachable_root] = true;
+    worklist[work_end++] = reachable_root;
 
     while (work_start < work_end) {
         const u32 bi = worklist[work_start++];

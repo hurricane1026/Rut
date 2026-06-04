@@ -328,7 +328,7 @@ TEST(frontend, rir_verifier_e2e_reports_invalid_resume_block) {
     rir.destroy();
 }
 
-TEST(frontend, rir_verifier_e2e_reports_invalid_state_zero_resume_target) {
+TEST(frontend, rir_verifier_e2e_reports_state_zero_resume_target_that_skips_entry) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
     auto& fn = rir.module.functions[0];
@@ -341,15 +341,15 @@ TEST(frontend, rir_verifier_e2e_reports_invalid_state_zero_resume_target) {
     auto verified = rir::verify_module(rir.module);
     REQUIRE(!verified.ok);
     CHECK_EQ(static_cast<u8>(verified.issue.code),
-             static_cast<u8>(rir::VerifyIssueCode::InvalidStateZeroEntry));
+             static_cast<u8>(rir::VerifyIssueCode::UnreachableBlock));
     const std::string text = format_verify_text(verified);
-    CHECK(text.find("rir verifier: InvalidStateZeroEntry") != std::string::npos);
-    CHECK(text.find("target=") != std::string::npos);
+    CHECK(text.find("rir verifier: UnreachableBlock") != std::string::npos);
+    CHECK(text.find("block=0") != std::string::npos);
 
     rir.destroy();
 }
 
-TEST(frontend, rir_verifier_e2e_reports_invalid_non_explicit_state_zero_entry) {
+TEST(frontend, rir_verifier_e2e_reports_non_explicit_state_zero_that_skips_entry) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
     auto& fn = rir.module.functions[0];
@@ -365,10 +365,10 @@ TEST(frontend, rir_verifier_e2e_reports_invalid_non_explicit_state_zero_entry) {
     auto verified = rir::verify_module(rir.module);
     REQUIRE(!verified.ok);
     CHECK_EQ(static_cast<u8>(verified.issue.code),
-             static_cast<u8>(rir::VerifyIssueCode::InvalidStateZeroEntry));
+             static_cast<u8>(rir::VerifyIssueCode::UnreachableBlock));
     const std::string text = format_verify_text(verified);
-    CHECK(text.find("rir verifier: InvalidStateZeroEntry") != std::string::npos);
-    CHECK(text.find("target=") != std::string::npos);
+    CHECK(text.find("rir verifier: UnreachableBlock") != std::string::npos);
+    CHECK(text.find("block=0") != std::string::npos);
 
     rir.destroy();
 }
