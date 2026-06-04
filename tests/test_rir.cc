@@ -872,6 +872,106 @@ TEST(RirVerifier, RejectsUnsupportedLoweredYieldKind) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsRuntimeUnsupportedDownstreamSendYield) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {0};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Send)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Send), 0, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
+    CHECK_EQ(result.issue.target_index, static_cast<u32>(jit::YieldKind::Send));
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsUpstreamConnectYieldWithoutTargetPayload) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {0};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::UpstreamConnect)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::UpstreamConnect), 0, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
+    CHECK_EQ(result.issue.target_index, static_cast<u32>(jit::YieldKind::UpstreamConnect));
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsUpstreamIoYieldWithoutTargetPayload) {
+    const jit::YieldKind kinds[] = {jit::YieldKind::UpstreamRecv, jit::YieldKind::UpstreamSend};
+
+    for (jit::YieldKind yield_kind : kinds) {
+        TestContext ctx;
+        REQUIRE(ctx.init());
+
+        Builder b;
+        b.init(&ctx.mod);
+
+        auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        auto resume = V(b.create_block(fn, lit("resume")));
+
+        u32 payloads[1] = {0};
+        u8 encoded_kinds[1] = {static_cast<u8>(yield_kind)};
+        VOK(b.set_yield_payload(fn, payloads, 1, encoded_kinds));
+        BlockId resume_blocks[2] = {entry, resume};
+        VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+        b.set_insert_point(fn, entry);
+        VOK(b.emit_yield_event(static_cast<u8>(yield_kind), 0, 1));
+
+        b.set_insert_point(fn, resume);
+        VOK(b.emit_ret_status(204));
+
+        auto result = verify_function(fn);
+        REQUIRE(!result.ok);
+        CHECK_EQ(static_cast<u8>(result.issue.code),
+                 static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
+        CHECK_EQ(result.issue.target_index, static_cast<u32>(yield_kind));
+
+        ctx.destroy();
+    }
+}
+
 TEST(RirVerifier, RejectsYieldTerminatorMetadataMismatch) {
     TestContext ctx;
     REQUIRE(ctx.init());

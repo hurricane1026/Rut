@@ -283,6 +283,64 @@ TEST(frontend, rir_verifier_e2e_reports_yield_metadata_mismatch) {
     rir.destroy();
 }
 
+TEST(frontend, rir_verifier_e2e_reports_invalid_yield_runtime_protocol) {
+    FrontendRirModule rir{};
+    REQUIRE(
+        lower_src_to_rir("upstream api at \"127.0.0.1:9000\"\n"
+                         "route GET \"/connect\" { wait(upstream(api).connect()) return 204 }\n",
+                         rir));
+    auto& fn = rir.module.functions[0];
+    auto* yield = find_first_op(fn, rir::Opcode::YieldTimer);
+    REQUIRE(yield != nullptr);
+    REQUIRE(fn.yield_payload != nullptr);
+
+    const u64 packed = static_cast<u64>(yield->imm.i64_val);
+    const u64 next_state = (packed >> 32) & 0xffffu;
+    const u64 kind = (packed >> 48) & 0xffu;
+    REQUIRE_EQ(kind, static_cast<u64>(jit::YieldKind::UpstreamConnect));
+    yield->imm.i64_val = static_cast<i64>((kind << 48) | (next_state << 32));
+    fn.yield_payload[0] = 0;
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidYieldRuntimeProtocol));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidYieldRuntimeProtocol") != std::string::npos);
+    CHECK(text.find("target=7") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_targetless_upstream_io_yield) {
+    FrontendRirModule rir{};
+    REQUIRE(
+        lower_src_to_rir("upstream api at \"127.0.0.1:9000\"\n"
+                         "route GET \"/recv\" { wait(upstream(api).recv()) return 204 }\n",
+                         rir));
+    auto& fn = rir.module.functions[0];
+    auto* yield = find_first_op(fn, rir::Opcode::YieldTimer);
+    REQUIRE(yield != nullptr);
+    REQUIRE(fn.yield_payload != nullptr);
+
+    const u64 packed = static_cast<u64>(yield->imm.i64_val);
+    const u64 next_state = (packed >> 32) & 0xffffu;
+    const u64 kind = (packed >> 48) & 0xffu;
+    REQUIRE_EQ(kind, static_cast<u64>(jit::YieldKind::UpstreamRecv));
+    yield->imm.i64_val = static_cast<i64>((kind << 48) | (next_state << 32));
+    fn.yield_payload[0] = 0;
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidYieldRuntimeProtocol));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidYieldRuntimeProtocol") != std::string::npos);
+    CHECK(text.find("target=8") != std::string::npos);
+
+    rir.destroy();
+}
+
 TEST(frontend, rir_verifier_e2e_reports_duplicate_yield_next_state) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(500) wait(1000) return 204 }\n", rir));

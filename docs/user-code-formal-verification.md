@@ -189,12 +189,25 @@ Covered today:
 - every block has exactly one final terminator,
 - branch and jump targets point at existing blocks,
 - all blocks are reachable by default,
-- RIR yield terminators match function yield metadata,
-- yield kinds are inside the runtime ABI range.
+- RIR yield terminators are lowered to the executable `YieldTimer` state-machine
+  boundary; non-lowered yield opcodes are rejected,
+- encoded yield kind, next-state, and payload fields match function yield
+  metadata for every block, including dead blocks when reachability is relaxed,
+- each yield state has exactly one producer: duplicate and missing encoded
+  `next_state` values are rejected,
+- yield functions declare a supported resume mapping, and verifier reachability
+  starts from the same state-zero dispatch root used by codegen,
+- lowered yield kinds are restricted to runtime-schedulable wait/event kinds,
+- the first runtime-protocol checks reject yield shapes that the event loop
+  cannot safely schedule, such as downstream-send event yields and upstream
+  connect/recv/send yields without a target payload.
 
 This is not yet the full safety/deadlock checker described above. It is the
 foundation for that checker: a route automaton must be structurally valid before
 Rut can prove callback hygiene, declared resume targets, or progress properties.
+The next verifier layer should lift the currently hard-coded runtime-protocol
+checks into a compact handler automaton with explicit pending operation and
+callback-slot state.
 
 ## TLA+ Role
 
