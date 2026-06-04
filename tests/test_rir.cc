@@ -744,6 +744,45 @@ TEST(RirVerifier, RejectsYieldTerminatorMetadataMismatch) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsDuplicateYieldNextState) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume1 = V(b.create_block(fn, lit("resume1")));
+    auto resume2 = V(b.create_block(fn, lit("resume2")));
+
+    u32 payloads[2] = {50, 100};
+    u8 kinds[2] = {static_cast<u8>(jit::YieldKind::Timer), static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 2, kinds));
+    BlockId resume_blocks[3] = {entry, resume1, resume2};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 3));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    b.set_insert_point(fn, resume1);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 100, 2));
+    fn->blocks[resume1.id].insts[0].imm.i64_val =
+        (static_cast<i64>(jit::YieldKind::Timer) << 48) | (static_cast<i64>(1) << 32) | 100;
+
+    b.set_insert_point(fn, resume2);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::DuplicateYieldNextState));
+    CHECK_EQ(result.issue.block_index, resume1.id);
+    CHECK_EQ(result.issue.target_index, 1u);
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsUnreachableBlockByDefault) {
     TestContext ctx;
     REQUIRE(ctx.init());

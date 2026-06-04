@@ -24,8 +24,11 @@ enum class VerifyIssueCode : u8 {
     UnsupportedYieldTerminator,
     InvalidYieldKind,
     InvalidYieldNextState,
+    DuplicateYieldNextState,
+    MissingYieldNextState,
     YieldMetadataMismatch,
     YieldCountMismatch,
+    TooManyYieldStates,
     TooManyBlocks,
     UnreachableBlock,
 };
@@ -116,6 +119,10 @@ inline VerifyResult verify_function(const Function* fn,
     if (fn->block_count > kMaxVerifierBlocks) {
         return verify_fail(summary, VerifyIssueCode::TooManyBlocks, function_index);
     }
+    if (fn->yield_count >= Function::kMaxResumeBlocks) {
+        return verify_fail(
+            summary, VerifyIssueCode::TooManyYieldStates, function_index, 0, 0, fn->yield_count);
+    }
 
     summary.block_count = fn->block_count;
 
@@ -128,6 +135,7 @@ inline VerifyResult verify_function(const Function* fn,
     worklist[work_end++] = 0;
 
     u32 seen_yield_terminators = 0;
+    bool seen_yield_next_state[Function::kMaxResumeBlocks]{};
 
     for (u32 bi = 0; bi < fn->block_count; bi++) {
         const Block& block = fn->blocks[bi];
@@ -203,6 +211,15 @@ inline VerifyResult verify_function(const Function* fn,
                                        block.inst_count - 1,
                                        next_state);
                 }
+                if (seen_yield_next_state[next_state]) {
+                    return verify_fail(summary,
+                                       VerifyIssueCode::DuplicateYieldNextState,
+                                       function_index,
+                                       bi,
+                                       block.inst_count - 1,
+                                       next_state);
+                }
+                seen_yield_next_state[next_state] = true;
             }
             seen_yield_terminators++;
         } else {
@@ -217,6 +234,12 @@ inline VerifyResult verify_function(const Function* fn,
                            0,
                            seen_yield_terminators,
                            fn->yield_count);
+    }
+    for (u32 yi = 1; yi <= fn->yield_count; yi++) {
+        if (!seen_yield_next_state[yi]) {
+            return verify_fail(
+                summary, VerifyIssueCode::MissingYieldNextState, function_index, 0, yi, yi);
+        }
     }
     if (fn->yield_count > 0 && (fn->yield_payload == nullptr || fn->yield_kinds == nullptr)) {
         return verify_fail(summary, VerifyIssueCode::MissingYieldMetadata, function_index);
@@ -389,10 +412,16 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidYieldKind";
         case VerifyIssueCode::InvalidYieldNextState:
             return "InvalidYieldNextState";
+        case VerifyIssueCode::DuplicateYieldNextState:
+            return "DuplicateYieldNextState";
+        case VerifyIssueCode::MissingYieldNextState:
+            return "MissingYieldNextState";
         case VerifyIssueCode::YieldMetadataMismatch:
             return "YieldMetadataMismatch";
         case VerifyIssueCode::YieldCountMismatch:
             return "YieldCountMismatch";
+        case VerifyIssueCode::TooManyYieldStates:
+            return "TooManyYieldStates";
         case VerifyIssueCode::TooManyBlocks:
             return "TooManyBlocks";
         case VerifyIssueCode::UnreachableBlock:
