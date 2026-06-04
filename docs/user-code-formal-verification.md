@@ -178,6 +178,24 @@ The first prototype should model one or two representative handlers, not the
 whole language. A good initial target is a handler with `wait any { ... }`, a
 timer timeout branch, and an upstream connect/send/recv path.
 
+## Current MVP
+
+The first native verifier entry point is RIR graph validation. It is intentionally
+small: it checks route-local block structure before any larger runtime model is
+introduced.
+
+Covered today:
+
+- every block has exactly one final terminator,
+- branch and jump targets point at existing blocks,
+- all blocks are reachable by default,
+- RIR yield terminators match function yield metadata,
+- yield kinds are inside the runtime ABI range.
+
+This is not yet the full safety/deadlock checker described above. It is the
+foundation for that checker: a route automaton must be structurally valid before
+Rut can prove callback hygiene, declared resume targets, or progress properties.
+
 ## TLA+ Role
 
 TLA+ should stay in the project for design-level runtime invariants and for

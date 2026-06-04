@@ -3,10 +3,12 @@
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
+#include "rut/compiler/verifier.h"
 #include "test.h"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <string>
 using namespace rut;
 static Str lit(const char* s) {
     u32 n = 0;
@@ -32,6 +34,36 @@ static bool function_has_op(const rir::Function& fn, rir::Opcode op) {
     }
     return false;
 }
+
+static bool replace_first_op(rir::Function& fn, rir::Opcode from, rir::Opcode to) {
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++) {
+            if (fn.blocks[bi].insts[ii].op == from) {
+                fn.blocks[bi].insts[ii].op = to;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static rir::Instruction* find_nth_op(rir::Function& fn, rir::Opcode op, u32 ordinal) {
+    u32 seen = 0;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++) {
+            if (fn.blocks[bi].insts[ii].op == op) {
+                if (seen == ordinal) return &fn.blocks[bi].insts[ii];
+                seen++;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static rir::Instruction* find_first_op(rir::Function& fn, rir::Opcode op) {
+    return find_nth_op(fn, op, 0);
+}
+
 // RAII wrapper for FrontendResult<T*>. The frontend APIs (parse_file,
 // analyze_file, build_mir) all .release() a unique_ptr and hand back a raw
 // pointer. Tests allocated hundreds of these without ever deleting; before
@@ -96,6 +128,271 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
 }
+
+static bool lower_src_to_rir(const char* src, FrontendRirModule& rir) {
+    auto lexed = lex(lit(src));
+    if (!lexed) return false;
+    auto ast = parse_file_heap(lexed.value());
+    if (!ast) return false;
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir) return false;
+    auto mir = build_mir_heap(hir.value());
+    if (!mir) return false;
+    auto lowered = lower_to_rir(mir.value(), rir);
+    return static_cast<bool>(lowered);
+}
+
+static std::string format_verify_text(const rir::VerifyResult& result) {
+    char msg_data[256];
+    rir::PrintBuf msg;
+    msg.init(msg_data, sizeof(msg_data), -1);
+    rir::format_verify_result(msg, result);
+    return std::string(msg.data, msg.len);
+}
+
+TEST(frontend, rir_verifier_e2e_accepts_lowered_wait_route) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(verified.ok);
+    CHECK_EQ(verified.summary.function_count, 1u);
+    CHECK_EQ(verified.summary.yield_count, 1u);
+    CHECK(format_verify_text(verified).find("rir verifier: ok") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_non_lowered_yield_terminator) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    REQUIRE(function_has_op(rir.module.functions[0], rir::Opcode::YieldTimer));
+
+    // Simulate a stale lowering/codegen boundary bug: the source went through
+    // the full frontend pipeline, but the RIR handed to verifier still contains
+    // a non-lowered yield opcode that current JIT codegen cannot execute.
+    REQUIRE(replace_first_op(
+        rir.module.functions[0], rir::Opcode::YieldTimer, rir::Opcode::YieldHttpGet));
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::UnsupportedYieldTerminator));
+
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: UnsupportedYieldTerminator") != std::string::npos);
+    CHECK(text.find("function=0") != std::string::npos);
+    CHECK(text.find("opcode=yield.http_get") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_invalid_yield_next_state) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    auto* yield = find_first_op(fn, rir::Opcode::YieldTimer);
+    REQUIRE(yield != nullptr);
+
+    const u64 packed = static_cast<u64>(yield->imm.i64_val);
+    const u64 payload = packed & 0xffffffffu;
+    const u64 kind = (packed >> 48) & 0xffu;
+    yield->imm.i64_val =
+        static_cast<i64>((kind << 48) | (static_cast<u64>(fn.yield_count + 1) << 32) | payload);
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidYieldNextState));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidYieldNextState") != std::string::npos);
+    CHECK(text.find("target=2") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_invalid_encoded_yield_kind) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    auto* yield = find_first_op(fn, rir::Opcode::YieldTimer);
+    REQUIRE(yield != nullptr);
+
+    const u64 packed = static_cast<u64>(yield->imm.i64_val);
+    const u64 payload = packed & 0xffffffffu;
+    const u64 next_state = (packed >> 32) & 0xffffu;
+    yield->imm.i64_val =
+        static_cast<i64>((static_cast<u64>(99) << 48) | (next_state << 32) | payload);
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidYieldKind));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidYieldKind") != std::string::npos);
+    CHECK(text.find("target=99") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_unsupported_lowered_yield_kind) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    auto* yield = find_first_op(fn, rir::Opcode::YieldTimer);
+    REQUIRE(yield != nullptr);
+    REQUIRE(fn.yield_kinds != nullptr);
+
+    const u64 packed = static_cast<u64>(yield->imm.i64_val);
+    const u64 payload = packed & 0xffffffffu;
+    const u64 next_state = (packed >> 32) & 0xffffu;
+    yield->imm.i64_val = static_cast<i64>((static_cast<u64>(jit::YieldKind::HttpPost) << 48) |
+                                          (next_state << 32) | payload);
+    fn.yield_kinds[0] = static_cast<u8>(jit::YieldKind::HttpPost);
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidYieldKind));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidYieldKind") != std::string::npos);
+    CHECK(text.find("target=1") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_yield_metadata_mismatch) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    auto* yield = find_first_op(fn, rir::Opcode::YieldTimer);
+    REQUIRE(yield != nullptr);
+
+    yield->imm.i64_val = static_cast<i64>(static_cast<u64>(yield->imm.i64_val) + 1u);
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::YieldMetadataMismatch));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: YieldMetadataMismatch") != std::string::npos);
+    CHECK(text.find("target=1") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_duplicate_yield_next_state) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(500) wait(1000) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE_EQ(fn.yield_count, 2u);
+    auto* second_yield = find_nth_op(fn, rir::Opcode::YieldTimer, 1);
+    REQUIRE(second_yield != nullptr);
+
+    const u64 packed = static_cast<u64>(second_yield->imm.i64_val);
+    const u64 payload = packed & 0xffffffffu;
+    const u64 kind = (packed >> 48) & 0xffu;
+    second_yield->imm.i64_val =
+        static_cast<i64>((kind << 48) | (static_cast<u64>(1) << 32) | payload);
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::DuplicateYieldNextState));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: DuplicateYieldNextState") != std::string::npos);
+    CHECK(text.find("target=1") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_invalid_resume_block) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE(fn.has_explicit_resume_blocks);
+    REQUIRE_GT(fn.yield_count, 0u);
+
+    fn.resume_blocks[fn.yield_count] = fn.block_count;
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::InvalidResumeBlock));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: InvalidResumeBlock") != std::string::npos);
+    CHECK(text.find("target=") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_state_zero_resume_target_that_skips_entry) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE(fn.has_explicit_resume_blocks);
+    REQUIRE_GT(fn.yield_count, 0u);
+    REQUIRE_NE(fn.resume_blocks[fn.yield_count], fn.blocks[0].id.id);
+
+    fn.resume_blocks[0] = fn.resume_blocks[fn.yield_count];
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::UnreachableBlock));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: UnreachableBlock") != std::string::npos);
+    CHECK(text.find("block=0") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_non_explicit_state_zero_that_skips_entry) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE(fn.has_explicit_resume_blocks);
+    REQUIRE_GT(fn.yield_count, 0u);
+    REQUIRE_NE(fn.resume_blocks[fn.yield_count], fn.blocks[0].id.id);
+
+    fn.has_explicit_resume_blocks = false;
+    fn.state_zero_enters_entry = true;
+    fn.state_zero_entry_block = fn.resume_blocks[fn.yield_count];
+    fn.resume_terminal_block = fn.resume_blocks[fn.yield_count];
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::UnreachableBlock));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: UnreachableBlock") != std::string::npos);
+    CHECK(text.find("block=0") != std::string::npos);
+
+    rir.destroy();
+}
+
+TEST(frontend, rir_verifier_e2e_reports_missing_yield_resume_mapping) {
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir("route GET \"/sleep\" { wait(1) return 204 }\n", rir));
+    auto& fn = rir.module.functions[0];
+    REQUIRE_GT(fn.yield_count, 0u);
+    REQUIRE(fn.has_explicit_resume_blocks || fn.state_zero_enters_entry);
+
+    fn.has_explicit_resume_blocks = false;
+    fn.state_zero_enters_entry = false;
+
+    auto verified = rir::verify_module(rir.module);
+    REQUIRE(!verified.ok);
+    CHECK_EQ(static_cast<u8>(verified.issue.code),
+             static_cast<u8>(rir::VerifyIssueCode::MissingYieldResumeMapping));
+    const std::string text = format_verify_text(verified);
+    CHECK(text.find("rir verifier: MissingYieldResumeMapping") != std::string::npos);
+
+    rir.destroy();
+}
+
 TEST(frontend, lex_parse_return_route) {
     const char* src = "upstream api\nroute GET \"/users\" { return 200 }\n";
     auto lexed = lex(lit(src));
