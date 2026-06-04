@@ -280,6 +280,14 @@ inline VerifyResult verify_function(const Function* fn,
                                    fn->resume_blocks[i]);
             }
         }
+        if (fn->resume_blocks[0] != fn->blocks[0].id.id) {
+            return verify_fail(summary,
+                               VerifyIssueCode::InvalidStateZeroEntry,
+                               function_index,
+                               0,
+                               0,
+                               fn->resume_blocks[0]);
+        }
     }
 
     while (work_start < work_end) {
