@@ -1,6 +1,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/compiler/rir_printer.h"
+#include "rut/compiler/verifier.h"
 #include "test.h"
 
 using namespace rut;
@@ -470,6 +471,150 @@ TEST(RirBuilder, InstructionIsTerminator) {
     inst.op = Opcode::YieldHttpGet;
     CHECK(inst.is_terminator());
     CHECK(inst.is_yield());
+}
+
+TEST(RirVerifier, AcceptsReturnAndBranchRouteGraph) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto reject = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto cond = V(b.emit_const_bool(true));
+    VOK(b.emit_br(cond, ok, reject));
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(204));
+
+    b.set_insert_point(fn, reject);
+    VOK(b.emit_ret_status(403));
+
+    auto result = verify_function(fn);
+    REQUIRE(result.ok);
+    CHECK_EQ(result.summary.block_count, 3u);
+    CHECK_EQ(result.summary.reachable_block_count, 3u);
+    CHECK_EQ(result.summary.terminal_block_count, 2u);
+    CHECK_EQ(result.summary.branch_edge_count, 2u);
+    CHECK_EQ(result.summary.yield_count, 0u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsMissingTerminator) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    V(b.emit_const_i32(1));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::MissingTerminator));
+    CHECK_EQ(result.issue.block_index, entry.id);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsInvalidBranchTarget) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto ok = V(b.create_block(fn, lit("ok")));
+    auto reject = V(b.create_block(fn, lit("reject")));
+
+    b.set_insert_point(fn, entry);
+    auto cond = V(b.emit_const_bool(true));
+    VOK(b.emit_br(cond, ok, reject));
+    fn->blocks[entry.id].insts[1].imm.block_targets[1] = BlockId{99};
+
+    b.set_insert_point(fn, ok);
+    VOK(b.emit_ret_status(204));
+
+    b.set_insert_point(fn, reject);
+    VOK(b.emit_ret_status(403));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidBranchTarget));
+    CHECK_EQ(result.issue.block_index, entry.id);
+    CHECK_EQ(result.issue.target_index, 99u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsYieldCountMismatch) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    u32 payloads[2] = {50, 100};
+    u8 kinds[2] = {static_cast<u8>(jit::YieldKind::Timer), static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 2, kinds));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::YieldCountMismatch));
+    CHECK_EQ(result.issue.inst_index, 1u);
+    CHECK_EQ(result.issue.target_index, 2u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RejectsUnreachableBlockByDefault) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto dead = V(b.create_block(fn, lit("dead")));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_ret_status(204));
+    b.set_insert_point(fn, dead);
+    VOK(b.emit_ret_status(500));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::UnreachableBlock));
+    CHECK_EQ(result.issue.block_index, dead.id);
+
+    VerifyOptions relaxed{};
+    relaxed.require_all_blocks_reachable = false;
+    auto relaxed_result = verify_function(fn, 0, relaxed);
+    REQUIRE(relaxed_result.ok);
+    CHECK_EQ(relaxed_result.summary.reachable_block_count, 1u);
+
+    ctx.destroy();
 }
 
 TEST(RirBuilder, ValueIdSentinel) {
