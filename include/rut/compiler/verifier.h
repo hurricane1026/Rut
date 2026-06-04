@@ -149,6 +149,10 @@ inline VerifyResult verify_function(const Function* fn,
     u32 seen_yield_terminators = 0;
     bool seen_yield_next_state[Function::kMaxResumeBlocks]{};
 
+    if (fn->yield_count > 0 && (fn->yield_payload == nullptr || fn->yield_kinds == nullptr)) {
+        return verify_fail(summary, VerifyIssueCode::MissingYieldMetadata, function_index);
+    }
+
     for (u32 bi = 0; bi < fn->block_count; bi++) {
         const Block& block = fn->blocks[bi];
         if (block.id.id != bi) {
@@ -231,6 +235,16 @@ inline VerifyResult verify_function(const Function* fn,
                                        block.inst_count - 1,
                                        next_state);
                 }
+                const u32 yi = static_cast<u32>(next_state - 1);
+                const u32 payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
+                if (fn->yield_kinds[yi] != kind || fn->yield_payload[yi] != payload) {
+                    return verify_fail(summary,
+                                       VerifyIssueCode::YieldMetadataMismatch,
+                                       function_index,
+                                       bi,
+                                       block.inst_count - 1,
+                                       next_state);
+                }
                 seen_yield_next_state[next_state] = true;
             }
             seen_yield_terminators++;
@@ -252,9 +266,6 @@ inline VerifyResult verify_function(const Function* fn,
             return verify_fail(
                 summary, VerifyIssueCode::MissingYieldNextState, function_index, 0, yi, yi);
         }
-    }
-    if (fn->yield_count > 0 && (fn->yield_payload == nullptr || fn->yield_kinds == nullptr)) {
-        return verify_fail(summary, VerifyIssueCode::MissingYieldMetadata, function_index);
     }
     for (u32 yi = 0; yi < fn->yield_count; yi++) {
         if (!verify_valid_yield_kind(fn->yield_kinds[yi])) {
@@ -325,21 +336,10 @@ inline VerifyResult verify_function(const Function* fn,
             }
         } else if (term.op == Opcode::YieldTimer) {
             const u16 next_state = verify_yield_timer_next_state(term);
-            const u8 kind = verify_yield_timer_kind(term);
-            const u32 payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
 
             if (next_state == 0 || next_state > fn->yield_count) {
                 return verify_fail(summary,
                                    VerifyIssueCode::InvalidYieldNextState,
-                                   function_index,
-                                   bi,
-                                   block.inst_count - 1,
-                                   next_state);
-            }
-            const u32 yi = static_cast<u32>(next_state - 1);
-            if (fn->yield_kinds[yi] != kind || fn->yield_payload[yi] != payload) {
-                return verify_fail(summary,
-                                   VerifyIssueCode::YieldMetadataMismatch,
                                    function_index,
                                    bi,
                                    block.inst_count - 1,

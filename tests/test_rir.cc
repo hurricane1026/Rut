@@ -943,6 +943,45 @@ TEST(RirVerifier, RejectsDuplicateYieldNextState) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsDeadYieldMetadataMismatchWhenReachabilityRelaxed) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto dead_yield = V(b.create_block(fn, lit("dead_yield")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_ret_status(204));
+
+    b.set_insert_point(fn, dead_yield);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 99, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    VerifyOptions relaxed{};
+    relaxed.require_all_blocks_reachable = false;
+    auto result = verify_function(fn, 0, relaxed);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::YieldMetadataMismatch));
+    CHECK_EQ(result.issue.block_index, dead_yield.id);
+    CHECK_EQ(result.issue.target_index, 1u);
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsUnreachableBlockByDefault) {
     TestContext ctx;
     REQUIRE(ctx.init());
