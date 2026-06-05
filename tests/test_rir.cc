@@ -996,6 +996,53 @@ TEST(RirVerifier, RuntimeProtocolModelMapsConnectToUpstreamSendSlot) {
              static_cast<u8>(VerifyRuntimeCallbackSlot::UpstreamSend));
 }
 
+TEST(RirVerifier, RuntimeProtocolModelAddsFailureTransitionForUpstreamYield) {
+    auto check = VerifyRuntimeProtocolModel::check_yield(
+        static_cast<u8>(jit::YieldKind::UpstreamConnect), 1);
+    REQUIRE(check.ok);
+    CHECK(check.submit_transition);
+    CHECK(check.completion_transition);
+    CHECK(check.fail_closed_transition);
+    CHECK_EQ(static_cast<u8>(check.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::UpstreamConnect));
+    CHECK_EQ(static_cast<u8>(check.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::UpstreamSend));
+}
+
+TEST(RirVerifier, RuntimeProtocolModelMarksTimerSchedulingFailureClosed) {
+    auto check =
+        VerifyRuntimeProtocolModel::check_yield(static_cast<u8>(jit::YieldKind::Timer), 50);
+    REQUIRE(check.ok);
+    CHECK(check.submit_transition);
+    CHECK(check.completion_transition);
+    CHECK(check.fail_closed_transition);
+    CHECK_EQ(check.submit_transition_count, 1u);
+    CHECK_EQ(check.completion_transition_count, 1u);
+    CHECK_EQ(check.fail_closed_transition_count, 1u);
+    CHECK_EQ(static_cast<u8>(check.pending_op), static_cast<u8>(VerifyRuntimePendingOp::Timer));
+    CHECK_EQ(static_cast<u8>(check.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::HandlerTimer));
+}
+
+TEST(RirVerifier, RuntimeProtocolModelCountsTimedAnyTimerAndRecvTransitions) {
+    auto check = VerifyRuntimeProtocolModel::check_yield(static_cast<u8>(jit::YieldKind::Any), 25);
+    REQUIRE(check.ok);
+    CHECK(check.submit_transition);
+    CHECK(check.completion_transition);
+    CHECK(check.fail_closed_transition);
+    CHECK_EQ(check.submit_transition_count, 2u);
+    CHECK_EQ(check.completion_transition_count, 2u);
+    CHECK_EQ(check.fail_closed_transition_count, 2u);
+    CHECK_EQ(static_cast<u8>(check.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::DownstreamRecv));
+    CHECK_EQ(static_cast<u8>(check.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::DownstreamRecv));
+    CHECK_EQ(static_cast<u8>(check.secondary_pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::Timer));
+    CHECK_EQ(static_cast<u8>(check.secondary_callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::HandlerTimer));
+}
+
 TEST(RirVerifier, RuntimeProtocolModelReportsUnsupportedEventYield) {
     auto check = VerifyRuntimeProtocolModel::check_yield(static_cast<u8>(jit::YieldKind::Send), 0);
     REQUIRE(!check.ok);
@@ -1004,6 +1051,140 @@ TEST(RirVerifier, RuntimeProtocolModelReportsUnsupportedEventYield) {
     CHECK_EQ(static_cast<u8>(check.pending_op), static_cast<u8>(VerifyRuntimePendingOp::None));
     CHECK_EQ(static_cast<u8>(check.callback_slot),
              static_cast<u8>(VerifyRuntimeCallbackSlot::None));
+}
+
+TEST(RirVerifier, HandlerAutomatonSummarizesTimerYieldAndTerminal) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(result.ok);
+
+    VerifyHandlerAutomaton automaton{};
+    REQUIRE(build_verify_handler_automaton(fn, automaton));
+    CHECK_EQ(automaton.node_count, 2u);
+    CHECK_EQ(automaton.yield_count, 1u);
+    CHECK_EQ(automaton.terminal_count, 1u);
+    CHECK_EQ(automaton.edge_count, 1u);
+    CHECK_EQ(automaton.runtime_submit_count, 1u);
+    CHECK_EQ(automaton.runtime_completion_count, 1u);
+    CHECK_EQ(automaton.runtime_fail_closed_count, 1u);
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].kind),
+             static_cast<u8>(VerifyHandlerNodeKind::Yield));
+    CHECK_EQ(automaton.nodes[entry.id].yield_kind, static_cast<u8>(jit::YieldKind::Timer));
+    CHECK_EQ(automaton.nodes[entry.id].yield_payload, 50u);
+    CHECK_EQ(automaton.nodes[entry.id].next_state, 1u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, HandlerAutomatonSummarizesTimedAnyAsTimerAndRecv) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {25};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Any)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Any), 25, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(result.ok);
+
+    VerifyHandlerAutomaton automaton{};
+    REQUIRE(build_verify_handler_automaton(fn, automaton));
+    CHECK_EQ(automaton.node_count, 2u);
+    CHECK_EQ(automaton.yield_count, 1u);
+    CHECK_EQ(automaton.terminal_count, 1u);
+    CHECK_EQ(automaton.edge_count, 1u);
+    CHECK_EQ(automaton.runtime_submit_count, 2u);
+    CHECK_EQ(automaton.runtime_completion_count, 2u);
+    CHECK_EQ(automaton.runtime_fail_closed_count, 2u);
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::DownstreamRecv));
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::DownstreamRecv));
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.secondary_pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::Timer));
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.secondary_callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::HandlerTimer));
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, HandlerAutomatonSummarizesUpstreamFailurePath) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {1};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::UpstreamConnect)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::UpstreamConnect), 1, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(result.ok);
+
+    VerifyHandlerAutomaton automaton{};
+    REQUIRE(build_verify_handler_automaton(fn, automaton));
+    CHECK_EQ(automaton.node_count, 2u);
+    CHECK_EQ(automaton.yield_count, 1u);
+    CHECK_EQ(automaton.terminal_count, 1u);
+    CHECK_EQ(automaton.edge_count, 1u);
+    CHECK_EQ(automaton.runtime_submit_count, 1u);
+    CHECK_EQ(automaton.runtime_completion_count, 1u);
+    CHECK_EQ(automaton.runtime_fail_closed_count, 1u);
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::UpstreamConnect));
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::UpstreamSend));
+
+    ctx.destroy();
 }
 
 TEST(RirVerifier, RejectsYieldTerminatorMetadataMismatch) {

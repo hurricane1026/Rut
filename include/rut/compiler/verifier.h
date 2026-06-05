@@ -131,11 +131,25 @@ enum class VerifyRuntimeProtocolReason : u8 {
     MissingUpstreamTarget,
 };
 
+enum class VerifyRuntimeTransitionKind : u8 {
+    Submit,
+    Complete,
+    FailClosed,
+};
+
 struct VerifyRuntimeProtocolCheck {
     bool ok = false;
     VerifyRuntimeProtocolReason reason = VerifyRuntimeProtocolReason::Ok;
     VerifyRuntimePendingOp pending_op = VerifyRuntimePendingOp::None;
     VerifyRuntimeCallbackSlot callback_slot = VerifyRuntimeCallbackSlot::None;
+    VerifyRuntimePendingOp secondary_pending_op = VerifyRuntimePendingOp::None;
+    VerifyRuntimeCallbackSlot secondary_callback_slot = VerifyRuntimeCallbackSlot::None;
+    bool submit_transition = false;
+    bool completion_transition = false;
+    bool fail_closed_transition = false;
+    u8 submit_transition_count = 0;
+    u8 completion_transition_count = 0;
+    u8 fail_closed_transition_count = 0;
 };
 
 struct VerifyRuntimeProtocolModel {
@@ -146,12 +160,31 @@ struct VerifyRuntimeProtocolModel {
                 check.ok = true;
                 check.pending_op = VerifyRuntimePendingOp::Timer;
                 check.callback_slot = VerifyRuntimeCallbackSlot::HandlerTimer;
+                check.submit_transition = true;
+                check.completion_transition = true;
+                check.fail_closed_transition = true;
+                check.submit_transition_count = 1;
+                check.completion_transition_count = 1;
+                check.fail_closed_transition_count = 1;
                 return check;
             case jit::YieldKind::Any:
             case jit::YieldKind::Recv:
                 check.ok = true;
                 check.pending_op = VerifyRuntimePendingOp::DownstreamRecv;
                 check.callback_slot = VerifyRuntimeCallbackSlot::DownstreamRecv;
+                check.submit_transition = true;
+                check.completion_transition = true;
+                check.fail_closed_transition = true;
+                check.submit_transition_count = 1;
+                check.completion_transition_count = 1;
+                check.fail_closed_transition_count = 1;
+                if (static_cast<jit::YieldKind>(kind) == jit::YieldKind::Any && payload != 0) {
+                    check.secondary_pending_op = VerifyRuntimePendingOp::Timer;
+                    check.secondary_callback_slot = VerifyRuntimeCallbackSlot::HandlerTimer;
+                    check.submit_transition_count = 2;
+                    check.completion_transition_count = 2;
+                    check.fail_closed_transition_count = 2;
+                }
                 return check;
             case jit::YieldKind::UpstreamConnect:
                 check.pending_op = VerifyRuntimePendingOp::UpstreamConnect;
@@ -161,6 +194,12 @@ struct VerifyRuntimeProtocolModel {
                     return check;
                 }
                 check.ok = true;
+                check.submit_transition = true;
+                check.completion_transition = true;
+                check.fail_closed_transition = true;
+                check.submit_transition_count = 1;
+                check.completion_transition_count = 1;
+                check.fail_closed_transition_count = 1;
                 return check;
             case jit::YieldKind::UpstreamRecv:
                 check.pending_op = VerifyRuntimePendingOp::UpstreamRecv;
@@ -170,6 +209,12 @@ struct VerifyRuntimeProtocolModel {
                     return check;
                 }
                 check.ok = true;
+                check.submit_transition = true;
+                check.completion_transition = true;
+                check.fail_closed_transition = true;
+                check.submit_transition_count = 1;
+                check.completion_transition_count = 1;
+                check.fail_closed_transition_count = 1;
                 return check;
             case jit::YieldKind::UpstreamSend:
                 check.pending_op = VerifyRuntimePendingOp::UpstreamSend;
@@ -179,6 +224,12 @@ struct VerifyRuntimeProtocolModel {
                     return check;
                 }
                 check.ok = true;
+                check.submit_transition = true;
+                check.completion_transition = true;
+                check.fail_closed_transition = true;
+                check.submit_transition_count = 1;
+                check.completion_transition_count = 1;
+                check.fail_closed_transition_count = 1;
                 return check;
             case jit::YieldKind::Send:
             case jit::YieldKind::HttpGet:
@@ -190,6 +241,35 @@ struct VerifyRuntimeProtocolModel {
         check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
         return check;
     }
+};
+
+enum class VerifyHandlerNodeKind : u8 {
+    Terminal,
+    Branch,
+    Jump,
+    Yield,
+};
+
+struct VerifyHandlerAutomatonNode {
+    VerifyHandlerNodeKind kind = VerifyHandlerNodeKind::Terminal;
+    u32 block_index = 0;
+    u32 inst_index = 0;
+    u8 yield_kind = 0;
+    u32 yield_payload = 0;
+    u16 next_state = 0;
+    VerifyRuntimeProtocolCheck runtime{};
+};
+
+struct VerifyHandlerAutomaton {
+    static constexpr u32 kMaxNodes = 4096;
+    VerifyHandlerAutomatonNode nodes[kMaxNodes]{};
+    u32 node_count = 0;
+    u32 edge_count = 0;
+    u32 terminal_count = 0;
+    u32 yield_count = 0;
+    u32 runtime_submit_count = 0;
+    u32 runtime_completion_count = 0;
+    u32 runtime_fail_closed_count = 0;
 };
 
 inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
@@ -301,6 +381,56 @@ inline u8 verify_yield_timer_kind(const Instruction& inst) {
 inline u16 verify_yield_timer_next_state(const Instruction& inst) {
     const u64 packed = static_cast<u64>(inst.imm.i64_val);
     return static_cast<u16>((packed >> 32) & 0xffffu);
+}
+
+inline bool build_verify_handler_automaton(const Function* fn, VerifyHandlerAutomaton& out) {
+    out = VerifyHandlerAutomaton{};
+
+    if (fn == nullptr || fn->block_count == 0 || fn->blocks == nullptr ||
+        fn->block_count > VerifyHandlerAutomaton::kMaxNodes) {
+        return false;
+    }
+
+    for (u32 bi = 0; bi < fn->block_count; bi++) {
+        const Block& block = fn->blocks[bi];
+        if (block.inst_count == 0 || block.insts == nullptr) {
+            return false;
+        }
+
+        const u32 inst_index = block.inst_count - 1;
+        const Instruction& term = block.insts[inst_index];
+        VerifyHandlerAutomatonNode& node = out.nodes[out.node_count++];
+        node.block_index = bi;
+        node.inst_index = inst_index;
+
+        if (term.op == Opcode::Br) {
+            node.kind = VerifyHandlerNodeKind::Branch;
+            out.edge_count += 2;
+        } else if (term.op == Opcode::Jmp) {
+            node.kind = VerifyHandlerNodeKind::Jump;
+            out.edge_count += 1;
+        } else if (term.is_yield()) {
+            if (term.op != Opcode::YieldTimer) {
+                return false;
+            }
+            node.kind = VerifyHandlerNodeKind::Yield;
+            node.yield_kind = verify_yield_timer_kind(term);
+            node.yield_payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
+            node.next_state = verify_yield_timer_next_state(term);
+            node.runtime =
+                VerifyRuntimeProtocolModel::check_yield(node.yield_kind, node.yield_payload);
+            out.yield_count++;
+            out.edge_count += 1;
+            out.runtime_submit_count += node.runtime.submit_transition_count;
+            out.runtime_completion_count += node.runtime.completion_transition_count;
+            out.runtime_fail_closed_count += node.runtime.fail_closed_transition_count;
+        } else {
+            node.kind = VerifyHandlerNodeKind::Terminal;
+            out.terminal_count++;
+        }
+    }
+
+    return true;
 }
 
 inline VerifyResult verify_function(const Function* fn,
