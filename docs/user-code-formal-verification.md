@@ -199,19 +199,22 @@ Covered today:
   starts from the same state-zero dispatch root used by codegen,
 - lowered yield kinds are restricted to runtime-schedulable wait/event kinds,
 - a small runtime-protocol model classifies each lowered yield by pending
-  operation and callback slot, and rejects yield shapes that the event loop
-  cannot safely schedule, such as downstream-send event yields and upstream
-  connect/recv/send yields without a target payload,
+  operation, callback slot, and submit/completion/fail-closed transition shape,
+  and rejects yield shapes that the event loop cannot safely schedule, such as
+  downstream-send event yields and upstream connect/recv/send yields without a
+  target payload,
 - runtime-protocol verifier failures include a compact Rut-facing trace with
   the yield kind, payload, modeled pending operation, callback slot, and failure
-  reason.
+  reason,
+- a handler-verification automaton MVP summarizes route terminators, yields,
+  resume edges, and runtime transition counts for the next explicit-state
+  checker.
 
 This is not yet the full safety/deadlock checker described above. It is the
 foundation for that checker: a route automaton must be structurally valid before
 Rut can prove callback hygiene, declared resume targets, or progress properties.
-The next verifier layer should use the runtime-protocol model as the seed for a
-larger handler automaton with explicit completion/failure transitions and
-callback-slot hygiene checks.
+The next verifier layer should turn this automaton summary into an explicit-state
+safety/deadlock checker with callback-slot hygiene checks.
 
 ## TLA+ Role
 
