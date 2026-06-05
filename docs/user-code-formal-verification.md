@@ -208,13 +208,15 @@ Covered today:
   reason,
 - a handler-verification automaton MVP summarizes route terminators, yields,
   resume edges, and runtime transition counts for the next explicit-state
-  checker.
+  checker,
+- a first route-local automaton check rejects synchronous CFG cycles made only
+  of branch/jump nodes, before Rut attempts larger runtime composition.
 
 This is not yet the full safety/deadlock checker described above. It is the
 foundation for that checker: a route automaton must be structurally valid before
 Rut can prove callback hygiene, declared resume targets, or progress properties.
-The next verifier layer should turn this automaton summary into an explicit-state
-safety/deadlock checker with callback-slot hygiene checks.
+The next verifier layer should compose yielded states with callback-slot hygiene
+and runtime completion/failure transitions.
 
 ## TLA+ Role
 

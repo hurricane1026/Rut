@@ -29,6 +29,8 @@ enum class VerifyIssueCode : u8 {
     MissingYieldNextState,
     YieldMetadataMismatch,
     InvalidYieldRuntimeProtocol,
+    InvalidHandlerAutomaton,
+    NonYieldingControlCycle,
     YieldCountMismatch,
     TooManyYieldStates,
     TooManyBlocks,
@@ -254,6 +256,8 @@ struct VerifyHandlerAutomatonNode {
     VerifyHandlerNodeKind kind = VerifyHandlerNodeKind::Terminal;
     u32 block_index = 0;
     u32 inst_index = 0;
+    u32 target_count = 0;
+    u32 targets[2]{};
     u8 yield_kind = 0;
     u32 yield_payload = 0;
     u16 next_state = 0;
@@ -270,6 +274,25 @@ struct VerifyHandlerAutomaton {
     u32 runtime_submit_count = 0;
     u32 runtime_completion_count = 0;
     u32 runtime_fail_closed_count = 0;
+};
+
+enum class VerifyHandlerCheckIssueCode : u8 {
+    None,
+    MissingAutomaton,
+    InvalidTarget,
+    DeadEnd,
+    NonYieldingCycle,
+};
+
+struct VerifyHandlerCheckIssue {
+    VerifyHandlerCheckIssueCode code = VerifyHandlerCheckIssueCode::None;
+    u32 node_index = 0;
+    u32 target_index = 0;
+};
+
+struct VerifyHandlerCheckResult {
+    bool ok = true;
+    VerifyHandlerCheckIssue issue{};
 };
 
 inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
@@ -405,9 +428,14 @@ inline bool build_verify_handler_automaton(const Function* fn, VerifyHandlerAuto
 
         if (term.op == Opcode::Br) {
             node.kind = VerifyHandlerNodeKind::Branch;
+            node.target_count = 2;
+            node.targets[0] = term.imm.block_targets[0].id;
+            node.targets[1] = term.imm.block_targets[1].id;
             out.edge_count += 2;
         } else if (term.op == Opcode::Jmp) {
             node.kind = VerifyHandlerNodeKind::Jump;
+            node.target_count = 1;
+            node.targets[0] = term.imm.block_targets[0].id;
             out.edge_count += 1;
         } else if (term.is_yield()) {
             if (term.op != Opcode::YieldTimer) {
@@ -419,6 +447,13 @@ inline bool build_verify_handler_automaton(const Function* fn, VerifyHandlerAuto
             node.next_state = verify_yield_timer_next_state(term);
             node.runtime =
                 VerifyRuntimeProtocolModel::check_yield(node.yield_kind, node.yield_payload);
+            if (fn->has_explicit_resume_blocks && node.next_state <= fn->yield_count) {
+                node.target_count = 1;
+                node.targets[0] = fn->resume_blocks[node.next_state];
+            } else if (fn->state_zero_enters_entry && fn->resume_terminal_block < fn->block_count) {
+                node.target_count = 1;
+                node.targets[0] = fn->resume_terminal_block;
+            }
             out.yield_count++;
             out.edge_count += 1;
             out.runtime_submit_count += node.runtime.submit_transition_count;
@@ -431,6 +466,83 @@ inline bool build_verify_handler_automaton(const Function* fn, VerifyHandlerAuto
     }
 
     return true;
+}
+
+inline VerifyHandlerCheckResult verify_handler_automaton(const VerifyHandlerAutomaton& automaton) {
+    VerifyHandlerCheckResult result{};
+
+    if (automaton.node_count == 0) {
+        result.ok = false;
+        result.issue.code = VerifyHandlerCheckIssueCode::MissingAutomaton;
+        return result;
+    }
+
+    for (u32 ni = 0; ni < automaton.node_count; ni++) {
+        const VerifyHandlerAutomatonNode& node = automaton.nodes[ni];
+        if ((node.kind == VerifyHandlerNodeKind::Branch ||
+             node.kind == VerifyHandlerNodeKind::Jump ||
+             node.kind == VerifyHandlerNodeKind::Yield) &&
+            node.target_count == 0) {
+            result.ok = false;
+            result.issue.code = VerifyHandlerCheckIssueCode::DeadEnd;
+            result.issue.node_index = ni;
+            return result;
+        }
+        for (u32 ti = 0; ti < node.target_count; ti++) {
+            if (node.targets[ti] >= automaton.node_count) {
+                result.ok = false;
+                result.issue.code = VerifyHandlerCheckIssueCode::InvalidTarget;
+                result.issue.node_index = ni;
+                result.issue.target_index = node.targets[ti];
+                return result;
+            }
+        }
+    }
+
+    u8 color[VerifyHandlerAutomaton::kMaxNodes]{};
+    u32 stack[VerifyHandlerAutomaton::kMaxNodes]{};
+    u32 next_target[VerifyHandlerAutomaton::kMaxNodes]{};
+    for (u32 start = 0; start < automaton.node_count; start++) {
+        if (color[start] != 0) continue;
+        if (automaton.nodes[start].kind != VerifyHandlerNodeKind::Branch &&
+            automaton.nodes[start].kind != VerifyHandlerNodeKind::Jump) {
+            color[start] = 2;
+            continue;
+        }
+
+        u32 depth = 0;
+        stack[depth++] = start;
+        color[start] = 1;
+        while (depth > 0) {
+            const u32 ni = stack[depth - 1];
+            const VerifyHandlerAutomatonNode& node = automaton.nodes[ni];
+            if (next_target[ni] >= node.target_count) {
+                color[ni] = 2;
+                depth--;
+                continue;
+            }
+
+            const u32 target = node.targets[next_target[ni]++];
+            const VerifyHandlerAutomatonNode& target_node = automaton.nodes[target];
+            if (target_node.kind != VerifyHandlerNodeKind::Branch &&
+                target_node.kind != VerifyHandlerNodeKind::Jump) {
+                continue;
+            }
+            if (color[target] == 1) {
+                result.ok = false;
+                result.issue.code = VerifyHandlerCheckIssueCode::NonYieldingCycle;
+                result.issue.node_index = ni;
+                result.issue.target_index = target;
+                return result;
+            }
+            if (color[target] == 0) {
+                color[target] = 1;
+                stack[depth++] = target;
+            }
+        }
+    }
+
+    return result;
 }
 
 inline VerifyResult verify_function(const Function* fn,
@@ -702,6 +814,24 @@ inline VerifyResult verify_function(const Function* fn,
         }
     }
 
+    VerifyHandlerAutomaton automaton{};
+    if (!build_verify_handler_automaton(fn, automaton)) {
+        return verify_fail(summary, VerifyIssueCode::InvalidHandlerAutomaton, function_index);
+    }
+    const VerifyHandlerCheckResult automaton_check = verify_handler_automaton(automaton);
+    if (!automaton_check.ok) {
+        const VerifyIssueCode code =
+            automaton_check.issue.code == VerifyHandlerCheckIssueCode::NonYieldingCycle
+                ? VerifyIssueCode::NonYieldingControlCycle
+                : VerifyIssueCode::InvalidHandlerAutomaton;
+        return verify_fail(summary,
+                           code,
+                           function_index,
+                           automaton_check.issue.node_index,
+                           0,
+                           automaton_check.issue.target_index);
+    }
+
     VerifyResult result{};
     result.ok = true;
     result.summary = summary;
@@ -776,6 +906,10 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "YieldMetadataMismatch";
         case VerifyIssueCode::InvalidYieldRuntimeProtocol:
             return "InvalidYieldRuntimeProtocol";
+        case VerifyIssueCode::InvalidHandlerAutomaton:
+            return "InvalidHandlerAutomaton";
+        case VerifyIssueCode::NonYieldingControlCycle:
+            return "NonYieldingControlCycle";
         case VerifyIssueCode::YieldCountMismatch:
             return "YieldCountMismatch";
         case VerifyIssueCode::TooManyYieldStates:

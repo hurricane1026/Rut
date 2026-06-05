@@ -1090,9 +1090,13 @@ TEST(RirVerifier, HandlerAutomatonSummarizesTimerYieldAndTerminal) {
     CHECK_EQ(automaton.runtime_fail_closed_count, 1u);
     CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].kind),
              static_cast<u8>(VerifyHandlerNodeKind::Yield));
+    CHECK_EQ(automaton.nodes[entry.id].target_count, 1u);
+    CHECK_EQ(automaton.nodes[entry.id].targets[0], resume.id);
     CHECK_EQ(automaton.nodes[entry.id].yield_kind, static_cast<u8>(jit::YieldKind::Timer));
     CHECK_EQ(automaton.nodes[entry.id].yield_payload, 50u);
     CHECK_EQ(automaton.nodes[entry.id].next_state, 1u);
+    auto check = verify_handler_automaton(automaton);
+    REQUIRE(check.ok);
 
     ctx.destroy();
 }
@@ -1140,6 +1144,44 @@ TEST(RirVerifier, HandlerAutomatonSummarizesTimedAnyAsTimerAndRecv) {
              static_cast<u8>(VerifyRuntimePendingOp::Timer));
     CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.secondary_callback_slot),
              static_cast<u8>(VerifyRuntimeCallbackSlot::HandlerTimer));
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, HandlerAutomatonRejectsNonYieldingControlCycle) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 0));
+    auto entry = V(b.create_block(fn, lit("entry")));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_jmp(entry));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::NonYieldingControlCycle));
+    CHECK_EQ(result.issue.block_index, entry.id);
+    CHECK_EQ(result.issue.target_index, entry.id);
+
+    VerifyHandlerAutomaton automaton{};
+    REQUIRE(build_verify_handler_automaton(fn, automaton));
+    CHECK_EQ(automaton.node_count, 1u);
+    CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].kind),
+             static_cast<u8>(VerifyHandlerNodeKind::Jump));
+    CHECK_EQ(automaton.nodes[entry.id].target_count, 1u);
+    CHECK_EQ(automaton.nodes[entry.id].targets[0], entry.id);
+
+    auto check = verify_handler_automaton(automaton);
+    REQUIRE(!check.ok);
+    CHECK_EQ(static_cast<u8>(check.issue.code),
+             static_cast<u8>(VerifyHandlerCheckIssueCode::NonYieldingCycle));
+    CHECK_EQ(check.issue.node_index, entry.id);
+    CHECK_EQ(check.issue.target_index, entry.id);
 
     ctx.destroy();
 }
