@@ -2263,6 +2263,8 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::Any);
     CHECK_EQ(hir->routes[0].waits[0].ms, 250u);
+    CHECK_EQ(hir->routes[0].waits[0].arm_mask,
+             static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer));
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::If));
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
              static_cast<u8>(HirExprKind::WaitField));

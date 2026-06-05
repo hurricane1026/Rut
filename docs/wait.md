@@ -333,8 +333,9 @@ The following are future work rather than current behavior:
 - Response starts inside `wait(downstream.send(response(...)))`; use terminal
   `return response(...)` for downstream responses until route completion can
   model "send and finish" without a second terminal response.
-- Exact event subsets inside `wait any`; today it uses current-connection `Any`
-  once the listed forms validate.
+- Exact event subsets beyond the current `downstream.recv()` plus `timer(ms)`
+  `wait any` subset. The current subset carries a verifier-visible exact arm
+  mask while the runtime ABI still uses current-connection `Any`.
 - Parameterized IO starts inside `wait any`; start the operation before a later
   race wait until that payload has a richer representation.
 - `wait any` arm result binding such as `r = downstream.recv() => { ... }`.

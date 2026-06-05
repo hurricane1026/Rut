@@ -211,12 +211,18 @@ Covered today:
   checker,
 - a first route-local automaton check rejects synchronous CFG cycles made only
   of branch/jump nodes, before Rut attempts larger runtime composition.
+- a minimal explicit-state runtime checker composes yield nodes with declared
+  wait-arm masks, callback slots, pending operations, completion transitions,
+  and fail-closed transitions,
+- the current `wait any { downstream.recv(), timer(ms) }` subset carries an
+  exact verifier-visible arm mask even though the runtime ABI still uses
+  `YieldKind::Any`.
 
 This is not yet the full safety/deadlock checker described above. It is the
 foundation for that checker: a route automaton must be structurally valid before
 Rut can prove callback hygiene, declared resume targets, or progress properties.
-The next verifier layer should compose yielded states with callback-slot hygiene
-and runtime completion/failure transitions.
+The next verifier layer should add richer counterexample traces and grow the
+same explicit-state model as Rut admits more wait arms and async capabilities.
 
 ## TLA+ Role
 
