@@ -382,6 +382,7 @@ struct HirExpr {
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
+    u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
     static constexpr u32 kMaxFieldInits = 8;
     // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
@@ -629,6 +630,7 @@ struct HirLocal {
     bool is_magic_request_proxy = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
+    u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
     HirExpr init{};
 };
@@ -885,6 +887,7 @@ struct HirRoute {
         u32 ms = 0;  // duration in milliseconds; packed into the u32 yield
                      // payload (status_code + upstream_id) at codegen time.
                      // Parser caps at UINT32_MAX (~49 days).
+        u8 arm_mask = kWaitEventArmTimer;
     };
 
     Span span{};

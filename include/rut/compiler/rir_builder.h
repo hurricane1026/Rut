@@ -6,6 +6,30 @@
 namespace rut {
 namespace rir {
 
+inline u8 default_yield_arm_mask(u8 kind, u32 payload) {
+    switch (static_cast<jit::YieldKind>(kind)) {
+        case jit::YieldKind::Timer:
+            return 1u << 0;
+        case jit::YieldKind::Any:
+            return static_cast<u8>((1u << 1) | (payload != 0 ? (1u << 0) : 0));
+        case jit::YieldKind::Recv:
+            return 1u << 1;
+        case jit::YieldKind::Send:
+            return 1u << 2;
+        case jit::YieldKind::UpstreamConnect:
+            return 1u << 3;
+        case jit::YieldKind::UpstreamRecv:
+            return 1u << 4;
+        case jit::YieldKind::UpstreamSend:
+            return 1u << 5;
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+            return 0;
+    }
+    return 0;
+}
+
 // ── RIR Builder ─────────────────────────────────────────────────────
 // Stateful builder for constructing RIR functions. All memory is
 // allocated from the module's arena — no malloc, no stdlib.
@@ -119,6 +143,7 @@ struct Builder {
         for (u32 i = 0; i < Function::kMaxResumeBlocks; i++) fn->resume_blocks[i] = 0;
         fn->yield_payload = nullptr;
         fn->yield_kinds = nullptr;
+        fn->yield_arm_masks = nullptr;
         fn->blocks = blocks;
         fn->block_count = 0;
         fn->block_cap = kInitBlocks;
@@ -137,22 +162,28 @@ struct Builder {
     VoidResult set_yield_payload(Function* fn,
                                  const u32* ms_list,
                                  u32 count,
-                                 const u8* kind_list = nullptr) {
+                                 const u8* kind_list = nullptr,
+                                 const u8* arm_mask_list = nullptr) {
         if (count == 0) {
             fn->yield_count = 0;
             fn->yield_payload = nullptr;
             fn->yield_kinds = nullptr;
+            fn->yield_arm_masks = nullptr;
             return {};
         }
         auto* buf = mod->arena->alloc_array<u32>(count);
         auto* kinds = mod->arena->alloc_array<u8>(count);
-        if (!buf || !kinds) return err(RirError::OutOfMemory);
+        auto* arm_masks = mod->arena->alloc_array<u8>(count);
+        if (!buf || !kinds || !arm_masks) return err(RirError::OutOfMemory);
         for (u32 i = 0; i < count; i++) {
             buf[i] = ms_list[i];
             kinds[i] = kind_list ? kind_list[i] : kDefaultYieldKind;
+            arm_masks[i] =
+                arm_mask_list ? arm_mask_list[i] : default_yield_arm_mask(kinds[i], buf[i]);
         }
         fn->yield_payload = buf;
         fn->yield_kinds = kinds;
+        fn->yield_arm_masks = arm_masks;
         fn->yield_count = count;
         return {};
     }

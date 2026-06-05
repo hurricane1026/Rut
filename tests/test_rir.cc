@@ -1,3 +1,4 @@
+#include "rut/compiler/ast.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/compiler/rir_printer.h"
@@ -586,6 +587,38 @@ TEST(RirVerifier, RejectsYieldCountMismatch) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsMissingYieldArmMaskMetadata) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {50};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    fn->yield_arm_masks = nullptr;
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::MissingYieldMetadata));
+
+    ctx.destroy();
+}
+
 TEST(RirVerifier, RejectsNonLoweredYieldTerminator) {
     TestContext ctx;
     REQUIRE(ctx.init());
@@ -1144,6 +1177,53 @@ TEST(RirVerifier, HandlerAutomatonSummarizesTimedAnyAsTimerAndRecv) {
              static_cast<u8>(VerifyRuntimePendingOp::Timer));
     CHECK_EQ(static_cast<u8>(automaton.nodes[entry.id].runtime.secondary_callback_slot),
              static_cast<u8>(VerifyRuntimeCallbackSlot::HandlerTimer));
+    CHECK_EQ(automaton.nodes[entry.id].wait_arm_mask,
+             static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer));
+    auto runtime_check = verify_handler_runtime_states(automaton);
+    REQUIRE(runtime_check.ok);
+    CHECK_EQ(runtime_check.runtime_state_count, 2u);
+    CHECK_EQ(runtime_check.runtime_transition_count, 5u);
+
+    ctx.destroy();
+}
+
+TEST(RirVerifier, RuntimeStateCheckerRejectsAnyWithMissingDeclaredArm) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+
+    u32 payloads[1] = {25};
+    u8 kinds[1] = {static_cast<u8>(jit::YieldKind::Any)};
+    u8 arm_masks[1] = {kWaitEventArmTimer};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds, arm_masks));
+    BlockId resume_blocks[2] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resume_blocks, 2));
+
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Any), 25, 1));
+
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+
+    auto result = verify_function(fn);
+    REQUIRE(!result.ok);
+    CHECK_EQ(static_cast<u8>(result.issue.code),
+             static_cast<u8>(VerifyIssueCode::InvalidRuntimeStateModel));
+    CHECK_EQ(result.issue.block_index, entry.id);
+    CHECK_EQ(result.issue.target_index, static_cast<u32>(kWaitEventArmTimer));
+
+    VerifyHandlerAutomaton automaton{};
+    REQUIRE(build_verify_handler_automaton(fn, automaton));
+    auto runtime_check = verify_handler_runtime_states(automaton);
+    REQUIRE(!runtime_check.ok);
+    CHECK_EQ(static_cast<u8>(runtime_check.issue.code),
+             static_cast<u8>(VerifyHandlerCheckIssueCode::WaitArmMaskMismatch));
 
     ctx.destroy();
 }

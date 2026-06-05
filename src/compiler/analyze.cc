@@ -4985,6 +4985,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
 struct WaitSpec {
     WaitEventKind kind = WaitEventKind::Timer;
     u32 payload = 0;
+    u8 arm_mask = kWaitEventArmTimer;
 };
 
 static FrontendResult<u32> find_wait_upstream_index(const HirModule& mod, const AstExpr& arg) {
@@ -5018,6 +5019,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
     if (is_downstream && op.name.eq({"recv", 4})) {
         if (op.args.len != 0) return frontend_error(FrontendError::UnsupportedSyntax, op.span);
         spec.kind = WaitEventKind::Recv;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     if (is_downstream && op.name.eq({"send", 4})) {
@@ -5029,6 +5031,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         auto upstream = find_wait_upstream_index(mod, *op.lhs->args[0]);
         if (!upstream) return core::make_unexpected(upstream.error());
         spec.payload = upstream.value() + 1;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     if (is_upstream && op.name.eq({"recv", 4})) {
@@ -5037,6 +5040,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         if (!upstream) return core::make_unexpected(upstream.error());
         spec.kind = WaitEventKind::UpstreamRecv;
         spec.payload = upstream.value() + 1;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     if (is_upstream && op.name.eq({"send", 4})) {
@@ -5047,6 +5051,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         if (!upstream) return core::make_unexpected(upstream.error());
         spec.kind = WaitEventKind::UpstreamSend;
         spec.payload = upstream.value() + 1;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     return frontend_error(FrontendError::UnsupportedSyntax, op.span, op.name);
@@ -5077,6 +5082,7 @@ static FrontendResult<WaitSpec> analyze_wait_value_spec(const AstExpr& expr,
         WaitSpec spec{};
         spec.kind = expr.wait_event_kind;
         spec.payload = ms;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
 
@@ -5099,6 +5105,7 @@ static FrontendResult<HirExpr> analyze_wait_result_expr(const AstExpr& expr, con
     out.is_wait_result = true;
     out.wait_event_kind = wait_spec->kind;
     out.wait_payload = wait_spec->payload;
+    out.wait_arm_mask = wait_spec->arm_mask;
     return out;
 }
 
@@ -6665,6 +6672,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.is_wait_result = locals[i].is_wait_result;
             out.wait_event_kind = locals[i].wait_event_kind;
             out.wait_payload = locals[i].wait_payload;
+            out.wait_arm_mask = locals[i].wait_arm_mask;
             out.wait_index = locals[i].wait_index;
             out.generic_index = locals[i].generic_index;
             out.associated_name = locals[i].associated_name;
@@ -10342,6 +10350,7 @@ static FrontendResult<WaitSpec> analyze_wait_stmt_spec(const AstStatement& stmt,
         WaitSpec spec{};
         spec.kind = stmt.wait_event_kind;
         spec.payload = stmt.status_code;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
 
@@ -10392,6 +10401,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     wait.span = stmt.span;
     wait.event_kind = WaitEventKind::Any;
     wait.ms = timer_ms;
+    wait.arm_mask = static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer);
     const u32 wait_index = route.waits.len;
     if (!route.waits.push(wait)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
@@ -10402,6 +10412,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     base.is_wait_result = true;
     base.wait_event_kind = WaitEventKind::Any;
     base.wait_payload = timer_ms;
+    base.wait_arm_mask = wait.arm_mask;
     base.wait_index = wait_index;
     if (!route.exprs.push(base)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
@@ -10548,6 +10559,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             local.is_wait_result = init->is_wait_result;
             local.wait_event_kind = init->wait_event_kind;
             local.wait_payload = init->wait_payload;
+            local.wait_arm_mask = init->wait_arm_mask;
             local.wait_index = init->wait_index;
             local.generic_index = init->generic_index;
             local.generic_has_error_constraint = init->generic_has_error_constraint;
@@ -11176,6 +11188,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             local.is_wait_result = init->is_wait_result;
                             local.wait_event_kind = init->wait_event_kind;
                             local.wait_payload = init->wait_payload;
+                            local.wait_arm_mask = init->wait_arm_mask;
                             local.wait_index = init->wait_index;
                             local.generic_index = init->generic_index;
                             local.generic_has_error_constraint = init->generic_has_error_constraint;
@@ -14819,6 +14832,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 w.span = stmt.span;
                 w.event_kind = wait_spec->kind;
                 w.ms = wait_spec->payload;
+                w.arm_mask = wait_spec->arm_mask;
                 if (!route.waits.push(w))
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
                 continue;
@@ -14917,6 +14931,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     w.span = stmt.expr.span;
                     w.event_kind = init->wait_event_kind;
                     w.ms = init->wait_payload;
+                    w.arm_mask = init->wait_arm_mask;
                     init->wait_index = route.waits.len;
                     if (!route.waits.push(w))
                         return frontend_error(FrontendError::TooManyItems, stmt.span);
@@ -14928,6 +14943,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 local.is_wait_result = init->is_wait_result;
                 local.wait_event_kind = init->wait_event_kind;
                 local.wait_payload = init->wait_payload;
+                local.wait_arm_mask = init->wait_arm_mask;
                 local.wait_index = init->wait_index;
                 local.generic_index = init->generic_index;
                 local.generic_has_error_constraint = init->generic_has_error_constraint;

@@ -55,6 +55,37 @@ enum class WaitEventKind : u8 {
     UpstreamSend,
 };
 
+enum WaitEventArmMask : u8 {
+    kWaitEventArmNone = 0,
+    kWaitEventArmTimer = 1u << 0,
+    kWaitEventArmRecv = 1u << 1,
+    kWaitEventArmSend = 1u << 2,
+    kWaitEventArmUpstreamConnect = 1u << 3,
+    kWaitEventArmUpstreamRecv = 1u << 4,
+    kWaitEventArmUpstreamSend = 1u << 5,
+};
+
+inline u8 wait_event_kind_default_arm_mask(WaitEventKind kind, u32 payload = 0) {
+    switch (kind) {
+        case WaitEventKind::Timer:
+            return kWaitEventArmTimer;
+        case WaitEventKind::Any:
+            return static_cast<u8>(kWaitEventArmRecv |
+                                   (payload != 0 ? kWaitEventArmTimer : kWaitEventArmNone));
+        case WaitEventKind::Recv:
+            return kWaitEventArmRecv;
+        case WaitEventKind::Send:
+            return kWaitEventArmSend;
+        case WaitEventKind::UpstreamConnect:
+            return kWaitEventArmUpstreamConnect;
+        case WaitEventKind::UpstreamRecv:
+            return kWaitEventArmUpstreamRecv;
+        case WaitEventKind::UpstreamSend:
+            return kWaitEventArmUpstreamSend;
+    }
+    return kWaitEventArmNone;
+}
+
 // Single response header key/value pair, used by `response(N, headers: {...})`.
 // Both fields are non-owning views into the lexer's source buffer.
 struct AstHeaderKV {

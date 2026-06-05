@@ -561,6 +561,9 @@ TEST(simulate_engine, wait_any_statement_uses_concrete_wait_kind) {
     REQUIRE_GE(rir.module.functions[0].yield_count, 1u);
     CHECK_EQ(rir.module.functions[0].yield_kinds[0], static_cast<u8>(jit::YieldKind::Any));
     CHECK_EQ(rir.module.functions[0].yield_payload[0], 50u);
+    REQUIRE(rir.module.functions[0].yield_arm_masks != nullptr);
+    CHECK_EQ(rir.module.functions[0].yield_arm_masks[0],
+             static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer));
 
     Engine engine;
     REQUIRE(engine.init(rir.module, nullptr, 0));

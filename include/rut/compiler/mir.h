@@ -177,6 +177,7 @@ struct MirValue {
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
+    u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
     static constexpr u32 kMaxFieldInits = 8;
     static constexpr u32 kMaxArgs = 8;
@@ -203,6 +204,7 @@ struct MirLocal {
     bool is_wait_result = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
+    u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
     MirValue init{};
 };
@@ -232,6 +234,7 @@ struct MirTerminator {
     u32 else_block = 0;
     WaitEventKind yield_event_kind = WaitEventKind::Timer;
     u32 yield_ms = 0;
+    u8 yield_arm_mask = kWaitEventArmTimer;
     u16 yield_next_state = 0;
     // Optional response body literal — carried verbatim from HIR for
     // ReturnStatus terminators. lower_rir maps identical literals to a
@@ -254,6 +257,7 @@ struct MirFunction {
         Span span{};
         WaitEventKind event_kind = WaitEventKind::Timer;
         u32 ms = 0;
+        u8 arm_mask = kWaitEventArmTimer;
     };
 
     Span span{};

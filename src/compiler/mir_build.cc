@@ -658,6 +658,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.is_wait_result = expr.is_wait_result;
         v.wait_event_kind = expr.wait_event_kind;
         v.wait_payload = expr.wait_payload;
+        v.wait_arm_mask = expr.wait_arm_mask;
         v.wait_index = expr.wait_index;
         v.variant_index = expr.variant_index;
         v.struct_index = expr.struct_index;
@@ -673,6 +674,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.is_wait_result = true;
         v.wait_event_kind = expr.wait_event_kind;
         v.wait_payload = expr.wait_payload;
+        v.wait_arm_mask = expr.wait_arm_mask;
         v.wait_index = expr.wait_index;
         return v;
     }
@@ -857,6 +859,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             w.span = module.routes[i].waits[wi].span;
             w.event_kind = module.routes[i].waits[wi].event_kind;
             w.ms = module.routes[i].waits[wi].ms;
+            w.arm_mask = module.routes[i].waits[wi].arm_mask;
             if (!fn.waits.push(w)) return frontend_error(FrontendError::TooManyItems, w.span);
         }
 
@@ -902,6 +905,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.is_wait_result = module.routes[i].locals[li].is_wait_result;
             local.wait_event_kind = module.routes[i].locals[li].wait_event_kind;
             local.wait_payload = module.routes[i].locals[li].wait_payload;
+            local.wait_arm_mask = module.routes[i].locals[li].wait_arm_mask;
             local.wait_index = module.routes[i].locals[li].wait_index;
             auto init = mir_value(module.routes[i].locals[li].init, module, &fn);
             if (!init) return core::make_unexpected(init.error());
@@ -1221,6 +1225,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     step_block.term.span = wait.span;
                     step_block.term.yield_event_kind = wait.event_kind;
                     step_block.term.yield_ms = wait.ms;
+                    step_block.term.yield_arm_mask = wait.arm_mask;
                     step_block.term.yield_next_state = static_cast<u16>(wait_ordinal);
                     fn.resume_blocks[wait_ordinal] = next_index;
                 }
@@ -2374,6 +2379,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             yield_block.term.span = fn.waits[0].span;
             yield_block.term.yield_event_kind = fn.waits[0].event_kind;
             yield_block.term.yield_ms = fn.waits[0].ms;
+            yield_block.term.yield_arm_mask = fn.waits[0].arm_mask;
             yield_block.term.yield_next_state = 1;
             if (!fn.blocks.push(yield_block))
                 return frontend_error(FrontendError::TooManyItems, fn.span);

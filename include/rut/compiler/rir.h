@@ -369,9 +369,11 @@ struct Function {
 
     // Per-yield ABI metadata. yield_payload[i] is the u32 payload carried
     // by state i+1, and yield_kinds[i] is the jit::YieldKind ABI byte.
-    // Both arrays are arena-allocated with length = yield_count.
+    // yield_arm_masks[i] is verifier metadata for the declared wait arms.
+    // All arrays are arena-allocated with length = yield_count.
     u32* yield_payload;
     u8* yield_kinds;
+    u8* yield_arm_masks;
 
     Block* entry() { return block_count > 0 ? &blocks[0] : nullptr; }
     const Block* entry() const { return block_count > 0 ? &blocks[0] : nullptr; }
