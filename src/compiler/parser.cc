@@ -1041,6 +1041,12 @@ struct Parser {
                 while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
                     AstStatement::MatchArm arm{};
                     arm.span = span_from(cur());
+                    if (cur().type == TokenType::Ident && peek().type == TokenType::Eq) {
+                        const Token bind_tok = cur();
+                        pos += 2;
+                        arm.bind_value = true;
+                        arm.bind_name = bind_tok.text;
+                    }
                     auto event = parse_expr();
                     if (!event) return core::make_unexpected(event.error());
                     arm.pattern = event.value();

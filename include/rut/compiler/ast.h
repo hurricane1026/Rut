@@ -216,6 +216,8 @@ struct AstStatement {
     struct MatchArm {
         Span span{};
         bool is_wildcard = false;
+        bool bind_value = false;
+        Str bind_name{};
         AstExpr pattern{};
         bool has_guard = false;
         AstExpr* guard = nullptr;
