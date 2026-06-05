@@ -308,6 +308,10 @@ TEST(frontend, rir_verifier_e2e_reports_invalid_yield_runtime_protocol) {
     const std::string text = format_verify_text(verified);
     CHECK(text.find("rir verifier: InvalidYieldRuntimeProtocol") != std::string::npos);
     CHECK(text.find("target=7") != std::string::npos);
+    CHECK(text.find("trace=yield kind=UpstreamConnect payload=0") != std::string::npos);
+    CHECK(text.find("pending_op=UpstreamConnect") != std::string::npos);
+    CHECK(text.find("callback_slot=UpstreamSend") != std::string::npos);
+    CHECK(text.find("reason=MissingUpstreamTarget") != std::string::npos);
 
     rir.destroy();
 }
@@ -337,6 +341,10 @@ TEST(frontend, rir_verifier_e2e_reports_targetless_upstream_io_yield) {
     const std::string text = format_verify_text(verified);
     CHECK(text.find("rir verifier: InvalidYieldRuntimeProtocol") != std::string::npos);
     CHECK(text.find("target=8") != std::string::npos);
+    CHECK(text.find("trace=yield kind=UpstreamRecv payload=0") != std::string::npos);
+    CHECK(text.find("pending_op=UpstreamRecv") != std::string::npos);
+    CHECK(text.find("callback_slot=UpstreamRecv") != std::string::npos);
+    CHECK(text.find("reason=MissingUpstreamTarget") != std::string::npos);
 
     rir.destroy();
 }

@@ -41,6 +41,7 @@ struct VerifyIssue {
     u32 block_index = 0;
     u32 inst_index = 0;
     u32 target_index = 0;
+    u32 detail_index = 0;
 };
 
 struct VerifySummary {
@@ -69,7 +70,8 @@ inline VerifyResult verify_fail(VerifySummary summary,
                                 u32 function_index,
                                 u32 block_index = 0,
                                 u32 inst_index = 0,
-                                u32 target_index = 0) {
+                                u32 target_index = 0,
+                                u32 detail_index = 0) {
     VerifyResult result{};
     result.ok = false;
     result.summary = summary;
@@ -78,6 +80,7 @@ inline VerifyResult verify_fail(VerifySummary summary,
     result.issue.block_index = block_index;
     result.issue.inst_index = inst_index;
     result.issue.target_index = target_index;
+    result.issue.detail_index = detail_index;
     return result;
 }
 
@@ -105,6 +108,90 @@ enum class VerifyYieldRuntimeClass : u8 {
     Unsupported,
 };
 
+enum class VerifyRuntimePendingOp : u8 {
+    None,
+    Timer,
+    DownstreamRecv,
+    UpstreamConnect,
+    UpstreamRecv,
+    UpstreamSend,
+};
+
+enum class VerifyRuntimeCallbackSlot : u8 {
+    None,
+    HandlerTimer,
+    DownstreamRecv,
+    UpstreamRecv,
+    UpstreamSend,
+};
+
+enum class VerifyRuntimeProtocolReason : u8 {
+    Ok,
+    UnsupportedEventYield,
+    MissingUpstreamTarget,
+};
+
+struct VerifyRuntimeProtocolCheck {
+    bool ok = false;
+    VerifyRuntimeProtocolReason reason = VerifyRuntimeProtocolReason::Ok;
+    VerifyRuntimePendingOp pending_op = VerifyRuntimePendingOp::None;
+    VerifyRuntimeCallbackSlot callback_slot = VerifyRuntimeCallbackSlot::None;
+};
+
+struct VerifyRuntimeProtocolModel {
+    static VerifyRuntimeProtocolCheck check_yield(u8 kind, u32 payload) {
+        VerifyRuntimeProtocolCheck check{};
+        switch (static_cast<jit::YieldKind>(kind)) {
+            case jit::YieldKind::Timer:
+                check.ok = true;
+                check.pending_op = VerifyRuntimePendingOp::Timer;
+                check.callback_slot = VerifyRuntimeCallbackSlot::HandlerTimer;
+                return check;
+            case jit::YieldKind::Any:
+            case jit::YieldKind::Recv:
+                check.ok = true;
+                check.pending_op = VerifyRuntimePendingOp::DownstreamRecv;
+                check.callback_slot = VerifyRuntimeCallbackSlot::DownstreamRecv;
+                return check;
+            case jit::YieldKind::UpstreamConnect:
+                check.pending_op = VerifyRuntimePendingOp::UpstreamConnect;
+                check.callback_slot = VerifyRuntimeCallbackSlot::UpstreamSend;
+                if (payload == 0) {
+                    check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
+                    return check;
+                }
+                check.ok = true;
+                return check;
+            case jit::YieldKind::UpstreamRecv:
+                check.pending_op = VerifyRuntimePendingOp::UpstreamRecv;
+                check.callback_slot = VerifyRuntimeCallbackSlot::UpstreamRecv;
+                if (payload == 0) {
+                    check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
+                    return check;
+                }
+                check.ok = true;
+                return check;
+            case jit::YieldKind::UpstreamSend:
+                check.pending_op = VerifyRuntimePendingOp::UpstreamSend;
+                check.callback_slot = VerifyRuntimeCallbackSlot::UpstreamSend;
+                if (payload == 0) {
+                    check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
+                    return check;
+                }
+                check.ok = true;
+                return check;
+            case jit::YieldKind::Send:
+            case jit::YieldKind::HttpGet:
+            case jit::YieldKind::HttpPost:
+            case jit::YieldKind::Forward:
+                check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
+                return check;
+        }
+        check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
+        return check;
+    }
+};
+
 inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
     switch (static_cast<jit::YieldKind>(kind)) {
         case jit::YieldKind::Timer:
@@ -125,24 +212,79 @@ inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
 }
 
 inline bool verify_valid_yield_runtime_protocol(u8 kind, u32 payload) {
-    if (verify_yield_runtime_class(kind) == VerifyYieldRuntimeClass::Unsupported) return false;
+    return VerifyRuntimeProtocolModel::check_yield(kind, payload).ok;
+}
 
+inline const char* verify_yield_kind_name(u8 kind) {
     switch (static_cast<jit::YieldKind>(kind)) {
-        case jit::YieldKind::Timer:
-        case jit::YieldKind::Any:
-        case jit::YieldKind::Recv:
-            return true;
-        case jit::YieldKind::UpstreamConnect:
-        case jit::YieldKind::UpstreamRecv:
-        case jit::YieldKind::UpstreamSend:
-            return payload != 0;
-        case jit::YieldKind::Send:
         case jit::YieldKind::HttpGet:
+            return "HttpGet";
         case jit::YieldKind::HttpPost:
+            return "HttpPost";
         case jit::YieldKind::Forward:
-            return false;
+            return "Forward";
+        case jit::YieldKind::Timer:
+            return "Timer";
+        case jit::YieldKind::Any:
+            return "Any";
+        case jit::YieldKind::Recv:
+            return "Recv";
+        case jit::YieldKind::Send:
+            return "Send";
+        case jit::YieldKind::UpstreamConnect:
+            return "UpstreamConnect";
+        case jit::YieldKind::UpstreamRecv:
+            return "UpstreamRecv";
+        case jit::YieldKind::UpstreamSend:
+            return "UpstreamSend";
     }
-    return false;
+    return "Unknown";
+}
+
+inline const char* verify_runtime_pending_op_name(VerifyRuntimePendingOp op) {
+    switch (op) {
+        case VerifyRuntimePendingOp::None:
+            return "None";
+        case VerifyRuntimePendingOp::Timer:
+            return "Timer";
+        case VerifyRuntimePendingOp::DownstreamRecv:
+            return "DownstreamRecv";
+        case VerifyRuntimePendingOp::UpstreamConnect:
+            return "UpstreamConnect";
+        case VerifyRuntimePendingOp::UpstreamRecv:
+            return "UpstreamRecv";
+        case VerifyRuntimePendingOp::UpstreamSend:
+            return "UpstreamSend";
+    }
+    return "Unknown";
+}
+
+inline const char* verify_runtime_callback_slot_name(VerifyRuntimeCallbackSlot slot) {
+    switch (slot) {
+        case VerifyRuntimeCallbackSlot::None:
+            return "None";
+        case VerifyRuntimeCallbackSlot::HandlerTimer:
+            return "HandlerTimer";
+        case VerifyRuntimeCallbackSlot::DownstreamRecv:
+            return "DownstreamRecv";
+        case VerifyRuntimeCallbackSlot::UpstreamRecv:
+            return "UpstreamRecv";
+        case VerifyRuntimeCallbackSlot::UpstreamSend:
+            return "UpstreamSend";
+    }
+    return "Unknown";
+}
+
+inline const char* verify_runtime_protocol_reason_name(VerifyRuntimeProtocolReason reason) {
+    switch (reason) {
+        case VerifyRuntimeProtocolReason::Ok:
+            return "Ok";
+        case VerifyRuntimeProtocolReason::UnsupportedEventYield:
+            return "UnsupportedEventYield";
+        case VerifyRuntimeProtocolReason::MissingUpstreamTarget:
+            return "MissingUpstreamTarget";
+    }
+    return "Unknown";
 }
 
 inline bool verify_valid_block_target(const Function& fn, BlockId target) {
@@ -284,13 +426,16 @@ inline VerifyResult verify_function(const Function* fn,
                 }
                 const u32 yi = static_cast<u32>(next_state - 1);
                 const u32 payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
-                if (!verify_valid_yield_runtime_protocol(kind, payload)) {
+                const VerifyRuntimeProtocolCheck runtime_check =
+                    VerifyRuntimeProtocolModel::check_yield(kind, payload);
+                if (!runtime_check.ok) {
                     return verify_fail(summary,
                                        VerifyIssueCode::InvalidYieldRuntimeProtocol,
                                        function_index,
                                        bi,
                                        block.inst_count - 1,
-                                       kind);
+                                       kind,
+                                       payload);
                 }
                 if (fn->yield_kinds[yi] != kind || fn->yield_payload[yi] != payload) {
                     return verify_fail(summary,
@@ -534,6 +679,23 @@ inline void format_verify_result(PrintBuf& buf, const VerifyResult& result) {
     } else {
         buf.put_cstr(" target=");
         buf.put_u32(result.issue.target_index);
+    }
+
+    if (result.issue.code == VerifyIssueCode::InvalidYieldRuntimeProtocol) {
+        const u8 kind = static_cast<u8>(result.issue.target_index);
+        const u32 payload = result.issue.detail_index;
+        const VerifyRuntimeProtocolCheck runtime_check =
+            VerifyRuntimeProtocolModel::check_yield(kind, payload);
+        buf.put_cstr(" trace=yield kind=");
+        buf.put_cstr(verify_yield_kind_name(kind));
+        buf.put_cstr(" payload=");
+        buf.put_u32(payload);
+        buf.put_cstr(" pending_op=");
+        buf.put_cstr(verify_runtime_pending_op_name(runtime_check.pending_op));
+        buf.put_cstr(" callback_slot=");
+        buf.put_cstr(verify_runtime_callback_slot_name(runtime_check.callback_slot));
+        buf.put_cstr(" reason=");
+        buf.put_cstr(verify_runtime_protocol_reason_name(runtime_check.reason));
     }
 }
 
