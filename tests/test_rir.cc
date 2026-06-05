@@ -900,6 +900,7 @@ TEST(RirVerifier, RejectsRuntimeUnsupportedDownstreamSendYield) {
     CHECK_EQ(static_cast<u8>(result.issue.code),
              static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
     CHECK_EQ(result.issue.target_index, static_cast<u32>(jit::YieldKind::Send));
+    CHECK_EQ(result.issue.detail_index, 0u);
 
     ctx.destroy();
 }
@@ -932,6 +933,7 @@ TEST(RirVerifier, RejectsUpstreamConnectYieldWithoutTargetPayload) {
     CHECK_EQ(static_cast<u8>(result.issue.code),
              static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
     CHECK_EQ(result.issue.target_index, static_cast<u32>(jit::YieldKind::UpstreamConnect));
+    CHECK_EQ(result.issue.detail_index, 0u);
 
     ctx.destroy();
 }
@@ -967,9 +969,41 @@ TEST(RirVerifier, RejectsUpstreamIoYieldWithoutTargetPayload) {
         CHECK_EQ(static_cast<u8>(result.issue.code),
                  static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
         CHECK_EQ(result.issue.target_index, static_cast<u32>(yield_kind));
+        CHECK_EQ(result.issue.detail_index, 0u);
 
         ctx.destroy();
     }
+}
+
+TEST(RirVerifier, RuntimeProtocolModelClassifiesSchedulableUpstreamYield) {
+    auto check =
+        VerifyRuntimeProtocolModel::check_yield(static_cast<u8>(jit::YieldKind::UpstreamRecv), 2);
+    REQUIRE(check.ok);
+    CHECK_EQ(static_cast<u8>(check.reason), static_cast<u8>(VerifyRuntimeProtocolReason::Ok));
+    CHECK_EQ(static_cast<u8>(check.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::UpstreamRecv));
+    CHECK_EQ(static_cast<u8>(check.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::UpstreamRecv));
+}
+
+TEST(RirVerifier, RuntimeProtocolModelMapsConnectToUpstreamSendSlot) {
+    auto check = VerifyRuntimeProtocolModel::check_yield(
+        static_cast<u8>(jit::YieldKind::UpstreamConnect), 1);
+    REQUIRE(check.ok);
+    CHECK_EQ(static_cast<u8>(check.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::UpstreamConnect));
+    CHECK_EQ(static_cast<u8>(check.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::UpstreamSend));
+}
+
+TEST(RirVerifier, RuntimeProtocolModelReportsUnsupportedEventYield) {
+    auto check = VerifyRuntimeProtocolModel::check_yield(static_cast<u8>(jit::YieldKind::Send), 0);
+    REQUIRE(!check.ok);
+    CHECK_EQ(static_cast<u8>(check.reason),
+             static_cast<u8>(VerifyRuntimeProtocolReason::UnsupportedEventYield));
+    CHECK_EQ(static_cast<u8>(check.pending_op), static_cast<u8>(VerifyRuntimePendingOp::None));
+    CHECK_EQ(static_cast<u8>(check.callback_slot),
+             static_cast<u8>(VerifyRuntimeCallbackSlot::None));
 }
 
 TEST(RirVerifier, RejectsYieldTerminatorMetadataMismatch) {

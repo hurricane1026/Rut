@@ -198,16 +198,20 @@ Covered today:
 - yield functions declare a supported resume mapping, and verifier reachability
   starts from the same state-zero dispatch root used by codegen,
 - lowered yield kinds are restricted to runtime-schedulable wait/event kinds,
-- the first runtime-protocol checks reject yield shapes that the event loop
+- a small runtime-protocol model classifies each lowered yield by pending
+  operation and callback slot, and rejects yield shapes that the event loop
   cannot safely schedule, such as downstream-send event yields and upstream
-  connect/recv/send yields without a target payload.
+  connect/recv/send yields without a target payload,
+- runtime-protocol verifier failures include a compact Rut-facing trace with
+  the yield kind, payload, modeled pending operation, callback slot, and failure
+  reason.
 
 This is not yet the full safety/deadlock checker described above. It is the
 foundation for that checker: a route automaton must be structurally valid before
 Rut can prove callback hygiene, declared resume targets, or progress properties.
-The next verifier layer should lift the currently hard-coded runtime-protocol
-checks into a compact handler automaton with explicit pending operation and
-callback-slot state.
+The next verifier layer should use the runtime-protocol model as the seed for a
+larger handler automaton with explicit completion/failure transitions and
+callback-slot hygiene checks.
 
 ## TLA+ Role
 
