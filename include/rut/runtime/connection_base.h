@@ -251,6 +251,7 @@ struct ConnectionBase {
     u8* send_slice;
     Buffer recv_buf;
     Buffer send_buf;
+    u32 send_progress;
 
     // Upstream recv buffer — separate from client recv_buf to prevent:
     // 1. Client pipelined data being parsed as upstream response
@@ -331,6 +332,7 @@ struct ConnectionBase {
         send_slice = nullptr;
         recv_buf.bind(nullptr, 0);
         send_buf.bind(nullptr, 0);
+        send_progress = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);
     }

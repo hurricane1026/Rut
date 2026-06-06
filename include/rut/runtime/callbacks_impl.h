@@ -179,6 +179,7 @@ template <typename Loop>
 void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     // Slot: on_recv. dispatch_event guarantees ev.type == Recv.
+    conn.send_progress = 0;
 
     if (ev.result <= 0) {
         loop->close_conn(conn);
@@ -398,32 +399,38 @@ template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const u32 kSendLen = conn.send_buf.len();
+    const u32 kResult = static_cast<u32>(ev.result);
 
     if (ev.result < 0) {
         loop->close_conn(conn);
         return;
     }
 
-    const u32 kResult = static_cast<u32>(ev.result);
-    if (kResult > kSendLen) {
+    if (conn.send_progress > kSendLen) {
         loop->close_conn(conn);
         return;
     }
+    if (kResult > (kSendLen - conn.send_progress)) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress += kResult;
 
-    if (kResult < kSendLen) {
+    if (conn.send_progress < kSendLen) {
         if (kResult == 0u) {
             // No progress cannot guarantee eventual completion.
             loop->close_conn(conn);
             return;
         }
 
-        const u32 kRemaining = kSendLen - kResult;
+        const u32 kRemaining = kSendLen - conn.send_progress;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data() + kResult, kRemaining);
+        loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining);
         return;
     }
 
     // Send complete — clear all slots (will set on_recv for keep-alive below).
+    conn.send_progress = 0;
     conn.clear_slots();
 
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());

@@ -5817,21 +5817,32 @@ TEST(send, partial_send_continues) {
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
     const u32 full_send_len = c->send_buf.len();
-    REQUIRE(full_send_len > 1u);
+    const u32 first_partial = 2u;
+    const u32 second_partial = 2u;
+    REQUIRE(full_send_len > first_partial + second_partial);
 
     u32 cid = c->id;
-    // First completion is partial: callback should continue sending remainder.
-    const u32 partial_len = 1u;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(partial_len)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(first_partial)));
     CHECK_NE(loop.conns[cid].fd, -1);        // still open
     CHECK_EQ(loop.conns[cid].on_send, &on_response_sent<SmallLoop>);
     auto* send_op = loop.backend.last_op(MockOp::Send);
     REQUIRE(send_op != nullptr);
-    CHECK_EQ(send_op->send_len, full_send_len - partial_len);
+    CHECK_EQ(send_op->send_len, full_send_len - first_partial);
+    CHECK_EQ(send_op->send_buf, c->send_buf.data() + first_partial);
 
-    // Remaining completion closes the response and returns to request parsing.
+    // Second completion is also partial for the remaining chunk.
+    REQUIRE(send_op->send_len > second_partial);
     loop.inject_and_dispatch(
-        make_ev(cid, IoEventType::Send, static_cast<i32>(full_send_len - partial_len)));
+        make_ev(cid, IoEventType::Send, static_cast<i32>(second_partial)));
+    CHECK_NE(loop.conns[cid].fd, -1);  // still open
+    send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    CHECK_EQ(send_op->send_len, full_send_len - first_partial - second_partial);
+    CHECK_EQ(send_op->send_buf, c->send_buf.data() + first_partial + second_partial);
+
+    // Final completion closes the response and returns to request parsing.
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(full_send_len - first_partial - second_partial)));
     CHECK_GE(loop.conns[cid].fd, 0);            // kept alive (default is keep-alive)
     CHECK_EQ(c->state, ConnState::ReadingHeader);
 }
