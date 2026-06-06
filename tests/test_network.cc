@@ -1186,7 +1186,7 @@ TEST(copilot4, arena_alloc_overflow_returns_null) {
     a.destroy();
 }
 
-// === Partial send (TODO #1) ===
+// === Partial send behavior ===
 
 // Verify send_buf uses Buffer API correctly
 TEST(send_buf, write_and_data) {
@@ -1404,8 +1404,8 @@ TEST(copilot5, mock_10_keepalive_cycles) {
     CHECK_EQ(conn->fd, 42);  // still alive
 }
 
-// Regression: partial send TODO exists (code documents the limitation).
-// Verify that add_send with immediate success queues a synthetic completion.
+// Regression: partial sends are now handled by on_response_sent continuation logic.
+// Verify that add_send with immediate success still queues a synthetic completion.
 TEST(copilot5, add_send_immediate_success) {
     SmallLoop loop;
     loop.setup();
@@ -5809,17 +5809,31 @@ TEST(log_method, fallback_all) {
 
 // === Coverage: on_response_sent edge cases ===
 
-TEST(send, partial_send_closes) {
+TEST(send, partial_send_continues) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 100));
-    // on_response_sent expects send_buf.len() == ev.result
+    const u32 full_send_len = c->send_buf.len();
+    REQUIRE(full_send_len > 1u);
+
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));  // partial
-    CHECK_EQ(loop.conns[cid].fd, -1);                              // closed
+    // First completion is partial: callback should continue sending remainder.
+    const u32 partial_len = 1u;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(partial_len)));
+    CHECK_NE(loop.conns[cid].fd, -1);        // still open
+    CHECK_EQ(loop.conns[cid].on_send, &on_response_sent<SmallLoop>);
+    auto* send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    CHECK_EQ(send_op->send_len, full_send_len - partial_len);
+
+    // Remaining completion closes the response and returns to request parsing.
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(full_send_len - partial_len)));
+    CHECK_GE(loop.conns[cid].fd, 0);            // kept alive (default is keep-alive)
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
 }
 
 // === Coverage: on_header_received stale events ===

@@ -397,20 +397,34 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    // Send complete — clear all slots (will set on_recv for keep-alive below).
-    conn.clear_slots();
+    const u32 kSendLen = conn.send_buf.len();
 
     if (ev.result < 0) {
         loop->close_conn(conn);
         return;
     }
 
-    // Validate full send — partial sends (possible with io_uring) would serve
-    // truncated responses. Close rather than risk corruption on keep-alive.
-    if (static_cast<u32>(ev.result) != conn.send_buf.len()) {
+    const u32 kResult = static_cast<u32>(ev.result);
+    if (kResult > kSendLen) {
         loop->close_conn(conn);
         return;
     }
+
+    if (kResult < kSendLen) {
+        if (kResult == 0u) {
+            // No progress cannot guarantee eventual completion.
+            loop->close_conn(conn);
+            return;
+        }
+
+        const u32 kRemaining = kSendLen - kResult;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data() + kResult, kRemaining);
+        return;
+    }
+
+    // Send complete — clear all slots (will set on_recv for keep-alive below).
+    conn.clear_slots();
 
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
     loop->epoch_leave();
