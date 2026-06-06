@@ -407,6 +407,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (conn.send_progress > kSendLen) {
+    if (kResult > kSendLen) {
         loop->close_conn(conn);
         return;
     }
