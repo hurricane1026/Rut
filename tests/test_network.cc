@@ -5823,7 +5823,7 @@ TEST(send, partial_send_continues) {
 
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(first_partial)));
-    CHECK_NE(loop.conns[cid].fd, -1);  // still open
+    CHECK_NE(loop.conns[cid].fd, -1);        // still open
     CHECK_EQ(loop.conns[cid].on_send, &on_response_sent<SmallLoop>);
     auto* send_op = loop.backend.last_op(MockOp::Send);
     REQUIRE(send_op != nullptr);
@@ -5832,7 +5832,8 @@ TEST(send, partial_send_continues) {
 
     // Second completion is also partial for the remaining chunk.
     REQUIRE(send_op->send_len > second_partial);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(second_partial)));
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(second_partial)));
     CHECK_NE(loop.conns[cid].fd, -1);  // still open
     send_op = loop.backend.last_op(MockOp::Send);
     REQUIRE(send_op != nullptr);
@@ -5840,8 +5841,8 @@ TEST(send, partial_send_continues) {
     CHECK_EQ(send_op->send_buf, c->send_buf.data() + first_partial + second_partial);
 
     // Final completion closes the response and returns to request parsing.
-    loop.inject_and_dispatch(make_ev(
-        cid, IoEventType::Send, static_cast<i32>(full_send_len - first_partial - second_partial)));
+    loop.inject_and_dispatch(
+        make_ev(cid, IoEventType::Send, static_cast<i32>(full_send_len - first_partial - second_partial)));
     CHECK_GE(loop.conns[cid].fd, 0);  // kept alive (default is keep-alive)
     CHECK_EQ(c->state, ConnState::ReadingHeader);
 }
