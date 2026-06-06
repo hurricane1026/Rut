@@ -5009,6 +5009,9 @@ static i32 wait_event_resume_kind_value(WaitEventKind kind) {
 }
 
 static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
+    if (stmt.kind == AstStmtKind::Guard)
+        return true;
+
     if (stmt.kind == AstStmtKind::Block) {
         for (u32 i = 0; i < stmt.block_stmts.len; i++) {
             const auto& inner = *stmt.block_stmts[i];
@@ -10451,7 +10454,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         if (wait_any_wait_arm_has_block_let(*arm.stmt))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arm.span,
-                                  lit_str("wait any arm block-local lets are not supported"));
+                                  lit_str("wait any arm block-local lets/guard bindings are not supported"));
     }
 
     HirRoute::Wait wait{};

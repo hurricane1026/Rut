@@ -2340,7 +2340,21 @@ TEST(frontend, analyze_rejects_wait_any_arm_block_let) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(hir.error().detail.eq(lit("wait any arm block-local lets are not supported")));
+    CHECK(hir.error().detail.eq(lit("wait any arm block-local lets/guard bindings are not supported")));
+}
+
+TEST(frontend, analyze_rejects_wait_any_arm_guard_let) {
+    const char* src =
+        "route GET \"/x\" { wait any { ev = downstream.recv() => { guard let ok = ev.ok else { return"
+        " 500 } if ok { return 204 } else { return 400 } } timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("wait any arm block-local lets/guard bindings are not supported")));
 }
 
 TEST(frontend, analyze_rejects_wait_any_arm_binding_shadowing_route_local) {
