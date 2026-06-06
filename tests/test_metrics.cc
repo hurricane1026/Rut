@@ -252,10 +252,17 @@ TEST_F(MetricsLoopF, requests_active_decremented_on_send_error) {
     CHECK_EQ(self.m.requests_active, 0u);
 }
 
-TEST_F(MetricsLoopF, requests_active_decremented_on_partial_send) {
+TEST_F(MetricsLoopF, requests_active_decremented_after_partial_send_completes) {
     REQUIRE(self.accept_and_recv());
     CHECK_EQ(self.m.requests_active, 1u);
-    self.loop.inject_and_dispatch(make_ev(self.cid, IoEventType::Send, 1));
+    const u32 send_len = self.c->send_buf.len();
+    REQUIRE(send_len > 1u);
+    const u32 partial_len = 1u;
+    self.loop.inject_and_dispatch(
+        make_ev(self.cid, IoEventType::Send, static_cast<i32>(partial_len)));
+    CHECK_EQ(self.m.requests_active, 1u);
+    self.loop.inject_and_dispatch(
+        make_ev(self.cid, IoEventType::Send, static_cast<i32>(send_len - partial_len)));
     CHECK_EQ(self.m.requests_active, 0u);
 }
 
