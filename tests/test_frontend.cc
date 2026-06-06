@@ -2329,6 +2329,20 @@ TEST(frontend, analyze_wait_any_arm_result_binding_is_arm_local) {
     rir.destroy();
 }
 
+TEST(frontend, analyze_rejects_wait_any_arm_block_let) {
+    const char* src =
+        "route GET \"/x\" { wait any { ev = downstream.recv() => { let n = ev.result if n == 0 { return"
+        " 204 } else { return 400 } } timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("wait any arm block-local lets are not supported")));
+}
+
 TEST(frontend, analyze_rejects_wait_any_arm_binding_shadowing_route_local) {
     const char* src =
         "route GET \"/x\" { let ev = 1 wait any { "

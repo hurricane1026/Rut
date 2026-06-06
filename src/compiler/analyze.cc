@@ -5008,6 +5008,39 @@ static i32 wait_event_resume_kind_value(WaitEventKind kind) {
     return 0;
 }
 
+static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
+    if (stmt.kind == AstStmtKind::Block) {
+        for (u32 i = 0; i < stmt.block_stmts.len; i++) {
+            const auto& inner = *stmt.block_stmts[i];
+            if (inner.kind == AstStmtKind::Let) return true;
+            if (wait_any_wait_arm_has_block_let(inner)) return true;
+        }
+        return false;
+    }
+
+    if (stmt.kind == AstStmtKind::If) {
+        if (stmt.then_stmt != nullptr && wait_any_wait_arm_has_block_let(*stmt.then_stmt))
+            return true;
+        if (stmt.else_stmt != nullptr && wait_any_wait_arm_has_block_let(*stmt.else_stmt))
+            return true;
+        return false;
+    }
+
+    if (stmt.kind == AstStmtKind::Match) {
+        for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+            const auto& arm = stmt.match_arms[ai];
+            if (arm.stmt != nullptr && wait_any_wait_arm_has_block_let(*arm.stmt)) return true;
+        }
+        return false;
+    }
+
+    if (stmt.kind == AstStmtKind::For) {
+        return stmt.then_stmt != nullptr && wait_any_wait_arm_has_block_let(*stmt.then_stmt);
+    }
+
+    return false;
+}
+
 static FrontendResult<u32> find_wait_upstream_index(const HirModule& mod, const AstExpr& arg) {
     if (arg.kind != AstExprKind::Ident)
         return frontend_error(FrontendError::UnsupportedSyntax, arg.span);
@@ -10411,6 +10444,16 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     if (timer_arm == nullptr || recv_arm == nullptr || timer_ms == 0)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 
+    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+        const auto& arm = stmt.match_arms[ai];
+        if (!arm.stmt)
+            return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+        if (wait_any_wait_arm_has_block_let(*arm.stmt))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arm.span,
+                                  lit_str("wait any arm block-local lets are not supported"));
+    }
+
     HirRoute::Wait wait{};
     wait.span = stmt.span;
     wait.event_kind = WaitEventKind::Any;
@@ -10507,8 +10550,10 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         FixedVec<HirLocal, HirRoute::kMaxLocals> scoped;
         auto scoped_result = scoped_locals_for_arm(ast_arm, kind, payload, scoped);
         if (!scoped_result) return core::make_unexpected(scoped_result.error());
+        const u32 saved_locals = route.locals.len;
         auto body = analyze_match_arm_body(
             *ast_arm.stmt, &arm, &route, mod, scoped.data, scoped.len, nullptr);
+        route.locals.len = saved_locals;
         if (!body) return core::make_unexpected(body.error());
         if (!route.control.match_arms.push(arm))
             return frontend_error(FrontendError::TooManyItems, ast_arm.span);
