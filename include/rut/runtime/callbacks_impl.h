@@ -134,31 +134,33 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         loop->access_log->push(entry);
     }
 
-    // TODO: avoid 8KB stack alloc + double copy by adding a reserve/commit
-    // API to CaptureRing (write directly into ring slot). Acceptable for now
-    // since capture is a debug feature, not always-on production path.
     if (loop->capture_ring && conn.capture_buf && conn.capture_header_len > 0) {
-        CaptureEntry cap;
-        __builtin_memset(&cap, 0, sizeof(cap));
-        cap.timestamp_us = realtime_us();
-        cap.req_content_length = conn.req_content_length;
-        cap.resp_content_length = resp_size;
-        cap.resp_status = status;
-        cap.raw_header_len = conn.capture_header_len;
-        cap.peer_port = conn.peer_port;
-        cap.method = conn.req_method;
-        cap.shard_id = conn.shard_id;
-        cap.flags =
+        CaptureEntry* cap_entry = nullptr;
+        u32 expected_wp = 0;
+        if (!loop->capture_ring->begin_push(&cap_entry, &expected_wp)) {
+            return;
+        }
+        auto* cap = cap_entry;
+        __builtin_memset(cap, 0, sizeof(*cap));
+        cap->timestamp_us = realtime_us();
+        cap->req_content_length = conn.req_content_length;
+        cap->resp_content_length = resp_size;
+        cap->resp_status = status;
+        cap->raw_header_len = conn.capture_header_len;
+        cap->peer_port = conn.peer_port;
+        cap->method = conn.req_method;
+        cap->shard_id = conn.shard_id;
+        cap->flags =
             (conn.capture_header_len == CaptureEntry::kMaxHeaderLen) ? kCaptureFlagTruncated : 0;
-        constexpr u32 kCopyLen = sizeof(conn.upstream_name) < sizeof(cap.upstream_name)
+        constexpr u32 kCopyLen = sizeof(conn.upstream_name) < sizeof(cap->upstream_name)
                                      ? sizeof(conn.upstream_name)
-                                     : sizeof(cap.upstream_name);
+                                     : sizeof(cap->upstream_name);
         for (u32 i = 0; i < kCopyLen; i++) {
-            cap.upstream_name[i] = conn.upstream_name[i];
+            cap->upstream_name[i] = conn.upstream_name[i];
             if (conn.upstream_name[i] == '\0') break;
         }
-        __builtin_memcpy(cap.raw_headers, conn.capture_buf, conn.capture_header_len);
-        loop->capture_ring->push(cap);
+        __builtin_memcpy(cap->raw_headers, conn.capture_buf, conn.capture_header_len);
+        loop->capture_ring->commit_push(expected_wp);
     }
 }
 

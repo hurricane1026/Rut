@@ -182,6 +182,47 @@ TEST(capture_ring, full_drops) {
     CHECK(ring.push(entry));
 }
 
+TEST(capture_ring, begin_push_and_commit) {
+    CaptureRing ring;
+    ring.init();
+
+    CaptureEntry* slot = nullptr;
+    u32 wp = 0;
+    CHECK(ring.begin_push(&slot, &wp));
+    REQUIRE(slot != nullptr);
+
+    __builtin_memset(slot, 0, sizeof(*slot));
+    slot->resp_status = 201;
+    slot->method = static_cast<u8>(LogHttpMethod::Post);
+    slot->raw_header_len = 4;
+    const u8 prefix[] = {'P', 'O', 'S', 'T'};
+    for (u32 i = 0; i < 4; i++) slot->raw_headers[i] = prefix[i];
+    ring.commit_push(wp);
+
+    CHECK_EQ(ring.available(), 1u);
+
+    CaptureEntry out{};
+    CHECK(ring.pop(out));
+    CHECK_EQ(out.resp_status, 201);
+    CHECK_EQ(out.method, static_cast<u8>(LogHttpMethod::Post));
+    CHECK_EQ(out.raw_header_len, 4);
+    CHECK_EQ(out.raw_headers[0], 'P');
+    CHECK_EQ(out.raw_headers[3], 'T');
+
+    ring.pop(out);
+    CHECK_EQ(ring.available(), 0u);
+
+    CaptureEntry* full_slots[CaptureRing::kCapacity];
+    for (u32 i = 0; i < CaptureRing::kCapacity; i++) {
+        u32 full_wp = 0;
+        CHECK(ring.begin_push(&full_slots[i], &full_wp));
+        CHECK_NE(full_slots[i], nullptr);
+        ring.commit_push(full_wp);
+    }
+    CHECK_EQ(ring.available(), CaptureRing::kCapacity);
+    CHECK(!ring.begin_push(nullptr, nullptr));
+}
+
 TEST(capture_ring, fifo_order) {
     CaptureRing ring;
     ring.init();

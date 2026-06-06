@@ -10208,6 +10208,58 @@ TEST(state_invariant, jit_event_yield_starts_runtime_operations) {
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
 }
 
+TEST(state_invariant, jit_upstream_send_mismatch_fail_closes_slots) {
+    SmallLoop loop;
+    loop.setup();
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 100;
+    c->upstream_idx = 0;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 13;
+    outcome.yield_kind = jit::YieldKind::UpstreamSend;
+    outcome.timer_ms = 3;  // target index=2, mismatched with upstream_idx=0
+    loop.backend.clear_ops();
+
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    check_sending_response_invariant(_tc, c);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->upstream_fd, 100);
+}
+
+TEST(state_invariant, jit_upstream_recv_mismatch_fail_closes_slots) {
+    SmallLoop loop;
+    loop.setup();
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 100;
+    c->upstream_idx = 0;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 14;
+    outcome.yield_kind = jit::YieldKind::UpstreamRecv;
+    outcome.timer_ms = 3;  // target index=2, mismatched with upstream_idx=0
+    loop.backend.clear_ops();
+
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    check_sending_response_invariant(_tc, c);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->upstream_fd, 100);
+}
+
 TEST(state_invariant, jit_upstream_wait_target_mismatch_fails_closed) {
     SmallLoop loop;
     loop.setup();

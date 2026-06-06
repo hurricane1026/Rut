@@ -88,17 +88,37 @@ struct CaptureRing {
         read_pos = 0;
     }
 
+    // Producer: reserve one slot for writing a capture entry. Returns false when full.
+    // The caller should fill `*out` then call `commit_push(expected_wp)`.
+    bool begin_push(CaptureEntry** out, u32* expected_wp) {
+        const u32 wp = write_pos.load(std::memory_order_relaxed);
+        const u32 rp = read_pos.load(std::memory_order_acquire);
+        if (wp - rp >= kCapacity) {
+            return false;  // full
+        }
+        if (out) {
+            *out = &entries[wp & kMask];
+        }
+        if (expected_wp) {
+            *expected_wp = wp;
+        }
+        return true;
+    }
+
+    // Producer: complete a reservation started by begin_push().
+    void commit_push(u32 expected_wp) {
+        write_pos.store(expected_wp + 1, std::memory_order_release);
+    }
+
     // Producer: write an entry. Returns false if full (entry dropped).
     bool push(const CaptureEntry& entry) {
-        u32 wp = write_pos.load(std::memory_order_relaxed);
-        u32 rp = read_pos.load(std::memory_order_acquire);
-
-        if (wp - rp >= kCapacity) {
-            return false;  // full — drop
+        CaptureEntry* slot = nullptr;
+        u32 expected_wp = 0;
+        if (!begin_push(&slot, &expected_wp)) {
+            return false;
         }
-
-        entries[wp & kMask] = entry;
-        write_pos.store(wp + 1, std::memory_order_release);
+        entries[expected_wp & kMask] = entry;
+        commit_push(expected_wp);
         return true;
     }
 
