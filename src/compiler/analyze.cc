@@ -5032,7 +5032,9 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     if (stmt.kind == AstStmtKind::Match) {
         for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
             const auto& arm = stmt.match_arms[ai];
-            if (arm.stmt != nullptr && wait_any_wait_arm_has_block_let(*arm.stmt)) return true;
+            if (arm.stmt != nullptr && wait_any_wait_arm_has_block_let(*arm.stmt)) {
+                return true;
+            }
         }
         return false;
     }

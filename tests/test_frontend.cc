@@ -2340,7 +2340,8 @@ TEST(frontend, analyze_rejects_wait_any_arm_block_let) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(hir.error().detail.eq(lit("wait any arm block-local lets/guard bindings are not supported")));
+    CHECK(hir.error().detail.eq(lit(
+        "wait any arm block-local lets/guard bindings are not supported")));
 }
 
 TEST(frontend, analyze_rejects_wait_any_arm_guard_let) {
@@ -2354,7 +2355,8 @@ TEST(frontend, analyze_rejects_wait_any_arm_guard_let) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(!hir);
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(hir.error().detail.eq(lit("wait any arm block-local lets/guard bindings are not supported")));
+    CHECK(hir.error().detail.eq(lit(
+        "wait any arm block-local lets/guard bindings are not supported")));
 }
 
 TEST(frontend, analyze_rejects_wait_any_arm_binding_shadowing_route_local) {
