@@ -2237,6 +2237,23 @@ TEST(frontend, parse_route_accepts_wait_any_statement) {
              static_cast<u8>(AstExprKind::Call));
 }
 
+TEST(frontend, parse_route_accepts_wait_any_arm_result_binding) {
+    const char* src =
+        "route GET \"/x\" { wait any { ev = downstream.recv() => { return 204 } "
+        "deadline = timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    const auto& wait_any = ast->items[0].route.statements[0];
+    REQUIRE_EQ(wait_any.match_arms.len, 2u);
+    CHECK(wait_any.match_arms[0].bind_value);
+    CHECK(wait_any.match_arms[0].bind_name.eq(lit("ev")));
+    CHECK(wait_any.match_arms[1].bind_value);
+    CHECK(wait_any.match_arms[1].bind_name.eq(lit("deadline")));
+}
+
 TEST(frontend, analyze_records_wait_in_hir_route) {
     const char* src = "route GET \"/sleep\" { wait(1000) return 200 }\n";
     auto lexed = lex(lit(src));
@@ -2263,6 +2280,8 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
     CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::Any);
     CHECK_EQ(hir->routes[0].waits[0].ms, 250u);
+    CHECK_EQ(hir->routes[0].waits[0].arm_mask,
+             static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer));
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::If));
     CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
              static_cast<u8>(HirExprKind::WaitField));
@@ -2272,6 +2291,87 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     CHECK_EQ(hir->routes[0].locals.len, 0u);
     CHECK_EQ(hir->routes[0].control.then_term.status_code, 408u);
     CHECK_EQ(hir->routes[0].control.else_term.status_code, 204u);
+}
+
+TEST(frontend, analyze_wait_any_arm_result_binding_is_arm_local) {
+    const char* src =
+        "route GET \"/x\" { wait any { "
+        "ev = downstream.recv() => { if ev.ok { return 204 } else { return 400 } } "
+        "deadline = timer(250) => { if deadline.timer { return 408 } else { return 500 } } "
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Match));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_expr.kind),
+             static_cast<u8>(HirExprKind::WaitField));
+    CHECK(hir->routes[0].control.match_expr.str_value.eq(lit("kind")));
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_arms[0].body_kind),
+             static_cast<u8>(HirMatchArm::BodyKind::If));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_arms[0].cond.kind),
+             static_cast<u8>(HirExprKind::WaitField));
+    CHECK(hir->routes[0].control.match_arms[0].cond.str_value.eq(lit("ok")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_arms[1].body_kind),
+             static_cast<u8>(HirMatchArm::BodyKind::If));
+    CHECK(hir->routes[0].control.match_arms[1].cond.str_value.eq(lit("timer")));
+    CHECK_EQ(hir->routes[0].locals.len, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_wait_any_arm_block_let) {
+    const char* src =
+        "route GET \"/x\" { wait any { ev = downstream.recv() => { let n = ev.result if n == 0 { "
+        "return"
+        " 204 } else { return 400 } } timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(
+        lit("wait any arm block-local lets/guard bindings are not supported")));
+}
+
+TEST(frontend, analyze_rejects_wait_any_arm_guard_let) {
+    const char* src =
+        "route GET \"/x\" { wait any { ev = downstream.recv() => { guard let ok = ev.ok else { "
+        "return"
+        " 500 } if ok { return 204 } else { return 400 } } timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(
+        lit("wait any arm block-local lets/guard bindings are not supported")));
+}
+
+TEST(frontend, analyze_rejects_wait_any_arm_binding_shadowing_route_local) {
+    const char* src =
+        "route GET \"/x\" { let ev = 1 wait any { "
+        "ev = downstream.recv() => { return 204 } timer(250) => { return 408 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, wait_any_statement_does_not_consume_local_slot) {

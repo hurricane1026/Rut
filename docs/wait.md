@@ -27,6 +27,14 @@ wait any {
     downstream.recv() => { return 204 }
     timer(250) => { return 408 }
 }
+wait any {
+    ev = downstream.recv() => {
+        if ev.ok { return 204 } else { return 400 }
+    }
+    deadline = timer(250) => {
+        if deadline.timer { return 408 } else { return 500 }
+    }
+}
 wait(250)
 ```
 
@@ -44,13 +52,31 @@ The forms are either operation-start waits or completion waits:
 `wait any` is the canonical race form. Each winning arm has explicit route
 logic, which makes the generated state machine and verifier trace easier to
 read. The first slice supports a downstream recv arm and a timer arm, with
-direct terminal branch bodies:
+direct terminal branch bodies or an arm-local wait result binding:
 
 ```rut
 route POST "/upload" {
     wait any {
         downstream.recv() => { return 204 }
         timer(2000) => { return 408 }
+    }
+}
+```
+
+The optional `name =` prefix binds the winning wait result only inside that arm.
+It exposes the same `kind`, `result`, `ok`, `eof`, and event predicate fields as
+`let ev = wait(...)`. It does not introduce a route-level local and cannot
+shadow an existing route local:
+
+```rut
+route POST "/upload" {
+    wait any {
+        ev = downstream.recv() => {
+            if ev.ok { return 204 } else { return 400 }
+        }
+        deadline = timer(2000) => {
+            if deadline.timer { return 408 } else { return 500 }
+        }
     }
 }
 ```
@@ -333,10 +359,10 @@ The following are future work rather than current behavior:
 - Response starts inside `wait(downstream.send(response(...)))`; use terminal
   `return response(...)` for downstream responses until route completion can
   model "send and finish" without a second terminal response.
-- Exact event subsets inside `wait any`; today it uses current-connection `Any`
-  once the listed forms validate.
+- Exact event subsets beyond the current `downstream.recv()` plus `timer(ms)`
+  `wait any` subset. The current subset carries a verifier-visible exact arm
+  mask while the runtime ABI still uses current-connection `Any`.
 - Parameterized IO starts inside `wait any`; start the operation before a later
   race wait until that payload has a richer representation.
-- `wait any` arm result binding such as `r = downstream.recv() => { ... }`.
 - Non-wait `let` bindings after a `wait(...)`.
 - Waits inside nested blocks, loops, branches, or decorator bodies.

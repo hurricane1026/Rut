@@ -30,6 +30,7 @@ enum class VerifyIssueCode : u8 {
     YieldMetadataMismatch,
     InvalidYieldRuntimeProtocol,
     InvalidHandlerAutomaton,
+    InvalidRuntimeStateModel,
     NonYieldingControlCycle,
     YieldCountMismatch,
     TooManyYieldStates,
@@ -245,6 +246,64 @@ struct VerifyRuntimeProtocolModel {
     }
 };
 
+inline u8 verify_yield_default_arm_mask(u8 kind, u32 payload) {
+    switch (static_cast<jit::YieldKind>(kind)) {
+        case jit::YieldKind::Timer:
+            return 1u << 0;
+        case jit::YieldKind::Any:
+            return static_cast<u8>((1u << 1) | (payload != 0 ? (1u << 0) : 0));
+        case jit::YieldKind::Recv:
+            return 1u << 1;
+        case jit::YieldKind::Send:
+            return 1u << 2;
+        case jit::YieldKind::UpstreamConnect:
+            return 1u << 3;
+        case jit::YieldKind::UpstreamRecv:
+            return 1u << 4;
+        case jit::YieldKind::UpstreamSend:
+            return 1u << 5;
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+            return 0;
+    }
+    return 0;
+}
+
+inline u8 verify_runtime_pending_op_arm_mask(VerifyRuntimePendingOp op) {
+    switch (op) {
+        case VerifyRuntimePendingOp::None:
+            return 0;
+        case VerifyRuntimePendingOp::Timer:
+            return 1u << 0;
+        case VerifyRuntimePendingOp::DownstreamRecv:
+            return 1u << 1;
+        case VerifyRuntimePendingOp::UpstreamConnect:
+            return 1u << 3;
+        case VerifyRuntimePendingOp::UpstreamRecv:
+            return 1u << 4;
+        case VerifyRuntimePendingOp::UpstreamSend:
+            return 1u << 5;
+    }
+    return 0;
+}
+
+inline u8 verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot slot) {
+    switch (slot) {
+        case VerifyRuntimeCallbackSlot::None:
+            return 0;
+        case VerifyRuntimeCallbackSlot::HandlerTimer:
+            return 1u << 0;
+        case VerifyRuntimeCallbackSlot::DownstreamRecv:
+            return 1u << 1;
+        case VerifyRuntimeCallbackSlot::UpstreamRecv:
+            return 1u << 2;
+        case VerifyRuntimeCallbackSlot::UpstreamSend:
+            return 1u << 3;
+    }
+    return 0;
+}
+
 enum class VerifyHandlerNodeKind : u8 {
     Terminal,
     Branch,
@@ -260,6 +319,7 @@ struct VerifyHandlerAutomatonNode {
     u32 targets[2]{};
     u8 yield_kind = 0;
     u32 yield_payload = 0;
+    u8 wait_arm_mask = 0;
     u16 next_state = 0;
     VerifyRuntimeProtocolCheck runtime{};
 };
@@ -282,6 +342,9 @@ enum class VerifyHandlerCheckIssueCode : u8 {
     InvalidTarget,
     DeadEnd,
     NonYieldingCycle,
+    MissingRuntimeTransition,
+    CallbackSlotMismatch,
+    WaitArmMaskMismatch,
 };
 
 struct VerifyHandlerCheckIssue {
@@ -293,6 +356,8 @@ struct VerifyHandlerCheckIssue {
 struct VerifyHandlerCheckResult {
     bool ok = true;
     VerifyHandlerCheckIssue issue{};
+    u32 runtime_state_count = 0;
+    u32 runtime_transition_count = 0;
 };
 
 inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
@@ -445,6 +510,13 @@ inline bool build_verify_handler_automaton(const Function* fn, VerifyHandlerAuto
             node.yield_kind = verify_yield_timer_kind(term);
             node.yield_payload = static_cast<u32>(static_cast<u64>(term.imm.i64_val));
             node.next_state = verify_yield_timer_next_state(term);
+            if (node.next_state != 0 && node.next_state <= fn->yield_count &&
+                fn->yield_arm_masks != nullptr) {
+                node.wait_arm_mask = fn->yield_arm_masks[node.next_state - 1];
+            } else {
+                node.wait_arm_mask =
+                    verify_yield_default_arm_mask(node.yield_kind, node.yield_payload);
+            }
             node.runtime =
                 VerifyRuntimeProtocolModel::check_yield(node.yield_kind, node.yield_payload);
             if (fn->has_explicit_resume_blocks && node.next_state <= fn->yield_count) {
@@ -545,6 +617,62 @@ inline VerifyHandlerCheckResult verify_handler_automaton(const VerifyHandlerAuto
     return result;
 }
 
+inline VerifyHandlerCheckResult verify_handler_runtime_states(
+    const VerifyHandlerAutomaton& automaton) {
+    VerifyHandlerCheckResult result{};
+
+    if (automaton.node_count == 0) {
+        result.ok = false;
+        result.issue.code = VerifyHandlerCheckIssueCode::MissingAutomaton;
+        return result;
+    }
+
+    for (u32 ni = 0; ni < automaton.node_count; ni++) {
+        const VerifyHandlerAutomatonNode& node = automaton.nodes[ni];
+        if (node.kind != VerifyHandlerNodeKind::Yield) continue;
+
+        result.runtime_state_count += 2;       // handler-running + runtime-waiting
+        result.runtime_transition_count += 1;  // submit into runtime-waiting
+
+        if (!node.runtime.ok || !node.runtime.submit_transition ||
+            !node.runtime.completion_transition || !node.runtime.fail_closed_transition ||
+            node.runtime.submit_transition_count == 0 ||
+            node.runtime.completion_transition_count != node.runtime.submit_transition_count ||
+            node.runtime.fail_closed_transition_count != node.runtime.submit_transition_count) {
+            result.ok = false;
+            result.issue.code = VerifyHandlerCheckIssueCode::MissingRuntimeTransition;
+            result.issue.node_index = ni;
+            return result;
+        }
+
+        const u8 callback_mask = static_cast<u8>(
+            verify_runtime_callback_slot_mask(node.runtime.callback_slot) |
+            verify_runtime_callback_slot_mask(node.runtime.secondary_callback_slot));
+        const u8 pending_arm_mask =
+            static_cast<u8>(verify_runtime_pending_op_arm_mask(node.runtime.pending_op) |
+                            verify_runtime_pending_op_arm_mask(node.runtime.secondary_pending_op));
+        if (callback_mask == 0 || pending_arm_mask == 0) {
+            result.ok = false;
+            result.issue.code = VerifyHandlerCheckIssueCode::CallbackSlotMismatch;
+            result.issue.node_index = ni;
+            return result;
+        }
+
+        if (node.wait_arm_mask != pending_arm_mask) {
+            result.ok = false;
+            result.issue.code = VerifyHandlerCheckIssueCode::WaitArmMaskMismatch;
+            result.issue.node_index = ni;
+            result.issue.target_index = node.wait_arm_mask;
+            return result;
+        }
+
+        result.runtime_transition_count += node.runtime.completion_transition_count;
+        result.runtime_transition_count += node.runtime.fail_closed_transition_count;
+    }
+
+    return result;
+}
+
 inline VerifyResult verify_function(const Function* fn,
                                     u32 function_index = 0,
                                     VerifyOptions options = {}) {
@@ -580,7 +708,8 @@ inline VerifyResult verify_function(const Function* fn,
     u32 seen_yield_terminators = 0;
     bool seen_yield_next_state[Function::kMaxResumeBlocks]{};
 
-    if (fn->yield_count > 0 && (fn->yield_payload == nullptr || fn->yield_kinds == nullptr)) {
+    if (fn->yield_count > 0 && (fn->yield_payload == nullptr || fn->yield_kinds == nullptr ||
+                                fn->yield_arm_masks == nullptr)) {
         return verify_fail(summary, VerifyIssueCode::MissingYieldMetadata, function_index);
     }
 
@@ -831,6 +960,15 @@ inline VerifyResult verify_function(const Function* fn,
                            0,
                            automaton_check.issue.target_index);
     }
+    const VerifyHandlerCheckResult runtime_state_check = verify_handler_runtime_states(automaton);
+    if (!runtime_state_check.ok) {
+        return verify_fail(summary,
+                           VerifyIssueCode::InvalidRuntimeStateModel,
+                           function_index,
+                           runtime_state_check.issue.node_index,
+                           0,
+                           runtime_state_check.issue.target_index);
+    }
 
     VerifyResult result{};
     result.ok = true;
@@ -908,6 +1046,8 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidYieldRuntimeProtocol";
         case VerifyIssueCode::InvalidHandlerAutomaton:
             return "InvalidHandlerAutomaton";
+        case VerifyIssueCode::InvalidRuntimeStateModel:
+            return "InvalidRuntimeStateModel";
         case VerifyIssueCode::NonYieldingControlCycle:
             return "NonYieldingControlCycle";
         case VerifyIssueCode::YieldCountMismatch:

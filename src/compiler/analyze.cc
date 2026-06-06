@@ -4985,7 +4985,65 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
 struct WaitSpec {
     WaitEventKind kind = WaitEventKind::Timer;
     u32 payload = 0;
+    u8 arm_mask = kWaitEventArmTimer;
 };
+
+static i32 wait_event_resume_kind_value(WaitEventKind kind) {
+    switch (kind) {
+        case WaitEventKind::Timer:
+            return 3;
+        case WaitEventKind::Recv:
+            return 5;
+        case WaitEventKind::Send:
+            return 6;
+        case WaitEventKind::UpstreamConnect:
+            return 7;
+        case WaitEventKind::UpstreamRecv:
+            return 8;
+        case WaitEventKind::UpstreamSend:
+            return 9;
+        case WaitEventKind::Any:
+            return 4;
+    }
+    return 0;
+}
+
+static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
+    if (stmt.kind == AstStmtKind::Guard) return true;
+
+    if (stmt.kind == AstStmtKind::Block) {
+        for (u32 i = 0; i < stmt.block_stmts.len; i++) {
+            const auto& inner = *stmt.block_stmts[i];
+            if (inner.kind == AstStmtKind::Let) return true;
+            if (wait_any_wait_arm_has_block_let(inner)) return true;
+        }
+        return false;
+    }
+
+    if (stmt.kind == AstStmtKind::If) {
+        if (stmt.then_stmt != nullptr && wait_any_wait_arm_has_block_let(*stmt.then_stmt))
+            return true;
+        if (stmt.else_stmt != nullptr && wait_any_wait_arm_has_block_let(*stmt.else_stmt))
+            return true;
+        return false;
+    }
+
+    if (stmt.kind == AstStmtKind::Match) {
+        for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+            const auto& arm = stmt.match_arms[ai];
+            if (arm.stmt != nullptr && wait_any_wait_arm_has_block_let(*arm.stmt)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (stmt.kind == AstStmtKind::For) {
+        return stmt.then_stmt != nullptr && wait_any_wait_arm_has_block_let(*stmt.then_stmt);
+    }
+
+    return false;
+}
 
 static FrontendResult<u32> find_wait_upstream_index(const HirModule& mod, const AstExpr& arg) {
     if (arg.kind != AstExprKind::Ident)
@@ -5018,6 +5076,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
     if (is_downstream && op.name.eq({"recv", 4})) {
         if (op.args.len != 0) return frontend_error(FrontendError::UnsupportedSyntax, op.span);
         spec.kind = WaitEventKind::Recv;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     if (is_downstream && op.name.eq({"send", 4})) {
@@ -5029,6 +5088,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         auto upstream = find_wait_upstream_index(mod, *op.lhs->args[0]);
         if (!upstream) return core::make_unexpected(upstream.error());
         spec.payload = upstream.value() + 1;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     if (is_upstream && op.name.eq({"recv", 4})) {
@@ -5037,6 +5097,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         if (!upstream) return core::make_unexpected(upstream.error());
         spec.kind = WaitEventKind::UpstreamRecv;
         spec.payload = upstream.value() + 1;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     if (is_upstream && op.name.eq({"send", 4})) {
@@ -5047,6 +5108,7 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         if (!upstream) return core::make_unexpected(upstream.error());
         spec.kind = WaitEventKind::UpstreamSend;
         spec.payload = upstream.value() + 1;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
     return frontend_error(FrontendError::UnsupportedSyntax, op.span, op.name);
@@ -5077,6 +5139,7 @@ static FrontendResult<WaitSpec> analyze_wait_value_spec(const AstExpr& expr,
         WaitSpec spec{};
         spec.kind = expr.wait_event_kind;
         spec.payload = ms;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
 
@@ -5099,6 +5162,7 @@ static FrontendResult<HirExpr> analyze_wait_result_expr(const AstExpr& expr, con
     out.is_wait_result = true;
     out.wait_event_kind = wait_spec->kind;
     out.wait_payload = wait_spec->payload;
+    out.wait_arm_mask = wait_spec->arm_mask;
     return out;
 }
 
@@ -6665,6 +6729,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             out.is_wait_result = locals[i].is_wait_result;
             out.wait_event_kind = locals[i].wait_event_kind;
             out.wait_payload = locals[i].wait_payload;
+            out.wait_arm_mask = locals[i].wait_arm_mask;
             out.wait_index = locals[i].wait_index;
             out.generic_index = locals[i].generic_index;
             out.associated_name = locals[i].associated_name;
@@ -10342,6 +10407,7 @@ static FrontendResult<WaitSpec> analyze_wait_stmt_spec(const AstStatement& stmt,
         WaitSpec spec{};
         spec.kind = stmt.wait_event_kind;
         spec.payload = stmt.status_code;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
         return spec;
     }
 
@@ -10360,38 +10426,43 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 
     u32 timer_ms = 0;
-    const AstStatement* timer_stmt = nullptr;
-    const AstStatement* recv_stmt = nullptr;
+    const AstStatement::MatchArm* timer_arm = nullptr;
+    const AstStatement::MatchArm* recv_arm = nullptr;
     for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
         const auto& arm = stmt.match_arms[ai];
         u32 arm_timer_ms = 0;
         if (wait_timer_call_ms(arm.pattern, arm_timer_ms)) {
-            if (timer_stmt != nullptr)
+            if (timer_arm != nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             timer_ms = arm_timer_ms;
-            timer_stmt = arm.stmt;
+            timer_arm = &arm;
             continue;
         }
         auto event_spec = analyze_wait_io_op_spec(arm.pattern, mod);
         if (!event_spec) return core::make_unexpected(event_spec.error());
         if (event_spec->kind != WaitEventKind::Recv || event_spec->payload != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-        if (recv_stmt != nullptr) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
-        recv_stmt = arm.stmt;
+        if (recv_arm != nullptr) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+        recv_arm = &arm;
     }
-    if (timer_stmt == nullptr || recv_stmt == nullptr || timer_ms == 0)
+    if (timer_arm == nullptr || recv_arm == nullptr || timer_ms == 0)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-    if (timer_stmt->kind != AstStmtKind::ReturnStatus &&
-        timer_stmt->kind != AstStmtKind::ForwardUpstream)
-        return frontend_error(FrontendError::UnsupportedSyntax, timer_stmt->span);
-    if (recv_stmt->kind != AstStmtKind::ReturnStatus &&
-        recv_stmt->kind != AstStmtKind::ForwardUpstream)
-        return frontend_error(FrontendError::UnsupportedSyntax, recv_stmt->span);
+
+    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+        const auto& arm = stmt.match_arms[ai];
+        if (!arm.stmt) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+        if (wait_any_wait_arm_has_block_let(*arm.stmt))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                arm.span,
+                lit_str("wait any arm block-local lets/guard bindings are not supported"));
+    }
 
     HirRoute::Wait wait{};
     wait.span = stmt.span;
     wait.event_kind = WaitEventKind::Any;
     wait.ms = timer_ms;
+    wait.arm_mask = static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer);
     const u32 wait_index = route.waits.len;
     if (!route.waits.push(wait)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
@@ -10402,24 +10473,107 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     base.is_wait_result = true;
     base.wait_event_kind = WaitEventKind::Any;
     base.wait_payload = timer_ms;
+    base.wait_arm_mask = wait.arm_mask;
     base.wait_index = wait_index;
     if (!route.exprs.push(base)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
+    auto simple_arm = [](const AstStatement::MatchArm* arm) {
+        return !arm->bind_value && (arm->stmt->kind == AstStmtKind::ReturnStatus ||
+                                    arm->stmt->kind == AstStmtKind::ForwardUpstream);
+    };
+    if (simple_arm(timer_arm) && simple_arm(recv_arm)) {
+        HirExpr cond{};
+        cond.kind = HirExprKind::WaitField;
+        cond.type = HirTypeKind::Bool;
+        cond.span = stmt.span;
+        cond.str_value = {"timer", 5};
+        cond.lhs = &route.exprs[route.exprs.len - 1];
+
+        route.control.kind = HirControlKind::If;
+        route.control.cond = cond;
+        auto then_term = analyze_term(*timer_arm->stmt, mod);
+        if (!then_term) return core::make_unexpected(then_term.error());
+        auto else_term = analyze_term(*recv_arm->stmt, mod);
+        if (!else_term) return core::make_unexpected(else_term.error());
+        route.control.then_term = then_term.value();
+        route.control.else_term = else_term.value();
+        return {};
+    }
+
+    auto scoped_locals_for_arm =
+        [&](const AstStatement::MatchArm& arm,
+            WaitEventKind kind,
+            u32 payload,
+            FixedVec<HirLocal, HirRoute::kMaxLocals>& scoped) -> FrontendResult<void> {
+        for (u32 li = 0; li < route.locals.len; li++) {
+            if (!scoped.push(route.locals[li]))
+                return frontend_error(FrontendError::TooManyItems, arm.span);
+        }
+        if (!arm.bind_value) return {};
+        for (u32 li = 0; li < scoped.len; li++) {
+            if (scoped[li].name.len != 0 && scoped[li].name.eq(arm.bind_name))
+                return frontend_error(FrontendError::UnsupportedSyntax, arm.span, arm.bind_name);
+        }
+        HirLocal local{};
+        local.span = arm.span;
+        local.name = arm.bind_name;
+        local.ref_index = next_local_ref_index(&route, scoped.data, scoped.len);
+        if (local.ref_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, arm.span);
+        local.type = HirTypeKind::Unknown;
+        local.is_wait_result = true;
+        local.wait_event_kind = kind;
+        local.wait_payload = payload;
+        local.wait_arm_mask = wait_event_kind_default_arm_mask(kind, payload);
+        local.wait_index = wait_index;
+        local.init = base;
+        if (!scoped.push(local)) return frontend_error(FrontendError::TooManyItems, arm.span);
+        return {};
+    };
+
     HirExpr cond{};
     cond.kind = HirExprKind::WaitField;
-    cond.type = HirTypeKind::Bool;
+    cond.type = HirTypeKind::I32;
     cond.span = stmt.span;
-    cond.str_value = {"timer", 5};
+    cond.str_value = {"kind", 4};
     cond.lhs = &route.exprs[route.exprs.len - 1];
 
-    route.control.kind = HirControlKind::If;
-    route.control.cond = cond;
-    auto then_term = analyze_term(*timer_stmt, mod);
-    if (!then_term) return core::make_unexpected(then_term.error());
-    auto else_term = analyze_term(*recv_stmt, mod);
-    if (!else_term) return core::make_unexpected(else_term.error());
-    route.control.then_term = then_term.value();
-    route.control.else_term = else_term.value();
+    route.control.kind = HirControlKind::Match;
+    route.control.match_expr = cond;
+    route.control.match_arms.len = 0;
+
+    auto append_arm = [&](const AstStatement::MatchArm& ast_arm,
+                          WaitEventKind kind,
+                          u32 payload) -> FrontendResult<void> {
+        HirMatchArm arm{};
+        arm.span = ast_arm.span;
+        arm.pattern.kind = HirExprKind::IntLit;
+        arm.pattern.type = HirTypeKind::I32;
+        arm.pattern.span = ast_arm.pattern.span;
+        arm.pattern.int_value = wait_event_resume_kind_value(kind);
+        FixedVec<HirLocal, HirRoute::kMaxLocals> scoped;
+        auto scoped_result = scoped_locals_for_arm(ast_arm, kind, payload, scoped);
+        if (!scoped_result) return core::make_unexpected(scoped_result.error());
+        const u32 saved_locals = route.locals.len;
+        auto body = analyze_match_arm_body(
+            *ast_arm.stmt, &arm, &route, mod, scoped.data, scoped.len, nullptr);
+        route.locals.len = saved_locals;
+        if (!body) return core::make_unexpected(body.error());
+        if (!route.control.match_arms.push(arm))
+            return frontend_error(FrontendError::TooManyItems, ast_arm.span);
+        return {};
+    };
+
+    for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+        const auto& arm = stmt.match_arms[ai];
+        if (&arm == timer_arm) {
+            auto appended = append_arm(arm, WaitEventKind::Timer, timer_ms);
+            if (!appended) return core::make_unexpected(appended.error());
+        } else {
+            auto appended = append_arm(arm, WaitEventKind::Recv, 0);
+            if (!appended) return core::make_unexpected(appended.error());
+        }
+    }
     return {};
 }
 
@@ -10548,6 +10702,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             local.is_wait_result = init->is_wait_result;
             local.wait_event_kind = init->wait_event_kind;
             local.wait_payload = init->wait_payload;
+            local.wait_arm_mask = init->wait_arm_mask;
             local.wait_index = init->wait_index;
             local.generic_index = init->generic_index;
             local.generic_has_error_constraint = init->generic_has_error_constraint;
@@ -11176,6 +11331,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             local.is_wait_result = init->is_wait_result;
                             local.wait_event_kind = init->wait_event_kind;
                             local.wait_payload = init->wait_payload;
+                            local.wait_arm_mask = init->wait_arm_mask;
                             local.wait_index = init->wait_index;
                             local.generic_index = init->generic_index;
                             local.generic_has_error_constraint = init->generic_has_error_constraint;
@@ -14819,6 +14975,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 w.span = stmt.span;
                 w.event_kind = wait_spec->kind;
                 w.ms = wait_spec->payload;
+                w.arm_mask = wait_spec->arm_mask;
                 if (!route.waits.push(w))
                     return frontend_error(FrontendError::TooManyItems, stmt.span);
                 continue;
@@ -14917,6 +15074,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     w.span = stmt.expr.span;
                     w.event_kind = init->wait_event_kind;
                     w.ms = init->wait_payload;
+                    w.arm_mask = init->wait_arm_mask;
                     init->wait_index = route.waits.len;
                     if (!route.waits.push(w))
                         return frontend_error(FrontendError::TooManyItems, stmt.span);
@@ -14928,6 +15086,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 local.is_wait_result = init->is_wait_result;
                 local.wait_event_kind = init->wait_event_kind;
                 local.wait_payload = init->wait_payload;
+                local.wait_arm_mask = init->wait_arm_mask;
                 local.wait_index = init->wait_index;
                 local.generic_index = init->generic_index;
                 local.generic_has_error_constraint = init->generic_has_error_constraint;
