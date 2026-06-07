@@ -9771,6 +9771,33 @@ TEST(state_invariant, early_response_during_body_send_has_one_upstream_slot) {
         _tc, c, &on_body_send_with_early_response<SmallLoop>);
 }
 
+TEST(state_invariant, request_body_send_error_with_buffered_response_keeps_proxy_slots) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
+    check_proxying_body_stream_invariant(_tc,
+                                         c,
+                                         nullptr,
+                                         &on_early_upstream_recvd_send_inflight<SmallLoop>,
+                                         &on_request_body_sent<SmallLoop>);
+
+    c->upstream_recv_buf.reset();
+    u8* dst = c->upstream_recv_buf.write_ptr();
+    for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
+    c->upstream_recv_buf.commit(kMockHttpResponseLen);
+
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, -32));
+
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_recv, nullptr);
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->on_upstream_send, nullptr);
+}
+
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     SmallLoop loop;
     loop.setup();
