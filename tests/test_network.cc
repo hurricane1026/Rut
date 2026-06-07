@@ -9798,6 +9798,19 @@ TEST(state_invariant, request_body_send_error_with_buffered_response_keeps_proxy
     CHECK_EQ(c->on_upstream_send, nullptr);
 }
 
+TEST(state_invariant, upstream_response_eof_without_data_resets_proxy_conn) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+
+    const u32 cid = c->id;
+    c->upstream_recv_buf.reset();
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamRecv, 0));
+
+    check_idle_invariant(_tc, &loop.conns[cid]);
+}
+
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     SmallLoop loop;
     loop.setup();
