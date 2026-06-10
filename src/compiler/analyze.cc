@@ -9280,15 +9280,59 @@ static bool contains_str(const std::vector<Str>& names, Str needle) {
     return false;
 }
 
-static void collect_route_decorator_names(const AstFile& file, std::vector<Str>& out) {
+static FrontendResult<void> validate_unique_chain_names(const AstFile& file) {
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
-        if (item.kind != AstItemKind::Route) continue;
-        for (u32 di = 0; di < item.route.decorators.len; di++) {
-            const Str name = item.route.decorators[di].name;
+        if (item.kind != AstItemKind::Chain) continue;
+        for (u32 j = i + 1; j < file.items.len; j++) {
+            const auto& other = file.items[j];
+            if (other.kind == AstItemKind::Chain && other.chain.name.eq(item.chain.name))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, other.chain.span, other.chain.name);
+        }
+    }
+    return {};
+}
+
+static bool chain_step_call_uses_req_placeholder(const AstExpr& call) {
+    return call.kind == AstExprKind::Call && call.args.len != 0 && call.args[0] != nullptr &&
+           call.args[0]->kind == AstExprKind::Ident && call.args[0]->name.eq({"req", 3});
+}
+
+static void collect_route_decorator_names(const AstFile& file, std::vector<Str>& out) {
+    std::vector<Str> attached_chain_names;
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind == AstItemKind::Route) {
+            for (u32 di = 0; di < item.route.decorators.len; di++) {
+                const Str name = item.route.decorators[di].name;
+                if (!contains_str(out, name)) out.push_back(name);
+            }
+            for (u32 ci = 0; ci < item.route.chains.len; ci++) {
+                const Str name = item.route.chains[ci].name;
+                if (!contains_str(attached_chain_names, name)) attached_chain_names.push_back(name);
+            }
+        }
+    }
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Chain) continue;
+        if (!contains_str(attached_chain_names, item.chain.name)) continue;
+        for (u32 si = 0; si < item.chain.steps.len; si++) {
+            const auto& step = item.chain.steps[si];
+            if (!chain_step_call_uses_req_placeholder(step.call)) continue;
+            const Str name = step.call.name;
             if (!contains_str(out, name)) out.push_back(name);
         }
     }
+}
+
+static const AstChainDecl* find_chain_decl(const AstFile& file, Str name) {
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind == AstItemKind::Chain && item.chain.name.eq(name)) return &item.chain;
+    }
+    return nullptr;
 }
 
 static Str import_visible_name(const ImportedModuleInfo& imported, Str original_name) {
@@ -11939,6 +11983,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
     auto* owned_strings =
         shared_owned_strings != nullptr ? shared_owned_strings : &mod.owned_strings;
+    auto validated_chain_names = validate_unique_chain_names(file);
+    if (!validated_chain_names) return core::make_unexpected(validated_chain_names.error());
     std::vector<Str> route_decorator_names = external_decorator_names;
     collect_route_decorator_names(file, route_decorator_names);
     std::vector<std::unique_ptr<HirModule>> imported_storage;
@@ -14921,6 +14967,85 @@ static FrontendResult<HirModule*> analyze_file_internal(
         route.method = route_method_key_from_token(item.route.method);
         if (route.method == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+
+        auto analyze_chain_step_arg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
+            if (arg.kind == AstExprKind::Ident && arg.name.eq({"req", 3})) {
+                HirExpr placeholder_req{};
+                placeholder_req.kind = HirExprKind::IntLit;
+                placeholder_req.type = HirTypeKind::I32;
+                placeholder_req.int_value = 0;
+                placeholder_req.span = arg.span;
+                return placeholder_req;
+            }
+            return analyze_expr(arg, &route, mod, route.locals.data, route.locals.len, nullptr);
+        };
+
+        auto analyze_chain_before_step = [&](const AstChainDecl::Step& step,
+                                             Span use_span) -> FrontendResult<void> {
+            if (step.call.kind != AstExprKind::Call)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span);
+            const u32 fn_index = find_function_index(mod, step.call.name);
+            if (fn_index == mod.functions.len)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, step.call.span, step.call.name);
+            const auto& fn = mod.functions[fn_index];
+            if (fn.return_type != HirTypeKind::Bool)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
+            if (fn.type_params.len != 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
+            if (step.call.args.len != fn.params.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
+
+            HirExpr args[AstExpr::kMaxArgs]{};
+            for (u32 ai = 0; ai < step.call.args.len; ai++) {
+                auto arg = analyze_chain_step_arg(*step.call.args[ai]);
+                if (!arg) return core::make_unexpected(arg.error());
+                auto expected = make_expected_param_expr(fn.params[ai]);
+                if (!same_hir_type_shape(mod, arg.value(), expected))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, step.call.args[ai]->span, fn.name);
+                args[ai] = arg.value();
+            }
+
+            auto cond = instantiate_function_expr(
+                fn.body, &route, mod, args, step.call.args.len, nullptr, 0);
+            if (!cond) return core::make_unexpected(cond.error());
+            if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
+
+            HirGuard guard{};
+            guard.span = use_span;
+            guard.cond = cond.value();
+            guard.fail_kind = HirGuard::FailKind::Term;
+            guard.fail_term.kind = HirTerminatorKind::ReturnStatus;
+            guard.fail_term.source_kind = HirTerminatorSourceKind::Literal;
+            guard.fail_term.status_code = static_cast<i32>(step.else_status);
+            guard.fail_term.span = step.span;
+            if (step.else_status < 100 || step.else_status > 999)
+                return frontend_error(FrontendError::InvalidStatusCode, step.span);
+            if (!route.guards.push(guard))
+                return frontend_error(FrontendError::TooManyItems, step.span);
+            return {};
+        };
+
+        for (u32 ci = 0; ci < item.route.chains.len; ci++) {
+            const auto& chain_use = item.route.chains[ci];
+            const AstChainDecl* chain = find_chain_decl(file, chain_use.name);
+            if (chain == nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, chain_use.span, chain_use.name);
+            for (u32 si = 0; si < chain->steps.len; si++) {
+                const auto& step = chain->steps[si];
+                if (step.kind == AstChainStepKind::After)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        step.span,
+                        lit_str(
+                            "chain after steps are reserved until response-side lowering exists"));
+                auto before = analyze_chain_before_step(step, chain_use.span);
+                if (!before) return core::make_unexpected(before.error());
+            }
+        }
 
         // Slice-1 constraint: a route body has the shape
         //   let* ; wait* ; guard* ; terminal_control

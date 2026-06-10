@@ -131,8 +131,9 @@ The current design review keeps the following direction:
   lower sequential syntax into states, but it should not discover hidden yield
   points inside ordinary helper code.
 - Decorator execution ordering and magic request binding are known risks, but
-  are deferred. They should be revisited before decorators become part of the
-  stable core surface.
+  the stable core should prefer explicit `chain` declarations. The implemented
+  core is limited to the `before` handler boundary. More precise sequencing
+  belongs inside the route handler.
 - State consistency should be simplified to the production modes Rut actually
   needs first. Additional consistency/backing-store modes should wait until
   their replay and verifier contracts are precise.
@@ -140,3 +141,6 @@ The current design review keeps the following direction:
   `.or(default)`, `guard let`, or `match`; keep symbolic forms such as `?.` and
   `??` non-core/reserved until they prove clearer for users, diagnostics, and
   LLM-generated code.
+- Chain order should be visible source order. Group chains and entry chains
+  compose in that order. If `after` lowering is added later, it should follow
+  the same visible order rather than a reverse wrapper unwind.

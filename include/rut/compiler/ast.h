@@ -15,6 +15,7 @@ enum class AstItemKind : u8 {
     Using,
     TypeAlias,
     Impl,
+    Chain,
     Route,
 };
 
@@ -394,6 +395,30 @@ struct AstDecorator {
     Str name{};
 };
 
+enum class AstChainStepKind : u8 {
+    Before,
+    After,
+};
+
+struct AstChainDecl {
+    struct Step {
+        AstChainStepKind kind = AstChainStepKind::Before;
+        Span span{};
+        AstExpr call{};
+        u32 else_status = 0;
+    };
+
+    Span span{};
+    Str name{};
+    static constexpr u32 kMaxSteps = 8;
+    FixedVec<Step, kMaxSteps> steps;
+};
+
+struct AstChainUse {
+    Span span{};
+    Str name{};
+};
+
 struct AstRouteDecl {
     Span span{};
     Span body_span{};
@@ -403,6 +428,8 @@ struct AstRouteDecl {
     FixedVec<AstStatement, kMaxStatements> statements;
     static constexpr u32 kMaxDecorators = 8;
     FixedVec<AstDecorator, kMaxDecorators> decorators;
+    static constexpr u32 kMaxChains = 4;
+    FixedVec<AstChainUse, kMaxChains> chains;
 };
 
 struct AstItem {
@@ -417,6 +444,7 @@ struct AstItem {
     AstUsingDecl using_decl{};
     AstTypeAliasDecl type_alias{};
     AstImplDecl impl_decl{};
+    AstChainDecl chain{};
     AstRouteDecl route{};
 };
 
@@ -581,6 +609,12 @@ private:
         }
     }
 
+    void rebase_chain(const AstFile& other, AstChainDecl& decl) {
+        for (u32 i = 0; i < decl.steps.len; i++) {
+            rebase_expr(other, decl.steps[i].call);
+        }
+    }
+
     void rebase_from(const AstFile& other) {
         for (u32 i = 0; i < type_pool.len; i++) rebase_type_ref(other, type_pool[i]);
         for (u32 i = 0; i < expr_pool.len; i++) rebase_expr(other, expr_pool[i]);
@@ -604,6 +638,9 @@ private:
                     break;
                 case AstItemKind::Impl:
                     rebase_impl(other, items[i].impl_decl);
+                    break;
+                case AstItemKind::Chain:
+                    rebase_chain(other, items[i].chain);
                     break;
                 case AstItemKind::Route:
                     for (u32 j = 0; j < items[i].route.statements.len; j++) {

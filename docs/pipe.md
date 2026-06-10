@@ -35,8 +35,8 @@ operators.
 
 ## Lowering And Inlining
 
-Pipe is a source-level convenience, not a runtime abstraction. A pipeline such
-as:
+Pipe is a source-level convenience, not a runtime abstraction. A pipe expression
+such as:
 
 ```rut
 let code = 204 | normalize_status(_) | mask_internal_error(_)
@@ -68,10 +68,17 @@ if has_value(req.header("Host")) {
 
 where `tenant_from_host(...)` is also expanded into ordinary expression IR.
 
-## Basic Use
+## Core Style
 
-The right-hand side must be a function call stage. `_` and `_1` both mean "the
-whole value from the left-hand side":
+Rut Core uses pipe only as a small expression-composition helper. Generated and
+reviewed code should prefer one canonical stage shape:
+
+```rut
+value | function_name(_, arg)
+```
+
+The right-hand side must be a function call stage with an explicit `_`
+placeholder for the whole left-hand value:
 
 ```rut
 func normalize_status(code: i32) -> i32 {
@@ -84,18 +91,26 @@ route GET "/health" {
 }
 ```
 
-The same call can use `_1`:
+Do not use method-stage pipe syntax in core examples:
 
 ```rut
-let code = 204 | normalize_status(_1)
+let ok = 200 | _.eq(200)
 ```
 
-If a function-call stage has no placeholder, the left-hand value is passed as
-the first argument:
+Prefer the function-stage spelling instead:
 
 ```rut
-let code = 204 | normalize_status()
+let ok = 200 | eq(_, 200)
 ```
+
+Method-stage syntax makes the generated code look like a member call even when
+the operation is really a protocol or builtin helper. The function-stage form
+keeps name lookup explicit and avoids requiring generated code to guess which
+type owns a method.
+
+The implementation currently accepts some broader forms for compatibility, but
+Rut Core documentation and generated examples should not introduce them unless
+there is no equivalent direct function stage.
 
 ## Chaining
 
@@ -128,7 +143,7 @@ route GET "/users" {
 
 ## Placeholder Position
 
-The placeholder can appear in any argument position. This is useful when a stage
+The `_` placeholder can appear in any argument position. This is useful when a stage
 needs constants or policy values alongside the piped value:
 
 ```rut
@@ -145,7 +160,8 @@ route GET "/admin" {
 
 ## Method Stages
 
-The placeholder can also be the receiver of a method-call stage:
+Method-call stages are implemented today, but they are not Rut Core style. This
+shape is accepted for compatibility:
 
 ```rut
 route GET "/method-stage" {
@@ -156,7 +172,16 @@ route GET "/method-stage" {
 
 `_` and `_1` are accepted as method receivers. Tuple-slot receivers such as
 `_2.method(...)` are still rejected; use a function stage with tuple-slot
-arguments when a pipeline needs to project tuple slots.
+arguments when a pipe expression needs to project tuple slots.
+
+Prefer:
+
+```rut
+route GET "/method-stage" {
+    let ok = 200 | eq(_, 200)
+    if ok { return 200 } else { return 500 }
+}
+```
 
 ## Optional Header Flow
 
@@ -222,7 +247,12 @@ Use explicit branching when the fallback rule is not simple "value or default".
 
 ## Tuple Slots
 
-When the left-hand side is a tuple, numbered placeholders select tuple slots.
+Tuple-slot placeholders are implemented today, but they should stay outside the
+core generated style. They make pipe serve as both composition and destructuring.
+When tuple values are involved, prefer a named helper that receives the whole
+tuple, or bind the tuple fields explicitly before piping.
+
+The compatibility form uses numbered placeholders to select tuple slots.
 Indexes are 1-based:
 
 ```rut
@@ -301,6 +331,22 @@ route GET "/generic" {
   variant payloads, and generic tuple/struct shapes.
 - Optional/error propagation through runtime values.
 - JIT execution after lowering through existing call-expression machinery.
+
+## Rut Core Recommendation
+
+Generated Rut Core should use the smallest pipe subset:
+
+- Function-call stages only: `value | fn(_, other_arg)`.
+- A single whole-value `_` placeholder per stage.
+- No method-call stages such as `value | _.method(arg)`.
+- No placeholder-free stages such as `value | fn(arg)`.
+- No tuple-slot placeholders such as `_1` or `_2`.
+- Prefer at most four stages in one pipe chain; longer flows should introduce
+  named locals.
+
+The broader implemented surface remains useful for compatibility and targeted
+human-written code, but the core subset gives LLM-generated code one clear way
+to express value flow.
 
 ## Current Gaps
 
