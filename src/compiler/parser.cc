@@ -2206,6 +2206,93 @@ struct Parser {
         return d;
     }
 
+    bool is_use_chain_start() const {
+        return cur().type == TokenType::Ident && cur().text.eq({"use", 3}) &&
+               peek().type == TokenType::Ident && peek().text.eq({"chain", 5}) &&
+               peek(2).type == TokenType::Ident;
+    }
+
+    bool is_chain_decl_start() const {
+        return cur().type == TokenType::Ident && cur().text.eq({"chain", 5}) &&
+               peek().type == TokenType::Ident && peek(2).type == TokenType::LBrace;
+    }
+
+    FrontendResult<AstChainUse> parse_use_chain() {
+        auto use = expect(TokenType::Ident);
+        if (!use) return core::make_unexpected(use.error());
+        if (!use.value()->text.eq({"use", 3}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(*use.value()));
+        auto chain = expect(TokenType::Ident);
+        if (!chain) return core::make_unexpected(chain.error());
+        if (!chain.value()->text.eq({"chain", 5}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(*chain.value()));
+        auto name = expect(TokenType::Ident);
+        if (!name) return core::make_unexpected(name.error());
+        AstChainUse chain_use{};
+        chain_use.name = name.value()->text;
+        chain_use.span =
+            Span{use.value()->start, name.value()->end, use.value()->line, use.value()->col};
+        return chain_use;
+    }
+
+    FrontendResult<AstItem> parse_chain() {
+        auto kw = expect(TokenType::Ident);
+        if (!kw) return core::make_unexpected(kw.error());
+        if (!kw.value()->text.eq({"chain", 5}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(*kw.value()));
+        auto name = expect(TokenType::Ident);
+        if (!name) return core::make_unexpected(name.error());
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+
+        AstItem item{};
+        item.kind = AstItemKind::Chain;
+        item.chain.name = name.value()->text;
+        while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            AstChainDecl::Step step{};
+            const Token start = cur();
+            if (cur().type == TokenType::Ident && cur().text.eq({"before", 6})) {
+                pos++;
+                step.kind = AstChainStepKind::Before;
+            } else if (cur().type == TokenType::Ident && cur().text.eq({"after", 5})) {
+                pos++;
+                step.kind = AstChainStepKind::After;
+            } else {
+                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+            }
+            auto call = parse_expr();
+            if (!call) return core::make_unexpected(call.error());
+            step.call = call.value();
+            if (step.kind == AstChainStepKind::Before) {
+                auto kw_else = expect(TokenType::KwElse);
+                if (!kw_else) return core::make_unexpected(kw_else.error());
+                auto status = expect(TokenType::IntLit);
+                if (!status) return core::make_unexpected(status.error());
+                u32 parsed_status = 0;
+                for (u32 i = 0; i < status.value()->text.len; i++) {
+                    const u32 digit = static_cast<u32>(status.value()->text.ptr[i] - '0');
+                    if (parsed_status > (0xffffffffu - digit) / 10)
+                        return frontend_error(FrontendError::InvalidInteger,
+                                              span_from(*status.value()));
+                    parsed_status = parsed_status * 10 + digit;
+                }
+                step.else_status = parsed_status;
+                step.span = Span{start.start, status.value()->end, start.line, start.col};
+            } else {
+                step.span = Span{start.start, call->span.end, start.line, start.col};
+            }
+            if (!item.chain.steps.push(step))
+                return frontend_error(FrontendError::TooManyItems, step.span);
+        }
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+        if (item.chain.steps.len == 0)
+            return frontend_error(FrontendError::UnexpectedToken, span_from(*rbrace.value()));
+        item.span = Span{kw.value()->start, rbrace.value()->end, kw.value()->line, kw.value()->col};
+        item.chain.span = item.span;
+        return item;
+    }
+
     static bool binding_matches(Str pattern, bool is_wildcard, Str path) {
         if (is_wildcard) return true;
         if (path.len < pattern.len) return false;
@@ -2224,6 +2311,12 @@ struct Parser {
         method = &toks->tokens[pos++];
         auto path = expect(TokenType::StringLit);
         if (!path) return core::make_unexpected(path.error());
+        while (is_use_chain_start()) {
+            auto chain_name = parse_use_chain();
+            if (!chain_name) return core::make_unexpected(chain_name.error());
+            if (!item.route.chains.push(chain_name.value()))
+                return frontend_error(FrontendError::TooManyItems, span_from(cur()));
+        }
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
@@ -2270,19 +2363,35 @@ struct Parser {
         };
         static constexpr u32 kMaxBindings = AstRouteDecl::kMaxDecorators;
         FixedVec<PendingBinding, kMaxBindings> bindings;
+        FixedVec<AstChainUse, AstRouteDecl::kMaxChains> group_chains;
 
-        // Phase 1: bindings — `@ident "pattern"` while next-after-@ident is StringLit.
-        while (cur().type == TokenType::At && peek().type == TokenType::Ident &&
-               peek(2).type == TokenType::StringLit) {
-            auto deco = parse_decorator_atom();
-            if (!deco) return core::make_unexpected(deco.error());
-            auto pat = expect(TokenType::StringLit);
-            if (!pat) return core::make_unexpected(pat.error());
-            PendingBinding pb{};
-            pb.decorator = deco.value();
-            pb.pattern = pat.value()->text;
-            pb.is_wildcard = pb.pattern.len == 1 && pb.pattern.ptr[0] == '*';
-            if (!bindings.push(pb)) return frontend_error(FrontendError::TooManyItems, deco->span);
+        // Phase 1: route-block bindings. Decorator bindings use
+        // `@ident "pattern"`; core chains use `use chain name` and apply to
+        // every entry in the block.
+        bool parsing_bindings = true;
+        while (parsing_bindings) {
+            if (cur().type == TokenType::At && peek().type == TokenType::Ident &&
+                peek(2).type == TokenType::StringLit) {
+                auto deco = parse_decorator_atom();
+                if (!deco) return core::make_unexpected(deco.error());
+                auto pat = expect(TokenType::StringLit);
+                if (!pat) return core::make_unexpected(pat.error());
+                PendingBinding pb{};
+                pb.decorator = deco.value();
+                pb.pattern = pat.value()->text;
+                pb.is_wildcard = pb.pattern.len == 1 && pb.pattern.ptr[0] == '*';
+                if (!bindings.push(pb))
+                    return frontend_error(FrontendError::TooManyItems, deco->span);
+                continue;
+            }
+            if (is_use_chain_start()) {
+                auto chain_name = parse_use_chain();
+                if (!chain_name) return core::make_unexpected(chain_name.error());
+                if (!group_chains.push(chain_name.value()))
+                    return frontend_error(FrontendError::TooManyItems, span_from(cur()));
+                continue;
+            }
+            parsing_bindings = false;
         }
 
         // Phase 2: entries (with optional entry-prefix decorators).
@@ -2297,6 +2406,16 @@ struct Parser {
             }
             auto entry = parse_route_entry(*kw.value());
             if (!entry) return core::make_unexpected(entry.error());
+            FixedVec<AstChainUse, AstRouteDecl::kMaxChains> entry_chains = entry->route.chains;
+            entry->route.chains.len = 0;
+            for (u32 i = 0; i < group_chains.len; i++) {
+                if (!entry->route.chains.push(group_chains[i]))
+                    return frontend_error(FrontendError::TooManyItems, entry->span);
+            }
+            for (u32 i = 0; i < entry_chains.len; i++) {
+                if (!entry->route.chains.push(entry_chains[i]))
+                    return frontend_error(FrontendError::TooManyItems, entry->span);
+            }
             for (u32 i = 0; i < bindings.len; i++) {
                 if (binding_matches(
                         bindings[i].pattern, bindings[i].is_wildcard, entry->route.path)) {
@@ -2372,6 +2491,10 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 item = p.parse_route();
                 break;
             default:
+                if (p.is_chain_decl_start()) {
+                    item = p.parse_chain();
+                    break;
+                }
                 if (p.cur().type == TokenType::Ident && p.cur().text.eq({"type", 4})) {
                     item = p.parse_type_alias();
                     break;

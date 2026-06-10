@@ -39,6 +39,34 @@ Outstanding work items, prioritized for the next implementation passes.
 **Acceptance**:
 - The backlog item is complete when remaining uncovered transitions have explicit invariant assertions or are documented as intentionally exempt.
 
+## P1: Rut Core Syntax Reduction
+
+**Goal**: Keep the stable language surface small enough for deterministic
+review, verification, replay, and LLM-assisted generation.
+
+**Why**: Rut has accumulated compatibility syntax for decorators, pipe method
+stages, tuple-slot pipe placeholders, protocol-style methods, static loops, and
+match expansions. Some of these are useful, but stable core syntax needs one
+canonical spelling for common gateway tasks.
+
+**Work**:
+- Treat decorator syntax as compatibility and design `chain` as the stable
+  before/after handler middleware model.
+- Keep pipe in core, but document generated code around direct function stages:
+  `value | fn(_, arg)`.
+- Keep method-stage pipe syntax, placeholder-free pipe stages, and tuple-slot
+  pipe placeholders out of core examples unless compatibility requires them.
+- Revisit protocol/impl exposure so protocol methods do not read like general
+  structure member functions in generated Rut code.
+- Audit `match`, static `for`, and generic examples for constructs that should
+  be core, compatibility, or experimental.
+
+**Acceptance**:
+- Core docs distinguish stable core, compatibility, and experimental syntax.
+- Generated examples use one canonical spelling for pipe, middleware, fallback,
+  and async boundaries.
+- Compatibility syntax has a clear lowering or migration path to core forms.
+
 ## P0: Fault Injection Harness
 
 **Goal**: Make OS-level edge cases cheap to add and hard to skip.

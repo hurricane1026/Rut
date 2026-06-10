@@ -3,6 +3,10 @@
 This document describes the decorator behavior implemented today. It is a
 route middleware subset, not a general language-level decorator system.
 
+Decorators are compatibility syntax, not the preferred Rut Core middleware
+model. New design work should use explicit `chain` declarations for `before`
+handler checks. See [chains.md](chains.md).
+
 ## Purpose
 
 A route decorator can allow the request to continue or reject it with an HTTP

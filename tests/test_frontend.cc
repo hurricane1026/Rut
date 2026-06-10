@@ -3332,6 +3332,238 @@ TEST(frontend, parse_route_block_legacy_form_still_works) {
     CHECK_EQ(ast->items[0].route.decorators.len, 0u);
 }
 
+TEST(frontend, parse_chain_and_route_use_chain_order) {
+    const char* src = R"rut(
+chain common {
+    before require_host(req) else 400
+}
+chain read {
+    before require_auth(req) else 401
+}
+route {
+    use chain common
+    GET "/users" use chain read { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 3u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].kind), static_cast<u8>(AstItemKind::Chain));
+    CHECK(ast->items[0].chain.name.eq(lit("common")));
+    REQUIRE_EQ(ast->items[0].chain.steps.len, 1u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].chain.steps[0].kind),
+             static_cast<u8>(AstChainStepKind::Before));
+    CHECK_EQ(ast->items[0].chain.steps[0].else_status, 400u);
+    CHECK_EQ(static_cast<u8>(ast->items[2].kind), static_cast<u8>(AstItemKind::Route));
+    REQUIRE_EQ(ast->items[2].route.chains.len, 2u);
+    CHECK(ast->items[2].route.chains[0].name.eq(lit("common")));
+    CHECK(ast->items[2].route.chains[1].name.eq(lit("read")));
+}
+
+TEST(frontend, parse_chain_step_words_remain_contextual_identifiers) {
+    const char* src = R"rut(
+func before(_ x: i32) -> bool => true
+func after(_ x: i32) -> bool => before(x)
+route GET "/users" {
+    guard after(1) else { return 403 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 3u);
+    CHECK(ast->items[0].func.name.eq(lit("before")));
+    CHECK(ast->items[1].func.name.eq(lit("after")));
+}
+
+TEST(frontend, parse_chain_named_type_impl_remains_contextual) {
+    const char* src = R"rut(
+struct chain { value: i32 }
+protocol Hashable {
+    func hash(_ self: Self) -> i32
+}
+chain impl Hashable {
+    func hash(_ self: chain) -> i32 => self.value
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 3u);
+    CHECK_EQ(static_cast<u8>(ast->items[0].kind), static_cast<u8>(AstItemKind::Struct));
+    CHECK(ast->items[0].struct_decl.name.eq(lit("chain")));
+    CHECK_EQ(static_cast<u8>(ast->items[2].kind), static_cast<u8>(AstItemKind::Impl));
+}
+
+TEST(frontend, analyze_chain_before_lowers_to_guard) {
+    const char* src = R"rut(
+func require_auth(_ req: i32) -> bool {
+    if req.method == GET { true } else { false }
+}
+chain secure {
+    before require_auth(req) else 401
+}
+route {
+    use chain secure
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::IfElse));
+}
+
+TEST(frontend, analyze_unused_chain_does_not_mark_callee_as_magic_request) {
+    const char* src = R"rut(
+func future_auth(_ req: i32) -> bool {
+    if req.method == GET { true } else { false }
+}
+chain future {
+    before future_auth(req) else 401
+}
+route GET "/users" {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_chain_non_req_argument_does_not_mark_callee_as_magic_request) {
+    const char* src = R"rut(
+func check(_ req: i32) -> bool {
+    if req.method == GET { true } else { false }
+}
+chain secure {
+    before check(123) else 401
+}
+route GET "/users" use chain secure {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
+TEST(frontend, analyze_rejects_duplicate_chain_names) {
+    const char* src = R"rut(
+func first_auth(_ req: i32) -> bool {
+    if req.method == GET { true } else { false }
+}
+func shadowed_auth(_ req: i32) -> bool {
+    if req.method == GET { true } else { false }
+}
+chain secure {
+    before first_auth(req) else 401
+}
+chain secure {
+    before shadowed_auth(req) else 403
+}
+route GET "/users" use chain secure {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("secure")));
+}
+
+TEST(frontend, analyze_rejects_chain_before_optional_error_predicate) {
+    const char* src = R"rut(
+func maybe_auth(_ req: i32) -> bool {
+    if req.method == GET { true } else { error(.timeout) }
+}
+chain secure {
+    before maybe_auth(req) else 401
+}
+route GET "/users" use chain secure {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("maybe_auth")));
+}
+
+TEST(frontend, mir_forward_declared_chain_guard_runs_before_route_wait) {
+    const char* src = R"rut(
+func require_auth(_ req: i32) -> bool {
+    if req.method == GET { true } else { false }
+}
+route GET "/users" use chain secure {
+    wait(50)
+    return 200
+}
+chain secure {
+    before require_auth(req) else 401
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE(mir->functions[0].blocks.len >= 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
+             static_cast<u8>(MirTerminatorKind::Branch));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
+             static_cast<u8>(MirTerminatorKind::YieldTimer));
+}
+
+TEST(frontend, analyze_chain_after_is_reserved_until_lowering_exists) {
+    const char* src = R"rut(
+func access_log(_ req: i32) -> bool => true
+chain access {
+    after access_log(req)
+}
+route {
+    use chain access
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));

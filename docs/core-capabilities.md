@@ -16,6 +16,7 @@ route automaton:
 - terminal `return`,
 - terminal `return forward(upstream)`,
 - explicit `wait(...)` and `wait any { ... }`,
+- route `chain` before handler steps,
 - bounded per-shard state.
 
 ## Async Boundaries
@@ -73,6 +74,35 @@ Additional modes such as broadcast notification, targeted notification, or
 external backing stores should be added only when their ordering, failure,
 replay, and verifier semantics are explicit.
 
+## Handler Chains
+
+Decorator-style middleware is too flexible for Rut Core because binding,
+ordering, return-value conventions, and execution timing are not obvious from a
+route entry. Core middleware should use explicit chains instead:
+
+```rut
+chain secure_upload {
+    before decode_body(req) else 400
+    before require_auth(req) else 401
+}
+
+route {
+    use chain secure_upload
+
+    POST "/data" {
+        return 204
+    }
+}
+```
+
+The implemented chain boundary is `before` handler. More precise sequencing
+belongs inside the handler body. `before` steps may fail closed with an explicit
+status. `after` is reserved for handler-adjacent observability or cleanup, but
+chains containing it are rejected until response-side lowering exists. Group
+chains and entry chains compose in source order.
+
+See [chains.md](chains.md) for the current design direction.
+
 ## Deferred Risks
 
 The current decorator design has two known risks:
@@ -80,5 +110,6 @@ The current decorator design has two known risks:
 - execution order is not yet a strict first-instruction guard chain,
 - magic request binding through a parameter named `req` can be shadowed.
 
-These are not blockers for the current design pass, but they should be resolved
-before decorators become stable core syntax.
+These are not blockers for compatibility, but decorators should not become
+stable core syntax unless they can mechanically lower to the same chain model
+without adding hidden ordering or binding rules.
