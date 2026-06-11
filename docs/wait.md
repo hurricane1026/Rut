@@ -329,10 +329,6 @@ waiting for real timers.
 Decorator syntax is deprecated and unsupported. Write the route logic directly
 with `guard`, `if`, `match`, and `wait` instead.
 
-For the current static for-loop subset, including the route-level restriction
-that rejects mixing `wait(...)` with static loop lowering, see
-[for-loops.md](for-loops.md).
-
 ## Current Gaps
 
 The following are future work rather than current behavior:

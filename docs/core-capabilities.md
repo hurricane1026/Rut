@@ -12,7 +12,6 @@ route automaton:
 - domain-typed request inspection,
 - `let` and handler-local `var`,
 - `guard`, `if`, and `match`,
-- bounded `for` over finite inputs,
 - terminal `return`,
 - terminal `return forward(upstream)`,
 - explicit `wait(...)` and `wait any { ... }`,

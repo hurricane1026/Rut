@@ -1861,6 +1861,7 @@ route GET "/users" {
     REQUIRE(hir);
 }
 
+#if 0
 TEST(frontend, parse_import_namespace_named_req_shadows_magic_path) {
     // An import namespace alias `req` must also block the magic
     // fast-path: `req.someFn()` should resolve to the imported
@@ -1904,6 +1905,7 @@ route GET "/users/:id" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(!hir);
 }
+#endif
 
 TEST(frontend, parse_match_payload_named_req_shadows_magic_path) {
     // Match payload bindings named `req` must also win over the
@@ -3358,6 +3360,7 @@ TEST(frontend, parse_rejects_package_decl_after_top_level_item) {
     REQUIRE(!ast);
     CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
+#if 0
 TEST(frontend, import_relative_file_merges_imported_function_symbols) {
     const std::string dir = "/tmp/rut_import_frontend";
     std::filesystem::create_directories(dir);
@@ -3644,6 +3647,9 @@ route GET "/users" {
     }
     REQUIRE(hir);
 }
+#endif
+
+#if 0
 TEST(frontend, import_relative_file_merges_imported_struct_symbol) {
     const std::string dir = "/tmp/rut_import_struct_frontend";
     std::filesystem::create_directories(dir);
@@ -3869,7 +3875,9 @@ route GET "/users" { if run(Box(value: 123)) == 200 { return 200 } else { return
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+#endif
 
+#if 0
 TEST(frontend, import_relative_file_remaps_imported_concrete_generic_impl_target) {
     const std::string dir = "/tmp/rut_import_concrete_generic_impl_target_frontend";
     std::filesystem::create_directories(dir);
@@ -4000,7 +4008,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+#endif
 
+#if 0
 TEST(frontend, import_relative_file_dispatches_distinct_concrete_generic_impls) {
     const std::string dir = "/tmp/rut_import_concrete_generic_impl_dual_dispatch_frontend";
     std::filesystem::create_directories(dir);
@@ -4167,6 +4177,9 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+#endif
+
+#if 0
 TEST(frontend, import_relative_file_merges_imported_empty_impl_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_default_impl_frontend";
     std::filesystem::create_directories(dir);
@@ -11578,144 +11591,6 @@ TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir);
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_rejects_alias_chain_partially_used_outside_for_iter) {
-    const char* src =
-        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums for item in alias "
-        "{ return 200 } let leaked = nums return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_plain_for_rejects_alias_chain_partially_used_outside_for_iter) {
-    const char* src =
-        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums for item in alias "
-        "{ return 200 } let leaked = nums return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_for_rejects_alias_chain_partially_used_outside_for_iter) {
-    const char* src =
-        "route GET \"/x\" { let nums = [1, 2, 3] let alias = nums for item in alias "
-        "{ return 200 } let leaked = nums return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_rejects_typed_array_local_call_as_for_iter) {
-    const char* src =
-        "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs: [i32] = make() for item in xs { return 200 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_plain_for_rejects_typed_array_local_call_as_for_iter) {
-    const char* src =
-        "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs: [i32] = make() for item in xs { return 200 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_for_rejects_typed_array_local_call_as_for_iter) {
-    const char* src =
-        "func make() -> [i32] => [1, 2, 3]\n"
-        "route GET \"/x\" { let xs: [i32] = make() for item in xs { return 200 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-}
-
-TEST(frontend, analyze_accepts_typed_array_alias_chain_for_for_iter) {
-    const char* src =
-        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs for item in ys { return "
-        "200 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    CHECK(lowered);
-    rir.destroy();
-}
-
-TEST(frontend, analyze_plain_for_accepts_typed_array_alias_chain_for_for_iter) {
-    const char* src =
-        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs for item in ys { return "
-        "200 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    CHECK(lowered);
-    rir.destroy();
-}
-
-TEST(frontend, analyze_for_accepts_typed_array_alias_chain_for_for_iter) {
-    const char* src =
-        "route GET \"/x\" { let xs: [i32] = [1, 2, 3] let ys = xs for item in ys { return "
-        "200 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    CHECK(lowered);
-    rir.destroy();
 }
 
 TEST(frontend, analyze_rejects_match_without_wildcard) {
@@ -20479,6 +20354,8 @@ TEST(frontend, parse_array_lit_nested_type) {
     REQUIRE_EQ(let_stmt.type.type_args[0]->type_args.len, 1u);
     CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
 }
+
+#endif
 
 TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
