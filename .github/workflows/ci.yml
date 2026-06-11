@@ -368,14 +368,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-20 llvm-20 llvm-20-dev cmake ninja-build libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
-          sudo update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-20 100
-          sudo update-alternatives --install /usr/bin/llvm-cov llvm-cov /usr/bin/llvm-cov-20 100
+          echo "CC=/usr/bin/clang-20" >> "$GITHUB_ENV"
+          echo "CXX=/usr/bin/clang++-20" >> "$GITHUB_ENV"
+          echo "LLVM_PROFDATA=/usr/bin/llvm-profdata-20" >> "$GITHUB_ENV"
+          echo "LLVM_COV=/usr/bin/llvm-cov-20" >> "$GITHUB_ENV"
 
       - name: Build with coverage
         run: |
-          CC=clang CXX=clang++ cmake -B build -G Ninja \
+          CC="$CC" CXX="$CXX" cmake -B build -G Ninja \
             -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
             -DCMAKE_BUILD_TYPE=Debug \
             -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
@@ -409,7 +409,7 @@ jobs:
 
       - name: Generate coverage report
         run: |
-          llvm-profdata merge build/*.profraw -o build/merged.profdata
+          "$LLVM_PROFDATA" merge build/*.profraw -o build/merged.profdata
 
           # Report first-party coverage areas as the UNION across test binaries:
           # a line counts as covered if any binary hits it. `llvm-cov
@@ -431,7 +431,7 @@ jobs:
           # types; the union merge would incorrectly count those as
           # real production paths. They still run above for correctness
           # validation.
-          python3 scripts/coverage_report.py \
+          LLVM_COV="$LLVM_COV" python3 scripts/coverage_report.py \
             --profile build/merged.profdata \
             --threshold 97 \
             build/tests/test_buffer \
