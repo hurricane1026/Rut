@@ -1929,6 +1929,89 @@ route GET "/users" {
     REQUIRE(hir);
 }
 
+TEST(frontend, import_relative_struct_file_records_package_metadata_in_hir) {
+    const std::string dir = "/tmp/rut_import_struct_metadata_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/types.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "struct Box { value: i32 }\n";
+    }
+    const auto src = R"rut(
+import "types.rut"
+route GET "/users" {
+    let b = Box(value: 200)
+    if b.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->imports.len, 1u);
+    CHECK(hir->imports[0].has_package_decl);
+    CHECK(hir->imports[0].package_name.eq(lit("auth")));
+    CHECK(!hir->imports[0].same_package);
+}
+
+TEST(frontend, import_relative_struct_file_in_same_package_marks_hir_import_as_same_package) {
+    const std::string dir = "/tmp/rut_import_struct_same_package_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/types.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "struct Box { value: i32 }\n";
+    }
+    const auto src = R"rut(
+package auth
+import "types.rut"
+route GET "/users" {
+    let b = Box(value: 200)
+    if b.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->imports.len, 1u);
+    CHECK(hir->imports[0].has_package_decl);
+    CHECK(hir->imports[0].package_name.eq(lit("auth")));
+    CHECK(hir->imports[0].same_package);
+}
+
+TEST(frontend, namespace_alias_import_for_struct_file_is_supported) {
+    const std::string dir = "/tmp/rut_import_struct_namespace_alias_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/types.rut", std::ios::binary);
+        out << "package auth\n";
+        out << "struct Box { value: i32 }\n";
+    }
+    const auto src = R"rut(
+package auth
+import * as authV1 from "types.rut"
+route GET "/users" {
+    let b = authV1.Box(value: 200)
+    if b.value == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->imports.len, 1u);
+    CHECK(hir->imports[0].has_namespace_alias);
+    CHECK(hir->imports[0].namespace_alias.eq(lit("authV1")));
+    CHECK(hir->imports[0].same_package);
+}
+
 TEST(frontend, parse_return_response_with_headers) {
     // Headers dict carries through parser → HIR → MIR → RIR:
     // intern_response_headers writes one set into rir::Module's flat
