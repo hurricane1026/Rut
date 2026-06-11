@@ -55,10 +55,8 @@ guard let user = req.body(User) else {
 }
 ```
 
-The symbolic forms `?.` and `??` are concise, but they are easy to overuse and
-harder to diagnose precisely. They should stay non-core/reserved until examples,
-diagnostics, and LLM-generated code show that they reduce rather than increase
-ambiguity.
+The symbolic forms `?.` and `??` are deprecated and intentionally unsupported.
+Use named fallback such as `.or(default)`, `guard let`, or `match` instead.
 
 `any` and `all` should be reserved for race/concurrency meanings, not ordinary
 optional fallback.

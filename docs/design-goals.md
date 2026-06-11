@@ -134,13 +134,14 @@ The current design review keeps the following direction:
   the stable core should prefer explicit `chain` declarations. The implemented
   core is limited to the `before` handler boundary. More precise sequencing
   belongs inside the route handler.
+- Decorators are deprecated and unsupported. Explicit route control flow should
+  use `guard`, `if`, `match`, and `wait` directly.
 - State consistency should be simplified to the production modes Rut actually
   needs first. Additional consistency/backing-store modes should wait until
   their replay and verifier contracts are precise.
 - Optional/fallback syntax should prefer named forms in Rut Core. Use
-  `.or(default)`, `guard let`, or `match`; keep symbolic forms such as `?.` and
-  `??` non-core/reserved until they prove clearer for users, diagnostics, and
-  LLM-generated code.
+  `.or(default)`, `guard let`, or `match`; the symbolic forms `?.` and `??`
+  are deprecated and unsupported.
 - Chain order should be visible source order. Group chains and entry chains
   compose in that order. If `after` lowering is added later, it should follow
   the same visible order rather than a reverse wrapper unwind.

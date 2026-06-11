@@ -326,25 +326,8 @@ waiting for real timers.
 
 ## Decorators
 
-Decorated wait routes are supported for the direct terminal subset:
-
-```rut
-func auth(_ ignored: i32) -> i32 => 0
-
-route {
-    @auth "*"
-    GET "/sleep" { wait(1000) return 204 }
-}
-```
-
-Decorator guards run before the first timer yield is armed. Decorated wait
-routes may use pre-wait `let` bindings, and may use top-level guards before or
-after the wait. Post-wait guards run after resume and may read request fields,
-but they cannot read user locals initialized before the wait and cannot contain
-fail-body `let` bindings. Decorated wait routes still reject user `let` bindings
-after a wait, wait-result locals, for-loops, and non-direct terminal control such
-as `if` / `match`. See [decorators.md](decorators.md) for the full decorated
-wait subset.
+Decorator syntax is deprecated and unsupported. Write the route logic directly
+with `guard`, `if`, `match`, and `wait` instead.
 
 For the current static for-loop subset, including the route-level restriction
 that rejects mixing `wait(...)` with static loop lowering, see
@@ -365,4 +348,4 @@ The following are future work rather than current behavior:
 - Parameterized IO starts inside `wait any`; start the operation before a later
   race wait until that payload has a richer representation.
 - Non-wait `let` bindings after a `wait(...)`.
-- Waits inside nested blocks, loops, branches, or decorator bodies.
+- Waits inside nested blocks, loops, or branches.

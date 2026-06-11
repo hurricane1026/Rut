@@ -2200,10 +2200,12 @@ struct Parser {
         if (!at) return core::make_unexpected(at.error());
         auto name_tok = expect(TokenType::Ident);
         if (!name_tok) return core::make_unexpected(name_tok.error());
-        AstDecorator d{};
-        d.name = name_tok.value()->text;
-        d.span = Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
-        return d;
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              Span{at.value()->start,
+                                   name_tok.value()->end,
+                                   at.value()->line,
+                                   at.value()->col},
+                              lit_str("decorators are deprecated"));
     }
 
     bool is_use_chain_start() const {
