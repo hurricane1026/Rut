@@ -2987,12 +2987,10 @@ TEST(frontend, analyze_rejects_wait_after_for_loop) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE(ast);
-        auto hir = analyze_file_heap(ast.value());
-        REQUIRE(!hir);
-        CHECK_EQ(static_cast<u8>(hir.error().code),
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(static_cast<u8>(ast.error().code),
                  static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(hir.error().detail.eq(lit("wait cannot be used after a static for-loop")));
+        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
     }
 }
 
@@ -3011,10 +3009,10 @@ TEST(frontend, analyze_rejects_for_loop_after_wait) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE(ast);
-        auto hir = analyze_file_heap(ast.value());
-        REQUIRE(!hir);
-        CHECK(hir.error().detail.eq(lit("static for-loop cannot be combined with wait")));
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(static_cast<u8>(ast.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
     }
 }
 
@@ -20482,28 +20480,14 @@ TEST(frontend, parse_array_lit_nested_type) {
     CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
 }
 
-TEST(frontend, parse_for_loop_basic) {
-    // `for item in xs { return 200 }` — loop variable stored in `name`,
-    // iteration source in `expr`, body block in `then_stmt`. Intentionally
-    // parse-only: asserts AST shape independent of analyze (full-pipeline
-    // coverage lives in analyze_for_loop_* tests below).
+TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    const auto& route = ast->items[0].route;
-    REQUIRE_EQ(route.statements.len, 2u);
-    const auto& for_stmt = route.statements[0];
-    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
-    CHECK(for_stmt.name.eq(lit("item")));
-    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
-    REQUIRE_EQ(for_stmt.expr.args.len, 3u);
-    REQUIRE(for_stmt.then_stmt != nullptr);
-    // Body is a single-stmt `return 200` (parse_braced_stmt_body collapses
-    // one-stmt blocks to the stmt itself — not a Block wrapper).
-    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
 }
 
 TEST(frontend, parse_inline_identifier_is_not_reserved) {
@@ -20527,6 +20511,17 @@ TEST(frontend, parse_rejects_inline_for_compat_spelling) {
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("use 'for', not 'inline for'")));
+}
+
+#if 0
+TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
 }
 
 TEST(frontend, parse_for_loop_field_access_source) {
@@ -26823,10 +26818,10 @@ TEST(frontend, parse_for_loop_rejects_missing_in) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loop expects 'in' after iterator name")));
-    CHECK_EQ(ast.error().span.col, 22u);
+    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
 }
 
+#endif
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
