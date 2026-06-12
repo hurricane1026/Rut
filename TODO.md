@@ -45,8 +45,8 @@ Outstanding work items, prioritized for the next implementation passes.
 review, verification, replay, and LLM-assisted generation.
 
 **Why**: Rut has accumulated compatibility syntax for decorators, pipe method
-stages, tuple-slot pipe placeholders, protocol-style methods, static loops, and
-match expansions. Some of these are useful, but stable core syntax needs one
+stages, tuple-slot pipe placeholders, protocol-style methods, and match
+expansions. Some of these are useful, but stable core syntax needs one
 canonical spelling for common gateway tasks.
 
 **Work**:
@@ -58,8 +58,8 @@ canonical spelling for common gateway tasks.
   pipe placeholders out of core examples unless compatibility requires them.
 - Revisit protocol/impl exposure so protocol methods do not read like general
   structure member functions in generated Rut code.
-- Audit `match`, static `for`, and generic examples for constructs that should
-  be core, compatibility, or experimental.
+- Audit `match` and generic examples for constructs that should be core,
+  compatibility, or experimental.
 
 **Acceptance**:
 - Core docs distinguish stable core, compatibility, and experimental syntax.

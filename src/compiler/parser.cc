@@ -1175,30 +1175,9 @@ struct Parser {
                                   lit_str("use 'for', not 'inline for'"));
         }
         if (cur().type == TokenType::KwFor) {
-            if (auto for_kw = expect(TokenType::KwFor); !for_kw)
-                return core::make_unexpected(for_kw.error());
-            auto var_name = expect(TokenType::Ident);
-            if (!var_name) return core::make_unexpected(var_name.error());
-            auto in_kw = take(TokenType::KwIn);
-            if (!in_kw)
-                return frontend_error(FrontendError::UnsupportedSyntax,
-                                      span_from(*var_name.value()),
-                                      lit_str("for loop expects 'in' after iterator name"));
-            auto iter_expr = parse_expr();
-            if (!iter_expr) return core::make_unexpected(iter_expr.error());
-            auto lbrace = expect(TokenType::LBrace);
-            if (!lbrace) return core::make_unexpected(lbrace.error());
-            auto body = parse_braced_stmt_body(*lbrace.value());
-            if (!body) return core::make_unexpected(body.error());
-            auto body_ptr = alloc_stmt(body.value());
-            if (!body_ptr) return core::make_unexpected(body_ptr.error());
-            AstStatement stmt{};
-            stmt.kind = AstStmtKind::For;
-            stmt.name = var_name.value()->text;
-            stmt.expr = iter_expr.value();
-            stmt.then_stmt = body_ptr.value();
-            stmt.span = Span{start.start, body->span.end, start.line, start.col};
-            return stmt;
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(cur()),
+                                  lit_str("for loops are unsupported in Rut Core"));
         }
         if (take(TokenType::KwMatch)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
@@ -2200,10 +2179,10 @@ struct Parser {
         if (!at) return core::make_unexpected(at.error());
         auto name_tok = expect(TokenType::Ident);
         if (!name_tok) return core::make_unexpected(name_tok.error());
-        AstDecorator d{};
-        d.name = name_tok.value()->text;
-        d.span = Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
-        return d;
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col},
+            lit_str("decorators are deprecated"));
     }
 
     bool is_use_chain_start() const {
@@ -2220,12 +2199,14 @@ struct Parser {
     FrontendResult<AstChainUse> parse_use_chain() {
         auto use = expect(TokenType::Ident);
         if (!use) return core::make_unexpected(use.error());
-        if (!use.value()->text.eq({"use", 3}))
+        if (!use.value()->text.eq({"use", 3})) {
             return frontend_error(FrontendError::UnexpectedToken, span_from(*use.value()));
+        }
         auto chain = expect(TokenType::Ident);
         if (!chain) return core::make_unexpected(chain.error());
-        if (!chain.value()->text.eq({"chain", 5}))
+        if (!chain.value()->text.eq({"chain", 5})) {
             return frontend_error(FrontendError::UnexpectedToken, span_from(*chain.value()));
+        }
         auto name = expect(TokenType::Ident);
         if (!name) return core::make_unexpected(name.error());
         AstChainUse chain_use{};

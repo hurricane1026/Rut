@@ -40,13 +40,13 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 clang-tidy-18 llvm-18-dev cmake ninja-build libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
-          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
+          sudo apt-get install -y clang-20 clang-tidy-20 llvm-20-dev cmake ninja-build libboost-dev ragel
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
+          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-20 100
 
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
 
       - name: Lint
         run: |
@@ -98,16 +98,16 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build llvm-18-dev libboost-dev ragel
+          sudo apt-get install -y cmake ninja-build llvm-20-dev libboost-dev ragel
           if [ "${{ matrix.compiler }}" = "clang" ]; then
-            sudo apt-get install -y clang-18
-            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+            sudo apt-get install -y clang-20
+            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
           fi
 
       - name: Configure
         run: |
-          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm"
+          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm"
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $LLVM_OPT
           else
@@ -165,9 +165,9 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+          sudo apt-get install -y clang-20 cmake ninja-build llvm-20-dev libboost-dev ragel
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
 
       - name: Report CPU capabilities
         run: |
@@ -206,7 +206,7 @@ jobs:
             if ! CC=clang CXX=clang++ cmake -B "build-$arch" -G Ninja \
                   -DCMAKE_BUILD_TYPE=Release \
                   -DSIMD_ARCH=$arch \
-                  -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
+                  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
               echo "::warning::cmake configure failed for SIMD_ARCH=$arch"
               cat "/tmp/cmake-$arch.err"
               continue
@@ -267,9 +267,9 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build llvm-18-dev libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+          sudo apt-get install -y clang-20 cmake ninja-build llvm-20-dev libboost-dev ragel
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
 
       - name: Report CPU capabilities
         run: |
@@ -295,7 +295,7 @@ jobs:
             if ! CC=clang CXX=clang++ cmake -B "build-$arch" -G Ninja \
                   -DCMAKE_BUILD_TYPE=Release \
                   -DSIMD_ARCH=$arch \
-                  -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
+                  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
               echo "::warning::cmake configure failed for SIMD_ARCH=$arch"
               cat "/tmp/cmake-$arch.err"
               continue
@@ -367,18 +367,18 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 llvm-18 llvm-18-dev cmake ninja-build libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
-          sudo update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-18 100
-          sudo update-alternatives --install /usr/bin/llvm-cov llvm-cov /usr/bin/llvm-cov-18 100
+          sudo apt-get install -y clang-20 llvm-20 llvm-20-dev cmake ninja-build libboost-dev ragel
+          echo "CC=/usr/bin/clang-20" >> "$GITHUB_ENV"
+          echo "CXX=/usr/bin/clang++-20" >> "$GITHUB_ENV"
+          echo "LLVM_PROFDATA=/usr/bin/llvm-profdata-20" >> "$GITHUB_ENV"
+          echo "LLVM_COV=/usr/bin/llvm-cov-20" >> "$GITHUB_ENV"
 
       - name: Build with coverage
         run: |
-          CC=clang CXX=clang++ cmake -B build -G Ninja \
+          CC="$CC" CXX="$CXX" cmake -B build -G Ninja \
             -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+            -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
           ninja -C build
 
       - name: Run tests
@@ -409,7 +409,7 @@ jobs:
 
       - name: Generate coverage report
         run: |
-          llvm-profdata merge build/*.profraw -o build/merged.profdata
+          "$LLVM_PROFDATA" merge build/*.profraw -o build/merged.profdata
 
           # Report first-party coverage areas as the UNION across test binaries:
           # a line counts as covered if any binary hits it. `llvm-cov
@@ -431,7 +431,7 @@ jobs:
           # types; the union merge would incorrectly count those as
           # real production paths. They still run above for correctness
           # validation.
-          python3 scripts/coverage_report.py \
+          LLVM_COV="$LLVM_COV" python3 scripts/coverage_report.py \
             --profile build/merged.profdata \
             --threshold 97 \
             build/tests/test_buffer \

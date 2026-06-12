@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 import json
 from pathlib import PurePosixPath
@@ -72,9 +73,10 @@ def area_for_path(path: str) -> CoverageArea | None:
 
 def per_binary_segments(profile: str, binary: str) -> dict:
     """Return llvm-cov JSON export for one binary restricted to first-party sources."""
+    llvm_cov = os.environ.get("LLVM_COV", "llvm-cov")
     proc = subprocess.run(
         [
-            "llvm-cov",
+            llvm_cov,
             "export",
             f"--instr-profile={profile}",
             f"--object={binary}",
