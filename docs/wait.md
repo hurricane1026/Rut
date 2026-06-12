@@ -246,7 +246,7 @@ For this slice, "completion wait" is the important boundary:
 
 - `wait(downstream.recv())` can arm downstream recv and wait for its completion.
 - `wait(downstream.send())` waits for the current downstream send buffer to
-  drain before resuming.
+  drain before resuming; an empty buffer resumes immediately.
 - `wait(upstream(api).connect())` starts the upstream connect and waits for
   its completion.
 - `wait(upstream(api).recv())` arms upstream recv on the current upstream
