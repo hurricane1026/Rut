@@ -17,9 +17,12 @@
 #include <unistd.h>
 
 using namespace rut;
+using rut::test_fault::fixed_clock_gettime;
 using rut::test_fault::IoFaultConfig;
 using rut::test_fault::ScopedIoFault;
 using rut::test_fault::ScopedSyscallFault;
+using rut::test_fault::single_recv_eintr;
+using rut::test_fault::single_send_eintr;
 using rut::test_fault::SyscallFaultConfig;
 
 namespace {
@@ -155,16 +158,43 @@ TEST(syscall_fault, mkstemp_and_unlink_failures_are_injected) {
 }
 
 TEST(syscall_fault, clock_gettime_fixed_time_is_injected_by_clock_id) {
-    SyscallFaultConfig realtime_config;
-    realtime_config.clock_gettime_fixed = true;
-    realtime_config.clock_gettime_match_all = false;
-    realtime_config.clock_gettime_clock_id = CLOCK_REALTIME;
-    realtime_config.clock_gettime_sec = 1711123456;
-    realtime_config.clock_gettime_nsec = 789123000;
-
-    ScopedSyscallFault realtime_fault(realtime_config);
+    ScopedSyscallFault realtime_fault(fixed_clock_gettime(CLOCK_REALTIME, 1711123456, 789123000));
     CHECK_EQ(realtime_us(), 1711123456789123ULL);
     CHECK(monotonic_us() > 0);
+}
+
+TEST(io_fault, single_send_eintr_helper_injects_once) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    u8 data[4] = {'o', 'k', 'a', 'y'};
+    {
+        ScopedIoFault fault(single_send_eintr(fds[0]));
+        errno = 0;
+        CHECK_EQ(send(fds[0], data, sizeof(data), 0), -1);
+        CHECK_EQ(errno, EINTR);
+    }
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(io_fault, single_recv_eintr_helper_injects_once) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    const char data[] = "abc";
+    auto recv_fault = single_recv_eintr(fds[1], data, sizeof(data) - 1);
+    (void)recv_fault;
+
+    u8 buf[4]{};
+    errno = 0;
+    CHECK_EQ(recv(fds[1], buf, sizeof(buf), 0), -1);
+    CHECK_EQ(errno, EINTR);
+    CHECK_EQ(recv(fds[1], buf, sizeof(buf), 0), 3);
+    CHECK_EQ(memcmp(buf, data, 3), 0);
+
+    close(fds[0]);
+    close(fds[1]);
 }
 
 TEST(syscall_fault, clock_gettime_fixed_time_can_match_all_clock_ids) {

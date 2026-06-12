@@ -68,6 +68,12 @@ inline IoFaultConfig single_write_eintr(int fd) {
     return config;
 }
 
+inline IoFaultConfig single_send_eintr(int fd) {
+    IoFaultConfig config = io_fault_for_fd(fd);
+    config.send_eintrs = 1;
+    return config;
+}
+
 struct SyscallFaultConfig {
     int epoll_create1_errno = 0;
     int epoll_create1_failures = 0;
@@ -96,6 +102,19 @@ struct SyscallFaultConfig {
     time_t clock_gettime_sec = 0;
     long clock_gettime_nsec = 0;
 };
+
+inline SyscallFaultConfig fixed_clock_gettime(clockid_t clock_id,
+                                              time_t sec,
+                                              long nsec,
+                                              bool match_all = false) {
+    SyscallFaultConfig config;
+    config.clock_gettime_fixed = true;
+    config.clock_gettime_match_all = match_all;
+    config.clock_gettime_clock_id = clock_id;
+    config.clock_gettime_sec = sec;
+    config.clock_gettime_nsec = nsec;
+    return config;
+}
 
 FaultState& state();
 void reset();
@@ -154,5 +173,9 @@ public:
 private:
     SyscallFaultConfig previous_;
 };
+
+inline ScopedRecvData single_recv_eintr(int fd, const char* data, size_t len) {
+    return ScopedRecvData(fd, data, len, 1);
+}
 
 }  // namespace rut::test_fault
