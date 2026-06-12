@@ -696,6 +696,7 @@ template void on_request_complete<EpollEventLoop>(EpollEventLoop*, Connection&, 
 template void pipeline_dispatch<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void on_header_received<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_response_sent<EpollEventLoop>(void*, Connection&, IoEvent);
+template void on_jit_wait_send_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_connected<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_request_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_response<EpollEventLoop>(void*, Connection&, IoEvent);
@@ -719,6 +720,7 @@ template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connectio
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void on_header_received<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+template void on_jit_wait_send_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_connected<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_request_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_upstream_response<IoUringEventLoop>(void*, Connection&, IoEvent);

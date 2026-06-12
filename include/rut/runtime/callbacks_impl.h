@@ -461,6 +461,46 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 }
 
 template <typename Loop>
+void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const u32 kSendLen = conn.send_buf.len();
+    const u32 kResult = ev.result < 0 ? 0u : static_cast<u32>(ev.result);
+
+    if (ev.result < 0) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.send_progress > kSendLen) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (kResult > (kSendLen - conn.send_progress)) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress += kResult;
+
+    if (conn.send_progress < kSendLen) {
+        if (kResult == 0u) {
+            loop->close_conn(conn);
+            return;
+        }
+
+        const u32 kRemaining = kSendLen - conn.send_progress;
+        conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining);
+        return;
+    }
+
+    conn.send_progress = 0;
+    conn.transition_to_exec_handler_wait();
+    conn.resume_event_kind = jit::YieldKind::Send;
+    conn.resume_event_result = ev.result;
+    resume_jit_handler<Loop>(loop, conn);
+}
+
+template <typename Loop>
 void handle_jit_outcome(Loop* loop,
                         Connection& conn,
                         const JitDispatchOutcome& outcome,
@@ -604,7 +644,12 @@ void handle_jit_outcome(Loop* loop,
                 }
             }
             if (outcome.yield_kind == jit::YieldKind::Send) {
-                send_internal_error();
+                if (conn.send_buf.len() == 0) {
+                    send_internal_error();
+                    return;
+                }
+                conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
                        outcome.timer_ms != 0) {

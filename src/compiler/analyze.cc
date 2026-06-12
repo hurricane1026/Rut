@@ -5080,7 +5080,10 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
         return spec;
     }
     if (is_downstream && op.name.eq({"send", 4})) {
-        return frontend_error(FrontendError::UnsupportedSyntax, op.span);
+        if (op.args.len != 0) return frontend_error(FrontendError::UnsupportedSyntax, op.span);
+        spec.kind = WaitEventKind::Send;
+        spec.arm_mask = wait_event_kind_default_arm_mask(spec.kind, spec.payload);
+        return spec;
     }
     if (is_upstream && op.name.eq({"connect", 7})) {
         if (op.args.len != 0) return frontend_error(FrontendError::UnsupportedSyntax, op.span);

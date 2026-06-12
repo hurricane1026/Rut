@@ -58,6 +58,9 @@ template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
+void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev);
+
+template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
@@ -104,6 +107,7 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev);
 
 extern template void on_header_received<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_sent<EpollEventLoop>(void*, Connection&, IoEvent);
+extern template void on_jit_wait_send_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_upstream_connected<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_upstream_request_sent<EpollEventLoop>(void*, Connection&, IoEvent);
 extern template void on_upstream_response<EpollEventLoop>(void*, Connection&, IoEvent);
@@ -122,6 +126,7 @@ extern template void on_body_send_with_early_response<EpollEventLoop>(void*, Con
 
 extern template void on_header_received<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_response_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+extern template void on_jit_wait_send_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_upstream_connected<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_upstream_request_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_upstream_response<IoUringEventLoop>(void*, Connection&, IoEvent);

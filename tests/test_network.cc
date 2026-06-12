@@ -9944,6 +9944,39 @@ TEST(state_invariant, jit_downstream_send_yield_fails_closed) {
     CHECK_EQ(c->resp_status, 500);
 }
 
+TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.reset();
+    const char kChunk[] = "abc";
+    c->send_buf.write(reinterpret_cast<const u8*>(kChunk), sizeof(kChunk) - 1);
+
+    g_state_invariant_jit_result = jit::HandlerResult::make_status(204);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_jit_wait_send_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->pending_handler_fn, &state_invariant_configured_jit_result);
+
+    const auto* first_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(first_send != nullptr);
+    loop.dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(first_send->send_len)));
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+}
+
 TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
     SmallLoop loop;
     loop.setup();

@@ -20,6 +20,7 @@ The statement forms available today are:
 ```rut
 wait()
 wait(downstream.recv())
+wait(downstream.send())
 wait(upstream(api).connect())
 wait(upstream(api).recv())
 wait(upstream(api).send(req.body))
@@ -230,20 +231,22 @@ The event kind is encoded in the JIT yield result:
 
 - `wait()` -> `YieldKind::Any`
 - `wait(downstream.recv())` -> `YieldKind::Recv`
+- `wait(downstream.send())` -> `YieldKind::Send`
 - `wait(upstream(api).connect())` -> `YieldKind::UpstreamConnect`
 - `wait(upstream(api).recv())` -> `YieldKind::UpstreamRecv`
 - `wait(upstream(api).send(req.body))` -> `YieldKind::UpstreamSend`
 
 The runtime stores the pending yield kind and only resumes the handler when a
 matching event arrives. In this slice, downstream recv is auto-armed when
-entering `wait()` or `wait(downstream.recv())`; upstream connect, upstream
-recv, and upstream send with `req.body` start the corresponding operation
-before waiting. Starting a downstream response send inside
-`wait(downstream.send(...))` is not supported yet.
+entering `wait()` or `wait(downstream.recv())`; downstream send waits on the
+current downstream send buffer; upstream connect, upstream recv, and upstream
+send with `req.body` start the corresponding operation before waiting.
 
 For this slice, "completion wait" is the important boundary:
 
 - `wait(downstream.recv())` can arm downstream recv and wait for its completion.
+- `wait(downstream.send())` waits for the current downstream send buffer to
+  drain before resuming.
 - `wait(upstream(api).connect())` starts the upstream connect and waits for
   its completion.
 - `wait(upstream(api).recv())` arms upstream recv on the current upstream
@@ -335,9 +338,8 @@ The following are future work rather than current behavior:
 
 - Rich result payloads beyond the current scalar fields and event-kind
   predicates.
-- Response starts inside `wait(downstream.send(response(...)))`; use terminal
-  `return response(...)` for downstream responses until route completion can
-  model "send and finish" without a second terminal response.
+- Response-builder payloads inside downstream send waits
+  (`wait(downstream.send(response(...)))`).
 - Exact event subsets beyond the current `downstream.recv()` plus `timer(ms)`
   `wait any` subset. The current subset carries a verifier-visible exact arm
   mask while the runtime ABI still uses current-connection `Any`.
