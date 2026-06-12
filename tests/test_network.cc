@@ -9811,6 +9811,20 @@ TEST(state_invariant, upstream_response_eof_without_data_resets_proxy_conn) {
     check_idle_invariant(_tc, &loop.conns[cid]);
 }
 
+TEST(state_invariant, proxy_timeout_clears_proxy_slots) {
+    SmallLoop loop;
+    loop.setup();
+    loop.keepalive_timeout = 0;
+
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    check_proxying_upstream_wait_invariant(_tc, c);
+
+    const u32 cid = c->id;
+    loop.dispatch(make_ev(0, IoEventType::Timeout, 1));
+    check_idle_invariant(_tc, &loop.conns[cid]);
+}
+
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     SmallLoop loop;
     loop.setup();

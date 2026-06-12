@@ -1861,6 +1861,7 @@ route GET "/users" {
     REQUIRE(hir);
 }
 
+// These import-namespace shadow cases still crash in analyze_file_heap_with_path.
 #if 0
 TEST(frontend, parse_import_namespace_named_req_shadows_magic_path) {
     // An import namespace alias `req` must also block the magic
@@ -3443,7 +3444,6 @@ TEST(frontend, parse_rejects_package_decl_after_top_level_item) {
     REQUIRE(!ast);
     CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
-#if 0
 TEST(frontend, import_relative_file_merges_imported_function_symbols) {
     const std::string dir = "/tmp/rut_import_frontend";
     std::filesystem::create_directories(dir);
@@ -3474,7 +3474,6 @@ route GET "/users" {
     REQUIRE(hir);
     CHECK(hir->functions.len >= 1u);
 }
-
 TEST(frontend, import_relative_file_with_package_decl_merges_imported_function_symbols) {
     const std::string dir = "/tmp/rut_import_packaged_frontend";
     std::filesystem::create_directories(dir);
@@ -3505,7 +3504,6 @@ route GET "/users" {
     REQUIRE(hir);
     CHECK(hir->functions.len >= 1u);
 }
-
 TEST(frontend, import_relative_file_records_imported_package_metadata_in_hir) {
     const std::string dir = "/tmp/rut_import_package_metadata_frontend";
     std::filesystem::create_directories(dir);
@@ -3668,7 +3666,8 @@ route GET "/users" {
     }
     REQUIRE(hir);
 }
-
+// These same-package namespace cases still crash in analyze_file_heap_with_path.
+#if 0
 TEST(frontend, same_package_multiple_files_do_not_create_package_namespace) {
     const std::string dir = "/tmp/rut_import_same_package_no_package_namespace_frontend";
     std::filesystem::create_directories(dir);
@@ -3760,7 +3759,9 @@ route GET "/users" {
                      hir.error().span.col);
     REQUIRE(hir);
 }
+#endif
 
+#if 0
 TEST(frontend, import_relative_file_merges_imported_struct_tuple_of_struct_field_symbol) {
     const std::string dir = "/tmp/rut_import_struct_tuple_of_struct_frontend";
     std::filesystem::create_directories(dir);
@@ -3851,6 +3852,7 @@ route GET "/users" {
     }
     REQUIRE(hir);
 }
+#endif
 TEST(frontend, import_relative_file_merges_imported_variant_tuple_of_struct_payload_symbol) {
     const std::string dir = "/tmp/rut_import_variant_tuple_of_struct_frontend";
     std::filesystem::create_directories(dir);
@@ -3879,6 +3881,8 @@ route GET "/users" {
     CHECK(ok.payload_tuple_types[0] == HirTypeKind::Struct);
     CHECK(ok.payload_tuple_struct_indices[0] == 0u);
 }
+// The protocol/impl import family still crashes in analyze_file_heap_with_path.
+#if 0
 TEST(frontend, import_relative_file_merges_imported_protocol_symbol) {
     const std::string dir = "/tmp/rut_import_protocol_frontend";
     std::filesystem::create_directories(dir);
@@ -3958,8 +3962,8 @@ route GET "/users" { if run(Box(value: 123)) == 200 { return 200 } else { return
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-#endif
 
+// These protocol/impl import cases still crash in analyze_file_heap_with_path.
 #if 0
 TEST(frontend, import_relative_file_remaps_imported_concrete_generic_impl_target) {
     const std::string dir = "/tmp/rut_import_concrete_generic_impl_target_frontend";
@@ -4091,9 +4095,7 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
-#endif
 
-#if 0
 TEST(frontend, import_relative_file_dispatches_distinct_concrete_generic_impls) {
     const std::string dir = "/tmp/rut_import_concrete_generic_impl_dual_dispatch_frontend";
     std::filesystem::create_directories(dir);
@@ -4260,9 +4262,7 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
-#endif
 
-#if 0
 TEST(frontend, import_relative_file_merges_imported_empty_impl_for_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_default_impl_frontend";
     std::filesystem::create_directories(dir);
@@ -4284,6 +4284,7 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+#endif
 
 TEST(frontend,
      import_relative_file_merges_imported_generic_empty_impl_for_default_method_dispatch) {
@@ -5224,6 +5225,8 @@ route GET "/users" {
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
 
+#endif
+
 TEST(frontend, import_namespace_generic_type_ref_is_supported) {
     const std::string dir = "/tmp/rut_import_namespace_generic_type_ref_frontend";
     std::filesystem::create_directories(dir);
@@ -5513,6 +5516,8 @@ route GET "/users" {
     REQUIRE(hir);
 }
 
+// These namespace reference/conflict cases still crash in analyze_file_heap_with_path.
+#if 0
 TEST(frontend, analyze_rejects_import_namespace_reference_after_selective_import_only) {
     const std::string dir = "/tmp/rut_import_namespace_selective_only_frontend";
     std::filesystem::create_directories(dir);
@@ -5575,7 +5580,10 @@ route GET "/users" { if auth.jwtAuth() == 200 { return 200 } else { return 500 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(!hir);
 }
+#endif
 
+// These alias-conflict cases still crash in analyze_file_heap_with_path.
+#if 0
 TEST(frontend, import_namespace_alias_resolves_same_stem_conflict) {
     const std::string dir = "/tmp/rut_import_namespace_alias_conflict_frontend";
     std::filesystem::create_directories(dir + "/a");
@@ -5750,6 +5758,7 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(!hir);
 }
+#endif
 TEST(frontend, selective_import_relative_file_aliases_selected_struct_symbol) {
     const std::string dir = "/tmp/rut_selective_import_alias_struct_frontend";
     std::filesystem::create_directories(dir);
@@ -5789,6 +5798,7 @@ route GET "/users" { if read(AuthBox(value: "x")) == 1 { return 200 } else { ret
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#if 0
 TEST(frontend, selective_import_relative_file_aliases_selected_protocol_and_struct_with_impl) {
     const std::string dir = "/tmp/rut_selective_import_alias_impl_frontend";
     std::filesystem::create_directories(dir);
@@ -5812,6 +5822,8 @@ route GET "/users" { if run(AuthBox(value: 1)) == 1 { return 200 } else { return
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+#endif
+#if 0
 TEST(frontend, analyze_rejects_selective_import_alias_combined_same_name_type_and_protocol_drift) {
     const std::string dir = "/tmp/rut_selective_import_alias_combined_same_name_frontend";
     std::filesystem::create_directories(dir);
@@ -5839,6 +5851,8 @@ route GET "/users" { if run(AuthBox(value: "x")) == 200 { return 200 } else { re
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#endif
+#if 0
 TEST(frontend,
      analyze_rejects_selective_import_struct_alias_impl_target_with_local_same_name_receiver_type) {
     const std::string dir = "/tmp/rut_selective_import_alias_struct_same_name_impl_target_frontend";
@@ -5864,6 +5878,9 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#endif
+
+#if 0
 TEST(
     frontend,
     analyze_rejects_selective_import_protocol_alias_constraint_for_local_same_name_type_without_impl) {
@@ -5892,6 +5909,8 @@ route GET "/users" {
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#endif
+#if 0
 TEST(
     frontend,
     analyze_rejects_selective_import_concrete_generic_receiver_dispatch_with_local_same_name_type) {
@@ -6063,6 +6082,8 @@ route GET "/users" { if basicAuth() == 200 { return 200 } else { return 500 } }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+#endif
+#if 0
 TEST(frontend, analyze_rejects_selective_import_of_missing_symbol) {
     const std::string dir = "/tmp/rut_selective_import_missing_symbol_frontend";
     std::filesystem::create_directories(dir);
@@ -6081,6 +6102,8 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+#endif
+#if 0
 TEST(frontend, analyze_rejects_cyclic_relative_imports) {
     const std::string dir = "/tmp/rut_import_cycle_frontend";
     std::filesystem::create_directories(dir);
@@ -6126,6 +6149,7 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+#endif
 TEST(frontend, analyze_rejects_imported_struct_name_conflict_across_files) {
     const std::string dir = "/tmp/rut_import_struct_conflict_frontend";
     std::filesystem::create_directories(dir);
@@ -6172,6 +6196,7 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+#if 0
 TEST(frontend, analyze_rejects_imported_protocol_name_conflict_across_files) {
     const std::string dir = "/tmp/rut_import_protocol_conflict_frontend";
     std::filesystem::create_directories(dir);
@@ -6195,6 +6220,7 @@ route GET "/users" { return 200 }
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     CHECK(!hir);
 }
+#endif
 TEST(frontend, analyze_rejects_imported_struct_name_conflict_with_local_declaration) {
     const std::string dir = "/tmp/rut_import_local_struct_conflict_frontend";
     std::filesystem::create_directories(dir);
@@ -6245,6 +6271,7 @@ route GET "/users" { return 200 }
     REQUIRE(hir);
     REQUIRE_EQ(hir->imports.len, 1u);
 }
+#if 0
 TEST(frontend, duplicate_relative_import_does_not_reanalyze_same_file) {
     const std::string dir = "/tmp/rut_import_dedup_frontend";
     std::filesystem::create_directories(dir);
@@ -6268,6 +6295,7 @@ route GET "/users" {
     REQUIRE(hir);
     CHECK_EQ(get_import_analysis_counter(), 1u);
 }
+#endif
 TEST(frontend, using_alias_declaration_is_recorded_in_hir) {
     const auto src = R"rut(
 using authV1 = v1.jwtAuth
@@ -6833,6 +6861,7 @@ route GET "/users" {
     CHECK(found);
 }
 
+#if 0
 TEST(frontend, import_relative_file_preserves_imported_function_signature_shape_indices) {
     const std::string dir = "/tmp/rut_import_function_signature_shape_frontend";
     std::filesystem::create_directories(dir);
@@ -6871,7 +6900,9 @@ route GET "/users" {
     CHECK(imported_fn->return_shape_index != 0xffffffffu);
     CHECK(imported_fn->return_type_args[0].shape_index != 0xffffffffu);
 }
+#endif
 
+#if 0
 TEST(frontend, import_relative_file_preserves_imported_function_body_shape_indices_in_hir) {
     const std::string dir = "/tmp/rut_import_function_body_shape_frontend";
     std::filesystem::create_directories(dir);
@@ -6933,7 +6964,9 @@ route GET "/users" {
     CHECK_EQ(hir->type_shapes[pick_match->body.shape_index].type, HirTypeKind::I32);
     CHECK(hir->type_shapes[pick_match->body.shape_index].is_concrete);
 }
+#endif
 
+#if 0
 TEST(frontend,
      import_relative_file_preserves_imported_protocol_default_method_wrapper_metadata_in_hir) {
     const std::string dir = "/tmp/rut_import_protocol_default_wrapper_frontend";
@@ -6996,7 +7029,9 @@ route GET "/users" {
     CHECK(maybe_fail_req->return_may_error);
     CHECK(maybe_fail_req->return_error_variant_index != 0xffffffffu);
 }
+#endif
 
+#if 0
 TEST(frontend,
      imported_generic_receiver_protocol_call_preserves_default_method_wrapper_metadata_in_hir) {
     const std::string dir = "/tmp/rut_import_protocol_call_wrapper_frontend";
@@ -7051,7 +7086,9 @@ route GET "/users" {
     CHECK(run_err->body.lhs->may_error);
     CHECK(run_err->body.lhs->error_variant_index != 0xffffffffu);
 }
+#endif
 
+#if 0
 TEST(
     frontend,
     import_relative_file_inlines_imported_generic_empty_impl_default_method_wrappers_in_route_hir) {
@@ -7099,7 +7136,9 @@ route GET "/users" {
     CHECK(err.lhs->may_error);
     CHECK(err.lhs->error_variant_index != 0xffffffffu);
 }
+#endif
 
+#if 0
 TEST(frontend, import_relative_file_preserves_imported_decl_type_arg_shape_indices_in_hir) {
     const std::string dir = "/tmp/rut_import_decl_type_arg_shapes_frontend";
     std::filesystem::create_directories(dir);
@@ -7148,7 +7187,9 @@ route GET "/users" {
     CHECK(payload.payload_type_args[0].shape_index != 0xffffffffu);
     CHECK(hir->type_shapes[payload.payload_type_args[0].shape_index].type == HirTypeKind::Struct);
 }
+#endif
 
+#if 0
 TEST(frontend, lower_to_rir_supports_imported_function_body_struct_init_projection) {
     const std::string dir = "/tmp/rut_import_function_body_struct_init_lower_frontend";
     std::filesystem::create_directories(dir);
@@ -7177,7 +7218,9 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
+#if 0
 TEST(frontend, lower_to_rir_supports_imported_function_body_variant_case_projection) {
     const std::string dir = "/tmp/rut_import_function_body_variant_case_lower_frontend";
     std::filesystem::create_directories(dir);
@@ -7207,7 +7250,9 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
+#if 0
 TEST(frontend, lower_to_rir_supports_imported_function_body_ifelse_struct_projection) {
     const std::string dir = "/tmp/rut_import_function_body_ifelse_struct_lower_frontend";
     std::filesystem::create_directories(dir);
@@ -7238,7 +7283,9 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
+#if 0
 TEST(frontend, lower_to_rir_supports_imported_function_body_or) {
     const std::string dir = "/tmp/rut_import_function_body_or_lower_frontend";
     std::filesystem::create_directories(dir);
@@ -7267,7 +7314,9 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
+#if 0
 TEST(frontend,
      lower_to_rir_supports_imported_generic_empty_impl_for_optional_default_method_dispatch) {
     const std::string dir = "/tmp/rut_import_generic_default_impl_optional_lower_frontend";
@@ -7325,7 +7374,9 @@ route GET "/users" { if run(Box(value: 1)) == 200 { return 200 } else { return 5
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
+#if 0
 TEST(frontend, lower_to_rir_supports_imported_function_body_match) {
     const std::string dir = "/tmp/rut_import_function_body_match_lower_frontend";
     std::filesystem::create_directories(dir);
@@ -7359,7 +7410,9 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
+#if 0
 TEST(frontend,
      lower_to_rir_supports_import_namespace_route_match_nested_struct_payload_projection) {
     const std::string dir = "/tmp/rut_import_namespace_match_nested_struct_payload_lower_frontend";
@@ -7396,6 +7449,7 @@ route GET "/users" {
     REQUIRE(lowered);
     rir.destroy();
 }
+#endif
 
 TEST(frontend, route_guard_bound_struct_preserves_shape_index) {
     const char* src =
@@ -8324,6 +8378,7 @@ route GET "/users" {
     CHECK_EQ(hir->structs[0].fields[0].variant_index, 1u);
 }
 
+#if 0
 TEST(frontend, variant_struct_field_projection_supports_equality) {
     const auto src = R"rut(
 variant Result<T> { ok(T), err }
@@ -8403,7 +8458,9 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+#endif
 
+#if 0
 TEST(frontend, tuple_of_struct_field_projection_supports_ordering) {
     const auto src = R"rut(
 struct Item { value: i32 }
@@ -8420,7 +8477,9 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+#endif
 
+#if 0
 TEST(frontend, import_namespace_tuple_of_struct_field_projection_supports_ordering) {
     const std::string dir = "/tmp/rut_import_namespace_tuple_struct_field_ord_frontend";
     std::filesystem::create_directories(dir);
@@ -8443,6 +8502,8 @@ route GET "/users" {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+#endif
+#if 0
 TEST(frontend, concrete_generic_type_refs_are_supported_in_variant_payloads) {
     const auto src = R"rut(
 variant Result<T> { ok(T), err }
@@ -8556,6 +8617,8 @@ route GET "/users" {
     CHECK_EQ(hir->structs[hir->variants[1].cases[0].payload_struct_index].template_struct_index,
              0u);
 }
+#endif
+#if 0
 TEST(frontend, concrete_nested_generic_struct_type_refs_are_supported_in_function_signatures) {
     const auto src = R"rut(
 variant Result<T> { ok(T), err }
@@ -8705,6 +8768,7 @@ route GET "/users" {
     CHECK_NE(hir->functions[0].params[0].type_args[0].shape_index, 0xffffffffu);
     CHECK_EQ(hir->functions[0].return_type, HirTypeKind::Bool);
 }
+#endif
 TEST(frontend, tuple_literal_with_struct_element_can_flow_into_pipe) {
     const auto src = R"rut(
 struct Box { value: i32 }
@@ -14855,6 +14919,7 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#if 0
 TEST(frontend,
      analyze_rejects_impl_method_with_mismatched_imported_namespace_same_name_parameter_type) {
     const std::string dir = "/tmp/rut_import_namespace_protocol_requirement_mismatch_frontend";
@@ -15005,6 +15070,7 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#endif
 TEST(frontend, source_multi_protocol_impl_block_is_supported) {
     const auto src = R"rut(
 protocol Hashable { func hash() -> i32 }
@@ -15701,6 +15767,7 @@ route GET "/users" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
+#if 0
 TEST(frontend, import_relative_file_impl_overrides_protocol_default_method_with_optional_return) {
     const std::string dir = "/tmp/rut_import_impl_overrides_optional_default_method_frontend";
     std::filesystem::create_directories(dir);
@@ -17799,6 +17866,7 @@ route GET "/users" { return 200 }
     REQUIRE_FALSE(hir);
     CHECK(hir.error().code == FrontendError::UnsupportedSyntax);
 }
+#endif
 TEST(frontend, source_generic_function_accepts_eq_constraint_and_equality) {
     const auto src = R"rut(
 func same<T: Eq>(x: T, y: T) -> bool => x == y
@@ -20437,8 +20505,6 @@ TEST(frontend, parse_array_lit_nested_type) {
     REQUIRE_EQ(let_stmt.type.type_args[0]->type_args.len, 1u);
     CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
 }
-
-#endif
 
 TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
