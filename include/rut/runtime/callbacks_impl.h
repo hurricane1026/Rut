@@ -434,6 +434,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.clear_slots();
 
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
+    conn.send_buf.reset();
     loop->epoch_leave();
 
     if (conn.upstream_fd >= 0) {
@@ -494,6 +495,7 @@ void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.send_progress = 0;
+    conn.send_buf.reset();
     conn.transition_to_exec_handler_wait();
     conn.resume_event_kind = jit::YieldKind::Send;
     conn.resume_event_result = ev.result;

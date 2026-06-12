@@ -10001,6 +10001,25 @@ TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
 }
 
+TEST(state_invariant, response_sent_clears_send_buf_before_keepalive_reuse) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    format_static_response(*c, 204, true);
+    c->state = ConnState::Sending;
+    c->keep_alive = true;
+    c->resp_status = 204;
+    c->set_slots(nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
+
+    loop.dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->send_buf.len(), 0u);
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
+}
+
 TEST(state_invariant, free_conn_clears_active_proxy_state) {
     SmallLoop loop;
     loop.setup();
