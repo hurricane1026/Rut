@@ -1594,10 +1594,11 @@ struct Parser {
         auto name = expect(TokenType::Ident);
         if (!name) return core::make_unexpected(name.error());
 
-        AstItem item{};
-        item.kind = AstItemKind::Func;
-        item.func.name = name.value()->text;
-        item.func.span = span_from(*kw.value());
+        auto item = std::make_unique<AstItem>();
+        AstItem& out = *item;
+        out.kind = AstItemKind::Func;
+        out.func.name = name.value()->text;
+        out.func.span = span_from(*kw.value());
 
         auto append_constraint = [&](AstFunctionDecl::TypeParamDecl& target,
                                      Str constraint_namespace,
@@ -1643,7 +1644,7 @@ struct Parser {
                         if (!comma) return core::make_unexpected(comma.error());
                     }
                 }
-                if (!item.func.type_params.push(decl))
+                if (!out.func.type_params.push(decl))
                     return frontend_error(FrontendError::TooManyItems,
                                           span_from(*type_param.value()));
                 if (take(TokenType::Gt)) break;
@@ -1668,7 +1669,7 @@ struct Parser {
                 param.name = param_name.value()->text;
                 param.type = type_ref.value();
                 param.has_underscore_label = has_underscore;
-                if (!item.func.params.push(param))
+                if (!out.func.params.push(param))
                     return frontend_error(FrontendError::TooManyItems,
                                           span_from(*param_name.value()));
                 if (take(TokenType::RParen)) break;
@@ -1680,8 +1681,8 @@ struct Parser {
         if (take(TokenType::ThinArrow)) {
             auto ret_type = parse_func_type_ref();
             if (!ret_type) return core::make_unexpected(ret_type.error());
-            item.func.has_return_type = true;
-            item.func.return_type = ret_type.value();
+            out.func.has_return_type = true;
+            out.func.return_type = ret_type.value();
         }
         if (take(TokenType::KwWhere)) {
             while (true) {
@@ -1703,9 +1704,9 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
 
                 AstFunctionDecl::TypeParamDecl* target = nullptr;
-                for (u32 ti = 0; ti < item.func.type_params.len; ti++) {
-                    if (item.func.type_params[ti].name.eq(type_param.value()->text)) {
-                        target = &item.func.type_params[ti];
+                for (u32 ti = 0; ti < out.func.type_params.len; ti++) {
+                    if (out.func.type_params[ti].name.eq(type_param.value()->text)) {
+                        target = &out.func.type_params[ti];
                         break;
                     }
                 }
@@ -1735,11 +1736,11 @@ struct Parser {
         auto body_ptr = alloc_stmt(body_stmt);
         if (!body_ptr) return core::make_unexpected(body_ptr.error());
 
-        item.func.body = body_ptr.value();
-        item.span =
+        out.func.body = body_ptr.value();
+        out.span =
             Span{kw.value()->start, body_ptr.value()->span.end, kw.value()->line, kw.value()->col};
-        item.func.span = item.span;
-        return item;
+        out.func.span = out.span;
+        return out;
     }
 
     FrontendResult<AstItem> parse_variant() {

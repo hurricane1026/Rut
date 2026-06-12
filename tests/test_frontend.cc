@@ -3444,8 +3444,6 @@ TEST(frontend, parse_rejects_package_decl_after_top_level_item) {
     REQUIRE(!ast);
     CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
 }
-// These imported-function cases still crash in load_imported_modules().
-#if 0
 TEST(frontend, import_relative_file_merges_imported_function_symbols) {
     const std::string dir = "/tmp/rut_import_frontend";
     std::filesystem::create_directories(dir);
@@ -3476,9 +3474,6 @@ route GET "/users" {
     REQUIRE(hir);
     CHECK(hir->functions.len >= 1u);
 }
-#endif
-
-#if 0
 TEST(frontend, import_relative_file_with_package_decl_merges_imported_function_symbols) {
     const std::string dir = "/tmp/rut_import_packaged_frontend";
     std::filesystem::create_directories(dir);
@@ -3509,9 +3504,6 @@ route GET "/users" {
     REQUIRE(hir);
     CHECK(hir->functions.len >= 1u);
 }
-#endif
-
-#if 0
 TEST(frontend, import_relative_file_records_imported_package_metadata_in_hir) {
     const std::string dir = "/tmp/rut_import_package_metadata_frontend";
     std::filesystem::create_directories(dir);
@@ -3674,7 +3666,6 @@ route GET "/users" {
     }
     REQUIRE(hir);
 }
-#endif
 // These same-package namespace cases still crash in analyze_file_heap_with_path.
 #if 0
 TEST(frontend, same_package_multiple_files_do_not_create_package_namespace) {
