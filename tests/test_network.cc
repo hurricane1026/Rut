@@ -9923,27 +9923,6 @@ TEST(state_invariant, jit_any_timer_yield_disarms_timer_when_downstream_recv_fai
     CHECK(!c->timer_node.empty());
 }
 
-TEST(state_invariant, jit_downstream_send_yield_fails_closed) {
-    SmallLoop loop;
-    loop.setup();
-    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
-    auto* c = loop.find_fd(42);
-    REQUIRE(c != nullptr);
-
-    JitDispatchOutcome outcome{};
-    outcome.kind = JitDispatchOutcome::Kind::EventYield;
-    outcome.next_state = 3;
-    outcome.yield_kind = jit::YieldKind::Send;
-    outcome.timer_ms = 202;
-    loop.backend.clear_ops();
-    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
-    CHECK_EQ(c->pending_handler_fn, nullptr);
-    CHECK_EQ(c->state, ConnState::Sending);
-    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
-    CHECK_EQ(c->resp_status, 500);
-}
-
 TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
     SmallLoop loop;
     loop.setup();
