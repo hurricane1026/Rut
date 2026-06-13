@@ -497,6 +497,7 @@ void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.send_progress = 0;
     conn.send_buf.reset();
     conn.transition_to_exec_handler_wait();
+    conn.recv_paused_for_send = false;
     conn.resume_event_kind = jit::YieldKind::Send;
     conn.resume_event_result = static_cast<i32>(kSendLen);
     resume_jit_handler<Loop>(loop, conn);
