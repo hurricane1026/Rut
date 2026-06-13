@@ -299,29 +299,11 @@ static void init_sim_handler_frame(SimHandlerFrame& frame) {
     frame.ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots;
 }
 
-static i32 synthetic_resume_result(jit::YieldKind kind) {
-    switch (kind) {
-        case jit::YieldKind::Timer:
-        case jit::YieldKind::UpstreamConnect:
-            return 0;
-        case jit::YieldKind::Recv:
-        case jit::YieldKind::Send:
-        case jit::YieldKind::UpstreamRecv:
-        case jit::YieldKind::UpstreamSend:
-        case jit::YieldKind::HttpGet:
-        case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
-        case jit::YieldKind::Any:
-            return 1;
-    }
-    return 1;
-}
-
 static void apply_synthetic_resume(jit::HandlerCtx& ctx,
                                    const jit::HandlerResult& yielded,
                                    jit::YieldKind kind) {
     ctx.resume_event_kind = static_cast<u32>(kind);
-    ctx.resume_event_result = synthetic_resume_result(kind);
+    ctx.resume_event_result = sim_synthetic_resume_result(kind);
     ctx.state = yielded.next_state;
 }
 

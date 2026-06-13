@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
@@ -111,6 +112,27 @@ inline u32 elapsed_us(const struct timespec& t0, const struct timespec& t1) {
     if (sec_diff < 0) return 0;
     u64 total_us = static_cast<u64>(sec_diff) * 1000000ULL + static_cast<u64>(nsec_diff) / 1000ULL;
     return static_cast<u32>(total_us);
+}
+
+// Synthetic resume values used when replaying JIT waits in the simulator.
+// Keep these aligned with runtime semantics for downstream send waits.
+inline i32 sim_synthetic_resume_result(jit::YieldKind kind) {
+    switch (kind) {
+        case jit::YieldKind::Timer:
+        case jit::YieldKind::UpstreamConnect:
+            return 0;
+        case jit::YieldKind::Recv:
+        case jit::YieldKind::UpstreamRecv:
+        case jit::YieldKind::UpstreamSend:
+        case jit::YieldKind::HttpGet:
+        case jit::YieldKind::HttpPost:
+        case jit::YieldKind::Forward:
+        case jit::YieldKind::Any:
+            return 1;
+        case jit::YieldKind::Send:
+            return 0;
+    }
+    return 1;
 }
 
 // Simulate one captured request via loopback TCP.
