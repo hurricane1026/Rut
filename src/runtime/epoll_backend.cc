@@ -232,7 +232,12 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
         const auto& ss = send_state[conn_id];
         if (ss.remaining > 0 && ss.fd >= 0) {
             type = ss.type;
-            events = ss.tls ? tls_send_interest_for_state(ss) : (EPOLLOUT | EPOLLRDHUP);
+            if (ss.tls) {
+                events = (ss.tls_wait_events == EPOLLIN) ? (EPOLLIN | EPOLLRDHUP)
+                                                         : (EPOLLOUT | EPOLLRDHUP);
+            } else {
+                events = EPOLLOUT | EPOLLRDHUP;
+            }
         }
     }
     set_fd_interest(epoll_fd, fd, conn_id, type, events);
