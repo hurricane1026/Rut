@@ -653,6 +653,11 @@ void handle_jit_outcome(Loop* loop,
                     resume_jit_handler<Loop>(loop, conn);
                     return;
                 }
+                if constexpr (requires(Loop* lp, u32 conn_id) {
+                                  lp->backend.pause_recv(conn_id);
+                              }) {
+                    loop->backend.pause_recv(conn.id);
+                }
                 conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
                 loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;

@@ -9953,6 +9953,10 @@ TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
     handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_jit_wait_send_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
+    REQUIRE(loop.backend.op_count >= 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseRecv);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(c->pending_handler_fn, &state_invariant_configured_jit_result);
 
@@ -9987,6 +9991,7 @@ TEST(state_invariant, jit_downstream_send_yield_without_buffer_resumes_immediate
     CHECK_EQ(c->resp_status, 204u);
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
 }
 
