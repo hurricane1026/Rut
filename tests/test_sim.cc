@@ -661,11 +661,11 @@ TEST(sim_gap, format_tiny_buffer) {
 }
 
 TEST(sim, synthetic_resume_result_matches_send_wait_semantics) {
-    CHECK_EQ(sim_synthetic_resume_result(jit::YieldKind::Timer), 0);
-    CHECK_EQ(sim_synthetic_resume_result(jit::YieldKind::Recv), 1);
-    CHECK_EQ(sim_synthetic_resume_result(jit::YieldKind::Send), 0);
-    CHECK_EQ(sim_synthetic_resume_result(jit::YieldKind::UpstreamRecv), 1);
-    CHECK_EQ(sim_synthetic_resume_result(jit::YieldKind::UpstreamSend), 1);
+    CHECK_EQ(rut::sim_synthetic_resume_result(jit::YieldKind::Timer), 0);
+    CHECK_EQ(rut::sim_synthetic_resume_result(jit::YieldKind::Recv), 1);
+    CHECK_EQ(rut::sim_synthetic_resume_result(jit::YieldKind::Send), 0);
+    CHECK_EQ(rut::sim_synthetic_resume_result(jit::YieldKind::UpstreamRecv), 1);
+    CHECK_EQ(rut::sim_synthetic_resume_result(jit::YieldKind::UpstreamSend), 1);
 }
 
 int main(int argc, char** argv) {

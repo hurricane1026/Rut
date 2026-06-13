@@ -303,7 +303,7 @@ static void apply_synthetic_resume(jit::HandlerCtx& ctx,
                                    const jit::HandlerResult& yielded,
                                    jit::YieldKind kind) {
     ctx.resume_event_kind = static_cast<u32>(kind);
-    ctx.resume_event_result = sim_synthetic_resume_result(kind);
+    ctx.resume_event_result = rut::sim_synthetic_resume_result(kind);
     ctx.state = yielded.next_state;
 }
 
