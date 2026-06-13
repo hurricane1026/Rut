@@ -226,8 +226,16 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     // directions are closed, and without RDHUP interest a half-close
     // would go undetected and the slot would sit until the yield
     // deadline. EPOLLERR is always delivered regardless of mask.
-    const u32 kMaskedEvents = preserve_send_interest ? (EPOLLOUT | EPOLLRDHUP) : EPOLLRDHUP;
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, kMaskedEvents);
+    IoEventType type = IoEventType::Recv;
+    u32 events = EPOLLRDHUP;
+    if (preserve_send_interest) {
+        const auto& ss = send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd >= 0) {
+            type = ss.type;
+            events = ss.tls ? tls_send_interest_for_state(ss) : (EPOLLOUT | EPOLLRDHUP);
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {

@@ -123,6 +123,19 @@ struct ScopedTlsHooks {
     EpollTlsHooks hooks_{};
 };
 
+static bool send_byte_with_retry(i32 fd, char byte) {
+    for (int attempt = 0; attempt < 50; attempt++) {
+        ssize_t nw = write(fd, &byte, 1);
+        if (nw == 1) return true;
+        if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(1000);
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
 struct TlsRecvRetryCase {
     bool handshake_first = false;
     i32 first_error = SSL_ERROR_WANT_READ;
@@ -342,7 +355,7 @@ static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCa
     ev.events = EPOLLIN;
     ev.data.u64 = static_cast<u64>(IoEventType::Send);
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
-    REQUIRE(send_all(fds[1], "r", 1));
+    REQUIRE(send_byte_with_retry(fds[1], 'r'));
 
     IoEvent events[8];
     u32 n = backend.wait(events, 8, &conn, 1);
@@ -358,6 +371,54 @@ static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCa
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
 
     n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, 4);
+    CHECK_EQ(tls_state.write_calls, 2);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+static void run_tls_send_readable_preserves_interest_while_paused_case(
+    rut::test::TestCase* test_case) {
+    auto* _tc = test_case;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    backend.downstream_fd_map[0] = fds[0];
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_READ;
+    tls_state.write_second_rc = 4;
+    tls_state.write_second_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'p', 'i', 'n', 'g'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, sizeof(kPayload));
+    CHECK(backend.send_state[0].tls);
+    CHECK_EQ(backend.send_state[0].tls_wait_events, EPOLLIN);
+
+    backend.pause_recv(0, true);
+
+    REQUIRE(send_byte_with_retry(fds[1], 'r'));
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
     REQUIRE_EQ(n, 1u);
     CHECK_EQ(events[0].type, IoEventType::Send);
     CHECK_EQ(events[0].result, 4);
@@ -1060,6 +1121,10 @@ TEST(tls_state_machine, send_retry_matrix) {
 
 TEST(tls_state_machine, send_want_write_readable_wakeup_buffers_recv) {
     run_tls_send_readable_while_waiting_for_write_case(_tc);
+}
+
+TEST(tls_state_machine, send_want_read_preserves_read_interest_when_paused) {
+    run_tls_send_readable_preserves_interest_while_paused_case(_tc);
 }
 
 TEST(tls_state_machine, send_rejects_out_of_range_conn_id) {
