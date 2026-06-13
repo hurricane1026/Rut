@@ -91,7 +91,7 @@ struct MockBackend {
         return true;
     }
 
-    void pause_recv(u32 conn_id) {
+    void pause_recv(u32 conn_id, bool /*preserve_send_interest*/ = false) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::PauseRecv, -1, conn_id, nullptr, 0};
         }

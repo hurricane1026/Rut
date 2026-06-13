@@ -81,7 +81,7 @@ struct EpollBackend {
     // kernel data would keep firing). The next submit_recv re-arms
     // EPOLLIN via add_recv's set_fd_interest path. No-op if the conn_id
     // has no registered downstream fd.
-    void pause_recv(u32 conn_id);
+    void pause_recv(u32 conn_id, bool preserve_send_interest = false);
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);

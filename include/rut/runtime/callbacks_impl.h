@@ -658,7 +658,7 @@ void handle_jit_outcome(Loop* loop,
                 if constexpr (requires(Loop* lp, u32 conn_id) {
                                   lp->backend.pause_recv(conn_id);
                               }) {
-                    loop->backend.pause_recv(conn.id);
+                    loop->backend.pause_recv(conn.id, true);
                 }
                 return;
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
