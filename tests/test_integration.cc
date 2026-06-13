@@ -845,6 +845,7 @@ TEST(partial_send, real_epollout_completion) {
     u8 fill_data[65536];
     for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
     conn.send_buf.write(fill_data, sizeof(fill_data));
+    const u32 kExpectedSendLen = conn.send_buf.len();
 
     // add_send tries immediate send — may be partial or EAGAIN
     backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
@@ -860,7 +861,8 @@ TEST(partial_send, real_epollout_completion) {
     if (backend.pending_count > 0) {
         u32 n = backend.wait(events, 16, &conn, 1);
         for (u32 i = 0; i < n; i++) {
-            if (events[i].type == IoEventType::Send && events[i].result == 4096) {
+            if (events[i].type == IoEventType::Send &&
+                events[i].result == static_cast<i32>(kExpectedSendLen)) {
                 got_full_send = true;
             }
         }
@@ -882,7 +884,7 @@ TEST(partial_send, real_epollout_completion) {
             u32 n = backend.wait(events, 16, &conn, 1);
             for (u32 i = 0; i < n; i++) {
                 if (events[i].type == IoEventType::Send) {
-                    CHECK_EQ(events[i].result, 4096);
+                    CHECK_EQ(events[i].result, static_cast<i32>(kExpectedSendLen));
                     got_full_send = true;
                 }
             }
@@ -1066,6 +1068,7 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
     u8 fill_data[4096];
     for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
     conn.send_buf.write(fill_data, sizeof(fill_data));
+    const u32 kExpectedSendLen = conn.send_buf.len();
 
     backend.add_send(fds[0], kConnId, conn.send_buf.data(), conn.send_buf.len());
 
@@ -1075,7 +1078,7 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
         u32 n = backend.wait(events, 16, &conn, 1);
         for (u32 i = 0; i < n; i++) {
             if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
-                events[i].result == 4096) {
+                events[i].result == static_cast<i32>(kExpectedSendLen)) {
                 got_full_send = true;
             }
         }
@@ -1093,7 +1096,7 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
             u32 n = backend.wait(events, 16, &conn, 1);
             for (u32 i = 0; i < n; i++) {
                 if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
-                    events[i].result == 4096) {
+                    events[i].result == static_cast<i32>(kExpectedSendLen)) {
                     got_full_send = true;
                 }
             }
