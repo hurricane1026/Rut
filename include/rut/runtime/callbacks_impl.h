@@ -653,13 +653,13 @@ void handle_jit_outcome(Loop* loop,
                     resume_jit_handler<Loop>(loop, conn);
                     return;
                 }
+                conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 if constexpr (requires(Loop* lp, u32 conn_id) {
                                   lp->backend.pause_recv(conn_id);
                               }) {
                     loop->backend.pause_recv(conn.id);
                 }
-                conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
                        outcome.timer_ms != 0) {
