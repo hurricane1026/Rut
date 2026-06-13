@@ -369,11 +369,11 @@ public:
         return false;
     }
 
-    void pause_recv(Connection& c) {
+    bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
         c.recv_pause_cancel_pending = true;
-        if (!c.recv_armed) return;
-        if (backend.pause_recv(c.fd, c.id)) c.recv_armed = false;
+        if (!c.recv_armed) return true;
+        return backend.pause_recv(c.fd, c.id);
     }
 
     void close_conn_impl(Connection& c) {
@@ -574,6 +574,7 @@ public:
                     if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
                         conn.recv_pause_cancel_pending) {
                         conn.recv_pause_cancel_pending = false;
+                        conn.recv_armed = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         break;
                     }

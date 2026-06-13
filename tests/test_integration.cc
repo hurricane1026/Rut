@@ -1511,18 +1511,19 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     conn.recv_paused_for_send = false;
     conn.recv_pause_cancel_pending = false;
 
-    loop->pause_recv(conn);
+    CHECK(loop->pause_recv(conn));
     CHECK(conn.recv_paused_for_send);
-    CHECK(!conn.recv_armed);
+    CHECK(conn.recv_armed);
     CHECK(conn.recv_pause_cancel_pending);
     CHECK_EQ(conn.pending_ops, 1u);
 
     CHECK(loop->submit_recv(conn));
-    CHECK(!conn.recv_armed);
+    CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
 
     loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
     CHECK(!conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 0u);
     CHECK(conn.recv_paused_for_send);
 
