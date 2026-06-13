@@ -12,11 +12,13 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <atomic>
+#include <memory>
 
 #include <openssl/ssl.h>
 #include <stdlib.h>
@@ -1484,6 +1486,39 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     close(fds[0]);
     close(fds[1]);
     backend.shutdown();
+}
+
+// Verify IoUringEventLoop::pause_recv blocks re-arming while a send wait is
+// pending, and restores recv arming after the pause is lifted.
+TEST(uring, pause_recv_defers_rearm_until_send_completes) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.pending_ops = 1;
+    conn.recv_armed = true;
+    conn.recv_paused_for_send = false;
+
+    loop->pause_recv(conn);
+    CHECK(conn.recv_paused_for_send);
+    CHECK(!conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 0u);
+
+    CHECK(loop->submit_recv(conn));
+    CHECK(!conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 0u);
+
+    conn.recv_paused_for_send = false;
+    CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+
+    loop->shutdown();
 }
 
 // === Shard lifecycle ===

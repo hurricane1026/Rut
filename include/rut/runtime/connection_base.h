@@ -193,6 +193,7 @@ struct ConnectionBase {
     bool send_armed;
     bool upstream_recv_armed;
     bool upstream_send_armed;
+    bool recv_paused_for_send;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -312,6 +313,7 @@ struct ConnectionBase {
         send_armed = false;
         upstream_recv_armed = false;
         upstream_send_armed = false;
+        recv_paused_for_send = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;

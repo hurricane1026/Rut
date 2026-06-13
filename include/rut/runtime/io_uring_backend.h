@@ -103,6 +103,10 @@ struct IoUringBackend {
     // can distinguish upstream vs client recv CQEs.
     bool add_recv_upstream(i32 fd, u32 conn_id);
 
+    // Pause downstream recv while a send wait is pending.
+    // Uses a silent cancel CQE so the event loop does not have to special-case it.
+    bool pause_recv(i32 fd, u32 conn_id);
+
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);

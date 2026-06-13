@@ -325,6 +325,7 @@ public:
     }
 
     bool submit_recv_impl(Connection& c) {
+        if (c.recv_paused_for_send) return true;
         if (c.recv_armed) return true;
         if (backend.add_recv(c.fd, c.id)) {
             c.pending_ops++;
@@ -366,6 +367,15 @@ public:
             return true;
         }
         return false;
+    }
+
+    void pause_recv(Connection& c) {
+        c.recv_paused_for_send = true;
+        if (!c.recv_armed) return;
+        if (backend.pause_recv(c.fd, c.id)) {
+            if (c.pending_ops > 0) c.pending_ops--;
+            c.recv_armed = false;
+        }
     }
 
     void close_conn_impl(Connection& c) {
@@ -577,6 +587,7 @@ public:
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                            if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
                             conn.resume_event_result = ev.result;
