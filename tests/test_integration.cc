@@ -1494,8 +1494,9 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     backend.shutdown();
 }
 
-// Verify IoUringEventLoop::pause_recv blocks re-arming while a send wait is
-// pending, and restores recv arming after the pause is lifted.
+// Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
+// pending, and re-arms once the late cancel CQE arrives after the handler has
+// already asked to keep reading.
 TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     auto loop = std::make_unique<IoUringEventLoop>();
     auto rc = loop->init(0, -1);
@@ -1510,22 +1511,19 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     conn.recv_armed = true;
     conn.recv_paused_for_send = false;
     conn.recv_pause_cancel_pending = false;
+    conn.recv_pause_rearm_pending = false;
 
     CHECK(loop->pause_recv(conn));
     CHECK(conn.recv_paused_for_send);
     CHECK(conn.recv_armed);
     CHECK(conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 1u);
 
     CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
-
-    loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
-    CHECK(!conn.recv_pause_cancel_pending);
-    CHECK(!conn.recv_armed);
-    CHECK_EQ(conn.pending_ops, 0u);
-    CHECK(conn.recv_paused_for_send);
 
     conn.on_send = &verify_send_pause_cleared;
     conn.pending_ops = 1;
@@ -1537,10 +1535,17 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(!conn.recv_paused_for_send);
     CHECK(g_send_pause_cleared);
 
-    conn.recv_paused_for_send = false;
     CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
+
+    conn.pending_ops = 1;
+    loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK(!conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_armed);
+    CHECK(!conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 1u);
+    CHECK(!conn.recv_paused_for_send);
 
     loop->shutdown();
 }

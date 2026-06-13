@@ -325,11 +325,18 @@ public:
     }
 
     bool submit_recv_impl(Connection& c) {
-        if (c.recv_paused_for_send) return true;
-        if (c.recv_armed) return true;
+        if (c.recv_paused_for_send) {
+            c.recv_pause_rearm_pending = true;
+            return true;
+        }
+        if (c.recv_armed) {
+            if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
+            return true;
+        }
         if (backend.add_recv(c.fd, c.id)) {
             c.pending_ops++;
             c.recv_armed = true;
+            c.recv_pause_rearm_pending = false;
             return true;
         }
         return false;
@@ -573,9 +580,17 @@ public:
                     auto& conn = conns[ev.conn_id];
                     if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
                         conn.recv_pause_cancel_pending) {
+                        const bool needs_recv_rearm = conn.recv_pause_rearm_pending;
+                        conn.recv_pause_rearm_pending = false;
                         conn.recv_pause_cancel_pending = false;
                         conn.recv_armed = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (needs_recv_rearm && !conn.recv_paused_for_send) {
+                            if (!this->submit_recv_impl(conn)) {
+                                this->close_conn(conn);
+                                break;
+                            }
+                        }
                         break;
                     }
                     // Async CQE accounting: decrement pending_ops on final CQE.
