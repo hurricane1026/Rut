@@ -654,6 +654,8 @@ void handle_jit_outcome(Loop* loop,
                     resume_jit_handler<Loop>(loop, conn);
                     return;
                 }
+                conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
+                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
                     if (!loop->pause_recv(conn)) {
                         loop->close_conn(conn);
@@ -668,8 +670,6 @@ void handle_jit_outcome(Loop* loop,
                                      }) {
                     loop->backend.pause_recv(conn.id);
                 }
-                conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
                        outcome.timer_ms != 0) {
@@ -758,6 +758,11 @@ void handle_jit_outcome(Loop* loop,
                     conn.yield_armed = false;
                 }
             };
+            if ((outcome.yield_kind == jit::YieldKind::Any ||
+                 outcome.yield_kind == jit::YieldKind::Recv) &&
+                conn.recv_pause_cancel_pending) {
+                conn.recv_pause_rearm_pending = true;
+            }
             if ((outcome.yield_kind == jit::YieldKind::Any ||
                  outcome.yield_kind == jit::YieldKind::Recv) &&
                 conn.fd >= 0 && !conn.recv_armed) {

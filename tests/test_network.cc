@@ -9955,8 +9955,8 @@ TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
     CHECK_EQ(c->on_send, &on_jit_wait_send_sent<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
     REQUIRE(loop.backend.op_count >= 2u);
-    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseRecv);
-    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(c->pending_handler_fn, &state_invariant_configured_jit_result);
 
@@ -9968,6 +9968,30 @@ TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+}
+
+TEST(state_invariant, jit_recv_yield_sets_recv_rearm_pending_if_recv_pause_cancel_pending) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->recv_armed = true;
+    c->recv_pause_cancel_pending = true;
+    c->recv_pause_rearm_pending = false;
+    c->recv_paused_for_send = false;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Recv;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->recv_pause_rearm_pending, true);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
 }
 
 TEST(state_invariant, jit_downstream_send_yield_without_buffer_resumes_immediately) {
