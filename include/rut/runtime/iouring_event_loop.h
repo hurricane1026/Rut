@@ -371,11 +371,9 @@ public:
 
     void pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
+        c.recv_pause_cancel_pending = true;
         if (!c.recv_armed) return;
-        if (backend.pause_recv(c.fd, c.id)) {
-            if (c.pending_ops > 0) c.pending_ops--;
-            c.recv_armed = false;
-        }
+        if (backend.pause_recv(c.fd, c.id)) c.recv_armed = false;
     }
 
     void close_conn_impl(Connection& c) {
@@ -573,6 +571,12 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
+                        conn.recv_pause_cancel_pending) {
+                        conn.recv_pause_cancel_pending = false;
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        break;
+                    }
                     // Async CQE accounting: decrement pending_ops on final CQE.
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
@@ -584,6 +588,7 @@ public:
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
                         timer.refresh(&conn, keepalive_timeout);
+                        if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {

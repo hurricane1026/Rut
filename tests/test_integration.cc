@@ -44,6 +44,12 @@ struct TestConn {
 
 namespace {
 
+bool g_send_pause_cleared = false;
+
+void verify_send_pause_cleared(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_send_pause_cleared = (ev.type == IoEventType::Send && !conn.recv_paused_for_send);
+}
+
 struct ScriptedTlsState {
     i32 accept_calls = 0;
     i32 read_calls = 0;
@@ -1503,15 +1509,32 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     conn.pending_ops = 1;
     conn.recv_armed = true;
     conn.recv_paused_for_send = false;
+    conn.recv_pause_cancel_pending = false;
 
     loop->pause_recv(conn);
     CHECK(conn.recv_paused_for_send);
     CHECK(!conn.recv_armed);
-    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
 
     CHECK(loop->submit_recv(conn));
     CHECK(!conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+
+    loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK(!conn.recv_pause_cancel_pending);
     CHECK_EQ(conn.pending_ops, 0u);
+    CHECK(conn.recv_paused_for_send);
+
+    conn.on_send = &verify_send_pause_cleared;
+    conn.pending_ops = 1;
+    conn.send_armed = true;
+    g_send_pause_cleared = false;
+    loop->dispatch(make_ev(conn.id, IoEventType::Send, 1));
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK(!conn.send_armed);
+    CHECK(!conn.recv_paused_for_send);
+    CHECK(g_send_pause_cleared);
 
     conn.recv_paused_for_send = false;
     CHECK(loop->submit_recv(conn));
