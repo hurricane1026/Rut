@@ -317,6 +317,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         ctx->resume_event_result = 0;
         ctx->route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+        conn.send_buf.reset();
         auto outcome = invoke_jit_handler(route->fn,
                                           static_cast<void*>(&conn),
                                           *ctx,
@@ -386,6 +387,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     ctx->resume_event_result = 0;
     ctx->route_param_count = route_param_count;
     for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+    conn.send_buf.reset();
     auto outcome = invoke_jit_handler(route->fn,
                                       static_cast<void*>(&conn),
                                       *ctx,

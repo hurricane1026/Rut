@@ -10069,6 +10069,34 @@ TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
 }
 
+TEST(state_invariant, response_sent_clears_send_buf_before_downstream_send_wait) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/x", 'G', &state_invariant_wait_send_then_status));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.write(reinterpret_cast<const u8*>("stale-response"), 14);
+
+    static const char kReq[] = "GET /x HTTP/1.1\r\nHost: example\r\n\r\n";
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 i = 0; i < sizeof(kReq) - 1; i++) dst[i] = static_cast<u8>(kReq[i]);
+    c->recv_buf.commit(static_cast<u32>(sizeof(kReq) - 1));
+
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Recv, sizeof(kReq) - 1));
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+}
+
 TEST(state_invariant, response_sent_clears_send_buf_before_keepalive_reuse) {
     SmallLoop loop;
     loop.setup();
