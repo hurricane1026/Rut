@@ -1085,6 +1085,22 @@ TEST(RirVerifier, RuntimeProtocolModelReportsDownstreamSendYield) {
     CHECK(check.fail_closed_transition);
 }
 
+TEST(RirVerifier, RuntimeCallbackSlotMasksRemainDistinct) {
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::HandlerTimer),
+             static_cast<u8>(1u << 0));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::DownstreamRecv),
+             static_cast<u8>(1u << 1));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::DownstreamSend),
+             static_cast<u8>(1u << 2));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::UpstreamRecv),
+             static_cast<u8>(1u << 3));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::UpstreamSend),
+             static_cast<u8>(1u << 4));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::DownstreamSend) &
+                 verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::UpstreamRecv),
+             0u);
+}
+
 TEST(RirVerifier, HandlerAutomatonSummarizesTimerYieldAndTerminal) {
     TestContext ctx;
     REQUIRE(ctx.init());

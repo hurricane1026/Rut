@@ -308,9 +308,9 @@ inline u8 verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot slot) {
         case VerifyRuntimeCallbackSlot::DownstreamSend:
             return 1u << 2;
         case VerifyRuntimeCallbackSlot::UpstreamRecv:
-            return 1u << 2;
-        case VerifyRuntimeCallbackSlot::UpstreamSend:
             return 1u << 3;
+        case VerifyRuntimeCallbackSlot::UpstreamSend:
+            return 1u << 4;
     }
     return 0;
 }
