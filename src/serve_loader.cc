@@ -85,6 +85,23 @@ struct HeapIR {
     }
 };
 
+// Record a frontend diagnostic, copying its detail bytes into the
+// LoadError. The Diagnostic's detail Str may view into analyzer-owned
+// storage (e.g. imported-file source) that is freed once load_rut_program
+// returns; copy it now, while that storage is still alive, so
+// format_load_error reads stable memory later.
+void set_load_diag(LoadError& err, const Diagnostic& diag) {
+    err.has_diag = true;
+    err.diag = diag;
+    u32 n = diag.detail.len;
+    if (n >= LoadError::kMaxDetail) n = LoadError::kMaxDetail - 1;
+    for (u32 i = 0; i < n; i++) {
+        err.detail_buf[i] = diag.detail.ptr ? diag.detail.ptr[i] : '\0';
+    }
+    err.detail_buf[n] = '\0';
+    err.diag.detail = Str{err.detail_buf, n};
+}
+
 }  // namespace
 
 bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt) {
@@ -110,16 +127,14 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     err.stage = LoadStage::Lex;
     auto lexed = lex(kSource);
     if (!lexed) {
-        err.has_diag = true;
-        err.diag = lexed.error();
+        set_load_diag(err, lexed.error());
         return false;
     }
 
     err.stage = LoadStage::Parse;
     auto ast = parse_file(lexed.value());
     if (!ast) {
-        err.has_diag = true;
-        err.diag = ast.error();
+        set_load_diag(err, ast.error());
         return false;
     }
     ir.ast = ast.value();
@@ -132,8 +147,7 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     while (path[path_len]) path_len++;
     auto hir = analyze_file(*ir.ast, Str{path, path_len});
     if (!hir) {
-        err.has_diag = true;
-        err.diag = hir.error();
+        set_load_diag(err, hir.error());
         return false;
     }
     ir.hir = hir.value();
@@ -141,8 +155,7 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     err.stage = LoadStage::BuildMir;
     auto mir = build_mir(*ir.hir);
     if (!mir) {
-        err.has_diag = true;
-        err.diag = mir.error();
+        set_load_diag(err, mir.error());
         return false;
     }
     ir.mir = mir.value();
@@ -150,8 +163,7 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     err.stage = LoadStage::Lower;
     auto lowered = lower_to_rir(*ir.mir, out.rir);
     if (!lowered) {
-        err.has_diag = true;
-        err.diag = lowered.error();
+        set_load_diag(err, lowered.error());
         return false;
     }
 

@@ -49,6 +49,12 @@ struct LoadError {
     LoadStage stage = LoadStage::Read;
     bool has_diag = false;  // true iff `diag` was populated by the frontend
     Diagnostic diag{};
+    // Owns the bytes of `diag.detail`. The frontend's Diagnostic::detail can
+    // point into analyzer-owned storage (e.g. imported-file source) that is
+    // freed when load_rut_program returns, so the loader copies the detail
+    // here and repoints diag.detail at this buffer for stable later reads.
+    static constexpr u32 kMaxDetail = 256;
+    char detail_buf[kMaxDetail] = {};
 };
 
 struct LoadedProgram {
