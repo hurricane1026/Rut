@@ -71,7 +71,11 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     err.stage = LoadStage::Read;
     if (!map_source(path, out)) return false;
 
-    const Str kSource{static_cast<const char*>(out.src_map), static_cast<u32>(out.src_map_len)};
+    // A zero-byte program leaves src_map null (nothing to unmap). lex()
+    // forms its EOF token at source.ptr + source.len, so hand it a
+    // non-null base even when len == 0 to avoid null-pointer arithmetic.
+    const char* src_base = out.src_map ? static_cast<const char*>(out.src_map) : "";
+    const Str kSource{src_base, static_cast<u32>(out.src_map_len)};
 
     // ── Frontend: source text → RIR module ──────────────────────────
     // parse_file/analyze_file/build_mir each heap-allocate their result
@@ -96,7 +100,12 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     }
 
     err.stage = LoadStage::Analyze;
-    auto hir = analyze_file(*ast.value());
+    // Pass the program path so relative `import "..."` resolves against it,
+    // matching the frontend's import-aware analysis path. Without a path the
+    // analyzer skips imports entirely.
+    u32 path_len = 0;
+    while (path[path_len]) path_len++;
+    auto hir = analyze_file(*ast.value(), Str{path, path_len});
     if (!hir) {
         err.has_diag = true;
         err.diag = hir.error();

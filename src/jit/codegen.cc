@@ -1328,6 +1328,41 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
 
 // ── Function Codegen ───────────────────────────────────────────────
 
+// True when the function contains a request-access opcode that reads from
+// the parse cache. Status-only / forward-only handlers (and ones that only
+// touch route params or the peer address) don't, so they skip the
+// parse-prime call entirely and pay no parse at entry.
+static bool rir_function_uses_parse(const rir::Function& fn) {
+    if (!fn.blocks) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        if (!blk.insts) continue;
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            switch (blk.insts[ii].op) {
+                case rir::Opcode::ReqHeader:
+                case rir::Opcode::ReqQuery:
+                case rir::Opcode::ReqQueryString:
+                case rir::Opcode::ReqMethod:
+                case rir::Opcode::ReqPath:
+                case rir::Opcode::ReqPathOnly:
+                case rir::Opcode::ReqBody:
+                case rir::Opcode::ReqKeepAlive:
+                case rir::Opcode::ReqChunked:
+                case rir::Opcode::ReqHasContentLength:
+                case rir::Opcode::ReqHttp10:
+                case rir::Opcode::ReqHttp11:
+                case rir::Opcode::ReqHttpVersion:
+                case rir::Opcode::ReqContentLength:
+                case rir::Opcode::ReqCookie:
+                    return true;
+                default:
+                    break;
+            }
+        }
+    }
+    return false;
+}
+
 static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
     c.ctx_store_sink = nullptr;
@@ -1373,6 +1408,10 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         c.block_map[blk.id.id] = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, label);
     }
 
+    // Whether this handler reads the request at all — gates the one-time
+    // parse-prime call emitted in the prologue below.
+    const bool kNeedsParse = rir_function_uses_parse(fn);
+
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
     // LLVM basic block dispatches on HandlerCtx::state. The default mapping
@@ -1405,8 +1444,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
         // Parse-once: prime the per-thread parse cache before any state runs,
-        // so every req_* helper in this invocation shares one parse.
-        c.emit_parse_prime();
+        // so every req_* helper in this invocation shares one parse. Skipped
+        // for handlers that never read the request (status/forward only).
+        if (kNeedsParse) c.emit_parse_prime();
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
@@ -1458,8 +1498,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
-        // Parse-once: prime the per-thread parse cache at handler entry.
-        c.emit_parse_prime();
+        // Parse-once: prime the per-thread parse cache at handler entry,
+        // unless the handler never reads the request.
+        if (kNeedsParse) c.emit_parse_prime();
     }
 
     // Emit instructions block by block.
