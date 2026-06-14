@@ -1,3 +1,22 @@
+/*
+ * Copyright (C) 2026 Rut Contributors
+ *
+ * This file is part of Rut.
+ *
+ * Rut is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Rut is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with Rut. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #pragma once
 
 #include "rut/common/types.h"
@@ -12,6 +31,17 @@ using LLVMModuleRef = struct LLVMOpaqueModule*;
 using LLVMContextRef = struct LLVMOpaqueContext*;
 
 namespace rut::jit {
+
+// IR optimization level applied to each handler module before LLJIT does
+// final codegen. O0 skips the mid-level pipeline entirely (fastest
+// compile / startup, least optimized code); O1..O3 run `default<O1..O3>`.
+// Higher levels trade longer startup compile time for faster handlers.
+enum class OptLevel : u8 {
+    O0 = 0,
+    O1 = 1,
+    O2 = 2,
+    O3 = 3,
+};
 
 // ── JIT Engine ─────────────────────────────────────────────────────
 // Wraps LLVM ORC LLJIT via the C API. Compiles LLVM IR modules to
@@ -48,6 +78,10 @@ struct JitEngine {
     RegexSlot** regex_slots = nullptr;
     u32 regex_slot_count = 0;
     u32 regex_slot_cap = 0;
+
+    // IR optimization level for compile(). Set before calling compile();
+    // defaults to O2. See OptLevel.
+    OptLevel opt_level = OptLevel::O2;
 
     bool init();
 

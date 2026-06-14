@@ -1,3 +1,22 @@
+/*
+ * Copyright (C) 2026 Rut Contributors
+ *
+ * This file is part of Rut.
+ *
+ * Rut is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Rut is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public
+ * License along with Rut. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #include "rut/jit/jit_engine.h"
 
 #include "rut/jit/runtime_helpers.h"
@@ -8,6 +27,8 @@
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
 #include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Transforms/PassBuilder.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +76,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_req_param", reinterpret_cast<void*>(&rut_helper_req_param)},
     {"rut_helper_req_remote_addr", reinterpret_cast<void*>(&rut_helper_req_remote_addr)},
     {"rut_helper_req_content_length", reinterpret_cast<void*>(&rut_helper_req_content_length)},
+    {"rut_helper_parse_prime", reinterpret_cast<void*>(&rut_helper_parse_prime)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
     {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
     {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
@@ -255,6 +277,79 @@ bool JitEngine::prepare_regex_symbols(LLVMModuleRef mod, u32* out_start_count) {
     return true;
 }
 
+// Run the mid-level (new pass manager) optimization pipeline on the
+// handler module before it is handed to LLJIT.
+//
+// Why this is needed: LLJIT's default compile layer only runs the
+// backend (instruction selection / scheduling / register allocation).
+// It does NOT run the IR-level optimizer, so the codegen output — which
+// is fairly direct, mostly unoptimized IR — would otherwise reach the
+// backend as-is. Running `default<O2>` here gives mem2reg/SROA/
+// instcombine/GVN/DCE/etc., and lets the regex DB pointer constants
+// baked in by prepare_regex_symbols() constant-propagate. User functions
+// are already inlined at the RIR stage, so this mainly cleans up the
+// per-handler IR; runtime helpers remain out-of-line external calls
+// (inlining those would need LTO with the runtime bitcode).
+//
+// The TargetMachine is built for the host CPU/features so the cost model
+// matches the code LLJIT will actually emit. It is used only for the IR
+// passes here — LLJIT does the final codegen with its own target.
+//
+// Best-effort: a pipeline failure logs and leaves the (already verified,
+// still valid) module unoptimized rather than failing the whole compile.
+static const char* opt_pipeline(OptLevel level) {
+    switch (level) {
+        case OptLevel::O0:
+            return nullptr;  // skip the mid-level pipeline entirely
+        case OptLevel::O1:
+            return "default<O1>";
+        case OptLevel::O2:
+            return "default<O2>";
+        case OptLevel::O3:
+            return "default<O3>";
+    }
+    return "default<O2>";
+}
+
+static void optimize_module(const char* triple, LLVMModuleRef mod, OptLevel level) {
+    const char* pipeline = opt_pipeline(level);
+    if (!pipeline) return;  // O0: nothing to run
+    if (!triple) return;
+
+    LLVMTargetRef target = nullptr;
+    char* err_msg = nullptr;
+    if (LLVMGetTargetFromTriple(triple, &target, &err_msg)) {
+        log_error("jit: opt pipeline target lookup failed", nullptr);
+        if (err_msg) LLVMDisposeMessage(err_msg);
+        return;
+    }
+
+    char* cpu = LLVMGetHostCPUName();
+    char* features = LLVMGetHostCPUFeatures();
+    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(target,
+                                                      triple,
+                                                      cpu ? cpu : "",
+                                                      features ? features : "",
+                                                      LLVMCodeGenLevelDefault,
+                                                      LLVMRelocDefault,
+                                                      LLVMCodeModelJITDefault);
+    if (cpu) LLVMDisposeMessage(cpu);
+    if (features) LLVMDisposeMessage(features);
+    if (!tm) {
+        log_error("jit: opt pipeline target machine creation failed", nullptr);
+        return;
+    }
+
+    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+    LLVMErrorRef perr = LLVMRunPasses(mod, pipeline, tm, opts);
+    LLVMDisposePassBuilderOptions(opts);
+    LLVMDisposeTargetMachine(tm);
+    if (perr) {
+        // log_error consumes the error via LLVMGetErrorMessage.
+        log_error("jit: optimization pipeline failed (continuing unoptimized)", perr);
+    }
+}
+
 bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     // Always takes ownership of mod and ctx regardless of return value.
     if (!lljit) {
@@ -295,6 +390,10 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
         LLVMContextDispose(ctx);
         return false;
     }
+
+    // Run the IR optimization pipeline now that the data layout, target
+    // triple, and regex DB constants are all in place. Best-effort.
+    optimize_module(triple, mod, opt_level);
 
     // Wrap module into a ThreadSafeModule for submission to LLJIT.
     // We create a fresh ThreadSafeContext as the lock wrapper. Its internal
