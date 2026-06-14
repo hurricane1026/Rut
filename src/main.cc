@@ -54,6 +54,16 @@ static bool starts_with_dash_dash(const char* s) {
     return s[0] != '\0' && s[0] == '-' && s[1] == '-';
 }
 
+// True only when the whole token is digits — so a numeric-looking path
+// like "404.rut" is treated as a program path, not a port.
+static bool is_all_digits(const char* s) {
+    if (!s || !*s) return false;
+    for (const char* p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -277,14 +287,14 @@ int main(int argc, char** argv) {
     //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] >= '0' && argv[i][0] <= '9') {
+        if (is_all_digits(argv[i])) {
             port = 0;
             for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                 port = port * 10 + static_cast<u16>(*p - '0');
         } else if (argv[i][0] != '-') {
-            // First bare non-numeric positional is the .rut program path.
-            // Flag values are consumed via i++ in the blocks below, so
-            // they never reach here.
+            // A bare positional that isn't a pure number is the .rut program
+            // path (e.g. "404.rut"). Flag values are consumed via i++ in the
+            // blocks below, so they never reach here.
             config_path = argv[i];
         }
         if (i + 1 < argc) {
