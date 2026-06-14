@@ -63,6 +63,28 @@ bool map_source(const char* path, LoadedProgram& out) {
     return true;
 }
 
+// Owns the heap-allocated intermediate IR (AST/HIR/MIR) and frees it when
+// load_rut_program returns. These must outlive jit::codegen(): lowering
+// can leave RIR Str immediates (ConstStr, header/query names, regex
+// patterns) as views into HirModule::owned_strings — notably the bytes of
+// imported `.rut` files — and codegen only copies those into LLVM globals.
+// Freeing earlier would JIT from dangling pointers. Frees in reverse
+// construction order on scope exit (covers every return path).
+struct HeapIR {
+    AstFile* ast = nullptr;
+    HirModule* hir = nullptr;
+    MirModule* mir = nullptr;
+
+    HeapIR() = default;
+    HeapIR(const HeapIR&) = delete;
+    HeapIR& operator=(const HeapIR&) = delete;
+    ~HeapIR() {
+        delete mir;
+        delete hir;
+        delete ast;
+    }
+};
+
 }  // namespace
 
 bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt) {
@@ -79,10 +101,12 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
 
     // ── Frontend: source text → RIR module ──────────────────────────
     // parse_file/analyze_file/build_mir each heap-allocate their result
-    // (frontend convention). The intermediate AST/HIR/MIR are only
-    // needed up to lowering — the RIR carries its own arena — so free
-    // them as the pipeline advances. The source mmap (and the lowered
-    // RIR) stay alive in `out` for the whole run.
+    // (frontend convention). `ir` keeps them alive until this function
+    // returns — past jit::codegen() — because lowered RIR Str immediates
+    // may still view into HIR-owned bytes (e.g. imported files). The
+    // source mmap and the lowered RIR stay alive in `out` for the run.
+    HeapIR ir;
+
     err.stage = LoadStage::Lex;
     auto lexed = lex(kSource);
     if (!lexed) {
@@ -98,6 +122,7 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
         err.diag = ast.error();
         return false;
     }
+    ir.ast = ast.value();
 
     err.stage = LoadStage::Analyze;
     // Pass the program path so relative `import "..."` resolves against it,
@@ -105,29 +130,25 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     // analyzer skips imports entirely.
     u32 path_len = 0;
     while (path[path_len]) path_len++;
-    auto hir = analyze_file(*ast.value(), Str{path, path_len});
+    auto hir = analyze_file(*ir.ast, Str{path, path_len});
     if (!hir) {
         err.has_diag = true;
         err.diag = hir.error();
-        delete ast.value();
         return false;
     }
+    ir.hir = hir.value();
 
     err.stage = LoadStage::BuildMir;
-    auto mir = build_mir(*hir.value());
+    auto mir = build_mir(*ir.hir);
     if (!mir) {
         err.has_diag = true;
         err.diag = mir.error();
-        delete hir.value();
-        delete ast.value();
         return false;
     }
+    ir.mir = mir.value();
 
     err.stage = LoadStage::Lower;
-    auto lowered = lower_to_rir(*mir.value(), out.rir);
-    delete mir.value();
-    delete hir.value();
-    delete ast.value();
+    auto lowered = lower_to_rir(*ir.mir, out.rir);
     if (!lowered) {
         err.has_diag = true;
         err.diag = lowered.error();
