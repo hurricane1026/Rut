@@ -24,30 +24,30 @@ using namespace rut;
 // runs to completion (yield or return) before the next one starts, so a
 // thread-local cache safely serves every helper call within one
 // invocation. The JIT emits one rut_helper_parse_prime() call at handler
-// entry that force-parses for the current request; that makes the
-// (data,len) key only ever match within a single invocation, so a reused
-// request buffer can never alias a previous request's parse.
+// entry that force-parses for the current request and marks the cache
+// `primed`. Only a primed cache is reused by helpers; an unprimed helper
+// call (e.g. a direct caller that never primed) always parses fresh and
+// leaves the cache unprimed — so two direct calls on a reused buffer
+// whose contents changed never return a stale parse.
 
 namespace {
 
 struct ParseCache {
     const u8* data = nullptr;
     u32 len = 0;
-    bool valid = false;  // a parse attempt was made for (data, len)
-    bool ok = false;     // parse reached ParseStatus::Complete
-    u32 header_end = 0;  // byte offset past the header block (for body)
+    bool primed = false;  // set only by rut_helper_parse_prime()
+    bool ok = false;      // parse reached ParseStatus::Complete
+    u32 header_end = 0;   // byte offset past the header block (for body)
     ParsedRequest req;
 };
 
 thread_local ParseCache t_parse_cache;
 
-// Return the cached parse for (data, len), parsing on a cache miss.
-const ParseCache& parse_cached(const u8* data, u32 len) {
-    ParseCache& pc = t_parse_cache;
-    if (pc.valid && pc.data == data && pc.len == len) return pc;
+// Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
+// pc.primed untouched — callers set it.
+void parse_into(ParseCache& pc, const u8* data, u32 len) {
     pc.data = data;
     pc.len = len;
-    pc.valid = true;
     HttpParser parser;
     parser.reset();
     pc.req.reset();
@@ -58,16 +58,28 @@ const ParseCache& parse_cached(const u8* data, u32 len) {
         pc.ok = false;
         pc.header_end = 0;
     }
+}
+
+// Used by all req_* helpers. Reuses the primed parse when it matches this
+// (data, len) — the JIT fast path where one prime serves every helper in
+// the invocation. Otherwise parses fresh and marks the cache unprimed so
+// it is never reused for a subsequent (possibly aliasing) direct call.
+const ParseCache& parse_cached(const u8* data, u32 len) {
+    ParseCache& pc = t_parse_cache;
+    if (pc.primed && pc.data == data && pc.len == len) return pc;
+    parse_into(pc, data, len);
+    pc.primed = false;
     return pc;
 }
 
 }  // namespace
 
 void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
-    // Force a fresh parse for this invocation, overwriting any cache entry
-    // left by a previous request (which may have reused this buffer).
-    t_parse_cache.valid = false;
-    (void)parse_cached(req_data, req_len);
+    // Parse once for this invocation and mark the cache primed so the
+    // following req_* helper calls reuse it.
+    ParseCache& pc = t_parse_cache;
+    parse_into(pc, req_data, req_len);
+    pc.primed = true;
 }
 
 // ── Request Access ─────────────────────────────────────────────────
