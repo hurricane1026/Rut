@@ -58,6 +58,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_req_remote_addr", reinterpret_cast<void*>(&rut_helper_req_remote_addr)},
     {"rut_helper_req_content_length", reinterpret_cast<void*>(&rut_helper_req_content_length)},
     {"rut_helper_parse_prime", reinterpret_cast<void*>(&rut_helper_parse_prime)},
+    {"rut_helper_parse_unprime", reinterpret_cast<void*>(&rut_helper_parse_unprime)},
     {"rut_helper_str_has_prefix", reinterpret_cast<void*>(&rut_helper_str_has_prefix)},
     {"rut_helper_str_eq", reinterpret_cast<void*>(&rut_helper_str_eq)},
     {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},

@@ -6237,6 +6237,64 @@ TEST(helpers, req_header_case_insensitive) {
     CHECK(has == 0);
 }
 
+// Regression: a JIT handler primes the per-thread parse cache for its
+// request buffer. After it returns, a direct rut_helper_req_* call that
+// reuses the same buffer address+length with different bytes must reparse
+// rather than return the handler's stale parse (the prime is cleared at
+// handler exit).
+TEST(helpers, parse_cache_not_stale_after_handler) {
+    const char* src =
+        "route GET \"/\" { let t = all(req.header(\"X-Tag\"), \"none\") if t == \"zzz\" { return "
+        "201 } else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // Two requests of identical length, differing only in the X-Tag value.
+    char buf[] = "GET / HTTP/1.1\r\nX-Tag: aaa\r\n\r\n";
+    static const char req2[] = "GET / HTTP/1.1\r\nX-Tag: bbb\r\n\r\n";
+    REQUIRE(sizeof(buf) == sizeof(req2));
+    const u32 buf_len = sizeof(buf) - 1;
+
+    TestHandlerCtxFrame frame{};
+    // Run the handler: it primes the parse cache for `buf`.
+    handler(nullptr, &frame.ctx, reinterpret_cast<const u8*>(buf), buf_len, nullptr);
+
+    // Reuse the same address+length with different content, then read a
+    // header directly. Must observe the new value, not the primed parse.
+    for (u32 i = 0; i < buf_len; i++) buf[i] = req2[i];
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 vlen = 0;
+    rut_helper_req_header(reinterpret_cast<const u8*>(buf), buf_len, "X-Tag", 5, &has, &ptr, &vlen);
+    CHECK(has == 1);
+    REQUIRE(vlen == 3);
+    REQUIRE(ptr != nullptr);
+    CHECK(ptr[0] == 'b');
+    CHECK(ptr[1] == 'b');
+    CHECK(ptr[2] == 'b');
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(helpers, req_param_from_handler_ctx) {
     TestHandlerCtxFrame frame{};
     static const char id_name[] = "id";

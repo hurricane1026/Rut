@@ -96,6 +96,11 @@ struct Ctx {
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
     LLVMValueRef fn_parse_prime;
+    LLVMValueRef fn_parse_unprime;
+
+    // True while emitting a handler that reads the request (and therefore
+    // primed the parse cache). Gates the parse-unprime calls at exits.
+    bool cur_fn_needs_parse = false;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
     LLVMValueRef fn_str_cmp;
@@ -179,6 +184,29 @@ struct Ctx {
         LLVMValueRef args[] = {param_req_data, param_req_len};
         LLVMBuildCall2(
             builder, LLVMGlobalGetValueType(get_parse_prime()), get_parse_prime(), args, 2, "");
+    }
+
+    // void rut_helper_parse_unprime()
+    LLVMValueRef get_parse_unprime() {
+        if (!fn_parse_unprime) {
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
+            fn_parse_unprime = LLVMAddFunction(llvm_mod, "rut_helper_parse_unprime", ft);
+        }
+        return fn_parse_unprime;
+    }
+
+    // Clear the primed parse cache at a handler exit, so the primed parse
+    // never outlives this invocation. No-op for handlers that don't read
+    // the request (they never primed). Builder must be positioned just
+    // before the terminal return.
+    void emit_parse_unprime() {
+        if (!cur_fn_needs_parse) return;
+        LLVMBuildCall2(builder,
+                       LLVMGlobalGetValueType(get_parse_unprime()),
+                       get_parse_unprime(),
+                       nullptr,
+                       0,
+                       "");
     }
 
     // void rut_helper_req_path(ptr, i32, ptr, ptr)
@@ -1283,6 +1311,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     LLVMConstInt(c.i64_ty, static_cast<u64>(headers_idx_imm) << 40, 0);
                 result = LLVMBuildOr(c.builder, result, headers_slot, "result.headers");
             }
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             break;
         }
@@ -1303,6 +1332,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");
             LLVMValueRef result = LLVMBuildOr(c.builder, action, shifted, "result");
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             break;
         }
@@ -1312,6 +1342,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             const u16 next_state = static_cast<u16>((packed >> 32) & 0xffffu);
             u8 yield_kind = static_cast<u8>((packed >> 48) & 0xffu);
             if (yield_kind == 0) yield_kind = static_cast<u8>(YieldKind::Timer);
+            // Clear the prime before suspending; the resume re-primes at entry.
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, c.make_result_yield(next_state, yield_kind, payload));
             break;
         }
@@ -1409,8 +1441,10 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     }
 
     // Whether this handler reads the request at all — gates the one-time
-    // parse-prime call emitted in the prologue below.
+    // parse-prime call emitted in the prologue below and the parse-unprime
+    // calls at the handler's returns.
     const bool kNeedsParse = rir_function_uses_parse(fn);
+    c.cur_fn_needs_parse = kNeedsParse;
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
@@ -1492,6 +1526,8 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             LLVMPositionBuilderAtEnd(c.builder, yield_bb);
             LLVMValueRef result =
                 c.make_result_yield(static_cast<u16>(si + 1), yield_kind, payload);
+            // Clear the prime before suspending; the resume re-primes at entry.
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), yield_bb);
         }
@@ -1547,6 +1583,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
     c.fn_parse_prime = nullptr;
+    c.fn_parse_unprime = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;

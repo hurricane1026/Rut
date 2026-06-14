@@ -82,6 +82,16 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
     pc.primed = true;
 }
 
+void rut_helper_parse_unprime() {
+    // Called at handler exit so the primed parse never outlives the
+    // invocation that created it. Without this, a direct caller of
+    // rut_helper_req_* on the same thread that happens to reuse the
+    // handler's request buffer (same address and length, different bytes)
+    // could match the stale primed entry; clearing the flag forces such a
+    // caller to reparse.
+    t_parse_cache.primed = false;
+}
+
 // ── Request Access ─────────────────────────────────────────────────
 
 void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {

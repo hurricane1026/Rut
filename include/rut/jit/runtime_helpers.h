@@ -112,6 +112,11 @@ rut::u64 rut_helper_req_content_length(const rut::u8* req_data, rut::u32 req_len
 // request buffer from aliasing a previous request's cached parse.
 void rut_helper_parse_prime(const rut::u8* req_data, rut::u32 req_len);
 
+// Clear the primed parse cache at handler exit so a primed parse never
+// outlives its invocation (see rut_helper_parse_prime). The JIT emits one
+// call before each terminal return of a request-reading handler.
+void rut_helper_parse_unprime();
+
 // ── String Operations ──────────────────────────────────────────────
 
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
