@@ -9970,6 +9970,38 @@ TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
 }
 
+TEST(state_invariant, jit_downstream_send_yield_fails_closed_when_send_cannot_queue) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.reset();
+    const char kChunk[] = "abc";
+    c->send_buf.write(reinterpret_cast<const u8*>(kChunk), sizeof(kChunk) - 1);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.clear_ops();
+    // The wait(downstream.send()) write cannot be queued (SQ-full analogue:
+    // add_send returns false). The handler must fail closed with a 500 instead
+    // of parking on pending_handler_fn for a Send completion that will never
+    // arrive, and recv must not be paused.
+    loop.backend.fail_send = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 500u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK(!c->keep_alive);
+    CHECK(!c->recv_paused_for_send);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+}
+
 TEST(state_invariant, jit_recv_yield_sets_recv_rearm_pending_if_recv_pause_cancel_pending) {
     SmallLoop loop;
     loop.setup();

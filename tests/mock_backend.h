@@ -35,6 +35,7 @@ struct MockBackend {
     bool fail_connect = false;
     bool fail_upstream_recv = false;
     bool fail_upstream_send = false;
+    bool fail_send = false;
 
     // Injected completions (fed back to event loop)
     static constexpr u32 kMaxEvents = 256;
@@ -48,6 +49,7 @@ struct MockBackend {
         fail_connect = false;
         fail_upstream_recv = false;
         fail_upstream_send = false;
+        fail_send = false;
         return {};
     }
 
@@ -77,6 +79,7 @@ struct MockBackend {
     }
 
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
+        if (fail_send) return false;
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::Send, fd, conn_id, buf, len};
         }

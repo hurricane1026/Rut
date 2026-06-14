@@ -657,7 +657,16 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+                    // The send couldn't be queued (io_uring add_send returns
+                    // false under SQ pressure), so no Send completion will ever
+                    // arrive to call on_jit_wait_send_sent and resume the
+                    // handler. Fail closed like the other event-yield arms whose
+                    // submit_* couldn't be started, rather than leaving
+                    // pending_handler_fn parked until keepalive.
+                    send_internal_error();
+                    return;
+                }
                 if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
                     if (!loop->pause_recv(conn)) {
                         loop->close_conn(conn);

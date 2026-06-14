@@ -373,12 +373,11 @@ public:
 
     bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
 
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
-            backend.add_send_tls(c, buf, len);
-            return;
+            return backend.add_send_tls(c, buf, len);
         }
-        backend.add_send(c.fd, c.id, buf, len);
+        return backend.add_send(c.fd, c.id, buf, len);
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {

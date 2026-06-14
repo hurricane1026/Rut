@@ -342,11 +342,13 @@ public:
         return false;
     }
 
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) {
             c.pending_ops++;
             c.send_armed = true;
+            return true;
         }
+        return false;
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
