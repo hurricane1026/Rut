@@ -327,7 +327,12 @@ if(RUT_ENABLE_JIT)
     if(LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
         set(LLVM_LIBS LLVM)
     else()
-        llvm_map_components_to_libnames(LLVM_LIBS core orcjit orcshared orctargetprocess native support)
+        # `passes` provides the new pass-manager C API (LLVMRunPasses /
+        # LLVMCreatePassBuilderOptions) used by the JIT optimization pipeline;
+        # `target` provides TargetMachine creation. Required for static LLVM
+        # installs where these aren't pulled in transitively.
+        llvm_map_components_to_libnames(LLVM_LIBS
+            core orcjit orcshared orctargetprocess native support passes target)
     endif()
     target_link_libraries(rut_jit ${LLVM_LIBS})
 
@@ -374,3 +379,13 @@ target_link_libraries(rut
     rut_runtime
     rut_compiler
 )
+
+# When the JIT is built, the server can compile and serve a .rut program
+# end to end. serve_loader.cc bridges frontend → JIT → RouteConfig; it
+# pulls in rut_jit (and thus LLVM). Without the JIT the binary still
+# builds and runs, just without program loading.
+if(RUT_ENABLE_JIT)
+    target_sources(rut PRIVATE serve_loader.cc)
+    target_link_libraries(rut rut_jit)
+    target_compile_definitions(rut PRIVATE RUT_ENABLE_JIT=1)
+endif()

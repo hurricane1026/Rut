@@ -95,6 +95,12 @@ struct Ctx {
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
+    LLVMValueRef fn_parse_prime;
+    LLVMValueRef fn_parse_unprime;
+
+    // True while emitting a handler that reads the request (and therefore
+    // primed the parse cache). Gates the parse-unprime calls at exits.
+    bool cur_fn_needs_parse = false;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
     LLVMValueRef fn_str_cmp;
@@ -160,6 +166,48 @@ struct Ctx {
     }
 
     // ── Lazy Helper Declaration ────────────────────────────────────
+
+    // void rut_helper_parse_prime(ptr, i32)
+    LLVMValueRef get_parse_prime() {
+        if (!fn_parse_prime) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_parse_prime = LLVMAddFunction(llvm_mod, "rut_helper_parse_prime", ft);
+        }
+        return fn_parse_prime;
+    }
+
+    // Emit the one-time parse-prime call for this handler invocation. The
+    // builder must already be positioned in the handler's first executed
+    // block so the call dominates every req_* helper call.
+    void emit_parse_prime() {
+        LLVMValueRef args[] = {param_req_data, param_req_len};
+        LLVMBuildCall2(
+            builder, LLVMGlobalGetValueType(get_parse_prime()), get_parse_prime(), args, 2, "");
+    }
+
+    // void rut_helper_parse_unprime()
+    LLVMValueRef get_parse_unprime() {
+        if (!fn_parse_unprime) {
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
+            fn_parse_unprime = LLVMAddFunction(llvm_mod, "rut_helper_parse_unprime", ft);
+        }
+        return fn_parse_unprime;
+    }
+
+    // Clear the primed parse cache at a handler exit, so the primed parse
+    // never outlives this invocation. No-op for handlers that don't read
+    // the request (they never primed). Builder must be positioned just
+    // before the terminal return.
+    void emit_parse_unprime() {
+        if (!cur_fn_needs_parse) return;
+        LLVMBuildCall2(builder,
+                       LLVMGlobalGetValueType(get_parse_unprime()),
+                       get_parse_unprime(),
+                       nullptr,
+                       0,
+                       "");
+    }
 
     // void rut_helper_req_path(ptr, i32, ptr, ptr)
     LLVMValueRef get_req_path() {
@@ -1263,6 +1311,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     LLVMConstInt(c.i64_ty, static_cast<u64>(headers_idx_imm) << 40, 0);
                 result = LLVMBuildOr(c.builder, result, headers_slot, "result.headers");
             }
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             break;
         }
@@ -1283,6 +1332,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");
             LLVMValueRef result = LLVMBuildOr(c.builder, action, shifted, "result");
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             break;
         }
@@ -1292,6 +1342,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             const u16 next_state = static_cast<u16>((packed >> 32) & 0xffffu);
             u8 yield_kind = static_cast<u8>((packed >> 48) & 0xffu);
             if (yield_kind == 0) yield_kind = static_cast<u8>(YieldKind::Timer);
+            // Clear the prime before suspending; the resume re-primes at entry.
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, c.make_result_yield(next_state, yield_kind, payload));
             break;
         }
@@ -1307,6 +1359,41 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
 }
 
 // ── Function Codegen ───────────────────────────────────────────────
+
+// True when the function contains a request-access opcode that reads from
+// the parse cache. Status-only / forward-only handlers (and ones that only
+// touch route params or the peer address) don't, so they skip the
+// parse-prime call entirely and pay no parse at entry.
+static bool rir_function_uses_parse(const rir::Function& fn) {
+    if (!fn.blocks) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        if (!blk.insts) continue;
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            switch (blk.insts[ii].op) {
+                case rir::Opcode::ReqHeader:
+                case rir::Opcode::ReqQuery:
+                case rir::Opcode::ReqQueryString:
+                case rir::Opcode::ReqMethod:
+                case rir::Opcode::ReqPath:
+                case rir::Opcode::ReqPathOnly:
+                case rir::Opcode::ReqBody:
+                case rir::Opcode::ReqKeepAlive:
+                case rir::Opcode::ReqChunked:
+                case rir::Opcode::ReqHasContentLength:
+                case rir::Opcode::ReqHttp10:
+                case rir::Opcode::ReqHttp11:
+                case rir::Opcode::ReqHttpVersion:
+                case rir::Opcode::ReqContentLength:
+                case rir::Opcode::ReqCookie:
+                    return true;
+                default:
+                    break;
+            }
+        }
+    }
+    return false;
+}
 
 static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
@@ -1353,6 +1440,12 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         c.block_map[blk.id.id] = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, label);
     }
 
+    // Whether this handler reads the request at all — gates the one-time
+    // parse-prime call emitted in the prologue below and the parse-unprime
+    // calls at the handler's returns.
+    const bool kNeedsParse = rir_function_uses_parse(fn);
+    c.cur_fn_needs_parse = kNeedsParse;
+
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
     // LLVM basic block dispatches on HandlerCtx::state. The default mapping
@@ -1384,6 +1477,10 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        // Parse-once: prime the per-thread parse cache before any state runs,
+        // so every req_* helper in this invocation shares one parse. Skipped
+        // for handlers that never read the request (status/forward only).
+        if (kNeedsParse) c.emit_parse_prime();
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
@@ -1429,12 +1526,17 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             LLVMPositionBuilderAtEnd(c.builder, yield_bb);
             LLVMValueRef result =
                 c.make_result_yield(static_cast<u16>(si + 1), yield_kind, payload);
+            // Clear the prime before suspending; the resume re-primes at entry.
+            c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             LLVMAddCase(sw, LLVMConstInt(c.i16_ty, si, 0), yield_bb);
         }
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        // Parse-once: prime the per-thread parse cache at handler entry,
+        // unless the handler never reads the request.
+        if (kNeedsParse) c.emit_parse_prime();
     }
 
     // Emit instructions block by block.
@@ -1480,6 +1582,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
+    c.fn_parse_prime = nullptr;
+    c.fn_parse_unprime = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;

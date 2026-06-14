@@ -12,16 +12,93 @@
 
 using namespace rut;
 
+// ── Per-invocation parse cache (parse-once) ────────────────────────
+//
+// The handler ABI passes raw request bytes, and historically every
+// rut_helper_req_* re-parsed the whole request from scratch — a handler
+// reading method + path + 2 headers parsed 4 times. This cache parses
+// the request once per handler invocation and serves all req_* helpers
+// from the result.
+//
+// Safety: a shard event loop is single-threaded and a handler invocation
+// runs to completion (yield or return) before the next one starts, so a
+// thread-local cache safely serves every helper call within one
+// invocation. The JIT emits one rut_helper_parse_prime() call at handler
+// entry that force-parses for the current request and marks the cache
+// `primed`. Only a primed cache is reused by helpers; an unprimed helper
+// call (e.g. a direct caller that never primed) always parses fresh and
+// leaves the cache unprimed — so two direct calls on a reused buffer
+// whose contents changed never return a stale parse.
+
+namespace {
+
+struct ParseCache {
+    const u8* data = nullptr;
+    u32 len = 0;
+    bool primed = false;  // set only by rut_helper_parse_prime()
+    bool ok = false;      // parse reached ParseStatus::Complete
+    u32 header_end = 0;   // byte offset past the header block (for body)
+    ParsedRequest req;
+};
+
+thread_local ParseCache t_parse_cache;
+
+// Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
+// pc.primed untouched — callers set it.
+void parse_into(ParseCache& pc, const u8* data, u32 len) {
+    pc.data = data;
+    pc.len = len;
+    HttpParser parser;
+    parser.reset();
+    pc.req.reset();
+    if (parser.parse(data, len, &pc.req) == ParseStatus::Complete) {
+        pc.ok = true;
+        pc.header_end = parser.header_end;
+    } else {
+        pc.ok = false;
+        pc.header_end = 0;
+    }
+}
+
+// Used by all req_* helpers. Reuses the primed parse when it matches this
+// (data, len) — the JIT fast path where one prime serves every helper in
+// the invocation. Otherwise parses fresh and marks the cache unprimed so
+// it is never reused for a subsequent (possibly aliasing) direct call.
+const ParseCache& parse_cached(const u8* data, u32 len) {
+    ParseCache& pc = t_parse_cache;
+    if (pc.primed && pc.data == data && pc.len == len) return pc;
+    parse_into(pc, data, len);
+    pc.primed = false;
+    return pc;
+}
+
+}  // namespace
+
+void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
+    // Parse once for this invocation and mark the cache primed so the
+    // following req_* helper calls reuse it.
+    ParseCache& pc = t_parse_cache;
+    parse_into(pc, req_data, req_len);
+    pc.primed = true;
+}
+
+void rut_helper_parse_unprime() {
+    // Called at handler exit so the primed parse never outlives the
+    // invocation that created it. Without this, a direct caller of
+    // rut_helper_req_* on the same thread that happens to reuse the
+    // handler's request buffer (same address and length, different bytes)
+    // could match the stale primed entry; clearing the flag forces such a
+    // caller to reparse.
+    t_parse_cache.primed = false;
+}
+
 // ── Request Access ─────────────────────────────────────────────────
 
 void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
-    // Fast path: parse just enough to extract the path.
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) == ParseStatus::Complete) {
-        *out_ptr = req.path.ptr;
-        *out_len = req.path.len;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (pc.ok) {
+        *out_ptr = pc.req.path.ptr;
+        *out_len = pc.req.path.len;
         return;
     }
 
@@ -60,15 +137,14 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
     *out_ptr = "";
     *out_len = 0;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
-    if (!req.has_content_length || parser.header_end >= req_len || req.content_length == 0) return;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return;
+    const ParsedRequest& req = pc.req;
+    if (!req.has_content_length || pc.header_end >= req_len || req.content_length == 0) return;
 
-    const u32 available = req_len - parser.header_end;
+    const u32 available = req_len - pc.header_end;
     if (available < req.content_length) return;
-    *out_ptr = reinterpret_cast<const char*>(req_data + parser.header_end);
+    *out_ptr = reinterpret_cast<const char*>(req_data + pc.header_end);
     *out_len = req.content_length;
 }
 
@@ -79,10 +155,9 @@ void rut_helper_req_http_version(const u8* req_data,
     *out_ptr = "";
     *out_len = 0;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return;
+    const ParsedRequest& req = pc.req;
 
     if (req.version == HttpVersion::Http10) {
         *out_ptr = "HTTP/1.0";
@@ -97,10 +172,9 @@ void rut_helper_req_http_version(const u8* req_data,
 }
 
 u8 rut_helper_req_flag(const u8* req_data, u32 req_len, u8 flag) {
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return 0;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return 0;
+    const ParsedRequest& req = pc.req;
     if (flag == 0) return req.keep_alive ? 1 : 0;
     if (flag == 1) return req.chunked ? 1 : 0;
     if (flag == 2) return req.has_content_length ? 1 : 0;
@@ -110,12 +184,8 @@ u8 rut_helper_req_flag(const u8* req_data, u32 req_len, u8 flag) {
 }
 
 u8 rut_helper_req_method(const u8* req_data, u32 req_len) {
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) == ParseStatus::Complete) {
-        return static_cast<u8>(req.method);
-    }
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (pc.ok) return static_cast<u8>(pc.req.method);
 
     // Fallback: return Unknown
     return static_cast<u8>(HttpMethod::Unknown);
@@ -132,10 +202,9 @@ void rut_helper_req_header(const u8* req_data,
     *out_ptr = nullptr;
     *out_len = 0;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return;
+    const ParsedRequest& req = pc.req;
 
     // Linear scan through parsed headers (case-insensitive name match).
     for (u32 i = 0; i < req.header_count; i++) {
@@ -186,10 +255,9 @@ void rut_helper_req_cookie(const u8* req_data,
     *out_len = 0;
     if (!name || name_len == 0) return;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return;
+    const ParsedRequest& req = pc.req;
 
     for (u32 i = 0; i < req.header_count; i++) {
         const auto& h = req.headers[i];
@@ -237,10 +305,9 @@ void rut_helper_req_query(const u8* req_data,
     *out_len = 0;
     if (!name || name_len == 0) return;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return;
+    const ParsedRequest& req = pc.req;
     if (req.path.len == 0) return;
 
     const char* path = req.path.ptr;
@@ -290,10 +357,9 @@ void rut_helper_req_query_string(
     *out_ptr = nullptr;
     *out_len = 0;
 
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return;
+    const ParsedRequest& req = pc.req;
     if (req.path.len == 0) return;
 
     const char* path = req.path.ptr;
@@ -347,11 +413,9 @@ u32 rut_helper_req_remote_addr(void* conn) {
 }
 
 u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
-    HttpParser parser;
-    ParsedRequest req;
-    parser.reset();
-    if (parser.parse(req_data, req_len, &req) != ParseStatus::Complete) return 0;
-    return req.has_content_length ? req.content_length : 0;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return 0;
+    return pc.req.has_content_length ? pc.req.content_length : 0;
 }
 
 // ── String Operations ──────────────────────────────────────────────

@@ -250,6 +250,22 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(test_jit PRIVATE ${LLVM_DEFINITIONS})
     add_test(NAME test_jit COMMAND test_jit)
     set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
+
+    # serve_loader.cc lives only in the rut binary target, so compile it
+    # directly here; it pulls in the frontend + JIT.
+    add_executable(test_serve_loader
+        test_serve_loader.cc
+        ${PROJECT_SOURCE_DIR}/src/serve_loader.cc
+    )
+    target_link_libraries(test_serve_loader rut_jit rut_compiler)
+    target_include_directories(test_serve_loader PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/testing
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(test_serve_loader PRIVATE ${LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
+    add_test(NAME test_serve_loader COMMAND test_serve_loader)
+    set_tests_properties(test_serve_loader PROPERTIES LABELS "unit;jit")
 endif()
 
 add_executable(test_traffic_capture
@@ -331,6 +347,7 @@ if(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_chunked_parser>
         COMMAND $<TARGET_FILE:test_shard_control>
         COMMAND $<TARGET_FILE:test_jit>
+        COMMAND $<TARGET_FILE:test_serve_loader>
         COMMAND $<TARGET_FILE:test_traffic_capture>
         COMMAND $<TARGET_FILE:test_traffic_replay>
         COMMAND $<TARGET_FILE:test_sim>
@@ -338,7 +355,7 @@ if(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_route_trie>
         COMMAND $<TARGET_FILE:test_route_art>
         COMMAND $<TARGET_FILE:test_route_select>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
         COMMENT "Running all tests..."
     )
 else()

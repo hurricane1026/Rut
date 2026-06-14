@@ -4,6 +4,10 @@
 #include "rut/runtime/socket.h"
 #include "rut/runtime/tls.h"
 
+#ifdef RUT_ENABLE_JIT
+#include "rut/serve_loader.h"
+#endif
+
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
@@ -50,6 +54,16 @@ static bool starts_with_dash_dash(const char* s) {
     return s[0] != '\0' && s[0] == '-' && s[1] == '-';
 }
 
+// True only when the whole token is digits — so a numeric-looking path
+// like "404.rut" is treated as a program path, not a port.
+static bool is_all_digits(const char* s) {
+    if (!s || !*s) return false;
+    for (const char* p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
 static bool detect_io_uring() {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -81,7 +95,8 @@ static i32 run_shards(u16 port,
                       TlsServerContext* tls_server,
                       const char* access_log_path,
                       bool access_log_compress,
-                      i32 access_log_level) {
+                      i32 access_log_level,
+                      const RouteConfig* route_config) {
     Shard<EventLoopType> shards[kMaxShards];
 
     // Create one SO_REUSEPORT listen socket per shard.
@@ -131,6 +146,13 @@ static i32 run_shards(u16 port,
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
         }
+
+        // Hand the compiled routes to the shard. Read-only and shared by
+        // every shard (share-nothing applies to mutable per-request
+        // state, not the immutable config). spawn() seeds active_config
+        // from this pointer. A null config keeps the legacy route-less
+        // behavior (every request falls through to the default action).
+        shards[i].route_config = route_config;
     }
 
     // Get actual port from first shard's socket
@@ -255,18 +277,25 @@ int main(int argc, char** argv) {
     u32 pool_prealloc = 0;  // 0 = fully lazy
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
+    const char* config_path = nullptr;
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
+    u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
     //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] >= '0' && argv[i][0] <= '9') {
+        if (is_all_digits(argv[i])) {
             port = 0;
             for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                 port = port * 10 + static_cast<u16>(*p - '0');
+        } else if (argv[i][0] != '-') {
+            // A bare positional that isn't a pure number is the .rut program
+            // path (e.g. "404.rut"). Flag values are consumed via i++ in the
+            // blocks below, so they never reach here.
+            config_path = argv[i];
         }
         if (i + 1 < argc) {
             if (str_eq(argv[i], "--shards")) {
@@ -326,6 +355,19 @@ int main(int argc, char** argv) {
                 access_log_level = 0;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
                     access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
+            } else if (str_eq(argv[i], "--opt")) {
+                if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
+                    write_str("--opt requires a numeric argument (0-3)\n");
+                    return 1;
+                }
+                i++;
+                opt_level = 0;
+                for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
+                    opt_level = opt_level * 10 + static_cast<u32>(*p - '0');
+                if (opt_level > 3) {
+                    write_str("--opt must be between 0 and 3\n");
+                    return 1;
+                }
             }
         }
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
@@ -335,7 +377,7 @@ int main(int argc, char** argv) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
                 str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--tls-cert") ||
                 str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--access-log") ||
-                str_eq(argv[i], "--access-log-level")) {
+                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt")) {
                 write_str(argv[i]);
                 write_str(" requires an argument\n");
                 return 1;
@@ -375,6 +417,65 @@ int main(int argc, char** argv) {
         write_str("TLS: enabled\n");
     }
 
+    // Compile the .rut program (if given) into a RouteConfig the shards
+    // serve. The loader owns the JIT code + RIR arena + source mapping
+    // for the whole run, so it lives at file scope to outlive every
+    // shard and to keep the 1.28 MB RouteConfig off the stack.
+    const RouteConfig* route_config = nullptr;
+#ifdef RUT_ENABLE_JIT
+    static LoadedProgram program;
+    if (config_path) {
+        jit::OptLevel olvl = jit::OptLevel::O2;
+        switch (opt_level) {
+            case 0:
+                olvl = jit::OptLevel::O0;
+                break;
+            case 1:
+                olvl = jit::OptLevel::O1;
+                break;
+            case 2:
+                olvl = jit::OptLevel::O2;
+                break;
+            case 3:
+                olvl = jit::OptLevel::O3;
+                break;
+            default:
+                olvl = jit::OptLevel::O2;
+                break;
+        }
+        LoadError load_err;
+        if (!load_rut_program(config_path, program, load_err, olvl)) {
+            char msg[512];
+            format_load_error(load_err, msg, sizeof(msg));
+            write_str("Failed to load ");
+            write_str(config_path);
+            write_str(": ");
+            write_str(msg);
+            write_str("\n");
+            program.destroy();
+            destroy_tls_server_context(tls_server);
+            return 1;
+        }
+        route_config = &program.config;
+        write_str("Loaded program: ");
+        write_str(config_path);
+        write_str(" (opt O");
+        write_u32(opt_level);
+        write_str(")\n");
+    } else {
+        write_str("No .rut program given — serving default routes only.\n");
+    }
+#else
+    (void)opt_level;
+    if (config_path) {
+        write_str("This build has no JIT (RUT_ENABLE_JIT=OFF); cannot load ");
+        write_str(config_path);
+        write_str("\n");
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+#endif
+
     i32 rc = 0;
     if (tls_server) {
         write_str("Backend: epoll (TLS)\n");
@@ -386,7 +487,8 @@ int main(int argc, char** argv) {
                                         tls_server,
                                         access_log_path,
                                         access_log_compress,
-                                        access_log_level);
+                                        access_log_level,
+                                        route_config);
     } else if (detect_io_uring()) {
         write_str("Backend: io_uring\n");
         rc = run_shards<IoUringEventLoop>(port,
@@ -397,7 +499,8 @@ int main(int argc, char** argv) {
                                           tls_server,
                                           access_log_path,
                                           access_log_compress,
-                                          access_log_level);
+                                          access_log_level,
+                                          route_config);
     } else {
         write_str("Backend: epoll\n");
         rc = run_shards<EpollEventLoop>(port,
@@ -408,8 +511,14 @@ int main(int argc, char** argv) {
                                         tls_server,
                                         access_log_path,
                                         access_log_compress,
-                                        access_log_level);
+                                        access_log_level,
+                                        route_config);
     }
     destroy_tls_server_context(tls_server);
+#ifdef RUT_ENABLE_JIT
+    // Shards have joined inside run_shards; safe to release JIT code,
+    // the RIR arena, and the source mapping.
+    program.destroy();
+#endif
     return rc;
 }

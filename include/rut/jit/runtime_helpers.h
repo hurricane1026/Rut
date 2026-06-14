@@ -105,6 +105,18 @@ rut::u32 rut_helper_req_remote_addr(void* conn);
 // Get parsed Content-Length from request bytes. Returns 0 when absent or malformed.
 rut::u64 rut_helper_req_content_length(const rut::u8* req_data, rut::u32 req_len);
 
+// Parse-once: force a fresh parse of (req_data, req_len) into the per-thread
+// parse cache. The JIT emits exactly one call to this at handler entry so all
+// req_* helpers in that invocation share a single parse instead of each
+// re-parsing the request. Priming on every entry also prevents a reused
+// request buffer from aliasing a previous request's cached parse.
+void rut_helper_parse_prime(const rut::u8* req_data, rut::u32 req_len);
+
+// Clear the primed parse cache at handler exit so a primed parse never
+// outlives its invocation (see rut_helper_parse_prime). The JIT emits one
+// call before each terminal return of a request-reading handler.
+void rut_helper_parse_unprime();
+
 // ── String Operations ──────────────────────────────────────────────
 
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
