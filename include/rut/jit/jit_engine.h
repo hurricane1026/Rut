@@ -13,6 +13,17 @@ using LLVMContextRef = struct LLVMOpaqueContext*;
 
 namespace rut::jit {
 
+// IR optimization level applied to each handler module before LLJIT does
+// final codegen. O0 skips the mid-level pipeline entirely (fastest
+// compile / startup, least optimized code); O1..O3 run `default<O1..O3>`.
+// Higher levels trade longer startup compile time for faster handlers.
+enum class OptLevel : u8 {
+    O0 = 0,
+    O1 = 1,
+    O2 = 2,
+    O3 = 3,
+};
+
 // ── JIT Engine ─────────────────────────────────────────────────────
 // Wraps LLVM ORC LLJIT via the C API. Compiles LLVM IR modules to
 // native code and resolves symbols (including runtime helpers).
@@ -48,6 +59,10 @@ struct JitEngine {
     RegexSlot** regex_slots = nullptr;
     u32 regex_slot_count = 0;
     u32 regex_slot_cap = 0;
+
+    // IR optimization level for compile(). Set before calling compile();
+    // defaults to O2. See OptLevel.
+    OptLevel opt_level = OptLevel::O2;
 
     bool init();
 

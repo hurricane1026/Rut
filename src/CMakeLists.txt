@@ -374,3 +374,13 @@ target_link_libraries(rut
     rut_runtime
     rut_compiler
 )
+
+# When the JIT is built, the server can compile and serve a .rut program
+# end to end. serve_loader.cc bridges frontend → JIT → RouteConfig; it
+# pulls in rut_jit (and thus LLVM). Without the JIT the binary still
+# builds and runs, just without program loading.
+if(RUT_ENABLE_JIT)
+    target_sources(rut PRIVATE serve_loader.cc)
+    target_link_libraries(rut rut_jit)
+    target_compile_definitions(rut PRIVATE RUT_ENABLE_JIT=1)
+endif()

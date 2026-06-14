@@ -95,6 +95,7 @@ struct Ctx {
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
+    LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_str_has_prefix;
     LLVMValueRef fn_str_eq;
     LLVMValueRef fn_str_cmp;
@@ -160,6 +161,25 @@ struct Ctx {
     }
 
     // ── Lazy Helper Declaration ────────────────────────────────────
+
+    // void rut_helper_parse_prime(ptr, i32)
+    LLVMValueRef get_parse_prime() {
+        if (!fn_parse_prime) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_parse_prime = LLVMAddFunction(llvm_mod, "rut_helper_parse_prime", ft);
+        }
+        return fn_parse_prime;
+    }
+
+    // Emit the one-time parse-prime call for this handler invocation. The
+    // builder must already be positioned in the handler's first executed
+    // block so the call dominates every req_* helper call.
+    void emit_parse_prime() {
+        LLVMValueRef args[] = {param_req_data, param_req_len};
+        LLVMBuildCall2(
+            builder, LLVMGlobalGetValueType(get_parse_prime()), get_parse_prime(), args, 2, "");
+    }
 
     // void rut_helper_req_path(ptr, i32, ptr, ptr)
     LLVMValueRef get_req_path() {
@@ -1384,6 +1404,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        // Parse-once: prime the per-thread parse cache before any state runs,
+        // so every req_* helper in this invocation shares one parse.
+        c.emit_parse_prime();
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
@@ -1435,6 +1458,8 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        // Parse-once: prime the per-thread parse cache at handler entry.
+        c.emit_parse_prime();
     }
 
     // Emit instructions block by block.
@@ -1480,6 +1505,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
+    c.fn_parse_prime = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;
