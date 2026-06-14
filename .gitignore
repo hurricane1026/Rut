@@ -1,4 +1,7 @@
 build/
+# Catch all out-of-source build directories (build-cov, build-release,
+# build-coverage, build-nojit, build-lto, …).
+build-*/
 build-cov/
 .cache/
 build-release/
@@ -8,3 +11,11 @@ node_modules/
 build-dbg/
 .claude/
 spec/states/
+
+# Coverage / profiling artifacts
+*.profraw
+*.profdata
+
+# Python bytecode (e.g. scripts/__pycache__)
+__pycache__/
+*.pyc
