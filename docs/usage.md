@@ -73,9 +73,9 @@ A program is a set of routes. The two route outcomes that are wired end
 to end today are **returning a status** and **forwarding to an upstream**.
 
 ```rut
-# app.rut
+// app.rut
 
-# Declare upstreams with an address. forward(name) proxies to it.
+// Declare upstreams with an address. forward(name) proxies to it.
 upstream origin at "127.0.0.1:9090"
 
 route GET "/" {
@@ -87,7 +87,7 @@ route GET "/health" {
 }
 
 route GET "/proxy" {
-    return forward(origin)          # zero-copy proxy to `origin`
+    return forward(origin)          // zero-copy proxy to `origin`
 }
 ```
 
