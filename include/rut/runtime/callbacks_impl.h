@@ -786,6 +786,27 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
             }
+            // io_uring keeps the multishot downstream recv armed across upstream
+            // waits so client FINs / pipelined bytes still surface a Recv CQE
+            // (handled by the mid-yield dispatch branch). A preceding non-empty
+            // wait(downstream.send()) cancels that recv via pause_recv; calling
+            // submit_recv here re-arms it when the cancel has already drained,
+            // or marks recv_pause_rearm_pending so the in-flight cancel
+            // completion re-arms — covering both Send/cancel CQE orderings. It
+            // is a no-op when recv is still armed (the normal upstream-wait
+            // case). Gated to the io_uring loop via the pause_recv(conn)
+            // member; epoll deliberately masks EPOLLIN for these waits above.
+            if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+                const bool kWaitsUpstream = outcome.yield_kind == jit::YieldKind::UpstreamConnect ||
+                                            outcome.yield_kind == jit::YieldKind::UpstreamRecv ||
+                                            outcome.yield_kind == jit::YieldKind::UpstreamSend;
+                if (kWaitsUpstream && conn.fd >= 0 && !conn.recv_paused_for_send) {
+                    // Best-effort: under SQ pressure the upstream op or
+                    // keepalive still bounds the wait, so a missed FIN detector
+                    // must not fail the in-flight upstream request.
+                    (void)loop->submit_recv(conn);
+                }
+            }
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {

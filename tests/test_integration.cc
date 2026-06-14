@@ -1560,6 +1560,57 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     loop->shutdown();
 }
 
+// HandlerFn stub that yields on an upstream recv — never invoked by the test
+// below, only used as a non-null pending_handler_fn.
+static u64 upstream_recv_yield_handler(void* /*conn*/,
+                                       rut::jit::HandlerCtx* /*ctx*/,
+                                       const rut::u8* /*req*/,
+                                       rut::u32 /*len*/,
+                                       void* /*arena*/) {
+    return rut::jit::HandlerResult::make_yield(1, rut::jit::YieldKind::UpstreamRecv).pack();
+}
+
+// A non-empty wait(downstream.send()) cancels the io_uring multishot recv. If
+// the handler then yields on an upstream wait (not Recv/Any), the downstream
+// recv must still be (re)armed so client FINs surface during the upstream wait.
+// Here the recv cancel CQE is still in flight (recv_armed +
+// recv_pause_cancel_pending), so handle_jit_outcome's upstream arm must mark
+// recv_pause_rearm_pending for the eventual cancel completion to re-arm on.
+TEST(uring, send_wait_into_upstream_wait_rearms_downstream_recv) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.upstream_fd = 99;  // upstream_target_matches() needs fd >= 0
+    conn.upstream_idx = 0;
+    conn.upstream_recv_armed = true;  // submit_recv_upstream short-circuits true
+    conn.pending_ops = 1;
+    conn.recv_armed = true;
+    conn.recv_pause_cancel_pending = true;
+    conn.recv_pause_rearm_pending = false;
+    conn.recv_paused_for_send = false;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamRecv;
+    outcome.next_state = 1;
+    outcome.timer_ms = 0;  // upstream_target_matches() -> true for upstream_fd
+
+    handle_jit_outcome<IoUringEventLoop>(
+        loop.get(), conn, outcome, &upstream_recv_yield_handler, true);
+
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_yield_kind, jit::YieldKind::UpstreamRecv);
+    CHECK(conn.recv_armed);
+
+    loop->shutdown();
+}
+
 // === Shard lifecycle ===
 
 // Shard init + shutdown without spawning a thread
