@@ -578,6 +578,26 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    // Send-wait recv pause: pause_recv() cancels the multishot
+                    // recv before a non-empty wait(downstream.send()). Only the
+                    // terminal -ECANCELED CQE is special-cased here (flag reset
+                    // + optional rearm). A *positive* recv CQE that was already
+                    // harvested into recv_buf before the cancel took effect is
+                    // deliberately NOT suppressed: those bytes are always past
+                    // the current request's framing (needs_req_body buffers the
+                    // full Content-Length body before the handler can yield, and
+                    // chunked bodies are rejected with 400), so they are the
+                    // next pipelined request. Every request accessor re-parses
+                    // req_data and bounds its output to the first request
+                    // (rut_helper_req_body caps at content_length, path/method/
+                    // header to the first request's line/block), so the larger
+                    // req_len is inert — no route value can observe the raced
+                    // bytes. Dropping them would instead corrupt HTTP/1.1
+                    // pipelining, and would diverge from the timer/upstream wait
+                    // contract that intentionally keeps such bytes (see the
+                    // mid-yield stray-CQE handling below). The pause is thus
+                    // best-effort liveness/buffer-pressure defence, not a hard
+                    // data barrier the residual in-flight CQE could breach.
                     if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
                         conn.recv_pause_cancel_pending) {
                         const bool needs_recv_rearm = conn.recv_pause_rearm_pending;
