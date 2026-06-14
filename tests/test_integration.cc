@@ -837,6 +837,14 @@ TEST(partial_send, real_epollout_completion) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
 
+    // Shrink the send buffer so a 65536-byte write reliably exceeds it and the
+    // first add_send returns partial/EAGAIN — otherwise a typical socketpair
+    // (SO_SNDBUF ~200KB) absorbs the whole payload and the EPOLLOUT-preservation
+    // path this test exists to exercise would be skipped. The kernel enforces a
+    // floor (and doubles the value), so the SKIP guard below stays as a backstop.
+    int sndbuf = 8192;
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
     // Use init() so timerfd is created — gives wait() a bounded 1-second wakeup
     // to prevent indefinite hangs if EPOLLOUT doesn't fire immediately.
     EpollBackend backend;
@@ -847,16 +855,18 @@ TEST(partial_send, real_epollout_completion) {
     tc.init(0, fds[0]);
     Connection& conn = tc.conn;
 
-    // Fill send_buf with 65536 bytes to force the epoll send path to arm EPOLLOUT
-    // on typical socketpair buffers. If the environment buffers the whole payload,
-    // skip instead of turning the test into a false positive.
+    // Send 65536 bytes straight from this stack buffer rather than through
+    // conn.send_buf: TestConn binds send_buf to kTestBufSize (4096), so
+    // Buffer::write would silently truncate the fill to 4096 — small enough to
+    // complete synchronously and defeat the partial-send path. add_send stores
+    // this pointer in send_state for the EPOLLOUT remainder, so fill_data must
+    // outlive the drain loop below; as a function-scope stack array, it does.
     u8 fill_data[65536];
     for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
-    conn.send_buf.write(fill_data, sizeof(fill_data));
-    const u32 kExpectedSendLen = conn.send_buf.len();
+    const u32 kExpectedSendLen = sizeof(fill_data);
 
     // add_send tries immediate send — may be partial or EAGAIN
-    backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
+    backend.add_send(fds[0], 0, fill_data, kExpectedSendLen);
     backend.pause_recv(0, true);
     if (backend.send_state[0].remaining == 0) {
         SKIP("socketpair buffered the full payload; send-wait EPOLLOUT preservation not exercised");
