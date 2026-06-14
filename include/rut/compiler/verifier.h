@@ -115,6 +115,7 @@ enum class VerifyRuntimePendingOp : u8 {
     None,
     Timer,
     DownstreamRecv,
+    DownstreamSend,
     UpstreamConnect,
     UpstreamRecv,
     UpstreamSend,
@@ -124,6 +125,7 @@ enum class VerifyRuntimeCallbackSlot : u8 {
     None,
     HandlerTimer,
     DownstreamRecv,
+    DownstreamSend,
     UpstreamRecv,
     UpstreamSend,
 };
@@ -172,6 +174,7 @@ struct VerifyRuntimeProtocolModel {
                 return check;
             case jit::YieldKind::Any:
             case jit::YieldKind::Recv:
+            case jit::YieldKind::Send:
                 check.ok = true;
                 check.pending_op = VerifyRuntimePendingOp::DownstreamRecv;
                 check.callback_slot = VerifyRuntimeCallbackSlot::DownstreamRecv;
@@ -187,6 +190,11 @@ struct VerifyRuntimeProtocolModel {
                     check.submit_transition_count = 2;
                     check.completion_transition_count = 2;
                     check.fail_closed_transition_count = 2;
+                }
+                if (static_cast<jit::YieldKind>(kind) == jit::YieldKind::Send) {
+                    check.pending_op = VerifyRuntimePendingOp::DownstreamSend;
+                    check.callback_slot = VerifyRuntimeCallbackSlot::DownstreamSend;
+                    return check;
                 }
                 return check;
             case jit::YieldKind::UpstreamConnect:
@@ -234,7 +242,6 @@ struct VerifyRuntimeProtocolModel {
                 check.completion_transition_count = 1;
                 check.fail_closed_transition_count = 1;
                 return check;
-            case jit::YieldKind::Send:
             case jit::YieldKind::HttpGet:
             case jit::YieldKind::HttpPost:
             case jit::YieldKind::Forward:
@@ -278,6 +285,8 @@ inline u8 verify_runtime_pending_op_arm_mask(VerifyRuntimePendingOp op) {
             return 1u << 0;
         case VerifyRuntimePendingOp::DownstreamRecv:
             return 1u << 1;
+        case VerifyRuntimePendingOp::DownstreamSend:
+            return 1u << 2;
         case VerifyRuntimePendingOp::UpstreamConnect:
             return 1u << 3;
         case VerifyRuntimePendingOp::UpstreamRecv:
@@ -296,10 +305,12 @@ inline u8 verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot slot) {
             return 1u << 0;
         case VerifyRuntimeCallbackSlot::DownstreamRecv:
             return 1u << 1;
-        case VerifyRuntimeCallbackSlot::UpstreamRecv:
+        case VerifyRuntimeCallbackSlot::DownstreamSend:
             return 1u << 2;
-        case VerifyRuntimeCallbackSlot::UpstreamSend:
+        case VerifyRuntimeCallbackSlot::UpstreamRecv:
             return 1u << 3;
+        case VerifyRuntimeCallbackSlot::UpstreamSend:
+            return 1u << 4;
     }
     return 0;
 }
@@ -366,11 +377,11 @@ inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
             return VerifyYieldRuntimeClass::Timer;
         case jit::YieldKind::Any:
         case jit::YieldKind::Recv:
+        case jit::YieldKind::Send:
         case jit::YieldKind::UpstreamConnect:
         case jit::YieldKind::UpstreamRecv:
         case jit::YieldKind::UpstreamSend:
             return VerifyYieldRuntimeClass::Event;
-        case jit::YieldKind::Send:
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
         case jit::YieldKind::Forward:
@@ -417,6 +428,8 @@ inline const char* verify_runtime_pending_op_name(VerifyRuntimePendingOp op) {
             return "Timer";
         case VerifyRuntimePendingOp::DownstreamRecv:
             return "DownstreamRecv";
+        case VerifyRuntimePendingOp::DownstreamSend:
+            return "DownstreamSend";
         case VerifyRuntimePendingOp::UpstreamConnect:
             return "UpstreamConnect";
         case VerifyRuntimePendingOp::UpstreamRecv:
@@ -435,6 +448,8 @@ inline const char* verify_runtime_callback_slot_name(VerifyRuntimeCallbackSlot s
             return "HandlerTimer";
         case VerifyRuntimeCallbackSlot::DownstreamRecv:
             return "DownstreamRecv";
+        case VerifyRuntimeCallbackSlot::DownstreamSend:
+            return "DownstreamSend";
         case VerifyRuntimeCallbackSlot::UpstreamRecv:
             return "UpstreamRecv";
         case VerifyRuntimeCallbackSlot::UpstreamSend:

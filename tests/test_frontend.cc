@@ -2982,10 +2982,22 @@ TEST(frontend, analyze_wait_upstream_recv_send_preserve_target_payload) {
     CHECK_EQ(hir->routes[0].waits[1].ms, 2u);
 }
 
+TEST(frontend, analyze_wait_downstream_send_completion_is_supported) {
+    const char* src = "route GET \"/x\" { wait(downstream.send()) return 204 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK_EQ(hir->routes[0].waits[0].event_kind, WaitEventKind::Send);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 0u);
+}
+
 TEST(frontend, analyze_wait_io_rejects_ignored_arguments) {
     const char* sources[] = {
         "route GET \"/x\" { wait(downstream.recv(req.body)) return 204 }\n",
-        "route GET \"/x\" { wait(downstream.send()) return 204 }\n",
         "route GET \"/x\" { wait(downstream.send(response(200))) return 204 }\n",
         "route GET \"/x\" { wait(any(downstream.send(), timer(250))) return 204 }\n",
         "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { "

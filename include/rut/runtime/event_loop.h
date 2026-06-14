@@ -28,7 +28,7 @@ namespace rut {
 //
 // Derived must implement:
 //   bool submit_recv_impl(Connection& c)
-//   void submit_send_impl(Connection& c, const u8* buf, u32 len)
+//   bool submit_send_impl(Connection& c, const u8* buf, u32 len)
 //   bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len)
 //   bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len)
 //   bool submit_recv_upstream_impl(Connection& c)
@@ -45,8 +45,8 @@ class EventLoopCRTP {
 
 public:
     bool submit_recv(Connection& c) { return self().submit_recv_impl(c); }
-    void submit_send(Connection& c, const u8* buf, u32 len) {
-        self().submit_send_impl(c, buf, len);
+    bool submit_send(Connection& c, const u8* buf, u32 len) {
+        return self().submit_send_impl(c, buf, len);
     }
     bool submit_connect(Connection& c, const void* addr, u32 addr_len) {
         return self().submit_connect_impl(c, addr, addr_len);
@@ -508,12 +508,12 @@ public:
         }
         return false;
     }
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if constexpr (requires(Backend& be, Connection& conn, const u8* ptr, u32 n) {
                           be.add_send_tls(conn, ptr, n);
                       }) {
             if (c.tls_active) {
-                if (backend.add_send_tls(c, buf, len)) return;
+                if (backend.add_send_tls(c, buf, len)) return true;
             }
         }
         if (backend.add_send(c.fd, c.id, buf, len)) {
@@ -521,7 +521,9 @@ public:
                 c.pending_ops++;
                 c.send_armed = true;
             }
+            return true;
         }
+        return false;
     }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         if (backend.add_connect(c.upstream_fd, c.id, addr, addr_len)) {

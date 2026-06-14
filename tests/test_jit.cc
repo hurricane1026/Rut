@@ -17487,6 +17487,7 @@ TEST(jit, frontend_route_event_waits_emit_event_yield_kinds) {
     const Case cases[] = {
         {"wait()", YieldKind::Any, 0},
         {"wait(downstream.recv())", YieldKind::Recv, 0},
+        {"wait(downstream.send())", YieldKind::Send, 0},
         {"wait(upstream(api).connect())", YieldKind::UpstreamConnect, 1},
         {"wait(upstream(api).recv())", YieldKind::UpstreamRecv, 1},
         {"wait(upstream(api).send(req.body))", YieldKind::UpstreamSend, 1},
@@ -17817,7 +17818,7 @@ TEST(jit, frontend_route_wait_event_predicate_fields_drive_control_flow) {
     const Case cases[] = {
         {"wait(250)", "timer", YieldKind::Timer},
         {"wait(downstream.recv())", "recv", YieldKind::Recv},
-        {"wait(downstream.recv())", "send", YieldKind::Send},
+        {"wait(downstream.send())", "send", YieldKind::Send},
         {"wait(upstream(api).connect())", "upstream_connect", YieldKind::UpstreamConnect},
         {"wait(upstream(api).recv())", "upstream_recv", YieldKind::UpstreamRecv},
         {"wait(upstream(api).send(req.body))", "upstream_send", YieldKind::UpstreamSend},

@@ -147,8 +147,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         free_stack[free_top++] = cid;
     }
     bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
-        backend.add_send(c.fd, c.id, buf, len);
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        return backend.add_send(c.fd, c.id, buf, len);
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         return backend.add_send_upstream(c.upstream_fd, c.id, buf, len);
@@ -552,11 +552,13 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         }
         return false;
     }
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) {
             c.pending_ops++;
             c.send_armed = true;
+            return true;
         }
+        return false;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {
@@ -876,8 +878,12 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         }
         return false;
     }
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
-        if (backend.add_send(c.fd, c.id, buf, len)) c.pending_ops++;
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        if (backend.add_send(c.fd, c.id, buf, len)) {
+            c.pending_ops++;
+            return true;
+        }
+        return false;
     }
     bool submit_send_upstream_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send_upstream(c.upstream_fd, c.id, buf, len)) {

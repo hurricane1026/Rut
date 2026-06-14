@@ -9372,6 +9372,16 @@ static u64 state_invariant_wait_recv_then_status(
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Recv).pack();
 }
 
+static u64 state_invariant_wait_send_then_status(
+    void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx && ctx->state == 7) {
+        const bool got_send = ctx->resume_event_kind == static_cast<u32>(jit::YieldKind::Send) &&
+                              ctx->resume_event_result == 3;
+        return jit::HandlerResult::make_status(got_send ? 204 : 500).pack();
+    }
+    return jit::HandlerResult::make_yield(7, jit::YieldKind::Send).pack();
+}
+
 // Same as above, but accepts any recv event payload on resume so state
 // transition tests don't depend on synthetic recv byte counts.
 static u64 state_invariant_wait_recv_then_status_always_204(
@@ -9923,25 +9933,151 @@ TEST(state_invariant, jit_any_timer_yield_disarms_timer_when_downstream_recv_fai
     CHECK(!c->timer_node.empty());
 }
 
-TEST(state_invariant, jit_downstream_send_yield_fails_closed) {
+TEST(state_invariant, jit_downstream_send_yield_resumes_and_finishes_response) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* c = loop.find_fd(42);
     REQUIRE(c != nullptr);
 
+    c->send_buf.reset();
+    const char kChunk[] = "abc";
+    c->send_buf.write(reinterpret_cast<const u8*>(kChunk), sizeof(kChunk) - 1);
+
+    g_state_invariant_jit_result = jit::HandlerResult::make_status(204);
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::EventYield;
     outcome.next_state = 3;
     outcome.yield_kind = jit::YieldKind::Send;
-    outcome.timer_ms = 202;
     loop.backend.clear_ops();
-    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_jit_wait_send_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
+    REQUIRE(loop.backend.op_count >= 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->pending_handler_fn, &state_invariant_configured_jit_result);
+
+    const auto* first_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(first_send != nullptr);
+    loop.dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(first_send->send_len)));
     CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 204u);
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 2u);
+}
+
+TEST(state_invariant, jit_downstream_send_yield_fails_closed_when_send_cannot_queue) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.reset();
+    const char kChunk[] = "abc";
+    c->send_buf.write(reinterpret_cast<const u8*>(kChunk), sizeof(kChunk) - 1);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.clear_ops();
+    // The wait(downstream.send()) write cannot be queued (SQ-full analogue:
+    // add_send returns false). The handler must fail closed with a 500 instead
+    // of parking on pending_handler_fn for a Send completion that will never
+    // arrive, and recv must not be paused.
+    loop.backend.fail_send = true;
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 500u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK(!c->keep_alive);
+    CHECK(!c->recv_paused_for_send);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+}
+
+TEST(state_invariant, jit_recv_yield_sets_recv_rearm_pending_if_recv_pause_cancel_pending) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->recv_armed = true;
+    c->recv_pause_cancel_pending = true;
+    c->recv_pause_rearm_pending = false;
+    c->recv_paused_for_send = false;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Recv;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->recv_pause_rearm_pending, true);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+}
+
+TEST(state_invariant, jit_downstream_send_yield_without_buffer_resumes_immediately) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.reset();
+
+    g_state_invariant_jit_result = jit::HandlerResult::make_status(204);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 3;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
-    CHECK_EQ(c->resp_status, 500);
+}
+
+TEST(state_invariant, jit_downstream_send_yield_reports_total_bytes_sent) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.reset();
+    const char kChunk[] = "abc";
+    c->send_buf.write(reinterpret_cast<const u8*>(kChunk), sizeof(kChunk) - 1);
+
+    g_state_invariant_jit_result = jit::HandlerResult::make_status(204);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 7;
+    outcome.yield_kind = jit::YieldKind::Send;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_send_then_status, true);
+
+    CHECK_EQ(c->pending_handler_fn, &state_invariant_wait_send_then_status);
+    const auto* first_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(first_send != nullptr);
+    loop.dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(first_send->send_len)));
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->resp_status, 204u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
 }
 
 TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
@@ -9963,6 +10099,53 @@ TEST(state_invariant, response_sent_clears_stale_upstream_fd_on_keepalive) {
     CHECK_EQ(c->upstream_fd, -1);
     CHECK_EQ(c->state, ConnState::ReadingHeader);
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
+}
+
+TEST(state_invariant, response_sent_clears_send_buf_before_downstream_send_wait) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/x", 'G', &state_invariant_wait_send_then_status));
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    c->send_buf.write(reinterpret_cast<const u8*>("stale-response"), 14);
+
+    static const char kReq[] = "GET /x HTTP/1.1\r\nHost: example\r\n\r\n";
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 i = 0; i < sizeof(kReq) - 1; i++) dst[i] = static_cast<u8>(kReq[i]);
+    c->recv_buf.commit(static_cast<u32>(sizeof(kReq) - 1));
+
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Recv, sizeof(kReq) - 1));
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+}
+
+TEST(state_invariant, response_sent_clears_send_buf_before_keepalive_reuse) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    format_static_response(*c, 204, true);
+    c->state = ConnState::Sending;
+    c->keep_alive = true;
+    c->resp_status = 204;
+    c->set_slots(nullptr, &on_response_sent<SmallLoop>, nullptr, nullptr);
+
+    loop.dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    CHECK_EQ(c->send_buf.len(), 0u);
+    CHECK_EQ(c->state, ConnState::ReadingHeader);
+    CHECK_EQ(c->on_recv, &on_header_received<SmallLoop>);
 }
 
 TEST(state_invariant, free_conn_clears_active_proxy_state) {

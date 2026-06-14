@@ -215,7 +215,7 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
-void EpollBackend::pause_recv(u32 conn_id) {
+void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     if (conn_id >= kMaxFdMap) return;
     i32 fd = downstream_fd_map[conn_id];
     if (fd < 0) return;
@@ -226,7 +226,21 @@ void EpollBackend::pause_recv(u32 conn_id) {
     // directions are closed, and without RDHUP interest a half-close
     // would go undetected and the slot would sit until the yield
     // deadline. EPOLLERR is always delivered regardless of mask.
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLRDHUP);
+    IoEventType type = IoEventType::Recv;
+    u32 events = EPOLLRDHUP;
+    if (preserve_send_interest) {
+        const auto& ss = send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd >= 0) {
+            type = ss.type;
+            if (ss.tls) {
+                events = (ss.tls_wait_events == EPOLLIN) ? (EPOLLIN | EPOLLRDHUP)
+                                                         : (EPOLLOUT | EPOLLRDHUP);
+            } else {
+                events = EPOLLOUT | EPOLLRDHUP;
+            }
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {

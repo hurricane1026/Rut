@@ -905,7 +905,7 @@ TEST(RirVerifier, RejectsUnsupportedLoweredYieldKind) {
     ctx.destroy();
 }
 
-TEST(RirVerifier, RejectsRuntimeUnsupportedDownstreamSendYield) {
+TEST(RirVerifier, SupportsRuntimeDownstreamSendYield) {
     TestContext ctx;
     REQUIRE(ctx.init());
 
@@ -929,11 +929,7 @@ TEST(RirVerifier, RejectsRuntimeUnsupportedDownstreamSendYield) {
     VOK(b.emit_ret_status(204));
 
     auto result = verify_function(fn);
-    REQUIRE(!result.ok);
-    CHECK_EQ(static_cast<u8>(result.issue.code),
-             static_cast<u8>(VerifyIssueCode::InvalidYieldRuntimeProtocol));
-    CHECK_EQ(result.issue.target_index, static_cast<u32>(jit::YieldKind::Send));
-    CHECK_EQ(result.issue.detail_index, 0u);
+    REQUIRE(result.ok);
 
     ctx.destroy();
 }
@@ -1076,14 +1072,33 @@ TEST(RirVerifier, RuntimeProtocolModelCountsTimedAnyTimerAndRecvTransitions) {
              static_cast<u8>(VerifyRuntimeCallbackSlot::HandlerTimer));
 }
 
-TEST(RirVerifier, RuntimeProtocolModelReportsUnsupportedEventYield) {
+TEST(RirVerifier, RuntimeProtocolModelReportsDownstreamSendYield) {
     auto check = VerifyRuntimeProtocolModel::check_yield(static_cast<u8>(jit::YieldKind::Send), 0);
-    REQUIRE(!check.ok);
-    CHECK_EQ(static_cast<u8>(check.reason),
-             static_cast<u8>(VerifyRuntimeProtocolReason::UnsupportedEventYield));
-    CHECK_EQ(static_cast<u8>(check.pending_op), static_cast<u8>(VerifyRuntimePendingOp::None));
+    REQUIRE(check.ok);
+    CHECK_EQ(static_cast<u8>(check.reason), static_cast<u8>(VerifyRuntimeProtocolReason::Ok));
+    CHECK_EQ(static_cast<u8>(check.pending_op),
+             static_cast<u8>(VerifyRuntimePendingOp::DownstreamSend));
     CHECK_EQ(static_cast<u8>(check.callback_slot),
-             static_cast<u8>(VerifyRuntimeCallbackSlot::None));
+             static_cast<u8>(VerifyRuntimeCallbackSlot::DownstreamSend));
+    CHECK(check.submit_transition);
+    CHECK(check.completion_transition);
+    CHECK(check.fail_closed_transition);
+}
+
+TEST(RirVerifier, RuntimeCallbackSlotMasksRemainDistinct) {
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::HandlerTimer),
+             static_cast<u8>(1u << 0));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::DownstreamRecv),
+             static_cast<u8>(1u << 1));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::DownstreamSend),
+             static_cast<u8>(1u << 2));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::UpstreamRecv),
+             static_cast<u8>(1u << 3));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::UpstreamSend),
+             static_cast<u8>(1u << 4));
+    CHECK_EQ(verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::DownstreamSend) &
+                 verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot::UpstreamRecv),
+             0u);
 }
 
 TEST(RirVerifier, HandlerAutomatonSummarizesTimerYieldAndTerminal) {

@@ -325,20 +325,30 @@ public:
     }
 
     bool submit_recv_impl(Connection& c) {
-        if (c.recv_armed) return true;
+        if (c.recv_paused_for_send) {
+            c.recv_pause_rearm_pending = true;
+            return true;
+        }
+        if (c.recv_armed) {
+            if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
+            return true;
+        }
         if (backend.add_recv(c.fd, c.id)) {
             c.pending_ops++;
             c.recv_armed = true;
+            c.recv_pause_rearm_pending = false;
             return true;
         }
         return false;
     }
 
-    void submit_send_impl(Connection& c, const u8* buf, u32 len) {
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) {
             c.pending_ops++;
             c.send_armed = true;
+            return true;
         }
+        return false;
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
@@ -366,6 +376,13 @@ public:
             return true;
         }
         return false;
+    }
+
+    bool pause_recv(Connection& c) {
+        c.recv_paused_for_send = true;
+        c.recv_pause_cancel_pending = true;
+        if (!c.recv_armed) return true;
+        return backend.pause_recv(c.fd, c.id);
     }
 
     void close_conn_impl(Connection& c) {
@@ -563,6 +580,41 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < kMaxConns) {
                     auto& conn = conns[ev.conn_id];
+                    // Send-wait recv pause: pause_recv() cancels the multishot
+                    // recv before a non-empty wait(downstream.send()). Only the
+                    // terminal -ECANCELED CQE is special-cased here (flag reset
+                    // + optional rearm). A *positive* recv CQE that was already
+                    // harvested into recv_buf before the cancel took effect is
+                    // deliberately NOT suppressed: those bytes are always past
+                    // the current request's framing (needs_req_body buffers the
+                    // full Content-Length body before the handler can yield, and
+                    // chunked bodies are rejected with 400), so they are the
+                    // next pipelined request. Every request accessor re-parses
+                    // req_data and bounds its output to the first request
+                    // (rut_helper_req_body caps at content_length, path/method/
+                    // header to the first request's line/block), so the larger
+                    // req_len is inert — no route value can observe the raced
+                    // bytes. Dropping them would instead corrupt HTTP/1.1
+                    // pipelining, and would diverge from the timer/upstream wait
+                    // contract that intentionally keeps such bytes (see the
+                    // mid-yield stray-CQE handling below). The pause is thus
+                    // best-effort liveness/buffer-pressure defence, not a hard
+                    // data barrier the residual in-flight CQE could breach.
+                    if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
+                        conn.recv_pause_cancel_pending) {
+                        const bool needs_recv_rearm = conn.recv_pause_rearm_pending;
+                        conn.recv_pause_rearm_pending = false;
+                        conn.recv_pause_cancel_pending = false;
+                        conn.recv_armed = false;
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (needs_recv_rearm && !conn.recv_paused_for_send) {
+                            if (!this->submit_recv_impl(conn)) {
+                                this->close_conn(conn);
+                                break;
+                            }
+                        }
+                        break;
+                    }
                     // Async CQE accounting: decrement pending_ops on final CQE.
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
@@ -574,9 +626,11 @@ public:
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
                         timer.refresh(&conn, keepalive_timeout);
+                        if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                            if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
                             conn.resume_event_result = ev.result;

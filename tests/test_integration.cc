@@ -12,11 +12,13 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/tls.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <atomic>
+#include <memory>
 
 #include <openssl/ssl.h>
 #include <stdlib.h>
@@ -41,6 +43,12 @@ struct TestConn {
 };
 
 namespace {
+
+bool g_send_pause_cleared = false;
+
+void verify_send_pause_cleared(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_send_pause_cleared = (ev.type == IoEventType::Send && !conn.recv_paused_for_send);
+}
 
 struct ScriptedTlsState {
     i32 accept_calls = 0;
@@ -122,6 +130,19 @@ struct ScopedTlsHooks {
 
     EpollTlsHooks hooks_{};
 };
+
+static bool send_byte_with_retry(i32 fd, char byte) {
+    for (int attempt = 0; attempt < 50; attempt++) {
+        ssize_t nw = write(fd, &byte, 1);
+        if (nw == 1) return true;
+        if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            usleep(1000);
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
 
 struct TlsRecvRetryCase {
     bool handshake_first = false;
@@ -342,7 +363,7 @@ static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCa
     ev.events = EPOLLIN;
     ev.data.u64 = static_cast<u64>(IoEventType::Send);
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
-    REQUIRE(send_all(fds[1], "r", 1));
+    REQUIRE(send_byte_with_retry(fds[1], 'r'));
 
     IoEvent events[8];
     u32 n = backend.wait(events, 8, &conn, 1);
@@ -358,6 +379,54 @@ static void run_tls_send_readable_while_waiting_for_write_case(rut::test::TestCa
     REQUIRE_EQ(epoll_ctl(backend.epoll_fd, EPOLL_CTL_MOD, fds[0], &ev), 0);
 
     n = backend.wait(events, 8, &conn, 1);
+    REQUIRE_EQ(n, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, 4);
+    CHECK_EQ(tls_state.write_calls, 2);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+static void run_tls_send_readable_preserves_interest_while_paused_case(
+    rut::test::TestCase* test_case) {
+    auto* _tc = test_case;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    backend.downstream_fd_map[0] = fds[0];
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_READ;
+    tls_state.write_second_rc = 4;
+    tls_state.write_second_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+
+    static const u8 kPayload[] = {'p', 'i', 'n', 'g'};
+    REQUIRE(backend.add_send_tls(conn, kPayload, sizeof(kPayload)));
+    CHECK_EQ(tls_state.write_calls, 1);
+    CHECK_EQ(backend.send_state[0].remaining, sizeof(kPayload));
+    CHECK(backend.send_state[0].tls);
+    CHECK_EQ(backend.send_state[0].tls_wait_events, EPOLLIN);
+
+    backend.pause_recv(0, true);
+
+    REQUIRE(send_byte_with_retry(fds[1], 'r'));
+
+    IoEvent events[8];
+    u32 n = backend.wait(events, 8, &conn, 1);
     REQUIRE_EQ(n, 1u);
     CHECK_EQ(events[0].type, IoEventType::Send);
     CHECK_EQ(events[0].result, 4);
@@ -768,13 +837,13 @@ TEST(partial_send, real_epollout_completion) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
 
-    // Set minimal send buffer to force partial sends / EAGAIN quickly.
-    // Linux doubles the value, so minimum effective is ~2*sndbuf.
-    i32 sndbuf = 2048;
-    REQUIRE_EQ(setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
-    // Also limit recv buffer on peer to create backpressure faster
-    i32 rcvbuf = 2048;
-    REQUIRE_EQ(setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+    // Shrink the send buffer so a 65536-byte write reliably exceeds it and the
+    // first add_send returns partial/EAGAIN — otherwise a typical socketpair
+    // (SO_SNDBUF ~200KB) absorbs the whole payload and the EPOLLOUT-preservation
+    // path this test exists to exercise would be skipped. The kernel enforces a
+    // floor (and doubles the value), so the SKIP guard below stays as a backstop.
+    int sndbuf = 8192;
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     // Use init() so timerfd is created — gives wait() a bounded 1-second wakeup
     // to prevent indefinite hangs if EPOLLOUT doesn't fire immediately.
@@ -786,13 +855,22 @@ TEST(partial_send, real_epollout_completion) {
     tc.init(0, fds[0]);
     Connection& conn = tc.conn;
 
-    // Fill send_buf with 4096 bytes (larger than the tiny socket buffer)
-    u8 fill_data[4096];
+    // Send 65536 bytes straight from this stack buffer rather than through
+    // conn.send_buf: TestConn binds send_buf to kTestBufSize (4096), so
+    // Buffer::write would silently truncate the fill to 4096 — small enough to
+    // complete synchronously and defeat the partial-send path. add_send stores
+    // this pointer in send_state for the EPOLLOUT remainder, so fill_data must
+    // outlive the drain loop below; as a function-scope stack array, it does.
+    u8 fill_data[65536];
     for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
-    conn.send_buf.write(fill_data, sizeof(fill_data));
+    const u32 kExpectedSendLen = sizeof(fill_data);
 
     // add_send tries immediate send — may be partial or EAGAIN
-    backend.add_send(fds[0], 0, conn.send_buf.data(), conn.send_buf.len());
+    backend.add_send(fds[0], 0, fill_data, kExpectedSendLen);
+    backend.pause_recv(0, true);
+    if (backend.send_state[0].remaining == 0) {
+        SKIP("socketpair buffered the full payload; send-wait EPOLLOUT preservation not exercised");
+    }
 
     // Check for immediate completion via synthetic pending events (non-blocking).
     // If add_send succeeded fully, pending_count > 0 with the completion.
@@ -801,7 +879,8 @@ TEST(partial_send, real_epollout_completion) {
     if (backend.pending_count > 0) {
         u32 n = backend.wait(events, 16, &conn, 1);
         for (u32 i = 0; i < n; i++) {
-            if (events[i].type == IoEventType::Send && events[i].result == 4096) {
+            if (events[i].type == IoEventType::Send &&
+                events[i].result == static_cast<i32>(kExpectedSendLen)) {
                 got_full_send = true;
             }
         }
@@ -823,7 +902,7 @@ TEST(partial_send, real_epollout_completion) {
             u32 n = backend.wait(events, 16, &conn, 1);
             for (u32 i = 0; i < n; i++) {
                 if (events[i].type == IoEventType::Send) {
-                    CHECK_EQ(events[i].result, 4096);
+                    CHECK_EQ(events[i].result, static_cast<i32>(kExpectedSendLen));
                     got_full_send = true;
                 }
             }
@@ -1007,6 +1086,7 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
     u8 fill_data[4096];
     for (u32 j = 0; j < sizeof(fill_data); j++) fill_data[j] = static_cast<u8>(j & 0xFF);
     conn.send_buf.write(fill_data, sizeof(fill_data));
+    const u32 kExpectedSendLen = conn.send_buf.len();
 
     backend.add_send(fds[0], kConnId, conn.send_buf.data(), conn.send_buf.len());
 
@@ -1016,7 +1096,7 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
         u32 n = backend.wait(events, 16, &conn, 1);
         for (u32 i = 0; i < n; i++) {
             if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
-                events[i].result == 4096) {
+                events[i].result == static_cast<i32>(kExpectedSendLen)) {
                 got_full_send = true;
             }
         }
@@ -1034,7 +1114,7 @@ TEST(partial_send, non_tls_send_completes_with_smaller_conn_table) {
             u32 n = backend.wait(events, 16, &conn, 1);
             for (u32 i = 0; i < n; i++) {
                 if (events[i].type == IoEventType::Send && events[i].conn_id == kConnId &&
-                    events[i].result == 4096) {
+                    events[i].result == static_cast<i32>(kExpectedSendLen)) {
                     got_full_send = true;
                 }
             }
@@ -1062,6 +1142,10 @@ TEST(tls_state_machine, send_retry_matrix) {
 
 TEST(tls_state_machine, send_want_write_readable_wakeup_buffers_recv) {
     run_tls_send_readable_while_waiting_for_write_case(_tc);
+}
+
+TEST(tls_state_machine, send_want_read_preserves_read_interest_when_paused) {
+    run_tls_send_readable_preserves_interest_while_paused_case(_tc);
 }
 
 TEST(tls_state_machine, send_rejects_out_of_range_conn_id) {
@@ -1418,6 +1502,113 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     close(fds[0]);
     close(fds[1]);
     backend.shutdown();
+}
+
+// Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
+// pending, and re-arms once the late cancel CQE arrives after the handler has
+// already asked to keep reading.
+TEST(uring, pause_recv_defers_rearm_until_send_completes) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.pending_ops = 1;
+    conn.recv_armed = true;
+    conn.recv_paused_for_send = false;
+    conn.recv_pause_cancel_pending = false;
+    conn.recv_pause_rearm_pending = false;
+
+    CHECK(loop->pause_recv(conn));
+    CHECK(conn.recv_paused_for_send);
+    CHECK(conn.recv_armed);
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+
+    CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+
+    conn.on_send = &verify_send_pause_cleared;
+    conn.pending_ops = 1;
+    conn.send_armed = true;
+    g_send_pause_cleared = false;
+    loop->dispatch(make_ev(conn.id, IoEventType::Send, 1));
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK(!conn.send_armed);
+    CHECK(!conn.recv_paused_for_send);
+    CHECK(g_send_pause_cleared);
+
+    CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK(conn.recv_armed);
+
+    conn.pending_ops = 1;
+    loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK(!conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_armed);
+    CHECK(!conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK(!conn.recv_paused_for_send);
+
+    loop->shutdown();
+}
+
+// HandlerFn stub that yields on an upstream recv — never invoked by the test
+// below, only used as a non-null pending_handler_fn.
+static u64 upstream_recv_yield_handler(void* /*conn*/,
+                                       rut::jit::HandlerCtx* /*ctx*/,
+                                       const rut::u8* /*req*/,
+                                       rut::u32 /*len*/,
+                                       void* /*arena*/) {
+    return rut::jit::HandlerResult::make_yield(1, rut::jit::YieldKind::UpstreamRecv).pack();
+}
+
+// A non-empty wait(downstream.send()) cancels the io_uring multishot recv. If
+// the handler then yields on an upstream wait (not Recv/Any), the downstream
+// recv must still be (re)armed so client FINs surface during the upstream wait.
+// Here the recv cancel CQE is still in flight (recv_armed +
+// recv_pause_cancel_pending), so handle_jit_outcome's upstream arm must mark
+// recv_pause_rearm_pending for the eventual cancel completion to re-arm on.
+TEST(uring, send_wait_into_upstream_wait_rearms_downstream_recv) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.upstream_fd = 99;  // upstream_target_matches() needs fd >= 0
+    conn.upstream_idx = 0;
+    conn.upstream_recv_armed = true;  // submit_recv_upstream short-circuits true
+    conn.pending_ops = 1;
+    conn.recv_armed = true;
+    conn.recv_pause_cancel_pending = true;
+    conn.recv_pause_rearm_pending = false;
+    conn.recv_paused_for_send = false;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamRecv;
+    outcome.next_state = 1;
+    outcome.timer_ms = 0;  // upstream_target_matches() -> true for upstream_fd
+
+    handle_jit_outcome<IoUringEventLoop>(
+        loop.get(), conn, outcome, &upstream_recv_yield_handler, true);
+
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_yield_kind, jit::YieldKind::UpstreamRecv);
+    CHECK(conn.recv_armed);
+
+    loop->shutdown();
 }
 
 // === Shard lifecycle ===

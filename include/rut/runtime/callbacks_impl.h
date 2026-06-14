@@ -317,6 +317,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         ctx->resume_event_result = 0;
         ctx->route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+        conn.send_buf.reset();
         auto outcome = invoke_jit_handler(route->fn,
                                           static_cast<void*>(&conn),
                                           *ctx,
@@ -386,6 +387,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     ctx->resume_event_result = 0;
     ctx->route_param_count = route_param_count;
     for (u32 i = 0; i < route_param_count; i++) ctx->route_params[i] = route_params[i];
+    conn.send_buf.reset();
     auto outcome = invoke_jit_handler(route->fn,
                                       static_cast<void*>(&conn),
                                       *ctx,
@@ -434,6 +436,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.clear_slots();
 
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
+    conn.send_buf.reset();
     loop->epoch_leave();
 
     if (conn.upstream_fd >= 0) {
@@ -458,6 +461,48 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.recv_buf.reset();
     conn.transition_to_reading_header(&on_header_received<Loop>);
     loop->submit_recv(conn);
+}
+
+template <typename Loop>
+void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const u32 kSendLen = conn.send_buf.len();
+    const u32 kResult = ev.result < 0 ? 0u : static_cast<u32>(ev.result);
+
+    if (ev.result < 0) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.send_progress > kSendLen) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (kResult > (kSendLen - conn.send_progress)) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress += kResult;
+
+    if (conn.send_progress < kSendLen) {
+        if (kResult == 0u) {
+            loop->close_conn(conn);
+            return;
+        }
+
+        const u32 kRemaining = kSendLen - conn.send_progress;
+        conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining);
+        return;
+    }
+
+    conn.send_progress = 0;
+    conn.send_buf.reset();
+    conn.transition_to_exec_handler_wait();
+    conn.recv_paused_for_send = false;
+    conn.resume_event_kind = jit::YieldKind::Send;
+    conn.resume_event_result = static_cast<i32>(kSendLen);
+    resume_jit_handler<Loop>(loop, conn);
 }
 
 template <typename Loop>
@@ -604,7 +649,38 @@ void handle_jit_outcome(Loop* loop,
                 }
             }
             if (outcome.yield_kind == jit::YieldKind::Send) {
-                send_internal_error();
+                if (conn.send_buf.len() == 0) {
+                    conn.transition_to_exec_handler_wait();
+                    conn.resume_event_kind = jit::YieldKind::Send;
+                    conn.resume_event_result = 0;
+                    resume_jit_handler<Loop>(loop, conn);
+                    return;
+                }
+                conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
+                if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+                    // The send couldn't be queued (io_uring add_send returns
+                    // false under SQ pressure), so no Send completion will ever
+                    // arrive to call on_jit_wait_send_sent and resume the
+                    // handler. Fail closed like the other event-yield arms whose
+                    // submit_* couldn't be started, rather than leaving
+                    // pending_handler_fn parked until keepalive.
+                    send_internal_error();
+                    return;
+                }
+                if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+                    if (!loop->pause_recv(conn)) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                } else if constexpr (requires(Loop* lp, u32 conn_id) {
+                                         lp->backend.pause_recv(conn_id, true);
+                                     }) {
+                    loop->backend.pause_recv(conn.id, true);
+                } else if constexpr (requires(Loop* lp, u32 conn_id) {
+                                         lp->backend.pause_recv(conn_id);
+                                     }) {
+                    loop->backend.pause_recv(conn.id);
+                }
                 return;
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
                        outcome.timer_ms != 0) {
@@ -695,6 +771,11 @@ void handle_jit_outcome(Loop* loop,
             };
             if ((outcome.yield_kind == jit::YieldKind::Any ||
                  outcome.yield_kind == jit::YieldKind::Recv) &&
+                conn.recv_pause_cancel_pending) {
+                conn.recv_pause_rearm_pending = true;
+            }
+            if ((outcome.yield_kind == jit::YieldKind::Any ||
+                 outcome.yield_kind == jit::YieldKind::Recv) &&
                 conn.fd >= 0 && !conn.recv_armed) {
                 if (!loop->submit_recv(conn)) {
                     if (conn.yield_armed) {
@@ -703,6 +784,27 @@ void handle_jit_outcome(Loop* loop,
                     }
                     send_internal_error();
                     return;
+                }
+            }
+            // io_uring keeps the multishot downstream recv armed across upstream
+            // waits so client FINs / pipelined bytes still surface a Recv CQE
+            // (handled by the mid-yield dispatch branch). A preceding non-empty
+            // wait(downstream.send()) cancels that recv via pause_recv; calling
+            // submit_recv here re-arms it when the cancel has already drained,
+            // or marks recv_pause_rearm_pending so the in-flight cancel
+            // completion re-arms — covering both Send/cancel CQE orderings. It
+            // is a no-op when recv is still armed (the normal upstream-wait
+            // case). Gated to the io_uring loop via the pause_recv(conn)
+            // member; epoll deliberately masks EPOLLIN for these waits above.
+            if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+                const bool kWaitsUpstream = outcome.yield_kind == jit::YieldKind::UpstreamConnect ||
+                                            outcome.yield_kind == jit::YieldKind::UpstreamRecv ||
+                                            outcome.yield_kind == jit::YieldKind::UpstreamSend;
+                if (kWaitsUpstream && conn.fd >= 0 && !conn.recv_paused_for_send) {
+                    // Best-effort: under SQ pressure the upstream op or
+                    // keepalive still bounds the wait, so a missed FIN detector
+                    // must not fail the in-flight upstream request.
+                    (void)loop->submit_recv(conn);
                 }
             }
             return;
