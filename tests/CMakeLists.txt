@@ -122,6 +122,17 @@ target_include_directories(test_hpack PRIVATE
 add_test(NAME test_hpack COMMAND test_hpack)
 set_tests_properties(test_hpack PROPERTIES LABELS "unit")
 
+# Differential HPACK test against the vendored nghttp2 reference.
+add_executable(test_hpack_diff test_hpack_diff.cc)
+target_link_libraries(test_hpack_diff rut_runtime nghttp2_ref)
+target_include_directories(test_hpack_diff PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME test_hpack_diff COMMAND test_hpack_diff)
+set_tests_properties(test_hpack_diff PROPERTIES LABELS "unit")
+
 add_executable(test_http2_conn test_http2_conn.cc)
 target_link_libraries(test_http2_conn rut_runtime)
 target_include_directories(test_http2_conn PRIVATE
@@ -367,6 +378,7 @@ if(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_http_parser>
         COMMAND $<TARGET_FILE:test_http2>
         COMMAND $<TARGET_FILE:test_hpack>
+        COMMAND $<TARGET_FILE:test_hpack_diff>
         COMMAND $<TARGET_FILE:test_http2_conn>
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_types>
@@ -388,7 +400,7 @@ if(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_route_trie>
         COMMAND $<TARGET_FILE:test_route_art>
         COMMAND $<TARGET_FILE:test_route_select>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_http2_conn test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
         COMMENT "Running all tests..."
     )
 else()
@@ -401,6 +413,7 @@ else()
         COMMAND $<TARGET_FILE:test_http_parser>
         COMMAND $<TARGET_FILE:test_http2>
         COMMAND $<TARGET_FILE:test_hpack>
+        COMMAND $<TARGET_FILE:test_hpack_diff>
         COMMAND $<TARGET_FILE:test_http2_conn>
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_types>
@@ -419,7 +432,7 @@ else()
         COMMAND $<TARGET_FILE:test_route_trie>
         COMMAND $<TARGET_FILE:test_route_art>
         COMMAND $<TARGET_FILE:test_route_select>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_http2_conn test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_route_trie test_route_art test_route_select
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_route_trie test_route_art test_route_select
         COMMENT "Running non-JIT tests..."
     )
 endif()

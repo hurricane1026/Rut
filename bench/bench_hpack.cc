@@ -12,6 +12,10 @@
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 
+extern "C" {
+#include <nghttp2/nghttp2.h>  // NGHTTP2_STATICLIB comes from the nghttp2_ref target
+}
+
 using namespace rut;
 
 namespace {
@@ -130,7 +134,7 @@ int main() {
         b.bytes_per_op(req_block_len);
         b.print_header();
 
-        b.run("decode_header_block", [&] {
+        b.run("rut decode_header_block", [&] {
             hpack::DynamicTable dyn;
             dyn.init(4096);
             u8 scratch[4096];
@@ -141,6 +145,28 @@ int main() {
             bench::do_not_optimize(&ok);
             bench::do_not_optimize(&nh);
         });
+
+        // nghttp2 baseline: reuse one inflater, reset per block via end_headers.
+        nghttp2_hd_inflater* inf = nullptr;
+        nghttp2_hd_inflate_new(&inf);
+        b.run("nghttp2 inflate", [&] {
+            const u8* in = req_block;
+            size_t inlen = req_block_len;
+            for (;;) {
+                nghttp2_nv nv;
+                int flags = 0;
+                ssize_t rv = nghttp2_hd_inflate_hd2(inf, &nv, &flags, in, inlen, 1);
+                if (rv < 0) break;
+                in += rv;
+                inlen -= static_cast<size_t>(rv);
+                bench::do_not_optimize(&nv);
+                if (flags & NGHTTP2_HD_INFLATE_FINAL) break;
+                if (rv == 0 && inlen == 0) break;
+            }
+            nghttp2_hd_inflate_end_headers(inf);
+        });
+        nghttp2_hd_inflate_del(inf);
+        b.compare();
         bench::out("  (block encodes to ");
         bench::out_u64(req_block_len);
         bench::out(" bytes; ");

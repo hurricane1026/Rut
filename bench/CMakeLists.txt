@@ -29,9 +29,10 @@ target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 
-# HTTP/2 HPACK + framing hot paths.
+# HTTP/2 HPACK + framing hot paths. Links the vendored nghttp2 reference for a
+# decode baseline (rut vs nghttp2), mirroring bench_http_parser vs llhttp.
 add_executable(bench_hpack bench_hpack.cc)
-target_link_libraries(bench_hpack rut_runtime)
+target_link_libraries(bench_hpack rut_runtime nghttp2_ref)
 target_include_directories(bench_hpack PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
