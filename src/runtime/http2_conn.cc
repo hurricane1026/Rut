@@ -102,6 +102,99 @@ u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_s
 
 namespace {
 
+bool h2_str_eq(Str a, const char* b) {
+    u32 bl = 0;
+    while (b[bl]) bl++;
+    if (a.len != bl) return false;
+    for (u32 i = 0; i < bl; i++)
+        if (a.ptr[i] != b[i]) return false;
+    return true;
+}
+
+HttpMethod h2_method_from_str(Str m) {
+    if (h2_str_eq(m, "GET")) return HttpMethod::GET;
+    if (h2_str_eq(m, "POST")) return HttpMethod::POST;
+    if (h2_str_eq(m, "PUT")) return HttpMethod::PUT;
+    if (h2_str_eq(m, "DELETE")) return HttpMethod::DELETE;
+    if (h2_str_eq(m, "PATCH")) return HttpMethod::PATCH;
+    if (h2_str_eq(m, "HEAD")) return HttpMethod::HEAD;
+    if (h2_str_eq(m, "OPTIONS")) return HttpMethod::OPTIONS;
+    if (h2_str_eq(m, "CONNECT")) return HttpMethod::CONNECT;
+    if (h2_str_eq(m, "TRACE")) return HttpMethod::TRACE;
+    return HttpMethod::Unknown;
+}
+
+// Canonicalize a request path the way the HTTP/1 parser does: strip one leading
+// '/' and any trailing '/' run, exclude query (?) and fragment (#).
+Str h2_canon_path(Str path) {
+    const char* p = path.ptr;
+    u32 end = 0;
+    while (end < path.len && p[end] != '?' && p[end] != '#') end++;
+    u32 start = 0;
+    if (start < end && p[start] == '/') start++;
+    while (end > start && p[end - 1] == '/') end--;
+    return {p + start, end - start};
+}
+
+bool h2_value_to_u32(Str v, u32* out) {
+    if (v.len == 0 || v.len > 9) return false;
+    u32 acc = 0;
+    for (u32 i = 0; i < v.len; i++) {
+        if (v.ptr[i] < '0' || v.ptr[i] > '9') return false;
+        acc = acc * 10 + static_cast<u32>(v.ptr[i] - '0');
+    }
+    *out = acc;
+    return true;
+}
+
+}  // namespace
+
+bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
+    req->reset();
+    req->version = HttpVersion::Http11;  // h2 maps to HTTP/1.1 semantics
+    req->keep_alive = true;              // h2 connections persist
+
+    bool have_method = false;
+    bool have_path = false;
+    for (u32 i = 0; i < n; i++) {
+        const Str kName = hs[i].name;
+        const Str kValue = hs[i].value;
+        if (kName.len > 0 && kName.ptr[0] == ':') {
+            // Pseudo-header.
+            if (h2_str_eq(kName, ":method")) {
+                if (have_method) return false;  // duplicate
+                req->method = h2_method_from_str(kValue);
+                if (req->method == HttpMethod::Unknown) return false;
+                have_method = true;
+            } else if (h2_str_eq(kName, ":path")) {
+                if (have_path) return false;
+                if (kValue.len == 0) return false;
+                req->path = kValue;
+                req->path_canon = h2_canon_path(kValue);
+                have_path = true;
+            } else if (h2_str_eq(kName, ":authority")) {
+                if (req->header_count >= kMaxHeaders) return false;
+                req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+            }
+            // :scheme and any other pseudo-header are dropped.
+            continue;
+        }
+        // Regular header.
+        if (req->header_count >= kMaxHeaders) return false;
+        req->headers[req->header_count++] = {kName, kValue};
+        if (h2_str_eq(kName, "content-length")) {
+            u32 cl = 0;
+            if (h2_value_to_u32(kValue, &cl)) {
+                req->content_length = cl;
+                req->has_content_length = true;
+            }
+        }
+    }
+    return have_method && have_path;
+}
+
+namespace {
+
 // Append-and-bounds helper bound to one process() call.
 struct OutWriter {
     u8* out;

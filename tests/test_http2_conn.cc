@@ -380,6 +380,80 @@ TEST(http2_conn, response_writers_roundtrip) {
     CHECK((h.flags & http2_flag::kEndStream) != 0);
 }
 
+// === Request bridge: h2 headers -> ParsedRequest ===
+
+namespace {
+bool req_has_header(const ParsedRequest& r, const char* name, const char* value) {
+    u32 nl = 0;
+    while (name[nl]) nl++;
+    u32 vl = 0;
+    while (value[vl]) vl++;
+    for (u32 i = 0; i < r.header_count; i++) {
+        if (r.headers[i].name.eq(Str{name, nl}) && r.headers[i].value.eq(Str{value, vl}))
+            return true;
+    }
+    return false;
+}
+}  // namespace
+
+TEST(h2_request, basic_get_maps_method_path_authority) {
+    hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":authority", 10}, {"example.com", 11}},
+        {{":path", 5}, {"/", 1}},
+        {{"accept", 6}, {"*/*", 3}},
+    };
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 5, &req));
+    CHECK(req.method == HttpMethod::GET);
+    CHECK(req.version == HttpVersion::Http11);
+    CHECK(req.keep_alive);
+    CHECK(req.path.eq(Str{"/", 1}));
+    CHECK_EQ(req.path_canon.len, 0u);  // "/" canonicalizes to empty, non-null
+    CHECK(req.path_canon.ptr != nullptr);
+    // :authority became a host header; :scheme dropped; accept kept.
+    CHECK(req_has_header(req, "host", "example.com"));
+    CHECK(req_has_header(req, "accept", "*/*"));
+}
+
+TEST(h2_request, canon_strips_query_and_trailing_slash) {
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/api/users/?id=1", 16}}};
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 2, &req));
+    CHECK(req.path_canon.eq(Str{"api/users", 9}));
+}
+
+TEST(h2_request, content_length_parsed) {
+    hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"42", 2}},
+    };
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 3, &req));
+    CHECK(req.method == HttpMethod::POST);
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length, 42u);
+}
+
+TEST(h2_request, missing_method_or_path_fails) {
+    hpack::Header no_method[] = {{{":path", 5}, {"/", 1}}};
+    ParsedRequest req;
+    CHECK_FALSE(h2_headers_to_request(no_method, 1, &req));
+    hpack::Header no_path[] = {{{":method", 7}, {"GET", 3}}};
+    CHECK_FALSE(h2_headers_to_request(no_path, 1, &req));
+}
+
+TEST(h2_request, unknown_method_and_duplicates_fail) {
+    hpack::Header bad_method[] = {{{":method", 7}, {"FROBNICATE", 10}}, {{":path", 5}, {"/", 1}}};
+    ParsedRequest req;
+    CHECK_FALSE(h2_headers_to_request(bad_method, 2, &req));
+    hpack::Header dup[] = {
+        {{":method", 7}, {"GET", 3}}, {{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/", 1}}};
+    CHECK_FALSE(h2_headers_to_request(dup, 3, &req));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

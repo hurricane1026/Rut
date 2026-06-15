@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
+#include "rut/runtime/http_parser.h"
 
 // HTTP/2 connection engine (RFC 7540): drives the client preface, the SETTINGS
 // handshake, the frame loop, per-stream HEADERS/CONTINUATION assembly (HPACK
@@ -104,5 +105,19 @@ u32 http2_write_headers(
 // Write a DATA frame for data[0..len) on stream_id into out (must hold
 // kFrameHeaderSize + len). Returns octets written.
 u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream);
+
+// --- Request bridge ---
+
+// Map a decoded HTTP/2 header list into the ParsedRequest the existing routing
+// and JIT handlers consume (handlers read ParsedRequest via the parse-once
+// cache, so no codegen change is needed for h2). Pseudo-headers :method and
+// :path are required; :authority is rewritten to a synthesized "host" header;
+// :scheme is dropped; other fields are copied. path_canon is computed the same
+// way the HTTP/1 parser does (leading '/' and trailing '/' run stripped, query
+// and fragment excluded). req's Str fields point into the source header bytes,
+// except the synthesized host name which points at static storage. Returns false
+// on a malformed request (missing/duplicate :method or :path, unknown method,
+// or more headers than ParsedRequest holds).
+bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req);
 
 }  // namespace rut
