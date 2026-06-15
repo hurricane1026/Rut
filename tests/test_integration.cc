@@ -4752,6 +4752,101 @@ TEST(proxy_e2e, malformed_upstream_responses_fail_closed) {
     }
 }
 
+// A dead reserved endpoint: bind (but do NOT listen) on 127.0.0.1:0 so a
+// connect() gets ECONNREFUSED, and hold the fd open so the port isn't reused.
+struct DeadEndpoint {
+    i32 fd = -1;
+    u16 port = 0;
+    bool reserve() {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        struct sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = __builtin_bswap32(0x7F000001u);
+        a.sin_port = 0;
+        if (bind(fd, reinterpret_cast<struct sockaddr*>(&a), sizeof(a)) != 0) return false;
+        struct sockaddr_in got{};
+        socklen_t gl = sizeof(got);
+        if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&got), &gl) != 0) return false;
+        port = __builtin_bswap16(got.sin_port);
+        return true;  // no listen() → connect gets ECONNREFUSED
+    }
+    ~DeadEndpoint() {
+        if (fd >= 0) close(fd);
+    }
+};
+
+// Drive one proxied GET /api through the gateway and collect the response head.
+static u32 proxy_get_api(u16 port, char* buf, u32 cap) {
+    i32 client = connect_to(port);
+    if (client < 0) return 0;
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    if (!send_all(client, kReq, sizeof(kReq) - 1)) {
+        close(client);
+        return 0;
+    }
+    u32 total = 0;
+    while (total < cap) {
+        i32 n = recv_timeout(client, buf + total, cap - total, 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+    }
+    close(client);
+    return total;
+}
+
+// A connect to the first (dead) backend fails; the gateway retries the next
+// backend, which is live → the client gets 200, not 502. Robust to which
+// backend round-robin happens to try first (the live one always answers).
+TEST(proxy_e2e, retries_failed_connect_to_next_backend) {
+    using namespace rut;
+    static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    ScriptedUpstreamServer live;
+    REQUIRE(live.setup(kResp, sizeof(kResp) - 1));
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("pool", 0x7F000001, dead.port);  // backend 0: dead
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_upstream_backend(id.value(), 0x7F000001, live.port));  // backend 1: live
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 500));
+
+    char buf[1024];
+    const u32 total = proxy_get_api(proxy.port, buf, sizeof(buf));
+    CHECK(total > 0);
+    CHECK(buf_contains(buf, total, "200", 3));
+}
+
+// Every backend is unreachable → the retry budget is exhausted and the client
+// gets 502 (not a hang).
+TEST(proxy_e2e, all_backends_unreachable_502) {
+    using namespace rut;
+    DeadEndpoint d1, d2;
+    REQUIRE(d1.reserve());
+    REQUIRE(d2.reserve());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("pool", 0x7F000001, d1.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_upstream_backend(id.value(), 0x7F000001, d2.port));
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 500));
+
+    char buf[1024];
+    const u32 total = proxy_get_api(proxy.port, buf, sizeof(buf));
+    CHECK(total > 0);
+    CHECK(buf_contains(buf, total, "502", 3));
+}
+
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
 // body was registered). Runtime must fall back to the default status-
 // reason body rather than rendering garbage or hanging.
