@@ -406,6 +406,10 @@ jobs:
           LLVM_PROFILE_FILE=build/test_route_trie.profraw ./build/tests/test_route_trie
           LLVM_PROFILE_FILE=build/test_route_art.profraw ./build/tests/test_route_art
           LLVM_PROFILE_FILE=build/test_route_select.profraw ./build/tests/test_route_select
+          LLVM_PROFILE_FILE=build/test_http2.profraw ./build/tests/test_http2
+          LLVM_PROFILE_FILE=build/test_hpack.profraw ./build/tests/test_hpack
+          LLVM_PROFILE_FILE=build/test_hpack_diff.profraw ./build/tests/test_hpack_diff
+          LLVM_PROFILE_FILE=build/test_http2_conn.profraw ./build/tests/test_http2_conn
 
       - name: Generate coverage report
         run: |
@@ -440,6 +444,10 @@ jobs:
             build/tests/test_integration \
             build/tests/test_arena \
             build/tests/test_http_parser \
+            build/tests/test_http2 \
+            build/tests/test_hpack \
+            build/tests/test_hpack_diff \
+            build/tests/test_http2_conn \
             build/tests/test_expected \
             build/tests/test_drain \
             build/tests/test_access_log \
