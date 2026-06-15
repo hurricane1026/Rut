@@ -13,12 +13,20 @@
 namespace rut {
 
 struct RouteConfig;  // forward for per-request config pin below
+struct Http2Conn;    // forward: per-connection HTTP/2 engine, pool-allocated
 
 enum class BodyMode : u8 {
     None,           // No body
     ContentLength,  // Known size via Content-Length
     Chunked,        // Transfer-Encoding: chunked
     UntilClose,     // Read until EOF (HTTP/1.0)
+};
+
+// Active wire protocol on a connection, fixed after the TLS handshake from the
+// ALPN result (plaintext connections stay Http11). Drives parse/serialize path.
+enum class ConnProtocol : u8 {
+    Http11,
+    Http2,
 };
 
 enum class ConnState : u8 {
@@ -165,6 +173,13 @@ struct ConnectionBase {
     bool keep_alive;
     bool tls_active;
     bool tls_handshake_complete;
+    // Active wire protocol. Defaults to Http11; set from the ALPN result once
+    // the TLS handshake completes, or on detecting the cleartext h2c preface.
+    ConnProtocol protocol;
+    // Per-connection HTTP/2 engine, lazily allocated from a per-shard pool when
+    // the connection switches to Http2; returned to the pool on close. Null for
+    // HTTP/1 connections (they pay nothing).
+    Http2Conn* h2;
     SSL* tls;
 
     // HTTP pipelining state
@@ -298,6 +313,8 @@ struct ConnectionBase {
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;
+        protocol = ConnProtocol::Http11;
+        h2 = nullptr;  // pool slot is released by free_conn_impl, not reset()
         tls = nullptr;
         pipeline_depth = 0;
         pipeline_stash_len = 0;

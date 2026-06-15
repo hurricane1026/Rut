@@ -9,11 +9,13 @@
 #include "rut/runtime/epoll_backend.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
+#include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls.h"
@@ -167,6 +169,10 @@ public:
     static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     SlicePool pool;
+    // Per-shard HTTP/2 engine pool — lazily handed out when a connection
+    // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
+    static constexpr u32 kH2PoolCap = 2048;
+    SlabPool<Http2Conn, kH2PoolCap> h2_pool;
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top;
@@ -235,8 +241,14 @@ public:
         }
         // 3 slices max per connection: recv + send + upstream_recv (lazy).
         TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
+        auto h2p = h2_pool.init();
+        if (!h2p) {
+            pool.destroy();
+            return core::make_unexpected(h2p.error());
+        }
         auto be = backend.init(id, lfd);
         if (!be) {
+            h2_pool.destroy();
             pool.destroy();
             return core::make_unexpected(be.error());
         }
@@ -298,6 +310,7 @@ public:
 
     void shutdown() {
         backend.shutdown();
+        h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
             munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
@@ -360,6 +373,14 @@ public:
         return &conns[id];
     }
 
+    bool alloc_h2_impl(Connection& c) {
+        if (c.h2) return true;  // already attached
+        Http2Conn* h = h2_pool.alloc();
+        if (!h) return false;
+        c.h2 = h;
+        return true;
+    }
+
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
@@ -367,6 +388,7 @@ public:
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);
         if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+        if (c.h2) h2_pool.free(c.h2);
         c.reset();
         free_stack[free_top++] = cid;
     }

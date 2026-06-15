@@ -11,6 +11,9 @@
 #endif
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
+#include "rut/runtime/hpack.h"
+#include "rut/runtime/http2_conn.h"
+#include "rut/runtime/http2_frame.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
@@ -115,11 +118,19 @@ i32 scripted_ssl_get_error(SSL* /*ssl*/, i32 /*rc*/) {
     return g_scripted_tls->last_error;
 }
 
+// Scripted handshakes use a fake SSL*; never inspect real ALPN state.
+AlpnProtocol scripted_alpn_negotiated(SSL* /*ssl*/) {
+    return AlpnProtocol::None;
+}
+
 struct ScopedTlsHooks {
     explicit ScopedTlsHooks(ScriptedTlsState& state) {
         g_scripted_tls = &state;
-        hooks_ = {
-            scripted_ssl_accept, scripted_ssl_read, scripted_ssl_write, scripted_ssl_get_error};
+        hooks_ = {scripted_ssl_accept,
+                  scripted_ssl_read,
+                  scripted_ssl_write,
+                  scripted_ssl_get_error,
+                  scripted_alpn_negotiated};
         set_epoll_tls_hooks_for_test(&hooks_);
     }
 
@@ -1717,6 +1728,595 @@ TEST(shard, serves_https_requests) {
 TEST(tls, rejects_invalid_private_key_file) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
     CHECK(!tls_ctx.has_value());
+}
+
+// === HTTP/2 end-to-end (cleartext h2c over the real epoll serving path) ===
+
+namespace {
+bool write_all_fd(i32 fd, const u8* data, u32 len) {
+    u32 sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, data + sent, len - sent);
+        if (n <= 0) return false;
+        sent += static_cast<u32>(n);
+    }
+    return true;
+}
+
+// Scan h2 frames for a HEADERS frame on `stream_id`, HPACK-decode it, and
+// return its :status (0 if not found / not yet fully received).
+u16 h2_status_for_stream(const u8* buf, u32 len, u32 stream_id) {
+    u32 pos = 0;
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == stream_id) {
+            hpack::Header hs[32];
+            u8 scratch[4096];
+            u32 nh = 0;
+            if (hpack::decode_header_block(dyn,
+                                           buf + pos + kFrameHeaderSize,
+                                           h.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           hs,
+                                           32,
+                                           &nh)) {
+                for (u32 i = 0; i < nh; i++) {
+                    if (hs[i].name.eq(Str{":status", 7})) {
+                        u16 s = 0;
+                        for (u32 j = 0; j < hs[i].value.len; j++)
+                            s = static_cast<u16>(s * 10 + (hs[i].value.ptr[j] - '0'));
+                        return s;
+                    }
+                }
+            }
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return 0;
+}
+
+u16 h2_response_status(const u8* buf, u32 len) {
+    return h2_status_for_stream(buf, len, 1);
+}
+
+// Does the HEADERS frame for `stream_id` carry header (name, value)?
+bool h2_response_has_header(
+    const u8* buf, u32 len, u32 stream_id, const char* name, const char* value) {
+    u32 nl = 0;
+    while (name[nl]) nl++;
+    u32 vl = 0;
+    while (value[vl]) vl++;
+    u32 pos = 0;
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == stream_id) {
+            hpack::Header hs[32];
+            u8 scratch[4096];
+            u32 nh = 0;
+            if (hpack::decode_header_block(dyn,
+                                           buf + pos + kFrameHeaderSize,
+                                           h.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           hs,
+                                           32,
+                                           &nh)) {
+                for (u32 i = 0; i < nh; i++)
+                    if (hs[i].name.eq(Str{name, nl}) && hs[i].value.eq(Str{value, vl})) return true;
+            }
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return false;
+}
+
+// Concatenate DATA-frame payloads for `stream_id` into out; return total length.
+u32 h2_body_for_stream(const u8* buf, u32 len, u32 stream_id, u8* out, u32 cap) {
+    u32 pos = 0;
+    u32 blen = 0;
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Data) && h.stream_id == stream_id) {
+            for (u32 i = 0; i < h.length && blen < cap; i++)
+                out[blen++] = buf[pos + kFrameHeaderSize + i];
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return blen;
+}
+
+// Write preface + an empty client SETTINGS into out; return bytes written.
+u32 h2_client_prologue(u8* out) {
+    u32 n = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) out[n++] = kClientPreface[i];
+    Http2Settings cs;
+    cs.set_defaults();
+    n += write_settings_frame(out + n, cs);
+    return n;
+}
+
+// Append a GET request HEADERS frame for `path` on `stream_id` (END_STREAM).
+u32 h2_client_get(u8* out, u32 cap, u32 stream_id, const char* path, u32 path_len) {
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {path, path_len}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    return http2_write_headers(out, cap, stream_id, hs, 4, /*end_stream=*/true);
+}
+}  // namespace
+
+TEST(shard, serves_http2_cleartext) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Client: connection preface + empty SETTINGS + a GET / HEADERS (END_STREAM).
+    u8 out[512];
+    u32 n = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) out[n++] = kClientPreface[i];
+    Http2Settings cs;
+    cs.set_defaults();
+    n += write_settings_frame(out + n, cs);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/", 1}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    // Server replies with its SETTINGS, a SETTINGS ACK, and the :status response.
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 5 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_response_status(resp, total) != 0) break;
+    }
+    // No RouteConfig attached → route-less fallback answers 200 (matches HTTP/1).
+    CHECK_EQ(h2_response_status(resp, total), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+namespace {
+// Probe whether io_uring async socket ops actually complete in this
+// environment. A raw io_uring NOP can succeed while accept/recv/send never
+// complete (some sandboxes intercept socket syscalls but not io_uring's async
+// submissions). HTTP/1 doesn't depend on the h2 code, so a missing response
+// here means io_uring sockets are unavailable — not an h2 bug. Used to skip the
+// io_uring serving test where it can't run while still exercising it on CI.
+bool iouring_socket_live() {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    if (lfd < 0) return false;
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        return false;
+    }
+    u16 port = get_port(lfd);
+    if (!shard.spawn(-1).has_value()) {
+        shard.shutdown();
+        close(lfd);
+        return false;
+    }
+    usleep(50000);
+    bool live = false;
+    i32 c = connect_to(port);
+    if (c >= 0) {
+        set_socket_timeouts(c, 1);
+        if (send_all(c, HTTP_REQ, HTTP_REQ_LEN)) {
+            char buf[1024];
+            live = recv_timeout(c, buf, sizeof(buf), 1000) > 0;
+        }
+        close(c);
+    }
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    return live;
+}
+}  // namespace
+
+// HTTP/2 over io_uring uses the identical callbacks_h2.h serving path as epoll;
+// only the I/O submission differs. Skipped where io_uring async socket ops don't
+// complete (some sandboxes), exercised on real Linux/CI.
+TEST(shard, serves_http2_cleartext_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/", 1);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_response_status(resp, total) != 0) break;
+    }
+    CHECK_EQ(h2_response_status(resp, total), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_routed) {
+    // A real RouteConfig: /health is a static 204; an unmatched path falls
+    // through to the default 200.
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 204);
+    cfg.add_upstream("api", 0x7F000001, 8080);
+    cfg.add_proxy("/api/", 0, 0);
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/health", 7);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/nope", 5);
+    n += h2_client_get(out + n, sizeof(out) - n, 5, "/api/x", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 5) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);  // matched static route
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);  // default fallback
+    CHECK_EQ(h2_status_for_stream(resp, total, 5), 503u);  // proxy over h2 not yet supported
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_concurrent_streams) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Three interleaved streams in a single batch.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/", 1);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/", 1);
+    n += h2_client_get(out + n, sizeof(out) - n, 5, "/", 1);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 5) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);
+    CHECK_EQ(h2_status_for_stream(resp, total, 5), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_sequential_requests) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // First request (with the prologue).
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/", 1);
+    REQUIRE(write_all_fd(c, out, n));
+    u8 resp[4096];
+    u32 total = 0;
+    for (int a = 0; a < 6 && total < sizeof(resp); a++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    // Second request on the same connection (new stream id, no prologue).
+    u8 out2[256];
+    u32 n2 = h2_client_get(out2, sizeof(out2), 3, "/", 1);
+    REQUIRE(write_all_fd(c, out2, n2));
+    u8 resp2[4096];
+    u32 total2 = 0;
+    for (int a = 0; a < 6 && total2 < sizeof(resp2); a++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp2 + total2), sizeof(resp2) - total2, 2000);
+        if (got <= 0) break;
+        total2 += static_cast<u32>(got);
+        if (h2_status_for_stream(resp2, total2, 3) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp2, total2, 3), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, rejects_malformed_http2_request) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // HEADERS with no :method pseudo-header — h2_headers_to_request rejects it.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header bad[] = {{{":path", 5}, {"/", 1}}, {{":scheme", 7}, {"http", 4}}};
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, bad, 2, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int a = 0; a < 6 && total < sizeof(resp); a++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 400u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_over_tls_alpn) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, /*offer_h2=*/true);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    const u8 alpn[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    SSL_CTX_set_alpn_protos(client_ctx, alpn, sizeof(alpn));
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+    // ALPN must have selected h2.
+    CHECK(tls_negotiated_protocol(ssl) == AlpnProtocol::H2);
+
+    // Send the h2 client preface + SETTINGS + a GET / over TLS.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/", 1);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(out), n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int a = 0; a < 6 && total < sizeof(resp); a++) {
+        i32 got = SSL_read(ssl, resp + total, static_cast<i32>(sizeof(resp) - total));
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// === ALPN selection (pure logic, no crypto) ===
+
+TEST(alpn, picks_h2_when_offered_and_requested) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(alpn_pick(true, client, sizeof(client)) == AlpnProtocol::H2);
+}
+
+TEST(alpn, downgrades_to_http11_when_h2_not_offered) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(alpn_pick(false, client, sizeof(client)) == AlpnProtocol::Http11);
+}
+
+TEST(alpn, picks_http11_when_client_only_offers_http11) {
+    const u8 client[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(alpn_pick(true, client, sizeof(client)) == AlpnProtocol::Http11);
+}
+
+TEST(alpn, no_overlap_returns_none) {
+    // Client offers only h2 but server doesn't advertise it.
+    const u8 client[] = {2, 'h', '2'};
+    CHECK(alpn_pick(false, client, sizeof(client)) == AlpnProtocol::None);
+    // Unknown protocol with no http/1.1 fallback.
+    const u8 spdy[] = {6, 's', 'p', 'd', 'y', '/', '3'};
+    CHECK(alpn_pick(true, spdy, sizeof(spdy)) == AlpnProtocol::None);
+}
+
+TEST(alpn, empty_or_null_client_list_returns_none) {
+    CHECK(alpn_pick(true, nullptr, 0) == AlpnProtocol::None);
+    const u8 empty[] = {0};
+    CHECK(alpn_pick(true, empty, 0) == AlpnProtocol::None);
+}
+
+TEST(alpn, truncated_entry_does_not_overrun) {
+    // Length prefix claims 8 bytes but only 3 remain — must stop, not read OOB.
+    const u8 client[] = {8, 'h', 't', 't'};
+    CHECK(alpn_pick(true, client, sizeof(client)) == AlpnProtocol::None);
+}
+
+// === ALPN negotiation end-to-end over a real loopback TLS handshake ===
+
+namespace {
+// Run one real handshake: a shard with `server_offer_h2` against a client
+// advertising `client_protos`. Returns the protocol the client observes the
+// server selected (the same value the server stores on conn.protocol).
+AlpnProtocol negotiate_alpn(bool server_offer_h2, const u8* client_protos, u32 client_len) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, server_offer_h2);
+    if (!tls_ctx.has_value()) return AlpnProtocol::None;
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    if (lfd < 0) {
+        destroy_tls_server_context(tls_ctx.value());
+        return AlpnProtocol::None;
+    }
+    u16 port = get_port(lfd);
+    shard.init(0, lfd);
+    shard.loop->tls_server = tls_ctx.value();
+    shard.spawn(-1);
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    SSL_CTX_set_alpn_protos(client_ctx, client_protos, client_len);
+
+    i32 c = connect_to(port);
+    set_socket_timeouts(c, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    SSL_set_fd(ssl, c);
+
+    AlpnProtocol result = AlpnProtocol::None;
+    if (SSL_connect(ssl) == 1) {
+        // Client and server observe the same negotiated protocol.
+        result = tls_negotiated_protocol(ssl);
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+    return result;
+}
+}  // namespace
+
+TEST(shard, negotiates_h2_via_alpn) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(negotiate_alpn(/*server_offer_h2=*/true, client, sizeof(client)) == AlpnProtocol::H2);
+}
+
+TEST(shard, downgrades_h2_client_when_server_offers_only_http11) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(negotiate_alpn(/*server_offer_h2=*/false, client, sizeof(client)) ==
+          AlpnProtocol::Http11);
 }
 
 TEST(shard, serves_https_keepalive_requests) {
@@ -3766,6 +4366,62 @@ static u64 return_200_with_body_1_handler(void* /*conn*/,
 // End-to-end: handler returns ReturnStatus with body_idx=1;
 // RouteConfig has a body pre-registered; runtime formats response
 // with the body bytes + matching Content-Length + default Content-Type.
+// HTTP/2: a JIT handler returning a status + body, served over h2c. Exercises
+// the native h2 dispatch → request synthesis → handler invoke → HEADERS+DATA.
+TEST(shard, serves_http2_jit_handler_with_body) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char kBody[] = "Hello, world";
+    REQUIRE_EQ(cfg.add_response_body(kBody, sizeof(kBody) - 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_with_body_1_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/hello", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        u8 body[256];
+        if (h2_status_for_stream(resp, total, 1) != 0 &&
+            h2_body_for_stream(resp, total, 1, body, sizeof(body)) >= sizeof(kBody) - 1)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    u8 body[256];
+    u32 blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+    CHECK_EQ(blen, sizeof(kBody) - 1);
+    bool body_ok = blen == sizeof(kBody) - 1;
+    for (u32 i = 0; i < blen && body_ok; i++)
+        if (body[i] != static_cast<u8>(kBody[i])) body_ok = false;
+    CHECK(body_ok);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(route, jit_handler_custom_body_real_socket) {
     using namespace rut;
 
@@ -4177,6 +4833,186 @@ static u64 return_200_body_99_headers_1_handler(void* /*conn*/,
                               /*next_state=*/1,    // headers_idx: valid
                               rut::jit::YieldKind::HttpGet};
     return r.pack();
+}
+
+// HTTP/2: a JIT handler returning custom response headers, served over h2c.
+TEST(shard, serves_http2_jit_handler_with_headers) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char* keys[] = {"X-Service"};  // mixed case → must be lowercased for h2
+    u32 key_lens[] = {9};
+    const char* vals[] = {"auth"};
+    u32 val_lens[] = {4};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_body_99_headers_1_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/hello", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    // Header name lowercased to "x-service" for HTTP/2 compliance.
+    CHECK(h2_response_has_header(resp, total, 1, "x-service", "auth"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A JIT handler that inspects the request body (passed as the synthesized
+// HTTP/1 bytes) and returns 200 iff it equals "ping".
+static u64 h2_echo_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
+    u32 body_off = len;
+    for (u32 i = 0; i + 3 < len; i++) {
+        if (req[i] == '\r' && req[i + 1] == '\n' && req[i + 2] == '\r' && req[i + 3] == '\n') {
+            body_off = i + 4;
+            break;
+        }
+    }
+    const u32 blen = len - body_off;
+    const bool ok = blen == 4 && req[body_off] == 'p' && req[body_off + 1] == 'i' &&
+                    req[body_off + 2] == 'n' && req[body_off + 3] == 'g';
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              static_cast<u16>(ok ? 200 : 400),
+                              /*upstream_id=*/0,
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+// HTTP/2 request body: HEADERS (no END_STREAM) + a DATA frame; the handler
+// (needs_req_body) runs only after the body arrives and sees it.
+TEST(shard, serves_http2_request_body) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_echo_body_handler, /*needs_req_body=*/true));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 5, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("ping"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // handler saw "ping"
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// An h2 request body larger than the engine's per-connection buffer → 413.
+TEST(shard, serves_http2_request_body_too_large) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_echo_body_handler, /*needs_req_body=*/true));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Two 10 KB DATA frames (each fits a 16 KB recv slice, but together exceed
+    // the 16 KB body-synth cap → overflow → 413). Single frames can't exceed the
+    // recv slice, so the overflow must come from accumulation across frames.
+    static u8 big[32000];
+    u32 n = h2_client_prologue(big);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{"content-length", 14}, {"20000", 5}},
+    };
+    n += http2_write_headers(big + n, sizeof(big) - n, 1, hs, 4, /*end_stream=*/false);
+    static u8 body[10000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = 'a';
+    n += http2_write_data(big + n, 1, body, sizeof(body), /*end_stream=*/false);
+    n += http2_write_data(big + n, 1, body, sizeof(body), /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, big, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 413u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
 }
 
 TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
@@ -6862,6 +7698,82 @@ TEST(route, dsl_regex_guard_real_socket) {
     rir.destroy();
 }
 #endif
+
+// End-to-end cleartext HTTP/2 (h2c, prior knowledge) over a real epoll shard.
+namespace {
+u32 h2_extract_status(const u8* buf, u32 len) {
+    u32 pos = 0;
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers)) {
+            hpack::DynamicTable dyn;
+            dyn.init(4096);
+            u8 scratch[4096];
+            hpack::Header hs[32];
+            u32 nh = 0;
+            if (hpack::decode_header_block(dyn,
+                                           buf + pos + kFrameHeaderSize,
+                                           h.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           hs,
+                                           32,
+                                           &nh)) {
+                for (u32 i = 0; i < nh; i++) {
+                    if (hs[i].name.eq(Str{":status", 7}) && hs[i].value.len == 3) {
+                        return static_cast<u32>((hs[i].value.ptr[0] - '0') * 100 +
+                                                (hs[i].value.ptr[1] - '0') * 10 +
+                                                (hs[i].value.ptr[2] - '0'));
+                    }
+                }
+            }
+            return 0;
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return 0;
+}
+}  // namespace
+
+TEST(io, serves_h2c_prior_knowledge) {
+    TestServer srv;
+    REQUIRE(srv.setup(40));
+    i32 c = connect_to(srv.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 req[512];
+    u32 rp = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) req[rp++] = kClientPreface[i];
+    Http2Settings cs;
+    cs.set_defaults();
+    rp += write_settings_frame(req + rp, cs);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    rp += http2_write_headers(req + rp, sizeof(req) - rp, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(send_all(c, reinterpret_cast<const char*>(req), rp));
+
+    u8 rbuf[8192];
+    u32 rlen = 0;
+    u32 status = 0;
+    for (int tries = 0; tries < 10 && rlen < sizeof(rbuf); tries++) {
+        i32 n = recv_timeout(
+            c, reinterpret_cast<char*>(rbuf) + rlen, static_cast<i32>(sizeof(rbuf) - rlen), 1000);
+        if (n <= 0) break;
+        rlen += static_cast<u32>(n);
+        status = h2_extract_status(rbuf, rlen);
+        if (status != 0) break;
+    }
+    CHECK_EQ(status, 200u);
+    close(c);
+    srv.teardown();
+}
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

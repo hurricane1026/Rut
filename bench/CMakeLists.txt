@@ -29,6 +29,16 @@ target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/testing
 )
 
+# HTTP/2 HPACK + framing hot paths. Links the vendored nghttp2 reference for a
+# decode baseline (rut vs nghttp2), mirroring bench_http_parser vs llhttp.
+add_executable(bench_hpack bench_hpack.cc)
+target_link_libraries(bench_hpack rut_runtime nghttp2_ref)
+target_include_directories(bench_hpack PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+target_compile_options(bench_hpack PRIVATE -O3 -DNDEBUG)
+
 # JIT-specialized ART vs scalar ART, exercising both the direct JIT
 # function pointer and the productized RouteConfig dispatch paths.
 if(RUT_ENABLE_JIT)

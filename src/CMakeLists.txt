@@ -139,6 +139,9 @@ add_library(rut_runtime STATIC
     runtime/socket.cc
     runtime/tls.cc
     runtime/http_parser.cc
+    runtime/http2_frame.cc
+    runtime/http2_conn.cc
+    runtime/hpack.cc
     runtime/chunked_parser.cc
     runtime/access_log.cc
     runtime/traffic_capture.cc

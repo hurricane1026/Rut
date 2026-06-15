@@ -21,10 +21,66 @@ core::Expected<void, Error> tls_init_once() {
     return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 }
 
+// Wire-format ALPN protocol names (1-byte length prefix per RFC 7301).
+constexpr u8 kAlpnH2[] = {2, 'h', '2'};
+constexpr u8 kAlpnHttp11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+
+// Does the client's ALPN list contain `name` (length `nlen`, no prefix)?
+bool client_offers(const u8* in, u32 len, const char* name, u8 nlen) {
+    u32 i = 0;
+    while (i < len) {
+        const u8 kEntryLen = in[i];
+        if (i + 1u + kEntryLen > len) break;  // truncated entry
+        if (kEntryLen == nlen && __builtin_memcmp(in + i + 1, name, nlen) == 0) return true;
+        i += 1u + kEntryLen;
+    }
+    return false;
+}
+
+// ALPN select callback. arg points at the owning TlsServerContext so the
+// callback reads its offer_h2 flag. Picks server-preferred protocol; on no
+// overlap returns NOACK so the handshake proceeds without ALPN (HTTP/1.1).
+int alpn_select_cb(
+    SSL* /*ssl*/, const u8** out, u8* outlen, const u8* in, unsigned inlen, void* arg) {
+    const auto* ctx = static_cast<const TlsServerContext*>(arg);
+    const bool kOfferH2 = ctx && ctx->offer_h2;
+    const AlpnProtocol kPick = alpn_pick(kOfferH2, in, inlen);
+    if (kPick == AlpnProtocol::H2) {
+        *out = kAlpnH2 + 1;
+        *outlen = kAlpnH2[0];
+        return SSL_TLSEXT_ERR_OK;
+    }
+    if (kPick == AlpnProtocol::Http11) {
+        *out = kAlpnHttp11 + 1;
+        *outlen = kAlpnHttp11[0];
+        return SSL_TLSEXT_ERR_OK;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+
 }  // namespace
 
+AlpnProtocol alpn_pick(bool offer_h2, const u8* client_protos, u32 client_len) {
+    if (!client_protos || client_len == 0) return AlpnProtocol::None;
+    if (offer_h2 && client_offers(client_protos, client_len, "h2", 2)) return AlpnProtocol::H2;
+    if (client_offers(client_protos, client_len, "http/1.1", 8)) return AlpnProtocol::Http11;
+    return AlpnProtocol::None;
+}
+
+AlpnProtocol tls_negotiated_protocol(SSL* ssl) {
+    if (!ssl) return AlpnProtocol::None;
+    const u8* proto = nullptr;
+    unsigned len = 0;
+    SSL_get0_alpn_selected(ssl, &proto, &len);
+    if (!proto || len == 0) return AlpnProtocol::None;
+    if (len == 2 && __builtin_memcmp(proto, "h2", 2) == 0) return AlpnProtocol::H2;
+    if (len == 8 && __builtin_memcmp(proto, "http/1.1", 8) == 0) return AlpnProtocol::Http11;
+    return AlpnProtocol::None;
+}
+
 core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
-                                                                   const char* key_path) {
+                                                                   const char* key_path,
+                                                                   bool offer_h2) {
     TRY_VOID(tls_init_once());
 
     SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_server_method());
@@ -52,6 +108,10 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
         return core::make_unexpected(Error::make(ENOMEM, Error::Source::Socket));
     }
     ctx->ssl_ctx = ssl_ctx;
+    ctx->offer_h2 = offer_h2;
+    // Register ALPN negotiation. arg = ctx so the callback can read offer_h2.
+    // ctx outlives ssl_ctx (freed together in destroy_tls_server_context).
+    SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_cb, ctx);
     return ctx;
 }
 
