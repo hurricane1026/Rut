@@ -313,6 +313,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.upstream_fd = kUpstreamFd;
         conn.upstream_idx = route->upstream_id;
+        conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
         const u32 kBackend = next_backend_index(route->upstream_id, target.addr_count);
@@ -896,6 +897,8 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             conn.upstream_fd = kUpstreamFd;
+            conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
+            conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
             conn.upstream_start_us = monotonic_us();
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
             const u32 kBackend =
@@ -938,10 +941,52 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
 }
 
 template <typename Loop>
+void on_upstream_connected(void* lp, Connection& conn, IoEvent ev);
+
+// Maximum upstream connect attempts per request (initial + retries), capped by
+// the upstream's backend count. Retrying here is safe regardless of HTTP method:
+// the connect failed before any request bytes were sent upstream, so no
+// non-idempotent side effect can have occurred.
+inline constexpr u32 kMaxConnectAttempts = 3;
+
+// On a failed upstream connect, try the next backend (round-robin) if the retry
+// budget isn't exhausted. Closes the dead fd, opens a fresh socket, and submits
+// a new connect routed back to on_upstream_connected. Returns true if a retry
+// was submitted; false (budget/socket/submit exhausted) → caller answers 502.
+template <typename Loop>
+bool try_connect_next_backend(Loop* loop, Connection& conn) {
+    const RouteConfig* config = conn.request_config;
+    if (!config || conn.upstream_idx >= config->upstream_count) return false;
+    const UpstreamTarget& target = config->upstreams[conn.upstream_idx];
+    const u32 kBudget =
+        target.addr_count < kMaxConnectAttempts ? target.addr_count : kMaxConnectAttempts;
+    if (conn.upstream_attempts >= kBudget) return false;  // budget exhausted
+
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+    }
+    const i32 kFd = UpstreamPool::create_socket();
+    if (kFd < 0) return false;
+    conn.upstream_fd = kFd;
+    conn.upstream_attempts++;
+    conn.upstream_start_us = monotonic_us();
+    conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    const u32 kBackend = next_backend_index(conn.upstream_idx, target.addr_count);
+    return loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
+}
+
+template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result < 0) {
+        // Connect failed (e.g. ECONNREFUSED). Try the next backend within the
+        // retry budget; only answer 502 once all candidates are exhausted.
+        if (try_connect_next_backend(loop, conn)) return;
         static const char k502[] =
             "HTTP/1.1 502 Bad Gateway\r\n"
             "Content-Length: 11\r\n"
