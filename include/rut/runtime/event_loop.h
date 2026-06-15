@@ -88,11 +88,14 @@ public:
             case IoEventType::UpstreamRecv:
                 if (conn.on_upstream_recv) {
                     conn.on_upstream_recv(&self(), conn, ev);
-                } else if (ev.result < 0 && conn.state != ConnState::ReadingHeader) {
+                } else if (ev.result < 0 && conn.state != ConnState::ReadingHeader &&
+                           !conn.upstream_abandoned) {
                     // -ENOBUFS: upstream_recv_buf full, close to prevent hot-loop.
                     // Once keep-alive has returned to ReadingHeader, negative
                     // UpstreamRecv CQEs can be stale completions from a just-
-                    // closed upstream fd and must not kill the client.
+                    // closed upstream fd and must not kill the client. Likewise
+                    // once we've abandoned the upstream (timeout → 504): the
+                    // client send is in flight and stale upstream CQEs are benign.
                     self().close_conn(conn);
                 }
                 // null + result >= 0: data in upstream_recv_buf, safely ignored.
@@ -150,6 +153,7 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
+    static constexpr u32 kDefaultUpstreamTimeout = 30;  // proxying-connection deadline
     static constexpr bool kSupportsEventYieldResume = false;
     SlicePool
         pool;  // per-shard buffer pool (3 slices max per connection: recv + send + upstream_recv)
@@ -174,6 +178,7 @@ public:
     u32 deferred_accept_count;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
+    u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;  // stored for drain: close to stop kernel routing new connections
     TlsServerContext* tls_server = nullptr;
 
@@ -227,6 +232,7 @@ public:
         drain_start_.store(0, std::memory_order_relaxed);
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
+        upstream_timeout = kDefaultUpstreamTimeout;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;
@@ -627,7 +633,13 @@ public:
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
                 for (i32 t = 0; t < ticks; t++) {
-                    timer.tick([this](Connection* c) { this->close_conn(*c); });
+                    timer.tick([this](Connection* c) {
+                        if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
+                            respond_upstream_timeout(this, *c);  // upstream stalled → 504
+                        } else {
+                            this->close_conn(*c);
+                        }
+                    });
                 }
 
                 // During drain: probabilistically close idle connections.
@@ -672,7 +684,9 @@ public:
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn, keepalive_timeout);
+                        timer.refresh(&conn,
+                                      conn.state == ConnState::Proxying ? upstream_timeout
+                                                                        : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if constexpr (Backend::kAsyncIo) {
                         // Stale CQE for a closed connection. If all ops are now

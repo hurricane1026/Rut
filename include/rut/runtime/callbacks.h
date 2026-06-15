@@ -99,6 +99,11 @@ void on_early_upstream_recvd(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void resume_jit_handler(Loop* loop, Connection& conn);
 
+// Emit 504 Gateway Timeout for a proxying connection whose upstream stalled
+// before responding — invoked from timer.tick. Defined in callbacks_impl.h.
+template <typename Loop>
+void respond_upstream_timeout(Loop* loop, Connection& conn);
+
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);
 
