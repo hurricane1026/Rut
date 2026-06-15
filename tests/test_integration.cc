@@ -5789,8 +5789,31 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
     // returns true even though the module had a name-only upstream.
     CHECK(populate_route_config(cfg, rir.module));
     // The manually-bound address is untouched.
-    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(8080));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, __builtin_bswap16(8080));
     rir.destroy();
+}
+
+// Round-robin backend selection: a multi-backend upstream rotates through its
+// endpoints; a single-backend upstream always returns index 0. Uses dedicated
+// upstream ids so the per-shard (thread_local) cursor starts at 0.
+TEST(route, round_robin_backend_selection) {
+    using namespace rut;
+    // 3 backends on upstream id 40 → 0,1,2,0,1,2.
+    CHECK_EQ(next_backend_index(40, 3), 0u);
+    CHECK_EQ(next_backend_index(40, 3), 1u);
+    CHECK_EQ(next_backend_index(40, 3), 2u);
+    CHECK_EQ(next_backend_index(40, 3), 0u);
+    CHECK_EQ(next_backend_index(40, 3), 1u);
+    // A different upstream id has an independent cursor.
+    CHECK_EQ(next_backend_index(41, 2), 0u);
+    CHECK_EQ(next_backend_index(41, 2), 1u);
+    CHECK_EQ(next_backend_index(41, 2), 0u);
+    // Single backend (or none) never rotates.
+    CHECK_EQ(next_backend_index(42, 1), 0u);
+    CHECK_EQ(next_backend_index(42, 1), 0u);
+    CHECK_EQ(next_backend_index(42, 0), 0u);
+    // Out-of-range upstream id is clamped to 0 (defensive).
+    CHECK_EQ(next_backend_index(RouteConfig::kMaxUpstreams, 3), 0u);
 }
 
 // Pre-bound mode with a name mismatch: caller populated cfg in the
@@ -7479,8 +7502,8 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     const Str actual_name{cfg.upstreams[0].name, 7u};
     const Str expected_name{"backend", 7u};
     CHECK(actual_name.eq(expected_name));
-    CHECK_EQ(cfg.upstreams[0].addr.sin_port, __builtin_bswap16(upstream_port));
-    CHECK_EQ(cfg.upstreams[0].addr.sin_addr.s_addr, __builtin_bswap32(0x7F000001));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, __builtin_bswap16(upstream_port));
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_addr.s_addr, __builtin_bswap32(0x7F000001));
     REQUIRE(cfg.add_jit_handler("/api", 'G', handler_fn));
     const RouteConfig* active = &cfg;
 

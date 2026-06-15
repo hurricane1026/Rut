@@ -24,11 +24,15 @@ enum class RouteAction : u8 {
     JitHandler,  // invoke JIT-compiled handler, may yield for I/O/timer
 };
 
-// Upstream target — address:port for a backend server.
+// Upstream target — one named backend that may resolve to several
+// address:port endpoints. Multiple endpoints enable per-shard round-robin
+// load balancing; a single-endpoint upstream is just addr_count == 1.
 struct UpstreamTarget {
     static constexpr u32 kMaxUpstreamNameLen = 32;
+    static constexpr u32 kMaxBackends = 8;  // endpoints per upstream (LB pool)
 
-    struct sockaddr_in addr;
+    struct sockaddr_in addrs[kMaxBackends];
+    u32 addr_count;
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
     u32 name_len;
@@ -42,12 +46,22 @@ struct UpstreamTarget {
         name[name_len] = '\0';
     }
 
-    // Helper: set address from IP (host order) + port (host order)
+    // Append a backend endpoint from IP (host order) + port (host order).
+    // Returns false if the backend list is full.
+    bool add_addr(u32 ip, u16 port) {
+        if (addr_count >= kMaxBackends) return false;
+        struct sockaddr_in& a = addrs[addr_count++];
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(ip);
+        a.sin_port = htons(port);
+        return true;
+    }
+
+    // Reset to a single backend endpoint (clears any existing list).
     void set_addr(u32 ip, u16 port) {
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(ip);
-        addr.sin_port = htons(port);
+        addr_count = 0;
+        add_addr(ip, port);
     }
 };
 
@@ -580,6 +594,14 @@ struct RouteConfig {
         upstreams[idx].set_name(name);
         upstreams[idx].set_addr(ip, port);
         return idx;
+    }
+
+    // Append an additional backend endpoint to an existing upstream (for
+    // load balancing). `idx` must be a previously added upstream. Returns
+    // false on a bad index or a full backend list.
+    bool add_upstream_backend(u32 idx, u32 ip, u16 port) {
+        if (idx >= upstream_count) return false;
+        return upstreams[idx].add_addr(ip, port);
     }
 
     // Firewall helpers.
