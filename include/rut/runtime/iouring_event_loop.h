@@ -8,12 +8,14 @@
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/shard_control.h"
+#include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
 #include <atomic>
@@ -47,6 +49,10 @@ public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     SlicePool pool;
+    // Per-shard HTTP/2 engine pool (see EpollEventLoop). Lazily handed out on
+    // h2 upgrade; bounded, over-cap upgrades close the connection.
+    static constexpr u32 kH2PoolCap = 2048;
+    SlabPool<Http2Conn, kH2PoolCap> h2_pool;
     Connection conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top;
@@ -126,8 +132,14 @@ public:
         }
         // 3 slices max per connection: recv + send + upstream_recv (lazy).
         TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
+        auto h2p = h2_pool.init();
+        if (!h2p) {
+            pool.destroy();
+            return core::make_unexpected(h2p.error());
+        }
         auto be = backend.init(id, lfd);
         if (!be) {
+            h2_pool.destroy();
             pool.destroy();
             return core::make_unexpected(be.error());
         }
@@ -192,6 +204,7 @@ public:
     void shutdown() {
         reclaim_pending();
         backend.shutdown();
+        h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
             munmap(capture_region_, static_cast<u64>(kMaxConns) * kCaptureSliceSize);
@@ -299,9 +312,23 @@ public:
         return &conns[id];
     }
 
+    bool alloc_h2_impl(Connection& c) {
+        if (c.h2) return true;  // already attached
+        Http2Conn* h = h2_pool.alloc();
+        if (!h) return false;
+        c.h2 = h;
+        return true;
+    }
+
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
+        // now even with ops in flight (unlike the recv/send slices below).
+        if (c.h2) {
+            h2_pool.free(c.h2);
+            c.h2 = nullptr;
+        }
         // If no ops are in flight, reclaim immediately.
         if (c.pending_ops == 0) {
             if (c.recv_slice) pool.free(c.recv_slice);

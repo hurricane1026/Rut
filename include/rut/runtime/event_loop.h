@@ -55,6 +55,10 @@ public:
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) { self().free_conn_impl(c); }
 
+    // Lazily attach a pooled HTTP/2 engine to a connection (idempotent).
+    // Returns false if the per-shard h2 pool is exhausted.
+    bool alloc_h2(Connection& c) { return self().alloc_h2_impl(c); }
+
     // Upstream I/O: send/recv on upstream_fd instead of fd.
     bool submit_send_upstream(Connection& c, const u8* buf, u32 len) {
         return self().submit_send_upstream_impl(c, buf, len);
@@ -453,6 +457,10 @@ public:
             conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
         return &conns[id];
     }
+
+    // The legacy EventLoop predates HTTP/2 and has no h2 pool. Refuse the
+    // upgrade so the shared callbacks fall back to closing the connection.
+    bool alloc_h2_impl(Connection& /*c*/) { return false; }
 
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
