@@ -246,6 +246,16 @@ struct AstUpstreamDecl {
     Span addr_span{};  // points at the address site for diagnostics
     bool port_is_set = false;
     u32 port_lit = 0;  // u32 to fit any parsed IntLit before range check
+
+    //   C. `upstream backend { backends: ["10.0.0.1:8080", "10.0.0.2:8080"] }`
+    //      → backend_count > 0, each backend_lits[i] = "host:port".
+    //      Analyze parses backend_lits[0] into the primary (ip,port) and
+    //      backend_lits[1..] into the extra-backend arrays on HirUpstream,
+    //      so existing single-address readers are unchanged. Mutually
+    //      exclusive with host_lit/port_lit (the parser rejects mixing).
+    static constexpr u32 kMaxBackends = 8;
+    u32 backend_count = 0;  // 0 → single-address form via host_lit/port_lit
+    Str backend_lits[kMaxBackends]{};
 };
 
 struct AstFunctionDecl {

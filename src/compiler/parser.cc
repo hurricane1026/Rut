@@ -1323,6 +1323,30 @@ struct Parser {
                     item.upstream.port_lit = static_cast<u32>(v);
                     item.upstream.port_is_set = true;
                     seen_port = true;
+                } else if (field_name.eq({"backends", 8})) {
+                    // `backends: ["host:port", ...]` — a non-empty list of
+                    // string literals for round-robin load balancing. Analyze
+                    // splits each into (ip, port).
+                    if (item.upstream.backend_count > 0)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto lbrk = expect(TokenType::LBracket);
+                    if (!lbrk) return core::make_unexpected(lbrk.error());
+                    if (cur().type == TokenType::RBracket)
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()));
+                    while (true) {
+                        auto lit = expect(TokenType::StringLit);
+                        if (!lit) return core::make_unexpected(lit.error());
+                        if (item.upstream.backend_count >= AstUpstreamDecl::kMaxBackends)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*lit.value()));
+                        item.upstream.backend_lits[item.upstream.backend_count++] =
+                            lit.value()->text;
+                        if (!take(TokenType::Comma)) break;
+                        if (cur().type == TokenType::RBracket) break;  // trailing comma
+                    }
+                    auto rbrk = expect(TokenType::RBracket);
+                    if (!rbrk) return core::make_unexpected(rbrk.error());
                 } else {
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
@@ -1332,7 +1356,13 @@ struct Parser {
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
-            if (!seen_host || !seen_port) {
+            if (item.upstream.backend_count > 0) {
+                // `backends:` is mutually exclusive with host/port — mixing
+                // them is ambiguous about which is the primary endpoint.
+                if (seen_host || seen_port)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span);
+            } else if (!seen_host || !seen_port) {
                 // Name the specific missing field in the detail so the
                 // diagnostic tells the user what to add. Point the
                 // span at the address block (the `{` we captured),

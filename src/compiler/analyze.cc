@@ -11905,10 +11905,56 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // dispatch does `if (upstream_id < cfg->upstream_count)`
         // without adjustment.
         up.id = static_cast<u16>(mod.upstreams.len);
+        // Parse a packed "host:port" literal (split on the last colon, IPv4
+        // host, 1..65535 port) into (ip, port). Used by the backends-list
+        // form; returns false on any malformed component.
+        auto parse_host_port = [&](Str lit, u32& out_ip, u16& out_port) -> bool {
+            u32 colon_idx = 0xffffffffu;
+            for (u32 k = 0; k < lit.len; k++)
+                if (lit.ptr[k] == ':') colon_idx = k;
+            if (colon_idx == 0xffffffffu || colon_idx + 1 == lit.len) return false;
+            const Str host_part = {lit.ptr, colon_idx};
+            u32 port_value = 0;
+            for (u32 k = colon_idx + 1; k < lit.len; k++) {
+                const char c = lit.ptr[k];
+                if (c < '0' || c > '9') return false;
+                port_value = port_value * 10 + static_cast<u32>(c - '0');
+                if (port_value > 0xffffu) return false;
+            }
+            if (port_value == 0) return false;
+            u32 ip = 0;
+            if (!parse_ipv4(host_part.ptr, host_part.len, ip)) return false;
+            out_ip = ip;
+            out_port = static_cast<u16>(port_value);
+            return true;
+        };
+
         // Resolve the parsed address (if any) into concrete (ip, port).
-        // Two AST shapes produce this: `at "host:port"` packs both
-        // into host_lit; dict form separates host_lit and port_lit.
-        if (item.upstream.has_address) {
+        // Three AST shapes produce this: `at "host:port"` packs both into
+        // host_lit; `{ host, port }` separates them; `{ backends: [...] }`
+        // lists several "host:port" endpoints (backends[0] = primary).
+        if (item.upstream.backend_count > 0) {
+            u32 ip0 = 0;
+            u16 port0 = 0;
+            if (!parse_host_port(item.upstream.backend_lits[0], ip0, port0))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      item.upstream.addr_span,
+                                      item.upstream.backend_lits[0]);
+            up.has_address = true;
+            up.ip = ip0;
+            up.port = port0;
+            for (u32 b = 1; b < item.upstream.backend_count; b++) {
+                u32 ipb = 0;
+                u16 portb = 0;
+                if (!parse_host_port(item.upstream.backend_lits[b], ipb, portb))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span,
+                                          item.upstream.backend_lits[b]);
+                up.extra_ips[up.extra_count] = ipb;
+                up.extra_ports[up.extra_count] = portb;
+                up.extra_count++;
+            }
+        } else if (item.upstream.has_address) {
             const Str lit = item.upstream.host_lit;
             Str host_part = lit;
             u32 port_value = item.upstream.port_lit;
