@@ -719,6 +719,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         up.has_address = module.upstreams[i].has_address;
         up.ip = module.upstreams[i].ip;
         up.port = module.upstreams[i].port;
+        up.extra_count = module.upstreams[i].extra_count;
+        for (u32 b = 0; b < up.extra_count; b++) {
+            up.extra_ips[b] = module.upstreams[i].extra_ips[b];
+            up.extra_ports[b] = module.upstreams[i].extra_ports[b];
+        }
         if (!mir->upstreams.push(up)) return frontend_error(FrontendError::TooManyItems, up.span);
     }
 

@@ -2872,6 +2872,11 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].has_address = mir.upstreams[i].has_address;
         out.module.upstreams[i].ip = mir.upstreams[i].ip;
         out.module.upstreams[i].port = mir.upstreams[i].port;
+        out.module.upstreams[i].extra_count = mir.upstreams[i].extra_count;
+        for (u32 b = 0; b < mir.upstreams[i].extra_count; b++) {
+            out.module.upstreams[i].extra_ips[b] = mir.upstreams[i].extra_ips[b];
+            out.module.upstreams[i].extra_ports[b] = mir.upstreams[i].extra_ports[b];
+        }
     }
     out.module.upstream_count = mir.upstreams.len;
 

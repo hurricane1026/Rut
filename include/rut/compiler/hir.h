@@ -30,6 +30,13 @@ struct HirUpstream {
     bool has_address = false;
     u32 ip = 0;
     u16 port = 0;
+    // Extra load-balancing endpoints beyond the primary (ip, port), from
+    // `{ backends: [...] }`. Primary + extras are round-robined at runtime.
+    // ips in host byte order, matching RouteConfig::add_upstream_backend.
+    static constexpr u32 kMaxExtraBackends = 7;  // AstUpstreamDecl::kMaxBackends - 1
+    u32 extra_count = 0;
+    u32 extra_ips[kMaxExtraBackends] = {};
+    u16 extra_ports[kMaxExtraBackends] = {};
 };
 struct HirImport {
     Span span{};

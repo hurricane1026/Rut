@@ -5816,6 +5816,59 @@ TEST(route, round_robin_backend_selection) {
     CHECK_EQ(next_backend_index(RouteConfig::kMaxUpstreams, 3), 0u);
 }
 
+// `upstream X { backends: [...] }` compiles through the IR and populates a
+// multi-backend UpstreamTarget (primary + extras) in the RouteConfig.
+TEST(route, upstream_backends_list_compiles) {
+    using namespace rut;
+    const char* src =
+        "upstream pool { backends: [\"127.0.0.1:8081\", \"127.0.0.2:8082\", \"127.0.0.3:8083\"] }\n"
+        "route GET \"/api\" { return forward(pool) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    // RIR module: primary + 2 extras, all addresses resolved.
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(rir.module.upstreams[0].has_address);
+    CHECK_EQ(rir.module.upstreams[0].ip, 0x7F000001u);
+    CHECK_EQ(rir.module.upstreams[0].port, 8081u);
+    REQUIRE_EQ(rir.module.upstreams[0].extra_count, 2u);
+    CHECK_EQ(rir.module.upstreams[0].extra_ips[0], 0x7F000002u);
+    CHECK_EQ(rir.module.upstreams[0].extra_ports[0], 8082u);
+    CHECK_EQ(rir.module.upstreams[0].extra_ips[1], 0x7F000003u);
+    CHECK_EQ(rir.module.upstreams[0].extra_ports[1], 8083u);
+    // populate_route_config builds a 3-endpoint UpstreamTarget.
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    CHECK_EQ(cfg.upstreams[0].addr_count, 3u);
+    CHECK_EQ(__builtin_bswap32(cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
+    CHECK_EQ(__builtin_bswap16(cfg.upstreams[0].addrs[2].sin_port), 8083u);
+    rir.destroy();
+}
+
+// Mixing `backends:` with `host`/`port` in one upstream dict is rejected.
+TEST(route, upstream_backends_mixed_with_host_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream pool { host: \"127.0.0.1\", backends: [\"127.0.0.2:8082\"] }\n"
+        "route GET \"/api\" { return forward(pool) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // parser rejects the mixed form
+}
+
 // Pre-bound mode with a name mismatch: caller populated cfg in the
 // wrong order / with wrong names. Helper verifies name-for-name
 // (ASCII case-sensitive) and rejects so forward() can't resolve to
