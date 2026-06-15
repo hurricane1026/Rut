@@ -108,14 +108,17 @@ u32 http2_write_headers(
 u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream);
 
 // Serialize a complete response for stream_id into out using the connection's
-// dynamic-indexing encoder: a HEADERS frame (:status, plus content-length when
-// there is a body), then a DATA frame if body_len > 0. END_STREAM is set on the
-// last frame. Returns total octets written, or 0 if it would exceed out_cap.
+// dynamic-indexing encoder: a HEADERS frame (:status, the `nhdrs` caller-
+// supplied headers, plus content-length when there is a body), then a DATA frame
+// if body_len > 0. END_STREAM is set on the last frame. Returns total octets
+// written, or 0 if it would exceed out_cap.
 u32 http2_write_response(u8* out,
                          u32 out_cap,
                          hpack::Encoder& enc,
                          u32 stream_id,
                          u16 status,
+                         const hpack::Header* hdrs,
+                         u32 nhdrs,
                          const u8* body,
                          u32 body_len);
 

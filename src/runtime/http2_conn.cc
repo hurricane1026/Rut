@@ -124,16 +124,36 @@ u32 http2_write_response(u8* out,
                          hpack::Encoder& enc,
                          u32 stream_id,
                          u16 status,
+                         const hpack::Header* hdrs,
+                         u32 nhdrs,
                          const u8* body,
                          u32 body_len) {
-    // Encode the header block: :status, plus content-length when there's a body.
-    u8 hblock[64];
+    // Encode the header block: :status, caller headers, then content-length when
+    // there's a body. Sized for the bounded route-config header set + slack.
+    u8 hblock[8192];
     u32 hb = 0;
     char sbuf[3];
     sbuf[0] = static_cast<char>('0' + (status / 100) % 10);
     sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
     sbuf[2] = static_cast<char>('0' + status % 10);
     hb += enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
+    for (u32 i = 0; i < nhdrs; i++) {
+        // Worst case per header ~ name+value+few prefix octets; bail if tight.
+        if (hb + hdrs[i].name.len + hdrs[i].value.len + 8 > sizeof(hblock)) return 0;
+        // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
+        // config may hold mixed case (HTTP/1 tolerates it). Lowercase into a
+        // small buffer before encoding.
+        char lname[256];
+        Str name = hdrs[i].name;
+        if (name.len <= sizeof(lname)) {
+            for (u32 j = 0; j < name.len; j++) {
+                const char kC = name.ptr[j];
+                lname[j] = (kC >= 'A' && kC <= 'Z') ? static_cast<char>(kC - 'A' + 'a') : kC;
+            }
+            name = Str{lname, name.len};
+        }
+        hb += enc.encode(hblock + hb, name, hdrs[i].value);
+    }
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);

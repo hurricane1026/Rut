@@ -37,15 +37,23 @@ struct H2Dispatch {
 };
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
-// the connection's dynamic-indexing encoder.
+// the connection's dynamic-indexing encoder. `hdrs[0..nhdrs)` are extra
+// response headers (after :status, before content-length).
 template <typename Loop>
-void h2_emit_response(
-    H2Dispatch<Loop>& d, u32 stream_id, u16 status, const u8* body, u32 body_len) {
+void h2_emit_response(H2Dispatch<Loop>& d,
+                      u32 stream_id,
+                      u16 status,
+                      const hpack::Header* hdrs,
+                      u32 nhdrs,
+                      const u8* body,
+                      u32 body_len) {
     const u32 kN = http2_write_response(d.resp + d.resp_len,
                                         d.resp_cap - d.resp_len,
                                         d.conn->h2->hpack_enc,
                                         stream_id,
                                         status,
+                                        hdrs,
+                                        nhdrs,
                                         body,
                                         body_len);
     if (kN == 0)
@@ -57,7 +65,7 @@ void h2_emit_response(
 // Append a status-only response (HEADERS with :status, END_STREAM).
 template <typename Loop>
 void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
-    h2_emit_response(d, stream_id, status, nullptr, 0);
+    h2_emit_response(d, stream_id, status, nullptr, 0, nullptr, 0);
 }
 
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
@@ -137,7 +145,7 @@ void h2_run_jit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);
         return;
     }
-    // Optional custom body from the pinned route config (response_bodies table).
+    // Optional custom body + header set from the pinned route config.
     const RouteConfig* cfg = d.conn->request_config;
     const u8* body = nullptr;
     u32 body_len = 0;
@@ -147,7 +155,20 @@ void h2_run_jit(H2Dispatch<Loop>& d,
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
-    h2_emit_response(d, stream_id, kOutcome.status_code, body, body_len);
+    hpack::Header hdrs[RouteConfig::kMaxHeadersPerSet];
+    u32 nhdrs = 0;
+    if (kOutcome.response_headers_idx != 0 && cfg != nullptr &&
+        kOutcome.response_headers_idx <= cfg->response_header_set_count) {
+        const auto& ref = cfg->response_header_sets[kOutcome.response_headers_idx - 1];
+        for (u16 i = 0; i < ref.count; i++) {
+            hdrs[nhdrs].name = {cfg->header_keys[ref.offset + i].data,
+                                cfg->header_keys[ref.offset + i].len};
+            hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
+                                 cfg->header_values[ref.offset + i].len};
+            nhdrs++;
+        }
+    }
+    h2_emit_response(d, stream_id, kOutcome.status_code, hdrs, nhdrs, body, body_len);
 }
 
 // Resolve a completed h2 request to a status and emit the response.

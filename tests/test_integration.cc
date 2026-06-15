@@ -1784,6 +1784,41 @@ u16 h2_response_status(const u8* buf, u32 len) {
     return h2_status_for_stream(buf, len, 1);
 }
 
+// Does the HEADERS frame for `stream_id` carry header (name, value)?
+bool h2_response_has_header(
+    const u8* buf, u32 len, u32 stream_id, const char* name, const char* value) {
+    u32 nl = 0;
+    while (name[nl]) nl++;
+    u32 vl = 0;
+    while (value[vl]) vl++;
+    u32 pos = 0;
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == stream_id) {
+            hpack::Header hs[32];
+            u8 scratch[4096];
+            u32 nh = 0;
+            if (hpack::decode_header_block(dyn,
+                                           buf + pos + kFrameHeaderSize,
+                                           h.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           hs,
+                                           32,
+                                           &nh)) {
+                for (u32 i = 0; i < nh; i++)
+                    if (hs[i].name.eq(Str{name, nl}) && hs[i].value.eq(Str{value, vl})) return true;
+            }
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return false;
+}
+
 // Concatenate DATA-frame payloads for `stream_id` into out; return total length.
 u32 h2_body_for_stream(const u8* buf, u32 len, u32 stream_id, u8* out, u32 cap) {
     u32 pos = 0;
@@ -4798,6 +4833,56 @@ static u64 return_200_body_99_headers_1_handler(void* /*conn*/,
                               /*next_state=*/1,    // headers_idx: valid
                               rut::jit::YieldKind::HttpGet};
     return r.pack();
+}
+
+// HTTP/2: a JIT handler returning custom response headers, served over h2c.
+TEST(shard, serves_http2_jit_handler_with_headers) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char* keys[] = {"X-Service"};  // mixed case → must be lowercased for h2
+    u32 key_lens[] = {9};
+    const char* vals[] = {"auth"};
+    u32 val_lens[] = {4};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_body_99_headers_1_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/hello", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    // Header name lowercased to "x-service" for HTTP/2 compliance.
+    CHECK(h2_response_has_header(resp, total, 1, "x-service", "auth"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
 }
 
 TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
