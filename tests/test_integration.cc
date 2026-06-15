@@ -4847,6 +4847,100 @@ TEST(proxy_e2e, all_backends_unreachable_502) {
     CHECK(buf_contains(buf, total, "502", 3));
 }
 
+// A backend that accepts and reads the request but never responds and holds the
+// connection open — to exercise the upstream read timeout.
+struct StallServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~StallServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<StallServer*>(arg);
+        i32 client = -1;
+        while (s->running.load(std::memory_order_acquire)) {
+            client = accept(s->listen_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            char req[1024];
+            (void)recv_timeout(client, req, sizeof(req), 500);                // read, never reply
+            while (s->running.load(std::memory_order_acquire)) usleep(5000);  // hold open
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Upstream accepts but never responds → the gateway hits its upstream timeout
+// and returns 504 Gateway Timeout (rather than hanging or eventually closing).
+TEST(proxy_e2e, upstream_timeout_returns_504) {
+    using namespace rut;
+    StallServer stall;
+    REQUIRE(stall.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("slow", 0x7F000001, stall.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 500));
+    proxy.loop->upstream_timeout = 1;  // 1s upstream deadline (vs 60s keepalive)
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE(client >= 0);
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+    char buf[1024];
+    u32 total = 0;
+    // Timer wheel is 1s-resolution, so 504 lands ~1-2s out — read generously.
+    while (total < sizeof(buf)) {
+        i32 n = recv_timeout(client, buf + total, sizeof(buf) - total, 5000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+    }
+    CHECK(total > 0);
+    CHECK(buf_contains(buf, total, "504", 3));
+    close(client);
+}
+
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
 // body was registered). Runtime must fall back to the default status-
 // reason body rather than rendering garbage or hanging.

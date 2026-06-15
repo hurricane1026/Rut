@@ -48,6 +48,7 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
+    static constexpr u32 kDefaultUpstreamTimeout = 30;  // proxying-connection deadline
     SlicePool pool;
     // Per-shard HTTP/2 engine pool (see EpollEventLoop). Lazily handed out on
     // h2 upgrade; bounded, over-cap upgrades close the connection.
@@ -68,6 +69,7 @@ public:
     u32 deferred_accept_count;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
+    u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
 
     AccessLogRing* access_log = nullptr;
@@ -114,6 +116,7 @@ public:
         drain_start_.store(0, std::memory_order_relaxed);
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
+        upstream_timeout = kDefaultUpstreamTimeout;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;
@@ -582,6 +585,9 @@ public:
                             c->resume_event_kind = jit::YieldKind::Timer;
                             c->resume_event_result = 0;
                             resume_jit_handler<IoUringEventLoop>(this, *c);
+                        } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
+                            // Upstream stalled before responding → 504.
+                            respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else {
                             this->close_conn(*c);
                         }
@@ -652,7 +658,9 @@ public:
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn, keepalive_timeout);
+                        timer.refresh(&conn,
+                                      conn.state == ConnState::Proxying ? upstream_timeout
+                                                                        : keepalive_timeout);
                         if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {

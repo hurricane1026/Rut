@@ -168,6 +168,7 @@ private:
 public:
     static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
+    static constexpr u32 kDefaultUpstreamTimeout = 30;  // proxying-connection deadline
     SlicePool pool;
     // Per-shard HTTP/2 engine pool — lazily handed out when a connection
     // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
@@ -178,6 +179,7 @@ public:
     u32 free_top;
 
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
+    u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
     TlsServerContext* tls_server = nullptr;
 
@@ -225,6 +227,7 @@ public:
         drain_start_.store(0, std::memory_order_relaxed);
         drain_period_.store(0, std::memory_order_relaxed);
         keepalive_timeout = kDefaultKeepaliveTimeout;
+        upstream_timeout = kDefaultUpstreamTimeout;
         capture_ring = nullptr;
         capture_region_ = nullptr;
         config_ptr = nullptr;
@@ -575,6 +578,9 @@ public:
                             c->resume_event_kind = jit::YieldKind::Timer;
                             c->resume_event_result = 0;
                             resume_jit_handler<EpollEventLoop>(this, *c);
+                        } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
+                            // Upstream stalled before responding → 504.
+                            respond_upstream_timeout<EpollEventLoop>(this, *c);
                         } else {
                             this->close_conn(*c);
                         }
@@ -602,7 +608,9 @@ public:
                     auto& conn = conns[ev.conn_id];
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn, keepalive_timeout);
+                        timer.refresh(&conn,
+                                      conn.state == ConnState::Proxying ? upstream_timeout
+                                                                        : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {

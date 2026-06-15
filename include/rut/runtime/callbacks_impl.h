@@ -163,6 +163,12 @@ void handle_jit_outcome(Loop* loop,
 template <typename Loop>
 void resume_jit_handler(Loop* loop, Connection& conn);
 
+// Emit 504 Gateway Timeout for a proxying connection whose upstream stalled.
+// Defined below; forward-declared so the per-shard timer tick (in the event
+// loop headers) can call it.
+template <typename Loop>
+void respond_upstream_timeout(Loop* loop, Connection& conn);
+
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
 
@@ -1038,6 +1044,38 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     return loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
 }
 
+// The upstream timed out before any response bytes reached the client → emit
+// 504 Gateway Timeout and tear down the upstream side. Called from the timer
+// tick for a proxying connection past its upstream deadline (and only while
+// proxy_resp_started is false — once response bytes are in flight we can't
+// inject a new status, so the tick closes instead). Safe w.r.t. in-flight
+// upstream I/O: closing the upstream fd + upstream_abandoned makes dispatch
+// ignore late upstream CQEs, and transition_to_sending clears the upstream
+// slots so only the client-send callback runs.
+template <typename Loop>
+void respond_upstream_timeout(Loop* loop, Connection& conn) {
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+    }
+    conn.upstream_abandoned = true;
+    static const char k504[] =
+        "HTTP/1.1 504 Gateway Timeout\r\n"
+        "Content-Length: 15\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Gateway Timeout";
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+    conn.keep_alive = false;
+    conn.resp_status = 504;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -1735,6 +1773,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     conn.resp_body_sent = initial_send_len;
     conn.upstream_send_len = initial_send_len;
+
+    // Response bytes are now headed to the client — past this point a timeout
+    // cannot inject a 504 (the tick will close instead).
+    conn.proxy_resp_started = true;
 
     if (body_complete) {
         conn.transition_to_sending(&on_proxy_response_sent<Loop>);
