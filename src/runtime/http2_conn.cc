@@ -31,6 +31,9 @@ void Http2Conn::init() {
     cont_end_stream = false;
     hdr_block_len = 0;
     nstreams = 0;
+    pending_stream = 0;
+    pending_synth_len = 0;
+    pending_overflow = false;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {

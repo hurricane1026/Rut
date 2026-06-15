@@ -4885,6 +4885,80 @@ TEST(shard, serves_http2_jit_handler_with_headers) {
     close(lfd);
 }
 
+// A JIT handler that inspects the request body (passed as the synthesized
+// HTTP/1 bytes) and returns 200 iff it equals "ping".
+static u64 h2_echo_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
+    u32 body_off = len;
+    for (u32 i = 0; i + 3 < len; i++) {
+        if (req[i] == '\r' && req[i + 1] == '\n' && req[i + 2] == '\r' && req[i + 3] == '\n') {
+            body_off = i + 4;
+            break;
+        }
+    }
+    const u32 blen = len - body_off;
+    const bool ok = blen == 4 && req[body_off] == 'p' && req[body_off + 1] == 'i' &&
+                    req[body_off + 2] == 'n' && req[body_off + 3] == 'g';
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              static_cast<u16>(ok ? 200 : 400),
+                              /*upstream_id=*/0,
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+// HTTP/2 request body: HEADERS (no END_STREAM) + a DATA frame; the handler
+// (needs_req_body) runs only after the body arrives and sees it.
+TEST(shard, serves_http2_request_body) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_echo_body_handler, /*needs_req_body=*/true));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 5, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("ping"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // handler saw "ping"
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
     using namespace rut;
 

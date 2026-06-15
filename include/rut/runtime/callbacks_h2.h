@@ -107,30 +107,17 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     return o;
 }
 
-// Run a synchronous JIT handler for an h2 stream and serialize its response.
-// Body-reading or yielding handlers are not supported over h2 yet → 503.
+// Invoke a synchronous JIT handler given the assembled HTTP/1 request bytes
+// (headers, plus body for POST), then serialize its response. Yielding /
+// forwarding handlers are not supported over h2 yet → 503.
 template <typename Loop>
-void h2_run_jit(H2Dispatch<Loop>& d,
-                u32 stream_id,
-                const RouteEntry* route,
-                const RouteParam* params,
-                u32 param_count,
-                const hpack::Header* headers,
-                u32 nheaders) {
-    if (!route->fn) {
-        h2_emit_status(d, stream_id, 500);
-        return;
-    }
-    if (route->needs_req_body) {
-        h2_emit_status(d, stream_id, 503);  // request-body over h2 not wired yet
-        return;
-    }
-    u8 synth[8192];
-    const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
-    if (kSynthLen == 0) {
-        h2_emit_status(d, stream_id, 400);
-        return;
-    }
+void h2_invoke_emit(H2Dispatch<Loop>& d,
+                    u32 stream_id,
+                    const RouteEntry* route,
+                    const RouteParam* params,
+                    u32 param_count,
+                    const u8* synth,
+                    u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
@@ -139,13 +126,11 @@ void h2_run_jit(H2Dispatch<Loop>& d,
     for (u32 i = 0; i < param_count; i++) ctx->route_params[i] = params[i];
 
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
-        route->fn, static_cast<void*>(d.conn), *ctx, synth, kSynthLen, /*arena=*/nullptr);
+        route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
-        // Forward / wait / yield over h2 not supported yet — fail closed.
-        h2_emit_status(d, stream_id, 503);
+        h2_emit_status(d, stream_id, 503);  // forward/yield over h2 not wired yet
         return;
     }
-    // Optional custom body + header set from the pinned route config.
     const RouteConfig* cfg = d.conn->request_config;
     const u8* body = nullptr;
     u32 body_len = 0;
@@ -171,12 +156,53 @@ void h2_run_jit(H2Dispatch<Loop>& d,
     h2_emit_response(d, stream_id, kOutcome.status_code, hdrs, nhdrs, body, body_len);
 }
 
-// Resolve a completed h2 request to a status and emit the response.
+// A body-reading handler has its full request (headers + accumulated body) in
+// the connection's pending_synth. Re-parse it to route, then invoke + serialize.
+template <typename Loop>
+void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
+    Http2Conn* h2 = d.conn->h2;
+    const bool kOverflow = h2->pending_overflow;
+    const u8* synth = h2->pending_synth;
+    const u32 kLen = h2->pending_synth_len;
+    h2->pending_stream = 0;  // clear before responding
+    h2->pending_synth_len = 0;
+    h2->pending_overflow = false;
+
+    if (kOverflow) {
+        h2_emit_status(d, stream_id, 413);  // body exceeded our buffer
+        return;
+    }
+    HttpParser parser;
+    parser.reset();
+    ParsedRequest req;
+    if (parser.parse(synth, kLen, &req) != ParseStatus::Complete) {
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
+    const RouteConfig* cfg = d.conn->request_config;
+    if (!cfg) {
+        h2_emit_status(d, stream_id, 200);
+        return;
+    }
+    RouteParam params[kMaxRouteParams]{};
+    u32 pc = 0;
+    const RouteEntry* route = cfg->match_canonical(
+        req.path_canon, route_method_key(req.method), params, &pc, kMaxRouteParams);
+    if (!route || route->action != RouteAction::JitHandler || !route->fn) {
+        h2_emit_status(d, stream_id, route ? 503 : 200);
+        return;
+    }
+    h2_invoke_emit(d, stream_id, route, params, pc, synth, kLen);
+}
+
+// Resolve a completed header block (END_HEADERS) to a response. end_stream is
+// the HEADERS frame's flag — false means a request body (DATA frames) follows.
 template <typename Loop>
 void h2_dispatch_request(H2Dispatch<Loop>& d,
                          u32 stream_id,
                          const hpack::Header* headers,
-                         u32 nheaders) {
+                         u32 nheaders,
+                         bool end_stream) {
     ParsedRequest req;
     if (!h2_headers_to_request(headers, nheaders, &req)) {
         h2_emit_status(d, stream_id, 400);
@@ -203,9 +229,35 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         case RouteAction::Static:
             h2_emit_status(d, stream_id, route->status_code);
             return;
-        case RouteAction::JitHandler:
-            h2_run_jit(d, stream_id, route, params, param_count, headers, nheaders);
+        case RouteAction::JitHandler: {
+            if (!route->fn) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            u8 synth[8192];
+            const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
+            if (kSynthLen == 0) {
+                h2_emit_status(d, stream_id, 400);
+                return;
+            }
+            if (!route->needs_req_body || end_stream) {
+                // No request body to wait for — invoke now.
+                h2_invoke_emit(d, stream_id, route, params, param_count, synth, kSynthLen);
+                return;
+            }
+            // Body follows: stash the synthesized headers and accumulate DATA.
+            // One body upload at a time per connection.
+            Http2Conn* h2 = d.conn->h2;
+            if (h2->pending_stream != 0 || kSynthLen > Http2Conn::kBodySynthCap) {
+                h2_emit_status(d, stream_id, 503);
+                return;
+            }
+            for (u32 i = 0; i < kSynthLen; i++) h2->pending_synth[i] = synth[i];
+            h2->pending_synth_len = kSynthLen;
+            h2->pending_overflow = false;
+            h2->pending_stream = stream_id;
             return;
+        }
         case RouteAction::Proxy:
         default:
             // TODO(h2): proxy over HTTP/2 needs the upstream state machine
@@ -217,9 +269,25 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
 
 template <typename Loop>
 void h2_on_headers_cb(
-    void* ctx, Http2Conn& /*c*/, u32 stream_id, const hpack::Header* hs, u32 n, bool /*end*/) {
+    void* ctx, Http2Conn& /*c*/, u32 stream_id, const hpack::Header* hs, u32 n, bool end) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
-    h2_dispatch_request(*d, stream_id, hs, n);
+    h2_dispatch_request(*d, stream_id, hs, n, end);
+}
+
+// DATA frames for a body-reading request: append to pending_synth, finalize at
+// END_STREAM. DATA for any other stream is ignored (flow control already ran).
+template <typename Loop>
+void h2_on_data_cb(
+    void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
+    auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if (c.pending_stream != stream_id) return;
+    if (c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+        c.pending_overflow = true;
+    } else {
+        for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
+        c.pending_synth_len += len;
+    }
+    if (end_stream) h2_finish_body(*d, stream_id);
 }
 
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.
@@ -285,7 +353,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
 
     conn.h2->cb_ctx = &d;
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
-    conn.h2->on_data = nullptr;  // body ignored for static routes (flow control still runs)
+    conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
     conn.h2->on_reset = nullptr;
     conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
 

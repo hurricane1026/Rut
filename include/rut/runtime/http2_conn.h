@@ -81,6 +81,18 @@ struct Http2Conn {
     Http2Stream streams[kMaxStreams];
     u32 nstreams;
 
+    // Pending body-reading request awaiting DATA frames. The serving layer
+    // synthesizes the HTTP/1 request headers here at HEADERS time and appends
+    // body as DATA arrives; at END_STREAM it re-parses pending_synth (a valid
+    // HTTP/1 request) to route + invoke the handler. One at a time: a second
+    // concurrent body upload is refused (503). pending_stream == 0 means none.
+    // Kept trivial (no routing types) so Http2Conn stays SlabPool-poolable.
+    static constexpr u32 kBodySynthCap = 16384;
+    u32 pending_stream;
+    u32 pending_synth_len;
+    bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
+    u8 pending_synth[kBodySynthCap];
+
     // Set callbacks (any may be null) then call init().
     void init();
 
