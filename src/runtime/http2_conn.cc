@@ -15,6 +15,7 @@ constexpr i64 kMaxWindow = 2147483647;  // 2^31 - 1
 
 void Http2Conn::init() {
     hpack_dec.init(kDefaultHeaderTableSize);
+    hpack_enc.init(kDefaultHeaderTableSize);
     our_settings.set_defaults();
     // Advertise our limits: bounded concurrent streams; keep the default window.
     our_settings.max_concurrent_streams = kMaxStreams;
@@ -98,6 +99,63 @@ u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_s
     write_frame_header(out, h);
     for (u32 i = 0; i < len; i++) out[kFrameHeaderSize + i] = data[i];
     return kFrameHeaderSize + len;
+}
+
+namespace {
+// Render an unsigned value as decimal into buf (max 10 digits); returns length.
+u32 u32_to_dec(u32 v, char* buf) {
+    if (v == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    char tmp[10];
+    u32 n = 0;
+    while (v > 0) {
+        tmp[n++] = static_cast<char>('0' + v % 10);
+        v /= 10;
+    }
+    for (u32 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    return n;
+}
+}  // namespace
+
+u32 http2_write_response(u8* out,
+                         u32 out_cap,
+                         hpack::Encoder& enc,
+                         u32 stream_id,
+                         u16 status,
+                         const u8* body,
+                         u32 body_len) {
+    // Encode the header block: :status, plus content-length when there's a body.
+    u8 hblock[64];
+    u32 hb = 0;
+    char sbuf[3];
+    sbuf[0] = static_cast<char>('0' + (status / 100) % 10);
+    sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
+    sbuf[2] = static_cast<char>('0' + status % 10);
+    hb += enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
+    if (body_len > 0) {
+        char clbuf[10];
+        const u32 kClLen = u32_to_dec(body_len, clbuf);
+        hb += enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
+    }
+
+    const bool kEndOnHeaders = (body_len == 0);
+    const u32 kNeed = kFrameHeaderSize + hb + (body_len > 0 ? kFrameHeaderSize + body_len : 0u);
+    if (kNeed > out_cap) return 0;
+
+    Http2FrameHeader h;
+    h.length = hb;
+    h.type = static_cast<u8>(Http2FrameType::Headers);
+    h.flags =
+        static_cast<u8>(http2_flag::kEndHeaders | (kEndOnHeaders ? http2_flag::kEndStream : 0));
+    h.stream_id = stream_id;
+    write_frame_header(out, h);
+    for (u32 i = 0; i < hb; i++) out[kFrameHeaderSize + i] = hblock[i];
+    u32 o = kFrameHeaderSize + hb;
+    if (body_len > 0)
+        o += http2_write_data(out + o, stream_id, body, body_len, /*end_stream=*/true);
+    return o;
 }
 
 namespace {

@@ -1784,6 +1784,23 @@ u16 h2_response_status(const u8* buf, u32 len) {
     return h2_status_for_stream(buf, len, 1);
 }
 
+// Concatenate DATA-frame payloads for `stream_id` into out; return total length.
+u32 h2_body_for_stream(const u8* buf, u32 len, u32 stream_id, u8* out, u32 cap) {
+    u32 pos = 0;
+    u32 blen = 0;
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Data) && h.stream_id == stream_id) {
+            for (u32 i = 0; i < h.length && blen < cap; i++)
+                out[blen++] = buf[pos + kFrameHeaderSize + i];
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return blen;
+}
+
 // Write preface + an empty client SETTINGS into out; return bytes written.
 u32 h2_client_prologue(u8* out) {
     u32 n = 0;
@@ -4314,6 +4331,62 @@ static u64 return_200_with_body_1_handler(void* /*conn*/,
 // End-to-end: handler returns ReturnStatus with body_idx=1;
 // RouteConfig has a body pre-registered; runtime formats response
 // with the body bytes + matching Content-Length + default Content-Type.
+// HTTP/2: a JIT handler returning a status + body, served over h2c. Exercises
+// the native h2 dispatch → request synthesis → handler invoke → HEADERS+DATA.
+TEST(shard, serves_http2_jit_handler_with_body) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char kBody[] = "Hello, world";
+    REQUIRE_EQ(cfg.add_response_body(kBody, sizeof(kBody) - 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_with_body_1_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/hello", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        u8 body[256];
+        if (h2_status_for_stream(resp, total, 1) != 0 &&
+            h2_body_for_stream(resp, total, 1, body, sizeof(body)) >= sizeof(kBody) - 1)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    u8 body[256];
+    u32 blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+    CHECK_EQ(blen, sizeof(kBody) - 1);
+    bool body_ok = blen == sizeof(kBody) - 1;
+    for (u32 i = 0; i < blen && body_ok; i++)
+        if (body[i] != static_cast<u8>(kBody[i])) body_ok = false;
+    CHECK(body_ok);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(route, jit_handler_custom_body_real_socket) {
     using namespace rut;
 

@@ -63,6 +63,7 @@ struct Http2Conn {
     OnReset on_reset;
 
     hpack::DynamicTable hpack_dec;
+    hpack::Encoder hpack_enc;  // response-side encoder (dynamic indexing)
     Http2Settings our_settings;
     Http2Settings peer_settings;
     i64 conn_send_window;
@@ -105,6 +106,18 @@ u32 http2_write_headers(
 // Write a DATA frame for data[0..len) on stream_id into out (must hold
 // kFrameHeaderSize + len). Returns octets written.
 u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream);
+
+// Serialize a complete response for stream_id into out using the connection's
+// dynamic-indexing encoder: a HEADERS frame (:status, plus content-length when
+// there is a body), then a DATA frame if body_len > 0. END_STREAM is set on the
+// last frame. Returns total octets written, or 0 if it would exceed out_cap.
+u32 http2_write_response(u8* out,
+                         u32 out_cap,
+                         hpack::Encoder& enc,
+                         u32 stream_id,
+                         u16 status,
+                         const u8* body,
+                         u32 body_len);
 
 // --- Request bridge ---
 
