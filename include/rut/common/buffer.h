@@ -163,6 +163,13 @@ struct Buffer {
         len_ += n;
     }
 
+    // Set the absolute length after an in-place edit (e.g. rewriting the
+    // request line for forward(set_path:)). Traps if released or out of range.
+    void set_len(u32 n) noexcept {
+        if (released_ || !ptr_ || n > cap_) __builtin_trap();
+        len_ = n;
+    }
+
     // Read-only data pointer for kernel send() / zero-copy forwarding.
     // Traps if released — use View::data() for the released case.
     const u8* data() const noexcept {

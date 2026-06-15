@@ -1076,6 +1076,43 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
     loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
 }
 
+// forward(set_path:) — rewrite the request-line path in recv_buf in place from
+// conn.req_path_override before forwarding upstream. The path lives at the front
+// of the request (inside the initial-forward chunk), so the buffered bytes after
+// it (remaining headers + any buffered body) shift by the length delta, and both
+// recv_buf's length and req_initial_send_len are adjusted to match. No-ops on a
+// malformed request line or if the rewritten request would exceed the buffer.
+inline void rewrite_request_line_path(Connection& conn) {
+    if (!conn.req_path_overridden || conn.req_path_override.ptr == nullptr) return;
+    u8* buf = conn.recv_slice;
+    const u32 total = conn.recv_buf.len();
+    if (buf == nullptr || total == 0) return;
+    // Request line: METHOD SP PATH SP VERSION CRLF — locate the two spaces.
+    u32 i = 0;
+    while (i < total && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n') i++;
+    if (i >= total || buf[i] != ' ') return;
+    const u32 path_start = i + 1;
+    u32 j = path_start;
+    while (j < total && buf[j] != ' ' && buf[j] != '\r' && buf[j] != '\n') j++;
+    if (j >= total || buf[j] != ' ') return;
+    const u32 old_len = j - path_start;
+    const u32 new_len = conn.req_path_override.len;
+    if (new_len == 0) return;
+    const i64 delta = static_cast<i64>(new_len) - static_cast<i64>(old_len);
+    if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) return;
+    if (delta != 0) {
+        __builtin_memmove(
+            buf + (static_cast<i64>(j) + delta), buf + j, static_cast<size_t>(total - j));
+    }
+    __builtin_memcpy(buf + path_start, conn.req_path_override.ptr, new_len);
+    conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(total) + delta));
+    // The path sits within the initial forward chunk, so shift its length too.
+    if (delta != 0 && conn.req_initial_send_len > 0) {
+        const i64 adjusted = static_cast<i64>(conn.req_initial_send_len) + delta;
+        conn.req_initial_send_len = adjusted > 0 ? static_cast<u32>(adjusted) : 0;
+    }
+}
+
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -1118,6 +1155,9 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.state = ConnState::Proxying;
+    // forward(set_path:) — rewrite the request line before forwarding (no-op
+    // unless a path override was recorded by the JIT handler).
+    rewrite_request_line_path(conn);
     u32 req_send_len =
         conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
     if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();

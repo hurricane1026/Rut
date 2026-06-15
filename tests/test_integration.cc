@@ -7600,6 +7600,154 @@ TEST(route, req_query_string_all_non_short_circuit_eager_rhs_is_observed_real_so
     rir.destroy();
 }
 
+// A backend that echoes back the request-line path it received as the response
+// body, so a test can assert what path the upstream actually saw.
+struct EchoPathServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~EchoPathServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<EchoPathServer*>(arg);
+        i32 client = -1;
+        while (s->running.load(std::memory_order_acquire)) {
+            client = accept(s->listen_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            char req[2048];
+            i32 n = recv_timeout(client, req, sizeof(req), 1000);
+            if (n > 0) {
+                // Parse the path token: METHOD SP PATH SP VERSION.
+                u32 i = 0;
+                const auto len = static_cast<u32>(n);
+                while (i < len && req[i] != ' ') i++;
+                u32 ps = i + 1, pe = ps;
+                while (pe < len && req[pe] != ' ') pe++;
+                const u32 plen = pe > ps ? pe - ps : 0;
+                char resp[2176];
+                int rn = snprintf(resp,
+                                  sizeof(resp),
+                                  "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n%.*s",
+                                  plen,
+                                  static_cast<int>(plen),
+                                  req + ps);
+                if (rn > 0) (void)send_all(client, resp, static_cast<u32>(rn));
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// End-to-end: `forward(backend, set_path: "/rewritten")` compiles, the JIT
+// handler records the override, and the proxy rewrites the request line so the
+// upstream receives "/rewritten" (not the client's "/api").
+TEST(route, forward_set_path_rewrites_upstream_request) {
+    using namespace rut;
+    EchoPathServer echo;
+    REQUIRE(echo.setup());
+
+    char src_buf[256];
+    const int src_len =
+        snprintf(src_buf,
+                 sizeof(src_buf),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/api\" { return forward(backend, set_path: \"/rewritten\") }\n",
+                 echo.port);
+    REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    {
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 500));
+        char buf[1024];
+        const u32 total = proxy_get_api(proxy.port, buf, sizeof(buf));
+        CHECK(total > 0);
+        // The upstream echoed the path it saw — must be the rewritten one.
+        CHECK(buf_contains(buf, total, "/rewritten", 10));
+        CHECK(!buf_contains(buf, total, "/api", 4));
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+// forward() rejects an unknown kwarg and a duplicated set_path.
+TEST(route, forward_invalid_kwargs_rejected) {
+    using namespace rut;
+    const char* bogus =
+        "upstream b at \"127.0.0.1:80\"\n"
+        "route GET \"/a\" { return forward(b, bogus: \"x\") }\n";
+    auto l1 = lex(Str{bogus, static_cast<u32>(strlen(bogus))});
+    REQUIRE(l1);
+    CHECK(!parse_file(l1.value()));
+
+    const char* dup =
+        "upstream b at \"127.0.0.1:80\"\n"
+        "route GET \"/a\" { return forward(b, set_path: \"/x\", set_path: \"/y\") }\n";
+    auto l2 = lex(Str{dup, static_cast<u32>(strlen(dup))});
+    REQUIRE(l2);
+    CHECK(!parse_file(l2.value()));
+}
+
 TEST(route, req_query_string_any_non_short_circuit_eager_rhs_is_observed_real_socket) {
     using namespace rut;
     const char* src =

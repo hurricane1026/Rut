@@ -245,6 +245,9 @@ struct MirTerminator {
     // RIR module's shared header pool.
     static constexpr u32 kMaxHeaders = 16;
     FixedVec<MirHeaderKV, kMaxHeaders> response_headers;
+    // Request-path rewrite for forward(set_path:) — carried verbatim from HIR.
+    // ptr != nullptr → lower_rir emits ReqSetPath before RetForward.
+    Str forward_set_path{};
 };
 
 struct MirBlock {

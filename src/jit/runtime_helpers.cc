@@ -231,6 +231,14 @@ void rut_helper_req_header(const u8* req_data,
     }
 }
 
+// forward(set_path:) — record the path override on the connection. The proxy
+// (on_upstream_connected) rewrites the request line from this before forwarding.
+void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
+    auto* c = static_cast<ConnectionBase*>(conn);
+    c->req_path_overridden = true;
+    c->req_path_override = Str{path, len};
+}
+
 static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
     if (h.len != name_len) return false;
     for (u32 j = 0; j < name_len; j++) {

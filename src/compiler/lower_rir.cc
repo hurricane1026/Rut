@@ -2791,6 +2791,13 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::ForwardUpstream) {
+        // forward(set_path: "..."): emit ReqSetPath(const-str) before the
+        // terminator so the handler records the path override at runtime.
+        if (term.forward_set_path.ptr != nullptr) {
+            auto path = b.emit_const_str(term.forward_set_path, {term.span.line, term.span.col});
+            if (!path || !b.emit_req_set_path(path.value(), {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+        }
         const u16 upstream_id = mir.upstreams[term.upstream_index].id;
         auto upstream =
             b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});
