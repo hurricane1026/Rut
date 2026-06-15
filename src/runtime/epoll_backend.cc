@@ -34,9 +34,15 @@ i32 default_ssl_write(SSL* ssl, const void* buf, i32 len) {
 i32 default_ssl_get_error(SSL* ssl, i32 rc) {
     return SSL_get_error(ssl, rc);
 }
+AlpnProtocol default_alpn_negotiated(SSL* ssl) {
+    return tls_negotiated_protocol(ssl);
+}
 
-EpollTlsHooks default_tls_hooks = {
-    default_ssl_accept, default_ssl_read, default_ssl_write, default_ssl_get_error};
+EpollTlsHooks default_tls_hooks = {default_ssl_accept,
+                                   default_ssl_read,
+                                   default_ssl_write,
+                                   default_ssl_get_error,
+                                   default_alpn_negotiated};
 
 const EpollTlsHooks* get_tls_hooks() {
     if (const EpollTlsHooks* hooks =
@@ -602,6 +608,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         i32 rc = get_tls_hooks()->ssl_accept(ssl);
                         if (rc == 1) {
                             conn.tls_handshake_complete = true;
+                            // Fix the wire protocol from the ALPN result. Hook
+                            // may be null in older test tables → keep Http11.
+                            auto alpn_fn = get_tls_hooks()->alpn_negotiated;
+                            if (alpn_fn && alpn_fn(ssl) == AlpnProtocol::H2)
+                                conn.protocol = ConnProtocol::Http2;
                             set_fd_interest(epoll_fd, fd, conn_id, type, EPOLLIN);
                         } else {
                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, rc);

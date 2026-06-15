@@ -21,6 +21,13 @@ enum class BodyMode : u8 {
     UntilClose,     // Read until EOF (HTTP/1.0)
 };
 
+// Active wire protocol on a connection, fixed after the TLS handshake from the
+// ALPN result (plaintext connections stay Http11). Drives parse/serialize path.
+enum class ConnProtocol : u8 {
+    Http11,
+    Http2,
+};
+
 enum class ConnState : u8 {
     Idle,
     ReadingHeader,
@@ -165,6 +172,9 @@ struct ConnectionBase {
     bool keep_alive;
     bool tls_active;
     bool tls_handshake_complete;
+    // Active wire protocol. Defaults to Http11; set from the ALPN result once
+    // the TLS handshake completes. Plaintext connections always stay Http11.
+    ConnProtocol protocol;
     SSL* tls;
 
     // HTTP pipelining state
@@ -298,6 +308,7 @@ struct ConnectionBase {
         keep_alive = false;
         tls_active = false;
         tls_handshake_complete = false;
+        protocol = ConnProtocol::Http11;
         tls = nullptr;
         pipeline_depth = 0;
         pipeline_stash_len = 0;

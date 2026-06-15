@@ -115,11 +115,19 @@ i32 scripted_ssl_get_error(SSL* /*ssl*/, i32 /*rc*/) {
     return g_scripted_tls->last_error;
 }
 
+// Scripted handshakes use a fake SSL*; never inspect real ALPN state.
+AlpnProtocol scripted_alpn_negotiated(SSL* /*ssl*/) {
+    return AlpnProtocol::None;
+}
+
 struct ScopedTlsHooks {
     explicit ScopedTlsHooks(ScriptedTlsState& state) {
         g_scripted_tls = &state;
-        hooks_ = {
-            scripted_ssl_accept, scripted_ssl_read, scripted_ssl_write, scripted_ssl_get_error};
+        hooks_ = {scripted_ssl_accept,
+                  scripted_ssl_read,
+                  scripted_ssl_write,
+                  scripted_ssl_get_error,
+                  scripted_alpn_negotiated};
         set_epoll_tls_hooks_for_test(&hooks_);
     }
 
@@ -1717,6 +1725,104 @@ TEST(shard, serves_https_requests) {
 TEST(tls, rejects_invalid_private_key_file) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
     CHECK(!tls_ctx.has_value());
+}
+
+// === ALPN selection (pure logic, no crypto) ===
+
+TEST(alpn, picks_h2_when_offered_and_requested) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(alpn_pick(true, client, sizeof(client)) == AlpnProtocol::H2);
+}
+
+TEST(alpn, downgrades_to_http11_when_h2_not_offered) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(alpn_pick(false, client, sizeof(client)) == AlpnProtocol::Http11);
+}
+
+TEST(alpn, picks_http11_when_client_only_offers_http11) {
+    const u8 client[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(alpn_pick(true, client, sizeof(client)) == AlpnProtocol::Http11);
+}
+
+TEST(alpn, no_overlap_returns_none) {
+    // Client offers only h2 but server doesn't advertise it.
+    const u8 client[] = {2, 'h', '2'};
+    CHECK(alpn_pick(false, client, sizeof(client)) == AlpnProtocol::None);
+    // Unknown protocol with no http/1.1 fallback.
+    const u8 spdy[] = {6, 's', 'p', 'd', 'y', '/', '3'};
+    CHECK(alpn_pick(true, spdy, sizeof(spdy)) == AlpnProtocol::None);
+}
+
+TEST(alpn, empty_or_null_client_list_returns_none) {
+    CHECK(alpn_pick(true, nullptr, 0) == AlpnProtocol::None);
+    const u8 empty[] = {0};
+    CHECK(alpn_pick(true, empty, 0) == AlpnProtocol::None);
+}
+
+TEST(alpn, truncated_entry_does_not_overrun) {
+    // Length prefix claims 8 bytes but only 3 remain — must stop, not read OOB.
+    const u8 client[] = {8, 'h', 't', 't'};
+    CHECK(alpn_pick(true, client, sizeof(client)) == AlpnProtocol::None);
+}
+
+// === ALPN negotiation end-to-end over a real loopback TLS handshake ===
+
+namespace {
+// Run one real handshake: a shard with `server_offer_h2` against a client
+// advertising `client_protos`. Returns the protocol the client observes the
+// server selected (the same value the server stores on conn.protocol).
+AlpnProtocol negotiate_alpn(bool server_offer_h2, const u8* client_protos, u32 client_len) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, server_offer_h2);
+    if (!tls_ctx.has_value()) return AlpnProtocol::None;
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    if (lfd < 0) {
+        destroy_tls_server_context(tls_ctx.value());
+        return AlpnProtocol::None;
+    }
+    u16 port = get_port(lfd);
+    shard.init(0, lfd);
+    shard.loop->tls_server = tls_ctx.value();
+    shard.spawn(-1);
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    SSL_CTX_set_alpn_protos(client_ctx, client_protos, client_len);
+
+    i32 c = connect_to(port);
+    set_socket_timeouts(c, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    SSL_set_fd(ssl, c);
+
+    AlpnProtocol result = AlpnProtocol::None;
+    if (SSL_connect(ssl) == 1) {
+        // Client and server observe the same negotiated protocol.
+        result = tls_negotiated_protocol(ssl);
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+    return result;
+}
+}  // namespace
+
+TEST(shard, negotiates_h2_via_alpn) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(negotiate_alpn(/*server_offer_h2=*/true, client, sizeof(client)) == AlpnProtocol::H2);
+}
+
+TEST(shard, downgrades_h2_client_when_server_offers_only_http11) {
+    const u8 client[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    CHECK(negotiate_alpn(/*server_offer_h2=*/false, client, sizeof(client)) ==
+          AlpnProtocol::Http11);
 }
 
 TEST(shard, serves_https_keepalive_requests) {
