@@ -228,6 +228,38 @@ bool h2_value_to_u32(Str v, u32* out) {
     return true;
 }
 
+// A field value must not contain NUL, CR, or LF (RFC 7540 §10.3). These would
+// let a crafted h2 header inject extra headers / split the request once it is
+// serialized back into HTTP/1 syntax to prime the handler's parse cache.
+bool h2_value_ok(Str v) {
+    for (u32 i = 0; i < v.len; i++) {
+        const char kCh = v.ptr[i];
+        if (kCh == '\0' || kCh == '\r' || kCh == '\n') return false;
+    }
+    return true;
+}
+
+// A regular field name must be a non-empty lowercase HTTP/2 token (§8.1.2): no
+// uppercase, no control chars / space / DEL, and no ':' (which would split the
+// HTTP/1 line). Pseudo-headers (leading ':') are validated separately.
+bool h2_name_ok(Str n) {
+    if (n.len == 0) return false;
+    for (u32 i = 0; i < n.len; i++) {
+        const auto kCh = static_cast<unsigned char>(n.ptr[i]);
+        if (kCh >= 'A' && kCh <= 'Z') return false;   // §8.1.2: names are lowercase
+        if (kCh < 0x21 || kCh == 0x7f) return false;  // controls, SP, DEL
+        if (kCh == ':') return false;                 // not a token char
+    }
+    return true;
+}
+
+// Connection-specific headers MUST be treated as malformed in HTTP/2 (§8.1.2.2).
+bool h2_is_connection_header(Str n) {
+    return h2_str_eq(n, "connection") || h2_str_eq(n, "transfer-encoding") ||
+           h2_str_eq(n, "keep-alive") || h2_str_eq(n, "upgrade") ||
+           h2_str_eq(n, "proxy-connection");
+}
+
 }  // namespace
 
 bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
@@ -237,11 +269,16 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
 
     bool have_method = false;
     bool have_path = false;
+    bool seen_regular = false;
     for (u32 i = 0; i < n; i++) {
         const Str kName = hs[i].name;
         const Str kValue = hs[i].value;
         if (kName.len > 0 && kName.ptr[0] == ':') {
-            // Pseudo-header.
+            // Pseudo-header: MUST precede all regular headers (§8.1.2.1), must be
+            // a recognized request pseudo-header, and its value must be
+            // injection-free (a CRLF in :path/:authority would split the request).
+            if (seen_regular) return false;
+            if (!h2_value_ok(kValue)) return false;
             if (h2_str_eq(kName, ":method")) {
                 if (have_method) return false;  // duplicate
                 req->method = h2_method_from_str(kValue);
@@ -256,11 +293,19 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
             } else if (h2_str_eq(kName, ":authority")) {
                 if (req->header_count >= kMaxHeaders) return false;
                 req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+            } else if (!h2_str_eq(kName, ":scheme")) {
+                // :scheme is recognized and dropped; any other pseudo-header
+                // (incl. response pseudo-headers like :status) is malformed.
+                return false;
             }
-            // :scheme and any other pseudo-header are dropped.
             continue;
         }
-        // Regular header.
+        // Regular header: reject names/values that would corrupt the synthesized
+        // HTTP/1 request, plus connection-specific headers (§8.1.2.2).
+        seen_regular = true;
+        if (!h2_name_ok(kName) || !h2_value_ok(kValue)) return false;
+        if (h2_is_connection_header(kName)) return false;
+        if (h2_str_eq(kName, "te") && !h2_str_eq(kValue, "trailers")) return false;
         if (req->header_count >= kMaxHeaders) return false;
         req->headers[req->header_count++] = {kName, kValue};
         if (h2_str_eq(kName, "content-length")) {
@@ -398,6 +443,9 @@ static Http2Error handle_frame(Http2Conn& c,
         }
 
         case Http2FrameType::Continuation: {
+            // A CONTINUATION with no HEADERS awaiting it is a connection error
+            // (§6.10). (A mismatched stream id was already rejected at the top.)
+            if (c.cont_stream == 0) return Http2Error::ProtocolError;
             const Http2Error kAe = append_fragment(c, payload, h.length);
             if (kAe != Http2Error::NoError) return kAe;
             if (h.flags & http2_flag::kEndHeaders) {
@@ -472,7 +520,13 @@ static Http2Error handle_frame(Http2Conn& c,
                 if (c.conn_send_window > kMaxWindow) return Http2Error::FlowControlError;
             } else {
                 Http2Stream* s = c.find_stream(h.stream_id);
-                if (!s) return Http2Error::NoError;  // window update for a closed stream
+                if (!s) {
+                    // Idle stream (peer-initiated id never opened) is a
+                    // connection error (§5.1); a closed stream is benign.
+                    if ((h.stream_id & 1u) != 0 && h.stream_id > c.last_stream_id)
+                        return Http2Error::ProtocolError;
+                    return Http2Error::NoError;
+                }
                 if (kInc == 0) {
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=

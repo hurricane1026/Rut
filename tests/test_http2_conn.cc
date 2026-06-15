@@ -454,6 +454,54 @@ TEST(h2_request, unknown_method_and_duplicates_fail) {
     CHECK_FALSE(h2_headers_to_request(dup, 3, &req));
 }
 
+TEST(h2_request, crlf_in_value_rejected) {
+    // A CRLF in a header value would split the synthesized HTTP/1 request and
+    // inject a header the routing layer never saw (RFC 7540 §10.3).
+    hpack::Header inj[] = {{{":method", 7}, {"GET", 3}},
+                           {{":path", 5}, {"/", 1}},
+                           {{"x-evil", 6}, {"a\r\nx-admin: 1", 13}}};
+    ParsedRequest req;
+    CHECK_FALSE(h2_headers_to_request(inj, 3, &req));
+    // Same for a CRLF smuggled into :path / :authority.
+    hpack::Header bad_path[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/a\r\nb", 5}}};
+    CHECK_FALSE(h2_headers_to_request(bad_path, 2, &req));
+}
+
+TEST(h2_request, uppercase_field_name_rejected) {
+    hpack::Header up[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{"X-Foo", 5}, {"bar", 3}}};
+    ParsedRequest req;
+    CHECK_FALSE(h2_headers_to_request(up, 3, &req));
+}
+
+TEST(h2_request, connection_specific_headers_rejected) {
+    ParsedRequest req;
+    hpack::Header conn[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{"connection", 10}, {"close", 5}}};
+    CHECK_FALSE(h2_headers_to_request(conn, 3, &req));
+    hpack::Header te_bad[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{"te", 2}, {"gzip", 4}}};
+    CHECK_FALSE(h2_headers_to_request(te_bad, 3, &req));
+    // te: trailers is the one allowed value.
+    hpack::Header te_ok[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{"te", 2}, {"trailers", 8}}};
+    CHECK(h2_headers_to_request(te_ok, 3, &req));
+}
+
+TEST(h2_request, pseudo_header_after_regular_rejected) {
+    hpack::Header bad[] = {
+        {{":method", 7}, {"GET", 3}}, {{"accept", 6}, {"*/*", 3}}, {{":path", 5}, {"/", 1}}};
+    ParsedRequest req;
+    CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
+}
+
+TEST(h2_request, unknown_pseudo_header_rejected) {
+    hpack::Header bad[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{":status", 7}, {"200", 3}}};
+    ParsedRequest req;
+    CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
+}
+
 // Write a raw frame (header + payload) into out; return bytes written.
 namespace {
 u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {
@@ -710,6 +758,39 @@ TEST(http2_conn, continuation_wrong_stream_goaway) {
     u32 fn = put_frame(frame, Http2FrameType::Headers, 0, 1, kBlock, 1);
     fn +=
         put_frame(frame + fn, Http2FrameType::Continuation, http2_flag::kEndHeaders, 3, kBlock, 1);
+    u8 in[128];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, stray_continuation_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // A CONTINUATION with no HEADERS awaiting assembly is a connection error.
+    const u8 kBlock[1] = {0x82};
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Continuation, http2_flag::kEndHeaders, 1, kBlock, 1);
+    u8 in[128];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, window_update_on_idle_stream_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // WINDOW_UPDATE on stream 5 before it is ever opened (idle) → PROTOCOL_ERROR.
+    u8 frame[64];
+    u32 fn = write_window_update(frame, 5, 1000);
     u8 in[128];
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
