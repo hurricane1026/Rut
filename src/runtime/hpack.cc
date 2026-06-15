@@ -107,6 +107,67 @@ constexpr HuffTrie build_trie() {
 
 constexpr HuffTrie kTrie = build_trie();
 
+// Table-driven Huffman decode FSM (nghttp2-style), built at compile time from
+// the bit trie. Each step consumes a 4-bit nibble: from state `node`, fsm_next
+// is the resulting trie node and fsm_sym (>=0) the symbol completed during the
+// nibble (at most one, since the shortest code is 5 bits). fsm_fail marks an
+// EOS symbol completing in the stream (a decode error). pad_ok[node] marks a
+// state that is a valid trailing-padding position (root, or 1..7 ones along the
+// EOS prefix). The HPACK Huffman code is complete, so every nibble transition
+// is valid mid-stream — no failure path except EOS and end-of-input padding.
+struct HuffFsm {
+    i16 next[kMaxNodes][16];
+    i16 sym[kMaxNodes][16];
+    u8 fail[kMaxNodes][16];
+    u8 pad_ok[kMaxNodes];
+};
+
+constexpr HuffFsm build_fsm() {
+    HuffFsm f{};
+    for (u32 n = 0; n < kMaxNodes; n++) {
+        f.pad_ok[n] = 0;
+        for (u32 v = 0; v < 16; v++) {
+            f.next[n][v] = 0;
+            f.sym[n][v] = -1;
+            f.fail[n][v] = 0;
+        }
+    }
+    for (u32 n = 0; n < kTrie.node_count; n++) {
+        for (u32 v = 0; v < 16; v++) {
+            i16 cur = static_cast<i16>(n);
+            i16 emitted = -1;
+            u8 failed = 0;
+            for (i32 b = 3; b >= 0; b--) {
+                const u32 kBit = (v >> static_cast<u32>(b)) & 1u;
+                cur = kTrie.child[cur][kBit];
+                if (cur < 0) break;  // unreachable: code is complete
+                if (kTrie.sym[cur] >= 0) {
+                    if (kTrie.sym[cur] == static_cast<i16>(kEosSym))
+                        failed = 1;
+                    else
+                        emitted = kTrie.sym[cur];
+                    cur = 0;  // back to root for the remaining bits
+                }
+            }
+            f.next[n][v] = cur;
+            f.sym[n][v] = emitted;
+            f.fail[n][v] = failed;
+        }
+    }
+    // Valid padding states: root and each node along the all-ones (EOS) prefix
+    // at depth 1..7.
+    f.pad_ok[0] = 1;
+    i16 node = 0;
+    for (u32 depth = 1; depth <= 7; depth++) {
+        node = kTrie.child[node][1];
+        if (node < 0) break;
+        f.pad_ok[node] = 1;
+    }
+    return f;
+}
+
+constexpr HuffFsm kFsm = build_fsm();
+
 }  // namespace
 
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
@@ -181,30 +242,27 @@ u32 huffman_encode(u8* out, const u8* src, u32 len) {
 
 i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
     i16 node = 0;
-    u32 partial = 0;       // bits walked since the last leaf (since root)
-    bool all_ones = true;  // whether those bits are all 1 (valid EOS padding)
     u32 o = 0;
     for (u32 i = 0; i < len; i++) {
         const u8 kByte = src[i];
-        for (i32 b = 7; b >= 0; b--) {
-            const u32 kBit = (kByte >> static_cast<u32>(b)) & 1u;
-            partial++;
-            if (kBit == 0) all_ones = false;
-            node = kTrie.child[node][kBit];
-            if (node < 0) return -1;  // not a valid code path
-            if (kTrie.sym[node] >= 0) {
-                const i16 kSym = kTrie.sym[node];
-                if (kSym == static_cast<i16>(kEosSym)) return -1;  // EOS in stream
-                if (o >= cap) return -1;                           // overflow
-                out[o++] = static_cast<u8>(kSym);
-                node = 0;
-                partial = 0;
-                all_ones = true;
-            }
+        // High nibble then low nibble — one FSM step each.
+        const u32 kHi = kByte >> 4;
+        if (kFsm.fail[node][kHi]) return -1;  // EOS symbol in the stream
+        if (kFsm.sym[node][kHi] >= 0) {
+            if (o >= cap) return -1;
+            out[o++] = static_cast<u8>(kFsm.sym[node][kHi]);
         }
+        node = kFsm.next[node][kHi];
+        const u32 kLo = kByte & 0xf;
+        if (kFsm.fail[node][kLo]) return -1;
+        if (kFsm.sym[node][kLo] >= 0) {
+            if (o >= cap) return -1;
+            out[o++] = static_cast<u8>(kFsm.sym[node][kLo]);
+        }
+        node = kFsm.next[node][kLo];
     }
-    // Trailing bits must be a valid EOS-prefix padding: all 1s and <= 7 bits.
-    if (partial > 7 || !all_ones) return -1;
+    // Trailing bits must be a valid EOS-prefix padding (root or 1..7 ones).
+    if (!kFsm.pad_ok[node]) return -1;
     return static_cast<i32>(o);
 }
 

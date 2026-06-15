@@ -389,6 +389,71 @@ TEST(hpack_encode, roundtrip_literal_name_and_value) {
     CHECK_EQ(dyn.nent, 0u);  // encoder never indexes -> decoder adds nothing
 }
 
+// === Deterministic round-trip fuzz (encode -> decode equality) ===
+
+namespace {
+u32 g_rng = 0x12345678u;
+u32 next_rng() {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+}  // namespace
+
+TEST(hpack_fuzz, encode_decode_roundtrip) {
+    g_rng = 0x9e3779b9u;
+    u8 src[8192];  // generated header bytes
+    u8 block[16384];
+    u8 scratch[16384];
+    hpack::Header out[64];
+
+    for (u32 iter = 0; iter < 2000; iter++) {
+        const u32 nh = 1 + (next_rng() % 8);
+        // Generate `nh` headers into src, recording offsets.
+        u32 sp = 0;
+        u32 noff[8], nlen[8], voff[8], vlen[8];
+        bool fit = true;
+        for (u32 i = 0; i < nh; i++) {
+            const u32 nl = 1 + (next_rng() % 20);
+            const u32 vl = next_rng() % 60;
+            if (sp + nl + vl > sizeof(src)) {
+                fit = false;
+                break;
+            }
+            noff[i] = sp;
+            nlen[i] = nl;
+            // Names: printable, lowercase-ish (avoids ':' pseudo-header ambiguity).
+            for (u32 j = 0; j < nl; j++) src[sp++] = static_cast<u8>('a' + (next_rng() % 26));
+            voff[i] = sp;
+            vlen[i] = vl;
+            // Values: full octet range to stress Huffman.
+            for (u32 j = 0; j < vl; j++) src[sp++] = static_cast<u8>(next_rng() & 0xff);
+        }
+        if (!fit) continue;
+
+        // Encode all headers into one block.
+        u32 bp = 0;
+        for (u32 i = 0; i < nh; i++) {
+            const Str name{reinterpret_cast<const char*>(src + noff[i]), nlen[i]};
+            const Str value{reinterpret_cast<const char*>(src + voff[i]), vlen[i]};
+            bp += hpack::encode_header(block + bp, name, value);
+        }
+
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        u32 dn = 0;
+        REQUIRE(hpack::decode_header_block(dyn, block, bp, scratch, sizeof(scratch), out, 64, &dn));
+        REQUIRE(dn == nh);
+        for (u32 i = 0; i < nh; i++) {
+            const Str name{reinterpret_cast<const char*>(src + noff[i]), nlen[i]};
+            const Str value{reinterpret_cast<const char*>(src + voff[i]), vlen[i]};
+            CHECK(out[i].name.eq(name));
+            CHECK(out[i].value.eq(value));
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
