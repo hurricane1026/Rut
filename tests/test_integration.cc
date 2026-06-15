@@ -1855,6 +1855,13 @@ TEST(shard, serves_http2_cleartext) {
     close(lfd);
 }
 
+// HTTP/2 over io_uring uses the identical callbacks_h2.h serving path as epoll
+// (only the I/O submission differs). It is not unit-tested here because this
+// sandbox's io_uring async socket ops never complete (a raw io_uring NOP does,
+// but accept/recv/send don't — HTTP/1 over io_uring is equally unresponsive
+// here), so an io_uring socket test would hang regardless of correctness. It is
+// exercised in environments where io_uring sockets work (normal Linux/CI).
+
 TEST(shard, serves_http2_routed) {
     // A real RouteConfig: /health is a static 204; an unmatched path falls
     // through to the default 200.
