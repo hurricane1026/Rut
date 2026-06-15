@@ -454,6 +454,219 @@ TEST(h2_request, unknown_method_and_duplicates_fail) {
     CHECK_FALSE(h2_headers_to_request(dup, 3, &req));
 }
 
+// Write a raw frame (header + payload) into out; return bytes written.
+namespace {
+u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {
+    Http2FrameHeader h;
+    h.length = plen;
+    h.type = static_cast<u8>(type);
+    h.flags = flags;
+    h.stream_id = stream_id;
+    write_frame_header(out, h);
+    for (u32 i = 0; i < plen; i++) out[kFrameHeaderSize + i] = payload[i];
+    return kFrameHeaderSize + plen;
+}
+}  // namespace
+
+TEST(http2_conn, padded_data_frame) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[256];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, false);
+    // PADDED DATA: [padlen=3]["hi"][3 pad bytes], END_STREAM.
+    const u8 kPayload[] = {3, 'h', 'i', 0, 0, 0};
+    fn += put_frame(frame + fn,
+                    Http2FrameType::Data,
+                    http2_flag::kPadded | http2_flag::kEndStream,
+                    1,
+                    kPayload,
+                    sizeof(kPayload));
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(cap.data_len, 2u);  // padding stripped
+    CHECK_EQ(cap.data[0], 'h');
+}
+
+TEST(http2_conn, headers_with_priority_flag) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // HEADERS with PRIORITY: 5 priority octets precede the block fragment.
+    u8 block[64];
+    block[0] = 0;  // exclusive(1)+stream dep(31)
+    block[1] = 0;
+    block[2] = 0;
+    block[3] = 0;
+    block[4] = 15;    // weight
+    block[5] = 0x82;  // :method GET
+    u8 frame[128];
+    u32 fn = put_frame(frame,
+                       Http2FrameType::Headers,
+                       http2_flag::kEndHeaders | http2_flag::kPriority | http2_flag::kEndStream,
+                       1,
+                       block,
+                       6);
+    u8 in[128];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(cap.headers_calls, 1u);
+    CHECK(name_is(cap, 0, ":method"));
+}
+
+TEST(http2_conn, window_update_zero_increment) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // Connection-level WINDOW_UPDATE with increment 0 → PROTOCOL_ERROR GOAWAY.
+    const u8 kZero[4] = {0, 0, 0, 0};
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::WindowUpdate, 0, 0, kZero, 4);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, settings_initial_window_adjusts_streams) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[256];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, false);
+    // SETTINGS raising INITIAL_WINDOW_SIZE to 100000.
+    Http2Settings s;
+    s.set_defaults();
+    s.initial_window_size = 100000;
+    fn += write_settings_frame(frame + fn, s);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    Http2Stream* st = c.find_stream(1);
+    REQUIRE(st != nullptr);
+    // 65535 default + (100000 - 65535) delta.
+    CHECK_EQ(st->send_window, 100000);
+}
+
+TEST(http2_conn, oversized_frame_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // Frame header claiming a length above the default max frame size (16384):
+    // process rejects on the header alone, before any payload.
+    u8 fh[kFrameHeaderSize];
+    Http2FrameHeader h;
+    h.length = 16385;
+    h.type = static_cast<u8>(Http2FrameType::Data);
+    h.flags = 0;
+    h.stream_id = 1;
+    write_frame_header(fh, h);
+    u8 in[64];
+    u32 inlen = with_preface(in, fh, sizeof(fh));
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, unknown_frame_type_ignored) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kBody[] = {1, 2, 3};
+    u8 frame[64];
+    u32 fn = put_frame(frame, static_cast<Http2FrameType>(0xfa), 0, 0, kBody, sizeof(kBody));
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(r.consumed, inlen);  // unknown frame consumed, no error
+}
+
+TEST(http2_conn, ping_bad_length_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kShort[4] = {0, 0, 0, 0};  // PING must be 8 octets
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Ping, 0, 0, kShort, 4);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, data_on_stream_zero_protocol_error) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kData[] = {'x'};
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Data, 0, 0, kData, 1);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, write_response_with_body_and_headers) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    const hpack::Header hdrs[] = {{{"content-type", 12}, {"text/plain", 10}}};
+    u8 out[256];
+    u32 n = http2_write_response(
+        out, sizeof(out), enc, 1, 200, hdrs, 1, reinterpret_cast<const u8*>("hi"), 2);
+    // Decode the HEADERS frame and confirm :status, the header, content-length.
+    Http2FrameHeader h;
+    REQUIRE(parse_frame_header(out, n, &h) == ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((h.flags & http2_flag::kEndStream) == 0);  // body follows
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header dh[16];
+    u8 scratch[256];
+    u32 dn = 0;
+    REQUIRE(hpack::decode_header_block(
+        dyn, out + kFrameHeaderSize, h.length, scratch, sizeof(scratch), dh, 16, &dn));
+    bool has_status = false, has_ct = false, has_cl = false;
+    for (u32 i = 0; i < dn; i++) {
+        if (dh[i].name.eq(Str{":status", 7}) && dh[i].value.eq(Str{"200", 3})) has_status = true;
+        if (dh[i].name.eq(Str{"content-type", 12})) has_ct = true;
+        if (dh[i].name.eq(Str{"content-length", 14}) && dh[i].value.eq(Str{"2", 1})) has_cl = true;
+    }
+    CHECK(has_status);
+    CHECK(has_ct);
+    CHECK(has_cl);
+    // The trailing DATA frame carries the body with END_STREAM.
+    Http2FrameHeader df;
+    parse_frame_header(out + kFrameHeaderSize + h.length, n - kFrameHeaderSize - h.length, &df);
+    CHECK_EQ(df.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK((df.flags & http2_flag::kEndStream) != 0);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
