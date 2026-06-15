@@ -7730,6 +7730,192 @@ TEST(route, forward_set_path_rewrites_upstream_request) {
     rir.destroy();
 }
 
+// A backend that reads a full request (headers + Content-Length body) and
+// echoes "<path>|<body>" so a test can verify both survive a set_path rewrite.
+struct PostEchoServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~PostEchoServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<PostEchoServer*>(arg);
+        i32 client = -1;
+        while (s->running.load(std::memory_order_acquire)) {
+            client = accept(s->listen_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            char req[4096];
+            u32 total = 0;
+            u32 want = 0;  // header_end + content_length, once known
+            while (total < sizeof(req)) {
+                i32 n = recv_timeout(client, req + total, sizeof(req) - total, 1000);
+                if (n <= 0) break;
+                total += static_cast<u32>(n);
+                if (want == 0) {
+                    for (u32 k = 0; k + 3 < total; k++) {
+                        if (req[k] == '\r' && req[k + 1] == '\n' && req[k + 2] == '\r' &&
+                            req[k + 3] == '\n') {
+                            const u32 hdr_end = k + 4;
+                            u32 cl = 0;
+                            const char* nk = "content-length:";
+                            for (u32 a = 0; a + 15 < hdr_end; a++) {
+                                bool m = true;
+                                for (u32 b = 0; b < 15; b++) {
+                                    char c = req[a + b];
+                                    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+                                    if (c != nk[b]) {
+                                        m = false;
+                                        break;
+                                    }
+                                }
+                                if (!m) continue;
+                                u32 p = a + 15;
+                                while (p < hdr_end && req[p] == ' ') p++;
+                                while (p < hdr_end && req[p] >= '0' && req[p] <= '9')
+                                    cl = cl * 10 + static_cast<u32>(req[p++] - '0');
+                                break;
+                            }
+                            want = hdr_end + cl;
+                            break;
+                        }
+                    }
+                }
+                if (want != 0 && total >= want) break;
+            }
+            u32 i = 0;
+            while (i < total && req[i] != ' ') i++;
+            const u32 ps = i + 1;
+            u32 pe = ps;
+            while (pe < total && req[pe] != ' ') pe++;
+            u32 body_off = 0;
+            for (u32 k = 0; k + 3 < total; k++) {
+                if (req[k] == '\r' && req[k + 1] == '\n' && req[k + 2] == '\r' &&
+                    req[k + 3] == '\n') {
+                    body_off = k + 4;
+                    break;
+                }
+            }
+            const u32 plen = pe > ps ? pe - ps : 0;
+            const u32 blen = (body_off && total > body_off) ? total - body_off : 0;
+            char resp[4352];
+            int rn = snprintf(resp,
+                              sizeof(resp),
+                              "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n%.*s|%.*s",
+                              plen + 1 + blen,
+                              static_cast<int>(plen),
+                              req + ps,
+                              static_cast<int>(blen),
+                              req + body_off);
+            if (rn > 0) (void)send_all(client, resp, static_cast<u32>(rn));
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// set_path on a POST whose body arrives AFTER the headers (forcing the
+// streaming-body path that derives offsets from req_header_end): the rewrite
+// must shift req_header_end too, or the forwarded body is mis-framed. The
+// upstream echoes "<path>|<body>" — both must be intact.
+TEST(route, forward_set_path_streaming_post_body) {
+    using namespace rut;
+    PostEchoServer echo;
+    REQUIRE(echo.setup());
+
+    char src_buf[256];
+    const int src_len =
+        snprintf(src_buf,
+                 sizeof(src_buf),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route POST \"/api\" { return forward(backend, set_path: \"/rewritten\") }\n",
+                 echo.port);
+    REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    {
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 800));
+        i32 c = connect_to(proxy.port);
+        REQUIRE(c >= 0);
+        // Headers first, then body separately, so the initial recv has only the
+        // headers and the body goes through the streaming path.
+        const char kHead[] = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
+        REQUIRE(send_all(c, kHead, sizeof(kHead) - 1));
+        usleep(30000);
+        REQUIRE(send_all(c, "hello", 5));
+        char buf[1024];
+        u32 total = 0;
+        while (total < sizeof(buf)) {
+            i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 2000);
+            if (n <= 0) break;
+            total += static_cast<u32>(n);
+            if (buf_contains(buf, total, "\r\n\r\n", 4)) break;
+        }
+        close(c);
+        CHECK(buf_contains(buf, total, "/rewritten|hello", 16));
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
 // forward() rejects an unknown kwarg and a duplicated set_path.
 TEST(route, forward_invalid_kwargs_rejected) {
     using namespace rut;

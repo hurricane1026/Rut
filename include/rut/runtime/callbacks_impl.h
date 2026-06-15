@@ -1106,10 +1106,19 @@ inline void rewrite_request_line_path(Connection& conn) {
     }
     __builtin_memcpy(buf + path_start, conn.req_path_override.ptr, new_len);
     conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(total) + delta));
-    // The path sits within the initial forward chunk, so shift its length too.
-    if (delta != 0 && conn.req_initial_send_len > 0) {
-        const i64 adjusted = static_cast<i64>(conn.req_initial_send_len) + delta;
-        conn.req_initial_send_len = adjusted > 0 ? static_cast<u32>(adjusted) : 0;
+    // The path sits at the front of the request, so every absolute offset past
+    // it shifts by delta: the initial-forward length AND req_header_end (which
+    // the ContentLength body-streaming path uses to locate later body bytes in
+    // recv_buf — see on_*_request_body_recvd). Leaving req_header_end stale
+    // would mis-frame a streaming POST body. req_path/req_path_canon become
+    // stale views here but are not read after routing.
+    if (delta != 0) {
+        if (conn.req_initial_send_len > 0) {
+            const i64 adj = static_cast<i64>(conn.req_initial_send_len) + delta;
+            conn.req_initial_send_len = adj > 0 ? static_cast<u32>(adj) : 0;
+        }
+        const i64 he = static_cast<i64>(conn.req_header_end) + delta;
+        conn.req_header_end = he > 0 ? static_cast<u32>(he) : 0;
     }
 }
 
