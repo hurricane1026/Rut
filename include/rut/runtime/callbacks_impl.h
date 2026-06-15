@@ -20,6 +20,20 @@
 
 namespace rut {
 
+// Per-shard round-robin cursor for upstream backend (load-balancing)
+// selection. Shards are share-nothing — one OS thread each — so a thread_local
+// table is naturally per-shard: no atomics, no cross-shard contention (same
+// rationale as the thread_local parse cache). Returns the index into
+// UpstreamTarget::addrs[] to use for the next connect to `upstream_id`.
+// A single-backend upstream (count <= 1) always returns 0.
+inline u32 next_backend_index(u16 upstream_id, u32 backend_count) {
+    static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
+    if (backend_count <= 1 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    const u32 kIdx = rr_cursor[upstream_id] % backend_count;
+    rr_cursor[upstream_id] = static_cast<u16>(rr_cursor[upstream_id] + 1);
+    return kIdx;
+}
+
 u8 map_log_method(HttpMethod method);
 u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
 void capture_request_metadata(Connection& conn);
@@ -301,7 +315,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_idx = route->upstream_id;
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-        if (!loop->submit_connect(conn, &target.addr, sizeof(target.addr))) {
+        const u32 kBackend = next_backend_index(route->upstream_id, target.addr_count);
+        if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
             conn.upstream_idx = 0;
@@ -742,7 +757,10 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_start_us = monotonic_us();
-                if (!loop->submit_connect(conn, &target.addr, sizeof(target.addr))) {
+                const u32 kBackend =
+                    next_backend_index(static_cast<u16>(upstream_id), target.addr_count);
+                if (!loop->submit_connect(
+                        conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
                     ::close(conn.upstream_fd);
                     conn.upstream_fd = -1;
                     conn.upstream_idx = 0;
@@ -880,7 +898,9 @@ void handle_jit_outcome(Loop* loop,
             conn.upstream_fd = kUpstreamFd;
             conn.upstream_start_us = monotonic_us();
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            loop->submit_connect(conn, &target.addr, sizeof(target.addr));
+            const u32 kBackend =
+                next_backend_index(static_cast<u16>(outcome.upstream_id), target.addr_count);
+            loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
             return;
         }
         case JitDispatchOutcome::Kind::Error:

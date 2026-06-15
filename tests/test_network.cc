@@ -1508,10 +1508,36 @@ TEST(route, upstream_target_addr) {
     auto idx = cfg.add_upstream("api", 0x0A000101, 9090);
     REQUIRE(idx.has_value());
     auto& t = cfg.upstreams[idx.value()];
-    CHECK_EQ(t.addr.sin_family, AF_INET);
-    CHECK_EQ(__builtin_bswap16(t.addr.sin_port), 9090u);
-    CHECK_EQ(__builtin_bswap32(t.addr.sin_addr.s_addr), 0x0A000101u);
+    CHECK_EQ(t.addr_count, 1u);
+    CHECK_EQ(t.addrs[0].sin_family, AF_INET);
+    CHECK_EQ(__builtin_bswap16(t.addrs[0].sin_port), 9090u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[0].sin_addr.s_addr), 0x0A000101u);
     CHECK_EQ(t.name[0], 'a');
+}
+
+TEST(route, upstream_multi_backend) {
+    RouteConfig cfg;
+    auto idx = cfg.add_upstream("api", 0x0A000101, 8080);  // first backend
+    REQUIRE(idx.has_value());
+    // Append two more endpoints for load balancing.
+    CHECK(cfg.add_upstream_backend(idx.value(), 0x0A000102, 8080));
+    CHECK(cfg.add_upstream_backend(idx.value(), 0x0A000103, 8080));
+    auto& t = cfg.upstreams[idx.value()];
+    CHECK_EQ(t.addr_count, 3u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[1].sin_addr.s_addr), 0x0A000102u);
+    CHECK_EQ(__builtin_bswap32(t.addrs[2].sin_addr.s_addr), 0x0A000103u);
+    // A bad upstream index is rejected.
+    CHECK(!cfg.add_upstream_backend(99, 0x0A000104, 8080));
+}
+
+TEST(route, upstream_backend_list_full) {
+    UpstreamTarget t;
+    t.set_addr(0x0A000101, 8080);  // count = 1
+    // Fill to capacity, then reject the overflow.
+    for (u32 i = 1; i < UpstreamTarget::kMaxBackends; i++) CHECK(t.add_addr(0x0A000101 + i, 8080));
+    CHECK_EQ(t.addr_count, UpstreamTarget::kMaxBackends);
+    CHECK(!t.add_addr(0xDEADBEEF, 9999));  // full
+    CHECK_EQ(t.addr_count, UpstreamTarget::kMaxBackends);
 }
 
 // === UpstreamPool ===
