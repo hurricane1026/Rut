@@ -5890,25 +5890,55 @@ TEST(route, populate_route_config_accepts_pre_bound_upstreams) {
 
 // Round-robin backend selection: a multi-backend upstream rotates through its
 // endpoints; a single-backend upstream always returns index 0. Uses dedicated
-// upstream ids so the per-shard (thread_local) cursor starts at 0.
+// upstream ids so the per-shard (thread_local) cursor + health start clean.
 TEST(route, round_robin_backend_selection) {
     using namespace rut;
+    const u64 kNow = 1'000'000;  // no backend ejected at this clock
     // 3 backends on upstream id 40 → 0,1,2,0,1,2.
-    CHECK_EQ(next_backend_index(40, 3), 0u);
-    CHECK_EQ(next_backend_index(40, 3), 1u);
-    CHECK_EQ(next_backend_index(40, 3), 2u);
-    CHECK_EQ(next_backend_index(40, 3), 0u);
-    CHECK_EQ(next_backend_index(40, 3), 1u);
+    CHECK_EQ(select_backend(40, 3, kNow), 0u);
+    CHECK_EQ(select_backend(40, 3, kNow), 1u);
+    CHECK_EQ(select_backend(40, 3, kNow), 2u);
+    CHECK_EQ(select_backend(40, 3, kNow), 0u);
+    CHECK_EQ(select_backend(40, 3, kNow), 1u);
     // A different upstream id has an independent cursor.
-    CHECK_EQ(next_backend_index(41, 2), 0u);
-    CHECK_EQ(next_backend_index(41, 2), 1u);
-    CHECK_EQ(next_backend_index(41, 2), 0u);
+    CHECK_EQ(select_backend(41, 2, kNow), 0u);
+    CHECK_EQ(select_backend(41, 2, kNow), 1u);
+    CHECK_EQ(select_backend(41, 2, kNow), 0u);
     // Single backend (or none) never rotates.
-    CHECK_EQ(next_backend_index(42, 1), 0u);
-    CHECK_EQ(next_backend_index(42, 1), 0u);
-    CHECK_EQ(next_backend_index(42, 0), 0u);
+    CHECK_EQ(select_backend(42, 1, kNow), 0u);
+    CHECK_EQ(select_backend(42, 1, kNow), 0u);
+    CHECK_EQ(select_backend(42, 0, kNow), 0u);
     // Out-of-range upstream id is clamped to 0 (defensive).
-    CHECK_EQ(next_backend_index(RouteConfig::kMaxUpstreams, 3), 0u);
+    CHECK_EQ(select_backend(RouteConfig::kMaxUpstreams, 3, kNow), 0u);
+}
+
+// Passive circuit breaking: kBackendFailThreshold consecutive connect failures
+// eject a backend for the cooldown; selection skips it until the cooldown
+// lapses; a success clears the record.
+TEST(route, backend_ejection_skips_unhealthy) {
+    using namespace rut;
+    const u16 kUid = 45;  // dedicated id → clean health/cursor
+    const u64 kT0 = 10'000'000;
+    // Fail backend 0 up to the threshold → ejected.
+    for (u16 i = 0; i < kBackendFailThreshold; i++)
+        record_backend_result(kUid, 0, /*success=*/false, kT0);
+    CHECK(backend_ejected(kUid, 0, kT0));
+    // With backend 0 ejected, selection over 2 backends only returns 1.
+    CHECK_EQ(select_backend(kUid, 2, kT0), 1u);
+    CHECK_EQ(select_backend(kUid, 2, kT0), 1u);
+    // After the cooldown lapses, backend 0 is eligible again.
+    const u64 kAfter = kT0 + kBackendEjectCooldownUs + 1;
+    CHECK(!backend_ejected(kUid, 0, kAfter));
+    // A success clears the failure record outright.
+    record_backend_result(kUid, 0, /*success=*/true, kAfter);
+    CHECK(!backend_ejected(kUid, 0, kT0));  // record cleared, not time-gated
+    // If every backend is ejected, selection still returns something (fail-open).
+    const u16 kUid2 = 46;
+    for (u16 b = 0; b < 2; b++)
+        for (u16 i = 0; i < kBackendFailThreshold; i++)
+            record_backend_result(kUid2, b, /*success=*/false, kT0);
+    const u32 pick = select_backend(kUid2, 2, kT0);
+    CHECK(pick < 2u);
 }
 
 // `upstream X { backends: [...] }` compiles through the IR and populates a

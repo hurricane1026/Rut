@@ -111,7 +111,8 @@ struct ConnectionBase {
     // Upstream (only when proxying)
     i32 upstream_fd;
     u16 upstream_idx;
-    u8 upstream_attempts;  // connect attempts so far (initial + retries) this request
+    u8 upstream_attempts;     // connect attempts so far (initial + retries) this request
+    u8 upstream_backend_idx;  // which backend endpoint the current connect targets
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -298,6 +299,7 @@ struct ConnectionBase {
         upstream_fd = -1;
         upstream_idx = 0;
         upstream_attempts = 0;
+        upstream_backend_idx = 0;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;
