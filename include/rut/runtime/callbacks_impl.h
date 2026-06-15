@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks.h"
+#include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
@@ -184,6 +185,30 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
+    }
+
+    // HTTP/2 entry: either ALPN negotiated h2 (TLS), or the cleartext h2c
+    // connection preface appears on the wire. A real HTTP/1 request never
+    // starts with the preface ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), so the
+    // prefix check can't misfire on HTTP/1 traffic.
+    if (conn.protocol == ConnProtocol::Http2) {
+        enter_h2<Loop>(loop, conn, ev);
+        return;
+    }
+    if (!conn.tls_active && conn.pipeline_depth == 0) {
+        const ParseStatus kPf = match_client_preface(conn.recv_buf.data(), conn.recv_buf.len());
+        if (kPf == ParseStatus::Complete) {
+            conn.protocol = ConnProtocol::Http2;
+            enter_h2<Loop>(loop, conn, ev);
+            return;
+        }
+        if (kPf == ParseStatus::Incomplete) {
+            // A strict prefix of the preface so far — wait for the full 24 bytes
+            // before committing to h2c.
+            conn.transition_to_reading_header(&on_header_received<Loop>);
+            loop->submit_recv(conn);
+            return;
+        }
     }
 
     // NOTE: recv_buf is NOT reset here — proxy flow needs recv_buf.data()

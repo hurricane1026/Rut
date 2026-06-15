@@ -11,6 +11,9 @@
 #endif
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
+#include "rut/runtime/hpack.h"
+#include "rut/runtime/http2_conn.h"
+#include "rut/runtime/http2_frame.h"
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
@@ -1725,6 +1728,106 @@ TEST(shard, serves_https_requests) {
 TEST(tls, rejects_invalid_private_key_file) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
     CHECK(!tls_ctx.has_value());
+}
+
+// === HTTP/2 end-to-end (cleartext h2c over the real epoll serving path) ===
+
+namespace {
+bool write_all_fd(i32 fd, const u8* data, u32 len) {
+    u32 sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, data + sent, len - sent);
+        if (n <= 0) return false;
+        sent += static_cast<u32>(n);
+    }
+    return true;
+}
+
+// Scan h2 frames for a HEADERS frame on stream 1, HPACK-decode it, and return
+// its :status (0 if not found / not yet fully received).
+u16 h2_response_status(const u8* buf, u32 len) {
+    u32 pos = 0;
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == 1) {
+            hpack::Header hs[32];
+            u8 scratch[4096];
+            u32 nh = 0;
+            if (hpack::decode_header_block(dyn,
+                                           buf + pos + kFrameHeaderSize,
+                                           h.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           hs,
+                                           32,
+                                           &nh)) {
+                for (u32 i = 0; i < nh; i++) {
+                    if (hs[i].name.eq(Str{":status", 7})) {
+                        u16 s = 0;
+                        for (u32 j = 0; j < hs[i].value.len; j++)
+                            s = static_cast<u16>(s * 10 + (hs[i].value.ptr[j] - '0'));
+                        return s;
+                    }
+                }
+            }
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return 0;
+}
+}  // namespace
+
+TEST(shard, serves_http2_cleartext) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Client: connection preface + empty SETTINGS + a GET / HEADERS (END_STREAM).
+    u8 out[512];
+    u32 n = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) out[n++] = kClientPreface[i];
+    Http2Settings cs;
+    cs.set_defaults();
+    n += write_settings_frame(out + n, cs);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/", 1}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    // Server replies with its SETTINGS, a SETTINGS ACK, and the :status response.
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 5 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_response_status(resp, total) != 0) break;
+    }
+    // No RouteConfig attached → route-less fallback answers 200 (matches HTTP/1).
+    CHECK_EQ(h2_response_status(resp, total), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
 }
 
 // === ALPN selection (pure logic, no crypto) ===
@@ -6968,6 +7071,82 @@ TEST(route, dsl_regex_guard_real_socket) {
     rir.destroy();
 }
 #endif
+
+// End-to-end cleartext HTTP/2 (h2c, prior knowledge) over a real epoll shard.
+namespace {
+u32 h2_extract_status(const u8* buf, u32 len) {
+    u32 pos = 0;
+    while (pos + kFrameHeaderSize <= len) {
+        Http2FrameHeader h;
+        parse_frame_header(buf + pos, len - pos, &h);
+        if (pos + kFrameHeaderSize + h.length > len) break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers)) {
+            hpack::DynamicTable dyn;
+            dyn.init(4096);
+            u8 scratch[4096];
+            hpack::Header hs[32];
+            u32 nh = 0;
+            if (hpack::decode_header_block(dyn,
+                                           buf + pos + kFrameHeaderSize,
+                                           h.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           hs,
+                                           32,
+                                           &nh)) {
+                for (u32 i = 0; i < nh; i++) {
+                    if (hs[i].name.eq(Str{":status", 7}) && hs[i].value.len == 3) {
+                        return static_cast<u32>((hs[i].value.ptr[0] - '0') * 100 +
+                                                (hs[i].value.ptr[1] - '0') * 10 +
+                                                (hs[i].value.ptr[2] - '0'));
+                    }
+                }
+            }
+            return 0;
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return 0;
+}
+}  // namespace
+
+TEST(io, serves_h2c_prior_knowledge) {
+    TestServer srv;
+    REQUIRE(srv.setup(40));
+    i32 c = connect_to(srv.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 req[512];
+    u32 rp = 0;
+    for (u32 i = 0; i < kClientPrefaceLen; i++) req[rp++] = kClientPreface[i];
+    Http2Settings cs;
+    cs.set_defaults();
+    rp += write_settings_frame(req + rp, cs);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    rp += http2_write_headers(req + rp, sizeof(req) - rp, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(send_all(c, reinterpret_cast<const char*>(req), rp));
+
+    u8 rbuf[8192];
+    u32 rlen = 0;
+    u32 status = 0;
+    for (int tries = 0; tries < 10 && rlen < sizeof(rbuf); tries++) {
+        i32 n = recv_timeout(
+            c, reinterpret_cast<char*>(rbuf) + rlen, static_cast<i32>(sizeof(rbuf) - rlen), 1000);
+        if (n <= 0) break;
+        rlen += static_cast<u32>(n);
+        status = h2_extract_status(rbuf, rlen);
+        if (status != 0) break;
+    }
+    CHECK_EQ(status, 200u);
+    close(c);
+    srv.teardown();
+}
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

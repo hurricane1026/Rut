@@ -280,6 +280,9 @@ int main(int argc, char** argv) {
     const char* config_path = nullptr;
     const char* access_log_path = nullptr;
     bool access_log_compress = false;
+    // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
+    // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
+    bool offer_h2 = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
@@ -372,6 +375,7 @@ int main(int argc, char** argv) {
         }
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
         if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
+        if (str_eq(argv[i], "--h2")) offer_h2 = true;
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
@@ -408,7 +412,7 @@ int main(int argc, char** argv) {
 
     TlsServerContext* tls_server = nullptr;
     if (tls_cert_path && tls_key_path) {
-        auto tls_result = create_tls_server_context(tls_cert_path, tls_key_path);
+        auto tls_result = create_tls_server_context(tls_cert_path, tls_key_path, offer_h2);
         if (!tls_result) {
             write_error("Failed to initialize TLS", tls_result.error());
             return 1;
