@@ -182,7 +182,7 @@ int main() {
         b.warmup(50000);
         b.bytes_per_op(header_bytes(kRespHeaders, kRespHeaderCount));
         b.print_header();
-        b.run("encode_header x6", [&] {
+        b.run("rut encode_header x6", [&] {
             u8 out[1024];
             u32 o = 0;
             for (u32 i = 0; i < kRespHeaderCount; i++)
@@ -190,6 +190,29 @@ int main() {
             bench::do_not_optimize(&o);
             bench::do_not_optimize(out);
         });
+
+        // nghttp2 deflate baseline. NOTE: not strictly apples-to-apples — rut's
+        // first-cut encoder is stateless (no dynamic-table indexing), while
+        // nghttp2 indexes into its dynamic table after the first call, so it
+        // does less work (and emits fewer bytes) in steady state.
+        nghttp2_nv nva[kRespHeaderCount];
+        for (u32 i = 0; i < kRespHeaderCount; i++) {
+            nva[i].name = const_cast<u8*>(reinterpret_cast<const u8*>(kRespHeaders[i].name.ptr));
+            nva[i].value = const_cast<u8*>(reinterpret_cast<const u8*>(kRespHeaders[i].value.ptr));
+            nva[i].namelen = kRespHeaders[i].name.len;
+            nva[i].valuelen = kRespHeaders[i].value.len;
+            nva[i].flags = NGHTTP2_NV_FLAG_NONE;
+        }
+        nghttp2_hd_deflater* def = nullptr;
+        nghttp2_hd_deflate_new(&def, 4096);
+        b.run("nghttp2 deflate", [&] {
+            u8 out[1024];
+            ssize_t o = nghttp2_hd_deflate_hd(def, out, sizeof(out), nva, kRespHeaderCount);
+            bench::do_not_optimize(&o);
+            bench::do_not_optimize(out);
+        });
+        nghttp2_hd_deflate_del(def);
+        b.compare();
         bench::out("\n");
     }
 
