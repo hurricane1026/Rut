@@ -894,10 +894,32 @@ struct Parser {
                 if (!lparen) return core::make_unexpected(lparen.error());
                 auto name = expect(TokenType::Ident);
                 if (!name) return core::make_unexpected(name.error());
-                auto rparen = expect(TokenType::RParen);
-                if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.kind = AstStmtKind::ForwardUpstream;
                 stmt.name = name.value()->text;
+                // Optional kwargs after the upstream name. Currently:
+                //   set_path: "<StringLit>"  — rewrite the outbound request path.
+                // Each at most once; analyze/lowering emits ReqSetPath.
+                while (take(TokenType::Comma)) {
+                    auto kw = expect(TokenType::Ident);
+                    if (!kw) return core::make_unexpected(kw.error());
+                    const Str kw_text = kw.value()->text;
+                    auto colon = expect(TokenType::Colon);
+                    if (!colon) return core::make_unexpected(colon.error());
+                    if (kw_text.eq({"set_path", 8})) {
+                        if (stmt.has_forward_set_path)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto val = expect(TokenType::StringLit);
+                        if (!val) return core::make_unexpected(val.error());
+                        stmt.forward_set_path = val.value()->text;
+                        stmt.has_forward_set_path = true;
+                    } else {
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                    }
+                }
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;
             }

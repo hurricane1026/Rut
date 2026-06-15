@@ -7922,6 +7922,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return frontend_error(FrontendError::UnknownUpstream, stmt.span, stmt.name);
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.upstream_index = upstream_index;
+    if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
     return term;
 }
 

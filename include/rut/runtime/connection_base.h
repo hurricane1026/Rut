@@ -115,6 +115,12 @@ struct ConnectionBase {
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    // forward(set_path:) request mutation: a JIT handler may rewrite the request
+    // path before proxying. The runtime helper records the new path (a view into
+    // stable JIT constant memory); on_upstream_connected rewrites the request
+    // line in recv_buf before forwarding. Reset per request.
+    bool req_path_overridden;
+    Str req_path_override;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -304,6 +310,8 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
+        req_path_overridden = false;
+        req_path_override = {nullptr, 0};
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

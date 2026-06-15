@@ -148,4 +148,10 @@ void rut_helper_str_trim_prefix(const char* s,
                                 const char** out_ptr,
                                 rut::u32* out_len);
 
+// forward(set_path:) request mutation — records a request-path override on the
+// connection (a JIT handler calls this before returning forward). `conn` is the
+// opaque Connection*; `path` must point at stable memory (a JIT string
+// constant), since the proxy reads it later when rewriting the request line.
+void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
+
 }  // extern "C"

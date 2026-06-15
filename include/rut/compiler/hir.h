@@ -682,6 +682,10 @@ struct HirTerminator {
     // means "no kwarg" (parser rejects explicit empty dicts).
     static constexpr u32 kMaxHeaders = 16;
     FixedVec<HirHeaderKV, kMaxHeaders> response_headers;
+    // Request-path rewrite for `forward(name, set_path: "...")` (literal). ptr
+    // != nullptr means a path override is present; lowering emits ReqSetPath
+    // before the RetForward terminator.
+    Str forward_set_path{};
 };
 
 struct HirGuardBody {

@@ -279,6 +279,17 @@ struct Ctx {
         return fn_req_header;
     }
 
+    // void rut_helper_req_set_path(ptr conn, ptr path, i32 len)
+    LLVMValueRef fn_req_set_path = nullptr;
+    LLVMValueRef get_req_set_path() {
+        if (!fn_req_set_path) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
+            fn_req_set_path = LLVMAddFunction(llvm_mod, "rut_helper_req_set_path", ft);
+        }
+        return fn_req_set_path;
+    }
+
     // void rut_helper_req_cookie(ptr, i32, ptr, i32, ptr, ptr, ptr)
     LLVMValueRef get_req_cookie() {
         if (!fn_req_cookie) {
@@ -847,6 +858,22 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "opt.ptr");
             opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "opt.len");
             c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::ReqSetPath: {
+            // operands[0] is the new path (a Str value, e.g. a ConstStr). Record
+            // it on the connection via the runtime helper; the proxy rewrites the
+            // outbound request line from it before forwarding.
+            LLVMValueRef path = c.get_value(inst.operands[0]);
+            LLVMValueRef p = LLVMBuildExtractValue(c.builder, path, 0, "setpath.ptr");
+            LLVMValueRef l = LLVMBuildExtractValue(c.builder, path, 1, "setpath.len");
+            LLVMValueRef args[] = {c.param_conn, p, l};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_path()),
+                           c.get_req_set_path(),
+                           args,
+                           3,
+                           "");
             break;
         }
         case rir::Opcode::ReqParam: {

@@ -209,6 +209,11 @@ struct AstStatement {
     // length uniquely distinguishes "absent" from "present".
     static constexpr u32 kMaxResponseHeaders = 16;
     FixedVec<AstHeaderKV, kMaxResponseHeaders> response_headers;
+    // Request-path rewrite from `forward(name, set_path: "...")`. Literal only
+    // for now; lowered to a ReqSetPath op before the forward terminator so the
+    // proxy rewrites the outbound request line.
+    Str forward_set_path{};
+    bool has_forward_set_path = false;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

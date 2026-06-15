@@ -931,6 +931,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
+            out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;
             // Both HIR and MIR cap at 16 headers per terminator, so a
             // straight copy cannot truncate. Static-assert the cap
