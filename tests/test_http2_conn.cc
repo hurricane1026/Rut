@@ -805,6 +805,206 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     CHECK((df.flags & http2_flag::kEndStream) != 0);
 }
 
+// Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
+// more frames. Helper to reduce boilerplate in the branch tests below.
+namespace {
+u32 open_stream1(u8* frame, u32 cap) {
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    return http2_write_headers(frame, cap, 1, hs, 2, /*end_stream=*/false);
+}
+}  // namespace
+
+TEST(http2_conn, priority_frame_ignored) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kPrio[5] = {0, 0, 0, 0, 16};
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Priority, 0, 1, kPrio, 5);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(r.consumed, inlen);
+}
+
+TEST(http2_conn, connection_window_update_accepted) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kInc[4] = {0, 0, 0x10, 0};  // +4096 on the connection
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::WindowUpdate, 0, 0, kInc, 4);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(c.conn_send_window, static_cast<i64>(kDefaultInitialWindowSize) + 4096);
+}
+
+TEST(http2_conn, stream_window_update_zero_rsts) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[256];
+    u32 fn = open_stream1(frame, sizeof(frame));
+    const u8 kZero[4] = {0, 0, 0, 0};
+    fn += put_frame(frame + fn, Http2FrameType::WindowUpdate, 0, 1, kZero, 4);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);  // stream-level error
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+}
+
+TEST(http2_conn, data_without_end_stream_replenishes_stream_window) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[256];
+    u32 fn = open_stream1(frame, sizeof(frame));
+    fn +=
+        http2_write_data(frame + fn, 1, reinterpret_cast<const u8*>("ab"), 2, /*end_stream=*/false);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_EQ(cap.data_len, 2u);
+    CHECK_FALSE(cap.data_end);
+    // Both connection- and stream-level WINDOW_UPDATE replenish the 2 octets.
+    u32 wu = 0;
+    u32 pos = 0;
+    while (pos + kFrameHeaderSize <= ow) {
+        Http2FrameHeader h;
+        parse_frame_header(out + pos, ow - pos, &h);
+        if (h.type == static_cast<u8>(Http2FrameType::WindowUpdate)) wu++;
+        pos += kFrameHeaderSize + h.length;
+    }
+    CHECK_GE(wu, 2u);
+}
+
+TEST(http2_conn, data_on_half_closed_stream_rsts) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // HEADERS with END_STREAM half-closes the stream; a following DATA is illegal.
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[256];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/true);
+    fn += http2_write_data(frame + fn, 1, reinterpret_cast<const u8*>("x"), 1, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+}
+
+TEST(http2_conn, padded_data_missing_pad_length_is_error) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[256];
+    u32 fn = open_stream1(frame, sizeof(frame));
+    // PADDED flag set but zero-length payload → no pad-length octet → error.
+    fn += put_frame(frame + fn, Http2FrameType::Data, http2_flag::kPadded, 1, nullptr, 0);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, closed_stream_slot_is_reused) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[256];
+    u32 fn = open_stream1(frame, sizeof(frame));  // stream 1 (slot 0)
+    const u8 kErr[4] = {0, 0, 0, 8};              // RST_STREAM CANCEL on stream 1
+    fn += put_frame(frame + fn, Http2FrameType::RstStream, 0, 1, kErr, 4);
+    // A new stream (id 3) should reuse the now-Closed slot.
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    fn += http2_write_headers(frame + fn, sizeof(frame) - fn, 3, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK(c.find_stream(3) != nullptr);
+    CHECK_EQ(c.nstreams, 1u);  // slot reused, not grown
+}
+
+TEST(http2_conn, headers_padded_missing_pad_length_is_error) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // HEADERS with PADDED set but zero-length payload → no pad-length octet.
+    u8 frame[64];
+    u32 fn = put_frame(frame,
+                       Http2FrameType::Headers,
+                       http2_flag::kEndHeaders | http2_flag::kPadded,
+                       1,
+                       nullptr,
+                       0);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, bad_hpack_block_is_compression_error) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // Indexed header field with index 0 is illegal HPACK → decode fails.
+    const u8 kBlock[1] = {0x80};
+    u8 frame[64];
+    u32 fn = put_frame(frame,
+                       Http2FrameType::Headers,
+                       http2_flag::kEndHeaders | http2_flag::kEndStream,
+                       1,
+                       kBlock,
+                       1);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, connection_window_update_overflow_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kBig[4] = {0x7f, 0xff, 0xff, 0xff};  // +2^31-1 overflows the conn window
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::WindowUpdate, 0, 0, kBig, 4);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
