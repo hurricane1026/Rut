@@ -4959,6 +4959,62 @@ TEST(shard, serves_http2_request_body) {
     close(lfd);
 }
 
+// An h2 request body larger than the engine's per-connection buffer → 413.
+TEST(shard, serves_http2_request_body_too_large) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_echo_body_handler, /*needs_req_body=*/true));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Two 10 KB DATA frames (each fits a 16 KB recv slice, but together exceed
+    // the 16 KB body-synth cap → overflow → 413). Single frames can't exceed the
+    // recv slice, so the overflow must come from accumulation across frames.
+    static u8 big[32000];
+    u32 n = h2_client_prologue(big);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{"content-length", 14}, {"20000", 5}},
+    };
+    n += http2_write_headers(big + n, sizeof(big) - n, 1, hs, 4, /*end_stream=*/false);
+    static u8 body[10000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = 'a';
+    n += http2_write_data(big + n, 1, body, sizeof(body), /*end_stream=*/false);
+    n += http2_write_data(big + n, 1, body, sizeof(body), /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, big, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 413u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(route, jit_handler_unknown_body_idx_with_headers_falls_back) {
     using namespace rut;
 

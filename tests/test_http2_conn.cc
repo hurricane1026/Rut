@@ -632,6 +632,144 @@ TEST(http2_conn, data_on_stream_zero_protocol_error) {
     CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
 }
 
+TEST(http2_conn, settings_ack_ignored) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Settings, http2_flag::kAck, 0, nullptr, 0);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(r.consumed, inlen);
+}
+
+TEST(http2_conn, settings_ack_with_payload_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kPayload[6] = {0, 4, 0, 0, 0, 0};  // ACK must be empty
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Settings, http2_flag::kAck, 0, kPayload, 6);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, settings_invalid_value_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kPayload[6] = {0, 0x02, 0, 0, 0, 0x02};  // ENABLE_PUSH=2 (invalid)
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Settings, 0, 0, kPayload, 6);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, headers_on_stream_zero_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kBlock[1] = {0x82};
+    u8 frame[64];
+    u32 fn = put_frame(frame,
+                       Http2FrameType::Headers,
+                       http2_flag::kEndHeaders | http2_flag::kEndStream,
+                       0,
+                       kBlock,
+                       1);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, continuation_wrong_stream_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kBlock[1] = {0x82};
+    u8 frame[64];
+    // HEADERS on stream 1 without END_HEADERS, then CONTINUATION on stream 3.
+    u32 fn = put_frame(frame, Http2FrameType::Headers, 0, 1, kBlock, 1);
+    fn +=
+        put_frame(frame + fn, Http2FrameType::Continuation, http2_flag::kEndHeaders, 3, kBlock, 1);
+    u8 in[128];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, goaway_from_peer_drains) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kPayload[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // last_stream_id=0, NO_ERROR
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::Goaway, 0, 0, kPayload, 8);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);  // peer GOAWAY is not our error; loop drains normally
+    CHECK_EQ(r.consumed, inlen);
+}
+
+TEST(http2_conn, rst_stream_on_stream_zero_goaway) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const u8 kErr[4] = {0, 0, 0, 8};  // CANCEL on stream 0 (illegal)
+    u8 frame[64];
+    u32 fn = put_frame(frame, Http2FrameType::RstStream, 0, 0, kErr, 4);
+    u8 in[64];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, window_update_overflow_rsts_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[256];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, false);
+    // Increment that pushes the stream window past 2^31-1 → FLOW_CONTROL_ERROR.
+    const u8 kBig[4] = {0x7f, 0xff, 0xff, 0xff};
+    fn += put_frame(frame + fn, Http2FrameType::WindowUpdate, 0, 1, kBig, 4);
+    u8 in[384];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);  // stream-level error, connection survives
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+}
+
 TEST(http2_conn, write_response_with_body_and_headers) {
     hpack::Encoder enc;
     enc.init(4096);
