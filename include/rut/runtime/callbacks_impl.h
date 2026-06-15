@@ -20,18 +20,71 @@
 
 namespace rut {
 
-// Per-shard round-robin cursor for upstream backend (load-balancing)
-// selection. Shards are share-nothing — one OS thread each — so a thread_local
-// table is naturally per-shard: no atomics, no cross-shard contention (same
-// rationale as the thread_local parse cache). Returns the index into
-// UpstreamTarget::addrs[] to use for the next connect to `upstream_id`.
-// A single-backend upstream (count <= 1) always returns 0.
-inline u32 next_backend_index(u16 upstream_id, u32 backend_count) {
+// --- Upstream backend selection + passive health (circuit breaking) ---
+//
+// Shards are share-nothing — one OS thread each — so per-shard state lives in
+// thread_local tables: no atomics, no cross-shard contention (same rationale as
+// the thread_local parse cache). Two tables, indexed by upstream_id (and backend
+// index): a round-robin cursor, and a passive-health record per backend.
+//
+// Passive circuit breaking: after kBackendFailThreshold consecutive connect
+// failures a backend is ejected for kBackendEjectCooldownUs; selection skips
+// ejected backends. A successful connect clears the record.
+inline constexpr u16 kBackendFailThreshold = 3;
+inline constexpr u64 kBackendEjectCooldownUs = 5'000'000;  // 5s
+
+struct BackendHealth {
+    u16 fails;           // consecutive connect failures
+    u64 eject_until_us;  // ejected while now < this (0 = healthy)
+};
+
+// thread_local health table. Returns a mutable ref, or nullptr if indices are
+// out of range (caller then treats the backend as always-healthy).
+inline BackendHealth* backend_health(u16 upstream_id, u32 backend_idx) {
+    static thread_local BackendHealth health[RouteConfig::kMaxUpstreams]
+                                            [UpstreamTarget::kMaxBackends] = {};
+    if (upstream_id >= RouteConfig::kMaxUpstreams || backend_idx >= UpstreamTarget::kMaxBackends)
+        return nullptr;
+    return &health[upstream_id][backend_idx];
+}
+
+inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
+    const BackendHealth* h = backend_health(upstream_id, backend_idx);
+    return h != nullptr && now_us < h->eject_until_us;
+}
+
+// Record the outcome of a connect attempt to (upstream_id, backend_idx).
+// On success: clear the record. On failure: bump the consecutive-failure count
+// and eject the backend once it crosses the threshold.
+inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us) {
+    BackendHealth* h = backend_health(upstream_id, backend_idx);
+    if (h == nullptr) return;
+    if (success) {
+        h->fails = 0;
+        h->eject_until_us = 0;
+        return;
+    }
+    if (h->fails < 0xffff) h->fails++;
+    if (h->fails >= kBackendFailThreshold) h->eject_until_us = now_us + kBackendEjectCooldownUs;
+}
+
+// Pick the next backend index for `upstream_id` via round-robin, skipping
+// ejected backends. If every backend is ejected, falls back to plain
+// round-robin (serving through a possibly-down backend beats refusing). A
+// single-backend upstream (count <= 1) always returns 0.
+inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
     if (backend_count <= 1 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
-    const u32 kIdx = rr_cursor[upstream_id] % backend_count;
-    rr_cursor[upstream_id] = static_cast<u16>(rr_cursor[upstream_id] + 1);
-    return kIdx;
+    for (u32 step = 0; step < backend_count; step++) {
+        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
+        if (!backend_ejected(upstream_id, idx, now_us)) {
+            rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
+            return idx;
+        }
+    }
+    const u32 idx = rr_cursor[upstream_id] % backend_count;
+    rr_cursor[upstream_id] = static_cast<u16>((rr_cursor[upstream_id] + 1) % backend_count);
+    return idx;
 }
 
 u8 map_log_method(HttpMethod method);
@@ -316,7 +369,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-        const u32 kBackend = next_backend_index(route->upstream_id, target.addr_count);
+        const u32 kBackend =
+            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+        conn.upstream_backend_idx = static_cast<u8>(kBackend);
         if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
@@ -758,8 +813,9 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_start_us = monotonic_us();
-                const u32 kBackend =
-                    next_backend_index(static_cast<u16>(upstream_id), target.addr_count);
+                const u32 kBackend = select_backend(
+                    static_cast<u16>(upstream_id), target.addr_count, conn.upstream_start_us);
+                conn.upstream_backend_idx = static_cast<u8>(kBackend);
                 if (!loop->submit_connect(
                         conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
                     ::close(conn.upstream_fd);
@@ -901,8 +957,9 @@ void handle_jit_outcome(Loop* loop,
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
             conn.upstream_start_us = monotonic_us();
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            const u32 kBackend =
-                next_backend_index(static_cast<u16>(outcome.upstream_id), target.addr_count);
+            const u32 kBackend = select_backend(
+                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
+            conn.upstream_backend_idx = static_cast<u8>(kBackend);
             loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
             return;
         }
@@ -975,7 +1032,9 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     conn.upstream_attempts++;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-    const u32 kBackend = next_backend_index(conn.upstream_idx, target.addr_count);
+    const u32 kBackend =
+        select_backend(conn.upstream_idx, target.addr_count, conn.upstream_start_us);
+    conn.upstream_backend_idx = static_cast<u8>(kBackend);
     return loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
 }
 
@@ -984,8 +1043,12 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result < 0) {
-        // Connect failed (e.g. ECONNREFUSED). Try the next backend within the
-        // retry budget; only answer 502 once all candidates are exhausted.
+        // Connect failed (e.g. ECONNREFUSED). Record the failure against this
+        // backend (passive health → ejection past the threshold), then try the
+        // next backend within the retry budget; only answer 502 once all
+        // candidates are exhausted.
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         if (try_connect_next_backend(loop, conn)) return;
         static const char k502[] =
             "HTTP/1.1 502 Bad Gateway\r\n"
@@ -1001,6 +1064,10 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
+
+    // Connect succeeded — clear this backend's passive-health record.
+    record_backend_result(
+        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
 
     if (conn.req_malformed) {
         loop->close_conn(conn);
