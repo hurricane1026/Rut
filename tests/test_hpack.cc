@@ -454,6 +454,74 @@ TEST(hpack_fuzz, encode_decode_roundtrip) {
     }
 }
 
+// === Stateful encoder: dynamic-table indexing ===
+
+TEST(hpack_encoder, dynamic_indexing_roundtrip) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    hpack::DynamicTable dec;
+    dec.init(4096);
+    u8 block[256];
+    u8 scratch[256];
+    hpack::Header out[8];
+    u32 n = 0;
+
+    // First occurrence: literal with incremental indexing → added to both tables.
+    u32 b1 = enc.encode(block, cstr("custom-key"), cstr("custom-value"));
+    REQUIRE(hpack::decode_header_block(dec, block, b1, scratch, sizeof(scratch), out, 8, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(out[0], "custom-key", "custom-value"));
+
+    // Second identical field: now an exact dynamic match → a single index octet.
+    u32 b2 = enc.encode(block, cstr("custom-key"), cstr("custom-value"));
+    CHECK_EQ(b2, 1u);
+    REQUIRE(hpack::decode_header_block(dec, block, b2, scratch, sizeof(scratch), out, 8, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(out[0], "custom-key", "custom-value"));
+}
+
+TEST(hpack_encoder, static_exact_match_is_one_byte) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    u8 block[64];
+    // :method GET is static index 2 — one octet, no dynamic insertion.
+    u32 n = enc.encode(block, cstr(":method"), cstr("GET"));
+    CHECK_EQ(n, 1u);
+    CHECK_EQ(block[0], 0x82);
+    CHECK_EQ(enc.dyn.nent, 0u);  // static full matches don't grow the table
+}
+
+TEST(hpack_encoder, sequence_stays_in_sync_with_decoder) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    hpack::DynamicTable dec;
+    dec.init(4096);
+    const char* names[] = {":method", ":path", "accept", "x-request-id"};
+    const char* values[] = {"GET", "/api/v1/users", "application/json", "abc-123"};
+    // Encode the same request set three times; decode each block against one
+    // shared decoder. Steady-state blocks must shrink as indexing kicks in.
+    u32 first_size = 0;
+    u32 last_size = 0;
+    for (u32 round = 0; round < 3; round++) {
+        u8 block[512];
+        u32 bp = 0;
+        for (u32 i = 0; i < 4; i++) bp += enc.encode(block + bp, cstr(names[i]), cstr(values[i]));
+        if (round == 0) first_size = bp;
+        last_size = bp;
+
+        u8 scratch[1024];
+        hpack::Header out[16];
+        u32 n = 0;
+        REQUIRE(hpack::decode_header_block(dec, block, bp, scratch, sizeof(scratch), out, 16, &n));
+        REQUIRE(n == 4u);
+        for (u32 i = 0; i < 4; i++) {
+            CHECK(out[i].name.eq(cstr(names[i])));
+            CHECK(out[i].value.eq(cstr(values[i])));
+        }
+    }
+    CHECK(last_size < first_size);  // dynamic indexing compressed the repeats
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -476,6 +476,28 @@ i32 static_find_name(Str name) {
     return 0;
 }
 
+// Encoder-side dynamic table lookups: return the 1-based HPACK index of a
+// matching entry (dynamic indices follow the 61 static entries; newest = 62),
+// or 0. j counts from the newest entry, matching the protocol index order.
+i32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
+    for (u32 j = 0; j < d.nent; j++) {
+        const DynamicTable::Entry& e = d.ents[d.nent - 1 - j];
+        const Str kEn{reinterpret_cast<const char*>(d.buf + e.off), e.nlen};
+        const Str kEv{reinterpret_cast<const char*>(d.buf + e.off + e.nlen), e.vlen};
+        if (kEn.eq(name) && kEv.eq(value)) return static_cast<i32>(kStaticCount + 1 + j);
+    }
+    return 0;
+}
+
+i32 dyn_find_name(const DynamicTable& d, Str name) {
+    for (u32 j = 0; j < d.nent; j++) {
+        const DynamicTable::Entry& e = d.ents[d.nent - 1 - j];
+        const Str kEn{reinterpret_cast<const char*>(d.buf + e.off), e.nlen};
+        if (kEn.eq(name)) return static_cast<i32>(kStaticCount + 1 + j);
+    }
+    return 0;
+}
+
 }  // namespace
 
 void DynamicTable::init(u32 settings_max) {
@@ -575,6 +597,29 @@ u32 encode_header(u8* out, Str name, Str value) {
     u32 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
     if (kNameIdx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
+    return o;
+}
+
+u32 Encoder::encode(u8* out, Str name, Str value) {
+    // Exact (name,value) match → Indexed Header Field (§6.1, 1 byte for small
+    // indices). Check the dynamic table first: in steady state most fields hit
+    // it, and it is far smaller than the 61-entry static table, so this skips
+    // the static scan on the common path. Either index is valid per §2.3.3.
+    const i32 kDynFull = dyn_find_full(dyn, name, value);
+    if (kDynFull > 0) return encode_integer(out, static_cast<u32>(kDynFull), 7, 0x80);
+    const i32 kStaticFull = static_find_full(name, value);
+    if (kStaticFull > 0) return encode_integer(out, static_cast<u32>(kStaticFull), 7, 0x80);
+
+    // Otherwise Literal with Incremental Indexing (§6.2.1, 6-bit name index)
+    // and add the field so the next occurrence indexes to 1 byte.
+    i32 nidx = static_find_name(name);
+    if (nidx == 0) nidx = dyn_find_name(dyn, name);
+    u32 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
+    if (nidx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
+    o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
+    // Index resolution above used the pre-add table — the same order the peer's
+    // decoder sees — so adding now keeps both tables in sync.
+    dyn_add(dyn, name, value);
     return o;
 }
 

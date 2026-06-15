@@ -106,4 +106,23 @@ bool decode_header_block(DynamicTable& dyn,
 // the worst case (~ name.len + value.len + a few prefix octets).
 u32 encode_header(u8* out, Str name, Str value);
 
+// Stateful HPACK encoder. Unlike encode_header (which never indexes), this
+// indexes into a dynamic table: an exact (name,value) match emits a 1-byte
+// index, and every other field is emitted with incremental indexing (§6.2.1)
+// and added to the table — so repeated headers compress to an index in steady
+// state (matching what nghttp2's deflater does). A standard HPACK decoder (incl.
+// rut's decode_header_block) applies the same instructions and stays in sync.
+//
+// Usage: init(max_size) once per connection, then encode() per header field.
+struct Encoder {
+    DynamicTable dyn;
+
+    void init(u32 max_size) { dyn.init(max_size); }
+
+    // Encode one header field into out, possibly emitting an index and growing
+    // the dynamic table. Returns octets written. name/value must not alias
+    // dyn.buf (callers pass their own header storage, so this always holds).
+    u32 encode(u8* out, Str name, Str value);
+};
+
 }  // namespace rut::hpack

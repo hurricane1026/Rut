@@ -268,6 +268,75 @@ TEST(hpack_diff, fuzz_both_directions) {
     }
 }
 
+TEST(hpack_diff, our_indexing_encoder_vs_nghttp2_inflate) {
+    // rut's stateful Encoder (dynamic indexing) must produce blocks nghttp2's
+    // inflater decodes correctly across a multi-request sequence.
+    const KV reqs[] = {
+        {":method", "GET"},
+        {":scheme", "https"},
+        {":authority", "www.example.com"},
+        {":path", "/"},
+        {"cookie", "sid=abc123; theme=dark"},
+        {"user-agent", "rut/1.0"},
+    };
+    constexpr u32 kN = sizeof(reqs) / sizeof(reqs[0]);
+
+    hpack::Encoder enc;
+    enc.init(4096);
+    nghttp2_hd_inflater* inf = nullptr;
+    REQUIRE(nghttp2_hd_inflate_new(&inf) == 0);
+
+    for (u32 round = 0; round < 3; round++) {
+        u8 block[1024];
+        u32 bp = 0;
+        for (u32 i = 0; i < kN; i++)
+            bp += enc.encode(block + bp,
+                             Str{reqs[i].name, slen(reqs[i].name)},
+                             Str{reqs[i].value, slen(reqs[i].value)});
+        // Decode this block with nghttp2.
+        KV out[16];
+        char arena[2048];
+        u32 nout = 0;
+        u32 ap = 0;
+        const u8* in = block;
+        size_t inlen = bp;
+        bool ok = true;
+        for (;;) {
+            nghttp2_nv nv;
+            int flags = 0;
+            ssize_t rv = nghttp2_hd_inflate_hd2(inf, &nv, &flags, in, inlen, 1);
+            if (rv < 0) {
+                ok = false;
+                break;
+            }
+            in += rv;
+            inlen -= static_cast<size_t>(rv);
+            if (flags & NGHTTP2_HD_INFLATE_EMIT) {
+                char* nm = arena + ap;
+                for (size_t k = 0; k < nv.namelen; k++) arena[ap++] = static_cast<char>(nv.name[k]);
+                arena[ap++] = '\0';
+                char* vl = arena + ap;
+                for (size_t k = 0; k < nv.valuelen; k++)
+                    arena[ap++] = static_cast<char>(nv.value[k]);
+                arena[ap++] = '\0';
+                out[nout].name = nm;
+                out[nout].value = vl;
+                nout++;
+            }
+            if (flags & NGHTTP2_HD_INFLATE_FINAL) break;
+            if (rv == 0 && inlen == 0) break;
+        }
+        nghttp2_hd_inflate_end_headers(inf);
+        REQUIRE(ok);
+        REQUIRE(nout == kN);
+        for (u32 i = 0; i < kN; i++) {
+            CHECK(kv_eq(out[i].name, reqs[i].name));
+            CHECK(kv_eq(out[i].value, reqs[i].value));
+        }
+    }
+    nghttp2_hd_inflate_del(inf);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

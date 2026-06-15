@@ -182,7 +182,8 @@ int main() {
         b.warmup(50000);
         b.bytes_per_op(header_bytes(kRespHeaders, kRespHeaderCount));
         b.print_header();
-        b.run("rut encode_header x6", [&] {
+        // Stateless encoder (re-encodes every literal each call).
+        b.run("rut encode_header (stateless)", [&] {
             u8 out[1024];
             u32 o = 0;
             for (u32 i = 0; i < kRespHeaderCount; i++)
@@ -191,10 +192,21 @@ int main() {
             bench::do_not_optimize(out);
         });
 
-        // nghttp2 deflate baseline. NOTE: not strictly apples-to-apples — rut's
-        // first-cut encoder is stateless (no dynamic-table indexing), while
-        // nghttp2 indexes into its dynamic table after the first call, so it
-        // does less work (and emits fewer bytes) in steady state.
+        // Stateful encoder with dynamic-table indexing, reused across calls —
+        // apples-to-apples with nghttp2's reused deflater (both index in steady
+        // state).
+        hpack::Encoder renc;
+        renc.init(4096);
+        b.run("rut Encoder (indexing)", [&] {
+            u8 out[1024];
+            u32 o = 0;
+            for (u32 i = 0; i < kRespHeaderCount; i++)
+                o += renc.encode(out + o, kRespHeaders[i].name, kRespHeaders[i].value);
+            bench::do_not_optimize(&o);
+            bench::do_not_optimize(out);
+        });
+
+        // nghttp2 deflate baseline (reused deflater → indexes in steady state).
         nghttp2_nv nva[kRespHeaderCount];
         for (u32 i = 0; i < kRespHeaderCount; i++) {
             nva[i].name = const_cast<u8*>(reinterpret_cast<const u8*>(kRespHeaders[i].name.ptr));
