@@ -240,4 +240,284 @@ u32 encode_string(u8* out, const u8* src, u32 len) {
     return kHdr + len;
 }
 
+namespace {
+
+// Static table (RFC 7541 Appendix A), 1-based in the protocol. Entries with no
+// predefined value carry an empty value string.
+struct StaticEntry {
+    const char* name;
+    u16 nlen;
+    const char* value;
+    u16 vlen;
+};
+
+constexpr StaticEntry kStatic[] = {
+    {":authority", 10, "", 0},
+    {":method", 7, "GET", 3},
+    {":method", 7, "POST", 4},
+    {":path", 5, "/", 1},
+    {":path", 5, "/index.html", 11},
+    {":scheme", 7, "http", 4},
+    {":scheme", 7, "https", 5},
+    {":status", 7, "200", 3},
+    {":status", 7, "204", 3},
+    {":status", 7, "206", 3},
+    {":status", 7, "304", 3},
+    {":status", 7, "400", 3},
+    {":status", 7, "404", 3},
+    {":status", 7, "500", 3},
+    {"accept-charset", 14, "", 0},
+    {"accept-encoding", 15, "gzip, deflate", 13},
+    {"accept-language", 15, "", 0},
+    {"accept-ranges", 13, "", 0},
+    {"accept", 6, "", 0},
+    {"access-control-allow-origin", 27, "", 0},
+    {"age", 3, "", 0},
+    {"allow", 5, "", 0},
+    {"authorization", 13, "", 0},
+    {"cache-control", 13, "", 0},
+    {"content-disposition", 19, "", 0},
+    {"content-encoding", 16, "", 0},
+    {"content-language", 16, "", 0},
+    {"content-length", 14, "", 0},
+    {"content-location", 16, "", 0},
+    {"content-range", 13, "", 0},
+    {"content-type", 12, "", 0},
+    {"cookie", 6, "", 0},
+    {"date", 4, "", 0},
+    {"etag", 4, "", 0},
+    {"expect", 6, "", 0},
+    {"expires", 7, "", 0},
+    {"from", 4, "", 0},
+    {"host", 4, "", 0},
+    {"if-match", 8, "", 0},
+    {"if-modified-since", 17, "", 0},
+    {"if-none-match", 13, "", 0},
+    {"if-range", 8, "", 0},
+    {"if-unmodified-since", 19, "", 0},
+    {"last-modified", 13, "", 0},
+    {"link", 4, "", 0},
+    {"location", 8, "", 0},
+    {"max-forwards", 12, "", 0},
+    {"proxy-authenticate", 18, "", 0},
+    {"proxy-authorization", 19, "", 0},
+    {"range", 5, "", 0},
+    {"referer", 7, "", 0},
+    {"refresh", 7, "", 0},
+    {"retry-after", 11, "", 0},
+    {"server", 6, "", 0},
+    {"set-cookie", 10, "", 0},
+    {"strict-transport-security", 25, "", 0},
+    {"transfer-encoding", 17, "", 0},
+    {"user-agent", 10, "", 0},
+    {"vary", 4, "", 0},
+    {"via", 3, "", 0},
+    {"www-authenticate", 16, "", 0},
+};
+
+constexpr u32 kStaticCount = sizeof(kStatic) / sizeof(kStatic[0]);  // 61
+
+bool str_eq(Str a, const char* b, u16 blen) {
+    if (a.len != blen) return false;
+    for (u32 i = 0; i < blen; i++)
+        if (a.ptr[i] != b[i]) return false;
+    return true;
+}
+
+// --- Dynamic table operations (bytes kept packed in insertion order) ---
+
+void dyn_clear(DynamicTable& d) {
+    d.nent = 0;
+    d.byte_used = 0;
+    d.table_size = 0;
+}
+
+void dyn_evict_oldest(DynamicTable& d) {
+    if (d.nent == 0) return;
+    const DynamicTable::Entry kOld = d.ents[0];
+    const u32 kBlen = static_cast<u32>(kOld.nlen) + kOld.vlen;
+    __builtin_memmove(d.buf, d.buf + kBlen, d.byte_used - kBlen);
+    d.byte_used -= kBlen;
+    d.table_size -= (static_cast<u32>(kOld.nlen) + kOld.vlen + 32u);
+    for (u32 i = 1; i < d.nent; i++) {
+        d.ents[i - 1] = d.ents[i];
+        d.ents[i - 1].off -= kBlen;
+    }
+    d.nent--;
+}
+
+void dyn_set_max_size(DynamicTable& d, u32 m) {
+    d.max_size = m;
+    while (d.table_size > d.max_size) dyn_evict_oldest(d);
+}
+
+// Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
+void dyn_add(DynamicTable& d, Str name, Str value) {
+    const u32 kCost = name.len + value.len + 32u;
+    if (kCost > d.max_size) {  // §4.4: entry larger than the table empties it
+        dyn_clear(d);
+        return;
+    }
+    while (d.table_size + kCost > d.max_size || d.nent >= DynamicTable::kMaxEntries)
+        dyn_evict_oldest(d);
+    const u32 kOff = d.byte_used;
+    __builtin_memcpy(d.buf + kOff, name.ptr, name.len);
+    __builtin_memcpy(d.buf + kOff + name.len, value.ptr, value.len);
+    d.byte_used += name.len + value.len;
+    d.ents[d.nent].off = kOff;
+    d.ents[d.nent].nlen = static_cast<u16>(name.len);
+    d.ents[d.nent].vlen = static_cast<u16>(value.len);
+    d.nent++;
+    d.table_size += kCost;
+}
+
+bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
+    if (i >= d.nent) return false;
+    const DynamicTable::Entry& e = d.ents[d.nent - 1 - i];
+    name->ptr = reinterpret_cast<const char*>(d.buf + e.off);
+    name->len = e.nlen;
+    value->ptr = reinterpret_cast<const char*>(d.buf + e.off + e.nlen);
+    value->len = e.vlen;
+    return true;
+}
+
+// Resolve a 1-based HPACK index to (name,value). idx 1..61 = static.
+bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
+    if (idx == 0) return false;
+    if (idx <= kStaticCount) {
+        const StaticEntry& e = kStatic[idx - 1];
+        *name = {e.name, e.nlen};
+        *value = {e.value, e.vlen};
+        return true;
+    }
+    return dyn_get(d, idx - kStaticCount - 1, name, value);
+}
+
+bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
+    Str value;
+    if (idx <= kStaticCount) {
+        if (idx == 0) return false;
+        const StaticEntry& e = kStatic[idx - 1];
+        *name = {e.name, e.nlen};
+        return true;
+    }
+    return dyn_get(d, idx - kStaticCount - 1, name, &value);
+}
+
+i32 static_find_full(Str name, Str value) {
+    for (u32 i = 0; i < kStaticCount; i++)
+        if (str_eq(name, kStatic[i].name, kStatic[i].nlen) &&
+            str_eq(value, kStatic[i].value, kStatic[i].vlen))
+            return static_cast<i32>(i + 1);
+    return 0;
+}
+
+i32 static_find_name(Str name) {
+    for (u32 i = 0; i < kStaticCount; i++)
+        if (str_eq(name, kStatic[i].name, kStatic[i].nlen)) return static_cast<i32>(i + 1);
+    return 0;
+}
+
+}  // namespace
+
+void DynamicTable::init(u32 settings_max) {
+    hard_max = settings_max <= kHardCap ? settings_max : kHardCap;
+    max_size = hard_max;
+    nent = 0;
+    byte_used = 0;
+    table_size = 0;
+}
+
+bool decode_header_block(DynamicTable& dyn,
+                         const u8* in,
+                         u32 len,
+                         u8* out_buf,
+                         u32 out_cap,
+                         Header* headers,
+                         u32 max_headers,
+                         u32* count) {
+    u32 pos = 0;
+    u32 op = 0;  // out_buf write cursor
+    u32 hc = 0;
+    while (pos < len) {
+        const u8 kByte = in[pos];
+        if (kByte & 0x80) {
+            // §6.1 Indexed Header Field.
+            u32 idx = 0;
+            const u32 kC = decode_integer(in + pos, len - pos, 7, &idx);
+            if (kC == 0 || idx == 0) return false;
+            pos += kC;
+            Str name, value;
+            if (!resolve_full(dyn, idx, &name, &value)) return false;
+            if (hc >= max_headers) return false;
+            headers[hc++] = {name, value};
+            continue;
+        }
+        if (kByte & 0x20 && !(kByte & 0x40)) {
+            // §6.3 Dynamic Table Size Update (001xxxxx).
+            u32 sz = 0;
+            const u32 kC = decode_integer(in + pos, len - pos, 5, &sz);
+            if (kC == 0 || sz > dyn.hard_max) return false;
+            pos += kC;
+            dyn_set_max_size(dyn, sz);
+            continue;
+        }
+        // Literal field: incremental indexing (§6.2.1, 0x40, 6-bit name index)
+        // or without/never indexing (§6.2.2/§6.2.3, 4-bit name index).
+        const bool kIncremental = (kByte & 0x40) != 0;
+        const u8 kPrefix = kIncremental ? 6 : 4;
+        u32 nidx = 0;
+        const u32 kNc = decode_integer(in + pos, len - pos, kPrefix, &nidx);
+        if (kNc == 0) return false;
+        pos += kNc;
+
+        Str name;
+        if (nidx == 0) {
+            u32 nlen = 0;
+            const u32 kSc = decode_string(in + pos, len - pos, out_buf + op, out_cap - op, &nlen);
+            if (kSc == 0) return false;
+            pos += kSc;
+            name = {reinterpret_cast<const char*>(out_buf + op), nlen};
+            op += nlen;
+        } else if (!resolve_name(dyn, nidx, &name)) {
+            return false;
+        }
+        // Value is always a literal string.
+        u32 vlen = 0;
+        const u32 kVc = decode_string(in + pos, len - pos, out_buf + op, out_cap - op, &vlen);
+        if (kVc == 0) return false;
+        pos += kVc;
+        Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
+        op += vlen;
+
+        if (kIncremental) {
+            // The name may alias dyn.buf (table reference); copy it into out_buf
+            // so dyn_add's eviction/compaction can't corrupt the source.
+            if (nidx != 0) {
+                if (op + name.len > out_cap) return false;
+                __builtin_memcpy(out_buf + op, name.ptr, name.len);
+                name = {reinterpret_cast<const char*>(out_buf + op), name.len};
+                op += name.len;
+            }
+            dyn_add(dyn, name, value);
+        }
+        if (hc >= max_headers) return false;
+        headers[hc++] = {name, value};
+    }
+    *count = hc;
+    return true;
+}
+
+u32 encode_header(u8* out, Str name, Str value) {
+    const i32 kFull = static_find_full(name, value);
+    if (kFull > 0) return encode_integer(out, static_cast<u32>(kFull), 7, 0x80);
+
+    const i32 kNameIdx = static_find_name(name);
+    // Literal without indexing (0000xxxx): name index (0 = literal name).
+    u32 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
+    if (kNameIdx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
+    o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
+    return o;
+}
+
 }  // namespace rut::hpack

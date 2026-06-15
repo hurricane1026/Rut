@@ -201,6 +201,194 @@ TEST(hpack_string, decode_truncated_payload_is_error) {
     CHECK_EQ(hpack::decode_string(buf, sizeof(buf), out, sizeof(out), &out_len), 0u);
 }
 
+// === Header field representations: decode / encode (RFC 7541 §6, App. C) ===
+
+namespace {
+u32 cstr_len(const char* s) {
+    u32 n = 0;
+    while (s[n]) n++;
+    return n;
+}
+bool hdr_is(const hpack::Header& h, const char* name, const char* value) {
+    return h.name.eq(Str{name, cstr_len(name)}) && h.value.eq(Str{value, cstr_len(value)});
+}
+Str cstr(const char* s) {
+    return Str{s, cstr_len(s)};
+}
+}  // namespace
+
+TEST(hpack_decode, c2_1_literal_incremental) {
+    // C.2.1: custom-key: custom-header, added to the dynamic table.
+    const u8 block[] = {0x40, 0x0a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0d,
+                        'c',  'u',  's', 't', 'o', 'm', '-', 'h', 'e', 'a', 'd', 'e', 'r'};
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 out[256];
+    hpack::Header hs[8];
+    u32 n = 0;
+    REQUIRE(hpack::decode_header_block(dyn, block, sizeof(block), out, sizeof(out), hs, 8, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(hs[0], "custom-key", "custom-header"));
+    CHECK_EQ(dyn.nent, 1u);
+    CHECK_EQ(dyn.table_size, 10u + 13u + 32u);  // 55
+}
+
+TEST(hpack_decode, c2_4_indexed) {
+    // C.2.4: 0x82 -> :method: GET (static index 2).
+    const u8 block[] = {0x82};
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 out[64];
+    hpack::Header hs[4];
+    u32 n = 0;
+    REQUIRE(hpack::decode_header_block(dyn, block, sizeof(block), out, sizeof(out), hs, 4, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(hs[0], ":method", "GET"));
+}
+
+TEST(hpack_decode, c3_request_sequence_shared_context) {
+    // C.3.1/3.2/3.3: three requests sharing one decoding context. The dynamic
+    // table built by earlier requests is referenced by later ones.
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 out[512];
+    hpack::Header hs[16];
+    u32 n = 0;
+
+    // C.3.1
+    const u8 b1[] = {0x82, 0x86, 0x84, 0x41, 0x0f, 'w', 'w', 'w', '.', 'e',
+                     'x',  'a',  'm',  'p',  'l',  'e', '.', 'c', 'o', 'm'};
+    REQUIRE(hpack::decode_header_block(dyn, b1, sizeof(b1), out, sizeof(out), hs, 16, &n));
+    CHECK_EQ(n, 4u);
+    CHECK(hdr_is(hs[0], ":method", "GET"));
+    CHECK(hdr_is(hs[1], ":scheme", "http"));
+    CHECK(hdr_is(hs[2], ":path", "/"));
+    CHECK(hdr_is(hs[3], ":authority", "www.example.com"));
+    CHECK_EQ(dyn.nent, 1u);
+
+    // C.3.2: 0xbe references dynamic[1] (:authority www.example.com); adds
+    // cache-control: no-cache.
+    const u8 b2[] = {0x82, 0x86, 0x84, 0xbe, 0x58, 0x08, 'n', 'o', '-', 'c', 'a', 'c', 'h', 'e'};
+    REQUIRE(hpack::decode_header_block(dyn, b2, sizeof(b2), out, sizeof(out), hs, 16, &n));
+    CHECK_EQ(n, 5u);
+    CHECK(hdr_is(hs[3], ":authority", "www.example.com"));
+    CHECK(hdr_is(hs[4], "cache-control", "no-cache"));
+    CHECK_EQ(dyn.nent, 2u);
+
+    // C.3.3: custom-key: custom-value (literal name), plus indexed lookups.
+    const u8 b3[] = {0x82, 0x87, 0x85, 0xbf, 0x40, 0x0a, 'c',  'u', 's', 't',
+                     'o',  'm',  '-',  'k',  'e',  'y',  0x0c, 'c', 'u', 's',
+                     't',  'o',  'm',  '-',  'v',  'a',  'l',  'u', 'e'};
+    REQUIRE(hpack::decode_header_block(dyn, b3, sizeof(b3), out, sizeof(out), hs, 16, &n));
+    CHECK_EQ(n, 5u);
+    CHECK(hdr_is(hs[0], ":method", "GET"));
+    CHECK(hdr_is(hs[1], ":scheme", "https"));
+    CHECK(hdr_is(hs[2], ":path", "/index.html"));
+    CHECK(hdr_is(hs[3], ":authority", "www.example.com"));
+    CHECK(hdr_is(hs[4], "custom-key", "custom-value"));
+    CHECK_EQ(dyn.nent, 3u);
+}
+
+TEST(hpack_decode, huffman_literal_value) {
+    // Literal incremental, name index 1 (:authority), Huffman value
+    // "www.example.com" (C.4.1 payload). H bit set, length 12.
+    const u8 block[] = {
+        0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff};
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 out[64];
+    hpack::Header hs[4];
+    u32 n = 0;
+    REQUIRE(hpack::decode_header_block(dyn, block, sizeof(block), out, sizeof(out), hs, 4, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(hs[0], ":authority", "www.example.com"));
+}
+
+TEST(hpack_decode, size_update_evicts) {
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 out[256];
+    hpack::Header hs[4];
+    u32 n = 0;
+    // Add custom-key: custom-header (size 55).
+    const u8 add[] = {0x40, 0x0a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0d,
+                      'c',  'u',  's', 't', 'o', 'm', '-', 'h', 'e', 'a', 'd', 'e', 'r'};
+    REQUIRE(hpack::decode_header_block(dyn, add, sizeof(add), out, sizeof(out), hs, 4, &n));
+    CHECK_EQ(dyn.nent, 1u);
+    // A size update to 0 (0x20) must evict everything.
+    const u8 shrink[] = {0x20};
+    REQUIRE(hpack::decode_header_block(dyn, shrink, sizeof(shrink), out, sizeof(out), hs, 4, &n));
+    CHECK_EQ(n, 0u);
+    CHECK_EQ(dyn.nent, 0u);
+}
+
+TEST(hpack_decode, eviction_drops_oldest) {
+    hpack::DynamicTable dyn;
+    dyn.init(60);  // room for one ~55-octet entry
+    u8 out[256];
+    hpack::Header hs[4];
+    u32 n = 0;
+    const u8 a[] = {0x40, 0x0a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0d,
+                    'c',  'u',  's', 't', 'o', 'm', '-', 'h', 'e', 'a', 'd', 'e', 'r'};  // 55
+    REQUIRE(hpack::decode_header_block(dyn, a, sizeof(a), out, sizeof(out), hs, 4, &n));
+    const u8 b[] = {0x40, 0x0a, 'c', 'u', 's', 't', 'o', 'm', '-', 'k', 'e', 'y', 0x0c,
+                    'c',  'u',  's', 't', 'o', 'm', '-', 'v', 'a', 'l', 'u', 'e'};  // 54
+    REQUIRE(hpack::decode_header_block(dyn, b, sizeof(b), out, sizeof(out), hs, 4, &n));
+    CHECK_EQ(dyn.nent, 1u);  // A evicted to fit B
+    // Index 62 = newest = B.
+    const u8 ref62[] = {0xbe};
+    REQUIRE(hpack::decode_header_block(dyn, ref62, sizeof(ref62), out, sizeof(out), hs, 4, &n));
+    CHECK(hdr_is(hs[0], "custom-key", "custom-value"));
+    // Index 63 no longer exists -> decode error.
+    const u8 ref63[] = {0xbf};
+    CHECK_FALSE(hpack::decode_header_block(dyn, ref63, sizeof(ref63), out, sizeof(out), hs, 4, &n));
+}
+
+TEST(hpack_decode, bad_index_is_error) {
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 out[64];
+    hpack::Header hs[4];
+    u32 n = 0;
+    const u8 block[] = {0xff, 0x00};  // indexed, index 62 with empty dynamic table
+    CHECK_FALSE(hpack::decode_header_block(dyn, block, sizeof(block), out, sizeof(out), hs, 4, &n));
+}
+
+TEST(hpack_encode, exact_static_match_is_indexed) {
+    u8 out[32];
+    u32 n = hpack::encode_header(out, cstr(":method"), cstr("GET"));
+    CHECK_EQ(n, 1u);
+    CHECK_EQ(out[0], 0x82);
+}
+
+TEST(hpack_encode, roundtrip_static_name) {
+    u8 out[64];
+    u32 n = hpack::encode_header(out, cstr(":path"), cstr("/sample/path"));
+    CHECK((out[0] & 0xf0) == 0x00);  // literal without indexing
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 dbuf[64];
+    hpack::Header hs[4];
+    u32 c = 0;
+    REQUIRE(hpack::decode_header_block(dyn, out, n, dbuf, sizeof(dbuf), hs, 4, &c));
+    CHECK_EQ(c, 1u);
+    CHECK(hdr_is(hs[0], ":path", "/sample/path"));
+}
+
+TEST(hpack_encode, roundtrip_literal_name_and_value) {
+    u8 out[64];
+    u32 n = hpack::encode_header(out, cstr("x-custom"), cstr("a-value"));
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    u8 dbuf[64];
+    hpack::Header hs[4];
+    u32 c = 0;
+    REQUIRE(hpack::decode_header_block(dyn, out, n, dbuf, sizeof(dbuf), hs, 4, &c));
+    CHECK_EQ(c, 1u);
+    CHECK(hdr_is(hs[0], "x-custom", "a-value"));
+    CHECK_EQ(dyn.nent, 0u);  // encoder never indexes -> decoder adds nothing
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

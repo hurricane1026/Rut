@@ -48,4 +48,62 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len);
 // Returns octets written.
 u32 encode_string(u8* out, const u8* src, u32 len);
 
+// --- Header field representations (§6) ---
+
+// A decoded header field. name/value are non-owning views: into static storage
+// for static-table references, otherwise into the caller's decode output buffer.
+struct Header {
+    Str name;
+    Str value;
+};
+
+// Decoder dynamic table (§2.3): a FIFO of recently-seen (name,value) pairs,
+// addressable after the 61 static entries. Bounded by the negotiated
+// SETTINGS_HEADER_TABLE_SIZE; entry cost is name+value+32 octets (§4.1). Bytes
+// are kept packed in insertion order; eviction drops the oldest. Owned per
+// connection by the decoder side.
+struct DynamicTable {
+    static constexpr u32 kHardCap = 4096;      // max table size we ever allow
+    static constexpr u32 kByteCap = kHardCap;  // packed name+value storage
+    static constexpr u32 kMaxEntries = 128;    // kHardCap / min-entry-size(32)
+
+    u8 buf[kByteCap];
+    struct Entry {
+        u32 off;   // start of name in buf
+        u16 nlen;  // name length
+        u16 vlen;  // value length
+    };
+    Entry ents[kMaxEntries];  // ents[0] = oldest, ents[nent-1] = newest
+    u32 nent;
+    u32 byte_used;   // packed bytes in buf
+    u32 table_size;  // sum of entry costs (name+value+32)
+    u32 max_size;    // current limit (<= hard_max)
+    u32 hard_max;    // negotiated SETTINGS_HEADER_TABLE_SIZE (<= kHardCap)
+
+    // settings_max = the peer's SETTINGS_HEADER_TABLE_SIZE.
+    void init(u32 settings_max);
+};
+
+// Decode a complete header block from in[0..len) using/updating `dyn`. Decoded
+// names/values are written into out_buf[0..out_cap) (static-table refs are not
+// copied — they point at constant storage). Fills headers[0..max_headers] and
+// sets *count. Returns true on success, false on any decoding error (bad index,
+// truncation, capacity/entry overflow, invalid size update).
+bool decode_header_block(DynamicTable& dyn,
+                         const u8* in,
+                         u32 len,
+                         u8* out_buf,
+                         u32 out_cap,
+                         Header* headers,
+                         u32 max_headers,
+                         u32* count);
+
+// Encode one header field into out without indexing (§6.2.2): an exact
+// (name,value) static match becomes an indexed field; a name-only static match
+// becomes a literal with the static name index; otherwise both are literals.
+// Never mutates a dynamic table (we don't index on the encode side). Literal
+// strings are Huffman-coded when shorter. Returns octets written. out must hold
+// the worst case (~ name.len + value.len + a few prefix octets).
+u32 encode_header(u8* out, Str name, Str value);
+
 }  // namespace rut::hpack
