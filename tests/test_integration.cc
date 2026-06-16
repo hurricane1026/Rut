@@ -777,6 +777,58 @@ TEST(rate_limit_e2e, meters_by_header_key) {
     destroy_real_loop(loop);
 }
 
+// Metering keyed by a query-string parameter — exercises the query extractor on
+// the live enforcement path (distinct from the header path above). Two distinct
+// ?uid values get independent budgets.
+TEST(rate_limit_e2e, meters_by_query_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/q", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));  // 1 per 60s (burst defaults to 1)
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Query, "uid", 3));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    // 429 closes the connection (Connection: close), so each request is one-shot.
+    auto one_shot = [&](const char* uid) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        char req[128];
+        const int rn = snprintf(req, sizeof(req), "GET /q?uid=%s HTTP/1.1\r\nHost: x\r\n\r\n", uid);
+        int rc = -1;
+        if (rn > 0 && send_all(c, req, static_cast<u32>(rn))) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot("alice"), 200);  // alice 1st
+    CHECK_EQ(one_shot("alice"), 429);  // alice over its 1/window
+    CHECK_EQ(one_shot("bob"), 200);    // bob: independent bucket
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // Stacked rate-limit rules: a route caps both per-IP and per-API-key, with
 // different limits. A request must satisfy every rule. Here the per-IP cap (2)
 // is the tighter one a single client hits first.
@@ -1469,6 +1521,68 @@ TEST(upstream_concurrency_e2e, max_inflight_sheds_503) {
     i32 n3 = recv_timeout(c3, buf, sizeof(buf), 2000);
     CHECK(n3 > 0 && buf_contains(buf, static_cast<u32>(n3), "200", 3));
     close(c3);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// The upstream slot must be released when a proxied request FAILS (not just on
+// clean completion) — otherwise a failing backend would permanently consume the
+// cap. Point at a closed port (connect refused → 502): with cap 1, two sequential
+// requests must BOTH reach the backend attempt (both 502). If the first failure
+// leaked its slot, the second would be shed with 503 instead.
+TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
+    using namespace rut;
+    // A port nobody listens on: bind one, read its port, close it.
+    auto dead = create_listen_socket(0);
+    REQUIRE(dead.has_value());
+    const u16 dead_port = get_port(dead.value());
+    close(dead.value());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("dead", 0x7F000001, dead_port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/p", 0, id.value()));
+    REQUIRE(cfg.set_upstream_max_inflight(id.value(), 1));
+    const RouteConfig* active = &cfg;
+
+    UpstreamConcurrency cc{};
+    cc.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_cc = &cc;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    const char kReq[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    auto one_shot = [&]() -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, kReq, sizeof(kReq) - 1)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "502", 3))
+                    rc = 502;
+                else if (buf_contains(buf, static_cast<u32>(n), "503", 3))
+                    rc = 503;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot(), 502);  // connect refused
+    CHECK_EQ(one_shot(), 502);  // slot was released → not stuck at 503
 
     lt.stop();
     loop->shutdown();
