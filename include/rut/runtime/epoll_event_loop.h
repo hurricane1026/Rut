@@ -158,6 +158,9 @@ struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     // when a new push does not change the heap's top.
     u64 yield_timer_armed_ns = 0;
     u32 shard_id;
+    // Total shards in this process (1 in tests). Used to scale a Global-scope
+    // rate limit to a per-shard share (ceil(max / shard_count)).
+    u32 shard_count = 1;
 
 private:
     std::atomic<bool> running_;

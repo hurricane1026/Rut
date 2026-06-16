@@ -2340,30 +2340,46 @@ struct Parser {
             if (kWin == 0 || maxv == 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
-            // Optional `, by: <key>` — composite metering key. `by:` takes a
-            // single source or a [list] of them; each is `ip` or
-            // header/query/cookie/param("name"). Absent → default per-client-IP.
-            if (take(TokenType::Comma)) {
-                auto by_kw = expect(TokenType::Ident);
-                if (!by_kw || !by_kw.value()->text.eq({"by", 2}))
-                    return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            // Optional trailing named args, in any order:
+            //   by: <key>     — single source or [list]; `ip` or
+            //                    header/query/cookie/param("name"). Default per-IP.
+            //   scope: shard|global — enforcement scope. Default shard.
+            while (take(TokenType::Comma)) {
+                auto arg = expect(TokenType::Ident);
+                if (!arg) return core::make_unexpected(arg.error());
                 if (!expect(TokenType::Colon))
                     return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
-                if (take(TokenType::LBracket)) {
-                    bool first = true;
-                    while (cur().type != TokenType::RBracket) {
-                        if (!first && !take(TokenType::Comma))
+                if (arg.value()->text.eq({"by", 2})) {
+                    if (take(TokenType::LBracket)) {
+                        bool first = true;
+                        while (cur().type != TokenType::RBracket) {
+                            if (!first && !take(TokenType::Comma))
+                                return frontend_error(
+                                    FrontendError::UnexpectedToken, deco.span, deco.name);
+                            first = false;
+                            auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
+                            if (!s) return core::make_unexpected(s.error());
+                        }
+                        if (!expect(TokenType::RBracket))
                             return frontend_error(
                                 FrontendError::UnexpectedToken, deco.span, deco.name);
-                        first = false;
+                    } else {
                         auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
                         if (!s) return core::make_unexpected(s.error());
                     }
-                    if (!expect(TokenType::RBracket))
-                        return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+                } else if (arg.value()->text.eq({"scope", 5})) {
+                    auto sv = expect(TokenType::Ident);
+                    if (!sv) return core::make_unexpected(sv.error());
+                    if (sv.value()->text.eq({"shard", 5}))
+                        deco.rate_limit_scope = RateLimitScope::Shard;
+                    else if (sv.value()->text.eq({"global", 6}))
+                        deco.rate_limit_scope = RateLimitScope::Global;
+                    else
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, deco.span, sv.value()->text);
                 } else {
-                    auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
-                    if (!s) return core::make_unexpected(s.error());
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, deco.span, arg.value()->text);
                 }
             }
             if (!expect(TokenType::RParen))

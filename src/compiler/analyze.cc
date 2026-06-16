@@ -15813,7 +15813,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 // Each @rateLimit stacks one rule (caps are silently dropped past
                 // the rule-set capacity).
                 const i32 kRuleIdx = route.rate_limit.add_rule(ast_deco.rate_limit_max,
-                                                               ast_deco.rate_limit_window_sec);
+                                                               ast_deco.rate_limit_window_sec,
+                                                               ast_deco.rate_limit_scope);
                 if (kRuleIdx >= 0) route.rate_limit.rules[kRuleIdx].key = ast_deco.rate_limit_key;
                 continue;
             }

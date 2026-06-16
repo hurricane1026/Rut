@@ -417,6 +417,7 @@ struct AstDecorator {
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
     RateLimitKeySpec rate_limit_key{};
+    RateLimitScope rate_limit_scope = RateLimitScope::Shard;
     // @throttle(downstream: <ByteSize> per <duration>): client-send byte rate,
     // stored as bytes/second (0 = none).
     u32 throttle_down_bps = 0;

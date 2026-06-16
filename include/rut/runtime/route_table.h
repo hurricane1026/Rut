@@ -440,10 +440,14 @@ struct RouteConfig {
     }
 
     // Append an additional rate-limit rule to a route (stacking): a request must
-    // pass every rule. Returns false on a bad index or when the rule set is full.
-    bool add_route_rate_limit_rule(u32 idx, u32 max, u32 window_sec) {
+    // pass every rule. `scope` selects per-shard (default) or approximate global
+    // enforcement. Returns false on a bad index or when the rule set is full.
+    bool add_route_rate_limit_rule(u32 idx,
+                                   u32 max,
+                                   u32 window_sec,
+                                   RateLimitScope scope = RateLimitScope::Shard) {
         if (idx >= route_count) return false;
-        return routes[idx].rate_limit.add_rule(max, window_sec) >= 0;
+        return routes[idx].rate_limit.add_rule(max, window_sec, scope) >= 0;
     }
 
     // Append one metering-key component to a route's *most recently added* rule

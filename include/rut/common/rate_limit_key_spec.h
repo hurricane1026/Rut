@@ -52,12 +52,25 @@ struct RateLimitKeySpec {
     }
 };
 
-// One rate-limit rule: `max` requests per `window_sec`, metered by `key`. A
-// route can stack several rules (one per @rateLimit) — a request must pass them
-// all, so e.g. an anonymous per-IP cap and a higher per-API-key cap coexist.
+// Where a rule's `max` applies. Shard (default): each per-core shard enforces
+// `max` independently — fast, no coordination, but a client spread across shards
+// gets up to max × shard_count (SO_REUSEPORT hashes connections by 4-tuple, so a
+// client's connections fan out). Global: `max` is an approximate cluster-wide
+// budget — each shard enforces ceil(max / shard_count) assuming clients spread
+// evenly; tighter for few-connection clients, looser-exact only with even fan-out.
+enum class RateLimitScope : u8 {
+    Shard = 0,
+    Global,
+};
+
+// One rate-limit rule: `max` requests per `window_sec`, metered by `key`, applied
+// at `scope`. A route can stack several rules (one per @rateLimit) — a request
+// must pass them all, so e.g. an anonymous per-IP cap and a higher per-API-key
+// cap coexist.
 struct RateLimitRule {
     u32 max = 0;
     u32 window_sec = 0;
+    RateLimitScope scope = RateLimitScope::Shard;
     RateLimitKeySpec key{};
 };
 
@@ -70,10 +83,11 @@ struct RateLimitRuleSet {
     u8 count = 0;
 
     // Append a rule; returns its index, or -1 if full.
-    i32 add_rule(u32 max, u32 window_sec) {
+    i32 add_rule(u32 max, u32 window_sec, RateLimitScope scope = RateLimitScope::Shard) {
         if (count >= kMaxRateLimitRules) return -1;
         rules[count].max = max;
         rules[count].window_sec = window_sec;
+        rules[count].scope = scope;
         rules[count].key = RateLimitKeySpec{};
         return static_cast<i32>(count++);
     }

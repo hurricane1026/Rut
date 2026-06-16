@@ -151,6 +151,10 @@ static i32 run_shards(u16 port,
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
         }
+        // Let each shard scale Global-scope rate limits to its per-shard share.
+        if constexpr (requires { shards[i].loop->shard_count; }) {
+            shards[i].loop->shard_count = shard_count;
+        }
 
         // Hand the compiled routes to the shard. Read-only and shared by
         // every shard (share-nothing applies to mutable per-request
