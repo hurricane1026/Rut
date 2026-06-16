@@ -80,6 +80,11 @@ struct RouteEntry {
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
+    // Per-route rate limit (fixed window, keyed by client IP). 0 = unlimited.
+    // `rate_limit_max` requests are allowed per `rate_limit_window_sec`; over
+    // the limit the runtime answers 429 before dispatching.
+    u32 rate_limit_max = 0;
+    u32 rate_limit_window_sec = 0;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -414,6 +419,16 @@ struct RouteConfig {
             return false;  // active dispatch at capacity — fail loud
         }
         route_count++;
+        return true;
+    }
+
+    // Attach a fixed-window, per-client-IP rate limit to an existing route
+    // (by index). `max` requests per `window_sec`; 0/0 disables. Returns false
+    // on a bad index. The DSL `@throttle` decorator will populate this later.
+    bool set_route_rate_limit(u32 idx, u32 max, u32 window_sec) {
+        if (idx >= route_count) return false;
+        routes[idx].rate_limit_max = max;
+        routes[idx].rate_limit_window_sec = window_sec;
         return true;
     }
 

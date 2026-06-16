@@ -676,6 +676,53 @@ TEST(metrics_endpoint, non_get_does_not_serve_exposition) {
     destroy_real_loop(loop);
 }
 
+// === Per-route rate limiting ===
+
+// A route with a fixed-window limit of 3 returns 200 for the first 3 requests
+// from one client, then 429 once the budget is exhausted within the window.
+TEST(rate_limit_e2e, route_returns_429_over_limit) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 3, 60));  // 3 per 60s
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /limited HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 ok = 0, throttled = 0;
+    for (u32 i = 0; i < 4; i++) {
+        if (!send_all(c, kReq, sizeof(kReq) - 1)) break;
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        if (n <= 0) break;
+        if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+            ok++;
+        else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+            throttled++;
+    }
+    close(c);
+    CHECK_EQ(ok, 3u);
+    CHECK_EQ(throttled, 1u);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

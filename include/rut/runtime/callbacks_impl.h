@@ -11,6 +11,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/prometheus.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
@@ -404,6 +405,27 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // the origin-form root "/" and dispatches normally.
         route = config->match_canonical(
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
+    }
+
+    // Per-route rate limit (fixed window, per client IP). Enforced after route
+    // match, before dispatch. The limiter is per-shard (one thread each), so a
+    // thread_local table needs no atomics — same rationale as the parse cache.
+    if (route && route->rate_limit_max > 0 && config) {
+        static thread_local RateLimiter rate_limiter{};
+        const u32 kRouteIdx = static_cast<u32>(route - config->routes);
+        const u64 kNowSec = monotonic_us() / 1'000'000ull;
+        if (!rate_limiter.allow(kRouteIdx,
+                                conn.peer_addr,
+                                route->rate_limit_max,
+                                route->rate_limit_window_sec,
+                                kNowSec)) {
+            conn.resp_status = 429;
+            format_static_response(conn, 429, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
     }
 
     if (route && route->action == RouteAction::Proxy) {

@@ -4,6 +4,7 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
@@ -1495,6 +1496,38 @@ TEST(route, static_response) {
     REQUIRE(r != nullptr);
     CHECK_EQ(r->action, RouteAction::Static);
     CHECK_EQ(r->status_code, 200u);
+}
+
+TEST(rate_limit, fixed_window) {
+    using namespace rut;
+    RateLimiter rl{};  // zero-init = empty
+    const u32 kIp = 0x0100007F;
+    // 3 requests per 60s window on route 0.
+    CHECK(rl.allow(0, kIp, 3, 60, 1000));   // 1
+    CHECK(rl.allow(0, kIp, 3, 60, 1000));   // 2
+    CHECK(rl.allow(0, kIp, 3, 60, 1001));   // 3
+    CHECK(!rl.allow(0, kIp, 3, 60, 1002));  // 4 → throttled
+    CHECK(!rl.allow(0, kIp, 3, 60, 1003));  // still throttled within window
+    // A different client IP has an independent budget.
+    CHECK(rl.allow(0, 0x0200007F, 3, 60, 1002));
+    // A different route is independent too.
+    CHECK(rl.allow(1, kIp, 3, 60, 1002));
+    // Window resets after window_sec elapses.
+    CHECK(rl.allow(0, kIp, 3, 60, 1062));  // 62s > 60s → new window
+    CHECK(rl.allow(0, kIp, 3, 60, 1062));
+    // max==0 or window==0 disables limiting (always allowed).
+    CHECK(rl.allow(2, kIp, 0, 60, 1000));
+    CHECK(rl.allow(2, kIp, 3, 0, 1000));
+}
+
+TEST(route, set_route_rate_limit) {
+    using namespace rut;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    CHECK(cfg.set_route_rate_limit(0, 100, 60));
+    CHECK_EQ(cfg.routes[0].rate_limit_max, 100u);
+    CHECK_EQ(cfg.routes[0].rate_limit_window_sec, 60u);
+    CHECK(!cfg.set_route_rate_limit(99, 1, 1));  // bad index
 }
 
 TEST(route, empty_config_no_match) {
