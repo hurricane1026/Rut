@@ -416,6 +416,7 @@ struct AstDecorator {
     // components (IP / header / query / cookie / param).
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    u32 rate_limit_burst = 0;  // token-bucket capacity; 0 → defaults to limit
     RateLimitKeySpec rate_limit_key{};
     RateLimitScope rate_limit_scope = RateLimitScope::Shard;
     // @throttle(downstream: <ByteSize> per <duration>): client-send byte rate,

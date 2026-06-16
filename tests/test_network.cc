@@ -1498,48 +1498,39 @@ TEST(route, static_response) {
     CHECK_EQ(r->status_code, 200u);
 }
 
-TEST(rate_limit, fixed_window) {
+TEST(rate_limit, token_bucket_gcra) {
     using namespace rut;
-    RateLimiter rl{};  // zero-init = empty
-    const u32 kIp = 0x0100007F;
-    // 3 requests per 60s window on route 0.
-    CHECK(rl.allow(0, kIp, 3, 60, 1000));   // 1
-    CHECK(rl.allow(0, kIp, 3, 60, 1000));   // 2
-    CHECK(rl.allow(0, kIp, 3, 60, 1001));   // 3
-    CHECK(!rl.allow(0, kIp, 3, 60, 1002));  // 4 → throttled
-    CHECK(!rl.allow(0, kIp, 3, 60, 1003));  // still throttled within window
-    // A different client IP has an independent budget.
-    CHECK(rl.allow(0, 0x0200007F, 3, 60, 1002));
-    // A different route is independent too.
-    CHECK(rl.allow(1, kIp, 3, 60, 1002));
-    // Window resets after window_sec elapses.
-    CHECK(rl.allow(0, kIp, 3, 60, 1062));  // 62s > 60s → new window
-    CHECK(rl.allow(0, kIp, 3, 60, 1062));
-    // max==0 or window==0 disables limiting (always allowed).
-    CHECK(rl.allow(2, kIp, 0, 60, 1000));
-    CHECK(rl.allow(2, kIp, 3, 0, 1000));
+    RateLimiter rl{};  // zero-init = empty bucket for every key
+    const u64 kKey = 0x0100007F;
+    const u64 kEmit = 10, kTau = 20;  // 1 token / 10µs, burst capacity 3
+    // A fresh bucket admits a burst of 3 at the same instant t=1000.
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 1
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 2
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 3
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1000));  // 4 → burst exhausted
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1005));  // still too soon
+    // After one emit interval elapses, one token frees up — then no more.
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1010));
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1010));
+    // A different key has an independent bucket.
+    CHECK(rl.allow_key(0x0200007F, kEmit, kTau, 1005));
+    // emit==0 disables (always allowed).
+    CHECK(rl.allow_key(kKey, 0, 0, 1000));
 }
 
-TEST(global_rate_limit, exact_cap_shared_window_reset) {
+TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};
     rl.reset();
     const u64 kKey = 0xABCDEF12;
-    // 3 per 60s — exact (no per-shard division). Two "shards" sharing one limiter
-    // both draw from the same budget.
-    CHECK(rl.allow_key(kKey, 3, 60, 1000));   // 1
-    CHECK(rl.allow_key(kKey, 3, 60, 1000));   // 2 (different shard, same key)
-    CHECK(rl.allow_key(kKey, 3, 60, 1001));   // 3
-    CHECK(!rl.allow_key(kKey, 3, 60, 1002));  // 4 → over the cluster cap
-    CHECK(!rl.allow_key(kKey, 3, 60, 1003));  // still over within the window
-    // A different key has an independent budget.
-    CHECK(rl.allow_key(0x99, 3, 60, 1002));
-    // Window resets after window_sec elapses.
-    CHECK(rl.allow_key(kKey, 3, 60, 1062));  // 62s > 60s → new window
-    CHECK(rl.allow_key(kKey, 3, 60, 1062));
-    // max==0 / window==0 disables.
-    CHECK(rl.allow_key(kKey, 0, 60, 1000));
-    CHECK(rl.allow_key(kKey, 3, 0, 1000));
+    const u64 kEmit = 10, kTau = 20;                // burst 3, one bucket shared across "shards"
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 1
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 2 (different shard, same key)
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 3
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1000));  // 4 → over the shared burst
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1010));   // one token refilled after 10µs
+    CHECK(rl.allow_key(0x99, kEmit, kTau, 1000));   // a different key is independent
+    CHECK(rl.allow_key(kKey, 0, 0, 1000));          // emit==0 disables
 }
 
 TEST(route, set_route_rate_limit) {

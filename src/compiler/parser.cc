@@ -2377,6 +2377,17 @@ struct Parser {
                     else
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, deco.span, sv.value()->text);
+                } else if (arg.value()->text.eq({"burst", 5})) {
+                    auto bv = expect(TokenType::IntLit);
+                    if (!bv) return core::make_unexpected(bv.error());
+                    u64 b = 0;
+                    for (u32 i = 0; i < bv.value()->text.len; i++) {
+                        b = b * 10 + static_cast<u64>(bv.value()->text.ptr[i] - '0');
+                        if (b > 0xffffffffull)
+                            return frontend_error(
+                                FrontendError::InvalidInteger, deco.span, bv.value()->text);
+                    }
+                    deco.rate_limit_burst = static_cast<u32>(b);
                 } else {
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, deco.span, arg.value()->text);

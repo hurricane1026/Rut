@@ -482,7 +482,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     if (route && route->rate_limit.count > 0 && config) {
         static thread_local RateLimiter rate_limiter{};
         const u32 kRouteIdx = static_cast<u32>(route - config->routes);
-        const u64 kNowSec = monotonic_us() / 1'000'000ull;
+        const u64 kNowUs = monotonic_us();
         u32 path_len = 0;
         while (path_len < Connection::kMaxReqPathLen && conn.req_path[path_len] != '\0') path_len++;
         RateLimitKeyInput key_in;
@@ -506,9 +506,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             // a counter even when their key components overlap.
             const u32 kScope = kRouteIdx * kMaxRateLimitRules + ri;
             const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
-            const bool kOk = (rule.scope == RateLimitScope::Global && grl != nullptr)
-                                 ? grl->allow_key(kKey, rule.max, rule.window_sec, kNowSec)
-                                 : rate_limiter.allow_key(kKey, rule.max, rule.window_sec, kNowSec);
+            const bool kOk =
+                (rule.scope == RateLimitScope::Global && grl != nullptr)
+                    ? grl->allow_key(kKey, rule.emit_interval_us, rule.tau_us, kNowUs)
+                    : rate_limiter.allow_key(kKey, rule.emit_interval_us, rule.tau_us, kNowUs);
             if (!kOk) {
                 over_limit = true;
                 break;

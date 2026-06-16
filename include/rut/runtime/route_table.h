@@ -427,11 +427,11 @@ struct RouteConfig {
         return true;
     }
 
-    // Set a route's rate limit to a single fixed-window rule (`max` requests per
-    // `window_sec`, default per-client-IP key), replacing any existing rules.
-    // 0/0 leaves the route unlimited. Returns false on a bad index. For stacked
-    // rules use add_route_rate_limit_rule; refine the key with
-    // add_route_rate_limit_key.
+    // Set a route's rate limit to a single token-bucket rule (`max` per
+    // `window_sec`, burst capacity defaulting to `max`, per-client-IP key),
+    // replacing any existing rules. 0/0 leaves the route unlimited. Returns false
+    // on a bad index. For stacked rules use add_route_rate_limit_rule; refine the
+    // key with add_route_rate_limit_key.
     bool set_route_rate_limit(u32 idx, u32 max, u32 window_sec) {
         if (idx >= route_count) return false;
         routes[idx].rate_limit = RateLimitRuleSet{};
@@ -440,14 +440,16 @@ struct RouteConfig {
     }
 
     // Append an additional rate-limit rule to a route (stacking): a request must
-    // pass every rule. `scope` selects per-shard (default) or approximate global
-    // enforcement. Returns false on a bad index or when the rule set is full.
+    // pass every rule. `scope` selects per-shard (default) or exact global; `burst`
+    // is the bucket capacity (0 → defaults to `max`). Returns false on a bad index
+    // or when the rule set is full.
     bool add_route_rate_limit_rule(u32 idx,
                                    u32 max,
                                    u32 window_sec,
-                                   RateLimitScope scope = RateLimitScope::Shard) {
+                                   RateLimitScope scope = RateLimitScope::Shard,
+                                   u32 burst = 0) {
         if (idx >= route_count) return false;
-        return routes[idx].rate_limit.add_rule(max, window_sec, scope) >= 0;
+        return routes[idx].rate_limit.add_rule(max, window_sec, burst, scope) >= 0;
     }
 
     // Append one metering-key component to a route's *most recently added* rule

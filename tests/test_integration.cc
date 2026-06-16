@@ -1053,6 +1053,39 @@ TEST(rate_limit_dsl, default_scope_is_shard) {
     auto lowered = lower_to_rir(*mir_owned, rir);
     REQUIRE(lowered);
     CHECK(rir.module.functions[0].rate_limit.rules[0].scope == RateLimitScope::Shard);
+    // Default burst = limit; GCRA params precomputed (emit = window/limit µs).
+    const auto& r = rir.module.functions[0].rate_limit.rules[0];
+    CHECK_EQ(r.burst, 5u);
+    CHECK_EQ(r.emit_interval_us, 60ull * 1000000ull / 5ull);  // 12s per token
+    rir.destroy();
+}
+
+// burst: sets the token-bucket capacity (and the GCRA tau), independent of limit.
+TEST(rate_limit_dsl, burst_compiles) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 100, window: 1s, burst: 10)\n"
+        "route GET \"/a\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    const auto& r = rir.module.functions[0].rate_limit.rules[0];
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    CHECK_EQ(r.max, 100u);
+    CHECK_EQ(r.burst, 10u);                  // explicit, not defaulted to 100
+    CHECK_EQ(r.emit_interval_us, 10000ull);  // 1s / 100 = 10ms per token
+    CHECK_EQ(r.tau_us, 9ull * 10000ull);     // (burst-1) * emit
     rir.destroy();
 }
 
