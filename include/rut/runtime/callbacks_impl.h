@@ -260,6 +260,19 @@ void throttle_resume(Loop* loop, Connection& conn) {
     }
 }
 
+// Release the upstream concurrency slot taken at proxy dispatch, exactly once.
+// Called on clean completion (promptly, so keep-alive connections free the slot
+// without waiting for close) and from close_conn (the catch-all for failures and
+// non-keep-alive completion) — the held flag makes the second call a no-op.
+template <typename Loop>
+void release_upstream_slot(Loop* loop, Connection& conn) {
+    if (!conn.upstream_slot_held) return;
+    conn.upstream_slot_held = false;
+    if constexpr (requires { loop->upstream_release(conn.upstream_slot_uid); }) {
+        loop->upstream_release(conn.upstream_slot_uid);
+    }
+}
+
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
@@ -556,6 +569,26 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     if (route && route->action == RouteAction::Proxy) {
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
+        // Upstream concurrency cap: if the backend is already at its in-flight
+        // limit, shed this request with 503 before opening a connection to it.
+        // Otherwise take a slot, released on every exit path (completion via
+        // release_upstream_slot at body-done; failure/close via close_conn).
+        if (target.max_inflight != 0) {
+            bool acquired = true;
+            if constexpr (requires { loop->upstream_acquire(route->upstream_id, 1u); }) {
+                acquired = loop->upstream_acquire(route->upstream_id, target.max_inflight);
+            }
+            if (!acquired) {
+                conn.resp_status = 503;
+                format_static_response(conn, 503, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            conn.upstream_slot_held = true;
+            conn.upstream_slot_uid = route->upstream_id;
+        }
         for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
             conn.upstream_name[i] = target.name[i];
         if (target.name_len < sizeof(conn.upstream_name))
@@ -1556,6 +1589,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (body_done) {
         conn.upstream_recv_buf.reset();
+        release_upstream_slot(loop, conn);  // free the backend slot promptly
 
         on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
         loop->epoch_leave();

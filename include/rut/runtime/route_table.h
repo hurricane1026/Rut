@@ -37,6 +37,10 @@ struct UpstreamTarget {
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
     u32 name_len;
+    // Max concurrent in-flight proxied requests to this backend (0 = unlimited).
+    // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
+    // cap the runtime answers 503 before connecting.
+    u32 max_inflight = 0;
 
     void set_name(const char* n) {
         name_len = 0;
@@ -470,6 +474,15 @@ struct RouteConfig {
     bool set_route_throttle(u32 idx, u32 down_bps) {
         if (idx >= route_count) return false;
         routes[idx].throttle_down_bps = down_bps;
+        return true;
+    }
+
+    // Cap concurrent in-flight proxied requests to an upstream (by id). 0 =
+    // unlimited. Over the cap the runtime answers 503 before connecting. Returns
+    // false on a bad upstream id.
+    bool set_upstream_max_inflight(u32 uid, u32 max_inflight) {
+        if (uid >= upstream_count) return false;
+        upstreams[uid].max_inflight = max_inflight;
         return true;
     }
 

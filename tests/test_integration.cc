@@ -1342,6 +1342,140 @@ TEST(throttle_e2e, downstream_paces_proxied_body) {
     destroy_real_loop(loop);
 }
 
+// A backend that holds each accepted connection open for `delay_ms` before
+// replying — so the gateway keeps the upstream concurrency slot occupied while
+// the test fires a second request.
+struct SlowResponseServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    u32 delay_ms = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~SlowResponseServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<SlowResponseServer*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            for (u32 e = 0; e < s->delay_ms && s->running.load(std::memory_order_acquire); e += 5)
+                usleep(5000);
+            const char resp[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+            (void)send_all(client, resp, sizeof(resp) - 1);
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(u32 d_ms) {
+        delay_ms = d_ms;
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Upstream concurrency cap: max_inflight=1 → while one slow request holds the
+// only slot, a concurrent request to the same backend is shed with 503; once the
+// first completes and frees the slot, a fresh request succeeds.
+TEST(upstream_concurrency_e2e, max_inflight_sheds_503) {
+    using namespace rut;
+    SlowResponseServer backend;
+    REQUIRE(backend.setup(400));  // hold each upstream conn ~400ms
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/p", 0, id.value()));
+    REQUIRE(cfg.set_upstream_max_inflight(id.value(), 1));
+    const RouteConfig* active = &cfg;
+
+    UpstreamConcurrency cc{};  // fresh shared gauge for this test
+    cc.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_cc = &cc;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    const char kReq[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    char buf[1024];
+
+    // Client 1 takes the only slot (backend sits on it ~400ms).
+    i32 c1 = connect_to(port);
+    REQUIRE(c1 >= 0);
+    REQUIRE(send_all(c1, kReq, sizeof(kReq) - 1));
+    usleep(150000);  // 150ms: c1's slot is acquired and the backend is sleeping
+
+    // Client 2 hits the backend at capacity → 503, no upstream connection.
+    i32 c2 = connect_to(port);
+    REQUIRE(c2 >= 0);
+    REQUIRE(send_all(c2, kReq, sizeof(kReq) - 1));
+    i32 n2 = recv_timeout(c2, buf, sizeof(buf), 2000);
+    CHECK(n2 > 0 && buf_contains(buf, static_cast<u32>(n2), "503", 3));
+    close(c2);
+
+    // Client 1 eventually completes (200), freeing the slot.
+    i32 n1 = recv_timeout(c1, buf, sizeof(buf), 2000);
+    CHECK(n1 > 0 && buf_contains(buf, static_cast<u32>(n1), "200", 3));
+    close(c1);
+
+    // Slot freed → a fresh request succeeds.
+    usleep(50000);
+    i32 c3 = connect_to(port);
+    REQUIRE(c3 >= 0);
+    REQUIRE(send_all(c3, kReq, sizeof(kReq) - 1));
+    i32 n3 = recv_timeout(c3, buf, sizeof(buf), 2000);
+    CHECK(n3 > 0 && buf_contains(buf, static_cast<u32>(n3), "200", 3));
+    close(c3);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

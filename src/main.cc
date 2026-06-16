@@ -109,6 +109,9 @@ static i32 run_shards(u16 port,
     // a stack local outlives every shard that points at it.
     static GlobalRateLimiter global_rl;
     global_rl.reset();
+    // One process-shared per-upstream concurrency gauge (max-inflight limiting).
+    static UpstreamConcurrency upstream_cc;
+    upstream_cc.reset();
 
     // Create one SO_REUSEPORT listen socket per shard.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
@@ -160,6 +163,10 @@ static i32 run_shards(u16 port,
         // Point every shard at the one shared limiter for @rateLimit(scope: global).
         if constexpr (requires { shards[i].loop->global_rl; }) {
             shards[i].loop->global_rl = &global_rl;
+        }
+        // …and at the one shared per-upstream concurrency gauge.
+        if constexpr (requires { shards[i].loop->upstream_cc; }) {
+            shards[i].loop->upstream_cc = &upstream_cc;
         }
 
         // Hand the compiled routes to the shard. Read-only and shared by

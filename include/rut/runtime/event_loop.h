@@ -15,6 +15,7 @@
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -155,6 +156,15 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.
     GlobalRateLimiter* global_rl = nullptr;
+    // Shared per-upstream concurrency gauge for max-inflight limiting (null =
+    // unlimited). main.cc points every shard at one shared instance.
+    UpstreamConcurrency* upstream_cc = nullptr;
+    bool upstream_acquire(u16 uid, u32 max) {
+        return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
+    }
+    void upstream_release(u16 uid) {
+        if (upstream_cc) upstream_cc->release(uid);
+    }
 
 private:
     // Cross-thread state — main thread writes (stop/drain), shard thread reads.
@@ -609,6 +619,12 @@ public:
         // before closing. This covers timer wheel timeouts, force_close_all
         // during drain, and any other path that bypasses normal callbacks.
         if (c.req_start_us != 0) epoch_leave();
+        // Release any held upstream concurrency slot (catch-all; idempotent via
+        // the held flag).
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
         if constexpr (Backend::kAsyncIo) {
             // Only cancel when ops are in flight. If pending_ops == 0,
             // the slot is freed immediately — no cancels needed.

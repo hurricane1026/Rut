@@ -121,6 +121,11 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // Upstream concurrency slot: set true between try_acquire and release so the
+    // slot is freed exactly once, on whatever exit path runs (completion, failure,
+    // or close). `upstream_slot_uid` records which backend's gauge to decrement.
+    bool upstream_slot_held;
+    u16 upstream_slot_uid;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -323,6 +328,8 @@ struct ConnectionBase {
         upstream_abandoned = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        upstream_slot_held = false;
+        upstream_slot_uid = 0;
         throttle_down_bps = 0;
         throttle_ns_per_byte = 0;
         throttle_tat_ns = 0;

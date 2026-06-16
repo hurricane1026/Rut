@@ -20,6 +20,7 @@
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -163,6 +164,15 @@ struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.
     GlobalRateLimiter* global_rl = nullptr;
+    // Shared per-upstream concurrency gauge for max-inflight limiting (null =
+    // unlimited). main.cc points every shard at one shared instance.
+    UpstreamConcurrency* upstream_cc = nullptr;
+    bool upstream_acquire(u16 uid, u32 max) {
+        return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
+    }
+    void upstream_release(u16 uid) {
+        if (upstream_cc) upstream_cc->release(uid);
+    }
 
 private:
     std::atomic<bool> running_;
@@ -440,6 +450,12 @@ public:
 
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
+        // Release any held upstream concurrency slot (catch-all for failure /
+        // non-keep-alive completion; the held flag makes a prior release a no-op).
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
         // If a yield is scheduled, drop its heap entry now so a long wait
         // doesn't keep an unused heap slot occupied until its deadline.
         // Only the pending_handler_fn path can have an entry; no-op

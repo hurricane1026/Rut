@@ -9,6 +9,7 @@
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -1531,6 +1532,32 @@ TEST(global_rate_limit, token_bucket_shared) {
     CHECK(rl.allow_key(kKey, kEmit, kTau, 1010));   // one token refilled after 10µs
     CHECK(rl.allow_key(0x99, kEmit, kTau, 1000));   // a different key is independent
     CHECK(rl.allow_key(kKey, 0, 0, 1000));          // emit==0 disables
+}
+
+TEST(upstream_concurrency, gauge_acquire_release) {
+    using namespace rut;
+    UpstreamConcurrency cc{};
+    cc.reset();
+    // Cap 2 on upstream 0: two acquires succeed, the third is shed.
+    CHECK(cc.try_acquire(0, 2));
+    CHECK(cc.try_acquire(0, 2));
+    CHECK(!cc.try_acquire(0, 2));  // at capacity
+    cc.release(0);                 // one completes
+    CHECK(cc.try_acquire(0, 2));   // slot freed
+    CHECK(!cc.try_acquire(0, 2));
+    CHECK(cc.try_acquire(1, 2));  // a different upstream is independent
+    CHECK(cc.try_acquire(0, 0));  // max == 0 → unlimited
+    CHECK(cc.try_acquire(0, 0));
+}
+
+TEST(route, set_upstream_max_inflight) {
+    using namespace rut;
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, 8080);
+    REQUIRE(id.has_value());
+    CHECK(cfg.set_upstream_max_inflight(id.value(), 16));
+    CHECK_EQ(cfg.upstreams[id.value()].max_inflight, 16u);
+    CHECK(!cfg.set_upstream_max_inflight(99, 1));  // bad upstream id
 }
 
 TEST(route, set_route_rate_limit) {
