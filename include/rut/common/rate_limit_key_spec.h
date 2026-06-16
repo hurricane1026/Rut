@@ -52,4 +52,31 @@ struct RateLimitKeySpec {
     }
 };
 
+// One rate-limit rule: `max` requests per `window_sec`, metered by `key`. A
+// route can stack several rules (one per @rateLimit) — a request must pass them
+// all, so e.g. an anonymous per-IP cap and a higher per-API-key cap coexist.
+struct RateLimitRule {
+    u32 max = 0;
+    u32 window_sec = 0;
+    RateLimitKeySpec key{};
+};
+
+static constexpr u32 kMaxRateLimitRules = 4;
+
+// The ordered rule list for a route + its length. POD (inline arrays) → one-line
+// memberwise copy through the IR.
+struct RateLimitRuleSet {
+    RateLimitRule rules[kMaxRateLimitRules];
+    u8 count = 0;
+
+    // Append a rule; returns its index, or -1 if full.
+    i32 add_rule(u32 max, u32 window_sec) {
+        if (count >= kMaxRateLimitRules) return -1;
+        rules[count].max = max;
+        rules[count].window_sec = window_sec;
+        rules[count].key = RateLimitKeySpec{};
+        return static_cast<i32>(count++);
+    }
+};
+
 }  // namespace rut

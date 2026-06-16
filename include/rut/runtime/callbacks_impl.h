@@ -475,11 +475,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // Per-route rate limit (fixed window). Enforced after route match, before
-    // dispatch. The metering unit is the configured key tuple (IP / header /
-    // query / cookie / param) extracted from this request; with no components it
-    // defaults to per-client-IP. The limiter is per-shard (one thread each), so a
+    // dispatch. A route may stack several rules; a request must pass every one,
+    // each metered by its own key tuple (IP / header / query / cookie / param;
+    // empty = per-client-IP). The limiter is per-shard (one thread each), so a
     // thread_local table needs no atomics — same rationale as the parse cache.
-    if (route && route->rate_limit_max > 0 && config) {
+    if (route && route->rate_limit.count > 0 && config) {
         static thread_local RateLimiter rate_limiter{};
         const u32 kRouteIdx = static_cast<u32>(route - config->routes);
         const u64 kNowSec = monotonic_us() / 1'000'000ull;
@@ -493,10 +493,19 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         key_in.path_len = path_len;
         key_in.params = route_params;
         key_in.param_count = route_param_count;
-        const u64 kKey =
-            rate_limit_key(kRouteIdx, route->rate_limit_key, route->rate_limit_key_count, key_in);
-        if (!rate_limiter.allow_key(
-                kKey, route->rate_limit_max, route->rate_limit_window_sec, kNowSec)) {
+        bool over_limit = false;
+        for (u32 ri = 0; ri < route->rate_limit.count; ri++) {
+            const RateLimitRule& rule = route->rate_limit.rules[ri];
+            // Fold the rule index into the key scope so stacked rules never share
+            // a counter even when their key components overlap.
+            const u32 kScope = kRouteIdx * kMaxRateLimitRules + ri;
+            const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
+            if (!rate_limiter.allow_key(kKey, rule.max, rule.window_sec, kNowSec)) {
+                over_limit = true;
+                break;
+            }
+        }
+        if (over_limit) {
             conn.resp_status = 429;
             format_static_response(conn, 429, /*keep_alive=*/false);
             conn.keep_alive = false;

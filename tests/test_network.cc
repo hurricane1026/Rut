@@ -1525,8 +1525,9 @@ TEST(route, set_route_rate_limit) {
     RouteConfig cfg;
     REQUIRE(cfg.add_static("/limited", 'G', 200));
     CHECK(cfg.set_route_rate_limit(0, 100, 60));
-    CHECK_EQ(cfg.routes[0].rate_limit_max, 100u);
-    CHECK_EQ(cfg.routes[0].rate_limit_window_sec, 60u);
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].max, 100u);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].window_sec, 60u);
     CHECK(!cfg.set_route_rate_limit(99, 1, 1));  // bad index
 }
 
@@ -1620,9 +1621,11 @@ TEST(route, add_route_rate_limit_key) {
     CHECK(cfg.set_route_rate_limit(0, 100, 60));
     CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Ip, nullptr, 0));
     CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
-    CHECK_EQ(cfg.routes[0].rate_limit_key_count, 2u);
-    CHECK(cfg.routes[0].rate_limit_key[1].kind == RateLimitKeyKind::Header);
-    CHECK_EQ(cfg.routes[0].rate_limit_key[1].name_len, 9u);
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
+    const auto& k0 = cfg.routes[0].rate_limit.rules[0].key;
+    CHECK_EQ(k0.count, 2u);
+    CHECK(k0.comps[1].kind == RateLimitKeyKind::Header);
+    CHECK_EQ(k0.comps[1].name_len, 9u);
     // Fills to capacity then rejects.
     CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Query, "a", 1));
     CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Cookie, "b", 1));

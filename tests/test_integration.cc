@@ -777,6 +777,60 @@ TEST(rate_limit_e2e, meters_by_header_key) {
     destroy_real_loop(loop);
 }
 
+// Stacked rate-limit rules: a route caps both per-IP and per-API-key, with
+// different limits. A request must satisfy every rule. Here the per-IP cap (2)
+// is the tighter one a single client hits first.
+TEST(rate_limit_e2e, stacked_rules_both_enforced) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/api", 'G', 200));
+    // Rule 0: per-IP, 2/window. Rule 1: per-API-key, 5/window.
+    REQUIRE(cfg.set_route_rate_limit(0, 2, 60));
+    REQUIRE(cfg.add_route_rate_limit_rule(0, 5, 60));
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 2u);
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\nX-API-Key: k\r\n\r\n";
+    auto one_shot = [&]() -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, kReq, sizeof(kReq) - 1)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    // Same IP + same key: per-IP rule (2) trips first, before the per-key rule (5).
+    CHECK_EQ(one_shot(), 200);
+    CHECK_EQ(one_shot(), 200);
+    CHECK_EQ(one_shot(), 429);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // The @rateLimit official decorator compiles through the IR to a per-route
 // limit on the RIR function (which register_jit_routes forwards to the config).
 TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
@@ -799,9 +853,10 @@ TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
     auto lowered = lower_to_rir(*mir_owned, rir);
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.func_count, 1u);
-    CHECK_EQ(rir.module.functions[0].rate_limit_max, 3u);
-    CHECK_EQ(rir.module.functions[0].rate_limit_window_sec, 60u);  // 1m
-    CHECK_EQ(rir.module.functions[0].rate_limit_key.count, 0u);    // default per-IP
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].max, 3u);
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].window_sec, 60u);  // 1m
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].key.count, 0u);    // default per-IP
     rir.destroy();
 }
 
@@ -826,7 +881,8 @@ TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     auto lowered = lower_to_rir(*mir_owned, rir);
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.func_count, 1u);
-    const auto& spec = rir.module.functions[0].rate_limit_key;
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    const auto& spec = rir.module.functions[0].rate_limit.rules[0].key;
     REQUIRE_EQ(spec.count, 2u);
     CHECK(spec.comps[0].kind == RateLimitKeyKind::Ip);
     CHECK(spec.comps[1].kind == RateLimitKeyKind::Header);
@@ -856,9 +912,43 @@ TEST(rate_limit_dsl, by_single_source) {
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(*mir_owned, rir);
     REQUIRE(lowered);
-    const auto& spec = rir.module.functions[0].rate_limit_key;
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    const auto& spec = rir.module.functions[0].rate_limit.rules[0].key;
     REQUIRE_EQ(spec.count, 1u);
     CHECK(spec.comps[0].kind == RateLimitKeyKind::Header);
+    rir.destroy();
+}
+
+// Two stacked @rateLimit decorators compile to two rules on the RIR function.
+TEST(rate_limit_dsl, stacked_decorators_compile_to_rules) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 100, window: 1m)\n"
+        "@rateLimit(limit: 1000, window: 1h, by: header(\"X-API-Key\"))\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    const auto& rl = rir.module.functions[0].rate_limit;
+    REQUIRE_EQ(rl.count, 2u);
+    CHECK_EQ(rl.rules[0].max, 100u);
+    CHECK_EQ(rl.rules[0].window_sec, 60u);
+    CHECK_EQ(rl.rules[0].key.count, 0u);  // per-IP
+    CHECK_EQ(rl.rules[1].max, 1000u);
+    CHECK_EQ(rl.rules[1].window_sec, 3600u);
+    REQUIRE_EQ(rl.rules[1].key.count, 1u);
+    CHECK(rl.rules[1].key.comps[0].kind == RateLimitKeyKind::Header);
     rir.destroy();
 }
 
@@ -915,7 +1005,8 @@ TEST(rate_limit_dsl, e2e_429_over_limit) {
     RouteConfig cfg{};
     REQUIRE(populate_route_config(cfg, rir.module));
     REQUIRE(register_jit_routes(cfg, rir.module, engine));
-    CHECK_EQ(cfg.routes[0].rate_limit_max, 3u);
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].max, 3u);
     const RouteConfig* active = &cfg;
 
     {

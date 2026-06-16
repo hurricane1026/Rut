@@ -100,13 +100,16 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
             return false;
         // @rateLimit decorator → per-route fixed-window limit on the route just
         // added (index route_count - 1).
-        if (fn.rate_limit_max > 0) {
+        // @rateLimit decorators → stacked rules, each with its own metering key.
+        if (fn.rate_limit.count > 0) {
             const u32 kRouteIdx = cfg.route_count - 1;
-            cfg.set_route_rate_limit(kRouteIdx, fn.rate_limit_max, fn.rate_limit_window_sec);
-            // @rateLimit `by:` → composite metering-key components.
-            for (u32 ki = 0; ki < fn.rate_limit_key.count; ki++) {
-                const RateLimitKeyComponent& kc = fn.rate_limit_key.comps[ki];
-                cfg.add_route_rate_limit_key(kRouteIdx, kc.kind, kc.name, kc.name_len);
+            for (u32 ri = 0; ri < fn.rate_limit.count; ri++) {
+                const RateLimitRule& rule = fn.rate_limit.rules[ri];
+                cfg.add_route_rate_limit_rule(kRouteIdx, rule.max, rule.window_sec);
+                for (u32 ki = 0; ki < rule.key.count; ki++) {
+                    const RateLimitKeyComponent& kc = rule.key.comps[ki];
+                    cfg.add_route_rate_limit_key(kRouteIdx, kc.kind, kc.name, kc.name_len);
+                }
             }
         }
         if (fn.throttle_down_bps > 0) {

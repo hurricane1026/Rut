@@ -15810,9 +15810,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // route metadata, not resolved to user functions. @rateLimit sets
             // the per-route fixed-window limit (enforced in the runtime).
             if (ast_deco.name.eq({"rateLimit", 9})) {
-                route.rate_limit_max = ast_deco.rate_limit_max;
-                route.rate_limit_window_sec = ast_deco.rate_limit_window_sec;
-                route.rate_limit_key = ast_deco.rate_limit_key;
+                // Each @rateLimit stacks one rule (caps are silently dropped past
+                // the rule-set capacity).
+                const i32 kRuleIdx = route.rate_limit.add_rule(ast_deco.rate_limit_max,
+                                                               ast_deco.rate_limit_window_sec);
+                if (kRuleIdx >= 0) route.rate_limit.rules[kRuleIdx].key = ast_deco.rate_limit_key;
                 continue;
             }
             if (ast_deco.name.eq({"throttle", 8})) {

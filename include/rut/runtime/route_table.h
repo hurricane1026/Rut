@@ -81,15 +81,12 @@ struct RouteEntry {
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
-    // Per-route rate limit (fixed window). 0 = unlimited. `rate_limit_max`
-    // requests are allowed per `rate_limit_window_sec`; over the limit the
-    // runtime answers 429 before dispatching. The metering unit is the tuple of
-    // `rate_limit_key[0..rate_limit_key_count)` extracted from each request
-    // (IP / header / query / cookie / param); count 0 = default per-client-IP.
-    u32 rate_limit_max = 0;
-    u32 rate_limit_window_sec = 0;
-    RateLimitKeyComponent rate_limit_key[kMaxRateLimitKeyComponents];
-    u8 rate_limit_key_count = 0;
+    // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
+    // allows `max` requests per `window_sec` metered by its own key (IP / header
+    // / query / cookie / param tuple; empty key = per-client-IP). A request must
+    // pass every rule, so stacked rules (one per @rateLimit) give different caps
+    // per dimension — e.g. anonymous per-IP plus a higher per-API-key cap.
+    RateLimitRuleSet rate_limit{};
     // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
@@ -430,31 +427,35 @@ struct RouteConfig {
         return true;
     }
 
-    // Attach a fixed-window, per-client-IP rate limit to an existing route
-    // (by index). `max` requests per `window_sec`; 0/0 disables. Returns false
-    // on a bad index. The DSL `@throttle` decorator will populate this later.
+    // Set a route's rate limit to a single fixed-window rule (`max` requests per
+    // `window_sec`, default per-client-IP key), replacing any existing rules.
+    // 0/0 leaves the route unlimited. Returns false on a bad index. For stacked
+    // rules use add_route_rate_limit_rule; refine the key with
+    // add_route_rate_limit_key.
     bool set_route_rate_limit(u32 idx, u32 max, u32 window_sec) {
         if (idx >= route_count) return false;
-        routes[idx].rate_limit_max = max;
-        routes[idx].rate_limit_window_sec = window_sec;
+        routes[idx].rate_limit = RateLimitRuleSet{};
+        if (max > 0 && window_sec > 0) routes[idx].rate_limit.add_rule(max, window_sec);
         return true;
     }
 
-    // Append one metering-key component to a route's rate-limit key (IP / header
-    // / query / cookie / param). With no components the route meters per client
-    // IP; each appended component adds a dimension, so the limiter counts per
-    // unique tuple. `name` is ignored for Ip. Returns false on a bad index or
-    // when the key is already full.
+    // Append an additional rate-limit rule to a route (stacking): a request must
+    // pass every rule. Returns false on a bad index or when the rule set is full.
+    bool add_route_rate_limit_rule(u32 idx, u32 max, u32 window_sec) {
+        if (idx >= route_count) return false;
+        return routes[idx].rate_limit.add_rule(max, window_sec) >= 0;
+    }
+
+    // Append one metering-key component to a route's *most recently added* rule
+    // (IP / header / query / cookie / param). With no components a rule meters
+    // per client IP; each appended component adds a dimension, so it counts per
+    // unique tuple. `name` is ignored for Ip. Returns false on a bad index, when
+    // the route has no rule yet, or when that rule's key is already full.
     bool add_route_rate_limit_key(u32 idx, RateLimitKeyKind kind, const char* name, u32 name_len) {
         if (idx >= route_count) return false;
-        RouteEntry& r = routes[idx];
-        if (r.rate_limit_key_count >= kMaxRateLimitKeyComponents) return false;
-        RateLimitKeyComponent& c = r.rate_limit_key[r.rate_limit_key_count];
-        c.kind = kind;
-        c.name_len = 0;
-        if (kind != RateLimitKeyKind::Ip && name) c.set_name(name, name_len);
-        r.rate_limit_key_count++;
-        return true;
+        RateLimitRuleSet& rs = routes[idx].rate_limit;
+        if (rs.count == 0) return false;
+        return rs.rules[rs.count - 1].key.add(kind, name, name_len);
     }
 
     // Attach a per-route client-send byte rate (bytes/sec, 0 disables). Set by
