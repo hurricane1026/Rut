@@ -831,14 +831,17 @@ TEST(rate_limit_e2e, stacked_rules_both_enforced) {
     destroy_real_loop(loop);
 }
 
-// scope: global scales the limit to a per-shard share. With shard_count=4 and a
-// global cap of 4, each shard allows just 1 before 429.
-TEST(rate_limit_e2e, global_scope_divides_by_shard_count) {
+// scope: global enforces an exact cluster-wide cap via the shared
+// GlobalRateLimiter (no divide-by-shard-count). Cap 2 → 2 allowed then 429.
+TEST(rate_limit_e2e, global_scope_shared_limiter) {
     using namespace rut;
     RouteConfig cfg{};
     REQUIRE(cfg.add_static("/api", 'G', 200));
-    REQUIRE(cfg.add_route_rate_limit_rule(0, 4, 60, RateLimitScope::Global));  // 4 global
+    REQUIRE(cfg.add_route_rate_limit_rule(0, 2, 60, RateLimitScope::Global));  // 2 global
     const RouteConfig* active = &cfg;
+
+    GlobalRateLimiter grl{};  // fresh shared limiter for this test
+    grl.reset();
 
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -848,7 +851,7 @@ TEST(rate_limit_e2e, global_scope_divides_by_shard_count) {
     const u16 port = get_port(listen_fd);
     REQUIRE(loop->init(0, listen_fd).has_value());
     loop->config_ptr = &active;
-    loop->shard_count = 4;  // pretend this is one of 4 shards → per-shard share = 1
+    loop->global_rl = &grl;
     LoopThread lt = {loop, {}, 200};
     lt.start();
 
@@ -870,8 +873,9 @@ TEST(rate_limit_e2e, global_scope_divides_by_shard_count) {
         close(c);
         return rc;
     };
-    CHECK_EQ(one_shot(), 200);  // 1st (ceil(4/4)=1 allowed on this shard)
-    CHECK_EQ(one_shot(), 429);  // 2nd over the per-shard share
+    CHECK_EQ(one_shot(), 200);  // 1
+    CHECK_EQ(one_shot(), 200);  // 2
+    CHECK_EQ(one_shot(), 429);  // over the cluster cap
 
     lt.stop();
     loop->shutdown();

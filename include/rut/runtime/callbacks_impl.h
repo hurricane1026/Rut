@@ -493,12 +493,12 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         key_in.path_len = path_len;
         key_in.params = route_params;
         key_in.param_count = route_param_count;
-        // Total shards this process runs (1 in tests / single-shard). A
-        // Global-scope rule's cluster-wide `max` is approximated as a per-shard
-        // share ceil(max / shard_count), assuming clients fan out across shards.
-        u32 shard_n = 1;
-        if constexpr (requires { loop->shard_count; }) shard_n = loop->shard_count;
-        if (shard_n == 0) shard_n = 1;
+        // Global-scope rules go to the process-shared GlobalRateLimiter (exact
+        // cluster-wide cap); shard-scope rules use this shard's thread_local
+        // table. If no shared limiter is wired (e.g. a minimal embedding), a
+        // global rule degrades to per-shard.
+        GlobalRateLimiter* grl = nullptr;
+        if constexpr (requires { loop->global_rl; }) grl = loop->global_rl;
         bool over_limit = false;
         for (u32 ri = 0; ri < route->rate_limit.count; ri++) {
             const RateLimitRule& rule = route->rate_limit.rules[ri];
@@ -506,12 +506,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             // a counter even when their key components overlap.
             const u32 kScope = kRouteIdx * kMaxRateLimitRules + ri;
             const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
-            u32 eff_max = rule.max;
-            if (rule.scope == RateLimitScope::Global && shard_n > 1) {
-                eff_max = (rule.max + shard_n - 1) / shard_n;  // ceil
-                if (eff_max == 0) eff_max = 1;
-            }
-            if (!rate_limiter.allow_key(kKey, eff_max, rule.window_sec, kNowSec)) {
+            const bool kOk = (rule.scope == RateLimitScope::Global && grl != nullptr)
+                                 ? grl->allow_key(kKey, rule.max, rule.window_sec, kNowSec)
+                                 : rate_limiter.allow_key(kKey, rule.max, rule.window_sec, kNowSec);
+            if (!kOk) {
                 over_limit = true;
                 break;
             }

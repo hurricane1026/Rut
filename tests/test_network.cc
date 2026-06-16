@@ -1520,6 +1520,28 @@ TEST(rate_limit, fixed_window) {
     CHECK(rl.allow(2, kIp, 3, 0, 1000));
 }
 
+TEST(global_rate_limit, exact_cap_shared_window_reset) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 kKey = 0xABCDEF12;
+    // 3 per 60s — exact (no per-shard division). Two "shards" sharing one limiter
+    // both draw from the same budget.
+    CHECK(rl.allow_key(kKey, 3, 60, 1000));   // 1
+    CHECK(rl.allow_key(kKey, 3, 60, 1000));   // 2 (different shard, same key)
+    CHECK(rl.allow_key(kKey, 3, 60, 1001));   // 3
+    CHECK(!rl.allow_key(kKey, 3, 60, 1002));  // 4 → over the cluster cap
+    CHECK(!rl.allow_key(kKey, 3, 60, 1003));  // still over within the window
+    // A different key has an independent budget.
+    CHECK(rl.allow_key(0x99, 3, 60, 1002));
+    // Window resets after window_sec elapses.
+    CHECK(rl.allow_key(kKey, 3, 60, 1062));  // 62s > 60s → new window
+    CHECK(rl.allow_key(kKey, 3, 60, 1062));
+    // max==0 / window==0 disables.
+    CHECK(rl.allow_key(kKey, 0, 60, 1000));
+    CHECK(rl.allow_key(kKey, 3, 0, 1000));
+}
+
 TEST(route, set_route_rate_limit) {
     using namespace rut;
     RouteConfig cfg;

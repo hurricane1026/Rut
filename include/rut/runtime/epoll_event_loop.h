@@ -14,6 +14,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
@@ -158,9 +159,10 @@ struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     // when a new push does not change the heap's top.
     u64 yield_timer_armed_ns = 0;
     u32 shard_id;
-    // Total shards in this process (1 in tests). Used to scale a Global-scope
-    // rate limit to a per-shard share (ceil(max / shard_count)).
-    u32 shard_count = 1;
+    // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
+    // global rules degrade to per-shard. main.cc points every shard at one
+    // shared instance.
+    GlobalRateLimiter* global_rl = nullptr;
 
 private:
     std::atomic<bool> running_;
