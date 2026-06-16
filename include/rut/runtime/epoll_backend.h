@@ -83,6 +83,13 @@ struct EpollBackend {
     // has no registered downstream fd.
     void pause_recv(u32 conn_id, bool preserve_send_interest = false);
 
+    // Suspend EPOLLIN on the upstream fd for conn_id. Used by @throttle to park
+    // the proxy body pump between byte-rate windows: epoll is level-triggered, so
+    // pending upstream data would otherwise keep firing UpstreamRecv and drive the
+    // pipeline past the pause. submit_recv_upstream re-arms EPOLLIN on resume.
+    // No-op if the conn_id has no registered upstream fd.
+    void pause_upstream_recv(u32 conn_id);
+
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);

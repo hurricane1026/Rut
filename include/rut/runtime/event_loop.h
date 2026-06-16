@@ -70,6 +70,18 @@ public:
     }
     bool submit_recv_upstream(Connection& c) { return self().submit_recv_upstream_impl(c); }
 
+    // Stop watching the upstream fd for readability (used by @throttle to park the
+    // proxy body pump between byte-rate windows). On backends with a persistent
+    // level-triggered registration (epoll) this disarms EPOLLIN so pending
+    // upstream data can't drive the pipeline past the pause; on submission-based
+    // backends (io_uring) simply not re-arming the recv is enough, so this is a
+    // no-op there. submit_recv_upstream re-arms on resume.
+    void pause_upstream_recv(Connection& c) {
+        if constexpr (requires { self().pause_upstream_recv_impl(c); }) {
+            self().pause_upstream_recv_impl(c);
+        }
+    }
+
     // Per-event-type dispatch: route to typed slot.
     // Called from each concrete EventLoop's dispatch() after timer refresh.
     // Centralizes all "unexpected event" handling in one place.
@@ -567,6 +579,12 @@ public:
         }
         return false;
     }
+    void pause_upstream_recv_impl(Connection& c) {
+        if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
+            backend.pause_upstream_recv(c.id);
+        }
+        if constexpr (Backend::kAsyncIo) c.upstream_recv_armed = false;
+    }
     bool submit_recv_upstream_impl(Connection& c) {
         if constexpr (Backend::kAsyncIo) {
             if (c.upstream_recv_armed) return true;
@@ -646,6 +664,8 @@ public:
                     timer.tick([this](Connection* c) {
                         if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             respond_upstream_timeout(this, *c);  // upstream stalled → 504
+                        } else if (c->throttle_paused) {
+                            throttle_resume(this, *c);  // @throttle: resume next window
                         } else {
                             this->close_conn(*c);
                         }
@@ -694,9 +714,11 @@ public:
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn,
-                                      conn.state == ConnState::Proxying ? upstream_timeout
-                                                                        : keepalive_timeout);
+                        // See EpollEventLoop: don't let stray events bump a
+                        // @throttle-paused connection's byte-rate-window timer back
+                        // to the keepalive timeout.
+                        if (!conn.throttle_paused) timer.refresh(&conn, conn.state == ConnState::Proxying ? upstream_timeout
+                                                            : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if constexpr (Backend::kAsyncIo) {
                         // Stale CQE for a closed connection. If all ops are now

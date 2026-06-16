@@ -431,6 +431,8 @@ public:
         return backend.add_recv_upstream(c.upstream_fd, c.id);
     }
 
+    void pause_upstream_recv_impl(Connection& c) { backend.pause_upstream_recv(c.id); }
+
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
         // If a yield is scheduled, drop its heap entry now so a long wait
@@ -595,6 +597,10 @@ public:
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504.
                             respond_upstream_timeout<EpollEventLoop>(this, *c);
+                        } else if (c->throttle_paused) {
+                            // @throttle: a new byte-rate window has opened — resume
+                            // the parked client send.
+                            throttle_resume<EpollEventLoop>(this, *c);
                         } else {
                             this->close_conn(*c);
                         }
@@ -622,9 +628,13 @@ public:
                     auto& conn = conns[ev.conn_id];
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn,
-                                      conn.state == ConnState::Proxying ? upstream_timeout
-                                                                        : keepalive_timeout);
+                        // A @throttle-paused connection's timer is owned by the
+                        // byte-rate window (refresh(&conn, 1) in the pump gate);
+                        // don't let stray events (e.g. a stale -ENOBUFS on the
+                        // upstream fd) bump it back to the keepalive timeout, which
+                        // would strand the parked pump until keepalive expiry.
+                        if (!conn.throttle_paused) timer.refresh(&conn, conn.state == ConnState::Proxying ? upstream_timeout
+                                                            : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {

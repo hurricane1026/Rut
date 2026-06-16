@@ -867,6 +867,129 @@ TEST(throttle_dsl, bad_unit_rejected) {
     CHECK(!parse_file(l.value()));  // unknown byte unit
 }
 
+// A backend that serves a fixed-size body in one shot — the gateway paces it to
+// the client when the route is throttled.
+struct LargeBodyServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    u32 body_len = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~LargeBodyServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<LargeBodyServer*>(arg);
+        i32 client = -1;
+        while (s->running.load(std::memory_order_acquire)) {
+            client = accept(s->listen_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            char hdr[128];
+            const int hn = snprintf(
+                hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", s->body_len);
+            if (hn > 0) (void)send_all(client, hdr, static_cast<u32>(hn));
+            static char body[65536];
+            for (u32 i = 0; i < s->body_len && i < sizeof(body); i++) body[i] = 'x';
+            (void)send_all(client, body, s->body_len);
+            // Hold the connection open so the gateway can finish draining at the
+            // throttled rate before we close.
+            while (s->running.load(std::memory_order_acquire)) usleep(5000);
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(u32 blen) {
+        body_len = blen;
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// End-to-end: a throttled proxy route paces the downstream body. 40 KB at
+// 8 KB/s must take noticeably longer than the sub-100ms an unthrottled proxy
+// would — proving the per-connection byte window + timer-resume actually paces.
+TEST(throttle_e2e, downstream_paces_proxied_body) {
+    using namespace rut;
+    LargeBodyServer backend;
+    REQUIRE(backend.setup(40000));
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/dl", 0, id.value()));
+    REQUIRE(cfg.set_route_throttle(0, 8192));  // 8 KB/s
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+    char buf[8192];
+    u32 total = 0;
+    while (total < 40000u) {
+        i32 n = recv_timeout(c, buf, sizeof(buf), 5000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+    }
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    close(c);
+    const double elapsed =
+        static_cast<double>(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    CHECK(total >= 40000u);  // full body delivered
+    CHECK(elapsed >= 1.5);   // paced (≈5s ideal; unthrottled would be < 0.1s)
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

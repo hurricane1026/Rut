@@ -422,6 +422,12 @@ public:
         return false;
     }
 
+    // io_uring only recvs when an SQE is submitted, so not re-arming the recv
+    // (which throttle_pause_before_pump achieves by returning early) is enough to
+    // backpressure the upstream. Just ensure the armed flag is clear so resume
+    // re-submits the recv. No in-flight recv exists at a pump point.
+    void pause_upstream_recv_impl(Connection& c) { c.upstream_recv_armed = false; }
+
     bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
         c.recv_pause_cancel_pending = true;
@@ -602,6 +608,8 @@ public:
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504.
                             respond_upstream_timeout<IoUringEventLoop>(this, *c);
+                        } else if (c->throttle_paused) {
+                            throttle_resume<IoUringEventLoop>(this, *c);
                         } else {
                             this->close_conn(*c);
                         }
@@ -672,9 +680,11 @@ public:
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn,
-                                      conn.state == ConnState::Proxying ? upstream_timeout
-                                                                        : keepalive_timeout);
+                        // See EpollEventLoop: don't let stray events bump a
+                        // @throttle-paused connection's byte-rate-window timer back
+                        // to the keepalive timeout.
+                        if (!conn.throttle_paused) timer.refresh(&conn, conn.state == ConnState::Proxying ? upstream_timeout
+                                                            : keepalive_timeout);
                         if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {

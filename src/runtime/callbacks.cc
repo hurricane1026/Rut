@@ -716,6 +716,7 @@ template void on_request_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent)
 template void on_jit_request_body_recvd<EpollEventLoop>(void*, Connection&, IoEvent);
 template void resume_jit_handler<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void respond_upstream_timeout<EpollEventLoop>(EpollEventLoop*, Connection&);
+template void throttle_resume<EpollEventLoop>(EpollEventLoop*, Connection&);
 
 template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
@@ -741,5 +742,6 @@ template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEven
 template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 
 }  // namespace rut

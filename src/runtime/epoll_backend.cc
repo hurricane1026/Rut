@@ -249,6 +249,19 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     set_fd_interest(epoll_fd, fd, conn_id, type, events);
 }
 
+void EpollBackend::pause_upstream_recv(u32 conn_id) {
+    if (conn_id >= kMaxFdMap) return;
+    i32 fd = upstream_fd_map[conn_id];
+    if (fd < 0) return;
+    // Mask all readability (events=0) so neither buffered upstream data nor a
+    // half-close (EPOLLRDHUP, which dispatch folds into has_read) can fire
+    // UpstreamRecv and drive the pipeline past the parked @throttle pump.
+    // EPOLLHUP/EPOLLERR are still delivered by the kernel regardless, but those
+    // are genuine terminal conditions. submit_recv_upstream re-arms EPOLLIN on
+    // resume, at which point any buffered upstream bytes surface immediately.
+    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, 0);
+}
+
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
