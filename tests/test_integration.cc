@@ -829,6 +829,107 @@ TEST(rate_limit_e2e, meters_by_query_key) {
     destroy_real_loop(loop);
 }
 
+// Metering keyed by a cookie value (Cookie header parsing on the live path).
+TEST(rate_limit_e2e, meters_by_cookie_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/c", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Cookie, "sid", 3));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    auto one_shot = [&](const char* sid) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        char req[160];
+        const int rn = snprintf(
+            req, sizeof(req), "GET /c HTTP/1.1\r\nHost: x\r\nCookie: a=1; sid=%s\r\n\r\n", sid);
+        int rc = -1;
+        if (rn > 0 && send_all(c, req, static_cast<u32>(rn))) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot("alice"), 200);
+    CHECK_EQ(one_shot("alice"), 429);
+    CHECK_EQ(one_shot("bob"), 200);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Metering keyed by a route parameter (/u/:id) — needs the segment trie so the
+// param is captured into route_params and reaches the extractor.
+TEST(rate_limit_e2e, meters_by_param_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.use_segment_trie());
+    REQUIRE(cfg.add_static("/u/:id", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Param, "id", 2));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    auto one_shot = [&](const char* id) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        char req[128];
+        const int rn = snprintf(req, sizeof(req), "GET /u/%s HTTP/1.1\r\nHost: x\r\n\r\n", id);
+        int rc = -1;
+        if (rn > 0 && send_all(c, req, static_cast<u32>(rn))) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot("alice"), 200);  // /u/alice 1st
+    CHECK_EQ(one_shot("alice"), 429);  // /u/alice over its 1/window
+    CHECK_EQ(one_shot("bob"), 200);    // /u/bob: independent param value
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // Stacked rate-limit rules: a route caps both per-IP and per-API-key, with
 // different limits. A request must satisfy every rule. Here the per-IP cap (2)
 // is the tighter one a single client hits first.
