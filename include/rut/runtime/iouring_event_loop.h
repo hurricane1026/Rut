@@ -553,6 +553,25 @@ public:
         if (timeout_armed) (void)backend.cancel_yield_timeout(conn.id, old_gen);
     }
 
+    // Park a @throttle-paused proxy connection for `delay_ns` via an io_uring
+    // TIMEOUT SQE (ms granularity — fine for byte pacing; throttle_resume
+    // re-checks the budget so rounding/early wake is safe). Reuses the JIT yield
+    // timeout machinery; the HandlerTimer CQE routes back to throttle_resume when
+    // the connection is throttle_paused. Returns false on SQ pressure → caller
+    // falls back to the keepalive wheel.
+    [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
+        timer.remove(&conn);
+        u32 ms = static_cast<u32>((delay_ns + 999'999ull) / 1'000'000ull);
+        if (ms == 0) ms = 1;
+        if (backend.add_yield_timeout(conn.id, conn, ms)) {
+            conn.yield_armed = true;
+            conn.yield_timeout_armed = true;
+            conn.pending_ops++;
+            return true;
+        }
+        return false;
+    }
+
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
             case IoEventType::Accept:
@@ -578,11 +597,15 @@ public:
                         c.yield_armed = false;
                         c.yield_timeout_armed = false;
                     }
-                    if (c.pending_handler_fn && matching_generation &&
-                        (c.pending_yield_kind == jit::YieldKind::Timer ||
-                         (was_yield_armed &&
-                          yield_kind_matches_event(c.pending_yield_kind,
-                                                   IoEventType::HandlerTimer)))) {
+                    if (c.throttle_paused && matching_generation) {
+                        // @throttle pacing timer fired — resume the parked proxy
+                        // pump (re-checks the byte budget; may re-park).
+                        throttle_resume<IoUringEventLoop>(this, c);
+                    } else if (c.pending_handler_fn && matching_generation &&
+                               (c.pending_yield_kind == jit::YieldKind::Timer ||
+                                (was_yield_armed &&
+                                 yield_kind_matches_event(c.pending_yield_kind,
+                                                          IoEventType::HandlerTimer)))) {
                         c.resume_event_kind = jit::YieldKind::Timer;
                         c.resume_event_result = 0;
                         resume_jit_handler<IoUringEventLoop>(this, c);

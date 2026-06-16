@@ -122,15 +122,16 @@ struct ConnectionBase {
     bool req_path_overridden;
     Str req_path_override;
 
-    // @throttle downstream pacing — per-connection fixed-window byte budget for
-    // sends to the client. Set per request from the matched route. When the
-    // current 1-second window's quota is spent, the proxy body pump is parked and
-    // resumed by the timer-wheel tick on the next window (see callbacks_impl.h).
-    u32 throttle_down_bps;      // bytes/sec cap (0 = unthrottled)
-    u32 throttle_window_bytes;  // bytes already sent in the current window
-    u64 throttle_window_sec;    // monotonic second the current window opened
-    bool throttle_paused;       // pump parked waiting for the next byte-rate window
-    u32 throttle_pending_len;   // buffered upstream bytes to replay on resume
+    // @throttle downstream pacing — per-connection token bucket (virtual-time /
+    // GCRA) for sends to the client. Set per request from the matched route. The
+    // proxy body pump advances `throttle_tat_ns` by sent_bytes × ns_per_byte; when
+    // it runs ahead of real time the pump parks for the exact deficit on the
+    // per-shard precise timer, resumed by throttle_resume (see callbacks_impl.h).
+    u32 throttle_down_bps;     // bytes/sec cap (0 = unthrottled)
+    u32 throttle_ns_per_byte;  // precomputed 1e9 / bps (ns per byte; 0 = off)
+    u64 throttle_tat_ns;       // GCRA theoretical arrival time (monotonic ns)
+    bool throttle_paused;      // pump parked waiting for byte-budget to recover
+    u32 throttle_pending_len;  // buffered upstream bytes to replay on resume
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -323,8 +324,8 @@ struct ConnectionBase {
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
         throttle_down_bps = 0;
-        throttle_window_bytes = 0;
-        throttle_window_sec = 0;
+        throttle_ns_per_byte = 0;
+        throttle_tat_ns = 0;
         throttle_paused = false;
         throttle_pending_len = 0;
         handler_state = 0;

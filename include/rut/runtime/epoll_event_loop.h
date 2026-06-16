@@ -545,10 +545,25 @@ public:
         if (yield_heap.remove_by_conn(conn.id) > 0) rearm_yield_timerfd();
     }
 
-    // Drain all heap entries whose deadline has passed. Resume each
-    // connection's pending JIT handler (skipping stale entries whose
-    // handler_gen no longer matches — indicating the slot was closed
-    // and reused before the timer fired).
+    // Park a @throttle-paused proxy connection on the precise (sub-second) yield
+    // timer for `delay_ns`, reusing the per-shard yield_heap. Tagged with
+    // handler_gen so a close+reuse before it fires is filtered as stale on drain.
+    // Returns false if the heap is full — the caller falls back to the keepalive
+    // wheel (throttle_resume re-checks the budget, so a coarse wake is safe).
+    [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
+        timer.remove(&conn);  // precise timer owns the wakeup; off the keepalive wheel
+        u64 deadline = epoll_yield::monotonic_ns() + delay_ns;
+        if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
+            rearm_yield_timerfd();
+            return true;
+        }
+        return false;
+    }
+
+    // Drain all heap entries whose deadline has passed. An entry resumes either a
+    // @throttle-paused proxy pump or a pending JIT handler (skipping stale entries
+    // whose handler_gen no longer matches — the slot was closed and reused before
+    // the timer fired).
     void drain_yield_heap() {
         u64 now = epoll_yield::monotonic_ns();
         while (!yield_heap.empty() && yield_heap.top().deadline_ns <= now) {
@@ -556,11 +571,15 @@ public:
             yield_heap.pop();
             if (entry.conn_id >= kMaxConns) continue;
             auto& c = conns[entry.conn_id];
+            if (c.handler_gen != entry.handler_gen) continue;  // stale
+            if (c.throttle_paused) {
+                throttle_resume<EpollEventLoop>(this, c);
+                continue;
+            }
             if (!c.pending_handler_fn) continue;
             if (c.pending_yield_kind != jit::YieldKind::Timer &&
                 !yield_kind_matches_event(c.pending_yield_kind, IoEventType::HandlerTimer))
                 continue;
-            if (c.handler_gen != entry.handler_gen) continue;  // stale
             c.yield_armed = false;
             c.resume_event_kind = jit::YieldKind::Timer;
             c.resume_event_result = 0;

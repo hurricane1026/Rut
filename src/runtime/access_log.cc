@@ -43,6 +43,14 @@ u64 monotonic_us() {
     return result;
 }
 
+u64 monotonic_ns() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return g_last_monotonic_us * 1000ULL;  // best-effort fallback
+    }
+    return static_cast<u64>(ts.tv_sec) * 1'000'000'000ULL + static_cast<u64>(ts.tv_nsec);
+}
+
 static u32 write_u64_dec(char* buf, u64 val) {
     if (val == 0) {
         buf[0] = '0';

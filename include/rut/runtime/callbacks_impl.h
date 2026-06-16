@@ -174,65 +174,84 @@ void respond_upstream_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
 
-// Client send with @throttle byte accounting. With no per-route throttle
-// (bps == 0) this is just loop->submit_send. Otherwise it tallies bytes into a
-// fixed 1-second window; the actual pacing happens on the proxy *read* side
-// (throttle_pause_before_pump), because pacing the upstream read lets TCP flow
-// control backpressure the backend — sending whole buffers as they're produced
-// keeps the downstream send path simple and never splits a send. Single-writer
-// per shard, so the window state needs no atomics.
+// Client send with @throttle token-bucket accounting. With no per-route throttle
+// (bps == 0) this is just loop->submit_send. Otherwise it advances the
+// connection's virtual-time bucket `throttle_tat_ns` by len × ns_per_byte
+// (anchored to now so an idle bucket doesn't bank credit). The actual pacing
+// happens on the proxy *read* side (throttle_pause_before_pump): pacing the
+// upstream read lets TCP flow control backpressure the backend, and sending whole
+// buffers as produced keeps the downstream path simple and never splits a send.
+// Single-writer per shard, so the bucket needs no atomics.
 template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
-    if (conn.throttle_down_bps != 0) {
-        const u64 kNowSec = monotonic_us() / 1'000'000ull;
-        if (kNowSec != conn.throttle_window_sec) {
-            conn.throttle_window_sec = kNowSec;
-            conn.throttle_window_bytes = 0;
-        }
-        conn.throttle_window_bytes += len;
+    if (conn.throttle_ns_per_byte != 0) {
+        const u64 kNowNs = monotonic_ns();
+        const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
+        conn.throttle_tat_ns = kBase + static_cast<u64>(len) * conn.throttle_ns_per_byte;
     }
     return loop->submit_send(conn, buf, len);
 }
 
 // @throttle read-side gate for the proxy body pump. Called at each point where
-// the proxy would read the next upstream chunk. If this connection has spent its
-// byte budget for the current 1-second window, disarm the upstream recv (so
-// level-triggered epoll readiness can't drive the pipeline past the pause), park
-// the connection on the per-shard timer wheel, and return true — the caller must
-// then return without pumping. throttle_resume re-arms on the next window.
+// the proxy would read the next upstream chunk. If the token bucket has run ahead
+// of real time (the bytes sent so far "should" take until throttle_tat_ns at the
+// configured rate), disarm the upstream recv — so level-triggered epoll readiness
+// can't drive the pipeline past the pause — park the connection on the per-shard
+// *precise* timer for exactly the deficit, and return true so the caller returns
+// without pumping. throttle_resume re-checks and re-arms when the budget recovers.
 template <typename Loop>
 bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remaining) {
-    if (conn.throttle_down_bps == 0) return false;
-    const u64 kNowSec = monotonic_us() / 1'000'000ull;
-    if (kNowSec != conn.throttle_window_sec) {
-        conn.throttle_window_sec = kNowSec;
-        conn.throttle_window_bytes = 0;
-        return false;  // fresh window — full budget available
-    }
-    if (conn.throttle_window_bytes < conn.throttle_down_bps) return false;
+    if (conn.throttle_ns_per_byte == 0) return false;
+    const u64 kNowNs = monotonic_ns();
+    if (conn.throttle_tat_ns <= kNowNs) return false;  // not ahead → budget available
+    const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
     conn.throttle_paused = true;
     conn.throttle_pending_len = pending_remaining;  // stash for resume
     if constexpr (requires { loop->pause_upstream_recv(conn); }) {
         loop->pause_upstream_recv(conn);
     }
-    if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
-        loop->timer.refresh(&conn, 1u);
+    // Arm the per-shard precise (sub-second) timer for the exact deficit. If the
+    // loop can't (heap full / no support), fall back to the 1-second keepalive
+    // wheel — throttle_resume re-checks the budget, so a coarse/early wake is safe.
+    bool armed = false;
+    if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
+        armed = loop->arm_throttle_timer(conn, kDelayNs);
+    }
+    if (!armed) {
+        if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
+            loop->timer.refresh(&conn, 1u);
+        }
     }
     return true;
 }
 
 // Resume the proxy body pump parked by throttle_pause_before_pump (invoked from
-// the timer tick on a throttle_paused connection). A new window has opened, so
-// either replay the buffered upstream bytes or re-arm the upstream recv.
+// the per-shard precise timer or the keepalive wheel). Re-check the bucket: if it
+// is still ahead of real time (the timer fired early, or a coarse wheel tick), the
+// budget hasn't recovered yet — re-park for the remaining deficit. Otherwise
+// replay the buffered upstream bytes or re-arm the upstream recv.
 template <typename Loop>
 void throttle_resume(Loop* loop, Connection& conn) {
+    if (conn.throttle_ns_per_byte != 0) {
+        const u64 kNowNs = monotonic_ns();
+        if (conn.throttle_tat_ns > kNowNs) {
+            // Budget not recovered yet — re-park for the remaining deficit.
+            const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
+            bool armed = false;
+            if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
+                armed = loop->arm_throttle_timer(conn, kDelayNs);
+            }
+            if (!armed) {
+                if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
+                    loop->timer.refresh(&conn, 1u);
+                }
+            }
+            return;  // stay paused
+        }
+    }
     conn.throttle_paused = false;
     const u32 kRemaining = conn.throttle_pending_len;
     conn.throttle_pending_len = 0;
-    // Reset the window for the freshly-opened second so the pump isn't
-    // immediately re-paused.
-    conn.throttle_window_sec = monotonic_us() / 1'000'000ull;
-    conn.throttle_window_bytes = 0;
     if (kRemaining > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
@@ -525,11 +544,14 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 
-    // @throttle: arm per-connection downstream pacing for this request's
-    // response (0 = unthrottled). Reset the window so pacing starts fresh.
+    // @throttle: arm per-connection downstream pacing for this request's response
+    // (0 = unthrottled). Precompute ns-per-byte once (1e9 / bps) so the send path
+    // needs no division; start the token bucket empty (tat = 0 ⇒ first chunk goes
+    // immediately, then paced).
     conn.throttle_down_bps = route ? route->throttle_down_bps : 0;
-    conn.throttle_window_bytes = 0;
-    conn.throttle_window_sec = 0;
+    conn.throttle_ns_per_byte =
+        conn.throttle_down_bps ? static_cast<u32>(1'000'000'000ull / conn.throttle_down_bps) : 0;
+    conn.throttle_tat_ns = 0;
 
     if (route && route->action == RouteAction::Proxy) {
         conn.state = ConnState::Proxying;
