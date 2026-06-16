@@ -2277,7 +2277,7 @@ struct Parser {
             Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
 
         if (deco.name.eq({"rateLimit", 9})) {
-            // @rateLimit(limit: <IntLit> per <DurLit>)
+            // @rateLimit(limit: <IntLit>, window: <DurLit>)
             if (!expect(TokenType::LParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto kw = expect(TokenType::Ident);
@@ -2294,9 +2294,12 @@ struct Parser {
                     return frontend_error(
                         FrontendError::InvalidInteger, deco.span, lim.value()->text);
             }
-            // `per` is a contextual keyword (lexed as an identifier).
-            auto per_tok = expect(TokenType::Ident);
-            if (!per_tok || !per_tok.value()->text.eq({"per", 3}))
+            if (!expect(TokenType::Comma))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto win_kw = expect(TokenType::Ident);
+            if (!win_kw || !win_kw.value()->text.eq({"window", 6}))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto dur = expect(TokenType::DurLit);
             if (!dur) return core::make_unexpected(dur.error());
@@ -2312,7 +2315,7 @@ struct Parser {
         }
 
         if (deco.name.eq({"throttle", 8})) {
-            // @throttle(downstream: <IntLit><b|kb|mb|gb> per <DurLit>)
+            // @throttle(downstream: <IntLit><b|kb|mb|gb>, window: <DurLit>)
             if (!expect(TokenType::LParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             // `downstream` is a reserved keyword (KwDownstream), not an Ident.
@@ -2346,8 +2349,12 @@ struct Parser {
             else
                 return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kUnit2);
             const u64 kBytes = amount * mult;
-            auto per_tok = expect(TokenType::Ident);
-            if (!per_tok || !per_tok.value()->text.eq({"per", 3}))
+            if (!expect(TokenType::Comma))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto win_kw = expect(TokenType::Ident);
+            if (!win_kw || !win_kw.value()->text.eq({"window", 6}))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto dur = expect(TokenType::DurLit);
             if (!dur) return core::make_unexpected(dur.error());

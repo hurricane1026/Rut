@@ -727,7 +727,7 @@ TEST(rate_limit_e2e, route_returns_429_over_limit) {
 TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
     using namespace rut;
     const char* src =
-        "@rateLimit(limit: 3 per 1m)\n"
+        "@rateLimit(limit: 3, window: 1m)\n"
         "route GET \"/api\" { return 200 }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -756,7 +756,7 @@ TEST(rate_limit_dsl, unknown_decorator_and_bad_args_rejected) {
     auto l1 = lex(Str{bogus, static_cast<u32>(strlen(bogus))});
     REQUIRE(l1);
     CHECK(!parse_file(l1.value()));  // unknown decorator
-    const char* zero = "@rateLimit(limit: 0 per 1m)\nroute GET \"/a\" { return 200 }\n";
+    const char* zero = "@rateLimit(limit: 0, window: 1m)\nroute GET \"/a\" { return 200 }\n";
     auto l2 = lex(Str{zero, static_cast<u32>(strlen(zero))});
     REQUIRE(l2);
     CHECK(!parse_file(l2.value()));  // limit 0 rejected
@@ -767,7 +767,7 @@ TEST(rate_limit_dsl, unknown_decorator_and_bad_args_rejected) {
 TEST(rate_limit_dsl, e2e_429_over_limit) {
     using namespace rut;
     const char* src =
-        "@rateLimit(limit: 3 per 1m)\n"
+        "@rateLimit(limit: 3, window: 1m)\n"
         "route GET \"/api\" { return 200 }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -838,7 +838,7 @@ TEST(rate_limit_dsl, e2e_429_over_limit) {
 TEST(throttle_dsl, decorator_compiles_to_bps) {
     using namespace rut;
     const char* src =
-        "@throttle(downstream: 5mb per 1s)\n"
+        "@throttle(downstream: 5mb, window: 1s)\n"
         "route GET \"/dl\" { return 200 }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -861,7 +861,7 @@ TEST(throttle_dsl, decorator_compiles_to_bps) {
 
 TEST(throttle_dsl, bad_unit_rejected) {
     using namespace rut;
-    const char* bad = "@throttle(downstream: 5xb per 1s)\nroute GET \"/a\" { return 200 }\n";
+    const char* bad = "@throttle(downstream: 5xb, window: 1s)\nroute GET \"/a\" { return 200 }\n";
     auto l = lex(Str{bad, static_cast<u32>(strlen(bad))});
     REQUIRE(l);
     CHECK(!parse_file(l.value()));  // unknown byte unit
