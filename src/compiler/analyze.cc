@@ -15814,6 +15814,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.rate_limit_window_sec = ast_deco.rate_limit_window_sec;
                 continue;
             }
+            if (ast_deco.name.eq({"throttle", 8})) {
+                route.throttle_down_bps = ast_deco.throttle_down_bps;
+                continue;
+            }
             const u32 fn_index = find_function_index(mod, ast_deco.name);
             if (fn_index == mod.functions.len)
                 return frontend_error(

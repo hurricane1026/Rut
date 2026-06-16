@@ -351,6 +351,8 @@ struct Function {
     // forwards these to RouteConfig::set_route_rate_limit.
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    // @throttle client-send byte rate (bytes/sec, 0 = none).
+    u32 throttle_down_bps = 0;
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;

@@ -833,6 +833,40 @@ TEST(rate_limit_dsl, e2e_429_over_limit) {
     rir.destroy();
 }
 
+// @throttle compiles to a per-route client-send byte rate on the RIR function.
+// (Runtime pacing is a separate change; here we verify the config plumbing.)
+TEST(throttle_dsl, decorator_compiles_to_bps) {
+    using namespace rut;
+    const char* src =
+        "@throttle(downstream: 5mb per 1s)\n"
+        "route GET \"/dl\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK_EQ(rir.module.functions[0].throttle_down_bps, 5u * 1024u * 1024u);  // 5mb / 1s
+    rir.destroy();
+}
+
+TEST(throttle_dsl, bad_unit_rejected) {
+    using namespace rut;
+    const char* bad = "@throttle(downstream: 5xb per 1s)\nroute GET \"/a\" { return 200 }\n";
+    auto l = lex(Str{bad, static_cast<u32>(strlen(bad))});
+    REQUIRE(l);
+    CHECK(!parse_file(l.value()));  // unknown byte unit
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

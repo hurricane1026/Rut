@@ -85,6 +85,9 @@ struct RouteEntry {
     // the limit the runtime answers 429 before dispatching.
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
+    // paces the response so it isn't sent faster than this.
+    u32 throttle_down_bps = 0;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -429,6 +432,15 @@ struct RouteConfig {
         if (idx >= route_count) return false;
         routes[idx].rate_limit_max = max;
         routes[idx].rate_limit_window_sec = window_sec;
+        return true;
+    }
+
+    // Attach a per-route client-send byte rate (bytes/sec, 0 disables). Set by
+    // the @throttle decorator via register_jit_routes. Returns false on a bad
+    // index.
+    bool set_route_throttle(u32 idx, u32 down_bps) {
+        if (idx >= route_count) return false;
+        routes[idx].throttle_down_bps = down_bps;
         return true;
     }
 

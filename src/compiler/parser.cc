@@ -2247,15 +2247,15 @@ struct Parser {
             digits = digits * 10 + static_cast<u64>(t.ptr[i] - '0');
             if (digits > 0xffffffffull) return 0;
         }
-        const Str unit{t.ptr + i, t.len - i};
+        const Str kUnit{t.ptr + i, t.len - i};
         u64 secs = 0;
-        if (unit.eq({"ms", 2}))
+        if (kUnit.eq({"ms", 2}))
             secs = (digits + 999) / 1000;  // round sub-second up to 1s
-        else if (unit.eq({"s", 1}))
+        else if (kUnit.eq({"s", 1}))
             secs = digits;
-        else if (unit.eq({"m", 1}))
+        else if (kUnit.eq({"m", 1}))
             secs = digits * 60;
-        else if (unit.eq({"h", 1}))
+        else if (kUnit.eq({"h", 1}))
             secs = digits * 3600;
         else
             return 0;
@@ -2300,14 +2300,67 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto dur = expect(TokenType::DurLit);
             if (!dur) return core::make_unexpected(dur.error());
-            const u32 win = dur_lit_to_seconds(dur.value()->text);
-            if (win == 0 || maxv == 0)
+            const u32 kWin = dur_lit_to_seconds(dur.value()->text);
+            if (kWin == 0 || maxv == 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
             if (!expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             deco.rate_limit_max = static_cast<u32>(maxv);
-            deco.rate_limit_window_sec = win;
+            deco.rate_limit_window_sec = kWin;
+            return deco;
+        }
+
+        if (deco.name.eq({"throttle", 8})) {
+            // @throttle(downstream: <IntLit><b|kb|mb|gb> per <DurLit>)
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            // `downstream` is a reserved keyword (KwDownstream), not an Ident.
+            if (!expect(TokenType::KwDownstream))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto num = expect(TokenType::IntLit);
+            if (!num) return core::make_unexpected(num.error());
+            u64 amount = 0;
+            for (u32 i = 0; i < num.value()->text.len; i++) {
+                amount = amount * 10 + static_cast<u64>(num.value()->text.ptr[i] - '0');
+                if (amount > 0xffffffffull)
+                    return frontend_error(
+                        FrontendError::InvalidInteger, deco.span, num.value()->text);
+            }
+            // ByteSize unit — a separate identifier token (e.g. "5mb" lexes as
+            // IntLit "5" + Ident "mb"; the duration lexer doesn't claim it).
+            auto unit = expect(TokenType::Ident);
+            if (!unit) return core::make_unexpected(unit.error());
+            u64 mult = 0;
+            const Str kUnit2 = unit.value()->text;
+            if (kUnit2.eq({"b", 1}))
+                mult = 1;
+            else if (kUnit2.eq({"kb", 2}))
+                mult = 1024;
+            else if (kUnit2.eq({"mb", 2}))
+                mult = 1024ull * 1024;
+            else if (kUnit2.eq({"gb", 2}))
+                mult = 1024ull * 1024 * 1024;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kUnit2);
+            const u64 kBytes = amount * mult;
+            auto per_tok = expect(TokenType::Ident);
+            if (!per_tok || !per_tok.value()->text.eq({"per", 3}))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto dur = expect(TokenType::DurLit);
+            if (!dur) return core::make_unexpected(dur.error());
+            const u32 kWin = dur_lit_to_seconds(dur.value()->text);
+            if (kWin == 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
+            if (!expect(TokenType::RParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            const u64 kBps = kBytes / kWin;
+            if (kBps == 0 || kBps > 0xffffffffull)
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            deco.throttle_down_bps = static_cast<u32>(kBps);
             return deco;
         }
         // Unknown decorator name — only the official whitelist is allowed.

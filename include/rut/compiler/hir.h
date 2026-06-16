@@ -927,6 +927,8 @@ struct HirRoute {
     // Flows to the RIR Function and on to RouteConfig::set_route_rate_limit.
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    // @throttle decorator → client-send byte rate (bytes/sec, 0 = none).
+    u32 throttle_down_bps = 0;
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -943,7 +945,8 @@ struct HirRoute {
           control(other.control),
           error_variant_index(other.error_variant_index),
           rate_limit_max(other.rate_limit_max),
-          rate_limit_window_sec(other.rate_limit_window_sec) {
+          rate_limit_window_sec(other.rate_limit_window_sec),
+          throttle_down_bps(other.throttle_down_bps) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -962,6 +965,7 @@ struct HirRoute {
         error_variant_index = other.error_variant_index;
         rate_limit_max = other.rate_limit_max;
         rate_limit_window_sec = other.rate_limit_window_sec;
+        throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
     }
@@ -979,7 +983,8 @@ struct HirRoute {
           control(other.control),
           error_variant_index(other.error_variant_index),
           rate_limit_max(other.rate_limit_max),
-          rate_limit_window_sec(other.rate_limit_window_sec) {
+          rate_limit_window_sec(other.rate_limit_window_sec),
+          throttle_down_bps(other.throttle_down_bps) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -998,6 +1003,7 @@ struct HirRoute {
         error_variant_index = other.error_variant_index;
         rate_limit_max = other.rate_limit_max;
         rate_limit_window_sec = other.rate_limit_window_sec;
+        throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
     }

@@ -104,6 +104,9 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
             cfg.set_route_rate_limit(
                 cfg.route_count - 1, fn.rate_limit_max, fn.rate_limit_window_sec);
         }
+        if (fn.throttle_down_bps > 0) {
+            cfg.set_route_throttle(cfg.route_count - 1, fn.throttle_down_bps);
+        }
     }
 
     return true;
