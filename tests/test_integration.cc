@@ -554,6 +554,86 @@ TEST(socket, double_listen_ok) {
     close(fd);
 }
 
+// === Built-in /metrics endpoint ===
+
+// GET /metrics returns the Prometheus exposition when the loop carries the
+// cross-shard metrics registry (what main wires under --metrics).
+TEST(metrics_endpoint, serves_prometheus_exposition) {
+    using namespace rut;
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+
+    ShardMetrics m;
+    m.init();
+    loop->metrics = &m;
+    ShardMetrics* reg[1] = {&m};
+    loop->all_shard_metrics = reg;  // enable the endpoint
+    loop->shard_metrics_count = 1;
+
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+    char buf[8192];
+    u32 total = 0;
+    while (total < sizeof(buf)) {
+        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (buf_contains(buf, total, "rut_request_duration_seconds_count", 34)) break;
+    }
+    close(c);
+
+    CHECK(buf_contains(buf, total, "200 OK", 6));
+    CHECK(buf_contains(buf, total, "# TYPE rut_requests_total counter", 33));
+    CHECK(buf_contains(buf, total, "rut_request_duration_seconds_bucket{le=\"+Inf\"}", 46));
+    CHECK(buf_contains(buf, total, "rut_connections_active", 22));
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Without the registry wired, /metrics is just a normal path (no exposition).
+TEST(metrics_endpoint, disabled_without_registry) {
+    using namespace rut;
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    // all_shard_metrics stays null → endpoint disabled.
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+    char buf[4096];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    close(c);
+    CHECK(n > 0);
+    // Falls through to the default route handling — no exposition body.
+    CHECK(!buf_contains(buf, static_cast<u32>(n > 0 ? n : 0), "# TYPE rut_requests_total", 25));
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

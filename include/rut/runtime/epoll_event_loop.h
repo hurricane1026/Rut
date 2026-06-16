@@ -211,6 +211,10 @@ public:
     }
 
     ShardMetrics* metrics = nullptr;
+    // Registry of every shard's metrics, for the built-in /metrics endpoint to
+    // aggregate across shards. Null → endpoint disabled (the default).
+    ShardMetrics* const* all_shard_metrics = nullptr;
+    u32 shard_metrics_count = 0;
 
     const RouteConfig** config_ptr = nullptr;
     ShardControlBlock* control = nullptr;
