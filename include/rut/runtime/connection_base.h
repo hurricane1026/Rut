@@ -137,6 +137,10 @@ struct ConnectionBase {
     u64 throttle_tat_ns;       // GCRA theoretical arrival time (monotonic ns)
     bool throttle_paused;      // pump parked waiting for byte-budget to recover
     u32 throttle_pending_len;  // buffered upstream bytes to replay on resume
+    // After a 101 Switching Protocols response the connection becomes a
+    // transparent full-duplex byte tunnel (WebSocket passthrough): the 4 slots
+    // splice client↔upstream and the keepalive timeout no longer closes it.
+    bool is_ws_tunnel;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -334,6 +338,7 @@ struct ConnectionBase {
         throttle_tat_ns = 0;
         throttle_paused = false;
         throttle_pending_len = 0;
+        is_ws_tunnel = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

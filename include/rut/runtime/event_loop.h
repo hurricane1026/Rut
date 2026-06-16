@@ -683,6 +683,9 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+#if RUT_ENABLE_WEBSOCKET
+                        if (c->is_ws_tunnel) return;  // WS tunnel: no idle timeout
+#endif
                         if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             respond_upstream_timeout(this, *c);  // upstream stalled → 504
                         } else if (c->throttle_paused) {

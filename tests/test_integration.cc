@@ -6160,6 +6160,127 @@ static u64 return_200_with_body_99_handler(void* /*conn*/,
     return r.pack();
 }
 
+// A backend that completes a WebSocket upgrade (sends 101) then echoes every
+// byte it receives — verifies the gateway's full-duplex passthrough tunnel.
+struct WsEchoServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~WsEchoServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<WsEchoServer*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);  // the upgrade request
+            const char k101[] =
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
+                "Upgrade\r\n\r\n";
+            (void)send_all(client, k101, sizeof(k101) - 1);
+            char buf[4096];
+            while (s->running.load(std::memory_order_acquire)) {
+                i32 n = recv_timeout(client, buf, sizeof(buf), 200);
+                if (n > 0)
+                    (void)send_all(client, buf, static_cast<u32>(n));  // echo
+                else if (n == 0)
+                    break;
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// WebSocket passthrough: the gateway forwards the upgrade, relays the 101 back,
+// then becomes a transparent full-duplex tunnel — bytes flow both ways.
+TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
+    using namespace rut;
+    WsEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/ws", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));  // upgrade relayed
+
+    REQUIRE(send_all(c, "HELLO", 5));
+    i32 m = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(m >= 5 && buf_contains(buf, static_cast<u32>(m), "HELLO", 5));
+
+    REQUIRE(send_all(c, "WORLD", 5));
+    i32 k = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(k >= 5 && buf_contains(buf, static_cast<u32>(k), "WORLD", 5));
+    close(c);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 TEST(route, jit_handler_unknown_body_idx_falls_back) {
     using namespace rut;
 

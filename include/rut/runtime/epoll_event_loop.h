@@ -641,6 +641,10 @@ public:
                             // @throttle: a new byte-rate window has opened — resume
                             // the parked client send.
                             throttle_resume<EpollEventLoop>(this, *c);
+#if RUT_ENABLE_WEBSOCKET
+                        } else if (c->is_ws_tunnel) {
+                            // WebSocket tunnel: no idle keepalive timeout (no-op).
+#endif
                         } else {
                             this->close_conn(*c);
                         }

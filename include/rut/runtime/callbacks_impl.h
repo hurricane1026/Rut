@@ -1882,6 +1882,81 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
 }
 
+#if RUT_ENABLE_WEBSOCKET
+// === WebSocket / Upgrade passthrough: full-duplex byte tunnel ================
+// After a 101 the connection runs as a transparent splice with four fixed slots,
+// two independent ping-pong loops (read one side → send to the other → re-read):
+//   on_recv          = on_ws_client_recv          (client bytes → upstream)
+//   on_upstream_send = on_ws_client_to_upstream_sent
+//   on_upstream_recv = on_ws_upstream_recv         (upstream bytes → client)
+//   on_send          = on_ws_upstream_to_client_sent
+// Either side closing tears down both. A stale -ENOBUFS (recv buffer full while
+// the paired send drains it) is ignored rather than treated as a close.
+
+template <typename Loop>
+void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result == -ENOBUFS) return;  // buffer full; the in-flight send will drain it
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len());
+}
+
+template <typename Loop>
+void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.recv_buf.reset();
+    loop->submit_recv(conn);  // re-arm client→upstream direction
+}
+
+template <typename Loop>
+void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result == -ENOBUFS) return;
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len());
+}
+
+template <typename Loop>
+void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.upstream_recv_buf.reset();
+    loop->submit_recv_upstream(conn);  // re-arm upstream→client direction
+}
+
+// The 101 (and any bytes the backend already sent) has been forwarded to the
+// client; switch into tunnel mode and arm both directions.
+template <typename Loop>
+void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.upstream_recv_buf.reset();
+    conn.recv_buf.reset();
+    conn.set_slots(&on_ws_client_recv<Loop>,
+                   &on_ws_upstream_to_client_sent<Loop>,
+                   &on_ws_upstream_recv<Loop>,
+                   &on_ws_client_to_upstream_sent<Loop>);
+    loop->submit_recv(conn);
+    loop->submit_recv_upstream(conn);
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
 template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -1930,6 +2005,18 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.resp_status = resp.status_code;
+
+#if RUT_ENABLE_WEBSOCKET
+    // 101 Switching Protocols → WebSocket/Upgrade passthrough. Forward the 101
+    // response plus any bytes the backend already sent (early frames) to the
+    // client, then run the connection as a transparent full-duplex tunnel.
+    if (resp.status_code == 101) {
+        conn.is_ws_tunnel = true;
+        conn.transition_to_sending(&on_ws_101_sent<Loop>);
+        loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len());
+        return;
+    }
+#endif
 
     if (resp.status_code >= 100 && resp.status_code < 200 && resp.status_code != 101) {
         const u32 kInterimEnd = resp_parser.header_end;

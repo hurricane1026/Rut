@@ -3,6 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Compile-time feature switches. WebSocket/Upgrade passthrough is ON by default;
+// build with -DRUT_ENABLE_WEBSOCKET=0 (e.g. a minimal k8s mesh sidecar that never
+// proxies WebSocket) to compile out the 101 tunnel path entirely — no 101 check
+// on the proxy response path, no tunnel callbacks, no idle-timeout exemption.
+#ifndef RUT_ENABLE_WEBSOCKET
+#define RUT_ENABLE_WEBSOCKET 1
+#endif
+
 // Placement new — declaration only; definition lives in src/placement_new.cc.
 #ifndef RUE_PLACEMENT_NEW_DECLARED
 #define RUE_PLACEMENT_NEW_DECLARED

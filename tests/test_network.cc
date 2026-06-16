@@ -4474,10 +4474,15 @@ TEST(streaming, _101_not_skipped) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // 101 is terminal — must NOT be skipped.
+    // 101 is terminal — must NOT be skipped as an interim 1xx.
     CHECK_EQ(conn->resp_status, static_cast<u16>(101));
-    // No CL, no chunked, no keep-alive → UntilClose (streaming).
+#if RUT_ENABLE_WEBSOCKET
+    // WebSocket/Upgrade passthrough: 101 pivots the connection into a tunnel.
+    CHECK(conn->is_ws_tunnel);
+#else
+    // Without the WS feature: no CL/chunked/keep-alive → UntilClose (streaming).
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
+#endif
 }
 
 // 205 Reset Content has no body (same as 204/304).
