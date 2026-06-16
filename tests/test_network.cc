@@ -1530,6 +1530,106 @@ TEST(route, set_route_rate_limit) {
     CHECK(!cfg.set_route_rate_limit(99, 1, 1));  // bad index
 }
 
+// Build a RateLimitKeyInput over a fixed raw request for extractor tests.
+static rut::RateLimitKeyInput make_key_input(const char* raw,
+                                             const char* path,
+                                             const rut::RouteParam* params,
+                                             rut::u32 param_count) {
+    using namespace rut;
+    RateLimitKeyInput in;
+    in.peer_addr = 0x0100007F;
+    in.req_buf = reinterpret_cast<const u8*>(raw);
+    u32 n = 0;
+    while (raw[n]) n++;
+    // header_end = offset past the final CRLFCRLF (here the whole string ends in it).
+    in.req_header_end = n;
+    in.path = path;
+    u32 pl = 0;
+    while (path[pl]) pl++;
+    in.path_len = pl;
+    in.params = params;
+    in.param_count = param_count;
+    return in;
+}
+
+TEST(rate_limit_key, extractors) {
+    using namespace rut;
+    using namespace rut::rl_detail;
+    const char* raw =
+        "GET /p?uid=42&x=9 HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "X-API-Key: abc123\r\n"
+        "Cookie: sid=zzz; tenant=acme\r\n"
+        "\r\n";
+    RouteParam params[1] = {{"id", 2, "777", 3}};
+    RateLimitKeyInput in = make_key_input(raw, "/p?uid=42&x=9", params, 1);
+
+    CHECK(header_value(in, "X-API-Key", 9).eq(Str{"abc123", 6}));
+    CHECK(header_value(in, "x-api-key", 9).eq(Str{"abc123", 6}));  // case-insensitive
+    CHECK(header_value(in, "Host", 4).eq(Str{"example.com", 11}));
+    CHECK(header_value(in, "Missing", 7).empty());
+    CHECK(query_value(in, "uid", 3).eq(Str{"42", 2}));
+    CHECK(query_value(in, "x", 1).eq(Str{"9", 1}));
+    CHECK(query_value(in, "nope", 4).empty());
+    CHECK(cookie_value(in, "sid", 3).eq(Str{"zzz", 3}));
+    CHECK(cookie_value(in, "tenant", 6).eq(Str{"acme", 4}));
+    CHECK(param_value(in, "id", 2).eq(Str{"777", 3}));
+}
+
+TEST(rate_limit_key, composition) {
+    using namespace rut;
+    const char* raw1 = "GET /p HTTP/1.1\r\nX-User: alice\r\n\r\n";
+    const char* raw2 = "GET /p HTTP/1.1\r\nX-User: bob\r\n\r\n";
+    RateLimitKeyInput a = make_key_input(raw1, "/p", nullptr, 0);
+    RateLimitKeyInput b = make_key_input(raw2, "/p", nullptr, 0);
+
+    // No components → keys by IP; same IP → same key, different IP → different.
+    CHECK_EQ(rate_limit_key(0, nullptr, 0, a), rate_limit_key(0, nullptr, 0, a));
+    RateLimitKeyInput a2 = a;
+    a2.peer_addr = 0x0200007F;
+    CHECK(rate_limit_key(0, nullptr, 0, a) != rate_limit_key(0, nullptr, 0, a2));
+
+    // Header component: same header value → same bucket, different → different.
+    RateLimitKeyComponent hdr[1];
+    hdr[0].kind = RateLimitKeyKind::Header;
+    hdr[0].set_name("X-User", 6);
+    CHECK_EQ(rate_limit_key(0, hdr, 1, a), rate_limit_key(0, hdr, 1, a));
+    CHECK(rate_limit_key(0, hdr, 1, a) != rate_limit_key(0, hdr, 1, b));
+    // ...and keying by header ignores IP (alice from either IP shares a bucket).
+    RateLimitKeyInput a_otherip = a;
+    a_otherip.peer_addr = 0x0900007F;
+    CHECK_EQ(rate_limit_key(0, hdr, 1, a), rate_limit_key(0, hdr, 1, a_otherip));
+
+    // Composite [ip, header]: each (ip, user) combination is its own bucket.
+    RateLimitKeyComponent combo[2];
+    combo[0].kind = RateLimitKeyKind::Ip;
+    combo[1].kind = RateLimitKeyKind::Header;
+    combo[1].set_name("X-User", 6);
+    CHECK(rate_limit_key(0, combo, 2, a) != rate_limit_key(0, combo, 2, a_otherip));  // diff ip
+    CHECK(rate_limit_key(0, combo, 2, a) != rate_limit_key(0, combo, 2, b));          // diff user
+    CHECK_EQ(rate_limit_key(0, combo, 2, a), rate_limit_key(0, combo, 2, a));
+
+    // Different route → different key (route folded in).
+    CHECK(rate_limit_key(0, hdr, 1, a) != rate_limit_key(1, hdr, 1, a));
+}
+
+TEST(route, add_route_rate_limit_key) {
+    using namespace rut;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    CHECK(cfg.set_route_rate_limit(0, 100, 60));
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Ip, nullptr, 0));
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
+    CHECK_EQ(cfg.routes[0].rate_limit_key_count, 2u);
+    CHECK(cfg.routes[0].rate_limit_key[1].kind == RateLimitKeyKind::Header);
+    CHECK_EQ(cfg.routes[0].rate_limit_key[1].name_len, 9u);
+    // Fills to capacity then rejects.
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Query, "a", 1));
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Cookie, "b", 1));
+    CHECK(!cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Param, "c", 1));    // full (max 4)
+    CHECK(!cfg.add_route_rate_limit_key(99, RateLimitKeyKind::Ip, nullptr, 0));  // bad index
+}
+
 TEST(route, empty_config_no_match) {
     RouteConfig cfg;
     const u8 path[] = "/anything";

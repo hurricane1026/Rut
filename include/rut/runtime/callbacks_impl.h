@@ -474,18 +474,29 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
 
-    // Per-route rate limit (fixed window, per client IP). Enforced after route
-    // match, before dispatch. The limiter is per-shard (one thread each), so a
+    // Per-route rate limit (fixed window). Enforced after route match, before
+    // dispatch. The metering unit is the configured key tuple (IP / header /
+    // query / cookie / param) extracted from this request; with no components it
+    // defaults to per-client-IP. The limiter is per-shard (one thread each), so a
     // thread_local table needs no atomics — same rationale as the parse cache.
     if (route && route->rate_limit_max > 0 && config) {
         static thread_local RateLimiter rate_limiter{};
         const u32 kRouteIdx = static_cast<u32>(route - config->routes);
         const u64 kNowSec = monotonic_us() / 1'000'000ull;
-        if (!rate_limiter.allow(kRouteIdx,
-                                conn.peer_addr,
-                                route->rate_limit_max,
-                                route->rate_limit_window_sec,
-                                kNowSec)) {
+        u32 path_len = 0;
+        while (path_len < Connection::kMaxReqPathLen && conn.req_path[path_len] != '\0') path_len++;
+        RateLimitKeyInput key_in;
+        key_in.peer_addr = conn.peer_addr;
+        key_in.req_buf = conn.recv_buf.data();
+        key_in.req_header_end = conn.req_header_end;
+        key_in.path = conn.req_path;
+        key_in.path_len = path_len;
+        key_in.params = route_params;
+        key_in.param_count = route_param_count;
+        const u64 kKey =
+            rate_limit_key(kRouteIdx, route->rate_limit_key, route->rate_limit_key_count, key_in);
+        if (!rate_limiter.allow_key(
+                kKey, route->rate_limit_max, route->rate_limit_window_sec, kNowSec)) {
             conn.resp_status = 429;
             format_static_response(conn, 429, /*keep_alive=*/false);
             conn.keep_alive = false;

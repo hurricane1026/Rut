@@ -6,6 +6,7 @@
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_canon.h"   // canonicalize_request
 #include "rut/runtime/route_select.h"  // path_has_param_segment
@@ -80,11 +81,15 @@ struct RouteEntry {
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
-    // Per-route rate limit (fixed window, keyed by client IP). 0 = unlimited.
-    // `rate_limit_max` requests are allowed per `rate_limit_window_sec`; over
-    // the limit the runtime answers 429 before dispatching.
+    // Per-route rate limit (fixed window). 0 = unlimited. `rate_limit_max`
+    // requests are allowed per `rate_limit_window_sec`; over the limit the
+    // runtime answers 429 before dispatching. The metering unit is the tuple of
+    // `rate_limit_key[0..rate_limit_key_count)` extracted from each request
+    // (IP / header / query / cookie / param); count 0 = default per-client-IP.
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    RateLimitKeyComponent rate_limit_key[kMaxRateLimitKeyComponents];
+    u8 rate_limit_key_count = 0;
     // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
@@ -432,6 +437,23 @@ struct RouteConfig {
         if (idx >= route_count) return false;
         routes[idx].rate_limit_max = max;
         routes[idx].rate_limit_window_sec = window_sec;
+        return true;
+    }
+
+    // Append one metering-key component to a route's rate-limit key (IP / header
+    // / query / cookie / param). With no components the route meters per client
+    // IP; each appended component adds a dimension, so the limiter counts per
+    // unique tuple. `name` is ignored for Ip. Returns false on a bad index or
+    // when the key is already full.
+    bool add_route_rate_limit_key(u32 idx, RateLimitKeyKind kind, const char* name, u32 name_len) {
+        if (idx >= route_count) return false;
+        RouteEntry& r = routes[idx];
+        if (r.rate_limit_key_count >= kMaxRateLimitKeyComponents) return false;
+        RateLimitKeyComponent& c = r.rate_limit_key[r.rate_limit_key_count];
+        c.kind = kind;
+        c.name_len = 0;
+        if (kind != RateLimitKeyKind::Ip && name) c.set_name(name, name_len);
+        r.rate_limit_key_count++;
         return true;
     }
 

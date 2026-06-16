@@ -722,6 +722,61 @@ TEST(rate_limit_e2e, route_returns_429_over_limit) {
     destroy_real_loop(loop);
 }
 
+// Composite metering key: limit keyed by a request header (not IP). Two distinct
+// header values each get an independent budget over the same connection/IP.
+TEST(rate_limit_e2e, meters_by_header_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/api", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 2, 60));  // 2 per 60s
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    const char kAlice[] = "GET /api HTTP/1.1\r\nHost: x\r\nX-API-Key: alice\r\n\r\n";
+    const char kBob[] = "GET /api HTTP/1.1\r\nHost: x\r\nX-API-Key: bob\r\n\r\n";
+    // Each request on its own connection (a 429 is sent Connection: close, and
+    // we want the per-shard header-keyed limiter — not keep-alive — under test).
+    auto one_shot = [&](const char* req, u32 len) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, req, len)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+                else
+                    rc = 0;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot(kAlice, sizeof(kAlice) - 1), 200);  // alice 1
+    CHECK_EQ(one_shot(kAlice, sizeof(kAlice) - 1), 200);  // alice 2
+    CHECK_EQ(one_shot(kAlice, sizeof(kAlice) - 1), 429);  // alice over limit
+    CHECK_EQ(one_shot(kBob, sizeof(kBob) - 1), 200);      // bob: independent bucket
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // The @rateLimit official decorator compiles through the IR to a per-route
 // limit on the RIR function (which register_jit_routes forwards to the config).
 TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
