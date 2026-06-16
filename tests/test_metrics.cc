@@ -1,9 +1,22 @@
 // Per-shard metrics tests: counters, histograms, aggregation, callback integration.
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/prometheus.h"
 #include "test.h"
 #include "test_helpers.h"
 
+#include <string.h>
+
 using namespace rut;
+
+namespace {
+bool prom_contains(const char* hay, u32 hlen, const char* needle) {
+    const u32 nlen = static_cast<u32>(strlen(needle));
+    if (nlen > hlen) return false;
+    for (u32 i = 0; i + nlen <= hlen; i++)
+        if (memcmp(hay + i, needle, nlen) == 0) return true;
+    return false;
+}
+}  // namespace
 
 // === LatencyHistogram: bucket selection ===
 
@@ -407,6 +420,73 @@ TEST_F(MetricsLoopF, 502_response_records_correct_status) {
     AccessLogEntry entry{};
     CHECK(ring.pop(entry));
     CHECK_EQ(entry.status, static_cast<u16>(502));
+}
+
+// === Prometheus text-format serializer ===
+
+TEST(prometheus, counters_and_histogram) {
+    ShardMetrics m;
+    m.init();
+    m.requests_total = 5;
+    m.connections_active = 3;
+    m.request_latency.record(50);    // bucket 0 (<100us)
+    m.request_latency.record(50);    // bucket 0
+    m.request_latency.record(2000);  // bucket 3 (<5ms) — 2000us
+    // sum_us = 2100, count = 3
+
+    char buf[4096];
+    const u32 n = format_prometheus(m, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    CHECK(prom_contains(buf, n, "# TYPE rut_requests_total counter\n"));
+    CHECK(prom_contains(buf, n, "rut_requests_total 5\n"));
+    CHECK(prom_contains(buf, n, "# TYPE rut_connections_active gauge\n"));
+    CHECK(prom_contains(buf, n, "rut_connections_active 3\n"));
+    CHECK(prom_contains(buf, n, "# TYPE rut_request_duration_seconds histogram\n"));
+    // Cumulative buckets: two 50us samples in le=0.0001; the 2000us sample lands
+    // by le=0.005, so that bucket holds all 3.
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"0.0001\"} 2\n"));
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"0.005\"} 3\n"));
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"+Inf\"} 3\n"));
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_count 3\n"));
+    // 2100us == 0.002100s
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_sum 0.002100\n"));
+}
+
+TEST(prometheus, cumulative_buckets_monotonic) {
+    ShardMetrics m;
+    m.init();
+    m.request_latency.record(50);       // le 0.0001
+    m.request_latency.record(300);      // le 0.0005
+    m.request_latency.record(7000000);  // >= 5s → only the +Inf bucket
+    char buf[4096];
+    const u32 n = format_prometheus(m, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"0.0001\"} 1\n"));
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"0.0005\"} 2\n"));
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"5\"} 2\n"));
+    CHECK(prom_contains(buf, n, "rut_request_duration_seconds_bucket{le=\"+Inf\"} 3\n"));
+}
+
+TEST(prometheus, buffer_too_small_returns_zero) {
+    ShardMetrics m;
+    m.init();
+    char buf[16];  // far too small for the full exposition
+    CHECK_EQ(format_prometheus(m, buf, sizeof(buf)), 0u);
+}
+
+TEST(prometheus, serializes_aggregated_metrics) {
+    ShardMetrics a;
+    a.init();
+    a.requests_total = 10;
+    ShardMetrics b;
+    b.init();
+    b.requests_total = 7;
+    ShardMetrics* shards[] = {&a, &b};
+    ShardMetrics agg = aggregate_metrics(shards, 2);
+    char buf[4096];
+    const u32 n = format_prometheus(agg, buf, sizeof(buf));
+    REQUIRE(n > 0);
+    CHECK(prom_contains(buf, n, "rut_requests_total 17\n"));
 }
 
 int main(int argc, char** argv) {
