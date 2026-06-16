@@ -347,6 +347,10 @@ struct Function {
     // Route metadata.
     Str route_pattern;  // e.g., "/users/:id"
     u8 http_method;     // route method key (0 = any, 1..9 = full HTTP method)
+    // @rateLimit per-route fixed-window limit (0 = none); register_jit_routes
+    // forwards these to RouteConfig::set_route_rate_limit.
+    u32 rate_limit_max = 0;
+    u32 rate_limit_window_sec = 0;
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;

@@ -98,6 +98,12 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         auto handler = reinterpret_cast<jit::HandlerFn>(addr);
         if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
             return false;
+        // @rateLimit decorator → per-route fixed-window limit on the route just
+        // added (index route_count - 1).
+        if (fn.rate_limit_max > 0) {
+            cfg.set_route_rate_limit(
+                cfg.route_count - 1, fn.rate_limit_max, fn.rate_limit_window_sec);
+        }
     }
 
     return true;

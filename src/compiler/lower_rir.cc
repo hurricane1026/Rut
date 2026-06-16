@@ -3345,6 +3345,8 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             out.destroy();
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
+        fn.value()->rate_limit_max = mir.functions[i].rate_limit_max;
+        fn.value()->rate_limit_window_sec = mir.functions[i].rate_limit_window_sec;
         if (mir.functions[i].waits.len > 0) {
             u32 ms_list[MirFunction::kMaxWaits]{};
             u8 kind_list[MirFunction::kMaxWaits]{};

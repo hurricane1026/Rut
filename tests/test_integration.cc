@@ -722,6 +722,116 @@ TEST(rate_limit_e2e, route_returns_429_over_limit) {
     destroy_real_loop(loop);
 }
 
+// The @rateLimit official decorator compiles through the IR to a per-route
+// limit on the RIR function (which register_jit_routes forwards to the config).
+TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 3 per 1m)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK_EQ(rir.module.functions[0].rate_limit_max, 3u);
+    CHECK_EQ(rir.module.functions[0].rate_limit_window_sec, 60u);  // 1m
+    rir.destroy();
+}
+
+// Only the official whitelist is accepted; bad args are rejected at parse time.
+TEST(rate_limit_dsl, unknown_decorator_and_bad_args_rejected) {
+    using namespace rut;
+    const char* bogus = "@bogus(x: 1)\nroute GET \"/a\" { return 200 }\n";
+    auto l1 = lex(Str{bogus, static_cast<u32>(strlen(bogus))});
+    REQUIRE(l1);
+    CHECK(!parse_file(l1.value()));  // unknown decorator
+    const char* zero = "@rateLimit(limit: 0 per 1m)\nroute GET \"/a\" { return 200 }\n";
+    auto l2 = lex(Str{zero, static_cast<u32>(strlen(zero))});
+    REQUIRE(l2);
+    CHECK(!parse_file(l2.value()));  // limit 0 rejected
+}
+
+// End-to-end: a route compiled with @rateLimit serves 200 up to the limit, then
+// 429 — proving the decorator → config → runtime path works from .rut.
+TEST(rate_limit_dsl, e2e_429_over_limit) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 3 per 1m)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    CHECK_EQ(cfg.routes[0].rate_limit_max, 3u);
+    const RouteConfig* active = &cfg;
+
+    {
+        RealLoop* loop = create_real_loop();
+        REQUIRE(loop != nullptr);
+        auto lfd = create_listen_socket(0);
+        REQUIRE(lfd.has_value());
+        const i32 listen_fd = lfd.value();
+        const u16 port = get_port(listen_fd);
+        REQUIRE(loop->init(0, listen_fd).has_value());
+        loop->config_ptr = &active;
+        LoopThread lt = {loop, {}, 200};
+        lt.start();
+
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        u32 ok = 0, throttled = 0;
+        for (u32 i = 0; i < 4; i++) {
+            if (!send_all(c, kReq, sizeof(kReq) - 1)) break;
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n <= 0) break;
+            if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                ok++;
+            else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                throttled++;
+        }
+        close(c);
+        CHECK_EQ(ok, 3u);
+        CHECK_EQ(throttled, 1u);
+
+        lt.stop();
+        loop->shutdown();
+        close(listen_fd);
+        destroy_real_loop(loop);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
 
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 

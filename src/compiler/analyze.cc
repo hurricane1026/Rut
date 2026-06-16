@@ -15806,6 +15806,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         const u32 first_decorator_guard_index = route.guards.len;
         for (u32 di = 0; di < item.route.decorators.len; di++) {
             const auto& ast_deco = item.route.decorators[di];
+            // Official built-in decorators are recognized here and lowered to
+            // route metadata, not resolved to user functions. @rateLimit sets
+            // the per-route fixed-window limit (enforced in the runtime).
+            if (ast_deco.name.eq({"rateLimit", 9})) {
+                route.rate_limit_max = ast_deco.rate_limit_max;
+                route.rate_limit_window_sec = ast_deco.rate_limit_window_sec;
+                continue;
+            }
             const u32 fn_index = find_function_index(mod, ast_deco.name);
             if (fn_index == mod.functions.len)
                 return frontend_error(

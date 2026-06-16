@@ -280,6 +280,9 @@ struct MirFunction {
     bool has_explicit_resume_blocks = false;
     u32 resume_blocks[kMaxWaits + 1]{};
     u32 error_variant_index = 0xffffffffu;
+    // @rateLimit per-route limit, copied from HirRoute → carried to RIR Function.
+    u32 rate_limit_max = 0;
+    u32 rate_limit_window_sec = 0;
 
     MirFunction() = default;
     MirFunction(const MirFunction& other)
@@ -294,7 +297,9 @@ struct MirFunction {
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit_max(other.rate_limit_max),
+          rate_limit_window_sec(other.rate_limit_window_sec) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -313,6 +318,8 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        rate_limit_max = other.rate_limit_max;
+        rate_limit_window_sec = other.rate_limit_window_sec;
         rebase_from(other);
         return *this;
     }
@@ -328,7 +335,9 @@ struct MirFunction {
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit_max(other.rate_limit_max),
+          rate_limit_window_sec(other.rate_limit_window_sec) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -347,6 +356,8 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        rate_limit_max = other.rate_limit_max;
+        rate_limit_window_sec = other.rate_limit_window_sec;
         rebase_from(other);
         return *this;
     }

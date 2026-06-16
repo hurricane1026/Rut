@@ -923,6 +923,10 @@ struct HirRoute {
     FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
     u32 error_variant_index = 0xffffffffu;
+    // @rateLimit decorator → per-route fixed-window request limit (0 = none).
+    // Flows to the RIR Function and on to RouteConfig::set_route_rate_limit.
+    u32 rate_limit_max = 0;
+    u32 rate_limit_window_sec = 0;
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -937,7 +941,9 @@ struct HirRoute {
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit_max(other.rate_limit_max),
+          rate_limit_window_sec(other.rate_limit_window_sec) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -954,6 +960,8 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         error_variant_index = other.error_variant_index;
+        rate_limit_max = other.rate_limit_max;
+        rate_limit_window_sec = other.rate_limit_window_sec;
         rebase_from(other);
         return *this;
     }
@@ -969,7 +977,9 @@ struct HirRoute {
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit_max(other.rate_limit_max),
+          rate_limit_window_sec(other.rate_limit_window_sec) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -986,6 +996,8 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         error_variant_index = other.error_variant_index;
+        rate_limit_max = other.rate_limit_max;
+        rate_limit_window_sec = other.rate_limit_window_sec;
         rebase_from(other);
         return *this;
     }

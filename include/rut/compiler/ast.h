@@ -408,6 +408,11 @@ struct AstDecorator {
     Span span{};
     Str namespace_name{};  // empty unless @ns.name form
     Str name{};
+    // Official built-in decorators carry typed args, interpreted by analyze per
+    // name (the parser only accepts a fixed whitelist — no user decorators).
+    // @rateLimit(limit: N per <duration>): requests per window, keyed by client IP.
+    u32 rate_limit_max = 0;
+    u32 rate_limit_window_sec = 0;
 };
 
 enum class AstChainStepKind : u8 {
