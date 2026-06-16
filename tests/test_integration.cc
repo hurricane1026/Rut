@@ -801,7 +801,76 @@ TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
     REQUIRE_EQ(rir.module.func_count, 1u);
     CHECK_EQ(rir.module.functions[0].rate_limit_max, 3u);
     CHECK_EQ(rir.module.functions[0].rate_limit_window_sec, 60u);  // 1m
+    CHECK_EQ(rir.module.functions[0].rate_limit_key.count, 0u);    // default per-IP
     rir.destroy();
+}
+
+// The `by:` clause compiles to a composite metering-key spec on the RIR function.
+TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 100, window: 1m, by: [ip, header(\"X-API-Key\")])\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    const auto& spec = rir.module.functions[0].rate_limit_key;
+    REQUIRE_EQ(spec.count, 2u);
+    CHECK(spec.comps[0].kind == RateLimitKeyKind::Ip);
+    CHECK(spec.comps[1].kind == RateLimitKeyKind::Header);
+    Str hdr_name{spec.comps[1].name, spec.comps[1].name_len};
+    Str want{"X-API-Key", 9};
+    CHECK(hdr_name.eq(want));
+    rir.destroy();
+}
+
+// A single `by:` source (no list) and the param/query/cookie sources parse.
+TEST(rate_limit_dsl, by_single_source) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 10, window: 30s, by: header(\"X-User\"))\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    const auto& spec = rir.module.functions[0].rate_limit_key;
+    REQUIRE_EQ(spec.count, 1u);
+    CHECK(spec.comps[0].kind == RateLimitKeyKind::Header);
+    rir.destroy();
+}
+
+// `by:` with an unknown source is rejected at parse time.
+TEST(rate_limit_dsl, by_unknown_source_rejected) {
+    using namespace rut;
+    const char* bad =
+        "@rateLimit(limit: 10, window: 1m, by: bogus(\"x\"))\n"
+        "route GET \"/a\" { return 200 }\n";
+    auto l = lex(Str{bad, static_cast<u32>(strlen(bad))});
+    REQUIRE(l);
+    CHECK(!parse_file(l.value()));
 }
 
 // Only the official whitelist is accepted; bad args are rejected at parse time.

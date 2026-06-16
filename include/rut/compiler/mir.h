@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -283,6 +284,8 @@ struct MirFunction {
     // @rateLimit per-route limit, copied from HirRoute → carried to RIR Function.
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    // @rateLimit `by:` composite metering-key spec (empty = per-client-IP).
+    RateLimitKeySpec rate_limit_key{};
     // @throttle client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
 
@@ -302,6 +305,7 @@ struct MirFunction {
           error_variant_index(other.error_variant_index),
           rate_limit_max(other.rate_limit_max),
           rate_limit_window_sec(other.rate_limit_window_sec),
+          rate_limit_key(other.rate_limit_key),
           throttle_down_bps(other.throttle_down_bps) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
@@ -323,6 +327,7 @@ struct MirFunction {
         error_variant_index = other.error_variant_index;
         rate_limit_max = other.rate_limit_max;
         rate_limit_window_sec = other.rate_limit_window_sec;
+        rate_limit_key = other.rate_limit_key;
         throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
@@ -342,6 +347,7 @@ struct MirFunction {
           error_variant_index(other.error_variant_index),
           rate_limit_max(other.rate_limit_max),
           rate_limit_window_sec(other.rate_limit_window_sec),
+          rate_limit_key(other.rate_limit_key),
           throttle_down_bps(other.throttle_down_bps) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
@@ -363,6 +369,7 @@ struct MirFunction {
         error_variant_index = other.error_variant_index;
         rate_limit_max = other.rate_limit_max;
         rate_limit_window_sec = other.rate_limit_window_sec;
+        rate_limit_key = other.rate_limit_key;
         throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;

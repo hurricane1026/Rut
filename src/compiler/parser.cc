@@ -2266,6 +2266,39 @@ struct Parser {
     // Parse one official (built-in) decorator: `@name(args)`. Only a fixed
     // whitelist is accepted — there are no user-defined decorators. Unknown
     // names are a parse error.
+    // Parse one @rateLimit `by:` key source into `spec`: `ip`, or one of
+    // header/query/cookie/param("name"). Sources are plain identifiers.
+    FrontendResult<bool> parse_rate_limit_source(RateLimitKeySpec& spec, Span deco_span) {
+        auto src = expect(TokenType::Ident);
+        if (!src) return core::make_unexpected(src.error());
+        const Str kName = src.value()->text;
+        if (kName.eq({"ip", 2})) {
+            if (!spec.add(RateLimitKeyKind::Ip, nullptr, 0))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
+            return true;
+        }
+        RateLimitKeyKind kind;
+        if (kName.eq({"header", 6}))
+            kind = RateLimitKeyKind::Header;
+        else if (kName.eq({"query", 5}))
+            kind = RateLimitKeyKind::Query;
+        else if (kName.eq({"cookie", 6}))
+            kind = RateLimitKeyKind::Cookie;
+        else if (kName.eq({"param", 5}))
+            kind = RateLimitKeyKind::Param;
+        else
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(*src.value()), kName);
+        if (!expect(TokenType::LParen))
+            return frontend_error(FrontendError::UnexpectedToken, deco_span, kName);
+        auto arg = expect(TokenType::StringLit);
+        if (!arg) return core::make_unexpected(arg.error());
+        if (!expect(TokenType::RParen))
+            return frontend_error(FrontendError::UnexpectedToken, deco_span, kName);
+        if (!spec.add(kind, arg.value()->text.ptr, arg.value()->text.len))
+            return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
+        return true;
+    }
+
     FrontendResult<AstDecorator> parse_official_decorator() {
         auto at = expect(TokenType::At);
         if (!at) return core::make_unexpected(at.error());
@@ -2307,6 +2340,32 @@ struct Parser {
             if (kWin == 0 || maxv == 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
+            // Optional `, by: <key>` — composite metering key. `by:` takes a
+            // single source or a [list] of them; each is `ip` or
+            // header/query/cookie/param("name"). Absent → default per-client-IP.
+            if (take(TokenType::Comma)) {
+                auto by_kw = expect(TokenType::Ident);
+                if (!by_kw || !by_kw.value()->text.eq({"by", 2}))
+                    return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+                if (!expect(TokenType::Colon))
+                    return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+                if (take(TokenType::LBracket)) {
+                    bool first = true;
+                    while (cur().type != TokenType::RBracket) {
+                        if (!first && !take(TokenType::Comma))
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, deco.span, deco.name);
+                        first = false;
+                        auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
+                        if (!s) return core::make_unexpected(s.error());
+                    }
+                    if (!expect(TokenType::RBracket))
+                        return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+                } else {
+                    auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
+                    if (!s) return core::make_unexpected(s.error());
+                }
+            }
             if (!expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             deco.rate_limit_max = static_cast<u32>(maxv);

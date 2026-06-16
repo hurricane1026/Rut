@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/compiler/diagnostic.h"
 
@@ -410,9 +411,12 @@ struct AstDecorator {
     Str name{};
     // Official built-in decorators carry typed args, interpreted by analyze per
     // name (the parser only accepts a fixed whitelist — no user decorators).
-    // @rateLimit(limit: N per <duration>): requests per window, keyed by client IP.
+    // @rateLimit(limit: N, window: <duration>, by: <key>): requests per window.
+    // The metering key (default per-client-IP) is built from `rate_limit_key`'s
+    // components (IP / header / query / cookie / param).
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    RateLimitKeySpec rate_limit_key{};
     // @throttle(downstream: <ByteSize> per <duration>): client-send byte rate,
     // stored as bytes/second (0 = none).
     u32 throttle_down_bps = 0;

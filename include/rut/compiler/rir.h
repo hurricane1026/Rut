@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -351,6 +352,9 @@ struct Function {
     // forwards these to RouteConfig::set_route_rate_limit.
     u32 rate_limit_max = 0;
     u32 rate_limit_window_sec = 0;
+    // @rateLimit `by:` composite metering-key spec (empty = per-client-IP);
+    // register_jit_routes forwards each component to add_route_rate_limit_key.
+    RateLimitKeySpec rate_limit_key{};
     // @throttle client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
 

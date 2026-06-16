@@ -1,44 +1,19 @@
 #pragma once
 
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/runtime/route_params.h"
 
-// Composable rate-limit key. A route's "metering unit" is an ordered list of
-// key components, each extracting one value from the request (client IP, a
-// header, a query/cookie/route param). The limiter meters one counter per
-// unique tuple of those values, scoped to the route — so @rateLimit can count
-// per-IP, per-API-key, per-user, or any combination, all from request data.
+// Composable rate-limit key — runtime value extraction. The key *spec* (the
+// component list: IP / header / query / cookie / param) lives in
+// common/rate_limit_key_spec.h so the compiler can carry it too; this header
+// turns a spec + a request into the u64 metering key the RateLimiter uses.
 //
-// Values are hashed (FNV-1a/64) into the single u64 slot key the RateLimiter
-// already uses; composite keys just chain more values into the same hash. All
-// extraction is zero-copy over the request bytes — no allocation.
+// Values are hashed (FNV-1a/64) into one u64; composite keys just chain more
+// values into the same hash, so the limiter meters one counter per unique
+// tuple. All extraction is zero-copy over the request bytes — no allocation.
 
 namespace rut {
-
-enum class RateLimitKeyKind : u8 {
-    Ip = 0,  // client source address (default when no components are given)
-    Header,  // request header value      — name = header name
-    Query,   // query-string parameter    — name = param name
-    Cookie,  // cookie value              — name = cookie name
-    Param,   // route/path parameter      — name = param name
-};
-
-// One component of a composite key. `name` is an inline, config-owned buffer
-// (so it survives RCU config swaps with no external lifetime); unused for Ip.
-struct RateLimitKeyComponent {
-    static constexpr u32 kMaxName = 32;
-    RateLimitKeyKind kind = RateLimitKeyKind::Ip;
-    u8 name_len = 0;
-    char name[kMaxName] = {};
-
-    void set_name(const char* s, u32 n) {
-        if (n > kMaxName) n = kMaxName;
-        name_len = static_cast<u8>(n);
-        for (u32 i = 0; i < n; i++) name[i] = s[i];
-    }
-};
-
-static constexpr u32 kMaxRateLimitKeyComponents = 4;
 
 // Request fields needed to extract component values. Passed explicitly so this
 // header need not depend on the full Connection definition.

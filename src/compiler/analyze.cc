@@ -15812,6 +15812,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (ast_deco.name.eq({"rateLimit", 9})) {
                 route.rate_limit_max = ast_deco.rate_limit_max;
                 route.rate_limit_window_sec = ast_deco.rate_limit_window_sec;
+                route.rate_limit_key = ast_deco.rate_limit_key;
                 continue;
             }
             if (ast_deco.name.eq({"throttle", 8})) {
