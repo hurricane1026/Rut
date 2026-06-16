@@ -10,6 +10,7 @@
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/prometheus.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
@@ -345,6 +346,31 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
+
+    // Built-in Prometheus endpoint. Opt-in: only when the loop carries the
+    // cross-shard metrics registry (main wires it under --metrics). Served on
+    // the data listener at GET /metrics, ahead of route matching, and works
+    // even with no RouteConfig. `if constexpr` keeps it out of loops/mocks that
+    // don't expose the registry.
+    if constexpr (requires { loop->all_shard_metrics; }) {
+        if (loop->all_shard_metrics != nullptr && conn.req_path_canon.eq(Str{"metrics", 7})) {
+            char mbuf[8192];
+            const ShardMetrics kAgg =
+                aggregate_metrics(loop->all_shard_metrics, loop->shard_metrics_count);
+            const u32 kLen = format_prometheus(kAgg, mbuf, sizeof(mbuf));
+            if (kLen > 0) {
+                format_response_with_body(conn, 200, mbuf, kLen, conn.keep_alive);
+            } else {
+                format_static_response(conn, 500, /*keep_alive=*/false);
+                conn.keep_alive = false;
+            }
+            conn.resp_status = kLen > 0 ? 200 : 500;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+    }
+
     const RouteEntry* route = nullptr;
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;

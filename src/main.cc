@@ -96,8 +96,13 @@ static i32 run_shards(u16 port,
                       const char* access_log_path,
                       bool access_log_compress,
                       i32 access_log_level,
-                      const RouteConfig* route_config) {
+                      const RouteConfig* route_config,
+                      bool serve_metrics) {
     Shard<EventLoopType> shards[kMaxShards];
+    // Cross-shard metrics registry for the built-in /metrics endpoint. Lives
+    // for the whole serve duration (outlives the shard threads, which join
+    // before this returns). Only populated under --metrics.
+    ShardMetrics* metrics_ptrs[kMaxShards];
 
     // Create one SO_REUSEPORT listen socket per shard.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
@@ -153,6 +158,20 @@ static i32 run_shards(u16 port,
         // from this pointer. A null config keeps the legacy route-less
         // behavior (every request falls through to the default action).
         shards[i].route_config = route_config;
+    }
+
+    // Wire the cross-shard metrics registry so any shard can serve an
+    // aggregated GET /metrics. Done after all shards init (loops valid) and
+    // before spawn (threads see a fully-built registry).
+    if (serve_metrics) {
+        for (u32 i = 0; i < shard_count; i++) metrics_ptrs[i] = &shards[i].shard_metrics;
+        for (u32 i = 0; i < shard_count; i++) {
+            if constexpr (requires { shards[i].loop->all_shard_metrics; }) {
+                shards[i].loop->all_shard_metrics = metrics_ptrs;
+                shards[i].loop->shard_metrics_count = shard_count;
+            }
+        }
+        write_str("Metrics: /metrics enabled\n");
     }
 
     // Get actual port from first shard's socket
@@ -283,6 +302,9 @@ int main(int argc, char** argv) {
     // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
     // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
     bool offer_h2 = false;
+    // Serve an aggregated Prometheus exposition at GET /metrics on the data
+    // listener. Opt-in (internal metrics shouldn't be public by default).
+    bool serve_metrics = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
@@ -376,6 +398,7 @@ int main(int argc, char** argv) {
         if (str_eq(argv[i], "--no-pin")) pin_cpus = false;
         if (str_eq(argv[i], "--access-log-compress")) access_log_compress = true;
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
+        if (str_eq(argv[i], "--metrics")) serve_metrics = true;
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
             if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
@@ -492,7 +515,8 @@ int main(int argc, char** argv) {
                                         access_log_path,
                                         access_log_compress,
                                         access_log_level,
-                                        route_config);
+                                        route_config,
+                                        serve_metrics);
     } else if (detect_io_uring()) {
         write_str("Backend: io_uring\n");
         rc = run_shards<IoUringEventLoop>(port,
@@ -504,7 +528,8 @@ int main(int argc, char** argv) {
                                           access_log_path,
                                           access_log_compress,
                                           access_log_level,
-                                          route_config);
+                                          route_config,
+                                          serve_metrics);
     } else {
         write_str("Backend: epoll\n");
         rc = run_shards<EpollEventLoop>(port,
@@ -516,7 +541,8 @@ int main(int argc, char** argv) {
                                         access_log_path,
                                         access_log_compress,
                                         access_log_level,
-                                        route_config);
+                                        route_config,
+                                        serve_metrics);
     }
     destroy_tls_server_context(tls_server);
 #ifdef RUT_ENABLE_JIT
