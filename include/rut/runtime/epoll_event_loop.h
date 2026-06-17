@@ -673,8 +673,10 @@ public:
                         // don't let stray events (e.g. a stale -ENOBUFS on the
                         // upstream fd) bump it back to the keepalive timeout, which
                         // would strand the parked pump until keepalive expiry.
-                        if (!conn.throttle_paused) timer.refresh(&conn, conn.state == ConnState::Proxying ? upstream_timeout
-                                                            : keepalive_timeout);
+                        if (!conn.throttle_paused)
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {

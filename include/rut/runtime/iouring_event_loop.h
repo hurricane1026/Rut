@@ -727,8 +727,10 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused) timer.refresh(&conn, conn.state == ConnState::Proxying ? upstream_timeout
-                                                            : keepalive_timeout);
+                        if (!conn.throttle_paused)
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
                         if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {

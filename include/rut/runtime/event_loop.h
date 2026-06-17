@@ -738,8 +738,10 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused) timer.refresh(&conn, conn.state == ConnState::Proxying ? upstream_timeout
-                                                            : keepalive_timeout);
+                        if (!conn.throttle_paused)
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if constexpr (Backend::kAsyncIo) {
                         // Stale CQE for a closed connection. If all ops are now
