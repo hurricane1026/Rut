@@ -7613,15 +7613,17 @@ struct EchoPathServer {
 
     static void* run(void* arg) {
         auto* s = static_cast<EchoPathServer*>(arg);
-        i32 client = -1;
+        // Loop over connections — the gateway opens a fresh upstream connection
+        // per request, so a keep-alive client driving N requests yields N here.
         while (s->running.load(std::memory_order_acquire)) {
-            client = accept(s->listen_fd, nullptr, nullptr);
-            if (client >= 0) break;
-            if (errno == EINTR) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
-            usleep(1000);
-        }
-        if (client >= 0) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
             char req[2048];
             i32 n = recv_timeout(client, req, sizeof(req), 1000);
             if (n > 0) {
@@ -7725,6 +7727,95 @@ TEST(route, forward_set_path_rewrites_upstream_request) {
         // The upstream echoed the path it saw — must be the rewritten one.
         CHECK(buf_contains(buf, total, "/rewritten", 10));
         CHECK(!buf_contains(buf, total, "/api", 4));
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Reads one response off `fd` until `tok` appears (the echoed path body) or the
+// socket goes quiet. Bounded so a regression (token never arrives) still ends.
+static u32 read_until_token(i32 fd, char* buf, u32 cap, const char* tok, u32 toklen) {
+    u32 total = 0;
+    for (int a = 0; a < 6 && total < cap; a++) {
+        i32 n = recv_timeout(fd, buf + total, cap - total, 1000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (buf_contains(buf, total, tok, toklen)) break;
+    }
+    return total;
+}
+
+// Regression for the #125 review: forward(set_path:) on one request must not
+// leak into the next request on a keep-alive-reused connection. reset() runs
+// only at connection alloc, so without an explicit per-request reset the
+// req_path_overridden / req_path_override set by request 1 would re-rewrite
+// request 2's path. Request 1 hits a set_path route (→ /rewritten); request 2
+// on the SAME connection hits a plain forward route and the upstream must see
+// /plain, not the stale /rewritten. Runs on the epoll path (the fix lives in
+// shared callbacks_impl.h), so it executes locally.
+TEST(route, set_path_does_not_leak_across_keepalive) {
+    using namespace rut;
+    EchoPathServer echo;
+    REQUIRE(echo.setup());
+
+    char src_buf[384];
+    const int src_len =
+        snprintf(src_buf,
+                 sizeof(src_buf),
+                 "upstream backend at \"127.0.0.1:%u\"\n"
+                 "route GET \"/rewrite\" { return forward(backend, set_path: \"/rewritten\") }\n"
+                 "route GET \"/plain\" { return forward(backend) }\n",
+                 echo.port);
+    REQUIRE(src_len > 0 && src_len < static_cast<int>(sizeof(src_buf)));
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+
+    {
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 1000));
+        i32 c = connect_to(proxy.port);
+        REQUIRE(c >= 0);
+        set_socket_timeouts(c, 3);
+
+        // Request 1: /rewrite → set_path → upstream sees /rewritten.
+        const char kR1[] = "GET /rewrite HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kR1, sizeof(kR1) - 1));
+        char b1[1024];
+        const u32 n1 = read_until_token(c, b1, sizeof(b1), "/rewritten", 10);
+        CHECK(buf_contains(b1, n1, "/rewritten", 10));
+
+        // Request 2 on the SAME keep-alive connection: /plain → plain forward.
+        // The upstream must see /plain — not the leaked /rewritten.
+        const char kR2[] = "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kR2, sizeof(kR2) - 1));
+        char b2[1024];
+        const u32 n2 = read_until_token(c, b2, sizeof(b2), "/plain", 6);
+        CHECK(buf_contains(b2, n2, "/plain", 6));
+        CHECK(!buf_contains(b2, n2, "/rewritten", 10));
+
+        close(c);
     }
     engine.shutdown();
     rir.destroy();
