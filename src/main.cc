@@ -171,7 +171,7 @@ static i32 run_shards(u16 port,
                 shards[i].loop->shard_metrics_count = shard_count;
             }
         }
-        write_str("Metrics: /metrics enabled\n");
+        write_str("Metrics: built-in GET /metrics enabled (reserved path — shadows user routes)\n");
     }
 
     // Get actual port from first shard's socket
@@ -311,6 +311,11 @@ int main(int argc, char** argv) {
     // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
     //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
+    //                      [--metrics]
+    // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
+    //   NOTE: this RESERVES the /metrics path — GET /metrics (and /metrics/,
+    //   /metrics?…) is served by the built-in endpoint ahead of route matching,
+    //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
         if (is_all_digits(argv[i])) {
             port = 0;

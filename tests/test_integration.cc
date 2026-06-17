@@ -634,6 +634,48 @@ TEST(metrics_endpoint, disabled_without_registry) {
     destroy_real_loop(loop);
 }
 
+// The built-in endpoint is GET-only: even with the registry wired, POST /metrics
+// must NOT return the exposition (it is not a scrape) — it falls through to
+// normal routing. Guards the method check added per the #126 review.
+TEST(metrics_endpoint, non_get_does_not_serve_exposition) {
+    using namespace rut;
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+
+    ShardMetrics m;
+    m.init();
+    loop->metrics = &m;
+    ShardMetrics* reg[1] = {&m};
+    loop->all_shard_metrics = reg;  // endpoint enabled
+    loop->shard_metrics_count = 1;
+
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "POST /metrics HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+    char buf[4096];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    close(c);
+    CHECK(n > 0);
+    // POST falls through to normal routing — no Prometheus exposition body.
+    const u32 total = static_cast<u32>(n > 0 ? n : 0);
+    CHECK(!buf_contains(buf, total, "# TYPE rut_requests_total", 25));
+    CHECK(!buf_contains(buf, total, "rut_request_duration_seconds_bucket", 35));
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {
