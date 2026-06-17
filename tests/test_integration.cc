@@ -6711,6 +6711,90 @@ TEST(proxy_e2e, upstream_timeout_returns_504) {
     close(client);
 }
 
+// Reverse-proxy a large body over TLS on io_uring. The body (64KB) streams from
+// the upstream in ~16KB chunks, each TLS-encrypted into ciphertext that spans
+// more than one record/flush — so a flush CQE resumes upstream recv and issues
+// the next client send while the prior one is still draining, exercising the
+// depth-1 send queue (submit_send_impl / tls_on_out_sent). Verifies the whole
+// body arrives intact. Skipped where io_uring async socket ops are unavailable.
+TEST(proxy_e2e, streams_large_body_over_tls_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    // 64KB recognizable body behind a valid HTTP/1.1 response.
+    static constexpr u32 kBodyLen = 65536;
+    static char resp[64 + kBodyLen];
+    const int kHdr =
+        snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", kBodyLen);
+    REQUIRE(kHdr > 0);
+    for (u32 i = 0; i < kBodyLen; i++) resp[kHdr + i] = static_cast<char>(i * 7u + 13u);
+    const u32 kRespLen = static_cast<u32>(kHdr) + kBodyLen;
+
+    ScriptedUpstreamServer upstream;
+    REQUIRE(upstream.setup(resp, kRespLen));
+
+    RouteConfig cfg{};
+    auto upstream_id = cfg.add_upstream("backend", 0x7F000001, upstream.port);
+    REQUIRE(upstream_id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, upstream_id.value()));
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 4);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(ssl_write_all(ssl, kReq, sizeof(kReq) - 1));
+
+    // Read the full decrypted response: headers + 64KB body.
+    static u8 got[64 + kBodyLen + 256];
+    u32 total = 0;
+    for (int i = 0; i < 20000 && total < kRespLen; i++) {
+        const i32 n = SSL_read(ssl, got + total, static_cast<int>(sizeof(got) - total));
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+    }
+    CHECK_EQ(total, kRespLen);
+    // Body integrity: locate the header terminator, compare the 64KB body.
+    bool body_ok = total == kRespLen;
+    if (body_ok) {
+        for (u32 i = 0; i < kBodyLen; i++) {
+            if (got[kHdr + i] != static_cast<u8>(i * 7u + 13u)) {
+                body_ok = false;
+                break;
+            }
+        }
+    }
+    CHECK(body_ok);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
 // body was registered). Runtime must fall back to the default status-
 // reason body rather than rendering garbage or hanging.

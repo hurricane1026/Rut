@@ -263,6 +263,15 @@ struct ConnectionBase {
     u32 tls_send_off;
     Callback tls_pending_on_recv;
     Callback tls_pending_on_send;
+    // Depth-1 send queue: one plaintext send accepted while another is still
+    // encrypting/in-flight (reverse-proxy streaming issues a new client send the
+    // moment a flush CQE resumes upstream recv, before the prior send's records
+    // have all drained). Drained by tls_on_out_sent. A second concurrent send
+    // fails safe (submit_send returns false → caller closes). The queued source
+    // buffer must stay stable until drained — true for proxy (upstream recv is
+    // paused during a client send) and direct serving (single response buffer).
+    const u8* tls_send_q_src;
+    u32 tls_send_q_len;
 
     // HTTP pipelining state
     u16 pipeline_depth;      // pipelined requests processed on this connection
@@ -437,6 +446,8 @@ struct ConnectionBase {
         tls_send_off = 0;
         tls_pending_on_recv = nullptr;
         tls_pending_on_send = nullptr;
+        tls_send_q_src = nullptr;
+        tls_send_q_len = 0;
         pipeline_depth = 0;
         pipeline_stash_len = 0;
         req_header_end = 0;

@@ -481,16 +481,22 @@ public:
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
-            // A send still mid-encryption (its plaintext didn't fit one TLS
-            // record / tls_out_slice) must not be overwritten or its remainder is
-            // lost. The upper layer serializes client sends via pause/resume, so
-            // this only arises for reverse-proxy streaming of body chunks larger
-            // than one TLS record; fail safe (caller closes) rather than corrupt.
-            // TODO: depth-1 queue to support proxy-over-TLS streaming of >16KB
-            // chunks on io_uring.
-            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
-                close_conn(c);
-                return false;
+            // A send already in progress (encrypting, or its ciphertext still in
+            // flight) can't be overwritten — its remaining plaintext would be
+            // lost. Queue one (depth-1); tls_on_out_sent starts it when the
+            // current send fully drains. Reverse-proxy streaming needs this: a
+            // flush CQE resumes upstream recv and issues the next chunk before the
+            // prior chunk's records have all drained. A second queued send fails
+            // safe — depth-1 suffices because the proxy pauses upstream recv during
+            // each client send. Callers may ignore the bool, so close on overflow.
+            if (c.tls_send_src) {
+                if (c.tls_send_q_src) {
+                    close_conn(c);  // queue full — fail safe
+                    return false;
+                }
+                c.tls_send_q_src = buf;
+                c.tls_send_q_len = len;
+                return true;
             }
             // Encrypt via the TlsEngine; ciphertext is sent by tls_pump_send.
             c.tls_pending_on_send = c.on_send;

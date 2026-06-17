@@ -118,6 +118,19 @@ void tls_on_out_sent(void* lp, Connection& c, IoEvent ev) {
     }
     // App-data send fully drained (or this was a handshake flight: src null).
     const u32 completed_len = c.tls_send_len;
+    // Start the queued send if present (depth-1; see submit_send_impl). Its
+    // source buffer is stable — the proxy pauses upstream recv during a client
+    // send. completed_len above is unused on this path (recomputed when the
+    // queued send later drains).
+    if (c.tls_send_q_src) {
+        c.tls_send_src = c.tls_send_q_src;
+        c.tls_send_len = c.tls_send_q_len;
+        c.tls_send_off = 0;
+        c.tls_send_q_src = nullptr;
+        c.tls_send_q_len = 0;
+        if (!tls_pump_send<Self>(loop, c)) loop->close_conn(c);
+        return;
+    }
     c.tls_send_src = nullptr;
     c.tls_send_len = 0;
     c.tls_send_off = 0;
