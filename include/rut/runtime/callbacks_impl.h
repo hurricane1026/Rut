@@ -312,6 +312,17 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // the new request's req_start_us lands in the same microsecond.
     conn.handler_gen++;
     conn.req_start_us = monotonic_us();
+    // Per-request proxy state must start clean on EVERY request. reset() runs
+    // only at connection alloc, so on a keep-alive-reused connection these flags
+    // would otherwise leak from the previous request: a prior forward(set_path:)
+    // would re-rewrite this request's path, and a stale proxy_resp_started /
+    // upstream_abandoned would skew the 504 timeout logic. This is the canonical
+    // new-request boundary (past the incomplete/pipeline-wait returns above), hit
+    // exactly once per complete request, before route matching / handler dispatch.
+    conn.req_path_overridden = false;
+    conn.req_path_override = {nullptr, 0};
+    conn.proxy_resp_started = false;
+    conn.upstream_abandoned = false;
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
