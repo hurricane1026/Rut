@@ -184,10 +184,18 @@ void pipeline_dispatch(Loop* loop, Connection& conn);
 // Single-writer per shard, so the bucket needs no atomics.
 template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
-    if (conn.throttle_ns_per_byte != 0) {
+    if (conn.throttle_down_bps != 0) {
         const u64 kNowNs = monotonic_ns();
         const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
-        conn.throttle_tat_ns = kBase + static_cast<u64>(len) * conn.throttle_ns_per_byte;
+        // Advance the bucket by the time `len` bytes "should" take: len/bps
+        // seconds, in ns. Compute len*1e9/bps at full precision per chunk rather
+        // than from a precomputed ns-per-byte — the latter (1e9/bps) truncates to
+        // 0 for bps >= 1e9, which would silently disable throttling above ~1 GB/s
+        // (and clamping it to 1 would silently cap every faster rate at 1 GB/s).
+        // len*1e9 <= ~4.3e18 for u32 len, well within u64; one divide per throttled
+        // chunk is negligible on an already-rate-limited path.
+        conn.throttle_tat_ns =
+            kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
     }
     return loop->submit_send(conn, buf, len);
 }
@@ -201,7 +209,7 @@ bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
 // without pumping. throttle_resume re-checks and re-arms when the budget recovers.
 template <typename Loop>
 bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remaining) {
-    if (conn.throttle_ns_per_byte == 0) return false;
+    if (conn.throttle_down_bps == 0) return false;
     const u64 kNowNs = monotonic_ns();
     if (conn.throttle_tat_ns <= kNowNs) return false;  // not ahead → budget available
     const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
@@ -232,7 +240,7 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
 // replay the buffered upstream bytes or re-arm the upstream recv.
 template <typename Loop>
 void throttle_resume(Loop* loop, Connection& conn) {
-    if (conn.throttle_ns_per_byte != 0) {
+    if (conn.throttle_down_bps != 0) {
         const u64 kNowNs = monotonic_ns();
         if (conn.throttle_tat_ns > kNowNs) {
             // Budget not recovered yet — re-park for the remaining deficit.
@@ -558,12 +566,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // @throttle: arm per-connection downstream pacing for this request's response
-    // (0 = unthrottled). Precompute ns-per-byte once (1e9 / bps) so the send path
-    // needs no division; start the token bucket empty (tat = 0 ⇒ first chunk goes
-    // immediately, then paced).
+    // (0 = unthrottled). The token bucket starts empty (tat = 0 ⇒ the first chunk
+    // goes immediately, then paced). client_send advances tat by len*1e9/bps at
+    // full precision (see there) — there is no precomputed ns-per-byte, which
+    // would round to 0 and silently disable throttling for rates >= ~1 GB/s.
     conn.throttle_down_bps = route ? route->throttle_down_bps : 0;
-    conn.throttle_ns_per_byte =
-        conn.throttle_down_bps ? static_cast<u32>(1'000'000'000ull / conn.throttle_down_bps) : 0;
     conn.throttle_tat_ns = 0;
 
     if (route && route->action == RouteAction::Proxy) {

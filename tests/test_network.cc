@@ -683,6 +683,34 @@ TEST(proxy, client_send_error) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
+// Regression (#127 round-2 review): @throttle must keep pacing at high bandwidth.
+// The old code precomputed ns_per_byte = 1e9/bps, which truncates to 0 for
+// bps >= 1e9 and silently disabled throttling above ~1 GB/s (clamping it to 1
+// would instead silently cap every faster rate at 1 GB/s). client_send now
+// advances the bucket by len*1e9/bps at full precision, so even a 2 GB/s cap
+// yields a non-zero, correct per-chunk deficit.
+TEST(throttle, high_bandwidth_still_paces) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->throttle_down_bps = 2'000'000'000u;  // 2 GB/s — old precompute → 0 ns/byte
+    conn->throttle_tat_ns = 0;
+    u8 buf[8] = {0};              // mock backend records ptr+len, never reads bytes
+    const u32 kLen = 1'000'000u;  // 1 MB
+    const u64 kBefore = rut::monotonic_ns();
+    client_send(&loop, *conn, buf, kLen);
+
+    // Expected per-chunk advance: len/bps = 1e6 / 2e9 s = 500us = 500'000 ns,
+    // anchored to now. With the old precompute tat stays 0 → this deficit is
+    // either 0 or a huge unsigned underflow, failing both bounds.
+    const u64 kDeficit = conn->throttle_tat_ns - kBefore;
+    CHECK(kDeficit >= 450'000u);
+    CHECK(kDeficit <= 700'000u);
+}
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;
