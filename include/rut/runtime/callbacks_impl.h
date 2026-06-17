@@ -1896,7 +1896,17 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    if (ev.result == -ENOBUFS) return;  // buffer full; the in-flight send will drain it
+    if (ev.result == -ENOBUFS) {
+        // recv_buf full while the paired client→upstream send drains it. On
+        // level-triggered epoll the client fd stays readable, so a bare return
+        // busy-loops; pause this direction (resumed by the send callback's
+        // reset + submit_recv). State-aware like on_response_body_recvd: only
+        // pause when truly full — a non-full -ENOBUFS is a stale completion.
+        if (conn.recv_buf.write_avail() == 0) {
+            if constexpr (requires { loop->pause_recv(conn); }) loop->pause_recv(conn);
+        }
+        return;
+    }
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
@@ -1918,7 +1928,15 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    if (ev.result == -ENOBUFS) return;
+    if (ev.result == -ENOBUFS) {
+        // upstream_recv_buf full while the paired upstream→client send drains it
+        // (see on_ws_client_recv). Pause the upstream direction when truly full.
+        if (conn.upstream_recv_buf.write_avail() == 0) {
+            if constexpr (requires { loop->pause_upstream_recv(conn); })
+                loop->pause_upstream_recv(conn);
+        }
+        return;
+    }
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
