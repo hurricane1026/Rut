@@ -711,6 +711,71 @@ TEST(throttle, high_bandwidth_still_paces) {
     CHECK(kDeficit <= 700'000u);
 }
 
+// Exercises the @throttle read-side gate branches (throttle_pause_before_pump /
+// throttle_resume) that the timing-based e2e doesn't reach: disabled/not-ahead
+// early-outs, the park path + arm-timer fallback (SmallLoop has no
+// arm_throttle_timer → the keepalive-wheel fallback runs), re-park on an early
+// resume, and the budget-recovered resume that re-arms the upstream recv.
+TEST(throttle, pause_resume_gate_branches) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Disabled (bps == 0) → no gate.
+    conn->throttle_down_bps = 0;
+    conn->throttle_tat_ns = 0;
+    CHECK(!throttle_pause_before_pump(&loop, *conn, 0u));
+
+    // Enabled but bucket not ahead of now → budget available, no park.
+    conn->throttle_down_bps = 1'000'000u;  // 1 MB/s
+    conn->throttle_tat_ns = 0;
+    CHECK(!throttle_pause_before_pump(&loop, *conn, 0u));
+    CHECK(!conn->throttle_paused);
+
+    // Bucket far ahead → park (arms the wheel fallback since SmallLoop lacks
+    // arm_throttle_timer) and stash the pending length.
+    conn->throttle_tat_ns = rut::monotonic_ns() + 500'000'000ull;  // +500ms
+    CHECK(throttle_pause_before_pump(&loop, *conn, 1234u));
+    CHECK(conn->throttle_paused);
+    CHECK_EQ(conn->throttle_pending_len, 1234u);
+
+    // Resume while the bucket is still ahead → re-park, stay paused.
+    throttle_resume(&loop, *conn);
+    CHECK(conn->throttle_paused);
+
+    // Budget recovered (tat in the past), nothing buffered → resume re-arms the
+    // upstream recv and clears the pause.
+    conn->throttle_tat_ns = 0;
+    conn->throttle_pending_len = 0;
+    throttle_resume(&loop, *conn);
+    CHECK(!conn->throttle_paused);
+
+    // Budget recovered WITH buffered bytes → resume replays them through the
+    // proxy body handler (the kRemaining > 0 branch). upstream_recv_buf is empty,
+    // so the handler re-parses and re-arms harmlessly; we only exercise the path.
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->throttle_paused = true;
+    conn->throttle_tat_ns = 0;
+    conn->throttle_pending_len = 8;
+    throttle_resume(&loop, *conn);
+    CHECK(!conn->throttle_paused);
+}
+
+// A rate-limit rule with max==0 / window==0 is "disabled" (emit_interval_us 0),
+// exercising RateLimitRuleSet::add_rule's else branch. The @rateLimit DSL rejects
+// limit:0, but the programmatic setter accepts it (defensive).
+TEST(rate_limit, disabled_rule_zero_max) {
+    rut::RateLimitRuleSet rs{};
+    const i32 idx =
+        rs.add_rule(/*max=*/0, /*window_sec=*/60, /*burst=*/0, rut::RateLimitScope::Shard);
+    REQUIRE_EQ(idx, 0);
+    CHECK_EQ(rs.count, 1u);
+    CHECK_EQ(rs.rules[0].emit_interval_us, 0u);  // disabled
+    CHECK_EQ(rs.rules[0].tau_us, 0u);
+}
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;
@@ -8322,6 +8387,85 @@ TEST(legacy_loop, alloc_upstream_buf) {
     CHECK(loop->alloc_upstream_buf(*c));
 
     loop->free_conn(*c);
+    loop->shutdown();
+}
+
+static void legacy_noop_recv_cb(void*, rut::ConnectionBase&, rut::IoEvent) {}
+
+// Drives EventLoop<MockBackend>'s timer-tick ladder and the dispatch refresh
+// across the proxy-timeout / @throttle branches that the rebase merged into the
+// legacy loop — exercised by neither the e2e (epoll/io_uring) nor the other
+// legacy tests. Tick: a Proxying-stalled conn → 504, a throttle_paused conn →
+// resume, an idle conn → close. Refresh: a throttle_paused conn's timer is NOT
+// bumped (so the byte-rate window owns it); a non-paused one is.
+TEST(legacy_loop, timer_tick_and_refresh_throttle_proxy_branches) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    ShardMetrics metrics;
+    metrics.init();
+    loop->metrics = &metrics;
+    ShardEpoch epoch;
+    epoch.epoch.store(0, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+
+    // Tick: throttle_paused (budget recovered) → throttle_resume → re-arm.
+    auto* a = loop->alloc_conn();
+    REQUIRE(a != nullptr);
+    a->fd = -1;
+    a->throttle_paused = true;
+    a->throttle_down_bps = 1'000'000u;
+    a->throttle_tat_ns = 0;  // not ahead → resume completes
+    a->throttle_pending_len = 0;
+    REQUIRE(loop->alloc_upstream_buf(*a));
+    loop->timer.add(a, 1);
+
+    // Tick: Proxying with no response yet → respond_upstream_timeout (504).
+    auto* b = loop->alloc_conn();
+    REQUIRE(b != nullptr);
+    b->fd = -1;
+    b->state = ConnState::Proxying;
+    b->proxy_resp_started = false;
+    loop->timer.add(b, 1);
+
+    // Tick: idle keep-alive → close.
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = -1;
+    c->state = ConnState::ReadingHeader;
+    loop->timer.add(c, 1);
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    // Conns were added one slot ahead (add(_, 1)); the wheel fires slots[cursor]
+    // then advances, so two ticks are needed to reach their slot.
+    tick.result = 2;
+    loop->dispatch(tick);  // fires a, b, c → tick ladder branches
+    CHECK(!a->throttle_paused);
+
+    // Refresh: a throttle_paused conn with a live callback → refresh is skipped.
+    auto* d = loop->alloc_conn();
+    REQUIRE(d != nullptr);
+    d->fd = -1;
+    d->throttle_paused = true;
+    d->on_recv = &legacy_noop_recv_cb;
+    IoEvent rd{};
+    rd.type = IoEventType::Recv;
+    rd.conn_id = d->id;
+    rd.result = 1;
+    loop->dispatch(rd);  // covers the `if (!throttle_paused) refresh` skip
+
+    // Refresh: a non-paused Proxying conn → refresh with the upstream deadline.
+    auto* e = loop->alloc_conn();
+    REQUIRE(e != nullptr);
+    e->fd = -1;
+    e->state = ConnState::Proxying;
+    e->on_recv = &legacy_noop_recv_cb;
+    IoEvent re{};
+    re.type = IoEventType::Recv;
+    re.conn_id = e->id;
+    re.result = 1;
+    loop->dispatch(re);
+
     loop->shutdown();
 }
 
