@@ -1268,6 +1268,9 @@ TEST(rate_limit_dsl, unknown_decorator_and_bad_args_rejected) {
 
 // End-to-end: a route compiled with @rateLimit serves 200 up to the limit, then
 // 429 — proving the decorator → config → runtime path works from .rut.
+// JIT-compiles + serves the .rut, so it links the JIT engine — excluded from
+// no-JIT builds (the other rate_limit_dsl tests only lower to RIR).
+#if RUT_ENABLE_JIT_TESTS
 TEST(rate_limit_dsl, e2e_429_over_limit) {
     using namespace rut;
     const char* src =
@@ -1337,6 +1340,7 @@ TEST(rate_limit_dsl, e2e_429_over_limit) {
     engine.shutdown();
     rir.destroy();
 }
+#endif  // RUT_ENABLE_JIT_TESTS
 
 // @throttle compiles to a per-route client-send byte rate on the RIR function.
 // (Runtime pacing is a separate change; here we verify the config plumbing.)
