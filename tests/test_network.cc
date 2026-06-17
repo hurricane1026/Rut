@@ -776,6 +776,55 @@ TEST(rate_limit, disabled_rule_zero_max) {
     CHECK_EQ(rs.rules[0].tau_us, 0u);
 }
 
+#if RUT_ENABLE_WEBSOCKET
+// A WS-tunnel recv callback that gets -ENOBUFS with a full buffer must pause that
+// direction (state-aware), not bare-return into a busy-loop, and must not close
+// the connection. Covers the -ENOBUFS branches in on_ws_client_recv /
+// on_ws_upstream_recv.
+TEST(websocket, enobufs_pauses_not_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    const u32 cid = conn->id;
+
+    // Client→upstream direction: fill recv_buf so write_avail() == 0, deliver
+    // -ENOBUFS → pause, no close.
+    conn->recv_buf.commit(conn->recv_buf.write_avail());
+    CHECK_EQ(conn->recv_buf.write_avail(), 0u);
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+
+    // Upstream→client direction: same, on upstream_recv_buf.
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_recv_buf.commit(conn->upstream_recv_buf.write_avail());
+    CHECK_EQ(conn->upstream_recv_buf.write_avail(), 0u);
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // still not closed
+}
+
+// The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
+// (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
+TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = -1;
+    c->is_ws_tunnel = true;
+    loop->timer.add(c, 1);
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 2;  // wheel fires slots[cursor] then advances; add(_,1) needs 2
+    loop->dispatch(tick);
+    // The tunnel was exempted (early return), not closed.
+    CHECK(c->is_ws_tunnel);
+    loop->shutdown();
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;
