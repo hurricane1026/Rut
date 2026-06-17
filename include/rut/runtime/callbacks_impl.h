@@ -1169,6 +1169,27 @@ void handle_jit_outcome(Loop* loop,
             }
             conn.state = ConnState::Proxying;
             auto& target = config->upstreams[outcome.upstream_id];
+            // Upstream concurrency cap — same as the direct RouteAction::Proxy
+            // path (a `return forward(...)` JIT route must honor max_inflight too,
+            // or JIT-implemented routes could exceed the backend's in-flight cap).
+            // Shed with 503 before connecting; slot released on every exit via
+            // close_conn's catch-all (or release_upstream_slot at body-done).
+            if (target.max_inflight != 0) {
+                bool acquired = true;
+                if constexpr (requires { loop->upstream_acquire(outcome.upstream_id, 1u); }) {
+                    acquired = loop->upstream_acquire(outcome.upstream_id, target.max_inflight);
+                }
+                if (!acquired) {
+                    conn.resp_status = 503;
+                    format_static_response(conn, 503, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                conn.upstream_slot_held = true;
+                conn.upstream_slot_uid = outcome.upstream_id;
+            }
             for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
                 conn.upstream_name[i] = target.name[i];
             if (target.name_len < sizeof(conn.upstream_name))

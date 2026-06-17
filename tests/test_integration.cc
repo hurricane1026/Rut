@@ -5429,6 +5429,68 @@ TEST(route, forward_jit_handler_enters_proxy_state) {
     destroy_real_loop(loop);
 }
 
+// Regression for the #127 review: a JIT `return forward(<upstream>)` route must
+// honor the upstream max_inflight cap, same as the direct RouteAction::Proxy
+// path. With cap 1, while a slow forwarded request holds the slot, a second
+// concurrent forward to the same backend is shed with 503 — before the fix the
+// JIT Forward branch skipped the acquire and would open a second upstream
+// connection, exceeding the cap.
+TEST(upstream_concurrency_e2e, jit_forward_honors_max_inflight) {
+    using namespace rut;
+    SlowResponseServer backend;
+    REQUIRE(backend.setup(400));  // hold each upstream conn ~400ms
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);  // forward_upstream_0_handler forwards to id 0
+    REQUIRE(cfg.add_jit_handler("/p", 'G', &forward_upstream_0_handler));
+    REQUIRE(cfg.set_upstream_max_inflight(id.value(), 1));
+    const RouteConfig* active = &cfg;
+
+    UpstreamConcurrency cc{};  // fresh shared gauge for this test
+    cc.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_cc = &cc;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    const char kReq[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    char buf[1024];
+
+    // c1 takes the only slot via the JIT forward path (backend holds ~400ms).
+    i32 c1 = connect_to(port);
+    REQUIRE(c1 >= 0);
+    REQUIRE(send_all(c1, kReq, sizeof(kReq) - 1));
+    usleep(150000);  // 150ms: c1's slot is acquired, backend is sleeping
+
+    // c2 forwards to the same backend at capacity → 503.
+    i32 c2 = connect_to(port);
+    REQUIRE(c2 >= 0);
+    REQUIRE(send_all(c2, kReq, sizeof(kReq) - 1));
+    i32 n2 = recv_timeout(c2, buf, sizeof(buf), 2000);
+    CHECK(n2 > 0 && buf_contains(buf, static_cast<u32>(n2), "503", 3));
+    close(c2);
+
+    // c1 completes (200) and frees the slot.
+    i32 n1 = recv_timeout(c1, buf, sizeof(buf), 2000);
+    CHECK(n1 > 0 && buf_contains(buf, static_cast<u32>(n1), "200", 3));
+    close(c1);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // Bad upstream_id (out of bounds) → handle_jit_outcome must return 502
 // rather than crash or hang. Guards the defensive bound check in the
 // Forward branch.
