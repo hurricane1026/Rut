@@ -48,7 +48,17 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
-    static constexpr u32 kDefaultUpstreamTimeout = 30;  // proxying-connection deadline
+    // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
+    // the Proxying state. SCOPE: the post-connect phase only — from the upstream
+    // connect completing, through request-send, until the upstream's first
+    // response bytes. Firing before any response reached the client
+    // (!proxy_resp_started) → 504; after streaming started → close (truncate).
+    // Does NOT bound TCP connect establishment: the timer flips to this value
+    // only on the first upstream I/O event (connect completion), so a *hung
+    // connect* is still bounded by keepalive_timeout (ECONNREFUSED is immediate,
+    // so this rarely matters). Idle keep-alive uses keepalive_timeout — a
+    // separate knob. TODO: a dedicated connect-timeout if hung connects matter.
+    static constexpr u32 kDefaultUpstreamTimeout = 30;
     SlicePool pool;
     // Per-shard HTTP/2 engine pool (see EpollEventLoop). Lazily handed out on
     // h2 upgrade; bounded, over-cap upgrades close the connection.
