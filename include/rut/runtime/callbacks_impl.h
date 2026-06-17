@@ -352,8 +352,18 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // the data listener at GET /metrics, ahead of route matching, and works
     // even with no RouteConfig. `if constexpr` keeps it out of loops/mocks that
     // don't expose the registry.
+    //
+    // RESERVED PATH: when --metrics is enabled, GET /metrics is a built-in
+    // endpoint that intentionally shadows any user route on that path.
+    // req_path_canon is the canonical-for-routing slice (leading/trailing '/'
+    // stripped, query removed), so /metrics, /metrics/ and /metrics?x all match.
+    // Only GET is intercepted — POST/PUT/DELETE/… /metrics fall through to
+    // normal routing (they are not the scrape endpoint and must not return the
+    // metrics body, keeping the behavior consistent with "Prometheus endpoint").
     if constexpr (requires { loop->all_shard_metrics; }) {
-        if (loop->all_shard_metrics != nullptr && conn.req_path_canon.eq(Str{"metrics", 7})) {
+        if (loop->all_shard_metrics != nullptr &&
+            conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+            conn.req_path_canon.eq(Str{"metrics", 7})) {
             char mbuf[8192];
             const ShardMetrics kAgg =
                 aggregate_metrics(loop->all_shard_metrics, loop->shard_metrics_count);
