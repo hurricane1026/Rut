@@ -364,6 +364,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         if (loop->all_shard_metrics != nullptr &&
             conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
             conn.req_path_canon.eq(Str{"metrics", 7})) {
+            // Fixed 8 KiB exposition buffer. The current metric set (counters +
+            // gauges + the 11-bucket latency histogram + _sum/_count) renders in
+            // a few hundred bytes, so this has ample headroom. format_prometheus
+            // is fail-closed: if the output would NOT fit it returns 0 (never a
+            // truncated/invalid body) and we respond 500 instead of emitting
+            // malformed Prometheus text. If the metric set ever outgrows 8 KiB,
+            // bump this buffer — the 500 is the signal, not silent truncation.
             char mbuf[8192];
             const ShardMetrics kAgg =
                 aggregate_metrics(loop->all_shard_metrics, loop->shard_metrics_count);
