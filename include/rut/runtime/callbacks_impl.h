@@ -2024,7 +2024,10 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.upstream_recv_paused_for_send = false;
-    loop->submit_recv_upstream(conn);  // re-arm upstream→client direction
+    if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream→client direction
+        loop->close_conn(conn);
+        return;
+    }
     if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
 }
 
