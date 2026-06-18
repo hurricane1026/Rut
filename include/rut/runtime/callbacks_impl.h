@@ -2034,6 +2034,12 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    if (ev.result == -ENOBUFS) {
+        if (conn.upstream_recv_buf.write_avail() == 0) {
+            if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+        }
+        return;
+    }
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
@@ -2055,6 +2061,8 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_upstream_send_pending = false;
     conn.ws_client_send_len = 0;
     conn.ws_upstream_send_len = 0;
+    on_request_complete(loop, conn, conn.resp_status, conn.upstream_send_len);
+    loop->epoch_leave();
     conn.upstream_recv_buf.consume(conn.upstream_send_len);
     conn.upstream_send_len = 0;
     conn.recv_buf.reset();

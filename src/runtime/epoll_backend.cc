@@ -236,7 +236,7 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     u32 events = EPOLLRDHUP;
     if (preserve_send_interest) {
         const auto& ss = send_state[conn_id];
-        if (ss.remaining > 0 && ss.fd >= 0) {
+        if (ss.remaining > 0 && ss.fd == fd) {
             type = ss.type;
             if (ss.tls) {
                 events = (ss.tls_wait_events == EPOLLIN) ? (EPOLLIN | EPOLLRDHUP)
