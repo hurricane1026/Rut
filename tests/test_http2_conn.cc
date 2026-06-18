@@ -1105,6 +1105,69 @@ TEST(http2_conn, duplicate_headers_block_is_decoded_before_reset) {
     CHECK_EQ(cap.last_stream, 3u);
 }
 
+TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    // POST with a body (no END_STREAM) followed by a DATA frame (no END_STREAM).
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    u8 frame[512];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/false);
+    fn += http2_write_data(
+        frame + fn, 1, reinterpret_cast<const u8*>("hello"), 5, /*end_stream=*/false);
+    u8 in[640];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(cap.data_calls, 1u);
+    CHECK_FALSE(cap.data_end);
+
+    // The serving layer would have deferred this upload.
+    c.pending_stream = 1;
+
+    // Trailing HEADERS: END_STREAM, no pseudo-headers → valid request trailers.
+    hpack::Header tr[] = {{{"x-checksum", 10}, {"ok", 2}}};
+    u8 tframe[128];
+    u32 tn = http2_write_headers(tframe, sizeof(tframe), 1, tr, 1, /*end_stream=*/true);
+    u8 tout[128];
+    u32 tow = 0;
+    Http2Result r2 = c.process(tframe, tn, tout, sizeof(tout), &tow);
+    CHECK_FALSE(r2.close);
+    CHECK_FALSE(has_frame(tout, tow, Http2FrameType::RstStream, 0, 0));  // not reset
+    CHECK_EQ(cap.data_calls, 2u);  // end-of-stream delivered to finalize the upload
+    CHECK(cap.data_end);
+    Http2Stream* s = c.find_stream(1);
+    REQUIRE(s != nullptr);
+    CHECK(s->state == Http2StreamState::HalfClosedRemote);
+}
+
+TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    u8 frame[512];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/false);
+    u8 in[640];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+
+    // END_STREAM is set, but a pseudo-header (:path) disqualifies it as trailers
+    // (RFC 7540 §8.1.2.1) → reset rather than finalize.
+    hpack::Header bad[] = {{{":path", 5}, {"/x", 2}}, {{"x-t", 3}, {"1", 1}}};
+    u8 bframe[128];
+    u32 bn = http2_write_headers(bframe, sizeof(bframe), 1, bad, 2, /*end_stream=*/true);
+    u8 bout[128];
+    u32 bow = 0;
+    c.process(bframe, bn, bout, sizeof(bout), &bow);
+    CHECK(has_frame(bout, bow, Http2FrameType::RstStream, 0, 0));
+}
+
 TEST(h2_serving, finalizes_body_without_injecting_content_length) {
     Http2Conn h2;
     h2.init();
@@ -1214,13 +1277,15 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     u8 resp[256];
     H2Dispatch<FakeH2Loop> d{&loop, &conn, resp, sizeof(resp), 0, false};
 
-    char scratch[8] = {'4', '2', 0, 0, 0, 0, 0, 0};  // mimics hdr_scratch
-    RouteParam params[1] = {{"id", 2, scratch, 2}};
+    // The path value lives in a mutable buffer standing in for hdr_scratch; the
+    // matched param value is a substring of it (as the real matcher produces).
+    char path_buf[] = "/users/42";
+    RouteParam params[1] = {{"id", 2, path_buf + 7, 2}};  // "42" within the path
     RouteEntry route{};
     route.action = RouteAction::JitHandler;
     route.fn = reinterpret_cast<jit::HandlerFn>(0x1);  // non-null, never invoked
 
-    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/users/42", 9}}};
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {path_buf, 9}}};
     ParsedRequest req{};
     req.has_content_length = true;
     req.content_length = 0;
@@ -1239,16 +1304,18 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
                                     200));
 
     // Simulate the engine reusing hdr_scratch for another stream's headers.
-    scratch[0] = '9';
-    scratch[1] = '9';
+    path_buf[7] = '9';
+    path_buf[8] = '9';
 
     REQUIRE(h2.pending_route_param_count == 1u);
     const H2RouteParam& sp = h2.pending_route_params[0];
     CHECK_EQ(sp.value_len, 2u);
-    CHECK(sp.value != scratch);                                              // not aliasing
-    CHECK(sp.value == reinterpret_cast<const char*>(h2.pending_param_buf));  // stable buf
-    CHECK(sp.value[0] == '4' && sp.value[1] == '2');                         // pre-clobber bytes
-    CHECK(sp.name == params[0].name);  // name still points into stable config
+    CHECK(sp.value != path_buf + 7);  // not aliasing the reusable matcher source
+    // Value re-anchored into the stable synth "GET /users/42 HTTP/1.1...": the
+    // path follows "GET " (offset 4), so "42" sits at offset 4 + len("/users/").
+    CHECK(sp.value == reinterpret_cast<const char*>(h2.pending_synth + 4 + 7));
+    CHECK(sp.value[0] == '4' && sp.value[1] == '2');  // pre-clobber bytes intact
+    CHECK(sp.name == params[0].name);                 // name still points into stable config
 }
 
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {

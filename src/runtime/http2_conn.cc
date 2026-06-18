@@ -375,7 +375,11 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream) {
     return Http2Error::NoError;
 }
 
-Http2Error discard_headers(Http2Conn& c) {
+// Decode a second header block we will not deliver (illegal repeat, or request
+// trailers), keeping the HPACK decoder dynamic table in sync. When has_pseudo is
+// non-null it reports whether the block contained any pseudo-header (a ':' name),
+// which disqualifies it from being valid trailers (RFC 7540 §8.1.2.1).
+Http2Error discard_headers(Http2Conn& c, bool* has_pseudo = nullptr) {
     hpack::Header hs[Http2Conn::kMaxHeadersPerReq];
     u32 nh = 0;
     if (!hpack::decode_header_block(c.hpack_dec,
@@ -387,6 +391,15 @@ Http2Error discard_headers(Http2Conn& c) {
                                     Http2Conn::kMaxHeadersPerReq,
                                     &nh)) {
         return Http2Error::CompressionError;
+    }
+    if (has_pseudo) {
+        *has_pseudo = false;
+        for (u32 i = 0; i < nh; i++) {
+            if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') {
+                *has_pseudo = true;
+                break;
+            }
+        }
     }
     c.hdr_block_len = 0;
     c.cont_stream = 0;
@@ -418,7 +431,6 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_static_status = 200;
     c.pending_jit_fn = nullptr;
     c.pending_route_param_count = 0;
-    c.pending_param_len = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         c.pending_route_params[i] = {};
     }
@@ -497,11 +509,26 @@ static Http2Error handle_frame(Http2Conn& c,
                 }
             }
             if (s->got_headers) {
+                // A second HEADERS block on an already-open stream is either
+                // request trailers (RFC 7540 §8.1: END_STREAM set, stream still
+                // receiving body) or an illegal second request header block.
+                // Decode it either way to keep the HPACK decoder in sync, then
+                // finalize the buffered upload (trailers) or reset the stream.
+                const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
                 const Http2Error kAe = append_fragment(c, p, n);
                 if (kAe != Http2Error::NoError) return kAe;
                 if (h.flags & http2_flag::kEndHeaders) {
-                    const Http2Error kDe = discard_headers(c);
+                    bool has_pseudo = false;
+                    const Http2Error kDe = discard_headers(c, &has_pseudo);
                     if (kDe != Http2Error::NoError) return kDe;
+                    // Valid request trailers: END_STREAM, no pseudo-headers, on a
+                    // stream still receiving its body.
+                    if (kEndStream && !has_pseudo && s->state == Http2StreamState::Open) {
+                        s->state = Http2StreamState::HalfClosedRemote;
+                        if (c.pending_stream == h.stream_id && c.on_data)
+                            c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
+                        return Http2Error::NoError;
+                    }
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
@@ -510,7 +537,7 @@ static Http2Error handle_frame(Http2Conn& c,
                     return Http2Error::NoError;
                 }
                 c.cont_stream = h.stream_id;
-                c.cont_end_stream = false;
+                c.cont_end_stream = kEndStream;  // carry END_STREAM for trailers
                 c.cont_discard = true;
                 return Http2Error::NoError;
             }
@@ -536,8 +563,16 @@ static Http2Error handle_frame(Http2Conn& c,
             if (h.flags & http2_flag::kEndHeaders) {
                 Http2Stream* s = c.find_stream(h.stream_id);
                 if (c.cont_discard) {
-                    const Http2Error kDe = discard_headers(c);
+                    const bool kTrailerEnd = c.cont_end_stream;  // before discard resets
+                    bool has_pseudo = false;
+                    const Http2Error kDe = discard_headers(c, &has_pseudo);
                     if (kDe != Http2Error::NoError) return kDe;
+                    if (kTrailerEnd && !has_pseudo && s && s->state == Http2StreamState::Open) {
+                        s->state = Http2StreamState::HalfClosedRemote;
+                        if (c.pending_stream == h.stream_id && c.on_data)
+                            c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
+                        return Http2Error::NoError;
+                    }
                     if (w.room(kFrameHeaderSize + 4))
                         w.len +=
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);

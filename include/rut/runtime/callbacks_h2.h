@@ -142,7 +142,6 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_static_status = 200;
     h2.pending_jit_fn = nullptr;
     h2.pending_route_param_count = 0;
-    h2.pending_param_len = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         h2.pending_route_params[i] = {};
     }
@@ -231,24 +230,40 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_route_action = action;
     h2->pending_static_status = static_status;
     h2->pending_jit_fn = route ? route->fn : nullptr;
-    const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
-    u32 off = 0;
+    // Snapshot route params for the deferred handler. Only JIT handlers consume
+    // params, and only they build the synthesized request; re-anchor each param
+    // value into pending_synth (stable) rather than the matcher's hdr_scratch
+    // source, which the next decoded header block reuses. Param values are
+    // substrings of the raw :path, which h2_synth_h1_request copied verbatim into
+    // pending_synth right after "METHOD ".
     u32 stored = 0;
-    for (u32 i = 0; i < kCapped; i++) {
-        const RouteParam& p = params[i];
-        // Copy the value bytes (which point into the reusable hdr_scratch) into
-        // stable pending storage; keep the name pointing into the snapshotted
-        // config. Drop a param whose value would overflow the bounded buffer.
-        if (off + p.value_len > Http2Conn::kPendingParamCap) break;
-        u8* dst = h2->pending_param_buf + off;
-        for (u32 j = 0; j < p.value_len; j++) dst[j] = static_cast<u8>(p.value[j]);
-        h2->pending_route_params[stored] = {
-            p.name, p.name_len, reinterpret_cast<const char*>(dst), p.value_len};
-        off += p.value_len;
-        stored++;
+    if (action == RouteAction::JitHandler) {
+        Str method{nullptr, 0};
+        Str path{nullptr, 0};
+        for (u32 i = 0; i < nheaders; i++) {
+            if (headers[i].name.eq(Str{":method", 7}))
+                method = headers[i].value;
+            else if (headers[i].name.eq(Str{":path", 5}))
+                path = headers[i].value;
+        }
+        const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
+        const u32 kPathStart = method.len + 1;  // path follows "METHOD " in synth
+        for (u32 i = 0; i < kCapped; i++) {
+            const RouteParam& p = params[i];
+            // Defensive: a trie-matched value is always within the raw path, so
+            // this skip is unreachable in practice (no silent truncation).
+            if (path.ptr == nullptr || p.value < path.ptr ||
+                p.value + p.value_len > path.ptr + path.len)
+                continue;
+            const u32 kOff = kPathStart + static_cast<u32>(p.value - path.ptr);
+            h2->pending_route_params[stored++] = {
+                p.name,
+                p.name_len,
+                reinterpret_cast<const char*>(h2->pending_synth + kOff),
+                p.value_len};
+        }
     }
     h2->pending_route_param_count = stored;
-    h2->pending_param_len = off;
     h2->pending_stream = stream_id;
     return true;
 }
