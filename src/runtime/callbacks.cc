@@ -284,10 +284,27 @@ bool pipeline_recover(Connection& conn) {
     conn.pipeline_stash_len = 0;
     if (kStashLen == 0) return false;
     const u8* src = conn.send_buf.data();
-    conn.recv_buf.reset();
-    u8* dst = conn.recv_buf.write_ptr();
-    __builtin_memmove(dst, src, kStashLen);
-    conn.recv_buf.commit(kStashLen);
+    const u32 kExisting = conn.recv_buf.len();
+    if (kExisting == 0) {
+        // HTTP/1 pipeline path (and the common WS case): recv_buf is empty, just
+        // restore the stash.
+        conn.recv_buf.reset();
+        u8* dst = conn.recv_buf.write_ptr();
+        __builtin_memmove(dst, src, kStashLen);
+        conn.recv_buf.commit(kStashLen);
+    } else {
+        // Bytes already read into recv_buf (client frames that raced in before
+        // tunnel install while an io_uring multishot recv stayed armed) came
+        // AFTER the stash, so they must follow it — not be dropped. Shift them up
+        // by kStashLen and prepend the stash. base == recv_buf.data().
+        u8* base = conn.recv_buf.write_ptr() - kExisting;
+        u32 keep = kExisting;
+        if (static_cast<u32>(kStashLen) + keep > conn.recv_buf.capacity())
+            keep = conn.recv_buf.capacity() - kStashLen;  // truncate tail to fit
+        __builtin_memmove(base + kStashLen, base, keep);
+        __builtin_memmove(base, src, kStashLen);
+        conn.recv_buf.set_len(kStashLen + keep);
+    }
     conn.send_buf.reset();
     conn.pipeline_depth++;
     return true;

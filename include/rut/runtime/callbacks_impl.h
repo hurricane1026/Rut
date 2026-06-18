@@ -1958,6 +1958,16 @@ void ws_stop_upstream_poll(Loop* loop, Connection& conn) {
     }
 }
 
+// Symmetric to ws_stop_upstream_poll for the client fd (epoll-only; no-op
+// elsewhere). Used when a tunnel close is deferred behind a draining send so a
+// level-triggered client half-close doesn't spin the loop.
+template <typename Loop>
+void ws_stop_client_poll(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_client(c); }) {
+        loop->ws_unpoll_client(conn);
+    }
+}
+
 template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.recv_buf.len() == 0) return true;
@@ -2005,8 +2015,13 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         // can make progress.
         if (conn.ws_client_send_pending || conn.recv_buf.len() > 0) {
             conn.ws_client_eof = true;
-            if (!conn.ws_client_send_pending && !ws_try_send_client_to_upstream(loop, conn))
+            if (!conn.ws_client_send_pending && !ws_try_send_client_to_upstream(loop, conn)) {
                 loop->close_conn(conn);
+                return;
+            }
+            // Stop the level-triggered client half-close from re-firing while the
+            // close waits on the draining send (epoll-only; close_conn closes fd).
+            ws_stop_client_poll(loop, conn);
             return;
         }
         loop->close_conn(conn);
@@ -2054,8 +2069,13 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         // is not truncated (on_ws_upstream_to_client_sent closes on drain).
         if (conn.ws_upstream_send_pending || conn.upstream_recv_buf.len() > 0) {
             conn.ws_upstream_eof = true;
-            if (!conn.ws_upstream_send_pending && !ws_try_send_upstream_to_client(loop, conn))
+            if (!conn.ws_upstream_send_pending && !ws_try_send_upstream_to_client(loop, conn)) {
                 loop->close_conn(conn);
+                return;
+            }
+            // Stop the level-triggered backend EOF from re-firing while the close
+            // waits on the draining send (epoll-only; close_conn closes the fd).
+            ws_stop_upstream_poll(loop, conn);
             return;
         }
         loop->close_conn(conn);
@@ -2128,6 +2148,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         pipeline_recover(conn);
     }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
+    // The HTTP request is complete at the 101: release the upstream max_inflight
+    // slot now so a long-lived tunnel doesn't hold an in-flight request slot for
+    // its whole lifetime and shed later requests with 503.
+    release_upstream_slot(loop, conn);
     loop->epoch_leave();
     u32 kRemaining = conn.upstream_recv_buf.len();
     if (kRemaining >= conn.ws_upgrade_response_len) {

@@ -1113,6 +1113,49 @@ TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
     CHECK(saw);  // buffered client bytes forwarded upstream
 }
 
+// Entering tunnel mode must release the upstream max_inflight slot so a
+// long-lived tunnel doesn't hold an in-flight request slot for its lifetime.
+TEST(websocket, upgrade_101_sent_releases_upstream_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+    conn->upstream_slot_held = true;  // slot taken at proxy dispatch
+
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK(!conn->upstream_slot_held);  // released at the 101, not held until close
+}
+
+// pipeline_recover must prepend the stash before bytes already read into
+// recv_buf (client frames that raced in before tunnel install), not drop them.
+TEST(websocket, pipeline_recover_preserves_raced_recv_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    const u8 stash[] = {'A', 'B'};  // bytes right after the upgrade request
+    conn->send_buf.reset();
+    REQUIRE_EQ(conn->send_buf.write(stash, sizeof(stash)), sizeof(stash));
+    conn->pipeline_stash_len = sizeof(stash);
+
+    const u8 raced[] = {'C', 'D', 'E'};  // arrived later, before tunnel install
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(raced, sizeof(raced)), sizeof(raced));
+
+    REQUIRE(pipeline_recover(*conn));
+    REQUIRE_EQ(conn->recv_buf.len(), 5u);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), "ABCDE", 5), 0);  // stash then raced
+    CHECK_EQ(conn->pipeline_stash_len, 0u);
+}
+
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
 // (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
 TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {

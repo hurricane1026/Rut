@@ -382,6 +382,14 @@ public:
         if (c.upstream_fd >= 0) (void)backend.cancel(c.upstream_fd, c.id);
     }
 
+    // Symmetric to ws_unpoll_upstream for the downstream (client) fd: stop epoll
+    // from redelivering a client half-close (EPOLLRDHUP) while a tunnel close is
+    // deferred behind a still-draining client→upstream send. close_conn ::closes
+    // the fd later.
+    void ws_unpoll_client(Connection& c) {
+        if (c.fd >= 0) (void)backend.cancel(c.fd, c.id);
+    }
+
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;  // already allocated
         u8* s = pool.alloc();
