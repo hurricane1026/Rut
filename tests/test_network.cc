@@ -1133,6 +1133,26 @@ TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
+// Cover the legacy EventLoop<Backend> accessors + free_conn slice release.
+TEST(legacy_loop, accessors_and_free_release_slices) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    CHECK(!loop->is_draining());
+    loop->clear_upstream_fd(0);
+    loop->clear_upstream_fd(EventLoop<MockBackend>::kMaxConns - 1);
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    REQUIRE(c->recv_slice != nullptr);
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->fd = -1;
+    loop->free_conn(*c);  // must return the pooled slices
+    CHECK_EQ(c->recv_slice, nullptr);
+    CHECK_EQ(c->upstream_recv_slice, nullptr);
+    loop->shutdown();
+}
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;
