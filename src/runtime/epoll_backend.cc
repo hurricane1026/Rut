@@ -243,6 +243,12 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
+void EpollBackend::clear_send_state(u32 conn_id) {
+    if (conn_id >= kMaxFdMap) return;
+    send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+    upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+}
+
 void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     if (conn_id >= kMaxFdMap) return;
     i32 fd = downstream_fd_map[conn_id];

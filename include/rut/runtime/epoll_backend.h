@@ -91,6 +91,14 @@ struct EpollBackend {
     // No-op if the conn_id has no registered upstream fd.
     void pause_upstream_recv(u32 conn_id, bool preserve_send_interest = false);
 
+    // Drop any partial-send bookkeeping for conn_id. MUST be called on close so
+    // a leftover send_state entry (a partial send that was still in flight when
+    // the connection closed) cannot be misread as live after the conn_id and fd
+    // number are reused: pause_recv/add_recv preserve a pending send's EPOLLOUT
+    // keyed on (remaining > 0 && ss.fd == fd), and would otherwise arm EPOLLOUT
+    // and send from the stale ss.src pointer into the new connection's fd.
+    void clear_send_state(u32 conn_id);
+
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len);

@@ -6642,6 +6642,40 @@ TEST(epoll_loop, alloc_free_conn) {
     destroy_real_loop(loop);
 }
 
+// close_conn must drop any in-flight partial-send bookkeeping so a reused
+// conn_id + fd number cannot resurrect a stale send. Without this, pause_recv /
+// add_recv would match the leftover entry (remaining > 0 && ss.fd == fd), arm
+// EPOLLOUT, and send from the dangling ss.src into the new connection's fd.
+TEST(epoll_loop, close_clears_partial_send_state) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+    c->fd = -1;  // no real socket to ::close
+
+    // Simulate a partial client→upstream and upstream→client send still recorded
+    // when the connection closes.
+    loop->backend.send_state[cid] = {
+        reinterpret_cast<const u8*>(0x1000), 7, 0, 16, IoEventType::Send, false, 0};
+    loop->backend.upstream_send_state[cid] = {
+        reinterpret_cast<const u8*>(0x2000), 9, 0, 16, IoEventType::UpstreamSend, false, 0};
+
+    loop->close_conn(*c);
+
+    CHECK_EQ(loop->backend.send_state[cid].remaining, 0u);
+    CHECK_EQ(loop->backend.send_state[cid].fd, -1);
+    CHECK(loop->backend.send_state[cid].src == nullptr);
+    CHECK_EQ(loop->backend.upstream_send_state[cid].remaining, 0u);
+    CHECK_EQ(loop->backend.upstream_send_state[cid].fd, -1);
+    CHECK(loop->backend.upstream_send_state[cid].src == nullptr);
+
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 TEST(epoll_loop, alloc_upstream_buf_lazy) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);

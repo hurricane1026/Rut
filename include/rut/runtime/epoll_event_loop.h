@@ -482,6 +482,9 @@ public:
         // Clear upstream fd map to prevent stale fd matching after reuse.
         if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = -1;
         if (c.id < EpollBackend::kMaxFdMap) backend.downstream_fd_map[c.id] = -1;
+        // Drop any in-flight partial-send bookkeeping so a reused conn_id+fd
+        // cannot resurrect a stale send (see EpollBackend::clear_send_state).
+        backend.clear_send_state(c.id);
         if (metrics) {
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
