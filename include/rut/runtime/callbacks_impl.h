@@ -1968,6 +1968,19 @@ void ws_stop_client_poll(Loop* loop, Connection& conn) {
     }
 }
 
+// True for backends whose recv eagerly consumes socket data into a provided
+// buffer (io_uring): a -ENOBUFS there means the overflow bytes were already read
+// from the socket and discarded, so the tunnel cannot recover them by pausing.
+// Sync backends (epoll) leave the bytes in the socket, so pausing is safe.
+template <typename Loop>
+constexpr bool ws_loop_async() {
+    if constexpr (requires { decltype(Loop::backend)::kAsyncIo; }) {
+        return decltype(Loop::backend)::kAsyncIo;
+    } else {
+        return false;
+    }
+}
+
 template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.recv_buf.len() == 0) return true;
@@ -1997,6 +2010,13 @@ template <typename Loop>
 void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result == -ENOBUFS) {
+        if constexpr (ws_loop_async<Loop>()) {
+            // io_uring already consumed the socket data into its provided buffer
+            // and discarded what didn't fit (IoUringBackend::wait), so pausing
+            // would forward a corrupted stream. Fail closed instead.
+            loop->close_conn(conn);
+            return;
+        }
         // recv_buf full while the paired client→upstream send drains it. On
         // level-triggered epoll the client fd stays readable, so a bare return
         // busy-loops; pause this direction (resumed by the send callback's
@@ -2056,6 +2076,10 @@ template <typename Loop>
 void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result == -ENOBUFS) {
+        if constexpr (ws_loop_async<Loop>()) {
+            loop->close_conn(conn);  // overflow discarded by io_uring (see above)
+            return;
+        }
         // upstream_recv_buf full while the paired upstream→client send drains it
         // (see on_ws_client_recv). Pause the upstream direction when truly full.
         if (conn.upstream_recv_buf.write_avail() == 0) {
@@ -2114,6 +2138,10 @@ template <typename Loop>
 void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result == -ENOBUFS) {
+        if constexpr (ws_loop_async<Loop>()) {
+            loop->close_conn(conn);  // overflow discarded by io_uring
+            return;
+        }
         if (conn.upstream_recv_buf.write_avail() == 0) {
             if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
         }

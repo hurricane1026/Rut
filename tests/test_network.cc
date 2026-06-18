@@ -813,6 +813,34 @@ TEST(websocket, enobufs_pauses_not_closes) {
     CHECK_EQ(loop.backend.ops[0].conn_id, cid);
 }
 
+// On an async (io_uring-style) backend a tunnel -ENOBUFS means the provided-buffer
+// recv already discarded the overflow, so pausing would forward a corrupted
+// stream. The tunnel must fail closed instead. (Contrast the sync test above.)
+TEST(websocket, enobufs_closes_on_async_backend) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->fd = 42;
+    conn->is_ws_tunnel = true;
+    conn->recv_buf.commit(conn->recv_buf.write_avail());  // full
+    on_ws_client_recv<AsyncSmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // failed closed, not paused
+
+    // Upstream direction is symmetric.
+    Connection* up = loop.alloc_conn();
+    REQUIRE(up != nullptr);
+    const u32 ucid = up->id;
+    up->fd = 43;
+    up->is_ws_tunnel = true;
+    REQUIRE(loop.alloc_upstream_buf(*up));
+    up->upstream_recv_buf.commit(up->upstream_recv_buf.write_avail());
+    on_ws_upstream_recv<AsyncSmallLoop>(
+        &loop, *up, make_ev(ucid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[ucid].fd, -1);  // failed closed
+}
+
 TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
     SmallLoop loop;
     loop.setup();
