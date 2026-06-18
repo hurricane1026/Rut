@@ -29,11 +29,16 @@ void Http2Conn::init() {
     last_stream_id = 0;
     cont_stream = 0;
     cont_end_stream = false;
+    cont_discard = false;
     hdr_block_len = 0;
     nstreams = 0;
     pending_stream = 0;
     pending_body_start = 0;
     pending_synth_len = 0;
+    pending_body_len = 0;
+    pending_content_length = 0;
+    pending_has_content_length = false;
+    pending_buffer_body = false;
     pending_overflow = false;
 }
 
@@ -356,7 +361,27 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream) {
     }
     c.hdr_block_len = 0;
     c.cont_stream = 0;
+    c.cont_discard = false;
     if (c.on_headers) c.on_headers(c.cb_ctx, c, stream_id, hs, nh, end_stream);
+    return Http2Error::NoError;
+}
+
+Http2Error discard_headers(Http2Conn& c) {
+    hpack::Header hs[Http2Conn::kMaxHeadersPerReq];
+    u32 nh = 0;
+    if (!hpack::decode_header_block(c.hpack_dec,
+                                    c.hdr_block,
+                                    c.hdr_block_len,
+                                    c.hdr_scratch,
+                                    Http2Conn::kHeaderScratchCap,
+                                    hs,
+                                    Http2Conn::kMaxHeadersPerReq,
+                                    &nh)) {
+        return Http2Error::CompressionError;
+    }
+    c.hdr_block_len = 0;
+    c.cont_stream = 0;
+    c.cont_discard = false;
     return Http2Error::NoError;
 }
 
@@ -366,6 +391,18 @@ Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
     for (u32 i = 0; i < n; i++) c.hdr_block[c.hdr_block_len + i] = p[i];
     c.hdr_block_len += n;
     return Http2Error::NoError;
+}
+
+void clear_pending_upload(Http2Conn& c, u32 stream_id) {
+    if (c.pending_stream != stream_id) return;
+    c.pending_stream = 0;
+    c.pending_body_start = 0;
+    c.pending_synth_len = 0;
+    c.pending_body_len = 0;
+    c.pending_content_length = 0;
+    c.pending_has_content_length = false;
+    c.pending_buffer_body = false;
+    c.pending_overflow = false;
 }
 
 }  // namespace
@@ -441,16 +478,21 @@ static Http2Error handle_frame(Http2Conn& c,
                 }
             }
             if (s->got_headers) {
-                if (w.room(kFrameHeaderSize + 4))
-                    w.len +=
-                        write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
-                if (c.pending_stream == h.stream_id) {
-                    c.pending_stream = 0;
-                    c.pending_synth_len = 0;
-                    c.pending_body_start = 0;
-                    c.pending_overflow = false;
+                const Http2Error kAe = append_fragment(c, p, n);
+                if (kAe != Http2Error::NoError) return kAe;
+                if (h.flags & http2_flag::kEndHeaders) {
+                    const Http2Error kDe = discard_headers(c);
+                    if (kDe != Http2Error::NoError) return kDe;
+                    if (w.room(kFrameHeaderSize + 4))
+                        w.len +=
+                            write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
+                    clear_pending_upload(c, h.stream_id);
+                    s->state = Http2StreamState::Closed;
+                    return Http2Error::NoError;
                 }
-                s->state = Http2StreamState::Closed;
+                c.cont_stream = h.stream_id;
+                c.cont_end_stream = false;
+                c.cont_discard = true;
                 return Http2Error::NoError;
             }
             s->got_headers = true;
@@ -474,6 +516,16 @@ static Http2Error handle_frame(Http2Conn& c,
             if (kAe != Http2Error::NoError) return kAe;
             if (h.flags & http2_flag::kEndHeaders) {
                 Http2Stream* s = c.find_stream(h.stream_id);
+                if (c.cont_discard) {
+                    const Http2Error kDe = discard_headers(c);
+                    if (kDe != Http2Error::NoError) return kDe;
+                    if (w.room(kFrameHeaderSize + 4))
+                        w.len +=
+                            write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
+                    clear_pending_upload(c, h.stream_id);
+                    if (s) s->state = Http2StreamState::Closed;
+                    return Http2Error::NoError;
+                }
                 if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
                 return finish_headers(c, h.stream_id, c.cont_end_stream);
             }

@@ -127,95 +127,31 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     return o;
 }
 
-inline u32 h2_dec_len(u32 v) {
-    u32 n = 1;
-    while (v >= 10) {
-        v /= 10;
-        n++;
-    }
-    return n;
+inline void h2_clear_pending(Http2Conn& h2) {
+    h2.pending_stream = 0;
+    h2.pending_body_start = 0;
+    h2.pending_synth_len = 0;
+    h2.pending_body_len = 0;
+    h2.pending_content_length = 0;
+    h2.pending_has_content_length = false;
+    h2.pending_buffer_body = false;
+    h2.pending_overflow = false;
 }
 
-inline void h2_write_dec(u8* out, u32 v) {
-    const u32 n = h2_dec_len(v);
-    for (u32 i = 0; i < n; i++) {
-        out[n - 1 - i] = static_cast<u8>('0' + (v % 10));
-        v /= 10;
-    }
-}
-
-inline bool h2_header_name_eq(const u8* p, u32 len, const char* s) {
-    u32 sl = 0;
-    while (s[sl]) sl++;
-    if (len != sl) return false;
-    for (u32 i = 0; i < len; i++)
-        if (p[i] != static_cast<u8>(s[i])) return false;
-    return true;
-}
-
-inline bool h2_parse_u32_dec(const u8* p, u32 len, u32* out) {
-    if (len == 0) return false;
-    u32 acc = 0;
-    for (u32 i = 0; i < len; i++) {
-        const u8 ch = p[i];
-        if (ch < '0' || ch > '9') return false;
-        const u32 digit = static_cast<u32>(ch - '0');
-        if (acc > 429496729u || (acc == 429496729u && digit > 5u)) return false;
-        acc = acc * 10 + digit;
-    }
-    *out = acc;
-    return true;
-}
-
-// The existing JIT parser consumes an HTTP/1-shaped request and uses
-// Content-Length to expose req.body. HTTP/2 DATA frames do not require a
-// content-length header, so synthesize one at END_STREAM when absent and reject
-// mismatches when present. pending_body_start points just after the synthesized
-// CRLFCRLF; DATA bytes follow there.
+// pending_body_start points just after the synthesized CRLFCRLF; DATA bytes are
+// appended there only when the matched handler actually reads req.body.
 inline bool h2_finalize_synth_body(Http2Conn& h2) {
     if (h2.pending_body_start < 4 || h2.pending_body_start > h2.pending_synth_len) return false;
-    const u32 body_len = h2.pending_synth_len - h2.pending_body_start;
-    u32 line = 0;
-    while (line + 1 < h2.pending_body_start) {
-        u32 end = line;
-        while (end + 1 < h2.pending_body_start &&
-               !(h2.pending_synth[end] == '\r' && h2.pending_synth[end + 1] == '\n'))
-            end++;
-        if (end == line) break;
-        u32 colon = line;
-        while (colon < end && h2.pending_synth[colon] != ':') colon++;
-        if (colon < end &&
-            h2_header_name_eq(h2.pending_synth + line, colon - line, "content-length")) {
-            u32 p = colon + 1;
-            while (p < end && h2.pending_synth[p] == ' ') p++;
-            u32 got = 0;
-            if (!h2_parse_u32_dec(h2.pending_synth + p, end - p, &got)) return false;
-            return got == body_len;
-        }
-        line = end + 2;
-    }
-
-    static constexpr char kPrefix[] = "content-length: ";
-    static constexpr u32 kPrefixLen = sizeof(kPrefix) - 1;
-    const u32 add_len = kPrefixLen + h2_dec_len(body_len) + 2;
-    if (h2.pending_synth_len + add_len > Http2Conn::kBodySynthCap) return false;
-    const u32 insert = h2.pending_body_start - 2;
-    for (u32 i = h2.pending_synth_len; i > insert; i--)
-        h2.pending_synth[i + add_len - 1] = h2.pending_synth[i - 1];
-    for (u32 i = 0; i < kPrefixLen; i++) h2.pending_synth[insert + i] = kPrefix[i];
-    h2_write_dec(h2.pending_synth + insert + kPrefixLen, body_len);
-    h2.pending_synth[insert + kPrefixLen + h2_dec_len(body_len)] = '\r';
-    h2.pending_synth[insert + kPrefixLen + h2_dec_len(body_len) + 1] = '\n';
-    h2.pending_synth_len += add_len;
-    h2.pending_body_start += add_len;
-    return true;
+    return !h2.pending_has_content_length || h2.pending_content_length == h2.pending_body_len;
 }
 
 template <typename Loop>
 bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                              u32 stream_id,
                              const hpack::Header* headers,
-                             u32 nheaders) {
+                             u32 nheaders,
+                             const ParsedRequest& req,
+                             bool buffer_body) {
     u8 synth[8192];
     const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
     if (kSynthLen == 0) {
@@ -230,6 +166,10 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     for (u32 i = 0; i < kSynthLen; i++) h2->pending_synth[i] = synth[i];
     h2->pending_body_start = kSynthLen;
     h2->pending_synth_len = kSynthLen;
+    h2->pending_body_len = 0;
+    h2->pending_content_length = req.content_length;
+    h2->pending_has_content_length = req.has_content_length;
+    h2->pending_buffer_body = buffer_body;
     h2->pending_overflow = false;
     h2->pending_stream = stream_id;
     return true;
@@ -284,34 +224,27 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     h2_emit_response(d, stream_id, kOutcome.status_code, hdrs, nhdrs, body, body_len);
 }
 
-// A body-reading handler has its full request (headers + accumulated body) in
-// the connection's pending_synth. Re-parse it to route, then invoke + serialize.
+// A deferred stream is complete. If the matched handler reads req.body,
+// pending_synth holds headers plus DATA; otherwise it holds only headers and
+// pending_body_len is used for Content-Length validation.
 template <typename Loop>
 void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     Http2Conn* h2 = d.conn->h2;
     const bool kOverflow = h2->pending_overflow;
     const u8* synth = h2->pending_synth;
     if (kOverflow) {
-        h2->pending_stream = 0;
-        h2->pending_synth_len = 0;
-        h2->pending_body_start = 0;
-        h2->pending_overflow = false;
-        h2_emit_status(d, stream_id, 413);  // body exceeded our buffer
+        const bool kBuffered = h2->pending_buffer_body;
+        h2_clear_pending(*h2);
+        h2_emit_status(d, stream_id, kBuffered ? 413 : 400);
         return;
     }
     if (!h2_finalize_synth_body(*h2)) {
-        h2->pending_stream = 0;
-        h2->pending_synth_len = 0;
-        h2->pending_body_start = 0;
-        h2->pending_overflow = false;
+        h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 400);
         return;
     }
     const u32 kLen = h2->pending_synth_len;
-    h2->pending_stream = 0;  // clear before responding
-    h2->pending_synth_len = 0;
-    h2->pending_body_start = 0;
-    h2->pending_overflow = false;
+    h2_clear_pending(*h2);  // clear before responding
     HttpParser parser;
     parser.reset();
     ParsedRequest req;
@@ -364,7 +297,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     const RouteConfig* config = d.conn->request_config;
     if (!config) {
         if (!end_stream && req.has_content_length) {
-            h2_defer_until_data_end(d, stream_id, headers, nheaders);
+            h2_defer_until_data_end(d, stream_id, headers, nheaders, req, /*buffer_body=*/false);
             return;
         }
         h2_emit_status(d, stream_id, 200);  // route-less fallback (matches HTTP/1)
@@ -379,7 +312,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
 
     if (!route) {
         if (!end_stream && req.has_content_length) {
-            h2_defer_until_data_end(d, stream_id, headers, nheaders);
+            h2_defer_until_data_end(d, stream_id, headers, nheaders, req, /*buffer_body=*/false);
             return;
         }
         h2_emit_status(d, stream_id, 200);  // default (matches HTTP/1 catchall)
@@ -388,7 +321,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     switch (route->action) {
         case RouteAction::Static:
             if (!end_stream && req.has_content_length) {
-                h2_defer_until_data_end(d, stream_id, headers, nheaders);
+                h2_defer_until_data_end(
+                    d, stream_id, headers, nheaders, req, /*buffer_body=*/false);
                 return;
             }
             h2_emit_status(d, stream_id, route->status_code);
@@ -405,7 +339,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 return;
             }
             if (!end_stream && req.has_content_length && !route->needs_req_body) {
-                h2_defer_until_data_end(d, stream_id, headers, nheaders);
+                h2_defer_until_data_end(
+                    d, stream_id, headers, nheaders, req, /*buffer_body=*/false);
                 return;
             }
             if (!route->needs_req_body || end_stream) {
@@ -415,13 +350,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             }
             // Body follows: stash the synthesized headers and accumulate DATA.
             // One body upload at a time per connection.
-            h2_defer_until_data_end(d, stream_id, headers, nheaders);
+            h2_defer_until_data_end(d, stream_id, headers, nheaders, req, /*buffer_body=*/true);
             return;
         }
         case RouteAction::Proxy:
         default:
             if (!end_stream && req.has_content_length) {
-                h2_defer_until_data_end(d, stream_id, headers, nheaders);
+                h2_defer_until_data_end(
+                    d, stream_id, headers, nheaders, req, /*buffer_body=*/false);
                 return;
             }
             // TODO(h2): proxy over HTTP/2 needs the upstream state machine
@@ -438,16 +374,22 @@ void h2_on_headers_cb(
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
-// DATA frames for a body-reading request: append to pending_synth, finalize at
-// END_STREAM. DATA for any other stream is ignored (flow control already ran).
+// DATA frames for a deferred request: count every body octet, append only when
+// the matched handler reads req.body, and finalize at END_STREAM. DATA for any
+// other stream is ignored (flow control already ran).
 template <typename Loop>
 void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
     if (c.pending_stream != stream_id) return;
-    if (c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+    if (c.pending_body_len > 0xffffffffu - len) {
         c.pending_overflow = true;
     } else {
+        c.pending_body_len += len;
+    }
+    if (c.pending_buffer_body && c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+        c.pending_overflow = true;
+    } else if (c.pending_buffer_body) {
         for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
         c.pending_synth_len += len;
     }

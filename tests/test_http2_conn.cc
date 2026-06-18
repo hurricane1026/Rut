@@ -448,6 +448,14 @@ TEST(h2_request, ten_digit_content_length_parsed) {
     REQUIRE(h2_headers_to_request(hs, 3, &req));
     CHECK(req.has_content_length);
     CHECK_EQ(req.content_length, 0u);
+
+    hpack::Header max[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"4294967295", 10}},
+    };
+    REQUIRE(h2_headers_to_request(max, 3, &req));
+    CHECK_EQ(req.content_length, 4294967295u);
 }
 
 TEST(h2_request, invalid_or_duplicate_content_length_fails) {
@@ -456,6 +464,10 @@ TEST(h2_request, invalid_or_duplicate_content_length_fails) {
                            {{":path", 5}, {"/u", 2}},
                            {{"content-length", 14}, {"x", 1}}};
     CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
+    hpack::Header over[] = {{{":method", 7}, {"POST", 4}},
+                            {{":path", 5}, {"/u", 2}},
+                            {{"content-length", 14}, {"4294967296", 10}}};
+    CHECK_FALSE(h2_headers_to_request(over, 3, &req));
     hpack::Header dup[] = {
         {{":method", 7}, {"POST", 4}},
         {{":path", 5}, {"/u", 2}},
@@ -1053,7 +1065,47 @@ TEST(http2_conn, repeated_headers_on_open_stream_rsts) {
     CHECK(c.find_stream(1) == nullptr);
 }
 
-TEST(h2_serving, finalizes_body_content_length) {
+TEST(http2_conn, duplicate_headers_block_is_decoded_before_reset) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    u8 frame[1024];
+    const hpack::Header open[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, open, 2, /*end_stream=*/false);
+
+    hpack::Encoder enc;
+    enc.init(4096);
+    u8 dup_block[128];
+    u32 dup_len = 0;
+    dup_len += enc.encode(dup_block + dup_len, Str{"x-seen", 6}, Str{"v", 1});
+    fn += put_frame(
+        frame + fn, Http2FrameType::Headers, http2_flag::kEndHeaders, 1, dup_block, dup_len);
+
+    u8 next_block[256];
+    u32 next_len = 0;
+    next_len += enc.encode(next_block + next_len, Str{":method", 7}, Str{"GET", 3});
+    next_len += enc.encode(next_block + next_len, Str{":path", 5}, Str{"/", 1});
+    next_len += enc.encode(next_block + next_len, Str{"x-seen", 6}, Str{"v", 1});
+    fn += put_frame(frame + fn,
+                    Http2FrameType::Headers,
+                    http2_flag::kEndHeaders | http2_flag::kEndStream,
+                    3,
+                    next_block,
+                    next_len);
+
+    u8 in[1200];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[512];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(cap.headers_calls, 2u);
+    CHECK_EQ(cap.last_stream, 3u);
+}
+
+TEST(h2_serving, finalizes_body_without_injecting_content_length) {
     Http2Conn h2;
     h2.init();
     const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nabc";
@@ -1064,13 +1116,13 @@ TEST(h2_serving, finalizes_body_content_length) {
     }
     h2.pending_body_start = len - 3;
     h2.pending_synth_len = len;
+    h2.pending_body_len = 3;
     REQUIRE(h2_finalize_synth_body(h2));
     ParsedRequest parsed;
     HttpParser parser;
     parser.reset();
     CHECK(parser.parse(h2.pending_synth, h2.pending_synth_len, &parsed) == ParseStatus::Complete);
-    CHECK(parsed.has_content_length);
-    CHECK_EQ(parsed.content_length, 3u);
+    CHECK_FALSE(parsed.has_content_length);
 }
 
 TEST(h2_serving, body_content_length_mismatch_fails) {
@@ -1084,6 +1136,9 @@ TEST(h2_serving, body_content_length_mismatch_fails) {
     }
     h2.pending_body_start = len - 3;
     h2.pending_synth_len = len;
+    h2.pending_body_len = 3;
+    h2.pending_content_length = 4;
+    h2.pending_has_content_length = true;
     CHECK_FALSE(h2_finalize_synth_body(h2));
 }
 
