@@ -110,6 +110,7 @@ void capture_request_metadata(Connection& conn) {
     conn.req_body_remaining = 0;
     conn.req_chunk_parser.reset();
     conn.req_malformed = false;
+    conn.req_wants_upgrade = false;
     conn.req_header_end = 0;
     conn.req_initial_send_len = 0;
     conn.req_content_length = 0;
@@ -123,6 +124,7 @@ void capture_request_metadata(Connection& conn) {
     parser.reset();
     if (parser.parse(data, kLen, &req) == ParseStatus::Complete) {
         conn.req_header_end = parser.header_end;
+        conn.req_wants_upgrade = req.upgrade;
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
@@ -297,13 +299,13 @@ bool pipeline_recover(Connection& conn) {
         // tunnel install while an io_uring multishot recv stayed armed) came
         // AFTER the stash, so they must follow it — not be dropped. Shift them up
         // by kStashLen and prepend the stash. base == recv_buf.data().
+        if (static_cast<u32>(kStashLen) + kExisting > conn.recv_buf.capacity())
+            return false;  // can't hold both — signal failure so the caller closes
+                           // rather than forwarding a truncated (corrupt) stream
         u8* base = conn.recv_buf.write_ptr() - kExisting;
-        u32 keep = kExisting;
-        if (static_cast<u32>(kStashLen) + keep > conn.recv_buf.capacity())
-            keep = conn.recv_buf.capacity() - kStashLen;  // truncate tail to fit
-        __builtin_memmove(base + kStashLen, base, keep);
+        __builtin_memmove(base + kStashLen, base, kExisting);
         __builtin_memmove(base, src, kStashLen);
-        conn.recv_buf.set_len(kStashLen + keep);
+        conn.recv_buf.set_len(kStashLen + kExisting);
     }
     conn.send_buf.reset();
     conn.pipeline_depth++;

@@ -4903,6 +4903,7 @@ TEST(streaming, _101_not_skipped) {
     loop.setup();
     auto* conn = setup_proxy_conn(loop);
     REQUIRE(conn != nullptr);
+    conn->req_wants_upgrade = true;  // client sent Connection: upgrade
 
     const char* resp =
         "HTTP/1.1 101 Switching Protocols\r\n"
@@ -4965,6 +4966,39 @@ TEST(streaming, _101_not_skipped) {
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
 #endif
 }
+
+#if RUT_ENABLE_WEBSOCKET
+// A 101 from the backend when the client never requested an upgrade is a
+// protocol violation (a hostile backend trying to hijack the connection). The
+// gateway must refuse — not install a tunnel and forward stashed bytes raw.
+TEST(streaming, _101_without_client_upgrade_is_rejected) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->req_wants_upgrade = false;  // client sent a normal request
+
+    const char* resp =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "\r\n";
+    u32 resp_len = 0;
+    while (resp[resp_len]) resp_len++;
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
+    conn->upstream_recv_buf.commit(resp_len);
+
+    loop.backend.inject(make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(resp_len)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK(!conn->is_ws_tunnel);        // no tunnel installed
+    CHECK_EQ(loop.conns[cid].fd, -1);  // connection refused/closed
+}
+#endif
 
 // 205 Reset Content has no body (same as 204/304).
 TEST(streaming, status_205_no_body) {

@@ -764,6 +764,24 @@ TEST(Corpus, InvalidControlCharHeaderValue) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+// Connection: upgrade token sets req.upgrade (gates the WebSocket 101 tunnel).
+TEST(Corpus, ConnectionUpgradeSetsFlag) {
+    HttpParser parser;
+    ParsedRequest req;
+    const u8 up[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(up, sizeof(up) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.upgrade);
+
+    parser.reset();
+    req.reset();
+    const u8 normal[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(normal, sizeof(normal) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.upgrade);
+}
+
 // ============================================================================
 // TEST SUITE 3: Incremental parsing — feed byte-by-byte for every valid vector
 // ============================================================================

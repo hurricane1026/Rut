@@ -58,6 +58,7 @@ struct ParsedRequest {
     bool keep_alive;          // Derived from Connection header + HTTP version.
     bool chunked;             // Transfer-Encoding: chunked
     bool has_content_length;  // True if Content-Length header was seen.
+    bool upgrade;             // Connection: upgrade token present (client intent)
 
     void reset() {
         method = HttpMethod::Unknown;
@@ -69,6 +70,7 @@ struct ParsedRequest {
         keep_alive = false;
         chunked = false;
         has_content_length = false;
+        upgrade = false;
     }
 };
 

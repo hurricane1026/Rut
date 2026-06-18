@@ -2173,7 +2173,13 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_client_send_len = 0;
     conn.ws_upstream_send_len = 0;
     if (conn.pipeline_stash_len > 0) {
-        pipeline_recover(conn);
+        // Recover the stashed post-upgrade bytes into recv_buf. If they (plus any
+        // bytes already read) don't fit, fail closed rather than truncate the
+        // tunnel stream.
+        if (!pipeline_recover(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
     // The HTTP request is complete at the 101: release the upstream max_inflight
@@ -2270,6 +2276,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // response plus any bytes the backend already sent (early frames) to the
     // client, then run the connection as a transparent full-duplex tunnel.
     if (resp.status_code == 101) {
+        if (!conn.req_wants_upgrade) {
+            // The client never sent Connection: upgrade, so a 101 here is a
+            // protocol violation — a misbehaving or hostile backend trying to
+            // hijack the connection. Installing a tunnel would forward any
+            // pipelined bytes (e.g. the next HTTP request) raw to the upstream.
+            // Refuse: tear the connection down instead of tunneling.
+            loop->close_conn(conn);
+            return;
+        }
         conn.ws_upgrade_response_len = resp_parser.header_end;
         conn.ws_pre_tunnel_upstream_closed = false;
         if (!ws_pause_upstream_recv(loop, conn)) {
