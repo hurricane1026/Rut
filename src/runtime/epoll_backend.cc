@@ -731,13 +731,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             if (has_write && conn_id < kMaxFdMap && out < max_events) {
                 if ((type == IoEventType::Send && send_state[conn_id].remaining > 0) ||
                     (type != IoEventType::Send && upstream_send_state[conn_id].remaining > 0)) {
-                goto handle_epollout;
+                    goto handle_epollout;
                 }
             }
         } else if (has_write) {
         handle_epollout:
             if (conn_id >= kMaxFdMap) continue;
-            auto& ss = (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
+            auto& ss =
+                (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
             if (ss.tls && conn_id >= max_conns) continue;
             if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
                 // No outstanding send associated with this connection.
