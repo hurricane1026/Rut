@@ -1909,7 +1909,9 @@ bool ws_pause_client_recv(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 bool ws_pause_upstream_recv(Loop* loop, Connection& conn) {
-    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv_for_send(c); }) {
+        return loop->pause_upstream_recv_for_send(conn);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
         return loop->pause_upstream_recv(conn);
     } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_upstream_recv(cid); }) {
         loop->backend.pause_upstream_recv(conn.id);
@@ -2064,14 +2066,20 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     loop->epoch_leave();
     conn.upstream_recv_buf.consume(conn.upstream_send_len);
     conn.upstream_send_len = 0;
-    conn.recv_buf.reset();
     conn.set_slots(&on_ws_client_recv<Loop>,
                    &on_ws_upstream_to_client_sent<Loop>,
                    &on_ws_upstream_recv<Loop>,
                    &on_ws_client_to_upstream_sent<Loop>);
-    if (!loop->submit_recv(conn)) {
-        loop->close_conn(conn);
-        return;
+    if (conn.recv_buf.len() > 0) {
+        if (!ws_try_send_client_to_upstream(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    } else {
+        if (!loop->submit_recv(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     if (conn.upstream_recv_buf.len() > 0) {
         if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);

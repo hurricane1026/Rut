@@ -264,7 +264,6 @@ void EpollBackend::pause_upstream_recv(u32 conn_id, bool preserve_send_interest)
     if (preserve_send_interest) {
         const auto& ss = send_state[conn_id];
         if (ss.remaining > 0 && ss.fd == fd) {
-            type = ss.type;
             events = EPOLLOUT;
         }
     }

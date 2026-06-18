@@ -446,13 +446,17 @@ public:
     }
 
     bool pause_upstream_recv_impl(Connection& c) {
-        c.upstream_recv_paused_for_send = true;
         c.upstream_recv_pause_cancel_pending = true;
         if (!c.upstream_recv_armed) {
             c.upstream_recv_pause_cancel_pending = false;
             return true;
         }
         return backend.pause_upstream_recv(c.upstream_fd, c.id);
+    }
+
+    bool pause_upstream_recv_for_send(Connection& c) {
+        c.upstream_recv_paused_for_send = true;
+        return pause_upstream_recv_impl(c);
     }
 
     bool pause_recv(Connection& c) {
