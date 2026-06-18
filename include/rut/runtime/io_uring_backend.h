@@ -80,6 +80,7 @@ struct IoUringBackend {
         i32 fd;
         u32 offset;
         u32 remaining;
+        IoEventType type;
     };
     SendState send_state[kMaxSendState];
 
