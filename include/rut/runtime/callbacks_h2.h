@@ -47,19 +47,37 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 nhdrs,
                       const u8* body,
                       u32 body_len) {
+    auto enc = d.conn->h2->hpack_enc;
     const u32 kN = http2_write_response(d.resp + d.resp_len,
                                         d.resp_cap - d.resp_len,
-                                        d.conn->h2->hpack_enc,
+                                        enc,
                                         stream_id,
                                         status,
                                         hdrs,
                                         nhdrs,
                                         body,
                                         body_len);
-    if (kN == 0)
-        d.overflow = true;
-    else
+    if (kN == 0) {
+        enc = d.conn->h2->hpack_enc;
+        const u32 kFallback = http2_write_response(d.resp + d.resp_len,
+                                                   d.resp_cap - d.resp_len,
+                                                   enc,
+                                                   stream_id,
+                                                   500,
+                                                   nullptr,
+                                                   0,
+                                                   nullptr,
+                                                   0);
+        if (kFallback == 0)
+            d.overflow = true;
+        else {
+            d.conn->h2->hpack_enc = enc;
+            d.resp_len += kFallback;
+        }
+    } else {
+        d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
+    }
 }
 
 // Append a status-only response (HEADERS with :status, END_STREAM).
@@ -105,6 +123,81 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     }
     if (!put("\r\n", 2)) return 0;
     return o;
+}
+
+inline u32 h2_dec_len(u32 v) {
+    u32 n = 1;
+    while (v >= 10) {
+        v /= 10;
+        n++;
+    }
+    return n;
+}
+
+inline void h2_write_dec(u8* out, u32 v) {
+    const u32 n = h2_dec_len(v);
+    for (u32 i = 0; i < n; i++) {
+        out[n - 1 - i] = static_cast<u8>('0' + (v % 10));
+        v /= 10;
+    }
+}
+
+inline bool h2_header_name_eq(const u8* p, u32 len, const char* s) {
+    u32 sl = 0;
+    while (s[sl]) sl++;
+    if (len != sl) return false;
+    for (u32 i = 0; i < len; i++)
+        if (p[i] != static_cast<u8>(s[i])) return false;
+    return true;
+}
+
+// The existing JIT parser consumes an HTTP/1-shaped request and uses
+// Content-Length to expose req.body. HTTP/2 DATA frames do not require a
+// content-length header, so synthesize one at END_STREAM when absent and reject
+// mismatches when present. pending_body_start points just after the synthesized
+// CRLFCRLF; DATA bytes follow there.
+inline bool h2_finalize_synth_body(Http2Conn& h2) {
+    if (h2.pending_body_start < 4 || h2.pending_body_start > h2.pending_synth_len) return false;
+    const u32 body_len = h2.pending_synth_len - h2.pending_body_start;
+    u32 line = 0;
+    while (line + 1 < h2.pending_body_start) {
+        u32 end = line;
+        while (end + 1 < h2.pending_body_start &&
+               !(h2.pending_synth[end] == '\r' && h2.pending_synth[end + 1] == '\n'))
+            end++;
+        if (end == line) break;
+        u32 colon = line;
+        while (colon < end && h2.pending_synth[colon] != ':') colon++;
+        if (colon < end &&
+            h2_header_name_eq(h2.pending_synth + line, colon - line, "content-length")) {
+            u32 p = colon + 1;
+            while (p < end && h2.pending_synth[p] == ' ') p++;
+            u32 got = 0;
+            if (p == end) return false;
+            while (p < end) {
+                const u8 ch = h2.pending_synth[p++];
+                if (ch < '0' || ch > '9') return false;
+                got = got * 10 + static_cast<u32>(ch - '0');
+            }
+            return got == body_len;
+        }
+        line = end + 2;
+    }
+
+    static constexpr char kPrefix[] = "content-length: ";
+    static constexpr u32 kPrefixLen = sizeof(kPrefix) - 1;
+    const u32 add_len = kPrefixLen + h2_dec_len(body_len) + 2;
+    if (h2.pending_synth_len + add_len > Http2Conn::kBodySynthCap) return false;
+    const u32 insert = h2.pending_body_start - 2;
+    for (u32 i = h2.pending_synth_len; i > insert; i--)
+        h2.pending_synth[i + add_len - 1] = h2.pending_synth[i - 1];
+    for (u32 i = 0; i < kPrefixLen; i++) h2.pending_synth[insert + i] = kPrefix[i];
+    h2_write_dec(h2.pending_synth + insert + kPrefixLen, body_len);
+    h2.pending_synth[insert + kPrefixLen + h2_dec_len(body_len)] = '\r';
+    h2.pending_synth[insert + kPrefixLen + h2_dec_len(body_len) + 1] = '\n';
+    h2.pending_synth_len += add_len;
+    h2.pending_body_start += add_len;
+    return true;
 }
 
 // Invoke a synchronous JIT handler given the assembled HTTP/1 request bytes
@@ -163,15 +256,27 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     Http2Conn* h2 = d.conn->h2;
     const bool kOverflow = h2->pending_overflow;
     const u8* synth = h2->pending_synth;
-    const u32 kLen = h2->pending_synth_len;
-    h2->pending_stream = 0;  // clear before responding
-    h2->pending_synth_len = 0;
-    h2->pending_overflow = false;
-
     if (kOverflow) {
+        h2->pending_stream = 0;
+        h2->pending_synth_len = 0;
+        h2->pending_body_start = 0;
+        h2->pending_overflow = false;
         h2_emit_status(d, stream_id, 413);  // body exceeded our buffer
         return;
     }
+    if (!h2_finalize_synth_body(*h2)) {
+        h2->pending_stream = 0;
+        h2->pending_synth_len = 0;
+        h2->pending_body_start = 0;
+        h2->pending_overflow = false;
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
+    const u32 kLen = h2->pending_synth_len;
+    h2->pending_stream = 0;  // clear before responding
+    h2->pending_synth_len = 0;
+    h2->pending_body_start = 0;
+    h2->pending_overflow = false;
     HttpParser parser;
     parser.reset();
     ParsedRequest req;
@@ -253,6 +358,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 return;
             }
             for (u32 i = 0; i < kSynthLen; i++) h2->pending_synth[i] = synth[i];
+            h2->pending_body_start = kSynthLen;
             h2->pending_synth_len = kSynthLen;
             h2->pending_overflow = false;
             h2->pending_stream = stream_id;

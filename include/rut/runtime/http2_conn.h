@@ -89,6 +89,7 @@ struct Http2Conn {
     // Kept trivial (no routing types) so Http2Conn stays SlabPool-poolable.
     static constexpr u32 kBodySynthCap = 16384;
     u32 pending_stream;
+    u32 pending_body_start;
     u32 pending_synth_len;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
     u8 pending_synth[kBodySynthCap];

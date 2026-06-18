@@ -32,6 +32,7 @@ void Http2Conn::init() {
     hdr_block_len = 0;
     nstreams = 0;
     pending_stream = 0;
+    pending_body_start = 0;
     pending_synth_len = 0;
     pending_overflow = false;
 }
@@ -269,6 +270,9 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
 
     bool have_method = false;
     bool have_path = false;
+    bool have_authority = false;
+    bool have_scheme = false;
+    bool have_content_length = false;
     bool seen_regular = false;
     for (u32 i = 0; i < n; i++) {
         const Str kName = hs[i].name;
@@ -291,12 +295,17 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
                 req->path_canon = h2_canon_path(kValue);
                 have_path = true;
             } else if (h2_str_eq(kName, ":authority")) {
+                if (have_authority) return false;
                 if (req->header_count >= kMaxHeaders) return false;
                 req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+                have_authority = true;
             } else if (!h2_str_eq(kName, ":scheme")) {
                 // :scheme is recognized and dropped; any other pseudo-header
                 // (incl. response pseudo-headers like :status) is malformed.
                 return false;
+            } else {
+                if (have_scheme) return false;
+                have_scheme = true;
             }
             continue;
         }
@@ -310,10 +319,10 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
         req->headers[req->header_count++] = {kName, kValue};
         if (h2_str_eq(kName, "content-length")) {
             u32 cl = 0;
-            if (h2_value_to_u32(kValue, &cl)) {
-                req->content_length = cl;
-                req->has_content_length = true;
-            }
+            if (have_content_length || !h2_value_to_u32(kValue, &cl)) return false;
+            have_content_length = true;
+            req->content_length = cl;
+            req->has_content_length = true;
         }
     }
     return have_method && have_path;
@@ -428,6 +437,13 @@ static Http2Error handle_frame(Http2Conn& c,
                             write_rst_stream(w.out + w.len, h.stream_id, Http2Error::RefusedStream);
                     return Http2Error::NoError;
                 }
+            }
+            if (s->got_headers) {
+                if (w.room(kFrameHeaderSize + 4))
+                    w.len +=
+                        write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
+                s->state = Http2StreamState::Closed;
+                return Http2Error::NoError;
             }
             s->got_headers = true;
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;

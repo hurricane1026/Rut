@@ -4,6 +4,7 @@
 // built with the engine's own response writers (HPACK encoder), fed through
 // process(), and the decoded callbacks + emitted control frames are asserted.
 
+#include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
 #include "test.h"
@@ -435,6 +436,39 @@ TEST(h2_request, content_length_parsed) {
     CHECK(req.method == HttpMethod::POST);
     CHECK(req.has_content_length);
     CHECK_EQ(req.content_length, 42u);
+}
+
+TEST(h2_request, invalid_or_duplicate_content_length_fails) {
+    ParsedRequest req;
+    hpack::Header bad[] = {{{":method", 7}, {"POST", 4}},
+                           {{":path", 5}, {"/u", 2}},
+                           {{"content-length", 14}, {"x", 1}}};
+    CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
+    hpack::Header dup[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"1", 1}},
+        {{"content-length", 14}, {"1", 1}},
+    };
+    CHECK_FALSE(h2_headers_to_request(dup, 4, &req));
+}
+
+TEST(h2_request, duplicate_pseudo_headers_fail) {
+    ParsedRequest req;
+    hpack::Header auth[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+        {{":authority", 10}, {"a", 1}},
+        {{":authority", 10}, {"b", 1}},
+    };
+    CHECK_FALSE(h2_headers_to_request(auth, 4, &req));
+    hpack::Header scheme[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":scheme", 7}, {"http", 4}},
+    };
+    CHECK_FALSE(h2_headers_to_request(scheme, 4, &req));
 }
 
 TEST(h2_request, missing_method_or_path_fails) {
@@ -987,6 +1021,58 @@ TEST(http2_conn, data_on_half_closed_stream_rsts) {
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
     CHECK_FALSE(r.close);
     CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+}
+
+TEST(http2_conn, repeated_headers_on_open_stream_rsts) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[512];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/false);
+    fn += http2_write_headers(frame + fn, sizeof(frame) - fn, 1, hs, 2, /*end_stream=*/true);
+    u8 in[640];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK(c.find_stream(1) == nullptr);
+}
+
+TEST(h2_serving, finalizes_body_content_length) {
+    Http2Conn h2;
+    h2.init();
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nabc";
+    u32 len = 0;
+    while (req[len]) {
+        h2.pending_synth[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    h2.pending_body_start = len - 3;
+    h2.pending_synth_len = len;
+    REQUIRE(h2_finalize_synth_body(h2));
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    CHECK(parser.parse(h2.pending_synth, h2.pending_synth_len, &parsed) == ParseStatus::Complete);
+    CHECK(parsed.has_content_length);
+    CHECK_EQ(parsed.content_length, 3u);
+}
+
+TEST(h2_serving, body_content_length_mismatch_fails) {
+    Http2Conn h2;
+    h2.init();
+    const char* req = "POST /u HTTP/1.1\r\ncontent-length: 4\r\n\r\nabc";
+    u32 len = 0;
+    while (req[len]) {
+        h2.pending_synth[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    h2.pending_body_start = len - 3;
+    h2.pending_synth_len = len;
+    CHECK_FALSE(h2_finalize_synth_body(h2));
 }
 
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {
