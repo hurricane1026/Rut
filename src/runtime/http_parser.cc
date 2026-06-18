@@ -251,6 +251,13 @@ static inline ParseStatus apply_semantic_header(
             }
             return ParseStatus::Complete;
         }
+    } else if (first == 'u') {
+        if (name_len == 7 && str_ci_eq(name + 1, "pgrade", 6)) {
+            // Presence of an Upgrade header (any protocol token). A valid upgrade
+            // request needs BOTH this and the Connection: upgrade token.
+            req->has_upgrade_header = true;
+            return ParseStatus::Complete;
+        }
     }
     return ParseStatus::Complete;  // not a semantic header — no-op
 }

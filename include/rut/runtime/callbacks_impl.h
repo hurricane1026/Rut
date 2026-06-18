@@ -2209,6 +2209,11 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
     }
+    // Log only the upgrade request itself: if the client coalesced its first
+    // WebSocket bytes with the request, req_size captured the whole recv_buf, so
+    // the access-log request size would depend on packet framing. Trim to the
+    // parsed header length (an upgrade request has no body).
+    if (conn.req_header_end > 0) conn.req_size = conn.req_header_end;
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
     // The HTTP request is complete at the 101: release the upstream max_inflight
     // slot now so a long-lived tunnel doesn't hold an in-flight request slot for
@@ -2321,8 +2326,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.transition_to_sending(&on_ws_101_sent<Loop>);
         conn.on_upstream_recv = &on_ws_pre_tunnel_upstream_recv<Loop>;
-        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.ws_upgrade_response_len))
+        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.ws_upgrade_response_len)) {
             loop->close_conn(conn);
+            return;
+        }
+        // Pause client reads until the tunnel slots are installed: a partial 101
+        // send arms the client fd EPOLLIN|EPOLLOUT (and an io_uring multishot recv
+        // may still be live), so client bytes arriving mid-drain would dispatch
+        // with on_recv == nullptr and could -ENOBUFS a valid upgrade. on_ws_101_sent
+        // re-arms the client recv once the tunnel is up. Preserves the 101 send's
+        // EPOLLOUT (ws_pause_client_recv uses preserve_send_interest).
+        if (!ws_pause_client_recv(loop, conn)) loop->close_conn(conn);
         return;
     }
 #endif

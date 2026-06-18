@@ -764,7 +764,8 @@ TEST(Corpus, InvalidControlCharHeaderValue) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
-// Connection: upgrade token sets req.upgrade (gates the WebSocket 101 tunnel).
+// A valid upgrade needs BOTH Connection: upgrade AND an Upgrade header — the
+// Connection token alone (hop-by-hop) must not gate the WebSocket 101 tunnel.
 TEST(Corpus, ConnectionUpgradeSetsFlag) {
     HttpParser parser;
     ParsedRequest req;
@@ -773,6 +774,16 @@ TEST(Corpus, ConnectionUpgradeSetsFlag) {
     REQUIRE_EQ(static_cast<u8>(parse_raw(up, sizeof(up) - 1, &req, &parser)),
                static_cast<u8>(ParseStatus::Complete));
     CHECK(req.upgrade);
+    CHECK(req.has_upgrade_header);  // gate = upgrade && has_upgrade_header
+
+    // Connection: upgrade with NO Upgrade header → not a valid upgrade.
+    parser.reset();
+    req.reset();
+    const u8 conn_only[] = "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(conn_only, sizeof(conn_only) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.upgrade);
+    CHECK(!req.has_upgrade_header);
 
     parser.reset();
     req.reset();
@@ -780,6 +791,7 @@ TEST(Corpus, ConnectionUpgradeSetsFlag) {
     REQUIRE_EQ(static_cast<u8>(parse_raw(normal, sizeof(normal) - 1, &req, &parser)),
                static_cast<u8>(ParseStatus::Complete));
     CHECK(!req.upgrade);
+    CHECK(!req.has_upgrade_header);
 }
 
 // ============================================================================

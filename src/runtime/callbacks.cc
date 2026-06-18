@@ -124,7 +124,9 @@ void capture_request_metadata(Connection& conn) {
     parser.reset();
     if (parser.parse(data, kLen, &req) == ParseStatus::Complete) {
         conn.req_header_end = parser.header_end;
-        conn.req_wants_upgrade = req.upgrade;
+        // Require BOTH Connection: upgrade and an Upgrade header — Connection is
+        // hop-by-hop, so the token alone is not a valid client upgrade request.
+        conn.req_wants_upgrade = req.upgrade && req.has_upgrade_header;
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
