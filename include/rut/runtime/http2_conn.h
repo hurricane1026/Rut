@@ -4,6 +4,8 @@
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/route_params.h"
+#include "rut/runtime/route_table.h"
 
 // HTTP/2 connection engine (RFC 7540): drives the client preface, the SETTINGS
 // handshake, the frame loop, per-stream HEADERS/CONTINUATION assembly (HPACK
@@ -86,7 +88,8 @@ struct Http2Conn {
     // serving layer appends DATA after synthesized HTTP/1 request headers; for
     // routes that only need Content-Length validation it keeps only the headers
     // and counts DATA bytes. One at a time for now: pending_stream == 0 means none.
-    // Kept trivial (no routing types) so Http2Conn stays SlabPool-poolable.
+    // A route snapshot is captured at END_HEADERS so delayed DATA handling does not
+    // re-match if config swaps between HEADERS and DATA.
     static constexpr u32 kBodySynthCap = 16384;
     u32 pending_stream;
     u32 pending_body_start;
@@ -96,6 +99,16 @@ struct Http2Conn {
     bool pending_has_content_length;
     bool pending_buffer_body;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
+    // Snapshot of matched route decisions at END_HEADERS time for deferred
+    // requests. This keeps delayed DATA handlers stable when config changes
+    // between HEADERS and DATA frames.
+    const RouteConfig* pending_route_config;
+    const RouteEntry* pending_route;
+    RouteAction pending_route_action;
+    u16 pending_static_status;
+    jit::HandlerFn pending_jit_fn;
+    RouteParam pending_route_params[kMaxRouteParams];
+    u32 pending_route_param_count;
     u8 pending_synth[kBodySynthCap];
 
     // Set callbacks (any may be null) then call init().

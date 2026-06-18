@@ -40,6 +40,15 @@ void Http2Conn::init() {
     pending_has_content_length = false;
     pending_buffer_body = false;
     pending_overflow = false;
+    pending_route_config = nullptr;
+    pending_route = nullptr;
+    pending_route_action = RouteAction::Static;
+    pending_static_status = 200;
+    pending_jit_fn = nullptr;
+    pending_route_param_count = 0;
+    for (u32 i = 0; i < kMaxRouteParams; i++) {
+        pending_route_params[i] = {};
+    }
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
@@ -403,6 +412,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_has_content_length = false;
     c.pending_buffer_body = false;
     c.pending_overflow = false;
+    c.pending_route_config = nullptr;
+    c.pending_route = nullptr;
+    c.pending_route_action = RouteAction::Static;
+    c.pending_static_status = 200;
+    c.pending_jit_fn = nullptr;
+    c.pending_route_param_count = 0;
+    for (u32 i = 0; i < Http2Conn::kMaxRouteParams; i++) {
+        c.pending_route_params[i] = {};
+    }
 }
 
 }  // namespace
@@ -626,6 +644,7 @@ static Http2Error handle_frame(Http2Conn& c,
         case Http2FrameType::RstStream: {
             if (h.stream_id == 0 || h.length != 4) return Http2Error::ProtocolError;
             Http2Stream* s = c.find_stream(h.stream_id);
+            clear_pending_upload(c, h.stream_id);
             if (s) s->state = Http2StreamState::Closed;
             if (c.on_reset)
                 c.on_reset(c.cb_ctx, c, h.stream_id, static_cast<Http2Error>(read_u32(payload)));
