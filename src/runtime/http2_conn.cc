@@ -219,11 +219,13 @@ Str h2_canon_path(Str path) {
 }
 
 bool h2_value_to_u32(Str v, u32* out) {
-    if (v.len == 0 || v.len > 9) return false;
+    if (v.len == 0) return false;
     u32 acc = 0;
     for (u32 i = 0; i < v.len; i++) {
         if (v.ptr[i] < '0' || v.ptr[i] > '9') return false;
-        acc = acc * 10 + static_cast<u32>(v.ptr[i] - '0');
+        const u32 digit = static_cast<u32>(v.ptr[i] - '0');
+        if (acc > 429496729u || (acc == 429496729u && digit > 5u)) return false;
+        acc = acc * 10 + digit;
     }
     *out = acc;
     return true;
@@ -442,6 +444,12 @@ static Http2Error handle_frame(Http2Conn& c,
                 if (w.room(kFrameHeaderSize + 4))
                     w.len +=
                         write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
+                if (c.pending_stream == h.stream_id) {
+                    c.pending_stream = 0;
+                    c.pending_synth_len = 0;
+                    c.pending_body_start = 0;
+                    c.pending_overflow = false;
+                }
                 s->state = Http2StreamState::Closed;
                 return Http2Error::NoError;
             }

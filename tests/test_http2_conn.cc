@@ -438,6 +438,18 @@ TEST(h2_request, content_length_parsed) {
     CHECK_EQ(req.content_length, 42u);
 }
 
+TEST(h2_request, ten_digit_content_length_parsed) {
+    hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"0000000000", 10}},
+    };
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 3, &req));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length, 0u);
+}
+
 TEST(h2_request, invalid_or_duplicate_content_length_fails) {
     ParsedRequest req;
     hpack::Header bad[] = {{{":method", 7}, {"POST", 4}},
