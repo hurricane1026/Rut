@@ -447,7 +447,7 @@ public:
     }
 
     void pause_upstream_recv_impl(Connection& c) {
-        backend.pause_upstream_recv(c.id, c.ws_upstream_send_pending);
+        backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
     }
 
     void close_conn_impl(Connection& c) {

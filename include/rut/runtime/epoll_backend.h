@@ -62,6 +62,7 @@ struct EpollBackend {
         u32 tls_wait_events;
     };
     SendState send_state[kMaxFdMap];
+    SendState upstream_send_state[kMaxFdMap];
 
     // --- Interface methods ---
 

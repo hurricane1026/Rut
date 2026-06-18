@@ -267,11 +267,15 @@ void throttle_resume(Loop* loop, Connection& conn) {
     conn.throttle_pending_len = 0;
     if (kRemaining > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+#if RUT_ENABLE_WEBSOCKET
         if (conn.is_ws_tunnel) {
             on_ws_upstream_recv<Loop>(static_cast<void*>(loop), conn, synth);
         } else {
             on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
         }
+#else
+        on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
+#endif
     } else {
         loop->submit_recv_upstream(conn);
     }
@@ -1953,7 +1957,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
     }
     const u32 kSendLen = conn.upstream_recv_buf.len();
     if (throttle_pause_before_pump(loop, conn, kSendLen)) return true;
-    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
+    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
     conn.ws_upstream_send_pending = true;
     conn.ws_upstream_send_len = kSendLen;
     return ws_pause_upstream_recv(loop, conn);
@@ -2072,6 +2076,9 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_upstream_send_pending = false;
     conn.ws_client_send_len = 0;
     conn.ws_upstream_send_len = 0;
+    if (conn.pipeline_stash_len > 0) {
+        pipeline_recover(conn);
+    }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
     loop->epoch_leave();
     conn.upstream_send_len = conn.ws_upgrade_response_len;
