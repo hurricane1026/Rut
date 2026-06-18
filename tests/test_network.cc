@@ -1441,6 +1441,27 @@ TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
     CHECK(conn.tls_pending_on_send == nullptr);
 }
 
+TEST(tls_iouring, queued_send_keeps_tls_completion_hook_during_inflight_flight) {
+    // A response send issued while a control/handshake ciphertext flight is still
+    // draining must leave on_send pointing at tls_on_out_sent, so the in-flight
+    // Send CQE resumes the TLS layer instead of being mis-handled as this
+    // response's completion. transition_to_sending() overwrote on_send with the
+    // upper-layer continuation (saved in tls_pending_on_send) just before the
+    // send funneled through tls_pump_send.
+    Connection conn;
+    conn.reset();
+    conn.id = 11;
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;            // a prior flight is still draining
+    conn.on_send = &tls_pending_send_probe;  // clobbered upper-layer continuation
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+
+    CHECK(tls_pump_send<IoUringEventLoop>(nullptr, conn));
+    CHECK(conn.on_send == &tls_on_out_sent<IoUringEventLoop>);  // hook restored
+    CHECK(conn.tls_out_inflight);                               // queued send waits
+    CHECK(conn.tls_pending_on_send == &tls_pending_send_probe);
+}
+
 TEST(tls_iouring, flush_out_no_output_is_noop) {
     Connection conn;
     conn.reset();

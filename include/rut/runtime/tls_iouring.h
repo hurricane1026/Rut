@@ -65,7 +65,18 @@ bool tls_flush_out(Self* loop, Connection& c) {
 // rest resumes from tls_on_out_sent once this flight drains.
 template <class Self>
 bool tls_pump_send(Self* loop, Connection& c) {
-    if (c.tls_out_inflight) return true;  // resumes on the send completion
+    if (c.tls_out_inflight) {
+        // A prior ciphertext flight (a handshake/control flight such as a TLS 1.3
+        // KeyUpdate emitted while reading) is still draining tls_out_slice, so
+        // this plaintext send is queued and resumes from tls_on_out_sent. The
+        // caller reached us via transition_to_sending(), which just overwrote
+        // on_send with the upper-layer continuation (already saved in
+        // tls_pending_on_send). Restore the TLS completion hook so the in-flight
+        // flight's Send CQE drives the TLS layer instead of being mis-handled as
+        // this response's completion.
+        c.on_send = &tls_on_out_sent<Self>;
+        return true;  // resumes on the send completion
+    }
     tls_engine_set_output(c.tls_engine, c.tls_out_slice, SlicePool::kSliceSize);
     while (c.tls_send_off < c.tls_send_len) {
         TlsOp st = TlsOp::Ok;
