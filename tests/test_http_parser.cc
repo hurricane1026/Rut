@@ -795,6 +795,16 @@ TEST(Corpus, ConnectionUpgradeSetsFlag) {
     CHECK(!req.upgrade);  // close wins
     CHECK(!req.keep_alive);
 
+    // close split into a separate Connection field still suppresses upgrade.
+    parser.reset();
+    req.reset();
+    const u8 split[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(split, sizeof(split) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.upgrade);  // close is sticky across Connection fields
+
     parser.reset();
     req.reset();
     const u8 normal[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";

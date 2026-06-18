@@ -1954,23 +1954,27 @@ bool ws_resume_client_recv(Loop* loop, Connection& conn) {
     return loop->submit_recv(conn);
 }
 
-// Stop polling the upstream fd after the backend closes during the pre-tunnel
-// 101 drain. epoll-only: a hung-up fd keeps waking the level-triggered loop
-// even with its interest mask zeroed (no-op where the loop lacks the method).
+// Stop reading from the upstream fd while a close is deferred behind a draining
+// send. epoll: drop the read interest (keep a pending send's EPOLLOUT) so a
+// level-triggered FIN can't spin. io_uring: cancel the multishot recv so no NEW
+// bytes are read after the FIN — otherwise the drain-then-close contract (stop
+// reading new data) would be violated and the tunnel would keep relaying.
 template <typename Loop>
 void ws_stop_upstream_poll(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_upstream(c); }) {
         loop->ws_unpoll_upstream(conn);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
+        (void)loop->pause_upstream_recv(conn);  // async: cancel the multishot recv
     }
 }
 
-// Symmetric to ws_stop_upstream_poll for the client fd (epoll-only; no-op
-// elsewhere). Used when a tunnel close is deferred behind a draining send so a
-// level-triggered client half-close doesn't spin the loop.
+// Symmetric to ws_stop_upstream_poll for the client fd.
 template <typename Loop>
 void ws_stop_client_poll(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_client(c); }) {
         loop->ws_unpoll_client(conn);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+        (void)loop->pause_recv(conn);  // async: cancel the multishot recv
     }
 }
 
@@ -2064,8 +2068,12 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         }
         return;
     }
-    if (ev.result <= 0) {
-        // Client half-closed (FIN). Enter drain mode: flush both directions'
+    if (ev.result < 0) {
+        loop->close_conn(conn);  // hard error (e.g. ECONNRESET): not a clean FIN
+        return;
+    }
+    if (ev.result == 0) {
+        // Client half-closed (clean FIN). Enter drain mode: flush both directions'
         // buffered/in-flight bytes, then tear down once everything has drained.
         conn.ws_client_eof = true;
         if (!ws_drain_pump(loop, conn)) {
@@ -2120,8 +2128,12 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         }
         return;
     }
-    if (ev.result <= 0) {
-        // Backend half-closed (FIN). Mirror on_ws_client_recv: drain both
+    if (ev.result < 0) {
+        loop->close_conn(conn);  // hard error (e.g. ECONNRESET): not a clean FIN
+        return;
+    }
+    if (ev.result == 0) {
+        // Backend half-closed (clean FIN). Mirror on_ws_client_recv: drain both
         // directions, then tear down once everything has flushed.
         conn.ws_upstream_eof = true;
         if (!ws_drain_pump(loop, conn)) {
@@ -2253,7 +2265,11 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     } else {
         conn.upstream_recv_paused_for_send = false;
         if (kRemaining == 0 && conn.ws_pre_tunnel_upstream_closed) {
-            loop->close_conn(conn);
+            // Backend already closed: enter drain mode rather than closing now, so
+            // a client→upstream send just kicked above (buffered post-upgrade
+            // bytes) flushes before teardown instead of being truncated.
+            conn.ws_upstream_eof = true;
+            ws_close_if_drained(loop, conn);
             return;
         }
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);

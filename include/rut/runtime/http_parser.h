@@ -61,6 +61,8 @@ struct ParsedRequest {
     bool upgrade;             // Connection: upgrade token present
     bool has_upgrade_header;  // Upgrade: header present (both required for a
                               // valid upgrade — Connection is hop-by-hop alone)
+    bool connection_close;    // a Connection: close token was seen (sticky across
+                              // duplicate Connection fields — suppresses upgrade)
 
     void reset() {
         method = HttpMethod::Unknown;
@@ -74,6 +76,7 @@ struct ParsedRequest {
         has_content_length = false;
         upgrade = false;
         has_upgrade_header = false;
+        connection_close = false;
     }
 };
 

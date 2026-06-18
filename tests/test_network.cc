@@ -1024,13 +1024,30 @@ TEST(websocket, client_half_close_defers_until_send_drains) {
     loop.backend.op_count = 0;
     on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 0));
     CHECK(conn->ws_client_eof);
-    CHECK_EQ(loop.conns[cid].fd, 42);     // deferred, not closed
-    CHECK_EQ(loop.backend.op_count, 0u);  // no extra send (one already pending)
+    CHECK_EQ(loop.conns[cid].fd, 42);                    // deferred, not closed
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);  // no extra send pending
 
     // The send completes; only now does the tunnel tear down.
     on_ws_client_to_upstream_sent<SmallLoop>(
         &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 3));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
+}
+
+// A negative recv error (e.g. ECONNRESET) is NOT a clean FIN — close at once
+// rather than entering the drain path (which could keep forwarding bytes).
+TEST(websocket, recv_error_closes_immediately) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ECONNRESET));
+    CHECK(!conn->ws_client_eof);       // not treated as a drainable FIN
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed immediately
 }
 
 // Symmetric guard for a backend half-close while its upstream→client send drains.
@@ -1054,7 +1071,7 @@ TEST(websocket, backend_half_close_defers_until_send_drains) {
     on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
     CHECK(conn->ws_upstream_eof);
     CHECK_EQ(loop.conns[cid].fd, 42);  // deferred, not closed
-    CHECK_EQ(loop.backend.op_count, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 
     on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 3));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
