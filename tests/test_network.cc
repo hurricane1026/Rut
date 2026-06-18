@@ -4575,6 +4575,9 @@ TEST(streaming, _101_not_skipped) {
     CHECK(!conn->is_ws_tunnel);
     REQUIRE(conn->on_send != nullptr);
     REQUIRE(conn->on_upstream_recv != nullptr);
+    const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
+               sizeof(early_bytes));
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 5));
     CHECK(!conn->is_ws_tunnel);
     loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));

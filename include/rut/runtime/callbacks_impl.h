@@ -1945,8 +1945,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         return ws_pause_upstream_recv(loop, conn);
     }
     const u32 kSendLen = conn.upstream_recv_buf.len();
-    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), kSendLen))
-        return false;
+    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
     conn.ws_upstream_send_pending = true;
     conn.ws_upstream_send_len = kSendLen;
     return ws_pause_upstream_recv(loop, conn);
