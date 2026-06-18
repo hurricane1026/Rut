@@ -54,6 +54,15 @@ TEST(accept, at_capacity) {
     CHECK_EQ(loop.free_top, 0u);
 }
 
+TEST(event_loop, default_alloc_h2_refuses) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    CHECK(!loop.alloc_h2(*c));
+    CHECK(c->h2 == nullptr);
+}
+
 // === Recv ===
 
 TEST(recv, then_send) {
