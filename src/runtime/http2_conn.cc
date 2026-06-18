@@ -418,6 +418,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_static_status = 200;
     c.pending_jit_fn = nullptr;
     c.pending_route_param_count = 0;
+    c.pending_param_len = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         c.pending_route_params[i] = {};
     }

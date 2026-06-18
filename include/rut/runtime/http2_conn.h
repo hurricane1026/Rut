@@ -119,6 +119,14 @@ struct Http2Conn {
     jit::HandlerFn pending_jit_fn;
     H2RouteParam pending_route_params[kMaxRouteParams];
     u32 pending_route_param_count;
+    // Route param VALUES point into hdr_scratch, which the engine reuses for the
+    // next decoded header block; copy them here at defer time so a concurrently
+    // multiplexed stream's HEADERS can't clobber req.param() for the deferred
+    // request. Param NAMES point into the snapshotted RouteConfig and stay valid,
+    // so only values are copied. Bounded; params whose value won't fit are dropped.
+    static constexpr u32 kPendingParamCap = 1024;
+    u32 pending_param_len;
+    u8 pending_param_buf[kPendingParamCap];
     u8 pending_synth[kBodySynthCap];
 
     // Set callbacks (any may be null) then call init().

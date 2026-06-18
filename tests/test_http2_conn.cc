@@ -1195,6 +1195,62 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
     CHECK_FALSE(h2_inject_content_length(buf, &len, len - 2, 2, sizeof(buf)));
 }
 
+namespace {
+struct FakeH2Loop {};
+}  // namespace
+
+TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
+    // A deferred dynamic route's param VALUES point into hdr_scratch, which the
+    // engine reuses for the next decoded header block. The snapshot must copy
+    // those bytes into stable per-connection storage so a concurrently
+    // multiplexed stream's HEADERS can't clobber req.param() for this request.
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+
+    FakeH2Loop loop;
+    u8 resp[256];
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, resp, sizeof(resp), 0, false};
+
+    char scratch[8] = {'4', '2', 0, 0, 0, 0, 0, 0};  // mimics hdr_scratch
+    RouteParam params[1] = {{"id", 2, scratch, 2}};
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = reinterpret_cast<jit::HandlerFn>(0x1);  // non-null, never invoked
+
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/users/42", 9}}};
+    ParsedRequest req{};
+    req.has_content_length = true;
+    req.content_length = 0;
+
+    REQUIRE(h2_defer_until_data_end(d,
+                                    1,
+                                    hs,
+                                    2,
+                                    req,
+                                    /*buffer_body=*/true,
+                                    RouteAction::JitHandler,
+                                    /*route_config=*/nullptr,
+                                    &route,
+                                    params,
+                                    1,
+                                    200));
+
+    // Simulate the engine reusing hdr_scratch for another stream's headers.
+    scratch[0] = '9';
+    scratch[1] = '9';
+
+    REQUIRE(h2.pending_route_param_count == 1u);
+    const H2RouteParam& sp = h2.pending_route_params[0];
+    CHECK_EQ(sp.value_len, 2u);
+    CHECK(sp.value != scratch);                                              // not aliasing
+    CHECK(sp.value == reinterpret_cast<const char*>(h2.pending_param_buf));  // stable buf
+    CHECK(sp.value[0] == '4' && sp.value[1] == '2');                         // pre-clobber bytes
+    CHECK(sp.name == params[0].name);  // name still points into stable config
+}
+
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {
     Http2Conn c;
     Capture cap;

@@ -142,6 +142,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_static_status = 200;
     h2.pending_jit_fn = nullptr;
     h2.pending_route_param_count = 0;
+    h2.pending_param_len = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         h2.pending_route_params[i] = {};
     }
@@ -230,11 +231,24 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_route_action = action;
     h2->pending_static_status = static_status;
     h2->pending_jit_fn = route ? route->fn : nullptr;
-    h2->pending_route_param_count = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
-    for (u32 i = 0; i < h2->pending_route_param_count; i++) {
-        h2->pending_route_params[i] = {
-            params[i].name, params[i].name_len, params[i].value, params[i].value_len};
+    const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
+    u32 off = 0;
+    u32 stored = 0;
+    for (u32 i = 0; i < kCapped; i++) {
+        const RouteParam& p = params[i];
+        // Copy the value bytes (which point into the reusable hdr_scratch) into
+        // stable pending storage; keep the name pointing into the snapshotted
+        // config. Drop a param whose value would overflow the bounded buffer.
+        if (off + p.value_len > Http2Conn::kPendingParamCap) break;
+        u8* dst = h2->pending_param_buf + off;
+        for (u32 j = 0; j < p.value_len; j++) dst[j] = static_cast<u8>(p.value[j]);
+        h2->pending_route_params[stored] = {
+            p.name, p.name_len, reinterpret_cast<const char*>(dst), p.value_len};
+        off += p.value_len;
+        stored++;
     }
+    h2->pending_route_param_count = stored;
+    h2->pending_param_len = off;
     h2->pending_stream = stream_id;
     return true;
 }
