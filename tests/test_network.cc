@@ -7038,6 +7038,7 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
 // prove the EPOLLOUT survived the re-arm; also exercise the TLS-pending branches.
 // Pre-tunnel backend EOF on the real epoll loop: records the deferred close and
 // deregisters the upstream fd (exercises ws_stop_upstream_poll's epoll branch).
+#if RUT_ENABLE_WEBSOCKET
 TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -7062,6 +7063,7 @@ TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
     loop->shutdown();
     destroy_real_loop(loop);
 }
+#endif  // RUT_ENABLE_WEBSOCKET
 
 TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     auto* loop = create_real_loop();

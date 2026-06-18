@@ -1922,7 +1922,13 @@ bool ws_pause_client_recv(Loop* loop, Connection& conn) {
         return ok;
     } else if constexpr (requires(Loop* lp, u32 conn_id) {
                              lp->backend.pause_recv(conn_id, true);
+                             lp->backend.pause_recv(conn_id);
                          }) {
+        // epoll-style backend: pause_recv(u32 conn_id, bool preserve=false). The
+        // extra 1-arg requirement excludes io_uring's pause_recv(i32 fd, u32
+        // conn_id) — which would otherwise bind conn.id as the fd and `true` as
+        // conn_id, cancelling the wrong recv (the io_uring loop uses the
+        // pause_recv(Connection&) branch above).
         loop->backend.pause_recv(conn.id, true);
     } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid); }) {
         loop->backend.pause_recv(conn.id);

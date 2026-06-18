@@ -200,8 +200,9 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             req->keep_alive = false;
-            return;  // close is sticky — overrides keep-alive (RFC 7230); a legit
-                     // upgrade request never combines close with upgrade.
+            req->upgrade = false;  // close is contradictory with upgrade — a
+                                   // "close, upgrade" request is not an upgrade
+            return;                // close is sticky — overrides keep-alive (RFC 7230)
         } else if (tok_len == 10 && str_ci_eq(val + tok_start, "keep-alive", 10)) {
             req->keep_alive = true;
         } else if (tok_len == 7 && str_ci_eq(val + tok_start, "upgrade", 7)) {
