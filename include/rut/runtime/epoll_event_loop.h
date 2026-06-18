@@ -446,7 +446,9 @@ public:
         return backend.add_recv_upstream(c.upstream_fd, c.id);
     }
 
-    void pause_upstream_recv_impl(Connection& c) { backend.pause_upstream_recv(c.id); }
+    void pause_upstream_recv_impl(Connection& c) {
+        backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
+    }
 
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();

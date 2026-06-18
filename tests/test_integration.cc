@@ -6233,6 +6233,7 @@ struct WsEchoServer {
 
 // WebSocket passthrough: the gateway forwards the upgrade, relays the 101 back,
 // then becomes a transparent full-duplex tunnel — bytes flow both ways.
+#if RUT_ENABLE_WEBSOCKET
 TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     using namespace rut;
     WsEchoServer backend;
@@ -6280,6 +6281,7 @@ TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     close(listen_fd);
     destroy_real_loop(loop);
 }
+#endif
 
 TEST(route, jit_handler_unknown_body_idx_falls_back) {
     using namespace rut;

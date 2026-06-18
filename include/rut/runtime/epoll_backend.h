@@ -88,7 +88,7 @@ struct EpollBackend {
     // pending upstream data would otherwise keep firing UpstreamRecv and drive the
     // pipeline past the pause. submit_recv_upstream re-arms EPOLLIN on resume.
     // No-op if the conn_id has no registered upstream fd.
-    void pause_upstream_recv(u32 conn_id);
+    void pause_upstream_recv(u32 conn_id, bool preserve_send_interest = false);
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);
