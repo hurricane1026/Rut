@@ -4,11 +4,13 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
@@ -1341,6 +1343,56 @@ TEST(legacy_loop, accessors_and_free_release_slices) {
     CHECK_EQ(c->recv_slice, nullptr);
     CHECK_EQ(c->upstream_recv_slice, nullptr);
     loop->shutdown();
+}
+
+namespace {
+bool g_tls_pending_send_called = false;
+u32 g_tls_pending_send_result = 0;
+
+void tls_pending_send_probe(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_tls_pending_send_called = true;
+    g_tls_pending_send_result = static_cast<u32>(ev.result);
+    conn.on_send = nullptr;
+}
+}  // namespace
+
+TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
+    Connection conn;
+    u8 recv_storage[SmallLoop::kBufSize];
+    u8 send_storage[SmallLoop::kBufSize];
+    conn.reset();
+    conn.id = 7;
+    conn.fd = 42;
+    conn.recv_slice = recv_storage;
+    conn.send_slice = send_storage;
+    conn.recv_buf.bind(recv_storage, SmallLoop::kBufSize);
+    conn.send_buf.bind(send_storage, SmallLoop::kBufSize);
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;
+    conn.tls_send_src = reinterpret_cast<const u8*>("plain");
+    conn.tls_send_len = 5;
+    conn.tls_send_off = 5;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+    conn.on_send = &tls_on_out_sent<IoUringEventLoop>;
+    g_tls_pending_send_called = false;
+    g_tls_pending_send_result = 0;
+
+    tls_on_out_sent<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
+
+    CHECK(g_tls_pending_send_called);
+    CHECK_EQ(g_tls_pending_send_result, 5u);
+    CHECK(!conn.tls_out_inflight);
+    CHECK(conn.tls_send_src == nullptr);
+    CHECK_EQ(conn.tls_send_len, 0u);
+    CHECK(conn.tls_pending_on_send == nullptr);
+}
+
+TEST(tls_iouring, flush_out_no_output_is_noop) {
+    Connection conn;
+    conn.reset();
+    conn.id = 8;
+    CHECK(tls_flush_out<IoUringEventLoop>(nullptr, conn));
+    CHECK(!conn.tls_out_inflight);
 }
 
 // Two proxy cycles on same connection (keep-alive)

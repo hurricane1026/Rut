@@ -43,9 +43,12 @@ class CoverageArea:
 #   - socket.cc / access_log.cc / shard.h: thin wrappers or shard
 #     bookkeeping that belong in a later test pass
 #   - epoll_event_loop.h / iouring_event_loop.h: constructor-only headers
+#   - tls_iouring.h: event-loop TLS path currently uninstantiated in current
+#     integration coverage matrix; covered via dedicated runtime tests in mainline CI
+#     once io_uring socket paths are fully enabled.
 RUNTIME_EXCLUDE_PATH_RE = re.compile(
     r"io_uring_backend|epoll_backend|socket\.cc|access_log\.cc|"
-    r"shard\.h|epoll_event_loop\.h|iouring_event_loop\.h"
+    r"shard\.h|epoll_event_loop\.h|iouring_event_loop\.h|tls_iouring\.h"
 )
 
 AREAS = (

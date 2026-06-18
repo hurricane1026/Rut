@@ -138,6 +138,7 @@ add_library(rut_runtime STATIC
     runtime/timer_wheel.cc
     runtime/socket.cc
     runtime/tls.cc
+    runtime/tls_engine.cc
     runtime/http_parser.cc
     runtime/http2_frame.cc
     runtime/http2_conn.cc
