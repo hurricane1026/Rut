@@ -1440,6 +1440,10 @@ TEST(tls_iouring, flush_out_no_output_is_noop) {
     CHECK(!conn.tls_out_inflight);
 }
 
+TEST(tls_iouring, input_buffer_fits_full_ciphertext_record) {
+    CHECK_GE(IoUringEventLoop::kTlsInputSize, SlicePool::kSliceSize + 1024);
+}
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;

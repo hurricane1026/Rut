@@ -2713,6 +2713,41 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     loop->shutdown();
 }
 
+TEST(uring, tls_send_want_read_recv_survives_send_pause) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(0x1);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+    conn.recv_armed = true;
+    conn.recv_paused_for_send = false;
+    conn.recv_pause_cancel_pending = false;
+    conn.recv_pause_rearm_pending = false;
+
+    CHECK(loop->pause_recv(conn));
+    CHECK(conn.recv_paused_for_send);
+    CHECK(conn.recv_armed);
+    CHECK(!conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_pause_rearm_pending);
+
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK(!conn.recv_pause_rearm_pending);
+
+    conn.tls_engine.ssl = nullptr;
+    loop->shutdown();
+}
+
 // HandlerFn stub that yields on an upstream recv — never invoked by the test
 // below, only used as a non-null pending_handler_fn.
 static u64 upstream_recv_yield_handler(void* /*conn*/,
