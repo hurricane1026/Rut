@@ -84,28 +84,47 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
 }
 
 // Find a query-string parameter value in the raw path ("...?k=v&k2=v2#frag").
-inline Str query_value(const RateLimitKeyInput& in, const char* name, u32 name_len) {
-    if (!in.path) return {nullptr, 0};
-    const char* p = in.path;
+// The full request target (path?query) read from the request line in req_buf.
+// Unlike in.path it is not capped at Connection::kMaxReqPathLen, so query values
+// past that cutoff still isolate into distinct buckets. Falls back to in.path
+// when req_buf is unavailable (e.g. unit callers that only set path).
+inline Str request_target(const RateLimitKeyInput& in) {
+    if (!in.req_buf || in.req_header_end == 0) return {in.path, in.path_len};
+    const char* p = reinterpret_cast<const char*>(in.req_buf);
+    u32 end = in.req_header_end;
     u32 i = 0;
-    while (i < in.path_len && p[i] != '?') i++;
-    if (i >= in.path_len) return {nullptr, 0};
+    while (i < end && p[i] != ' ' && p[i] != '\r' && p[i] != '\n') i++;  // method
+    if (i >= end || p[i] != ' ') return {in.path, in.path_len};
+    u32 ts = ++i;
+    while (i < end && p[i] != ' ' && p[i] != '\r' && p[i] != '\n') i++;  // request-target
+    if (i >= end || p[i] != ' ') return {in.path, in.path_len};
+    return {p + ts, i - ts};
+}
+
+inline Str query_value(const RateLimitKeyInput& in, const char* name, u32 name_len) {
+    const Str kTarget = request_target(in);
+    const char* p = kTarget.ptr;
+    u32 plen = kTarget.len;
+    if (!p) return {nullptr, 0};
+    u32 i = 0;
+    while (i < plen && p[i] != '?') i++;
+    if (i >= plen) return {nullptr, 0};
     i++;  // past '?'
-    while (i < in.path_len && p[i] != '#') {
+    while (i < plen && p[i] != '#') {
         u32 ks = i;
-        while (i < in.path_len && p[i] != '=' && p[i] != '&' && p[i] != '#') i++;
+        while (i < plen && p[i] != '=' && p[i] != '&' && p[i] != '#') i++;
         u32 klen = i - ks;
         const char* vp = nullptr;
         u32 vlen = 0;
-        if (i < in.path_len && p[i] == '=') {
+        if (i < plen && p[i] == '=') {
             i++;
             u32 vs = i;
-            while (i < in.path_len && p[i] != '&' && p[i] != '#') i++;
+            while (i < plen && p[i] != '&' && p[i] != '#') i++;
             vp = p + vs;
             vlen = i - vs;
         }
         if (ci_eq(p + ks, klen, name, name_len)) return {vp ? vp : p + ks, vp ? vlen : 0};
-        if (i < in.path_len && p[i] == '&') i++;
+        if (i < plen && p[i] == '&') i++;
     }
     return {nullptr, 0};
 }
