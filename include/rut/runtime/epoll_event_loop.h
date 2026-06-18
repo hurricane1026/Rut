@@ -379,7 +379,7 @@ public:
     // io_uring needs no equivalent (a cancelled recv does not re-fire), so this
     // method is epoll-only and the WS callback reaches it via a requires-guard.
     void ws_unpoll_upstream(Connection& c) {
-        if (c.upstream_fd >= 0) (void)backend.cancel(c.upstream_fd, c.id);
+        if (c.upstream_fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/true);
     }
 
     // Symmetric to ws_unpoll_upstream for the downstream (client) fd: stop epoll
@@ -387,7 +387,7 @@ public:
     // deferred behind a still-draining client→upstream send. close_conn ::closes
     // the fd later.
     void ws_unpoll_client(Connection& c) {
-        if (c.fd >= 0) (void)backend.cancel(c.fd, c.id);
+        if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false);
     }
 
     bool alloc_upstream_buf(ConnectionBase& c) {

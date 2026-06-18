@@ -2006,6 +2006,37 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
     return ws_pause_upstream_recv(loop, conn);
 }
 
+// nginx-style drain-then-close. Once either peer half-closes (TCP FIN), the
+// tunnel stops reading NEW data but flushes all in-flight/buffered bytes in BOTH
+// directions before tearing down — never truncating data, and never relaying
+// new data after the FIN (WebSocket shutdown is an application-level Close-frame
+// handshake, not a TCP half-close). See DESIGN.md §"WebSocket tunnel teardown".
+inline bool ws_draining(const Connection& conn) {
+    return conn.ws_client_eof || conn.ws_upstream_eof;
+}
+
+template <typename Loop>
+void ws_close_if_drained(Loop* loop, Connection& conn) {
+    if (!conn.ws_client_send_pending && !conn.ws_upstream_send_pending &&
+        conn.recv_buf.len() == 0 && conn.upstream_recv_buf.len() == 0) {
+        loop->close_conn(conn);
+    }
+}
+
+// Flush both directions: kick a send wherever bytes are buffered but no send is
+// in flight, then quiesce both fds — stop new reads (so a level-triggered FIN
+// can't spin) while preserving any pending send's EPOLLOUT so it still drains.
+template <typename Loop>
+bool ws_drain_pump(Loop* loop, Connection& conn) {
+    if (!conn.ws_client_send_pending && conn.recv_buf.len() > 0)
+        if (!ws_try_send_client_to_upstream(loop, conn)) return false;
+    if (!conn.ws_upstream_send_pending && conn.upstream_recv_buf.len() > 0)
+        if (!ws_try_send_upstream_to_client(loop, conn)) return false;
+    ws_stop_client_poll(loop, conn);
+    ws_stop_upstream_poll(loop, conn);
+    return true;
+}
+
 template <typename Loop>
 void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -2028,23 +2059,14 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
-        // Client half-closed (FIN). If a client→upstream send is still draining
-        // or bytes remain buffered, don't truncate the last frame: defer the
-        // teardown until the send completes (on_ws_client_to_upstream_sent closes
-        // once recv_buf drains). Kick a send if none is in flight so the drain
-        // can make progress.
-        if (conn.ws_client_send_pending || conn.recv_buf.len() > 0) {
-            conn.ws_client_eof = true;
-            if (!conn.ws_client_send_pending && !ws_try_send_client_to_upstream(loop, conn)) {
-                loop->close_conn(conn);
-                return;
-            }
-            // Stop the level-triggered client half-close from re-firing while the
-            // close waits on the draining send (epoll-only; close_conn closes fd).
-            ws_stop_client_poll(loop, conn);
+        // Client half-closed (FIN). Enter drain mode: flush both directions'
+        // buffered/in-flight bytes, then tear down once everything has drained.
+        conn.ws_client_eof = true;
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
             return;
         }
-        loop->close_conn(conn);
+        ws_close_if_drained(loop, conn);
         return;
     }
     if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
@@ -2060,12 +2082,17 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.recv_buf.consume(conn.ws_client_send_len);
     conn.ws_client_send_len = 0;
-    if (conn.recv_buf.len() > 0) {
-        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+    if (ws_draining(conn)) {
+        // Keep flushing both directions; close once everything has drained.
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
         return;
     }
-    if (conn.ws_client_eof) {  // client half-closed; last frame fully flushed
-        loop->close_conn(conn);
+    if (conn.recv_buf.len() > 0) {
+        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
         return;
     }
     if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn))
@@ -2088,21 +2115,14 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
-        // Backend half-closed. Mirror on_ws_client_recv: flush an in-flight or
-        // buffered upstream→client frame before tearing down so the last frame
-        // is not truncated (on_ws_upstream_to_client_sent closes on drain).
-        if (conn.ws_upstream_send_pending || conn.upstream_recv_buf.len() > 0) {
-            conn.ws_upstream_eof = true;
-            if (!conn.ws_upstream_send_pending && !ws_try_send_upstream_to_client(loop, conn)) {
-                loop->close_conn(conn);
-                return;
-            }
-            // Stop the level-triggered backend EOF from re-firing while the close
-            // waits on the draining send (epoll-only; close_conn closes the fd).
-            ws_stop_upstream_poll(loop, conn);
+        // Backend half-closed (FIN). Mirror on_ws_client_recv: drain both
+        // directions, then tear down once everything has flushed.
+        conn.ws_upstream_eof = true;
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
             return;
         }
-        loop->close_conn(conn);
+        ws_close_if_drained(loop, conn);
         return;
     }
     if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
@@ -2118,12 +2138,20 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.upstream_recv_buf.consume(conn.ws_upstream_send_len);
     conn.ws_upstream_send_len = 0;
-    if (conn.upstream_recv_buf.len() > 0) {
-        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+    if (conn.ws_pre_tunnel_upstream_closed) {  // backend closed during the 101 drain
+        loop->close_conn(conn);
         return;
     }
-    if (conn.ws_pre_tunnel_upstream_closed || conn.ws_upstream_eof) {
-        loop->close_conn(conn);
+    if (ws_draining(conn)) {
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    if (conn.upstream_recv_buf.len() > 0) {
+        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
         return;
     }
     conn.upstream_recv_paused_for_send = false;

@@ -243,6 +243,25 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
+void EpollBackend::quiesce_recv(u32 conn_id, bool upstream) {
+    if (conn_id >= kMaxFdMap) return;
+    i32 fd = upstream ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
+    if (fd < 0) return;
+    const auto& ss = upstream ? upstream_send_state[conn_id] : send_state[conn_id];
+    if (ss.remaining > 0 && ss.fd == fd) {
+        // Keep flushing the in-flight send. Downstream registers type=Send so the
+        // EPOLLOUT dispatches against send_state; upstream keeps type=UpstreamRecv
+        // (handle_epollout routes any non-Send type to upstream_send_state). No
+        // EPOLLIN/EPOLLRDHUP, so the half-close can't re-fire.
+        IoEventType type = upstream ? IoEventType::UpstreamRecv : ss.type;
+        u32 events = (ss.tls && ss.tls_wait_events == EPOLLIN) ? EPOLLIN : EPOLLOUT;
+        set_fd_interest(epoll_fd, fd, conn_id, type, events);
+    } else {
+        // Nothing to flush — remove the fd so EPOLLHUP/ERR can't spin the loop.
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    }
+}
+
 void EpollBackend::clear_send_state(u32 conn_id) {
     if (conn_id >= kMaxFdMap) return;
     send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};

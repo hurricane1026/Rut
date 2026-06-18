@@ -1060,6 +1060,45 @@ TEST(websocket, backend_half_close_defers_until_send_drains) {
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
 }
 
+// nginx-style drain-then-close: a FIN on one side must flush BOTH directions'
+// in-flight data before tearing down — the opposite direction's pending send is
+// not dropped. The tunnel closes only once both directions have drained.
+TEST(websocket, half_close_drains_both_directions_before_close) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    // A client→upstream send and an independent upstream→client send both in flight.
+    const u8 c2u[] = {'C', '2', 'U'};
+    REQUIRE_EQ(conn->recv_buf.write(c2u, sizeof(c2u)), sizeof(c2u));
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 3));
+    REQUIRE(conn->ws_client_send_pending);
+    const u8 u2c[] = {'U', '2', 'C'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(u2c, sizeof(u2c)), sizeof(u2c));
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 3));
+    REQUIRE(conn->ws_upstream_send_pending);
+
+    // Client FIN while both sends drain → defer.
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 0));
+    CHECK(conn->ws_client_eof);
+    CHECK_EQ(loop.conns[cid].fd, 42);
+
+    // client→upstream completes; the upstream→client send must still drain.
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 3));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // opposite direction NOT dropped
+
+    // upstream→client completes → both drained → tunnel tears down.
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 3));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed only after both flushed
+}
+
 // A backend that closes during the pre-tunnel 101 drain must defer teardown
 // (preserve buffered 101 bytes) rather than close mid-handshake.
 TEST(websocket, pre_tunnel_backend_close_defers) {

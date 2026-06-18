@@ -91,6 +91,14 @@ struct EpollBackend {
     // No-op if the conn_id has no registered upstream fd.
     void pause_upstream_recv(u32 conn_id, bool preserve_send_interest = false);
 
+    // Stop polling a tunnel fd's READ side (drop EPOLLIN/EPOLLRDHUP so a
+    // level-triggered half-close can't re-fire) while PRESERVING any in-flight
+    // send on that fd (keep its EPOLLOUT so it still drains). If no send is
+    // pending the fd is removed from the epoll set entirely. Used by the
+    // nginx-style drain-then-close path. upstream selects the upstream fd /
+    // upstream_send_state; otherwise the downstream fd / send_state.
+    void quiesce_recv(u32 conn_id, bool upstream);
+
     // Drop any partial-send bookkeeping for conn_id. MUST be called on close so
     // a leftover send_state entry (a partial send that was still in flight when
     // the connection closed) cannot be misread as live after the conn_id and fd
