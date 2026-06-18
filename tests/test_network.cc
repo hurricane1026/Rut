@@ -4588,10 +4588,16 @@ TEST(streaming, _101_not_skipped) {
     REQUIRE_EQ(loop.backend.op_count, 3u);
     CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 42);
-    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
-    CHECK_EQ(loop.backend.ops[1].fd, 42);
-    CHECK_EQ(loop.backend.ops[1].send_len, 5u);
-    CHECK_EQ(loop.backend.ops[2].type, MockOp::PauseUpstreamRecv);
+    const MockOp* early_send = nullptr;
+    for (u32 i = 0; i < loop.backend.op_count; i++) {
+        const MockOp& op = loop.backend.ops[i];
+        if (op.type == MockOp::Send && op.fd == 42 && op.send_len == 5u) {
+            early_send = &op;
+            break;
+        }
+    }
+    REQUIRE(early_send != nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseUpstreamRecv), 1u);
 #else
     // Without the WS feature: no CL/chunked/keep-alive → UntilClose (streaming).
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);

@@ -141,8 +141,8 @@ struct ConnectionBase {
     // transparent full-duplex byte tunnel (WebSocket passthrough): the 4 slots
     // splice client↔upstream and the keepalive timeout no longer closes it.
     bool is_ws_tunnel;
-    // Backends currently keep one per-connection send_state shared by Send and
-    // UpstreamSend, so the WebSocket tunnel serializes its two directions.
+    // WebSocket tunnel send state tracks the submitted prefix in each direction
+    // so raced recv completions can leave later bytes buffered for the next send.
     bool ws_client_send_pending;
     bool ws_upstream_send_pending;
     // Bytes submitted for the current tunnel send. A best-effort recv pause can

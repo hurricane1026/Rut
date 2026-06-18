@@ -1925,14 +1925,10 @@ bool ws_resume_client_recv(Loop* loop, Connection& conn) {
     return loop->submit_recv(conn);
 }
 
-inline bool ws_send_busy(const Connection& conn) {
-    return conn.ws_client_send_pending || conn.ws_upstream_send_pending;
-}
-
 template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.recv_buf.len() == 0) return true;
-    if (ws_send_busy(conn)) return ws_pause_client_recv(loop, conn);
+    if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
     const u32 kSendLen = conn.recv_buf.len();
     if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), kSendLen)) return false;
     conn.ws_client_send_pending = true;
@@ -1943,7 +1939,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
 template <typename Loop>
 bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
     if (conn.upstream_recv_buf.len() == 0) return true;
-    if (ws_send_busy(conn)) {
+    if (conn.ws_upstream_send_pending) {
         return ws_pause_upstream_recv(loop, conn);
     }
     const u32 kSendLen = conn.upstream_recv_buf.len();
