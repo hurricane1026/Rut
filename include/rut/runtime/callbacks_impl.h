@@ -2070,12 +2070,15 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
                    &on_ws_upstream_to_client_sent<Loop>,
                    &on_ws_upstream_recv<Loop>,
                    &on_ws_client_to_upstream_sent<Loop>);
-    loop->submit_recv(conn);
+    if (!loop->submit_recv(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
     if (conn.upstream_recv_buf.len() > 0) {
         if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
     } else {
         conn.upstream_recv_paused_for_send = false;
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
 #endif  // RUT_ENABLE_WEBSOCKET
