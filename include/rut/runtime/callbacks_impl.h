@@ -1894,6 +1894,25 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 // the paired send drains it) is ignored rather than treated as a close.
 
 template <typename Loop>
+bool ws_pause_client_recv(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+        return loop->pause_recv(conn);
+    } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid); }) {
+        loop->backend.pause_recv(conn.id);
+    }
+    return true;
+}
+
+template <typename Loop>
+void ws_pause_upstream_recv(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
+        loop->pause_upstream_recv(conn);
+    } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_upstream_recv(cid); }) {
+        loop->backend.pause_upstream_recv(conn.id);
+    }
+}
+
+template <typename Loop>
 void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result == -ENOBUFS) {
@@ -1903,7 +1922,7 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         // reset + submit_recv). State-aware like on_response_body_recvd: only
         // pause when truly full — a non-full -ENOBUFS is a stale completion.
         if (conn.recv_buf.write_avail() == 0) {
-            if constexpr (requires { loop->pause_recv(conn); }) loop->pause_recv(conn);
+            if (!ws_pause_client_recv(loop, conn)) loop->close_conn(conn);
         }
         return;
     }
@@ -1911,7 +1930,10 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len());
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len()) ||
+        !ws_pause_client_recv(loop, conn)) {
+        loop->close_conn(conn);
+    }
 }
 
 template <typename Loop>
@@ -1932,8 +1954,7 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         // upstream_recv_buf full while the paired upstream→client send drains it
         // (see on_ws_client_recv). Pause the upstream direction when truly full.
         if (conn.upstream_recv_buf.write_avail() == 0) {
-            if constexpr (requires { loop->pause_upstream_recv(conn); })
-                loop->pause_upstream_recv(conn);
+            ws_pause_upstream_recv(loop, conn);
         }
         return;
     }
@@ -1941,7 +1962,11 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len());
+    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len())) {
+        loop->close_conn(conn);
+        return;
+    }
+    ws_pause_upstream_recv(loop, conn);
 }
 
 template <typename Loop>

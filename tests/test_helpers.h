@@ -156,6 +156,11 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool submit_recv_upstream_impl(Connection& c) {
         return backend.add_recv_upstream(c.upstream_fd, c.id);
     }
+    bool pause_recv(Connection& c) {
+        backend.pause_recv(c.id);
+        return true;
+    }
+    void pause_upstream_recv_impl(Connection& c) { backend.pause_upstream_recv(c.id); }
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
         return backend.add_connect(c.upstream_fd, c.id, addr, addr_len);
     }

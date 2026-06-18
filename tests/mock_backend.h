@@ -15,7 +15,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // No real sockets, no syscalls, fully deterministic.
 
 struct MockOp {
-    enum Type : u8 { Accept, Recv, Send, Connect, Cancel, PauseRecv };
+    enum Type : u8 { Accept, Recv, Send, Connect, Cancel, PauseRecv, PauseUpstreamRecv };
     Type type;
     i32 fd;
     u32 conn_id;
@@ -97,6 +97,12 @@ struct MockBackend {
     void pause_recv(u32 conn_id, bool /*preserve_send_interest*/ = false) {
         if (op_count < kMaxOps) {
             ops[op_count++] = {MockOp::PauseRecv, -1, conn_id, nullptr, 0};
+        }
+    }
+
+    void pause_upstream_recv(u32 conn_id) {
+        if (op_count < kMaxOps) {
+            ops[op_count++] = {MockOp::PauseUpstreamRecv, -1, conn_id, nullptr, 0};
         }
     }
 

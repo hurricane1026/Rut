@@ -805,6 +805,41 @@ TEST(websocket, enobufs_pauses_not_closes) {
     CHECK_EQ(loop.conns[cid].fd, 42);  // still not closed
 }
 
+TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 client_bytes[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->recv_buf.write(client_bytes, sizeof(client_bytes)), sizeof(client_bytes));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 5));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+    CHECK_EQ(loop.backend.ops[1].conn_id, cid);
+
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    const u8 upstream_bytes[] = {'W', 'O', 'R', 'L', 'D'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(upstream_bytes, sizeof(upstream_bytes)),
+               sizeof(upstream_bytes));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 5));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[1].conn_id, cid);
+}
+
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
 // (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
 TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
