@@ -974,6 +974,81 @@ TEST(websocket, upstream_to_client_sent_resends_raced_bytes) {
     CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
 }
 
+// A client half-close (FIN) while its client→upstream send is still draining
+// must NOT truncate the last frame: defer the teardown until the send completes,
+// then close. Regression guard for the drain-before-close finding.
+TEST(websocket, client_half_close_defers_until_send_drains) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 bye[] = {'B', 'Y', 'E'};
+    REQUIRE_EQ(conn->recv_buf.write(bye, sizeof(bye)), sizeof(bye));
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 3));
+    REQUIRE(conn->ws_client_send_pending);
+
+    // FIN arrives while the BYE frame is still in flight to the upstream.
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 0));
+    CHECK(conn->ws_client_eof);
+    CHECK_EQ(loop.conns[cid].fd, 42);     // deferred, not closed
+    CHECK_EQ(loop.backend.op_count, 0u);  // no extra send (one already pending)
+
+    // The send completes; only now does the tunnel tear down.
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 3));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
+}
+
+// Symmetric guard for a backend half-close while its upstream→client send drains.
+TEST(websocket, backend_half_close_defers_until_send_drains) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 bye[] = {'B', 'Y', 'E'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(bye, sizeof(bye)), sizeof(bye));
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 3));
+    REQUIRE(conn->ws_upstream_send_pending);
+
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK(conn->ws_upstream_eof);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // deferred, not closed
+    CHECK_EQ(loop.backend.op_count, 0u);
+
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 3));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
+}
+
+// A backend that closes during the pre-tunnel 101 drain must defer teardown
+// (preserve buffered 101 bytes) rather than close mid-handshake.
+TEST(websocket, pre_tunnel_backend_close_defers) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_pre_tunnel_upstream_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK(conn->ws_pre_tunnel_upstream_closed);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed mid-handshake
+}
+
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
 // (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
 TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
@@ -6672,6 +6747,60 @@ TEST(epoll_loop, close_clears_partial_send_state) {
     CHECK_EQ(loop->backend.upstream_send_state[cid].fd, -1);
     CHECK(loop->backend.upstream_send_state[cid].src == nullptr);
 
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+// ws_unpoll_upstream must remove the upstream fd from the epoll set so a hung-up
+// backend (EPOLLHUP is delivered even with the interest mask zeroed) stops waking
+// the level-triggered loop during a slow pre-tunnel 101 drain. A control fd kept
+// readable guarantees wait() returns promptly instead of blocking on the -1
+// timeout, keeping the test from hanging.
+TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* up = loop->alloc_conn();
+    auto* ctl = loop->alloc_conn();
+    REQUIRE(up != nullptr);
+    REQUIRE(ctl != nullptr);
+    const u32 up_cid = up->id;
+
+    i32 ufds[2], cfds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, ufds) == 0);
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, cfds) == 0);
+    up->upstream_fd = ufds[0];
+    ctl->fd = cfds[0];
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], up_cid));
+    REQUIRE(loop->backend.add_recv(cfds[0], ctl->id));
+    close(ufds[1]);  // upstream peer closes → fd reports EPOLLHUP
+
+    loop->ws_unpoll_upstream(*up);
+
+    const u8 one = 'x';
+    REQUIRE(write(cfds[1], &one, 1) == 1);  // keep wait() non-blocking
+    IoEvent events[16];
+    u32 n = loop->backend.wait(events, 16, loop->conns, RealLoop::kMaxConns);
+    bool saw_upstream = false, saw_ctl = false;
+    for (u32 i = 0; i < n; i++) {
+        if (events[i].conn_id == up_cid && events[i].type == IoEventType::UpstreamRecv)
+            saw_upstream = true;
+        if (events[i].conn_id == ctl->id && events[i].type == IoEventType::Recv) saw_ctl = true;
+    }
+    CHECK(saw_ctl);        // wait() ran and returned the ready control fd
+    CHECK(!saw_upstream);  // the hung-up upstream fd was deregistered, no spin
+
+    // No-op when there is no upstream fd.
+    up->upstream_fd = -1;
+    loop->ws_unpoll_upstream(*up);
+
+    close(ufds[0]);
+    close(cfds[0]);
+    close(cfds[1]);
+    ctl->fd = -1;
+    loop->free_conn(*up);
+    loop->free_conn(*ctl);
     loop->shutdown();
     destroy_real_loop(loop);
 }

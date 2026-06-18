@@ -156,6 +156,13 @@ struct ConnectionBase {
     // Upstream closed during pre-tunnel 101 handling and should be closed once
     // tunnel mode is fully entered (after preserving buffered early bytes).
     bool ws_pre_tunnel_upstream_closed;
+    // A tunnel peer half-closed (FIN/EOF) while its paired send was still
+    // draining. Tear down only after the in-flight frame finishes flushing so
+    // the last frame is not truncated: ws_client_eof gates the client→upstream
+    // drain (on_ws_client_to_upstream_sent), ws_upstream_eof the upstream→client
+    // drain (on_ws_upstream_to_client_sent).
+    bool ws_client_eof;
+    bool ws_upstream_eof;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -363,6 +370,8 @@ struct ConnectionBase {
         ws_upstream_send_len = 0;
         ws_upgrade_response_len = 0;
         ws_pre_tunnel_upstream_closed = false;
+        ws_client_eof = false;
+        ws_upstream_eof = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

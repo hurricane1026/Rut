@@ -1938,6 +1938,16 @@ bool ws_resume_client_recv(Loop* loop, Connection& conn) {
     return loop->submit_recv(conn);
 }
 
+// Stop polling the upstream fd after the backend closes during the pre-tunnel
+// 101 drain. epoll-only: a hung-up fd keeps waking the level-triggered loop
+// even with its interest mask zeroed (no-op where the loop lacks the method).
+template <typename Loop>
+void ws_stop_upstream_poll(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_upstream(c); }) {
+        loop->ws_unpoll_upstream(conn);
+    }
+}
+
 template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.recv_buf.len() == 0) return true;
@@ -1978,6 +1988,17 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
+        // Client half-closed (FIN). If a client→upstream send is still draining
+        // or bytes remain buffered, don't truncate the last frame: defer the
+        // teardown until the send completes (on_ws_client_to_upstream_sent closes
+        // once recv_buf drains). Kick a send if none is in flight so the drain
+        // can make progress.
+        if (conn.ws_client_send_pending || conn.recv_buf.len() > 0) {
+            conn.ws_client_eof = true;
+            if (!conn.ws_client_send_pending && !ws_try_send_client_to_upstream(loop, conn))
+                loop->close_conn(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -1998,6 +2019,10 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
         return;
     }
+    if (conn.ws_client_eof) {  // client half-closed; last frame fully flushed
+        loop->close_conn(conn);
+        return;
+    }
     if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn))
         loop->close_conn(conn);
 }
@@ -2014,6 +2039,15 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
+        // Backend half-closed. Mirror on_ws_client_recv: flush an in-flight or
+        // buffered upstream→client frame before tearing down so the last frame
+        // is not truncated (on_ws_upstream_to_client_sent closes on drain).
+        if (conn.ws_upstream_send_pending || conn.upstream_recv_buf.len() > 0) {
+            conn.ws_upstream_eof = true;
+            if (!conn.ws_upstream_send_pending && !ws_try_send_upstream_to_client(loop, conn))
+                loop->close_conn(conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
@@ -2034,7 +2068,7 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
         return;
     }
-    if (conn.ws_pre_tunnel_upstream_closed) {
+    if (conn.ws_pre_tunnel_upstream_closed || conn.ws_upstream_eof) {
         loop->close_conn(conn);
         return;
     }
@@ -2057,6 +2091,10 @@ void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
     }
     if (ev.result <= 0) {
         conn.ws_pre_tunnel_upstream_closed = true;
+        // Stop polling the hung-up upstream fd so a slow 101 drain to the client
+        // doesn't spin the level-triggered loop on redelivered EPOLLHUP. The fd
+        // is still ::closed by close_conn once the tunnel is entered/torn down.
+        ws_stop_upstream_poll(loop, conn);
         return;
     }
     if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);

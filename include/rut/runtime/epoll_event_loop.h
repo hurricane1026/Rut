@@ -372,6 +372,16 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Stop polling the upstream fd without closing it (close_conn still ::closes
+    // it). epoll is level-triggered and delivers EPOLLHUP/EPOLLERR even with the
+    // interest mask zeroed, so a backend that closes during the pre-tunnel 101
+    // drain to a slow client would otherwise spin the loop redelivering the EOF.
+    // io_uring needs no equivalent (a cancelled recv does not re-fire), so this
+    // method is epoll-only and the WS callback reaches it via a requires-guard.
+    void ws_unpoll_upstream(Connection& c) {
+        if (c.upstream_fd >= 0) (void)backend.cancel(c.upstream_fd, c.id);
+    }
+
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;  // already allocated
         u8* s = pool.alloc();
