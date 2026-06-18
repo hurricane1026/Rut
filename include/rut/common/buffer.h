@@ -170,6 +170,16 @@ struct Buffer {
         len_ = n;
     }
 
+    void consume(u32 n) noexcept {
+        if (released_) __builtin_trap();
+        if (n >= len_) {
+            len_ = 0;
+            return;
+        }
+        __builtin_memmove(ptr_, ptr_ + n, len_ - n);
+        len_ -= n;
+    }
+
     // Read-only data pointer for kernel send() / zero-copy forwarding.
     // Traps if released — use View::data() for the released case.
     const u8* data() const noexcept {

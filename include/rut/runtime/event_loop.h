@@ -78,10 +78,14 @@ public:
     // upstream data can't drive the pipeline past the pause; on submission-based
     // backends (io_uring) simply not re-arming the recv is enough, so this is a
     // no-op there. submit_recv_upstream re-arms on resume.
-    void pause_upstream_recv(Connection& c) {
-        if constexpr (requires { self().pause_upstream_recv_impl(c); }) {
+    bool pause_upstream_recv(Connection& c) {
+        if constexpr (requires { static_cast<bool>(self().pause_upstream_recv_impl(c)); }) {
+            return static_cast<bool>(self().pause_upstream_recv_impl(c));
+        } else if constexpr (requires { self().pause_upstream_recv_impl(c); }) {
             self().pause_upstream_recv_impl(c);
+            return true;
         }
+        return true;
     }
 
     // Per-event-type dispatch: route to typed slot.

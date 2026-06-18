@@ -247,6 +247,9 @@ struct ConnectionBase {
     // True when code asked to recv during a send-wait pause window and the
     // read should be re-armed after the cancel CQE drains.
     bool recv_pause_rearm_pending;
+    bool upstream_recv_paused_for_send;
+    bool upstream_recv_pause_cancel_pending;
+    bool upstream_recv_pause_rearm_pending;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -386,6 +389,9 @@ struct ConnectionBase {
         recv_paused_for_send = false;
         recv_pause_cancel_pending = false;
         recv_pause_rearm_pending = false;
+        upstream_recv_paused_for_send = false;
+        upstream_recv_pause_cancel_pending = false;
+        upstream_recv_pause_rearm_pending = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;

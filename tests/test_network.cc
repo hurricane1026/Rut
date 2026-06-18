@@ -4574,10 +4574,21 @@ TEST(streaming, _101_not_skipped) {
     // The idle-timeout exemption starts only after the 101 reaches the client.
     CHECK(!conn->is_ws_tunnel);
     REQUIRE(conn->on_send != nullptr);
+    REQUIRE(conn->on_upstream_recv != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamRecv, 5));
+    CHECK(!conn->is_ws_tunnel);
     loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    loop.backend.op_count = 0;
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK(conn->is_ws_tunnel);
+    REQUIRE_EQ(loop.backend.op_count, 3u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].send_len, 5u);
+    CHECK_EQ(loop.backend.ops[2].type, MockOp::PauseUpstreamRecv);
 #else
     // Without the WS feature: no CL/chunked/keep-alive → UntilClose (streaming).
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
