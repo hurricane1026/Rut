@@ -11,6 +11,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/prometheus.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
@@ -172,6 +173,113 @@ void respond_upstream_timeout(Loop* loop, Connection& conn);
 
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn);
+
+// Client send with @throttle token-bucket accounting. With no per-route throttle
+// (bps == 0) this is just loop->submit_send. Otherwise it advances the
+// connection's virtual-time bucket `throttle_tat_ns` by len × ns_per_byte
+// (anchored to now so an idle bucket doesn't bank credit). The actual pacing
+// happens on the proxy *read* side (throttle_pause_before_pump): pacing the
+// upstream read lets TCP flow control backpressure the backend, and sending whole
+// buffers as produced keeps the downstream path simple and never splits a send.
+// Single-writer per shard, so the bucket needs no atomics.
+template <typename Loop>
+bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
+    if (conn.throttle_down_bps != 0) {
+        const u64 kNowNs = monotonic_ns();
+        const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
+        // Advance the bucket by the time `len` bytes "should" take: len/bps
+        // seconds, in ns. Compute len*1e9/bps at full precision per chunk rather
+        // than from a precomputed ns-per-byte — the latter (1e9/bps) truncates to
+        // 0 for bps >= 1e9, which would silently disable throttling above ~1 GB/s
+        // (and clamping it to 1 would silently cap every faster rate at 1 GB/s).
+        // len*1e9 <= ~4.3e18 for u32 len, well within u64; one divide per throttled
+        // chunk is negligible on an already-rate-limited path.
+        conn.throttle_tat_ns =
+            kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
+    }
+    return loop->submit_send(conn, buf, len);
+}
+
+// @throttle read-side gate for the proxy body pump. Called at each point where
+// the proxy would read the next upstream chunk. If the token bucket has run ahead
+// of real time (the bytes sent so far "should" take until throttle_tat_ns at the
+// configured rate), disarm the upstream recv — so level-triggered epoll readiness
+// can't drive the pipeline past the pause — park the connection on the per-shard
+// *precise* timer for exactly the deficit, and return true so the caller returns
+// without pumping. throttle_resume re-checks and re-arms when the budget recovers.
+template <typename Loop>
+bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remaining) {
+    if (conn.throttle_down_bps == 0) return false;
+    const u64 kNowNs = monotonic_ns();
+    if (conn.throttle_tat_ns <= kNowNs) return false;  // not ahead → budget available
+    const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
+    conn.throttle_paused = true;
+    conn.throttle_pending_len = pending_remaining;  // stash for resume
+    if constexpr (requires { loop->pause_upstream_recv(conn); }) {
+        loop->pause_upstream_recv(conn);
+    }
+    // Arm the per-shard precise (sub-second) timer for the exact deficit. If the
+    // loop can't (heap full / no support), fall back to the 1-second keepalive
+    // wheel — throttle_resume re-checks the budget, so a coarse/early wake is safe.
+    bool armed = false;
+    if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
+        armed = loop->arm_throttle_timer(conn, kDelayNs);
+    }
+    if (!armed) {
+        if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
+            loop->timer.refresh(&conn, 1u);
+        }
+    }
+    return true;
+}
+
+// Resume the proxy body pump parked by throttle_pause_before_pump (invoked from
+// the per-shard precise timer or the keepalive wheel). Re-check the bucket: if it
+// is still ahead of real time (the timer fired early, or a coarse wheel tick), the
+// budget hasn't recovered yet — re-park for the remaining deficit. Otherwise
+// replay the buffered upstream bytes or re-arm the upstream recv.
+template <typename Loop>
+void throttle_resume(Loop* loop, Connection& conn) {
+    if (conn.throttle_down_bps != 0) {
+        const u64 kNowNs = monotonic_ns();
+        if (conn.throttle_tat_ns > kNowNs) {
+            // Budget not recovered yet — re-park for the remaining deficit.
+            const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
+            bool armed = false;
+            if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
+                armed = loop->arm_throttle_timer(conn, kDelayNs);
+            }
+            if (!armed) {
+                if constexpr (requires { loop->timer.refresh(&conn, 1u); }) {
+                    loop->timer.refresh(&conn, 1u);
+                }
+            }
+            return;  // stay paused
+        }
+    }
+    conn.throttle_paused = false;
+    const u32 kRemaining = conn.throttle_pending_len;
+    conn.throttle_pending_len = 0;
+    if (kRemaining > 0) {
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
+    } else {
+        loop->submit_recv_upstream(conn);
+    }
+}
+
+// Release the upstream concurrency slot taken at proxy dispatch, exactly once.
+// Called on clean completion (promptly, so keep-alive connections free the slot
+// without waiting for close) and from close_conn (the catch-all for failures and
+// non-keep-alive completion) — the held flag makes the second call a no-op.
+template <typename Loop>
+void release_upstream_slot(Loop* loop, Connection& conn) {
+    if (!conn.upstream_slot_held) return;
+    conn.upstream_slot_held = false;
+    if constexpr (requires { loop->upstream_release(conn.upstream_slot_uid); }) {
+        loop->upstream_release(conn.upstream_slot_uid);
+    }
+}
 
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
@@ -343,7 +451,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn, 403, /*keep_alive=*/false);
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
 
@@ -406,9 +514,88 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
     }
 
+    // Per-route rate limit (fixed window). Enforced after route match, before
+    // dispatch. A route may stack several rules; a request must pass every one,
+    // each metered by its own key tuple (IP / header / query / cookie / param;
+    // empty = per-client-IP). The limiter is per-shard (one thread each), so a
+    // thread_local table needs no atomics — same rationale as the parse cache.
+    if (route && route->rate_limit.count > 0 && config) {
+        static thread_local RateLimiter rate_limiter{};
+        const u32 kRouteIdx = static_cast<u32>(route - config->routes);
+        const u64 kNowUs = monotonic_us();
+        u32 path_len = 0;
+        while (path_len < Connection::kMaxReqPathLen && conn.req_path[path_len] != '\0') path_len++;
+        RateLimitKeyInput key_in;
+        key_in.peer_addr = conn.peer_addr;
+        key_in.req_buf = conn.recv_buf.data();
+        key_in.req_header_end = conn.req_header_end;
+        key_in.path = conn.req_path;
+        key_in.path_len = path_len;
+        key_in.params = route_params;
+        key_in.param_count = route_param_count;
+        // Global-scope rules go to the process-shared GlobalRateLimiter (exact
+        // cluster-wide cap); shard-scope rules use this shard's thread_local
+        // table. If no shared limiter is wired (e.g. a minimal embedding), a
+        // global rule degrades to per-shard.
+        GlobalRateLimiter* grl = nullptr;
+        if constexpr (requires { loop->global_rl; }) grl = loop->global_rl;
+        bool over_limit = false;
+        for (u32 ri = 0; ri < route->rate_limit.count; ri++) {
+            const RateLimitRule& rule = route->rate_limit.rules[ri];
+            // Fold the rule index into the key scope so stacked rules never share
+            // a counter even when their key components overlap.
+            const u32 kScope = kRouteIdx * kMaxRateLimitRules + ri;
+            const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
+            const bool kOk =
+                (rule.scope == RateLimitScope::Global && grl != nullptr)
+                    ? grl->allow_key(kKey, rule.emit_interval_us, rule.tau_us, kNowUs)
+                    : rate_limiter.allow_key(kKey, rule.emit_interval_us, rule.tau_us, kNowUs);
+            if (!kOk) {
+                over_limit = true;
+                break;
+            }
+        }
+        if (over_limit) {
+            conn.resp_status = 429;
+            format_static_response(conn, 429, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
+    }
+
+    // @throttle: arm per-connection downstream pacing for this request's response
+    // (0 = unthrottled). The token bucket starts empty (tat = 0 ⇒ the first chunk
+    // goes immediately, then paced). client_send advances tat by len*1e9/bps at
+    // full precision (see there) — there is no precomputed ns-per-byte, which
+    // would round to 0 and silently disable throttling for rates >= ~1 GB/s.
+    conn.throttle_down_bps = route ? route->throttle_down_bps : 0;
+    conn.throttle_tat_ns = 0;
+
     if (route && route->action == RouteAction::Proxy) {
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
+        // Upstream concurrency cap: if the backend is already at its in-flight
+        // limit, shed this request with 503 before opening a connection to it.
+        // Otherwise take a slot, released on every exit path (completion via
+        // release_upstream_slot at body-done; failure/close via close_conn).
+        if (target.max_inflight != 0) {
+            bool acquired = true;
+            if constexpr (requires { loop->upstream_acquire(route->upstream_id, 1u); }) {
+                acquired = loop->upstream_acquire(route->upstream_id, target.max_inflight);
+            }
+            if (!acquired) {
+                conn.resp_status = 503;
+                format_static_response(conn, 503, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
+            conn.upstream_slot_held = true;
+            conn.upstream_slot_uid = route->upstream_id;
+        }
         for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
             conn.upstream_name[i] = target.name[i];
         if (target.name_len < sizeof(conn.upstream_name))
@@ -421,7 +608,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             format_static_response(conn, 502, false);
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
-            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
         conn.upstream_fd = kUpstreamFd;
@@ -441,14 +628,14 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             format_static_response(conn, 502, false);
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
-            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
     } else if (route && route->action == RouteAction::Static) {
         conn.resp_status = route->status_code;
         format_static_response(conn, route->status_code, kKeepAlive);
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
         if (route->needs_req_body) {
             if (conn.req_body_mode == BodyMode::Chunked) {
@@ -456,7 +643,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 format_static_response(conn, 400, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
             if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) {
@@ -490,7 +677,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
                                 kResponse200CloseLen);
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     }
 }
 
@@ -583,7 +770,7 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
         const u32 kRemaining = kSendLen - conn.send_progress;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining);
+        client_send(loop, conn, conn.send_buf.data() + conn.send_progress, kRemaining);
         return;
     }
 
@@ -648,7 +835,7 @@ void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
 
         const u32 kRemaining = kSendLen - conn.send_progress;
         conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining);
+        client_send(loop, conn, conn.send_buf.data() + conn.send_progress, kRemaining);
         return;
     }
 
@@ -739,7 +926,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, outcome.status_code, keep_alive);
             }
             conn.transition_to_sending(&on_response_sent<Loop>);
-            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
         case JitDispatchOutcome::Kind::TimerYield: {
@@ -769,7 +956,7 @@ void handle_jit_outcome(Loop* loop,
             // on_response_sent's normal dispatch refresh would eventually
             // cover it, but only if the Send CQE arrives.
             loop->timer.add(&conn, loop->keepalive_timeout);
-            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
         case JitDispatchOutcome::Kind::EventYield: {
@@ -783,7 +970,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             };
             auto send_internal_error = [&]() {
                 conn.pending_handler_fn = nullptr;
@@ -791,7 +978,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, 500, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             };
             auto upstream_target_matches = [&]() {
                 if (conn.upstream_fd < 0) return false;
@@ -813,7 +1000,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
-                if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
+                if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len())) {
                     // The send couldn't be queued (io_uring add_send returns
                     // false under SQ pressure), so no Send completion will ever
                     // arrive to call on_jit_wait_send_sent and resume the
@@ -848,7 +1035,7 @@ void handle_jit_outcome(Loop* loop,
                     format_static_response(conn, 502, /*keep_alive=*/false);
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
                 }
                 auto& target = config->upstreams[upstream_id];
@@ -859,7 +1046,7 @@ void handle_jit_outcome(Loop* loop,
                     format_static_response(conn, 502, /*keep_alive=*/false);
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                     return;
                 }
                 if (conn.upstream_fd >= 0) {
@@ -984,11 +1171,32 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
             conn.state = ConnState::Proxying;
             auto& target = config->upstreams[outcome.upstream_id];
+            // Upstream concurrency cap — same as the direct RouteAction::Proxy
+            // path (a `return forward(...)` JIT route must honor max_inflight too,
+            // or JIT-implemented routes could exceed the backend's in-flight cap).
+            // Shed with 503 before connecting; slot released on every exit via
+            // close_conn's catch-all (or release_upstream_slot at body-done).
+            if (target.max_inflight != 0) {
+                bool acquired = true;
+                if constexpr (requires { loop->upstream_acquire(outcome.upstream_id, 1u); }) {
+                    acquired = loop->upstream_acquire(outcome.upstream_id, target.max_inflight);
+                }
+                if (!acquired) {
+                    conn.resp_status = 503;
+                    format_static_response(conn, 503, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                conn.upstream_slot_held = true;
+                conn.upstream_slot_uid = outcome.upstream_id;
+            }
             for (u32 i = 0; i < sizeof(conn.upstream_name) && i < target.name_len; i++)
                 conn.upstream_name[i] = target.name[i];
             if (target.name_len < sizeof(conn.upstream_name))
@@ -1009,7 +1217,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
             conn.upstream_fd = kUpstreamFd;
@@ -1032,7 +1240,7 @@ void handle_jit_outcome(Loop* loop,
             format_static_response(conn, 500, /*keep_alive=*/false);
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
-            loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
     }
 }
@@ -1199,7 +1407,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
 
@@ -1317,6 +1525,7 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
     const u32 kRemaining = consume_upstream_sent(conn);
+    if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
     if (kRemaining > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
@@ -1330,6 +1539,21 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        // -ENOBUFS is the backend's "recv buffer full, couldn't read" signal, not
+        // a terminal error: it surfaces when a downstream send is still draining
+        // the buffer (e.g. a throttled burst the client hasn't consumed yet) while
+        // the level-triggered upstream fd reports more data. The event is built at
+        // backend-recv time and may be processed after the buffer state changed, so
+        // act on the *current* state: if the buffer is still full a downstream send
+        // is draining it and on_response_body_sent is guaranteed to re-arm the
+        // upstream recv — disarm now to avoid spinning on the level-triggered fd.
+        // If the buffer already has space the event is stale (the send completed
+        // and the pump already re-armed or @throttle-paused); leave that state
+        // untouched so we neither undo a re-arm nor undo a pause.
+        if (ev.result == -ENOBUFS) {
+            if (conn.upstream_recv_buf.write_avail() == 0) loop->pause_upstream_recv(conn);
+            return;
+        }
         if (conn.resp_body_mode == BodyMode::UntilClose) {
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
             loop->epoch_leave();
@@ -1369,7 +1593,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     conn.resp_body_sent += send_len;
     conn.upstream_send_len = send_len;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
-    loop->submit_send(conn, conn.upstream_recv_buf.data(), send_len);
+    client_send(loop, conn, conn.upstream_recv_buf.data(), send_len);
 }
 
 template <typename Loop>
@@ -1393,6 +1617,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (body_done) {
         conn.upstream_recv_buf.reset();
+        release_upstream_slot(loop, conn);  // free the backend slot promptly
 
         on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
         loop->epoch_leave();
@@ -1448,6 +1673,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
+    if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
     if (kRemaining > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(lp, conn, synth);
@@ -1700,7 +1926,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
     conn.resp_status = resp.status_code;
@@ -1782,7 +2008,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
             if (kChunkStatus == ChunkStatus::NeedMore) break;
@@ -1849,7 +2075,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     conn.transition_to_sending(&on_response_sent<Loop>);
                 }
                 conn.upstream_send_len = conn.upstream_recv_buf.len();
-                loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
             }
         }
@@ -1883,10 +2109,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     if (body_complete) {
         conn.transition_to_sending(&on_proxy_response_sent<Loop>);
-        loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
+        client_send(loop, conn, conn.upstream_recv_buf.data(), initial_send_len);
     } else {
         conn.transition_to_sending(&on_response_header_sent<Loop>);
-        loop->submit_send(conn, conn.upstream_recv_buf.data(), initial_send_len);
+        client_send(loop, conn, conn.upstream_recv_buf.data(), initial_send_len);
     }
 }
 

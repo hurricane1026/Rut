@@ -6,6 +6,7 @@
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_canon.h"   // canonicalize_request
 #include "rut/runtime/route_select.h"  // path_has_param_segment
@@ -36,6 +37,10 @@ struct UpstreamTarget {
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
     u32 name_len;
+    // Max concurrent in-flight proxied requests to this backend (0 = unlimited).
+    // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
+    // cap the runtime answers 503 before connecting.
+    u32 max_inflight = 0;
 
     void set_name(const char* n) {
         name_len = 0;
@@ -80,6 +85,15 @@ struct RouteEntry {
     u16 status_code;              // status code (if action == Static, e.g., 200, 404)
     jit::HandlerFn fn = nullptr;  // JIT-compiled handler (if action == JitHandler)
     bool needs_req_body = false;  // JIT handler reads req.body and needs the full body buffered
+    // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
+    // allows `max` requests per `window_sec` metered by its own key (IP / header
+    // / query / cookie / param tuple; empty key = per-client-IP). A request must
+    // pass every rule, so stacked rules (one per @rateLimit) give different caps
+    // per dimension — e.g. anonymous per-IP plus a higher per-API-key cap.
+    RateLimitRuleSet rate_limit{};
+    // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
+    // paces the response so it isn't sent faster than this.
+    u32 throttle_down_bps = 0;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -414,6 +428,61 @@ struct RouteConfig {
             return false;  // active dispatch at capacity — fail loud
         }
         route_count++;
+        return true;
+    }
+
+    // Set a route's rate limit to a single token-bucket rule (`max` per
+    // `window_sec`, burst capacity defaulting to `max`, per-client-IP key),
+    // replacing any existing rules. 0/0 leaves the route unlimited. Returns false
+    // on a bad index. For stacked rules use add_route_rate_limit_rule; refine the
+    // key with add_route_rate_limit_key.
+    bool set_route_rate_limit(u32 idx, u32 max, u32 window_sec) {
+        if (idx >= route_count) return false;
+        routes[idx].rate_limit = RateLimitRuleSet{};
+        if (max > 0 && window_sec > 0) routes[idx].rate_limit.add_rule(max, window_sec);
+        return true;
+    }
+
+    // Append an additional rate-limit rule to a route (stacking): a request must
+    // pass every rule. `scope` selects per-shard (default) or exact global; `burst`
+    // is the bucket capacity (0 → defaults to `max`). Returns false on a bad index
+    // or when the rule set is full.
+    bool add_route_rate_limit_rule(u32 idx,
+                                   u32 max,
+                                   u32 window_sec,
+                                   RateLimitScope scope = RateLimitScope::Shard,
+                                   u32 burst = 0) {
+        if (idx >= route_count) return false;
+        return routes[idx].rate_limit.add_rule(max, window_sec, burst, scope) >= 0;
+    }
+
+    // Append one metering-key component to a route's *most recently added* rule
+    // (IP / header / query / cookie / param). With no components a rule meters
+    // per client IP; each appended component adds a dimension, so it counts per
+    // unique tuple. `name` is ignored for Ip. Returns false on a bad index, when
+    // the route has no rule yet, or when that rule's key is already full.
+    bool add_route_rate_limit_key(u32 idx, RateLimitKeyKind kind, const char* name, u32 name_len) {
+        if (idx >= route_count) return false;
+        RateLimitRuleSet& rs = routes[idx].rate_limit;
+        if (rs.count == 0) return false;
+        return rs.rules[rs.count - 1].key.add(kind, name, name_len);
+    }
+
+    // Attach a per-route client-send byte rate (bytes/sec, 0 disables). Set by
+    // the @throttle decorator via register_jit_routes. Returns false on a bad
+    // index.
+    bool set_route_throttle(u32 idx, u32 down_bps) {
+        if (idx >= route_count) return false;
+        routes[idx].throttle_down_bps = down_bps;
+        return true;
+    }
+
+    // Cap concurrent in-flight proxied requests to an upstream (by id). 0 =
+    // unlimited. Over the cap the runtime answers 503 before connecting. Returns
+    // false on a bad upstream id.
+    bool set_upstream_max_inflight(u32 uid, u32 max_inflight) {
+        if (uid >= upstream_count) return false;
+        upstreams[uid].max_inflight = max_inflight;
         return true;
     }
 

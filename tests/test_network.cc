@@ -4,10 +4,12 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -679,6 +681,99 @@ TEST(proxy, client_send_error) {
     inject_upstream_response(loop, *conn);
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -32));  // client EPIPE
     CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+// Regression (#127 round-2 review): @throttle must keep pacing at high bandwidth.
+// The old code precomputed ns_per_byte = 1e9/bps, which truncates to 0 for
+// bps >= 1e9 and silently disabled throttling above ~1 GB/s (clamping it to 1
+// would instead silently cap every faster rate at 1 GB/s). client_send now
+// advances the bucket by len*1e9/bps at full precision, so even a 2 GB/s cap
+// yields a non-zero, correct per-chunk deficit.
+TEST(throttle, high_bandwidth_still_paces) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    conn->throttle_down_bps = 2'000'000'000u;  // 2 GB/s — old precompute → 0 ns/byte
+    conn->throttle_tat_ns = 0;
+    u8 buf[8] = {0};              // mock backend records ptr+len, never reads bytes
+    const u32 kLen = 1'000'000u;  // 1 MB
+    const u64 kBefore = rut::monotonic_ns();
+    client_send(&loop, *conn, buf, kLen);
+
+    // Expected per-chunk advance: len/bps = 1e6 / 2e9 s = 500us = 500'000 ns,
+    // anchored to now. With the old precompute tat stays 0 → this deficit is
+    // either 0 or a huge unsigned underflow, failing both bounds.
+    const u64 kDeficit = conn->throttle_tat_ns - kBefore;
+    CHECK(kDeficit >= 450'000u);
+    CHECK(kDeficit <= 700'000u);
+}
+
+// Exercises the @throttle read-side gate branches (throttle_pause_before_pump /
+// throttle_resume) that the timing-based e2e doesn't reach: disabled/not-ahead
+// early-outs, the park path + arm-timer fallback (SmallLoop has no
+// arm_throttle_timer → the keepalive-wheel fallback runs), re-park on an early
+// resume, and the budget-recovered resume that re-arms the upstream recv.
+TEST(throttle, pause_resume_gate_branches) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    // Disabled (bps == 0) → no gate.
+    conn->throttle_down_bps = 0;
+    conn->throttle_tat_ns = 0;
+    CHECK(!throttle_pause_before_pump(&loop, *conn, 0u));
+
+    // Enabled but bucket not ahead of now → budget available, no park.
+    conn->throttle_down_bps = 1'000'000u;  // 1 MB/s
+    conn->throttle_tat_ns = 0;
+    CHECK(!throttle_pause_before_pump(&loop, *conn, 0u));
+    CHECK(!conn->throttle_paused);
+
+    // Bucket far ahead → park (arms the wheel fallback since SmallLoop lacks
+    // arm_throttle_timer) and stash the pending length.
+    conn->throttle_tat_ns = rut::monotonic_ns() + 500'000'000ull;  // +500ms
+    CHECK(throttle_pause_before_pump(&loop, *conn, 1234u));
+    CHECK(conn->throttle_paused);
+    CHECK_EQ(conn->throttle_pending_len, 1234u);
+
+    // Resume while the bucket is still ahead → re-park, stay paused.
+    throttle_resume(&loop, *conn);
+    CHECK(conn->throttle_paused);
+
+    // Budget recovered (tat in the past), nothing buffered → resume re-arms the
+    // upstream recv and clears the pause.
+    conn->throttle_tat_ns = 0;
+    conn->throttle_pending_len = 0;
+    throttle_resume(&loop, *conn);
+    CHECK(!conn->throttle_paused);
+
+    // Budget recovered WITH buffered bytes → resume replays them through the
+    // proxy body handler (the kRemaining > 0 branch). upstream_recv_buf is empty,
+    // so the handler re-parses and re-arms harmlessly; we only exercise the path.
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->throttle_paused = true;
+    conn->throttle_tat_ns = 0;
+    conn->throttle_pending_len = 8;
+    throttle_resume(&loop, *conn);
+    CHECK(!conn->throttle_paused);
+}
+
+// A rate-limit rule with max==0 / window==0 is "disabled" (emit_interval_us 0),
+// exercising RateLimitRuleSet::add_rule's else branch. The @rateLimit DSL rejects
+// limit:0, but the programmatic setter accepts it (defensive).
+TEST(rate_limit, disabled_rule_zero_max) {
+    rut::RateLimitRuleSet rs{};
+    const i32 idx =
+        rs.add_rule(/*max=*/0, /*window_sec=*/60, /*burst=*/0, rut::RateLimitScope::Shard);
+    REQUIRE_EQ(idx, 0);
+    CHECK_EQ(rs.count, 1u);
+    CHECK_EQ(rs.rules[0].emit_interval_us, 0u);  // disabled
+    CHECK_EQ(rs.rules[0].tau_us, 0u);
 }
 
 // Two proxy cycles on same connection (keep-alive)
@@ -1495,6 +1590,180 @@ TEST(route, static_response) {
     REQUIRE(r != nullptr);
     CHECK_EQ(r->action, RouteAction::Static);
     CHECK_EQ(r->status_code, 200u);
+}
+
+TEST(rate_limit, token_bucket_gcra) {
+    using namespace rut;
+    RateLimiter rl{};  // zero-init = empty bucket for every key
+    const u64 kKey = 0x0100007F;
+    const u64 kEmit = 10, kTau = 20;  // 1 token / 10µs, burst capacity 3
+    // A fresh bucket admits a burst of 3 at the same instant t=1000.
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 1
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 2
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 3
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1000));  // 4 → burst exhausted
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1005));  // still too soon
+    // After one emit interval elapses, one token frees up — then no more.
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1010));
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1010));
+    // A different key has an independent bucket.
+    CHECK(rl.allow_key(0x0200007F, kEmit, kTau, 1005));
+    // emit==0 disables (always allowed).
+    CHECK(rl.allow_key(kKey, 0, 0, 1000));
+}
+
+TEST(global_rate_limit, token_bucket_shared) {
+    using namespace rut;
+    GlobalRateLimiter rl{};
+    rl.reset();
+    const u64 kKey = 0xABCDEF12;
+    const u64 kEmit = 10, kTau = 20;                // burst 3, one bucket shared across "shards"
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 1
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 2 (different shard, same key)
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1000));   // 3
+    CHECK(!rl.allow_key(kKey, kEmit, kTau, 1000));  // 4 → over the shared burst
+    CHECK(rl.allow_key(kKey, kEmit, kTau, 1010));   // one token refilled after 10µs
+    CHECK(rl.allow_key(0x99, kEmit, kTau, 1000));   // a different key is independent
+    CHECK(rl.allow_key(kKey, 0, 0, 1000));          // emit==0 disables
+}
+
+TEST(upstream_concurrency, gauge_acquire_release) {
+    using namespace rut;
+    UpstreamConcurrency cc{};
+    cc.reset();
+    // Cap 2 on upstream 0: two acquires succeed, the third is shed.
+    CHECK(cc.try_acquire(0, 2));
+    CHECK(cc.try_acquire(0, 2));
+    CHECK(!cc.try_acquire(0, 2));  // at capacity
+    cc.release(0);                 // one completes
+    CHECK(cc.try_acquire(0, 2));   // slot freed
+    CHECK(!cc.try_acquire(0, 2));
+    CHECK(cc.try_acquire(1, 2));  // a different upstream is independent
+    CHECK(cc.try_acquire(0, 0));  // max == 0 → unlimited
+    CHECK(cc.try_acquire(0, 0));
+}
+
+TEST(route, set_upstream_max_inflight) {
+    using namespace rut;
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, 8080);
+    REQUIRE(id.has_value());
+    CHECK(cfg.set_upstream_max_inflight(id.value(), 16));
+    CHECK_EQ(cfg.upstreams[id.value()].max_inflight, 16u);
+    CHECK(!cfg.set_upstream_max_inflight(99, 1));  // bad upstream id
+}
+
+TEST(route, set_route_rate_limit) {
+    using namespace rut;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    CHECK(cfg.set_route_rate_limit(0, 100, 60));
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].max, 100u);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].window_sec, 60u);
+    CHECK(!cfg.set_route_rate_limit(99, 1, 1));  // bad index
+}
+
+// Build a RateLimitKeyInput over a fixed raw request for extractor tests.
+static rut::RateLimitKeyInput make_key_input(const char* raw,
+                                             const char* path,
+                                             const rut::RouteParam* params,
+                                             rut::u32 param_count) {
+    using namespace rut;
+    RateLimitKeyInput in;
+    in.peer_addr = 0x0100007F;
+    in.req_buf = reinterpret_cast<const u8*>(raw);
+    u32 n = 0;
+    while (raw[n]) n++;
+    // header_end = offset past the final CRLFCRLF (here the whole string ends in it).
+    in.req_header_end = n;
+    in.path = path;
+    u32 pl = 0;
+    while (path[pl]) pl++;
+    in.path_len = pl;
+    in.params = params;
+    in.param_count = param_count;
+    return in;
+}
+
+TEST(rate_limit_key, extractors) {
+    using namespace rut;
+    using namespace rut::rl_detail;
+    const char* raw =
+        "GET /p?uid=42&x=9 HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "X-API-Key: abc123\r\n"
+        "Cookie: sid=zzz; tenant=acme\r\n"
+        "\r\n";
+    RouteParam params[1] = {{"id", 2, "777", 3}};
+    RateLimitKeyInput in = make_key_input(raw, "/p?uid=42&x=9", params, 1);
+
+    CHECK(header_value(in, "X-API-Key", 9).eq(Str{"abc123", 6}));
+    CHECK(header_value(in, "x-api-key", 9).eq(Str{"abc123", 6}));  // case-insensitive
+    CHECK(header_value(in, "Host", 4).eq(Str{"example.com", 11}));
+    CHECK(header_value(in, "Missing", 7).empty());
+    CHECK(query_value(in, "uid", 3).eq(Str{"42", 2}));
+    CHECK(query_value(in, "x", 1).eq(Str{"9", 1}));
+    CHECK(query_value(in, "nope", 4).empty());
+    CHECK(cookie_value(in, "sid", 3).eq(Str{"zzz", 3}));
+    CHECK(cookie_value(in, "tenant", 6).eq(Str{"acme", 4}));
+    CHECK(param_value(in, "id", 2).eq(Str{"777", 3}));
+}
+
+TEST(rate_limit_key, composition) {
+    using namespace rut;
+    const char* raw1 = "GET /p HTTP/1.1\r\nX-User: alice\r\n\r\n";
+    const char* raw2 = "GET /p HTTP/1.1\r\nX-User: bob\r\n\r\n";
+    RateLimitKeyInput a = make_key_input(raw1, "/p", nullptr, 0);
+    RateLimitKeyInput b = make_key_input(raw2, "/p", nullptr, 0);
+
+    // No components → keys by IP; same IP → same key, different IP → different.
+    CHECK_EQ(rate_limit_key(0, nullptr, 0, a), rate_limit_key(0, nullptr, 0, a));
+    RateLimitKeyInput a2 = a;
+    a2.peer_addr = 0x0200007F;
+    CHECK(rate_limit_key(0, nullptr, 0, a) != rate_limit_key(0, nullptr, 0, a2));
+
+    // Header component: same header value → same bucket, different → different.
+    RateLimitKeyComponent hdr[1];
+    hdr[0].kind = RateLimitKeyKind::Header;
+    hdr[0].set_name("X-User", 6);
+    CHECK_EQ(rate_limit_key(0, hdr, 1, a), rate_limit_key(0, hdr, 1, a));
+    CHECK(rate_limit_key(0, hdr, 1, a) != rate_limit_key(0, hdr, 1, b));
+    // ...and keying by header ignores IP (alice from either IP shares a bucket).
+    RateLimitKeyInput a_otherip = a;
+    a_otherip.peer_addr = 0x0900007F;
+    CHECK_EQ(rate_limit_key(0, hdr, 1, a), rate_limit_key(0, hdr, 1, a_otherip));
+
+    // Composite [ip, header]: each (ip, user) combination is its own bucket.
+    RateLimitKeyComponent combo[2];
+    combo[0].kind = RateLimitKeyKind::Ip;
+    combo[1].kind = RateLimitKeyKind::Header;
+    combo[1].set_name("X-User", 6);
+    CHECK(rate_limit_key(0, combo, 2, a) != rate_limit_key(0, combo, 2, a_otherip));  // diff ip
+    CHECK(rate_limit_key(0, combo, 2, a) != rate_limit_key(0, combo, 2, b));          // diff user
+    CHECK_EQ(rate_limit_key(0, combo, 2, a), rate_limit_key(0, combo, 2, a));
+
+    // Different route → different key (route folded in).
+    CHECK(rate_limit_key(0, hdr, 1, a) != rate_limit_key(1, hdr, 1, a));
+}
+
+TEST(route, add_route_rate_limit_key) {
+    using namespace rut;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    CHECK(cfg.set_route_rate_limit(0, 100, 60));
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Ip, nullptr, 0));
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
+    const auto& k0 = cfg.routes[0].rate_limit.rules[0].key;
+    CHECK_EQ(k0.count, 2u);
+    CHECK(k0.comps[1].kind == RateLimitKeyKind::Header);
+    CHECK_EQ(k0.comps[1].name_len, 9u);
+    // Fills to capacity then rejects.
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Query, "a", 1));
+    CHECK(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Cookie, "b", 1));
+    CHECK(!cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Param, "c", 1));    // full (max 4)
+    CHECK(!cfg.add_route_rate_limit_key(99, RateLimitKeyKind::Ip, nullptr, 0));  // bad index
 }
 
 TEST(route, empty_config_no_match) {
@@ -8118,6 +8387,85 @@ TEST(legacy_loop, alloc_upstream_buf) {
     CHECK(loop->alloc_upstream_buf(*c));
 
     loop->free_conn(*c);
+    loop->shutdown();
+}
+
+static void legacy_noop_recv_cb(void*, rut::ConnectionBase&, rut::IoEvent) {}
+
+// Drives EventLoop<MockBackend>'s timer-tick ladder and the dispatch refresh
+// across the proxy-timeout / @throttle branches that the rebase merged into the
+// legacy loop — exercised by neither the e2e (epoll/io_uring) nor the other
+// legacy tests. Tick: a Proxying-stalled conn → 504, a throttle_paused conn →
+// resume, an idle conn → close. Refresh: a throttle_paused conn's timer is NOT
+// bumped (so the byte-rate window owns it); a non-paused one is.
+TEST(legacy_loop, timer_tick_and_refresh_throttle_proxy_branches) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    ShardMetrics metrics;
+    metrics.init();
+    loop->metrics = &metrics;
+    ShardEpoch epoch;
+    epoch.epoch.store(0, std::memory_order_relaxed);
+    loop->epoch = &epoch;
+
+    // Tick: throttle_paused (budget recovered) → throttle_resume → re-arm.
+    auto* a = loop->alloc_conn();
+    REQUIRE(a != nullptr);
+    a->fd = -1;
+    a->throttle_paused = true;
+    a->throttle_down_bps = 1'000'000u;
+    a->throttle_tat_ns = 0;  // not ahead → resume completes
+    a->throttle_pending_len = 0;
+    REQUIRE(loop->alloc_upstream_buf(*a));
+    loop->timer.add(a, 1);
+
+    // Tick: Proxying with no response yet → respond_upstream_timeout (504).
+    auto* b = loop->alloc_conn();
+    REQUIRE(b != nullptr);
+    b->fd = -1;
+    b->state = ConnState::Proxying;
+    b->proxy_resp_started = false;
+    loop->timer.add(b, 1);
+
+    // Tick: idle keep-alive → close.
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = -1;
+    c->state = ConnState::ReadingHeader;
+    loop->timer.add(c, 1);
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    // Conns were added one slot ahead (add(_, 1)); the wheel fires slots[cursor]
+    // then advances, so two ticks are needed to reach their slot.
+    tick.result = 2;
+    loop->dispatch(tick);  // fires a, b, c → tick ladder branches
+    CHECK(!a->throttle_paused);
+
+    // Refresh: a throttle_paused conn with a live callback → refresh is skipped.
+    auto* d = loop->alloc_conn();
+    REQUIRE(d != nullptr);
+    d->fd = -1;
+    d->throttle_paused = true;
+    d->on_recv = &legacy_noop_recv_cb;
+    IoEvent rd{};
+    rd.type = IoEventType::Recv;
+    rd.conn_id = d->id;
+    rd.result = 1;
+    loop->dispatch(rd);  // covers the `if (!throttle_paused) refresh` skip
+
+    // Refresh: a non-paused Proxying conn → refresh with the upstream deadline.
+    auto* e = loop->alloc_conn();
+    REQUIRE(e != nullptr);
+    e->fd = -1;
+    e->state = ConnState::Proxying;
+    e->on_recv = &legacy_noop_recv_cb;
+    IoEvent re{};
+    re.type = IoEventType::Recv;
+    re.conn_id = e->id;
+    re.result = 1;
+    loop->dispatch(re);
+
     loop->shutdown();
 }
 

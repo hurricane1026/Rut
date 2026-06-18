@@ -923,6 +923,11 @@ struct HirRoute {
     FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
     u32 error_variant_index = 0xffffffffu;
+    // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
+    // Flows to the RIR Function and on to RouteConfig rate-limit setup.
+    RateLimitRuleSet rate_limit{};
+    // @throttle decorator → client-send byte rate (bytes/sec, 0 = none).
+    u32 throttle_down_bps = 0;
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -937,7 +942,9 @@ struct HirRoute {
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit(other.rate_limit),
+          throttle_down_bps(other.throttle_down_bps) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -954,6 +961,8 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         error_variant_index = other.error_variant_index;
+        rate_limit = other.rate_limit;
+        throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
     }
@@ -969,7 +978,9 @@ struct HirRoute {
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit(other.rate_limit),
+          throttle_down_bps(other.throttle_down_bps) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -986,6 +997,8 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         error_variant_index = other.error_variant_index;
+        rate_limit = other.rate_limit;
+        throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
     }

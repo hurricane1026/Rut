@@ -121,6 +121,22 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // Upstream concurrency slot: set true between try_acquire and release so the
+    // slot is freed exactly once, on whatever exit path runs (completion, failure,
+    // or close). `upstream_slot_uid` records which backend's gauge to decrement.
+    bool upstream_slot_held;
+    u16 upstream_slot_uid;
+
+    // @throttle downstream pacing — per-connection token bucket (virtual-time /
+    // GCRA) for sends to the client. Set per request from the matched route. The
+    // proxy body pump advances `throttle_tat_ns` by sent_bytes × 1e9 / bps (full
+    // precision; see client_send); when it runs ahead of real time the pump parks
+    // for the exact deficit on the
+    // per-shard precise timer, resumed by throttle_resume (see callbacks_impl.h).
+    u32 throttle_down_bps;     // bytes/sec cap (0 = unthrottled); also the "enabled" flag
+    u64 throttle_tat_ns;       // GCRA theoretical arrival time (monotonic ns)
+    bool throttle_paused;      // pump parked waiting for byte-budget to recover
+    u32 throttle_pending_len;  // buffered upstream bytes to replay on resume
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -312,6 +328,12 @@ struct ConnectionBase {
         upstream_abandoned = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        upstream_slot_held = false;
+        upstream_slot_uid = 0;
+        throttle_down_bps = 0;
+        throttle_tat_ns = 0;
+        throttle_paused = false;
+        throttle_pending_len = 0;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

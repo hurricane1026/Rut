@@ -856,6 +856,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         fn.path = module.routes[i].path;
         fn.name = {"route", 5};
         fn.error_variant_index = module.routes[i].error_variant_index;
+        fn.rate_limit = module.routes[i].rate_limit;
+        fn.throttle_down_bps = module.routes[i].throttle_down_bps;
 
         // Propagate wait(ms) list 1:1. Codegen will turn each into a yield
         // boundary in the generated state machine.

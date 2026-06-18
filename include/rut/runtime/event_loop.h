@@ -10,10 +10,12 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -69,6 +71,18 @@ public:
         return self().submit_send_upstream_impl(c, buf, len);
     }
     bool submit_recv_upstream(Connection& c) { return self().submit_recv_upstream_impl(c); }
+
+    // Stop watching the upstream fd for readability (used by @throttle to park the
+    // proxy body pump between byte-rate windows). On backends with a persistent
+    // level-triggered registration (epoll) this disarms EPOLLIN so pending
+    // upstream data can't drive the pipeline past the pause; on submission-based
+    // backends (io_uring) simply not re-arming the recv is enough, so this is a
+    // no-op there. submit_recv_upstream re-arms on resume.
+    void pause_upstream_recv(Connection& c) {
+        if constexpr (requires { self().pause_upstream_recv_impl(c); }) {
+            self().pause_upstream_recv_impl(c);
+        }
+    }
 
     // Per-event-type dispatch: route to typed slot.
     // Called from each concrete EventLoop's dispatch() after timer refresh.
@@ -138,6 +152,19 @@ struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     Backend backend;
     TimerWheel timer;
     u32 shard_id;
+    // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
+    // global rules degrade to per-shard. main.cc points every shard at one
+    // shared instance.
+    GlobalRateLimiter* global_rl = nullptr;
+    // Shared per-upstream concurrency gauge for max-inflight limiting (null =
+    // unlimited). main.cc points every shard at one shared instance.
+    UpstreamConcurrency* upstream_cc = nullptr;
+    bool upstream_acquire(u16 uid, u32 max) {
+        return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
+    }
+    void upstream_release(u16 uid) {
+        if (upstream_cc) upstream_cc->release(uid);
+    }
 
 private:
     // Cross-thread state — main thread writes (stop/drain), shard thread reads.
@@ -567,6 +594,12 @@ public:
         }
         return false;
     }
+    void pause_upstream_recv_impl(Connection& c) {
+        if constexpr (requires { backend.pause_upstream_recv(c.id); }) {
+            backend.pause_upstream_recv(c.id);
+        }
+        if constexpr (Backend::kAsyncIo) c.upstream_recv_armed = false;
+    }
     bool submit_recv_upstream_impl(Connection& c) {
         if constexpr (Backend::kAsyncIo) {
             if (c.upstream_recv_armed) return true;
@@ -586,6 +619,12 @@ public:
         // before closing. This covers timer wheel timeouts, force_close_all
         // during drain, and any other path that bypasses normal callbacks.
         if (c.req_start_us != 0) epoch_leave();
+        // Release any held upstream concurrency slot (catch-all; idempotent via
+        // the held flag).
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
         if constexpr (Backend::kAsyncIo) {
             // Only cancel when ops are in flight. If pending_ops == 0,
             // the slot is freed immediately — no cancels needed.
@@ -646,6 +685,8 @@ public:
                     timer.tick([this](Connection* c) {
                         if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             respond_upstream_timeout(this, *c);  // upstream stalled → 504
+                        } else if (c->throttle_paused) {
+                            throttle_resume(this, *c);  // @throttle: resume next window
                         } else {
                             this->close_conn(*c);
                         }
@@ -694,9 +735,13 @@ public:
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn,
-                                      conn.state == ConnState::Proxying ? upstream_timeout
-                                                                        : keepalive_timeout);
+                        // See EpollEventLoop: don't let stray events bump a
+                        // @throttle-paused connection's byte-rate-window timer back
+                        // to the keepalive timeout.
+                        if (!conn.throttle_paused)
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if constexpr (Backend::kAsyncIo) {
                         // Stale CQE for a closed connection. If all ops are now

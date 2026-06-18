@@ -54,6 +54,10 @@ u64 realtime_us();
 // clamped to never move backward.
 u64 monotonic_us();
 
+// Monotonic nanoseconds (CLOCK_MONOTONIC, raw — not clamped). Used for the
+// @throttle token bucket's sub-millisecond pacing.
+u64 monotonic_ns();
+
 // SPSC (single-producer, single-consumer) ring buffer for access log entries.
 //
 // Producer: shard thread (writes on request completion)

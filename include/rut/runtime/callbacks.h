@@ -104,6 +104,11 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
 
+// Resume a throttled (@throttle) client send parked for the next byte-rate
+// window — invoked from the per-shard timer tick. Defined in callbacks_impl.h.
+template <typename Loop>
+void throttle_resume(Loop* loop, Connection& conn);
+
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);
 

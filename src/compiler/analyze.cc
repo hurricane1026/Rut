@@ -15806,6 +15806,23 @@ static FrontendResult<HirModule*> analyze_file_internal(
         const u32 first_decorator_guard_index = route.guards.len;
         for (u32 di = 0; di < item.route.decorators.len; di++) {
             const auto& ast_deco = item.route.decorators[di];
+            // Official built-in decorators are recognized here and lowered to
+            // route metadata, not resolved to user functions. @rateLimit sets
+            // the per-route fixed-window limit (enforced in the runtime).
+            if (ast_deco.name.eq({"rateLimit", 9})) {
+                // Each @rateLimit stacks one rule (caps are silently dropped past
+                // the rule-set capacity).
+                const i32 kRuleIdx = route.rate_limit.add_rule(ast_deco.rate_limit_max,
+                                                               ast_deco.rate_limit_window_sec,
+                                                               ast_deco.rate_limit_burst,
+                                                               ast_deco.rate_limit_scope);
+                if (kRuleIdx >= 0) route.rate_limit.rules[kRuleIdx].key = ast_deco.rate_limit_key;
+                continue;
+            }
+            if (ast_deco.name.eq({"throttle", 8})) {
+                route.throttle_down_bps = ast_deco.throttle_down_bps;
+                continue;
+            }
             const u32 fn_index = find_function_index(mod, ast_deco.name);
             if (fn_index == mod.functions.len)
                 return frontend_error(

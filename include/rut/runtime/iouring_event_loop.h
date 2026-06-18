@@ -14,10 +14,12 @@
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/metrics.h"
+#include "rut/runtime/rate_limit.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
+#include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -38,6 +40,19 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     IoUringBackend backend;
     TimerWheel timer;
     u32 shard_id;
+    // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
+    // global rules degrade to per-shard. main.cc points every shard at one
+    // shared instance.
+    GlobalRateLimiter* global_rl = nullptr;
+    // Shared per-upstream concurrency gauge for max-inflight limiting (null =
+    // unlimited). main.cc points every shard at one shared instance.
+    UpstreamConcurrency* upstream_cc = nullptr;
+    bool upstream_acquire(u16 uid, u32 max) {
+        return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
+    }
+    void upstream_release(u16 uid) {
+        if (upstream_cc) upstream_cc->release(uid);
+    }
 
 private:
     std::atomic<bool> running_;
@@ -422,6 +437,12 @@ public:
         return false;
     }
 
+    // io_uring only recvs when an SQE is submitted, so not re-arming the recv
+    // (which throttle_pause_before_pump achieves by returning early) is enough to
+    // backpressure the upstream. Just ensure the armed flag is clear so resume
+    // re-submits the recv. No in-flight recv exists at a pump point.
+    void pause_upstream_recv_impl(Connection& c) { c.upstream_recv_armed = false; }
+
     bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
         c.recv_pause_cancel_pending = true;
@@ -431,6 +452,12 @@ public:
 
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
+        // Release any held upstream concurrency slot (catch-all; held flag makes a
+        // prior release at completion a no-op).
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
         // Only cancel when ops are in flight.
         if (c.pending_ops > 0) {
             c.pending_ops += backend.cancel(c.fd,
@@ -542,6 +569,25 @@ public:
         if (timeout_armed) (void)backend.cancel_yield_timeout(conn.id, old_gen);
     }
 
+    // Park a @throttle-paused proxy connection for `delay_ns` via an io_uring
+    // TIMEOUT SQE (ms granularity — fine for byte pacing; throttle_resume
+    // re-checks the budget so rounding/early wake is safe). Reuses the JIT yield
+    // timeout machinery; the HandlerTimer CQE routes back to throttle_resume when
+    // the connection is throttle_paused. Returns false on SQ pressure → caller
+    // falls back to the keepalive wheel.
+    [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
+        timer.remove(&conn);
+        u32 ms = static_cast<u32>((delay_ns + 999'999ull) / 1'000'000ull);
+        if (ms == 0) ms = 1;
+        if (backend.add_yield_timeout(conn.id, conn, ms)) {
+            conn.yield_armed = true;
+            conn.yield_timeout_armed = true;
+            conn.pending_ops++;
+            return true;
+        }
+        return false;
+    }
+
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
             case IoEventType::Accept:
@@ -567,11 +613,15 @@ public:
                         c.yield_armed = false;
                         c.yield_timeout_armed = false;
                     }
-                    if (c.pending_handler_fn && matching_generation &&
-                        (c.pending_yield_kind == jit::YieldKind::Timer ||
-                         (was_yield_armed &&
-                          yield_kind_matches_event(c.pending_yield_kind,
-                                                   IoEventType::HandlerTimer)))) {
+                    if (c.throttle_paused && matching_generation) {
+                        // @throttle pacing timer fired — resume the parked proxy
+                        // pump (re-checks the byte budget; may re-park).
+                        throttle_resume<IoUringEventLoop>(this, c);
+                    } else if (c.pending_handler_fn && matching_generation &&
+                               (c.pending_yield_kind == jit::YieldKind::Timer ||
+                                (was_yield_armed &&
+                                 yield_kind_matches_event(c.pending_yield_kind,
+                                                          IoEventType::HandlerTimer)))) {
                         c.resume_event_kind = jit::YieldKind::Timer;
                         c.resume_event_result = 0;
                         resume_jit_handler<IoUringEventLoop>(this, c);
@@ -602,6 +652,8 @@ public:
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504.
                             respond_upstream_timeout<IoUringEventLoop>(this, *c);
+                        } else if (c->throttle_paused) {
+                            throttle_resume<IoUringEventLoop>(this, *c);
                         } else {
                             this->close_conn(*c);
                         }
@@ -672,9 +724,13 @@ public:
                     }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
-                        timer.refresh(&conn,
-                                      conn.state == ConnState::Proxying ? upstream_timeout
-                                                                        : keepalive_timeout);
+                        // See EpollEventLoop: don't let stray events bump a
+                        // @throttle-paused connection's byte-rate-window timer back
+                        // to the keepalive timeout.
+                        if (!conn.throttle_paused)
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
                         if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {

@@ -104,6 +104,15 @@ static i32 run_shards(u16 port,
     // before this returns). Only populated under --metrics.
     ShardMetrics* metrics_ptrs[kMaxShards];
 
+    // One process-shared limiter backing @rateLimit(scope: global). Lives for the
+    // whole server run (run_shards joins all shard threads before returning), so
+    // a stack local outlives every shard that points at it.
+    static GlobalRateLimiter global_rl;
+    global_rl.reset();
+    // One process-shared per-upstream concurrency gauge (max-inflight limiting).
+    static UpstreamConcurrency upstream_cc;
+    upstream_cc.reset();
+
     // Create one SO_REUSEPORT listen socket per shard.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
     // then create remaining sockets on that concrete port.
@@ -150,6 +159,14 @@ static i32 run_shards(u16 port,
         }
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
+        }
+        // Point every shard at the one shared limiter for @rateLimit(scope: global).
+        if constexpr (requires { shards[i].loop->global_rl; }) {
+            shards[i].loop->global_rl = &global_rl;
+        }
+        // …and at the one shared per-upstream concurrency gauge.
+        if constexpr (requires { shards[i].loop->upstream_cc; }) {
+            shards[i].loop->upstream_cc = &upstream_cc;
         }
 
         // Hand the compiled routes to the shard. Read-only and shared by

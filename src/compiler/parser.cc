@@ -2238,6 +2238,228 @@ struct Parser {
             lit_str("decorators are deprecated"));
     }
 
+    // Convert a DurLit token ("500ms"/"5s"/"2m"/"1h") to whole seconds, rounding
+    // up sub-second values to 1. Returns 0 on a malformed literal.
+    static u32 dur_lit_to_seconds(Str t) {
+        u64 digits = 0;
+        u32 i = 0;
+        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
+            digits = digits * 10 + static_cast<u64>(t.ptr[i] - '0');
+            if (digits > 0xffffffffull) return 0;
+        }
+        const Str kUnit{t.ptr + i, t.len - i};
+        u64 secs = 0;
+        if (kUnit.eq({"ms", 2}))
+            secs = (digits + 999) / 1000;  // round sub-second up to 1s
+        else if (kUnit.eq({"s", 1}))
+            secs = digits;
+        else if (kUnit.eq({"m", 1}))
+            secs = digits * 60;
+        else if (kUnit.eq({"h", 1}))
+            secs = digits * 3600;
+        else
+            return 0;
+        if (secs == 0 && digits > 0) secs = 1;  // e.g. 1ms → 1s
+        return secs > 0xffffffffull ? 0xffffffffu : static_cast<u32>(secs);
+    }
+
+    // Parse one official (built-in) decorator: `@name(args)`. Only a fixed
+    // whitelist is accepted — there are no user-defined decorators. Unknown
+    // names are a parse error.
+    // Parse one @rateLimit `by:` key source into `spec`: `ip`, or one of
+    // header/query/cookie/param("name"). Sources are plain identifiers.
+    FrontendResult<bool> parse_rate_limit_source(RateLimitKeySpec& spec, Span deco_span) {
+        auto src = expect(TokenType::Ident);
+        if (!src) return core::make_unexpected(src.error());
+        const Str kName = src.value()->text;
+        if (kName.eq({"ip", 2})) {
+            if (!spec.add(RateLimitKeyKind::Ip, nullptr, 0))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
+            return true;
+        }
+        RateLimitKeyKind kind;
+        if (kName.eq({"header", 6}))
+            kind = RateLimitKeyKind::Header;
+        else if (kName.eq({"query", 5}))
+            kind = RateLimitKeyKind::Query;
+        else if (kName.eq({"cookie", 6}))
+            kind = RateLimitKeyKind::Cookie;
+        else if (kName.eq({"param", 5}))
+            kind = RateLimitKeyKind::Param;
+        else
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(*src.value()), kName);
+        if (!expect(TokenType::LParen))
+            return frontend_error(FrontendError::UnexpectedToken, deco_span, kName);
+        auto arg = expect(TokenType::StringLit);
+        if (!arg) return core::make_unexpected(arg.error());
+        if (!expect(TokenType::RParen))
+            return frontend_error(FrontendError::UnexpectedToken, deco_span, kName);
+        if (!spec.add(kind, arg.value()->text.ptr, arg.value()->text.len))
+            return frontend_error(FrontendError::UnsupportedSyntax, deco_span, kName);
+        return true;
+    }
+
+    FrontendResult<AstDecorator> parse_official_decorator() {
+        auto at = expect(TokenType::At);
+        if (!at) return core::make_unexpected(at.error());
+        auto name_tok = expect(TokenType::Ident);
+        if (!name_tok) return core::make_unexpected(name_tok.error());
+        AstDecorator deco{};
+        deco.name = name_tok.value()->text;
+        deco.span =
+            Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
+
+        if (deco.name.eq({"rateLimit", 9})) {
+            // @rateLimit(limit: <IntLit>, window: <DurLit>)
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto kw = expect(TokenType::Ident);
+            if (!kw || !kw.value()->text.eq({"limit", 5}))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto lim = expect(TokenType::IntLit);
+            if (!lim) return core::make_unexpected(lim.error());
+            u64 maxv = 0;
+            for (u32 i = 0; i < lim.value()->text.len; i++) {
+                maxv = maxv * 10 + static_cast<u64>(lim.value()->text.ptr[i] - '0');
+                if (maxv > 0xffffffffull)
+                    return frontend_error(
+                        FrontendError::InvalidInteger, deco.span, lim.value()->text);
+            }
+            if (!expect(TokenType::Comma))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto win_kw = expect(TokenType::Ident);
+            if (!win_kw || !win_kw.value()->text.eq({"window", 6}))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto dur = expect(TokenType::DurLit);
+            if (!dur) return core::make_unexpected(dur.error());
+            const u32 kWin = dur_lit_to_seconds(dur.value()->text);
+            if (kWin == 0 || maxv == 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
+            // Optional trailing named args, in any order:
+            //   by: <key>     — single source or [list]; `ip` or
+            //                    header/query/cookie/param("name"). Default per-IP.
+            //   scope: shard|global — enforcement scope. Default shard.
+            while (take(TokenType::Comma)) {
+                auto arg = expect(TokenType::Ident);
+                if (!arg) return core::make_unexpected(arg.error());
+                if (!expect(TokenType::Colon))
+                    return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+                if (arg.value()->text.eq({"by", 2})) {
+                    if (take(TokenType::LBracket)) {
+                        bool first = true;
+                        while (cur().type != TokenType::RBracket) {
+                            if (!first && !take(TokenType::Comma))
+                                return frontend_error(
+                                    FrontendError::UnexpectedToken, deco.span, deco.name);
+                            first = false;
+                            auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
+                            if (!s) return core::make_unexpected(s.error());
+                        }
+                        if (!expect(TokenType::RBracket))
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, deco.span, deco.name);
+                    } else {
+                        auto s = parse_rate_limit_source(deco.rate_limit_key, deco.span);
+                        if (!s) return core::make_unexpected(s.error());
+                    }
+                } else if (arg.value()->text.eq({"scope", 5})) {
+                    auto sv = expect(TokenType::Ident);
+                    if (!sv) return core::make_unexpected(sv.error());
+                    if (sv.value()->text.eq({"shard", 5}))
+                        deco.rate_limit_scope = RateLimitScope::Shard;
+                    else if (sv.value()->text.eq({"global", 6}))
+                        deco.rate_limit_scope = RateLimitScope::Global;
+                    else
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, deco.span, sv.value()->text);
+                } else if (arg.value()->text.eq({"burst", 5})) {
+                    auto bv = expect(TokenType::IntLit);
+                    if (!bv) return core::make_unexpected(bv.error());
+                    u64 b = 0;
+                    for (u32 i = 0; i < bv.value()->text.len; i++) {
+                        b = b * 10 + static_cast<u64>(bv.value()->text.ptr[i] - '0');
+                        if (b > 0xffffffffull)
+                            return frontend_error(
+                                FrontendError::InvalidInteger, deco.span, bv.value()->text);
+                    }
+                    deco.rate_limit_burst = static_cast<u32>(b);
+                } else {
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, deco.span, arg.value()->text);
+                }
+            }
+            if (!expect(TokenType::RParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            deco.rate_limit_max = static_cast<u32>(maxv);
+            deco.rate_limit_window_sec = kWin;
+            return deco;
+        }
+
+        if (deco.name.eq({"throttle", 8})) {
+            // @throttle(downstream: <IntLit><b|kb|mb|gb>, window: <DurLit>)
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            // `downstream` is a reserved keyword (KwDownstream), not an Ident.
+            if (!expect(TokenType::KwDownstream))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto num = expect(TokenType::IntLit);
+            if (!num) return core::make_unexpected(num.error());
+            u64 amount = 0;
+            for (u32 i = 0; i < num.value()->text.len; i++) {
+                amount = amount * 10 + static_cast<u64>(num.value()->text.ptr[i] - '0');
+                if (amount > 0xffffffffull)
+                    return frontend_error(
+                        FrontendError::InvalidInteger, deco.span, num.value()->text);
+            }
+            // ByteSize unit — a separate identifier token (e.g. "5mb" lexes as
+            // IntLit "5" + Ident "mb"; the duration lexer doesn't claim it).
+            auto unit = expect(TokenType::Ident);
+            if (!unit) return core::make_unexpected(unit.error());
+            u64 mult = 0;
+            const Str kUnit2 = unit.value()->text;
+            if (kUnit2.eq({"b", 1}))
+                mult = 1;
+            else if (kUnit2.eq({"kb", 2}))
+                mult = 1024;
+            else if (kUnit2.eq({"mb", 2}))
+                mult = 1024ull * 1024;
+            else if (kUnit2.eq({"gb", 2}))
+                mult = 1024ull * 1024 * 1024;
+            else
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kUnit2);
+            const u64 kBytes = amount * mult;
+            if (!expect(TokenType::Comma))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto win_kw = expect(TokenType::Ident);
+            if (!win_kw || !win_kw.value()->text.eq({"window", 6}))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            if (!expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto dur = expect(TokenType::DurLit);
+            if (!dur) return core::make_unexpected(dur.error());
+            const u32 kWin = dur_lit_to_seconds(dur.value()->text);
+            if (kWin == 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
+            if (!expect(TokenType::RParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            const u64 kBps = kBytes / kWin;
+            if (kBps == 0 || kBps > 0xffffffffull)
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            deco.throttle_down_bps = static_cast<u32>(kBps);
+            return deco;
+        }
+        // Unknown decorator name — only the official whitelist is allowed.
+        return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+    }
+
     bool is_use_chain_start() const {
         return cur().type == TokenType::Ident && cur().text.eq({"use", 3}) &&
                peek().type == TokenType::Ident && peek().text.eq({"chain", 5}) &&
@@ -2524,6 +2746,30 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 }
                 item = p.parse_route();
                 break;
+            case TokenType::At: {
+                // Official decorators prefixing a single route:
+                //   @rateLimit(limit: N per 1m)
+                //   route GET "/path" { ... }
+                FixedVec<AstDecorator, AstRouteDecl::kMaxDecorators> decos;
+                while (p.cur().type == TokenType::At) {
+                    auto d = p.parse_official_decorator();
+                    if (!d) return core::make_unexpected(d.error());
+                    if (!decos.push(d.value()))
+                        return frontend_error(FrontendError::TooManyItems, d.value().span);
+                }
+                if (p.cur().type != TokenType::KwRoute || p.peek().type == TokenType::LBrace)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, Parser::span_from(p.cur()), p.cur().text);
+                auto r = p.parse_route();
+                if (!r) return core::make_unexpected(r.error());
+                AstItem route_item = r.value();
+                for (u32 k = 0; k < decos.len; k++) {
+                    if (!route_item.route.decorators.push(decos[k]))
+                        return frontend_error(FrontendError::TooManyItems, decos[k].span);
+                }
+                item = route_item;
+                break;
+            }
             default:
                 if (p.is_chain_decl_start()) {
                     item = p.parse_chain();

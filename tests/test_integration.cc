@@ -676,6 +676,1025 @@ TEST(metrics_endpoint, non_get_does_not_serve_exposition) {
     destroy_real_loop(loop);
 }
 
+// === Per-route rate limiting ===
+
+// A route with a fixed-window limit of 3 returns 200 for the first 3 requests
+// from one client, then 429 once the budget is exhausted within the window.
+TEST(rate_limit_e2e, route_returns_429_over_limit) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/limited", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 3, 60));  // 3 per 60s
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /limited HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 ok = 0, throttled = 0;
+    for (u32 i = 0; i < 4; i++) {
+        if (!send_all(c, kReq, sizeof(kReq) - 1)) break;
+        char buf[1024];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        if (n <= 0) break;
+        if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+            ok++;
+        else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+            throttled++;
+    }
+    close(c);
+    CHECK_EQ(ok, 3u);
+    CHECK_EQ(throttled, 1u);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Composite metering key: limit keyed by a request header (not IP). Two distinct
+// header values each get an independent budget over the same connection/IP.
+TEST(rate_limit_e2e, meters_by_header_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/api", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 2, 60));  // 2 per 60s
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    const char kAlice[] = "GET /api HTTP/1.1\r\nHost: x\r\nX-API-Key: alice\r\n\r\n";
+    const char kBob[] = "GET /api HTTP/1.1\r\nHost: x\r\nX-API-Key: bob\r\n\r\n";
+    // Each request on its own connection (a 429 is sent Connection: close, and
+    // we want the per-shard header-keyed limiter — not keep-alive — under test).
+    auto one_shot = [&](const char* req, u32 len) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, req, len)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+                else
+                    rc = 0;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot(kAlice, sizeof(kAlice) - 1), 200);  // alice 1
+    CHECK_EQ(one_shot(kAlice, sizeof(kAlice) - 1), 200);  // alice 2
+    CHECK_EQ(one_shot(kAlice, sizeof(kAlice) - 1), 429);  // alice over limit
+    CHECK_EQ(one_shot(kBob, sizeof(kBob) - 1), 200);      // bob: independent bucket
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Metering keyed by a query-string parameter — exercises the query extractor on
+// the live enforcement path (distinct from the header path above). Two distinct
+// ?uid values get independent budgets.
+TEST(rate_limit_e2e, meters_by_query_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/q", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));  // 1 per 60s (burst defaults to 1)
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Query, "uid", 3));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    // 429 closes the connection (Connection: close), so each request is one-shot.
+    auto one_shot = [&](const char* uid) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        char req[128];
+        const int rn = snprintf(req, sizeof(req), "GET /q?uid=%s HTTP/1.1\r\nHost: x\r\n\r\n", uid);
+        int rc = -1;
+        if (rn > 0 && send_all(c, req, static_cast<u32>(rn))) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot("alice"), 200);  // alice 1st
+    CHECK_EQ(one_shot("alice"), 429);  // alice over its 1/window
+    CHECK_EQ(one_shot("bob"), 200);    // bob: independent bucket
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Metering keyed by a cookie value (Cookie header parsing on the live path).
+TEST(rate_limit_e2e, meters_by_cookie_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/c", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Cookie, "sid", 3));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    auto one_shot = [&](const char* sid) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        char req[160];
+        const int rn = snprintf(
+            req, sizeof(req), "GET /c HTTP/1.1\r\nHost: x\r\nCookie: a=1; sid=%s\r\n\r\n", sid);
+        int rc = -1;
+        if (rn > 0 && send_all(c, req, static_cast<u32>(rn))) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot("alice"), 200);
+    CHECK_EQ(one_shot("alice"), 429);
+    CHECK_EQ(one_shot("bob"), 200);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Metering keyed by a route parameter (/u/:id) — needs the segment trie so the
+// param is captured into route_params and reaches the extractor.
+TEST(rate_limit_e2e, meters_by_param_key) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.use_segment_trie());
+    REQUIRE(cfg.add_static("/u/:id", 'G', 200));
+    REQUIRE(cfg.set_route_rate_limit(0, 1, 60));
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Param, "id", 2));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    auto one_shot = [&](const char* id) -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        char req[128];
+        const int rn = snprintf(req, sizeof(req), "GET /u/%s HTTP/1.1\r\nHost: x\r\n\r\n", id);
+        int rc = -1;
+        if (rn > 0 && send_all(c, req, static_cast<u32>(rn))) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot("alice"), 200);  // /u/alice 1st
+    CHECK_EQ(one_shot("alice"), 429);  // /u/alice over its 1/window
+    CHECK_EQ(one_shot("bob"), 200);    // /u/bob: independent param value
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Stacked rate-limit rules: a route caps both per-IP and per-API-key, with
+// different limits. A request must satisfy every rule. Here the per-IP cap (2)
+// is the tighter one a single client hits first.
+TEST(rate_limit_e2e, stacked_rules_both_enforced) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/api", 'G', 200));
+    // Rule 0: per-IP, 2/window. Rule 1: per-API-key, 5/window.
+    REQUIRE(cfg.set_route_rate_limit(0, 2, 60));
+    REQUIRE(cfg.add_route_rate_limit_rule(0, 5, 60));
+    REQUIRE(cfg.add_route_rate_limit_key(0, RateLimitKeyKind::Header, "X-API-Key", 9));
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 2u);
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\nX-API-Key: k\r\n\r\n";
+    auto one_shot = [&]() -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, kReq, sizeof(kReq) - 1)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    // Same IP + same key: per-IP rule (2) trips first, before the per-key rule (5).
+    CHECK_EQ(one_shot(), 200);
+    CHECK_EQ(one_shot(), 200);
+    CHECK_EQ(one_shot(), 429);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// scope: global enforces an exact cluster-wide cap via the shared
+// GlobalRateLimiter (no divide-by-shard-count). Cap 2 → 2 allowed then 429.
+TEST(rate_limit_e2e, global_scope_shared_limiter) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/api", 'G', 200));
+    REQUIRE(cfg.add_route_rate_limit_rule(0, 2, 60, RateLimitScope::Global));  // 2 global
+    const RouteConfig* active = &cfg;
+
+    GlobalRateLimiter grl{};  // fresh shared limiter for this test
+    grl.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->global_rl = &grl;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+
+    const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    auto one_shot = [&]() -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, kReq, sizeof(kReq) - 1)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                    rc = 200;
+                else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                    rc = 429;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot(), 200);  // 1
+    CHECK_EQ(one_shot(), 200);  // 2
+    CHECK_EQ(one_shot(), 429);  // over the cluster cap
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// The @rateLimit official decorator compiles through the IR to a per-route
+// limit on the RIR function (which register_jit_routes forwards to the config).
+TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 3, window: 1m)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].max, 3u);
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].window_sec, 60u);  // 1m
+    CHECK_EQ(rir.module.functions[0].rate_limit.rules[0].key.count, 0u);    // default per-IP
+    rir.destroy();
+}
+
+// The `by:` clause compiles to a composite metering-key spec on the RIR function.
+TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 100, window: 1m, by: [ip, header(\"X-API-Key\")])\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    const auto& spec = rir.module.functions[0].rate_limit.rules[0].key;
+    REQUIRE_EQ(spec.count, 2u);
+    CHECK(spec.comps[0].kind == RateLimitKeyKind::Ip);
+    CHECK(spec.comps[1].kind == RateLimitKeyKind::Header);
+    Str hdr_name{spec.comps[1].name, spec.comps[1].name_len};
+    Str want{"X-API-Key", 9};
+    CHECK(hdr_name.eq(want));
+    rir.destroy();
+}
+
+// A single `by:` source (no list) and the param/query/cookie sources parse.
+TEST(rate_limit_dsl, by_single_source) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 10, window: 30s, by: header(\"X-User\"))\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    const auto& spec = rir.module.functions[0].rate_limit.rules[0].key;
+    REQUIRE_EQ(spec.count, 1u);
+    CHECK(spec.comps[0].kind == RateLimitKeyKind::Header);
+    rir.destroy();
+}
+
+// Two stacked @rateLimit decorators compile to two rules on the RIR function.
+TEST(rate_limit_dsl, stacked_decorators_compile_to_rules) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 100, window: 1m)\n"
+        "@rateLimit(limit: 1000, window: 1h, by: header(\"X-API-Key\"))\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    const auto& rl = rir.module.functions[0].rate_limit;
+    REQUIRE_EQ(rl.count, 2u);
+    CHECK_EQ(rl.rules[0].max, 100u);
+    CHECK_EQ(rl.rules[0].window_sec, 60u);
+    CHECK_EQ(rl.rules[0].key.count, 0u);  // per-IP
+    CHECK_EQ(rl.rules[1].max, 1000u);
+    CHECK_EQ(rl.rules[1].window_sec, 3600u);
+    REQUIRE_EQ(rl.rules[1].key.count, 1u);
+    CHECK(rl.rules[1].key.comps[0].kind == RateLimitKeyKind::Header);
+    rir.destroy();
+}
+
+// scope: global is carried onto the rule; by: and scope: compose in any order.
+TEST(rate_limit_dsl, scope_global_compiles) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 1000, window: 1m, scope: global, by: header(\"X-API-Key\"))\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    const auto& rl = rir.module.functions[0].rate_limit;
+    REQUIRE_EQ(rl.count, 1u);
+    CHECK(rl.rules[0].scope == RateLimitScope::Global);
+    REQUIRE_EQ(rl.rules[0].key.count, 1u);
+    CHECK(rl.rules[0].key.comps[0].kind == RateLimitKeyKind::Header);
+    rir.destroy();
+}
+
+// Default scope (no scope:) is Shard.
+TEST(rate_limit_dsl, default_scope_is_shard) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 5, window: 1m)\n"
+        "route GET \"/a\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    CHECK(rir.module.functions[0].rate_limit.rules[0].scope == RateLimitScope::Shard);
+    // Default burst = limit; GCRA params precomputed (emit = window/limit µs).
+    const auto& r = rir.module.functions[0].rate_limit.rules[0];
+    CHECK_EQ(r.burst, 5u);
+    CHECK_EQ(r.emit_interval_us, 60ull * 1000000ull / 5ull);  // 12s per token
+    rir.destroy();
+}
+
+// burst: sets the token-bucket capacity (and the GCRA tau), independent of limit.
+TEST(rate_limit_dsl, burst_compiles) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 100, window: 1s, burst: 10)\n"
+        "route GET \"/a\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    const auto& r = rir.module.functions[0].rate_limit.rules[0];
+    REQUIRE_EQ(rir.module.functions[0].rate_limit.count, 1u);
+    CHECK_EQ(r.max, 100u);
+    CHECK_EQ(r.burst, 10u);                  // explicit, not defaulted to 100
+    CHECK_EQ(r.emit_interval_us, 10000ull);  // 1s / 100 = 10ms per token
+    CHECK_EQ(r.tau_us, 9ull * 10000ull);     // (burst-1) * emit
+    rir.destroy();
+}
+
+// `by:` with an unknown source is rejected at parse time.
+TEST(rate_limit_dsl, by_unknown_source_rejected) {
+    using namespace rut;
+    const char* bad =
+        "@rateLimit(limit: 10, window: 1m, by: bogus(\"x\"))\n"
+        "route GET \"/a\" { return 200 }\n";
+    auto l = lex(Str{bad, static_cast<u32>(strlen(bad))});
+    REQUIRE(l);
+    CHECK(!parse_file(l.value()));
+}
+
+// Only the official whitelist is accepted; bad args are rejected at parse time.
+TEST(rate_limit_dsl, unknown_decorator_and_bad_args_rejected) {
+    using namespace rut;
+    const char* bogus = "@bogus(x: 1)\nroute GET \"/a\" { return 200 }\n";
+    auto l1 = lex(Str{bogus, static_cast<u32>(strlen(bogus))});
+    REQUIRE(l1);
+    CHECK(!parse_file(l1.value()));  // unknown decorator
+    const char* zero = "@rateLimit(limit: 0, window: 1m)\nroute GET \"/a\" { return 200 }\n";
+    auto l2 = lex(Str{zero, static_cast<u32>(strlen(zero))});
+    REQUIRE(l2);
+    CHECK(!parse_file(l2.value()));  // limit 0 rejected
+}
+
+// End-to-end: a route compiled with @rateLimit serves 200 up to the limit, then
+// 429 — proving the decorator → config → runtime path works from .rut.
+// JIT-compiles + serves the .rut, so it links the JIT engine — excluded from
+// no-JIT builds (the other rate_limit_dsl tests only lower to RIR).
+#if RUT_ENABLE_JIT_TESTS
+TEST(rate_limit_dsl, e2e_429_over_limit) {
+    using namespace rut;
+    const char* src =
+        "@rateLimit(limit: 3, window: 1m)\n"
+        "route GET \"/api\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    REQUIRE_EQ(cfg.routes[0].rate_limit.count, 1u);
+    CHECK_EQ(cfg.routes[0].rate_limit.rules[0].max, 3u);
+    const RouteConfig* active = &cfg;
+
+    {
+        RealLoop* loop = create_real_loop();
+        REQUIRE(loop != nullptr);
+        auto lfd = create_listen_socket(0);
+        REQUIRE(lfd.has_value());
+        const i32 listen_fd = lfd.value();
+        const u16 port = get_port(listen_fd);
+        REQUIRE(loop->init(0, listen_fd).has_value());
+        loop->config_ptr = &active;
+        LoopThread lt = {loop, {}, 200};
+        lt.start();
+
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        u32 ok = 0, throttled = 0;
+        for (u32 i = 0; i < 4; i++) {
+            if (!send_all(c, kReq, sizeof(kReq) - 1)) break;
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n <= 0) break;
+            if (buf_contains(buf, static_cast<u32>(n), "200", 3))
+                ok++;
+            else if (buf_contains(buf, static_cast<u32>(n), "429", 3))
+                throttled++;
+        }
+        close(c);
+        CHECK_EQ(ok, 3u);
+        CHECK_EQ(throttled, 1u);
+
+        lt.stop();
+        loop->shutdown();
+        close(listen_fd);
+        destroy_real_loop(loop);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+#endif  // RUT_ENABLE_JIT_TESTS
+
+// @throttle compiles to a per-route client-send byte rate on the RIR function.
+// (Runtime pacing is a separate change; here we verify the config plumbing.)
+TEST(throttle_dsl, decorator_compiles_to_bps) {
+    using namespace rut;
+    const char* src =
+        "@throttle(downstream: 5mb, window: 1s)\n"
+        "route GET \"/dl\" { return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK_EQ(rir.module.functions[0].throttle_down_bps, 5u * 1024u * 1024u);  // 5mb / 1s
+    rir.destroy();
+}
+
+TEST(throttle_dsl, bad_unit_rejected) {
+    using namespace rut;
+    const char* bad = "@throttle(downstream: 5xb, window: 1s)\nroute GET \"/a\" { return 200 }\n";
+    auto l = lex(Str{bad, static_cast<u32>(strlen(bad))});
+    REQUIRE(l);
+    CHECK(!parse_file(l.value()));  // unknown byte unit
+}
+
+// A backend that serves a fixed-size body in one shot — the gateway paces it to
+// the client when the route is throttled.
+struct LargeBodyServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    u32 body_len = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~LargeBodyServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<LargeBodyServer*>(arg);
+        i32 client = -1;
+        while (s->running.load(std::memory_order_acquire)) {
+            client = accept(s->listen_fd, nullptr, nullptr);
+            if (client >= 0) break;
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+            usleep(1000);
+        }
+        if (client >= 0) {
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            char hdr[128];
+            const int hn = snprintf(
+                hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", s->body_len);
+            if (hn > 0) (void)send_all(client, hdr, static_cast<u32>(hn));
+            static char body[65536];
+            for (u32 i = 0; i < s->body_len && i < sizeof(body); i++) body[i] = 'x';
+            (void)send_all(client, body, s->body_len);
+            // Hold the connection open so the gateway can finish draining at the
+            // throttled rate before we close.
+            while (s->running.load(std::memory_order_acquire)) usleep(5000);
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(u32 blen) {
+        body_len = blen;
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// End-to-end: a throttled proxy route paces the downstream body. 40 KB at
+// 8 KB/s must take noticeably longer than the sub-100ms an unthrottled proxy
+// would — proving the per-connection byte window + timer-resume actually paces.
+TEST(throttle_e2e, downstream_paces_proxied_body) {
+    using namespace rut;
+    LargeBodyServer backend;
+    REQUIRE(backend.setup(40000));
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/dl", 0, id.value()));
+    REQUIRE(cfg.set_route_throttle(0, 8192));  // 8 KB/s
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+    char buf[8192];
+    u32 total = 0;
+    while (total < 40000u) {
+        i32 n = recv_timeout(c, buf, sizeof(buf), 5000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+    }
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    close(c);
+    const double elapsed =
+        static_cast<double>(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    CHECK(total >= 40000u);  // full body delivered
+    CHECK(elapsed >= 1.5);   // paced (≈5s ideal; unthrottled would be < 0.1s)
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// A backend that holds each accepted connection open for `delay_ms` before
+// replying — so the gateway keeps the upstream concurrency slot occupied while
+// the test fires a second request.
+struct SlowResponseServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    u32 delay_ms = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~SlowResponseServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<SlowResponseServer*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            for (u32 e = 0; e < s->delay_ms && s->running.load(std::memory_order_acquire); e += 5)
+                usleep(5000);
+            const char resp[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+            (void)send_all(client, resp, sizeof(resp) - 1);
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup(u32 d_ms) {
+        delay_ms = d_ms;
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Upstream concurrency cap: max_inflight=1 → while one slow request holds the
+// only slot, a concurrent request to the same backend is shed with 503; once the
+// first completes and frees the slot, a fresh request succeeds.
+TEST(upstream_concurrency_e2e, max_inflight_sheds_503) {
+    using namespace rut;
+    SlowResponseServer backend;
+    REQUIRE(backend.setup(400));  // hold each upstream conn ~400ms
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/p", 0, id.value()));
+    REQUIRE(cfg.set_upstream_max_inflight(id.value(), 1));
+    const RouteConfig* active = &cfg;
+
+    UpstreamConcurrency cc{};  // fresh shared gauge for this test
+    cc.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_cc = &cc;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    const char kReq[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    char buf[1024];
+
+    // Client 1 takes the only slot (backend sits on it ~400ms).
+    i32 c1 = connect_to(port);
+    REQUIRE(c1 >= 0);
+    REQUIRE(send_all(c1, kReq, sizeof(kReq) - 1));
+    usleep(150000);  // 150ms: c1's slot is acquired and the backend is sleeping
+
+    // Client 2 hits the backend at capacity → 503, no upstream connection.
+    i32 c2 = connect_to(port);
+    REQUIRE(c2 >= 0);
+    REQUIRE(send_all(c2, kReq, sizeof(kReq) - 1));
+    i32 n2 = recv_timeout(c2, buf, sizeof(buf), 2000);
+    CHECK(n2 > 0 && buf_contains(buf, static_cast<u32>(n2), "503", 3));
+    close(c2);
+
+    // Client 1 eventually completes (200), freeing the slot.
+    i32 n1 = recv_timeout(c1, buf, sizeof(buf), 2000);
+    CHECK(n1 > 0 && buf_contains(buf, static_cast<u32>(n1), "200", 3));
+    close(c1);
+
+    // Slot freed → a fresh request succeeds.
+    usleep(50000);
+    i32 c3 = connect_to(port);
+    REQUIRE(c3 >= 0);
+    REQUIRE(send_all(c3, kReq, sizeof(kReq) - 1));
+    i32 n3 = recv_timeout(c3, buf, sizeof(buf), 2000);
+    CHECK(n3 > 0 && buf_contains(buf, static_cast<u32>(n3), "200", 3));
+    close(c3);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// The upstream slot must be released when a proxied request FAILS (not just on
+// clean completion) — otherwise a failing backend would permanently consume the
+// cap. Point at a closed port (connect refused → 502): with cap 1, two sequential
+// requests must BOTH reach the backend attempt (both 502). If the first failure
+// leaked its slot, the second would be shed with 503 instead.
+TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
+    using namespace rut;
+    // A port nobody listens on: bind one, read its port, close it.
+    auto dead = create_listen_socket(0);
+    REQUIRE(dead.has_value());
+    const u16 dead_port = get_port(dead.value());
+    close(dead.value());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("dead", 0x7F000001, dead_port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/p", 0, id.value()));
+    REQUIRE(cfg.set_upstream_max_inflight(id.value(), 1));
+    const RouteConfig* active = &cfg;
+
+    UpstreamConcurrency cc{};
+    cc.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_cc = &cc;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    const char kReq[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    auto one_shot = [&]() -> int {
+        i32 c = connect_to(port);
+        if (c < 0) return -1;
+        int rc = -1;
+        if (send_all(c, kReq, sizeof(kReq) - 1)) {
+            char buf[1024];
+            i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+            if (n > 0) {
+                if (buf_contains(buf, static_cast<u32>(n), "502", 3))
+                    rc = 502;
+                else if (buf_contains(buf, static_cast<u32>(n), "503", 3))
+                    rc = 503;
+            }
+        }
+        close(c);
+        return rc;
+    };
+    CHECK_EQ(one_shot(), 502);  // connect refused
+    CHECK_EQ(one_shot(), 502);  // slot was released → not stuck at 503
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {
@@ -4411,6 +5430,68 @@ TEST(route, forward_jit_handler_enters_proxy_state) {
     lt.stop();
     loop->shutdown();
     close(lfd);
+    destroy_real_loop(loop);
+}
+
+// Regression for the #127 review: a JIT `return forward(<upstream>)` route must
+// honor the upstream max_inflight cap, same as the direct RouteAction::Proxy
+// path. With cap 1, while a slow forwarded request holds the slot, a second
+// concurrent forward to the same backend is shed with 503 — before the fix the
+// JIT Forward branch skipped the acquire and would open a second upstream
+// connection, exceeding the cap.
+TEST(upstream_concurrency_e2e, jit_forward_honors_max_inflight) {
+    using namespace rut;
+    SlowResponseServer backend;
+    REQUIRE(backend.setup(400));  // hold each upstream conn ~400ms
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);  // forward_upstream_0_handler forwards to id 0
+    REQUIRE(cfg.add_jit_handler("/p", 'G', &forward_upstream_0_handler));
+    REQUIRE(cfg.set_upstream_max_inflight(id.value(), 1));
+    const RouteConfig* active = &cfg;
+
+    UpstreamConcurrency cc{};  // fresh shared gauge for this test
+    cc.reset();
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_cc = &cc;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    const char kReq[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    char buf[1024];
+
+    // c1 takes the only slot via the JIT forward path (backend holds ~400ms).
+    i32 c1 = connect_to(port);
+    REQUIRE(c1 >= 0);
+    REQUIRE(send_all(c1, kReq, sizeof(kReq) - 1));
+    usleep(150000);  // 150ms: c1's slot is acquired, backend is sleeping
+
+    // c2 forwards to the same backend at capacity → 503.
+    i32 c2 = connect_to(port);
+    REQUIRE(c2 >= 0);
+    REQUIRE(send_all(c2, kReq, sizeof(kReq) - 1));
+    i32 n2 = recv_timeout(c2, buf, sizeof(buf), 2000);
+    CHECK(n2 > 0 && buf_contains(buf, static_cast<u32>(n2), "503", 3));
+    close(c2);
+
+    // c1 completes (200) and frees the slot.
+    i32 n1 = recv_timeout(c1, buf, sizeof(buf), 2000);
+    CHECK(n1 > 0 && buf_contains(buf, static_cast<u32>(n1), "200", 3));
+    close(c1);
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
     destroy_real_loop(loop);
 }
 

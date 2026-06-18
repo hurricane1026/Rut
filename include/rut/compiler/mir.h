@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
@@ -280,6 +281,11 @@ struct MirFunction {
     bool has_explicit_resume_blocks = false;
     u32 resume_blocks[kMaxWaits + 1]{};
     u32 error_variant_index = 0xffffffffu;
+    // @rateLimit per-route limit, copied from HirRoute → carried to RIR Function.
+    // @rateLimit decorators -> stacked fixed-window rules (empty = no limit).
+    RateLimitRuleSet rate_limit{};
+    // @throttle client-send byte rate (bytes/sec, 0 = none).
+    u32 throttle_down_bps = 0;
 
     MirFunction() = default;
     MirFunction(const MirFunction& other)
@@ -294,7 +300,9 @@ struct MirFunction {
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit(other.rate_limit),
+          throttle_down_bps(other.throttle_down_bps) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -313,6 +321,8 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        rate_limit = other.rate_limit;
+        throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
     }
@@ -328,7 +338,9 @@ struct MirFunction {
           state_zero_enters_entry(other.state_zero_enters_entry),
           resume_terminal_block(other.resume_terminal_block),
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
-          error_variant_index(other.error_variant_index) {
+          error_variant_index(other.error_variant_index),
+          rate_limit(other.rate_limit),
+          throttle_down_bps(other.throttle_down_bps) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -347,6 +359,8 @@ struct MirFunction {
         has_explicit_resume_blocks = other.has_explicit_resume_blocks;
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         error_variant_index = other.error_variant_index;
+        rate_limit = other.rate_limit;
+        throttle_down_bps = other.throttle_down_bps;
         rebase_from(other);
         return *this;
     }
