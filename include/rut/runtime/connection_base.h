@@ -145,6 +145,11 @@ struct ConnectionBase {
     // UpstreamSend, so the WebSocket tunnel serializes its two directions.
     bool ws_client_send_pending;
     bool ws_upstream_send_pending;
+    // Bytes submitted for the current tunnel send. A best-effort recv pause can
+    // still race with already-harvested CQEs, so completion must consume only
+    // the submitted prefix and preserve later buffered bytes.
+    u32 ws_client_send_len;
+    u32 ws_upstream_send_len;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -348,6 +353,8 @@ struct ConnectionBase {
         is_ws_tunnel = false;
         ws_client_send_pending = false;
         ws_upstream_send_pending = false;
+        ws_client_send_len = 0;
+        ws_upstream_send_len = 0;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

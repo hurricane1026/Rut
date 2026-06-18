@@ -1931,8 +1931,10 @@ template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.recv_buf.len() == 0) return true;
     if (ws_send_busy(conn)) return ws_pause_client_recv(loop, conn);
-    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len())) return false;
+    const u32 kSendLen = conn.recv_buf.len();
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), kSendLen)) return false;
     conn.ws_client_send_pending = true;
+    conn.ws_client_send_len = kSendLen;
     return ws_pause_client_recv(loop, conn);
 }
 
@@ -1942,9 +1944,11 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
     if (ws_send_busy(conn)) {
         return ws_pause_upstream_recv(loop, conn);
     }
-    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len()))
+    const u32 kSendLen = conn.upstream_recv_buf.len();
+    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), kSendLen))
         return false;
     conn.ws_upstream_send_pending = true;
+    conn.ws_upstream_send_len = kSendLen;
     return ws_pause_upstream_recv(loop, conn);
 }
 
@@ -1977,7 +1981,12 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    conn.recv_buf.reset();
+    conn.recv_buf.consume(conn.ws_client_send_len);
+    conn.ws_client_send_len = 0;
+    if (conn.recv_buf.len() > 0) {
+        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+        return;
+    }
     if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn))
         loop->close_conn(conn);
 }
@@ -2008,7 +2017,12 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    conn.upstream_recv_buf.reset();
+    conn.upstream_recv_buf.consume(conn.ws_upstream_send_len);
+    conn.ws_upstream_send_len = 0;
+    if (conn.upstream_recv_buf.len() > 0) {
+        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+        return;
+    }
     conn.upstream_recv_paused_for_send = false;
     loop->submit_recv_upstream(conn);  // re-arm upstream→client direction
     if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
@@ -2036,6 +2050,8 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.is_ws_tunnel = true;
     conn.ws_client_send_pending = false;
     conn.ws_upstream_send_pending = false;
+    conn.ws_client_send_len = 0;
+    conn.ws_upstream_send_len = 0;
     conn.upstream_recv_buf.consume(conn.upstream_send_len);
     conn.upstream_send_len = 0;
     conn.recv_buf.reset();
