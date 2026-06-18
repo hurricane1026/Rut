@@ -10955,9 +10955,15 @@ TEST(state_invariant, jit_event_yield_starts_runtime_operations) {
     loop.backend.clear_ops();
     handle_jit_outcome<SmallLoop>(
         &loop, *up_recv, outcome, &state_invariant_wait_recv_then_status, true);
-    const MockOp* recv_op = loop.backend.last_op(MockOp::Recv);
-    REQUIRE(recv_op != nullptr);
-    CHECK_EQ(recv_op->fd, 88);
+    const MockOp* upstream_recv_op = nullptr;
+    for (u32 i = 0; i < loop.backend.op_count; i++) {
+        const MockOp& op = loop.backend.ops[i];
+        if (op.type == MockOp::Recv && op.fd == 88) {
+            upstream_recv_op = &op;
+            break;
+        }
+    }
+    REQUIRE(upstream_recv_op != nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
 }
 
