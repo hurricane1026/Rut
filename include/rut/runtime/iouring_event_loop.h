@@ -432,7 +432,10 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        if (c.upstream_recv_armed) return true;
+        if (c.upstream_recv_armed) {
+            if (c.upstream_recv_pause_cancel_pending) c.upstream_recv_pause_rearm_pending = true;
+            return true;
+        }
         if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
