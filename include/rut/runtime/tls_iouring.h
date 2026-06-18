@@ -179,6 +179,7 @@ void tls_process(Self* loop, Connection& c) {
     tls_engine_set_output(c.tls_engine, c.tls_out_slice, SlicePool::kSliceSize);
     for (;;) {
         const u32 kBefore = c.recv_buf.len();
+        bool saw_close_notify = false;
         for (;;) {
             const u32 kAvail = c.recv_buf.write_avail();
             if (kAvail == 0) break;
@@ -194,6 +195,8 @@ void tls_process(Self* loop, Connection& c) {
                     loop->close_conn(c);
                     return;
                 }
+                saw_close_notify = true;
+                c.keep_alive = false;
                 break;
             }
             if (st == TlsOp::WantWrite) {
@@ -206,12 +209,22 @@ void tls_process(Self* loop, Connection& c) {
         }
         const u32 kConsumed = tls_engine_input_consumed(c.tls_engine);
         c.tls_in_buf.consume(kConsumed);
+        const bool kHasControlOutput = tls_engine_output_len(c.tls_engine) > 0;
         if (c.recv_buf.len() <= kBefore) {
             if (kConsumed > 0 && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>) {
                 tls_resume_pending_send_recv<Self>(loop, c, {});
                 return;
             }
+            if (kHasControlOutput) {
+                if (!tls_flush_out<Self>(loop, c)) loop->close_conn(c);
+                return;
+            }
             break;  // produced nothing this round
+        }
+        if (saw_close_notify) c.keep_alive = false;
+        if (kHasControlOutput && !tls_flush_out<Self>(loop, c)) {
+            loop->close_conn(c);
+            return;
         }
 
         IoEvent pev = {};
@@ -219,7 +232,16 @@ void tls_process(Self* loop, Connection& c) {
         pev.type = IoEventType::Recv;
         pev.result = static_cast<i32>(c.recv_buf.len() - kBefore);
         auto pending_recv = c.tls_pending_on_recv;
-        if (!pending_recv) pending_recv = &on_header_received<Self>;
+        if (pending_recv == &tls_resume_pending_send_recv<Self>) {
+            c.tls_pending_on_recv = nullptr;
+            if (!tls_pump_send<Self>(loop, c)) {
+                loop->close_conn(c);
+                return;
+            }
+            pending_recv = &on_header_received<Self>;
+        } else if (!pending_recv) {
+            pending_recv = &on_header_received<Self>;
+        }
         pending_recv(loop, c, pev);
 
         // on_header_received may have closed the connection synchronously (EOF /

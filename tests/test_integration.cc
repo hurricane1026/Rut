@@ -3027,6 +3027,31 @@ bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl) {
     }
     return client_done && eng.handshake_done;
 }
+
+struct TlsIouringHarness : SmallLoop {
+    bool sent = false;
+    bool closed = false;
+
+    bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
+        sent = len > 0;
+        return true;
+    }
+
+    void close_conn(Connection& conn) {
+        closed = true;
+        conn.tls_active = false;
+    }
+
+    void disarm_yield_timer(Connection& /*conn*/) {}
+};
+
+bool g_tls_iouring_plain_recv_called = false;
+u32 g_tls_iouring_plain_recv_result = 0;
+
+void tls_iouring_plain_recv_probe(void* /*lp*/, Connection& /*conn*/, IoEvent ev) {
+    g_tls_iouring_plain_recv_called = true;
+    g_tls_iouring_plain_recv_result = static_cast<u32>(ev.result);
+}
 }  // namespace
 
 // Encrypt a payload far larger than the output buffer, forcing the WantWrite /
@@ -3195,6 +3220,56 @@ TEST(tls_engine, peer_close_notify_reports_closed) {
 
     cl.destroy();
     tls_engine_free(eng);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, close_notify_with_plaintext_disables_keepalive) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsIouringHarness loop;
+    Connection conn;
+    u8 recv_storage[4096];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 3;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.keep_alive = true;
+    conn.recv_slice = recv_storage;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.tls_pending_on_recv = &tls_iouring_plain_recv_probe;
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+
+    static constexpr char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(SSL_write(cl.ssl, kReq, static_cast<int>(sizeof(kReq) - 1)) ==
+            static_cast<int>(sizeof(kReq) - 1));
+    (void)SSL_shutdown(cl.ssl);
+
+    const int cipher_len =
+        BIO_read(cl.wbio, conn.tls_in_buf.write_ptr(), conn.tls_in_buf.write_avail());
+    REQUIRE(cipher_len > 0);
+    conn.tls_in_buf.commit(static_cast<u32>(cipher_len));
+
+    g_tls_iouring_plain_recv_called = false;
+    g_tls_iouring_plain_recv_result = 0;
+    tls_process<TlsIouringHarness>(&loop, conn);
+
+    CHECK(g_tls_iouring_plain_recv_called);
+    CHECK_EQ(g_tls_iouring_plain_recv_result, static_cast<u32>(sizeof(kReq) - 1));
+    CHECK(!conn.keep_alive);
+    CHECK(!loop.closed);
+
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
     destroy_tls_server_context(tls_ctx.value());
 }
 
