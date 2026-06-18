@@ -6805,6 +6805,76 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
     destroy_real_loop(loop);
 }
 
+// Re-arming a recv must preserve a pending opposite-direction send's EPOLLOUT on
+// the same fd (full-duplex tunnel backpressure). Drive the send to completion to
+// prove the EPOLLOUT survived the re-arm; also exercise the TLS-pending branches.
+TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+
+    i32 dfds[2], ufds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, dfds) == 0);
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, ufds) == 0);
+    c->fd = dfds[0];
+    c->upstream_fd = ufds[0];
+
+    // Downstream: an upstream→client send is pending on the client fd. Re-arming
+    // the client recv must keep EPOLLOUT so the send still drains.
+    REQUIRE(loop->backend.add_recv(dfds[0], cid));
+    static const u8 down[] = {'P', 'O', 'N', 'G'};
+    loop->backend.send_state[cid] = {down, dfds[0], 0, sizeof(down), IoEventType::Send, false, 0};
+    REQUIRE(loop->backend.add_recv(dfds[0], cid));
+    IoEvent ev[8];
+    u32 n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
+    bool saw_send = false;
+    for (u32 i = 0; i < n; i++)
+        if (ev[i].conn_id == cid && ev[i].type == IoEventType::Send) saw_send = true;
+    CHECK(saw_send);  // EPOLLOUT preserved across the recv re-arm
+    u8 rb[8];
+    CHECK_EQ(recv(dfds[1], rb, sizeof(rb), MSG_DONTWAIT), static_cast<ssize_t>(sizeof(down)));
+
+    // Upstream: symmetric — a client→upstream send pending on the upstream fd.
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid));
+    static const u8 up[] = {'P', 'I', 'N', 'G'};
+    loop->backend.upstream_send_state[cid] = {
+        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, false, 0};
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid));
+    n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
+    bool saw_usend = false;
+    for (u32 i = 0; i < n; i++)
+        if (ev[i].conn_id == cid && ev[i].type == IoEventType::UpstreamSend) saw_usend = true;
+    CHECK(saw_usend);
+    CHECK_EQ(recv(ufds[1], rb, sizeof(rb), MSG_DONTWAIT), static_cast<ssize_t>(sizeof(up)));
+
+    // TLS-pending sub-branches: WANT_READ keeps EPOLLIN only, WANT_WRITE adds
+    // EPOLLOUT. Just exercise the re-arm paths (no SSL drive).
+    loop->backend.send_state[cid] = {
+        down, dfds[0], 0, sizeof(down), IoEventType::Send, true, EPOLLIN};
+    CHECK(loop->backend.add_recv(dfds[0], cid));
+    loop->backend.send_state[cid] = {
+        down, dfds[0], 0, sizeof(down), IoEventType::Send, true, EPOLLOUT};
+    CHECK(loop->backend.add_recv(dfds[0], cid));
+    loop->backend.upstream_send_state[cid] = {
+        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, true, EPOLLIN};
+    CHECK(loop->backend.add_recv_upstream(ufds[0], cid));
+
+    loop->backend.clear_send_state(cid);
+    close(dfds[0]);
+    close(dfds[1]);
+    close(ufds[0]);
+    close(ufds[1]);
+    c->fd = -1;
+    c->upstream_fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 TEST(epoll_loop, alloc_upstream_buf_lazy) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
