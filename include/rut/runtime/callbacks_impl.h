@@ -1908,12 +1908,22 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
 template <typename Loop>
 bool ws_pause_client_recv(Loop* loop, Connection& conn) {
-    if constexpr (requires(Loop* lp, u32 conn_id) { lp->backend.pause_recv(conn_id, true); }) {
-        loop->backend.pause_recv(conn.id, true);
-    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+    // Prefer the loop-level pause_recv(Connection&): the io_uring loop needs it
+    // to set recv_paused_for_send / recv_pause_cancel_pending and cancel the
+    // multishot recv on the correct fd. It must be checked BEFORE the backend
+    // 2-arg form, because IoUringBackend::pause_recv(i32 fd, u32 conn_id) also
+    // binds to `backend.pause_recv(conn.id, true)` via implicit conversions
+    // (true→u32), which would pause the wrong conn_id and skip the loop flags.
+    // The epoll loop has no pause_recv(Connection&), so it falls through to the
+    // backend form with preserve_send_interest=true (unchanged behavior).
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
         const bool ok = loop->pause_recv(conn);
         if (ok && !conn.recv_armed) conn.recv_pause_cancel_pending = false;
         return ok;
+    } else if constexpr (requires(Loop* lp, u32 conn_id) {
+                             lp->backend.pause_recv(conn_id, true);
+                         }) {
+        loop->backend.pause_recv(conn.id, true);
     } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid); }) {
         loop->backend.pause_recv(conn.id);
     }
