@@ -147,6 +147,11 @@ extern const char kResponse200Close[];
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 
+#if RUT_ENABLE_WEBSOCKET
+template <typename Loop>
+void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev);
+#endif
+
 // ── JIT handler dispatch ───────────────────────────────────────────
 // Route-matched JitHandler action → invoke the compiled handler and
 // translate JitDispatchOutcome into event-loop operations (send, forward,
@@ -262,7 +267,11 @@ void throttle_resume(Loop* loop, Connection& conn) {
     conn.throttle_pending_len = 0;
     if (kRemaining > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
-        on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
+        if (conn.is_ws_tunnel) {
+            on_ws_upstream_recv<Loop>(static_cast<void*>(loop), conn, synth);
+        } else {
+            on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
+        }
     } else {
         loop->submit_recv_upstream(conn);
     }
@@ -1943,6 +1952,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         return ws_pause_upstream_recv(loop, conn);
     }
     const u32 kSendLen = conn.upstream_recv_buf.len();
+    if (throttle_pause_before_pump(loop, conn, kSendLen)) return true;
     if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
     conn.ws_upstream_send_pending = true;
     conn.ws_upstream_send_len = kSendLen;
@@ -2020,6 +2030,10 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
         return;
     }
+    if (conn.ws_pre_tunnel_upstream_closed) {
+        loop->close_conn(conn);
+        return;
+    }
     conn.upstream_recv_paused_for_send = false;
     if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream→client direction
         loop->close_conn(conn);
@@ -2038,7 +2052,7 @@ void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {
-        loop->close_conn(conn);
+        conn.ws_pre_tunnel_upstream_closed = true;
         return;
     }
     if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
@@ -2058,10 +2072,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_upstream_send_pending = false;
     conn.ws_client_send_len = 0;
     conn.ws_upstream_send_len = 0;
-    on_request_complete(loop, conn, conn.resp_status, conn.upstream_send_len);
+    on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
     loop->epoch_leave();
-    conn.upstream_recv_buf.consume(conn.upstream_send_len);
-    conn.upstream_send_len = 0;
+    conn.upstream_send_len = conn.ws_upgrade_response_len;
+    const u32 kRemaining = consume_upstream_sent(conn);
     conn.set_slots(&on_ws_client_recv<Loop>,
                    &on_ws_upstream_to_client_sent<Loop>,
                    &on_ws_upstream_recv<Loop>,
@@ -2081,6 +2095,10 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
     } else {
         conn.upstream_recv_paused_for_send = false;
+        if (kRemaining == 0 && conn.ws_pre_tunnel_upstream_closed) {
+            loop->close_conn(conn);
+            return;
+        }
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
@@ -2140,14 +2158,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // response plus any bytes the backend already sent (early frames) to the
     // client, then run the connection as a transparent full-duplex tunnel.
     if (resp.status_code == 101) {
-        conn.upstream_send_len = conn.upstream_recv_buf.len();
+        conn.ws_upgrade_response_len = resp_parser.header_end;
+        conn.ws_pre_tunnel_upstream_closed = false;
         if (!ws_pause_upstream_recv(loop, conn)) {
             loop->close_conn(conn);
             return;
         }
         conn.transition_to_sending(&on_ws_101_sent<Loop>);
         conn.on_upstream_recv = &on_ws_pre_tunnel_upstream_recv<Loop>;
-        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len()))
+        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.ws_upgrade_response_len))
             loop->close_conn(conn);
         return;
     }

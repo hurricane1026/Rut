@@ -83,6 +83,7 @@ struct IoUringBackend {
         IoEventType type;
     };
     SendState send_state[kMaxSendState];
+    SendState upstream_send_state[kMaxSendState];
 
     // Pending SQE count (for submission)
     u32 pending = 0;

@@ -150,6 +150,12 @@ struct ConnectionBase {
     // the submitted prefix and preserve later buffered bytes.
     u32 ws_client_send_len;
     u32 ws_upstream_send_len;
+    // Bytes of the 101 Switching Protocols response sent before entering
+    // tunnel mode (HTTP headers only, excluding any early upstream bytes).
+    u32 ws_upgrade_response_len;
+    // Upstream closed during pre-tunnel 101 handling and should be closed once
+    // tunnel mode is fully entered (after preserving buffered early bytes).
+    bool ws_pre_tunnel_upstream_closed;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -355,6 +361,8 @@ struct ConnectionBase {
         ws_upstream_send_pending = false;
         ws_client_send_len = 0;
         ws_upstream_send_len = 0;
+        ws_upgrade_response_len = 0;
+        ws_pre_tunnel_upstream_closed = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;
