@@ -52,9 +52,10 @@ bool tls_flush_out(Self* loop, Connection& c) {
     const u32 kN = tls_engine_output_len(c.tls_engine);
     if (kN == 0) return true;
     if (c.tls_out_inflight) return true;  // a prior flush is still draining
+    if (!loop->submit_send_raw(c, c.tls_out_slice, kN)) return false;
     c.tls_out_inflight = true;
     c.on_send = &tls_on_out_sent<Self>;
-    return loop->submit_send_raw(c, c.tls_out_slice, kN);
+    return true;
 }
 
 // Encrypt pending plaintext (tls_send_src/off/len) into tls_out_slice and send.
@@ -115,6 +116,9 @@ void tls_on_out_sent(void* lp, Connection& c, IoEvent ev) {
     } else {
         c.on_send = nullptr;  // handshake/control flight; no upper-layer continuation
     }
+    if (c.tls_engine.ssl && c.pending_handler_fn &&
+        yield_kind_matches_event(c.pending_yield_kind, IoEventType::Recv))
+        c.tls_pending_on_recv = &tls_resume_pending_handler_recv<Self>;
     if (c.tls_engine.ssl && (!c.tls_engine.handshake_done || c.tls_in_buf.len() > 0)) {
         tls_process<Self>(loop, c);  // continue handshake or drain deferred ciphertext
     } else if (!c.recv_armed && loop) {

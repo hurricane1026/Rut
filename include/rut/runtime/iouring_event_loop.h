@@ -477,13 +477,21 @@ public:
             // than one TLS record; fail safe (caller closes) rather than corrupt.
             // TODO: depth-1 queue to support proxy-over-TLS streaming of >16KB
             // chunks on io_uring.
-            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) return false;
+            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
+                close_conn(c);
+                return false;
+            }
             // Encrypt via the TlsEngine; ciphertext is sent by tls_pump_send.
             c.tls_pending_on_send = c.on_send;
             c.tls_send_src = buf;
             c.tls_send_len = len;
             c.tls_send_off = 0;
-            return tls_pump_send<Self>(this, c);
+            if (tls_pump_send<Self>(this, c)) return true;
+            c.tls_pending_on_send = nullptr;
+            c.tls_send_src = nullptr;
+            c.tls_send_len = 0;
+            c.tls_send_off = 0;
+            return false;
         }
         return submit_send_raw(c, buf, len);
     }
