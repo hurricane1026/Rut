@@ -1472,9 +1472,10 @@ TEST(jit, frontend_req_has_content_length_distinguishes_zero_from_absent) {
     rir.destroy();
 }
 
-TEST(jit, frontend_req_body_without_content_length_uses_trailing_data) {
+TEST(jit, frontend_req_body_without_content_length_does_not_expose_trailing_data) {
     const char* src =
-        "route POST \"/upload\" { let b = req.body if b == \"ping\" { return 204 } else { return 400 } }\n";
+        "route POST \"/upload\" { let b = req.body if b == \"ping\" { return 204 } else { return "
+        "400 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1486,7 +1487,7 @@ TEST(jit, frontend_req_body_without_content_length_uses_trailing_data) {
     REQUIRE(mir);
 
     FrontendRirModule rir{};
-    auto lowered = lower_to_rir_heap(mir.value(), rir);
+    auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
 
     auto cg = codegen(rir.module);
@@ -1499,20 +1500,30 @@ TEST(jit, frontend_req_body_without_content_length_uses_trailing_data) {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
-    static const char req[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\nping";
-    auto r = HandlerResult::unpack(
-        handler(nullptr, nullptr, reinterpret_cast<const u8*>(req), sizeof(req) - 1, nullptr));
-    CHECK(r.action == HandlerAction::ReturnStatus);
-    CHECK(r.status_code == 204);
-
-    static const char missing[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    r = HandlerResult::unpack(handler(nullptr,
-                                     nullptr,
-                                     reinterpret_cast<const u8*>(missing),
-                                     sizeof(missing) - 1,
-                                     nullptr));
+    // Without a Content-Length the trailing octets are the next pipelined
+    // keep-alive request, not this request's body. They must not surface as
+    // req.body, so "ping" is invisible and the handler falls through to 400.
+    static const char trailing[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\nping";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(trailing), sizeof(trailing) - 1, nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 400);
+
+    static const char missing[] = "POST /upload HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(missing), sizeof(missing) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 400);
+
+    // With an explicit Content-Length the same octets are framed as the body
+    // and become visible, confirming the gate above is the content-length,
+    // not the absence of trailing bytes.
+    static const char framed[] =
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nping";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(framed), sizeof(framed) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
 
     engine.shutdown();
     rir.destroy();
