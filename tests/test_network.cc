@@ -1049,6 +1049,70 @@ TEST(websocket, pre_tunnel_backend_close_defers) {
     CHECK_EQ(loop.conns[cid].fd, 42);  // not closed mid-handshake
 }
 
+// Backend FIN with no pending send and an empty buffer tears the tunnel down.
+TEST(websocket, backend_eof_no_pending_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed
+}
+
+// A pre-tunnel -ENOBUFS (backend filled upstream_recv_buf before the 101 sent)
+// pauses the upstream direction rather than closing the handshake.
+TEST(websocket, pre_tunnel_enobufs_pauses) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+    conn->upstream_recv_buf.commit(conn->upstream_recv_buf.write_avail());
+    CHECK_EQ(conn->upstream_recv_buf.write_avail(), 0u);
+
+    loop.backend.op_count = 0;
+    on_ws_pre_tunnel_upstream_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseUpstreamRecv);
+}
+
+// on_ws_101_sent forwards client bytes already buffered at tunnel install
+// (e.g. a recovered pipeline stash) into the upstream direction.
+TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+
+    const u8 cb[] = {'H', 'I'};
+    REQUIRE_EQ(conn->recv_buf.write(cb, sizeof(cb)), sizeof(cb));
+
+    loop.backend.op_count = 0;
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK(conn->ws_client_send_pending);
+    bool saw = false;
+    for (u32 i = 0; i < loop.backend.op_count; i++)
+        if (loop.backend.ops[i].type == MockOp::Send && loop.backend.ops[i].fd == 43) saw = true;
+    CHECK(saw);  // buffered client bytes forwarded upstream
+}
+
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
 // (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
 TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
@@ -6808,6 +6872,33 @@ TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
 // Re-arming a recv must preserve a pending opposite-direction send's EPOLLOUT on
 // the same fd (full-duplex tunnel backpressure). Drive the send to completion to
 // prove the EPOLLOUT survived the re-arm; also exercise the TLS-pending branches.
+// Pre-tunnel backend EOF on the real epoll loop: records the deferred close and
+// deregisters the upstream fd (exercises ws_stop_upstream_poll's epoll branch).
+TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    c->upstream_fd = fds[0];
+    REQUIRE(loop->backend.add_recv_upstream(fds[0], c->id));
+
+    on_ws_pre_tunnel_upstream_recv<RealLoop>(
+        loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    CHECK(c->ws_pre_tunnel_upstream_closed);  // deferred, flag recorded
+
+    close(fds[0]);
+    close(fds[1]);
+    c->upstream_fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
