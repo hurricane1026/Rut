@@ -1348,13 +1348,58 @@ TEST(legacy_loop, accessors_and_free_release_slices) {
 namespace {
 bool g_tls_pending_send_called = false;
 u32 g_tls_pending_send_result = 0;
+bool g_tls_set_slots_recv_called = false;
 
 void tls_pending_send_probe(void* /*lp*/, Connection& conn, IoEvent ev) {
     g_tls_pending_send_called = true;
     g_tls_pending_send_result = static_cast<u32>(ev.result);
     conn.on_send = nullptr;
 }
+
+void tls_set_slots_recv_probe(void*, Connection&, IoEvent) {
+    g_tls_set_slots_recv_called = true;
+}
+
+void tls_set_slots_send_probe(void*, Connection&, IoEvent) {}
 }  // namespace
+
+TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
+    Connection conn;
+    u8 tls_in_storage[SmallLoop::kBufSize];
+    u8 tls_out_storage[SmallLoop::kBufSize];
+    conn.reset();
+    conn.id = 77;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(0x1);
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+
+    g_tls_set_slots_recv_called = false;
+    conn.set_slots(&tls_set_slots_recv_probe, &tls_set_slots_send_probe, nullptr, nullptr);
+
+    CHECK(conn.uses_iouring_tls());
+    CHECK(conn.on_recv == nullptr);
+    CHECK(conn.tls_pending_on_recv == &tls_set_slots_recv_probe);
+    CHECK(g_tls_set_slots_recv_called == false);
+    conn.tls_engine.ssl = nullptr;
+}
+
+TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
+    TlsEngine engine;
+    u8 in[16];
+    u8 out[16];
+    tls_engine_set_input(engine, in, sizeof(in));
+    tls_engine_set_output(engine, out, sizeof(out));
+
+    CHECK_EQ(tls_engine_input_consumed(engine), 0u);
+    CHECK_EQ(tls_engine_output_len(engine), 0u);
+
+    engine.in_off = 4;
+    CHECK_EQ(tls_engine_input_consumed(engine), 4u);
+
+    engine.out_len = 7;
+    CHECK_EQ(tls_engine_output_len(engine), 7u);
+}
 
 TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
     Connection conn;
