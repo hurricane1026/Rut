@@ -218,7 +218,28 @@ void EpollBackend::add_accept() {
 
 bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     if (conn_id < kMaxFdMap) downstream_fd_map[conn_id] = fd;
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLIN);
+    // Re-arming the recv must not clobber an in-flight downstream send on the
+    // same fd: a single fd carries one epoll interest mask, so a bare EPOLLIN
+    // would drop a pending send's EPOLLOUT and stall it. This happens in the
+    // full-duplex WebSocket tunnel when the client→upstream send completes and
+    // we resume client reads while an upstream→client send is still draining on
+    // the client fd. Mirror pause_recv: register as the pending send's type and
+    // OR in EPOLLOUT so the send still drains (dispatch routes the read as Recv
+    // and chains EPOLLOUT to handle_epollout).
+    IoEventType type = IoEventType::Recv;
+    u32 events = EPOLLIN;
+    if (conn_id < kMaxFdMap) {
+        const auto& ss = send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd == fd) {
+            type = ss.type;
+            if (ss.tls) {
+                if (ss.tls_wait_events != EPOLLIN) events |= EPOLLOUT;
+            } else {
+                events |= EPOLLOUT;
+            }
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
     return true;
 }
 
@@ -332,7 +353,24 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
     if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, EPOLLIN);
+    // Symmetric to add_recv: preserve a pending client→upstream send's EPOLLOUT
+    // when resuming upstream reads, so the upstream→client send completing does
+    // not strand a still-draining client→upstream send on the upstream fd. Keep
+    // type=UpstreamRecv (as pause_upstream_recv does): dispatch routes EPOLLOUT
+    // to upstream_send_state for any non-Send type, and reads to the upstream fd.
+    IoEventType type = IoEventType::UpstreamRecv;
+    u32 events = EPOLLIN;
+    if (conn_id < kMaxFdMap) {
+        const auto& ss = upstream_send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd == fd) {
+            if (ss.tls) {
+                if (ss.tls_wait_events != EPOLLIN) events |= EPOLLOUT;
+            } else {
+                events |= EPOLLOUT;
+            }
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
     return true;
 }
 

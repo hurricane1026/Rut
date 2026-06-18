@@ -891,6 +891,89 @@ TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
     CHECK_EQ(loop.backend.ops[2].conn_id, conn->id);
 }
 
+// Bytes that race into recv_buf while a client→upstream tunnel send is in flight
+// must be forwarded next, never dropped: the send-completion consumes ONLY the
+// submitted length and re-sends the remainder, keeping client recv paused until
+// the buffer drains. Regression guard for the buffered-bytes-after-send finding.
+TEST(websocket, client_to_upstream_sent_resends_raced_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 hello[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->recv_buf.write(hello, sizeof(hello)), sizeof(hello));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 5));
+    REQUIRE(conn->ws_client_send_pending);
+    CHECK_EQ(conn->ws_client_send_len, 5u);
+
+    // More client bytes arrive while the HELLO send is still pending (e.g. a recv
+    // CQE harvested before the pause took effect). They append to recv_buf.
+    const u8 world[] = {'W', 'O', 'R', 'L', 'D'};
+    REQUIRE_EQ(conn->recv_buf.write(world, sizeof(world)), sizeof(world));
+    CHECK_EQ(conn->recv_buf.len(), 10u);
+
+    // HELLO send completes (5 bytes). Consume exactly 5; forward WORLD next.
+    loop.backend.op_count = 0;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 5));
+    REQUIRE_EQ(conn->recv_buf.len(), 5u);
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
+    REQUIRE(loop.backend.ops[0].send_buf != nullptr);
+    CHECK_EQ(__builtin_memcmp(loop.backend.ops[0].send_buf, world, sizeof(world)), 0);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+    CHECK(conn->ws_client_send_pending);
+    CHECK_EQ(conn->ws_client_send_len, 5u);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+}
+
+// Symmetric guard for the upstream→client direction: backend bytes that race in
+// while an upstream→client send is in flight are re-sent, not dropped.
+TEST(websocket, upstream_to_client_sent_resends_raced_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 ping[] = {'P', 'I', 'N', 'G'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(ping, sizeof(ping)), sizeof(ping));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 4));
+    REQUIRE(conn->ws_upstream_send_pending);
+    CHECK_EQ(conn->ws_upstream_send_len, 4u);
+
+    const u8 pong[] = {'P', 'O', 'N', 'G'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(pong, sizeof(pong)), sizeof(pong));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 8u);
+
+    loop.backend.op_count = 0;
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    REQUIRE_EQ(conn->upstream_recv_buf.len(), 4u);
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);  // client fd
+    CHECK_EQ(loop.backend.ops[0].send_len, 4u);
+    REQUIRE(loop.backend.ops[0].send_buf != nullptr);
+    CHECK_EQ(__builtin_memcmp(loop.backend.ops[0].send_buf, pong, sizeof(pong)), 0);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+    CHECK(conn->ws_upstream_send_pending);
+    CHECK_EQ(conn->ws_upstream_send_len, 4u);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+}
+
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
 // (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
 TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
