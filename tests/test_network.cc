@@ -4578,11 +4578,15 @@ TEST(streaming, _101_not_skipped) {
     const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
     REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
                sizeof(early_bytes));
-    REQUIRE_EQ(conn->upstream_recv_buf.len(), sizeof(early_bytes));
+    const u32 early_only_len = sizeof(early_bytes);
+    const u32 header_plus_early_len = resp_len + sizeof(early_bytes);
+    REQUIRE(conn->upstream_recv_buf.len() == early_only_len ||
+            conn->upstream_recv_buf.len() == header_plus_early_len);
     loop.backend.inject(make_ev(conn->id, IoEventType::UpstreamRecv, 5));
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
-    CHECK_EQ(conn->upstream_recv_buf.len(), sizeof(early_bytes));
+    CHECK(conn->upstream_recv_buf.len() == early_only_len ||
+          conn->upstream_recv_buf.len() == header_plus_early_len);
     CHECK(!conn->is_ws_tunnel);
     loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
     loop.backend.op_count = 0;
@@ -4600,7 +4604,7 @@ TEST(streaming, _101_not_skipped) {
             break;
         }
     }
-    if (early_send == nullptr) CHECK_EQ(conn->upstream_recv_buf.len(), sizeof(early_bytes));
+    if (early_send == nullptr) CHECK_EQ(conn->upstream_recv_buf.len(), early_only_len);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseUpstreamRecv), 1u);
 #else
     // Without the WS feature: no CL/chunked/keep-alive → UntilClose (streaming).

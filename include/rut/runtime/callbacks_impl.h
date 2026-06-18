@@ -1908,12 +1908,12 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
 template <typename Loop>
 bool ws_pause_client_recv(Loop* loop, Connection& conn) {
-    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+    if constexpr (requires(Loop* lp, u32 conn_id) { lp->backend.pause_recv(conn_id, true); }) {
+        loop->backend.pause_recv(conn.id, true);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
         const bool ok = loop->pause_recv(conn);
         if (ok && !conn.recv_armed) conn.recv_pause_cancel_pending = false;
         return ok;
-    } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid, true); }) {
-        loop->backend.pause_recv(conn.id, true);
     } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid); }) {
         loop->backend.pause_recv(conn.id);
     }
@@ -2081,8 +2081,13 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
     loop->epoch_leave();
-    conn.upstream_send_len = conn.ws_upgrade_response_len;
-    const u32 kRemaining = consume_upstream_sent(conn);
+    u32 kRemaining = conn.upstream_recv_buf.len();
+    if (kRemaining >= conn.ws_upgrade_response_len) {
+        conn.upstream_send_len = conn.ws_upgrade_response_len;
+        kRemaining = consume_upstream_sent(conn);
+    } else {
+        conn.upstream_send_len = 0;
+    }
     conn.set_slots(&on_ws_client_recv<Loop>,
                    &on_ws_upstream_to_client_sent<Loop>,
                    &on_ws_upstream_recv<Loop>,
