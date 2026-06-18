@@ -43,6 +43,8 @@ template <class Self>
 void tls_process(Self* loop, Connection& c);
 template <class Self>
 void tls_resume_pending_handler_recv(void* lp, Connection& c, IoEvent ev);
+template <class Self>
+void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent ev);
 
 // Send ciphertext staged in tls_out_slice. The bytes are already encrypted, so
 // this uses the raw (non-TLS) send. Marks the buffer in-flight; the completion
@@ -74,7 +76,12 @@ bool tls_pump_send(Self* loop, Connection& c) {
             continue;
         }
         if (st == TlsOp::WantWrite) break;  // slice full — flush, continue later
-        return false;                       // fatal
+        if (st == TlsOp::WantRead) {
+            c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+            if (!c.recv_armed && !loop->submit_recv(c)) return false;
+            return true;
+        }
+        return false;  // fatal
     }
     if (tls_engine_output_len(c.tls_engine) == 0) {
         c.tls_send_src = nullptr;  // nothing to send (len 0)
@@ -197,8 +204,15 @@ void tls_process(Self* loop, Connection& c) {
             loop->close_conn(c);  // fatal
             return;
         }
-        c.tls_in_buf.consume(tls_engine_input_consumed(c.tls_engine));
-        if (c.recv_buf.len() <= kBefore) break;  // produced nothing this round
+        const u32 kConsumed = tls_engine_input_consumed(c.tls_engine);
+        c.tls_in_buf.consume(kConsumed);
+        if (c.recv_buf.len() <= kBefore) {
+            if (kConsumed > 0 && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>) {
+                tls_resume_pending_send_recv<Self>(loop, c, {});
+                return;
+            }
+            break;  // produced nothing this round
+        }
 
         IoEvent pev = {};
         pev.conn_id = c.id;
@@ -249,6 +263,17 @@ void tls_resume_pending_handler_recv(void* lp, Connection& c, IoEvent ev) {
     c.resume_event_kind = yield_kind_from_event(IoEventType::Recv);
     c.resume_event_result = ev.result;
     resume_jit_handler<Self>(loop, c);
+}
+
+// SSL_write can need peer input for post-handshake TLS control messages. While
+// app-data plaintext remains pending, route one recv through TLS and then retry
+// encryption instead of treating WANT_READ as a fatal send failure.
+template <class Self>
+void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
+    auto* loop = static_cast<Self*>(lp);
+    c.tls_pending_on_recv = nullptr;
+    if (!c.tls_send_src || c.tls_send_off >= c.tls_send_len) return;
+    if (!tls_pump_send<Self>(loop, c)) loop->close_conn(c);
 }
 
 }  // namespace rut

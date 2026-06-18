@@ -541,6 +541,20 @@ int main(int argc, char** argv) {
                                           access_log_level,
                                           route_config,
                                           serve_metrics);
+        if (rc != 0 && tls_server) {
+            write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
+            rc = run_shards<EpollEventLoop>(port,
+                                            shard_count,
+                                            pin_cpus,
+                                            drain_secs,
+                                            pool_prealloc,
+                                            tls_server,
+                                            access_log_path,
+                                            access_log_compress,
+                                            access_log_level,
+                                            route_config,
+                                            serve_metrics);
+        }
     } else {
         write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
         rc = run_shards<EpollEventLoop>(port,
