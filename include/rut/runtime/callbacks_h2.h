@@ -11,10 +11,12 @@
 // are follow-ups). HTTP/1 is untouched: this path is only entered when
 // conn.protocol == Http2 (ALPN) or the cleartext h2c preface is detected.
 
+#include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -225,6 +227,27 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 200);  // default (matches HTTP/1 catchall)
         return;
     }
+
+    // Enforce @rateLimit before dispatch — the same per-shard buckets as HTTP/1
+    // (see rate_limit_enforce.h), so a route can't be called unmetered over h2.
+    // Build an HTTP/1-shaped view so header/query/cookie key components extract
+    // identically; IP and route-param keys work regardless of the synth.
+    if (route->rate_limit.count > 0) {
+        u8 rl_synth[8192];
+        const u32 kRlLen = h2_synth_h1_request(headers, nheaders, rl_synth, sizeof(rl_synth));
+        RateLimitKeyInput key_in;
+        key_in.peer_addr = d.conn->peer_addr;
+        key_in.req_buf = kRlLen ? rl_synth : nullptr;
+        key_in.req_header_end = kRlLen;
+        key_in.params = params;
+        key_in.param_count = param_count;
+        const u32 kRouteIdx = static_cast<u32>(route - config->routes);
+        if (rate_limit_exceeded(d.loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
+            h2_emit_status(d, stream_id, 429);
+            return;
+        }
+    }
+
     switch (route->action) {
         case RouteAction::Static:
             h2_emit_status(d, stream_id, route->status_code);
