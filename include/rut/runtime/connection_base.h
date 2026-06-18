@@ -141,6 +141,10 @@ struct ConnectionBase {
     // transparent full-duplex byte tunnel (WebSocket passthrough): the 4 slots
     // splice client↔upstream and the keepalive timeout no longer closes it.
     bool is_ws_tunnel;
+    // Backends currently keep one per-connection send_state shared by Send and
+    // UpstreamSend, so the WebSocket tunnel serializes its two directions.
+    bool ws_client_send_pending;
+    bool ws_upstream_send_pending;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -339,6 +343,8 @@ struct ConnectionBase {
         throttle_paused = false;
         throttle_pending_len = 0;
         is_ws_tunnel = false;
+        ws_client_send_pending = false;
+        ws_upstream_send_pending = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

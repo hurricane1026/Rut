@@ -1896,7 +1896,9 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 bool ws_pause_client_recv(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
-        return loop->pause_recv(conn);
+        const bool ok = loop->pause_recv(conn);
+        if (ok && !conn.recv_armed) conn.recv_pause_cancel_pending = false;
+        return ok;
     } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid); }) {
         loop->backend.pause_recv(conn.id);
     }
@@ -1910,6 +1912,39 @@ void ws_pause_upstream_recv(Loop* loop, Connection& conn) {
     } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_upstream_recv(cid); }) {
         loop->backend.pause_upstream_recv(conn.id);
     }
+}
+
+template <typename Loop>
+bool ws_resume_client_recv(Loop* loop, Connection& conn) {
+    conn.recv_paused_for_send = false;
+    return loop->submit_recv(conn);
+}
+
+inline bool ws_send_busy(const Connection& conn) {
+    return conn.ws_client_send_pending || conn.ws_upstream_send_pending;
+}
+
+template <typename Loop>
+bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
+    if (conn.recv_buf.len() == 0) return true;
+    if (ws_send_busy(conn)) return ws_pause_client_recv(loop, conn);
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len())) return false;
+    conn.ws_client_send_pending = true;
+    return ws_pause_client_recv(loop, conn);
+}
+
+template <typename Loop>
+bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
+    if (conn.upstream_recv_buf.len() == 0) return true;
+    if (ws_send_busy(conn)) {
+        ws_pause_upstream_recv(loop, conn);
+        return true;
+    }
+    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len()))
+        return false;
+    conn.ws_upstream_send_pending = true;
+    ws_pause_upstream_recv(loop, conn);
+    return true;
 }
 
 template <typename Loop>
@@ -1930,21 +1965,20 @@ void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len()) ||
-        !ws_pause_client_recv(loop, conn)) {
-        loop->close_conn(conn);
-    }
+    if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
 }
 
 template <typename Loop>
 void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    conn.ws_client_send_pending = false;
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
     }
     conn.recv_buf.reset();
-    loop->submit_recv(conn);  // re-arm client→upstream direction
+    if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn))
+        loop->close_conn(conn);
 }
 
 template <typename Loop>
@@ -1962,22 +1996,20 @@ void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len())) {
-        loop->close_conn(conn);
-        return;
-    }
-    ws_pause_upstream_recv(loop, conn);
+    if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
 }
 
 template <typename Loop>
 void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    conn.ws_upstream_send_pending = false;
     if (ev.result <= 0) {
         loop->close_conn(conn);
         return;
     }
     conn.upstream_recv_buf.reset();
     loop->submit_recv_upstream(conn);  // re-arm upstream→client direction
+    if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
 }
 
 // The 101 (and any bytes the backend already sent) has been forwarded to the
@@ -1989,6 +2021,9 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    conn.is_ws_tunnel = true;
+    conn.ws_client_send_pending = false;
+    conn.ws_upstream_send_pending = false;
     conn.upstream_recv_buf.reset();
     conn.recv_buf.reset();
     conn.set_slots(&on_ws_client_recv<Loop>,
@@ -2054,9 +2089,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // response plus any bytes the backend already sent (early frames) to the
     // client, then run the connection as a transparent full-duplex tunnel.
     if (resp.status_code == 101) {
-        conn.is_ws_tunnel = true;
         conn.transition_to_sending(&on_ws_101_sent<Loop>);
-        loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len());
+        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len()))
+            loop->close_conn(conn);
         return;
     }
 #endif

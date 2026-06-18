@@ -832,12 +832,22 @@ TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
                sizeof(upstream_bytes));
     loop.backend.op_count = 0;
     on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 5));
-    REQUIRE_EQ(loop.backend.op_count, 2u);
-    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].conn_id, cid);
+
+    conn->recv_paused_for_send = true;
+    loop.backend.op_count = 0;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 5));
+    CHECK(!conn->recv_paused_for_send);
+    REQUIRE_EQ(loop.backend.op_count, 3u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 42);
-    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
-    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
-    CHECK_EQ(loop.backend.ops[1].conn_id, cid);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].send_len, 5u);
+    CHECK_EQ(loop.backend.ops[2].type, MockOp::PauseUpstreamRecv);
 }
 
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
@@ -4561,7 +4571,12 @@ TEST(streaming, _101_not_skipped) {
     // 101 is terminal — must NOT be skipped as an interim 1xx.
     CHECK_EQ(conn->resp_status, static_cast<u16>(101));
 #if RUT_ENABLE_WEBSOCKET
-    // WebSocket/Upgrade passthrough: 101 pivots the connection into a tunnel.
+    // The idle-timeout exemption starts only after the 101 reaches the client.
+    CHECK(!conn->is_ws_tunnel);
+    REQUIRE(conn->on_send != nullptr);
+    loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK(conn->is_ws_tunnel);
 #else
     // Without the WS feature: no CL/chunked/keep-alive → UntilClose (streaming).
