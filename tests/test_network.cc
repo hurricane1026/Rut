@@ -794,15 +794,23 @@ TEST(websocket, enobufs_pauses_not_closes) {
     // -ENOBUFS → pause, no close.
     conn->recv_buf.commit(conn->recv_buf.write_avail());
     CHECK_EQ(conn->recv_buf.write_avail(), 0u);
+    loop.backend.op_count = 0;
     on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ENOBUFS));
     CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseRecv);
+    CHECK_EQ(loop.backend.ops[0].conn_id, cid);
 
     // Upstream→client direction: same, on upstream_recv_buf.
     REQUIRE(loop.alloc_upstream_buf(*conn));
     conn->upstream_recv_buf.commit(conn->upstream_recv_buf.write_avail());
     CHECK_EQ(conn->upstream_recv_buf.write_avail(), 0u);
+    loop.backend.op_count = 0;
     on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
     CHECK_EQ(loop.conns[cid].fd, 42);  // still not closed
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].conn_id, cid);
 }
 
 TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
@@ -848,6 +856,39 @@ TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
     CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 42);
     CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+}
+
+TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+
+    const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
+               sizeof(early_bytes));
+
+    loop.backend.op_count = 0;
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+
+    CHECK(conn->is_ws_tunnel);
+    CHECK_EQ(conn->upstream_send_len, 0u);
+    CHECK_EQ(conn->upstream_recv_buf.len(), sizeof(early_bytes));
+    CHECK(conn->ws_upstream_send_pending);
+    CHECK_EQ(conn->ws_upstream_send_len, sizeof(early_bytes));
+    REQUIRE_EQ(loop.backend.op_count, 3u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].send_len, sizeof(early_bytes));
+    CHECK_EQ(loop.backend.ops[2].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[2].conn_id, conn->id);
 }
 
 // The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
