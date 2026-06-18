@@ -1142,6 +1142,59 @@ TEST(h2_serving, body_content_length_mismatch_fails) {
     CHECK_FALSE(h2_finalize_synth_body(h2));
 }
 
+TEST(h2_serving, inject_content_length_exposes_data_only_body) {
+    // A DATA-only h2 body (client omitted content-length) is buffered as raw
+    // bytes after the synthesized headers; injecting content-length must make
+    // the HTTP/1-shaped parse expose exactly those bytes as the body.
+    u8 buf[256];
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nabcde";
+    u32 len = 0;
+    while (req[len]) {
+        buf[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    const u32 kBodyStart = len - 5;  // just past "\r\n\r\n"
+    REQUIRE(h2_inject_content_length(buf, &len, kBodyStart, 5, sizeof(buf)));
+
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    CHECK(parser.parse(buf, len, &parsed) == ParseStatus::Complete);
+    CHECK(parsed.has_content_length);
+    CHECK_EQ(parsed.content_length, 5u);
+    // The 5 body octets must be the final bytes, intact, after injection.
+    CHECK(Str(reinterpret_cast<const char*>(buf + len - 5), 5).eq(Str{"abcde", 5}));
+}
+
+TEST(h2_serving, inject_content_length_zero_length_body) {
+    u8 buf[128];
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\n";
+    u32 len = 0;
+    while (req[len]) {
+        buf[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    REQUIRE(h2_inject_content_length(buf, &len, len, 0, sizeof(buf)));
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    CHECK(parser.parse(buf, len, &parsed) == ParseStatus::Complete);
+    CHECK(parsed.has_content_length);
+    CHECK_EQ(parsed.content_length, 0u);
+}
+
+TEST(h2_serving, inject_content_length_rejects_overflow) {
+    u8 buf[40];
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nab";
+    u32 len = 0;
+    while (req[len]) {
+        buf[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    // Buffer too small to fit the injected "content-length: 2\r\n" line.
+    CHECK_FALSE(h2_inject_content_length(buf, &len, len - 2, 2, sizeof(buf)));
+}
+
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {
     Http2Conn c;
     Capture cap;

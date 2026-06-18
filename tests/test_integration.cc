@@ -6299,6 +6299,9 @@ static u64 h2_echo_body_handler(
     return r.pack();
 }
 
+// A body-reading handler for an h2 request that omitted content-length. The
+// bridge synthesizes a content-length so the HTTP/1-shaped parse exposes the
+// DATA bytes; the handler verifies both the injected header and the body.
 static u64 h2_no_cl_body_handler(
     void* /*conn*/, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
     u32 body_off = len;
@@ -6316,7 +6319,7 @@ static u64 h2_no_cl_body_handler(
         }
     }
     const u32 blen = len - body_off;
-    const bool ok = !saw_content_length && blen == 4 && req[body_off] == 'p' &&
+    const bool ok = saw_content_length && blen == 4 && req[body_off] == 'p' &&
                     req[body_off + 1] == 'i' && req[body_off + 2] == 'n' &&
                     req[body_off + 3] == 'g';
     rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
@@ -6392,7 +6395,7 @@ TEST(shard, serves_http2_request_body) {
     close(lfd);
 }
 
-TEST(shard, serves_http2_request_body_without_injected_content_length) {
+TEST(shard, serves_http2_request_body_with_synthesized_content_length) {
     using namespace rut;
 
     RouteConfig cfg{};

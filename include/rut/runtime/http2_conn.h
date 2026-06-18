@@ -39,6 +39,16 @@ struct Http2Result {
     bool close;    // connection error or GOAWAY emitted — flush out, then close
 };
 
+// Trivially-constructible mirror of RouteParam (which carries default member
+// initializers) so that Http2Conn — allocated from a SlabPool that requires
+// trivial constructibility — can snapshot matched route params inline.
+struct H2RouteParam {
+    const char* name;
+    u32 name_len;
+    const char* value;
+    u32 value_len;
+};
+
 struct Http2Conn {
     static constexpr u32 kMaxStreams = 64;
     static constexpr u32 kHeaderBlockCap = 16384;    // assembled HPACK fragments
@@ -107,7 +117,7 @@ struct Http2Conn {
     RouteAction pending_route_action;
     u16 pending_static_status;
     jit::HandlerFn pending_jit_fn;
-    RouteParam pending_route_params[kMaxRouteParams];
+    H2RouteParam pending_route_params[kMaxRouteParams];
     u32 pending_route_param_count;
     u8 pending_synth[kBodySynthCap];
 
