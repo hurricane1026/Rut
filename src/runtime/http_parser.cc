@@ -256,9 +256,15 @@ static inline ParseStatus apply_semantic_header(
         }
     } else if (first == 'u') {
         if (name_len == 7 && str_ci_eq(name + 1, "pgrade", 6)) {
-            // Presence of an Upgrade header (any protocol token). A valid upgrade
-            // request needs BOTH this and the Connection: upgrade token.
-            req->has_upgrade_header = true;
+            // Require at least one non-OWS token — an empty or whitespace-only
+            // Upgrade header requests no protocol and must not gate a tunnel. A
+            // valid upgrade also needs the Connection: upgrade token.
+            for (u32 i = 0; i < vlen; i++) {
+                if (val[i] != ' ' && val[i] != '\t') {
+                    req->has_upgrade_header = true;
+                    break;
+                }
+            }
             return ParseStatus::Complete;
         }
     }

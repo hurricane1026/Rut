@@ -805,6 +805,16 @@ TEST(Corpus, ConnectionUpgradeSetsFlag) {
                static_cast<u8>(ParseStatus::Complete));
     CHECK(!req.upgrade);  // close is sticky across Connection fields
 
+    // An empty / whitespace-only Upgrade header requests no protocol.
+    parser.reset();
+    req.reset();
+    const u8 empty_up[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade:  \r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(empty_up, sizeof(empty_up) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.upgrade);
+    CHECK(!req.has_upgrade_header);  // empty Upgrade value → not a valid upgrade
+
     parser.reset();
     req.reset();
     const u8 normal[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";

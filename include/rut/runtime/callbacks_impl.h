@@ -2156,9 +2156,11 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.upstream_recv_buf.consume(conn.ws_upstream_send_len);
     conn.ws_upstream_send_len = 0;
-    if (conn.ws_pre_tunnel_upstream_closed) {  // backend closed during the 101 drain
-        loop->close_conn(conn);
-        return;
+    if (conn.ws_pre_tunnel_upstream_closed) {
+        // Backend closed during the 101 drain: enter drain mode so a still-pending
+        // or buffered client→upstream send (post-upgrade bytes) flushes before the
+        // tunnel tears down, instead of being truncated.
+        conn.ws_upstream_eof = true;
     }
     if (ws_draining(conn)) {
         if (!ws_drain_pump(loop, conn)) {
