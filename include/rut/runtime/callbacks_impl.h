@@ -1586,6 +1586,71 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     client_send(loop, conn, conn.upstream_recv_buf.data(), send_len);
 }
 
+// The proxy response body is fully forwarded: release the upstream slot,
+// complete the request, close upstream, and continue the connection (keep-alive
+// pipeline / next request). Factored out of on_response_body_sent so the
+// io_uring-TLS owned-buffer path (tls_on_out_drain, see docs/iouring-tls-output-
+// buffer.md) shares the exact completion logic. tls_proxy_stream /
+// resp_fully_buffered are per-response — cleared here, the keep-alive boundary.
+template <typename Loop>
+void proxy_stream_complete(Loop* loop, Connection& conn) {
+    conn.tls_proxy_stream = false;
+    conn.resp_fully_buffered = false;
+    conn.upstream_recv_buf.reset();
+    release_upstream_slot(loop, conn);  // free the backend slot promptly
+
+    on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
+    loop->epoch_leave();
+
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    loop->clear_upstream_fd(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+
+    if (!conn.keep_alive || loop->is_draining()) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
+        const u16 kStashLen = conn.pipeline_stash_len;
+        const u32 kLateLen = conn.recv_buf.len();
+        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
+            conn.pipeline_stash_len = 0;
+            conn.send_buf.reset();
+            loop->close_conn(conn);
+            return;
+        }
+        conn.pipeline_stash_len = 0;
+        conn.upstream_recv_buf.reset();
+        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
+        conn.recv_buf.reset();
+        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
+        conn.upstream_recv_buf.reset();
+        conn.send_buf.reset();
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (pipeline_recover(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (conn.recv_buf.len() > 0) {
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    conn.pipeline_depth = 0;
+    conn.recv_buf.reset();
+    conn.transition_to_reading_header(&on_header_received<Loop>);
+    loop->submit_recv(conn);
+}
+
 template <typename Loop>
 void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -1606,59 +1671,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (body_done) {
-        conn.upstream_recv_buf.reset();
-        release_upstream_slot(loop, conn);  // free the backend slot promptly
-
-        on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
-        loop->epoch_leave();
-
-        if (conn.upstream_fd >= 0) {
-            ::close(conn.upstream_fd);
-            conn.upstream_fd = -1;
-        }
-        loop->clear_upstream_fd(conn.id);
-        conn.upstream_recv_armed = false;
-        conn.upstream_send_armed = false;
-
-        if (!conn.keep_alive || loop->is_draining()) {
-            loop->close_conn(conn);
-            return;
-        }
-
-        if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
-            const u16 kStashLen = conn.pipeline_stash_len;
-            const u32 kLateLen = conn.recv_buf.len();
-            if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
-                conn.pipeline_stash_len = 0;
-                conn.send_buf.reset();
-                loop->close_conn(conn);
-                return;
-            }
-            conn.pipeline_stash_len = 0;
-            conn.upstream_recv_buf.reset();
-            conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
-            conn.recv_buf.reset();
-            conn.recv_buf.write(conn.send_buf.data(), kStashLen);
-            conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
-            conn.upstream_recv_buf.reset();
-            conn.send_buf.reset();
-            conn.pipeline_depth++;
-            pipeline_dispatch<Loop>(loop, conn);
-            return;
-        }
-        if (pipeline_recover(conn)) {
-            pipeline_dispatch<Loop>(loop, conn);
-            return;
-        }
-        if (conn.recv_buf.len() > 0) {
-            conn.pipeline_depth++;
-            pipeline_dispatch<Loop>(loop, conn);
-            return;
-        }
-        conn.pipeline_depth = 0;
-        conn.recv_buf.reset();
-        conn.transition_to_reading_header(&on_header_received<Loop>);
-        loop->submit_recv(conn);
+        proxy_stream_complete<Loop>(loop, conn);
         return;
     }
 
