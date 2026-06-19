@@ -4,6 +4,7 @@
 // built with the engine's own response writers (HPACK encoder), fed through
 // process(), and the decoded callbacks + emitted control frames are asserted.
 
+#include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
 #include "test.h"
@@ -435,6 +436,63 @@ TEST(h2_request, content_length_parsed) {
     CHECK(req.method == HttpMethod::POST);
     CHECK(req.has_content_length);
     CHECK_EQ(req.content_length, 42u);
+}
+
+TEST(h2_request, ten_digit_content_length_parsed) {
+    hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"0000000000", 10}},
+    };
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 3, &req));
+    CHECK(req.has_content_length);
+    CHECK_EQ(req.content_length, 0u);
+
+    hpack::Header max[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"4294967295", 10}},
+    };
+    REQUIRE(h2_headers_to_request(max, 3, &req));
+    CHECK_EQ(req.content_length, 4294967295u);
+}
+
+TEST(h2_request, invalid_or_duplicate_content_length_fails) {
+    ParsedRequest req;
+    hpack::Header bad[] = {{{":method", 7}, {"POST", 4}},
+                           {{":path", 5}, {"/u", 2}},
+                           {{"content-length", 14}, {"x", 1}}};
+    CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
+    hpack::Header over[] = {{{":method", 7}, {"POST", 4}},
+                            {{":path", 5}, {"/u", 2}},
+                            {{"content-length", 14}, {"4294967296", 10}}};
+    CHECK_FALSE(h2_headers_to_request(over, 3, &req));
+    hpack::Header dup[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":path", 5}, {"/u", 2}},
+        {{"content-length", 14}, {"1", 1}},
+        {{"content-length", 14}, {"1", 1}},
+    };
+    CHECK_FALSE(h2_headers_to_request(dup, 4, &req));
+}
+
+TEST(h2_request, duplicate_pseudo_headers_fail) {
+    ParsedRequest req;
+    hpack::Header auth[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+        {{":authority", 10}, {"a", 1}},
+        {{":authority", 10}, {"b", 1}},
+    };
+    CHECK_FALSE(h2_headers_to_request(auth, 4, &req));
+    hpack::Header scheme[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/", 1}},
+        {{":scheme", 7}, {"https", 5}},
+        {{":scheme", 7}, {"http", 4}},
+    };
+    CHECK_FALSE(h2_headers_to_request(scheme, 4, &req));
 }
 
 TEST(h2_request, missing_method_or_path_fails) {
@@ -987,6 +1045,277 @@ TEST(http2_conn, data_on_half_closed_stream_rsts) {
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
     CHECK_FALSE(r.close);
     CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+}
+
+TEST(http2_conn, repeated_headers_on_open_stream_rsts) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[512];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/false);
+    fn += http2_write_headers(frame + fn, sizeof(frame) - fn, 1, hs, 2, /*end_stream=*/true);
+    u8 in[640];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK(c.find_stream(1) == nullptr);
+}
+
+TEST(http2_conn, duplicate_headers_block_is_decoded_before_reset) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    u8 frame[1024];
+    const hpack::Header open[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, open, 2, /*end_stream=*/false);
+
+    hpack::Encoder enc;
+    enc.init(4096);
+    u8 dup_block[128];
+    u32 dup_len = 0;
+    dup_len += enc.encode(dup_block + dup_len, Str{"x-seen", 6}, Str{"v", 1});
+    fn += put_frame(
+        frame + fn, Http2FrameType::Headers, http2_flag::kEndHeaders, 1, dup_block, dup_len);
+
+    u8 next_block[256];
+    u32 next_len = 0;
+    next_len += enc.encode(next_block + next_len, Str{":method", 7}, Str{"GET", 3});
+    next_len += enc.encode(next_block + next_len, Str{":path", 5}, Str{"/", 1});
+    next_len += enc.encode(next_block + next_len, Str{"x-seen", 6}, Str{"v", 1});
+    fn += put_frame(frame + fn,
+                    Http2FrameType::Headers,
+                    http2_flag::kEndHeaders | http2_flag::kEndStream,
+                    3,
+                    next_block,
+                    next_len);
+
+    u8 in[1200];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[512];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK(has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK_EQ(cap.headers_calls, 2u);
+    CHECK_EQ(cap.last_stream, 3u);
+}
+
+TEST(http2_conn, request_trailers_finalize_instead_of_rst) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+
+    // POST with a body (no END_STREAM) followed by a DATA frame (no END_STREAM).
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    u8 frame[512];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/false);
+    fn += http2_write_data(
+        frame + fn, 1, reinterpret_cast<const u8*>("hello"), 5, /*end_stream=*/false);
+    u8 in[640];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    CHECK_EQ(cap.data_calls, 1u);
+    CHECK_FALSE(cap.data_end);
+
+    // The serving layer would have deferred this upload.
+    c.pending_stream = 1;
+
+    // Trailing HEADERS: END_STREAM, no pseudo-headers → valid request trailers.
+    hpack::Header tr[] = {{{"x-checksum", 10}, {"ok", 2}}};
+    u8 tframe[128];
+    u32 tn = http2_write_headers(tframe, sizeof(tframe), 1, tr, 1, /*end_stream=*/true);
+    u8 tout[128];
+    u32 tow = 0;
+    Http2Result r2 = c.process(tframe, tn, tout, sizeof(tout), &tow);
+    CHECK_FALSE(r2.close);
+    CHECK_FALSE(has_frame(tout, tow, Http2FrameType::RstStream, 0, 0));  // not reset
+    CHECK_EQ(cap.data_calls, 2u);  // end-of-stream delivered to finalize the upload
+    CHECK(cap.data_end);
+    Http2Stream* s = c.find_stream(1);
+    REQUIRE(s != nullptr);
+    CHECK(s->state == Http2StreamState::HalfClosedRemote);
+}
+
+TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/up", 3}}};
+    u8 frame[512];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, /*end_stream=*/false);
+    u8 in[640];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+
+    // END_STREAM is set, but a pseudo-header (:path) disqualifies it as trailers
+    // (RFC 7540 §8.1.2.1) → reset rather than finalize.
+    hpack::Header bad[] = {{{":path", 5}, {"/x", 2}}, {{"x-t", 3}, {"1", 1}}};
+    u8 bframe[128];
+    u32 bn = http2_write_headers(bframe, sizeof(bframe), 1, bad, 2, /*end_stream=*/true);
+    u8 bout[128];
+    u32 bow = 0;
+    c.process(bframe, bn, bout, sizeof(bout), &bow);
+    CHECK(has_frame(bout, bow, Http2FrameType::RstStream, 0, 0));
+}
+
+TEST(h2_serving, finalizes_body_without_injecting_content_length) {
+    Http2Conn h2;
+    h2.init();
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nabc";
+    u32 len = 0;
+    while (req[len]) {
+        h2.pending_synth[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    h2.pending_body_start = len - 3;
+    h2.pending_synth_len = len;
+    h2.pending_body_len = 3;
+    REQUIRE(h2_finalize_synth_body(h2));
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    CHECK(parser.parse(h2.pending_synth, h2.pending_synth_len, &parsed) == ParseStatus::Complete);
+    CHECK_FALSE(parsed.has_content_length);
+}
+
+TEST(h2_serving, body_content_length_mismatch_fails) {
+    Http2Conn h2;
+    h2.init();
+    const char* req = "POST /u HTTP/1.1\r\ncontent-length: 4\r\n\r\nabc";
+    u32 len = 0;
+    while (req[len]) {
+        h2.pending_synth[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    h2.pending_body_start = len - 3;
+    h2.pending_synth_len = len;
+    h2.pending_body_len = 3;
+    h2.pending_content_length = 4;
+    h2.pending_has_content_length = true;
+    CHECK_FALSE(h2_finalize_synth_body(h2));
+}
+
+TEST(h2_serving, inject_content_length_exposes_data_only_body) {
+    // A DATA-only h2 body (client omitted content-length) is buffered as raw
+    // bytes after the synthesized headers; injecting content-length must make
+    // the HTTP/1-shaped parse expose exactly those bytes as the body.
+    u8 buf[256];
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nabcde";
+    u32 len = 0;
+    while (req[len]) {
+        buf[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    const u32 kBodyStart = len - 5;  // just past "\r\n\r\n"
+    REQUIRE(h2_inject_content_length(buf, &len, kBodyStart, 5, sizeof(buf)));
+
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    CHECK(parser.parse(buf, len, &parsed) == ParseStatus::Complete);
+    CHECK(parsed.has_content_length);
+    CHECK_EQ(parsed.content_length, 5u);
+    // The 5 body octets must be the final bytes, intact, after injection.
+    CHECK(Str(reinterpret_cast<const char*>(buf + len - 5), 5).eq(Str{"abcde", 5}));
+}
+
+TEST(h2_serving, inject_content_length_zero_length_body) {
+    u8 buf[128];
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\n";
+    u32 len = 0;
+    while (req[len]) {
+        buf[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    REQUIRE(h2_inject_content_length(buf, &len, len, 0, sizeof(buf)));
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    CHECK(parser.parse(buf, len, &parsed) == ParseStatus::Complete);
+    CHECK(parsed.has_content_length);
+    CHECK_EQ(parsed.content_length, 0u);
+}
+
+TEST(h2_serving, inject_content_length_rejects_overflow) {
+    u8 buf[40];
+    const char* req = "POST /u HTTP/1.1\r\nhost: x\r\n\r\nab";
+    u32 len = 0;
+    while (req[len]) {
+        buf[len] = static_cast<u8>(req[len]);
+        len++;
+    }
+    // Buffer too small to fit the injected "content-length: 2\r\n" line.
+    CHECK_FALSE(h2_inject_content_length(buf, &len, len - 2, 2, sizeof(buf)));
+}
+
+namespace {
+struct FakeH2Loop {};
+}  // namespace
+
+TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
+    // A deferred dynamic route's param VALUES point into hdr_scratch, which the
+    // engine reuses for the next decoded header block. The snapshot must copy
+    // those bytes into stable per-connection storage so a concurrently
+    // multiplexed stream's HEADERS can't clobber req.param() for this request.
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+
+    FakeH2Loop loop;
+    u8 resp[256];
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, resp, sizeof(resp), 0, false};
+
+    // The path value lives in a mutable buffer standing in for hdr_scratch; the
+    // matched param value is a substring of it (as the real matcher produces).
+    char path_buf[] = "/users/42";
+    RouteParam params[1] = {{"id", 2, path_buf + 7, 2}};  // "42" within the path
+    RouteEntry route{};
+    route.action = RouteAction::JitHandler;
+    route.fn = reinterpret_cast<jit::HandlerFn>(0x1);  // non-null, never invoked
+
+    const hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {path_buf, 9}}};
+    ParsedRequest req{};
+    req.has_content_length = true;
+    req.content_length = 0;
+
+    REQUIRE(h2_defer_until_data_end(d,
+                                    1,
+                                    hs,
+                                    2,
+                                    req,
+                                    /*buffer_body=*/true,
+                                    RouteAction::JitHandler,
+                                    /*route_config=*/nullptr,
+                                    &route,
+                                    params,
+                                    1,
+                                    200));
+
+    // Simulate the engine reusing hdr_scratch for another stream's headers.
+    path_buf[7] = '9';
+    path_buf[8] = '9';
+
+    REQUIRE(h2.pending_route_param_count == 1u);
+    const H2RouteParam& sp = h2.pending_route_params[0];
+    CHECK_EQ(sp.value_len, 2u);
+    CHECK(sp.value != path_buf + 7);  // not aliasing the reusable matcher source
+    // Value re-anchored into the stable synth "GET /users/42 HTTP/1.1...": the
+    // path follows "GET " (offset 4), so "42" sits at offset 4 + len("/users/").
+    CHECK(sp.value == reinterpret_cast<const char*>(h2.pending_synth + 4 + 7));
+    CHECK(sp.value[0] == '4' && sp.value[1] == '2');  // pre-clobber bytes intact
+    CHECK(sp.name == params[0].name);                 // name still points into stable config
 }
 
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {

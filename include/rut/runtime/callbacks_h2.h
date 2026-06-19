@@ -49,19 +49,39 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 nhdrs,
                       const u8* body,
                       u32 body_len) {
+    auto enc = d.conn->h2->hpack_enc;
     const u32 kN = http2_write_response(d.resp + d.resp_len,
                                         d.resp_cap - d.resp_len,
-                                        d.conn->h2->hpack_enc,
+                                        enc,
                                         stream_id,
                                         status,
                                         hdrs,
                                         nhdrs,
                                         body,
                                         body_len);
-    if (kN == 0)
+    if (kN == 0 && d.resp_len != 0) {
         d.overflow = true;
-    else
+    } else if (kN == 0 && d.resp_len == 0) {
+        enc = d.conn->h2->hpack_enc;
+        const u32 kFallback = http2_write_response(d.resp + d.resp_len,
+                                                   d.resp_cap - d.resp_len,
+                                                   enc,
+                                                   stream_id,
+                                                   500,
+                                                   nullptr,
+                                                   0,
+                                                   nullptr,
+                                                   0);
+        if (kFallback == 0)
+            d.overflow = true;
+        else {
+            d.conn->h2->hpack_enc = enc;
+            d.resp_len += kFallback;
+        }
+    } else {
+        d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
+    }
 }
 
 // Append a status-only response (HEADERS with :status, END_STREAM).
@@ -124,6 +144,147 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     return o;
 }
 
+inline void h2_clear_pending(Http2Conn& h2) {
+    h2.pending_stream = 0;
+    h2.pending_body_start = 0;
+    h2.pending_synth_len = 0;
+    h2.pending_body_len = 0;
+    h2.pending_content_length = 0;
+    h2.pending_has_content_length = false;
+    h2.pending_buffer_body = false;
+    h2.pending_overflow = false;
+    h2.pending_route_config = nullptr;
+    h2.pending_route = nullptr;
+    h2.pending_route_action = RouteAction::Static;
+    h2.pending_static_status = 200;
+    h2.pending_jit_fn = nullptr;
+    h2.pending_route_param_count = 0;
+    for (u32 i = 0; i < kMaxRouteParams; i++) {
+        h2.pending_route_params[i] = {};
+    }
+}
+
+// pending_body_start points just after the synthesized CRLFCRLF; DATA bytes are
+// appended there only when the matched handler actually reads req.body.
+inline bool h2_finalize_synth_body(Http2Conn& h2) {
+    if (h2.pending_body_start < 4 || h2.pending_body_start > h2.pending_synth_len) return false;
+    return !h2.pending_has_content_length || h2.pending_content_length == h2.pending_body_len;
+}
+
+// Insert "content-length: <body_len>\r\n" immediately before the blank-line
+// terminator of a synthesized HTTP/1 request, shifting any buffered body to the
+// right. `body_start` points just past the "\r\n\r\n" terminator. Returns false
+// (leaving the buffer untouched) if the result would exceed cap. Used to expose
+// HTTP/2 DATA-only bodies (no client content-length) through the HTTP/1-shaped
+// JIT body parser, which keys off content-length.
+inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body_len, u32 cap) {
+    if (body_start < 4 || body_start > *len) return false;
+    char digits[10];
+    u32 nd = 0;
+    if (body_len == 0) {
+        digits[nd++] = '0';
+    } else {
+        char tmp[10];
+        u32 t = 0;
+        for (u32 v = body_len; v > 0; v /= 10) tmp[t++] = static_cast<char>('0' + (v % 10));
+        while (t > 0) digits[nd++] = tmp[--t];
+    }
+    static const char kKey[] = "content-length: ";
+    const u32 kKeyLen = 16;             // strlen("content-length: ")
+    const u32 kIns = kKeyLen + nd + 2;  // header line + CRLF
+    if (*len + kIns > cap) return false;
+    const u32 kAt = body_start - 2;  // before the blank-line CRLF
+    for (u32 i = *len; i > kAt; i--) buf[i - 1 + kIns] = buf[i - 1];
+    u32 o = kAt;
+    for (u32 i = 0; i < kKeyLen; i++) buf[o++] = static_cast<u8>(kKey[i]);
+    for (u32 i = 0; i < nd; i++) buf[o++] = static_cast<u8>(digits[i]);
+    buf[o++] = '\r';
+    buf[o++] = '\n';
+    *len += kIns;
+    return true;
+}
+
+template <typename Loop>
+bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
+                             u32 stream_id,
+                             const hpack::Header* headers,
+                             u32 nheaders,
+                             const ParsedRequest& req,
+                             bool buffer_body,
+                             RouteAction action,
+                             const RouteConfig* route_config,
+                             const RouteEntry* route,
+                             const RouteParam* params,
+                             u32 param_count,
+                             u16 static_status) {
+    Http2Conn* h2 = d.conn->h2;
+    if (h2->pending_stream != 0) {
+        h2_emit_status(d, stream_id, 503);  // one body upload at a time
+        return false;
+    }
+    // Only JIT handlers consume the synthesized HTTP/1 request. Static / proxy /
+    // default deferrals just count DATA octets and validate Content-Length, so
+    // they never serialize the header list — that avoids a spurious 400 when a
+    // large-but-legal h2 header block exceeds the HTTP/1 synth cap.
+    u32 synth_len = 0;
+    if (action == RouteAction::JitHandler) {
+        synth_len =
+            h2_synth_h1_request(headers, nheaders, h2->pending_synth, Http2Conn::kBodySynthCap);
+        if (synth_len == 0) {
+            h2_emit_status(d, stream_id, 400);
+            return false;
+        }
+    }
+    h2->pending_body_start = synth_len;
+    h2->pending_synth_len = synth_len;
+    h2->pending_body_len = 0;
+    h2->pending_content_length = req.content_length;
+    h2->pending_has_content_length = req.has_content_length;
+    h2->pending_buffer_body = buffer_body;
+    h2->pending_overflow = false;
+    h2->pending_route_config = route_config;
+    h2->pending_route = route;
+    h2->pending_route_action = action;
+    h2->pending_static_status = static_status;
+    h2->pending_jit_fn = route ? route->fn : nullptr;
+    // Snapshot route params for the deferred handler. Only JIT handlers consume
+    // params, and only they build the synthesized request; re-anchor each param
+    // value into pending_synth (stable) rather than the matcher's hdr_scratch
+    // source, which the next decoded header block reuses. Param values are
+    // substrings of the raw :path, which h2_synth_h1_request copied verbatim into
+    // pending_synth right after "METHOD ".
+    u32 stored = 0;
+    if (action == RouteAction::JitHandler) {
+        Str method{nullptr, 0};
+        Str path{nullptr, 0};
+        for (u32 i = 0; i < nheaders; i++) {
+            if (headers[i].name.eq(Str{":method", 7}))
+                method = headers[i].value;
+            else if (headers[i].name.eq(Str{":path", 5}))
+                path = headers[i].value;
+        }
+        const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
+        const u32 kPathStart = method.len + 1;  // path follows "METHOD " in synth
+        for (u32 i = 0; i < kCapped; i++) {
+            const RouteParam& p = params[i];
+            // Defensive: a trie-matched value is always within the raw path, so
+            // this skip is unreachable in practice (no silent truncation).
+            if (path.ptr == nullptr || p.value < path.ptr ||
+                p.value + p.value_len > path.ptr + path.len)
+                continue;
+            const u32 kOff = kPathStart + static_cast<u32>(p.value - path.ptr);
+            h2->pending_route_params[stored++] = {
+                p.name,
+                p.name_len,
+                reinterpret_cast<const char*>(h2->pending_synth + kOff),
+                p.value_len};
+        }
+    }
+    h2->pending_route_param_count = stored;
+    h2->pending_stream = stream_id;
+    return true;
+}
+
 // Invoke a synchronous JIT handler given the assembled HTTP/1 request bytes
 // (headers, plus body for POST), then serialize its response. Yielding /
 // forwarding handlers are not supported over h2 yet → 503.
@@ -133,6 +294,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const RouteEntry* route,
                     const RouteParam* params,
                     u32 param_count,
+                    const RouteConfig* cfg,
                     const u8* synth,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
@@ -148,7 +310,6 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/yield over h2 not wired yet
         return;
     }
-    const RouteConfig* cfg = d.conn->request_config;
     const u8* body = nullptr;
     u32 body_len = 0;
     if (kOutcome.response_body_idx != 0 && cfg != nullptr &&
@@ -173,63 +334,71 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     h2_emit_response(d, stream_id, kOutcome.status_code, hdrs, nhdrs, body, body_len);
 }
 
-// A body-reading handler has its full request (headers + accumulated body) in
-// the connection's pending_synth. Re-parse it to route, then invoke + serialize.
+// A deferred stream is complete. If the matched handler reads req.body,
+// pending_synth holds headers plus DATA; otherwise it holds only headers and
+// pending_body_len is used for Content-Length validation.
 template <typename Loop>
 void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     Http2Conn* h2 = d.conn->h2;
-    const bool kOverflow = h2->pending_overflow;
-    const u8* synth = h2->pending_synth;
-    const u32 kLen = h2->pending_synth_len;
-    h2->pending_stream = 0;  // clear before responding
-    h2->pending_synth_len = 0;
-    h2->pending_overflow = false;
-
-    if (kOverflow) {
-        h2_emit_status(d, stream_id, 413);  // body exceeded our buffer
+    if (h2->pending_overflow) {
+        const bool kBuffered = h2->pending_buffer_body;
+        h2_clear_pending(*h2);
+        h2_emit_status(d, stream_id, kBuffered ? 413 : 400);
         return;
     }
-    HttpParser parser;
-    parser.reset();
-    ParsedRequest req;
-    if (parser.parse(synth, kLen, &req) != ParseStatus::Complete) {
+    // A client-supplied Content-Length must equal the actual DATA octet count,
+    // for every deferred action — not just body-reading handlers.
+    if (h2->pending_has_content_length && h2->pending_content_length != h2->pending_body_len) {
+        h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 400);
         return;
     }
-    const RouteConfig* cfg = d.conn->request_config;
-    if (!cfg) {
-        h2_emit_status(d, stream_id, 200);
+
+    const RouteAction kAction = h2->pending_route_action;
+    if (kAction != RouteAction::JitHandler) {
+        // Static / default / proxy: respond from the decision made at HEADERS
+        // time. No synthesized request was built for these.
+        const u16 kStatus = (kAction == RouteAction::Proxy) ? 503 : h2->pending_static_status;
+        h2_clear_pending(*h2);
+        h2_emit_status(d, stream_id, kStatus);
         return;
     }
-    RouteParam params[kMaxRouteParams]{};
-    u32 pc = 0;
-    const RouteEntry* route = cfg->match_canonical(
-        req.path_canon, route_method_key(req.method), params, &pc, kMaxRouteParams);
-    if (!route || route->action != RouteAction::JitHandler || !route->fn) {
-        h2_emit_status(d, stream_id, route ? 503 : 200);
+
+    // Body-reading handler whose client omitted Content-Length: inject the
+    // observed body length so the HTTP/1-shaped parse exposes the DATA bytes.
+    if (h2->pending_buffer_body && !h2->pending_has_content_length &&
+        !h2_inject_content_length(h2->pending_synth,
+                                  &h2->pending_synth_len,
+                                  h2->pending_body_start,
+                                  h2->pending_body_len,
+                                  Http2Conn::kBodySynthCap)) {
+        h2_clear_pending(*h2);
+        h2_emit_status(d, stream_id, 413);
         return;
     }
-    // Meter here (not at HEADERS time) against the route this body request
-    // actually dispatches to — the config may have been reloaded since the
-    // header block arrived. synth is the full stored request, so header/cookie/
-    // query keys all extract correctly (no overflow possible: it was bounded at
-    // HEADERS time). See the kDeferredBody note in h2_dispatch_request.
-    if (route->rate_limit.count > 0) {
-        RateLimitKeyInput key_in;
-        key_in.peer_addr = d.conn->peer_addr;
-        key_in.req_buf = synth;
-        key_in.req_header_end = parser.header_end;
-        key_in.path = req.path.ptr;
-        key_in.path_len = req.path.len;
-        key_in.params = params;
-        key_in.param_count = pc;
-        const u32 kRouteIdx = static_cast<u32>(route - cfg->routes);
-        if (rate_limit_exceeded(d.loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
-            h2_emit_status(d, stream_id, 429);
-            return;
-        }
+
+    const u32 kLen = h2->pending_synth_len;
+    const u8* synth = h2->pending_synth;
+    const RouteConfig* cfg = h2->pending_route_config;
+    const RouteEntry* route = h2->pending_route;
+    const jit::HandlerFn kJitFn = h2->pending_jit_fn;
+    const u32 kRouteParamCount = h2->pending_route_param_count;
+    RouteParam route_params[kMaxRouteParams];
+    for (u32 i = 0; i < kRouteParamCount; i++) {
+        const H2RouteParam& p = h2->pending_route_params[i];
+        route_params[i] = {p.name, p.name_len, p.value, p.value_len};
     }
-    h2_invoke_emit(d, stream_id, route, params, pc, synth, kLen);
+
+    h2_clear_pending(*h2);  // clear before responding
+    if (route == nullptr || kJitFn == nullptr) {
+        h2_emit_status(d, stream_id, 500);
+        return;
+    }
+    // No rate-limit charge here: #131 pins the matched route/config at HEADERS
+    // time (h2->pending_route*), so the deferred body dispatches to exactly the
+    // route metered at HEADERS time — h2_dispatch_request charges body routes
+    // there (a reload can't swap the route out from under the pinned dispatch).
+    h2_invoke_emit(d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -245,9 +414,28 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
+    if (end_stream && req.has_content_length && req.content_length != 0) {
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
 
     const RouteConfig* config = d.conn->request_config;
     if (!config) {
+        if (!end_stream && req.has_content_length) {
+            h2_defer_until_data_end(d,
+                                    stream_id,
+                                    headers,
+                                    nheaders,
+                                    req,
+                                    /*buffer_body=*/false,
+                                    RouteAction::Static,
+                                    /*route_config=*/nullptr,
+                                    /*route=*/nullptr,
+                                    /*params=*/nullptr,
+                                    /*param_count=*/0,
+                                    /*static_status=*/200);
+            return;
+        }
         h2_emit_status(d, stream_id, 200);  // route-less fallback (matches HTTP/1)
         return;
     }
@@ -259,6 +447,21 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         config->match_canonical(req.path_canon, kMethodKey, params, &param_count, kMaxRouteParams);
 
     if (!route) {
+        if (!end_stream && req.has_content_length) {
+            h2_defer_until_data_end(d,
+                                    stream_id,
+                                    headers,
+                                    nheaders,
+                                    req,
+                                    /*buffer_body=*/false,
+                                    RouteAction::Static,
+                                    config,
+                                    /*route=*/nullptr,
+                                    /*params=*/nullptr,
+                                    /*param_count=*/0,
+                                    /*static_status=*/200);
+            return;
+        }
         h2_emit_status(d, stream_id, 200);  // default (matches HTTP/1 catchall)
         return;
     }
@@ -267,14 +470,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // (see rate_limit_enforce.h), so a route can't be called unmetered over h2.
     // Build an HTTP/1-shaped view so header/query/cookie key components extract
     // identically; IP and route-param keys work regardless of the synth.
-    // A body-reading handler's dispatch is deferred to h2_finish_body (after the
-    // DATA frames), which re-matches the route against the then-current config.
-    // Meter THERE against the route that actually runs, not here — otherwise a
-    // config reload mid-body could charge a route that never executes (or skip
-    // the metering of the one that does). Immediate dispatches meter here.
-    const bool kDeferredBody = route->action == RouteAction::JitHandler && route->fn &&
-                               route->needs_req_body && !end_stream;
-    if (!kDeferredBody && route->rate_limit.count > 0) {
+    // Body-reading handlers defer dispatch to h2_finish_body (after the DATA
+    // frames), but #131 pins the matched route/config at HEADERS time
+    // (h2->pending_route*), so the deferred body runs against exactly this route.
+    // Meter HERE for every route (including deferred-body ones) — a config reload
+    // can't swap the route out from under the pinned dispatch, and finish_body
+    // does not re-charge, so each request is metered exactly once.
+    if (route->rate_limit.count > 0) {
         u8 rl_synth[8192];
         const u32 kRlLen = h2_synth_h1_request(headers, nheaders, rl_synth, sizeof(rl_synth));
         if (kRlLen == 0 && rate_limit_needs_req_buf(route->rate_limit)) {
@@ -304,6 +506,21 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
 
     switch (route->action) {
         case RouteAction::Static:
+            if (!end_stream && req.has_content_length) {
+                h2_defer_until_data_end(d,
+                                        stream_id,
+                                        headers,
+                                        nheaders,
+                                        req,
+                                        /*buffer_body=*/false,
+                                        RouteAction::Static,
+                                        config,
+                                        route,
+                                        params,
+                                        param_count,
+                                        route->status_code);
+                return;
+            }
             h2_emit_status(d, stream_id, route->status_code);
             return;
         case RouteAction::JitHandler: {
@@ -311,32 +528,51 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            u8 synth[8192];
+            // Defer when a body still follows: needs_req_body handlers wait to
+            // read it; others wait only to consume / validate a declared
+            // Content-Length. buffer_body decides whether DATA is accumulated.
+            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
+                h2_defer_until_data_end(d,
+                                        stream_id,
+                                        headers,
+                                        nheaders,
+                                        req,
+                                        /*buffer_body=*/route->needs_req_body,
+                                        RouteAction::JitHandler,
+                                        config,
+                                        route,
+                                        params,
+                                        param_count,
+                                        200);
+                return;
+            }
+            // No request body to wait for — invoke now.
+            u8 synth[Http2Conn::kBodySynthCap];
             const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
             if (kSynthLen == 0) {
                 h2_emit_status(d, stream_id, 400);
                 return;
             }
-            if (!route->needs_req_body || end_stream) {
-                // No request body to wait for — invoke now.
-                h2_invoke_emit(d, stream_id, route, params, param_count, synth, kSynthLen);
-                return;
-            }
-            // Body follows: stash the synthesized headers and accumulate DATA.
-            // One body upload at a time per connection.
-            Http2Conn* h2 = d.conn->h2;
-            if (h2->pending_stream != 0 || kSynthLen > Http2Conn::kBodySynthCap) {
-                h2_emit_status(d, stream_id, 503);
-                return;
-            }
-            for (u32 i = 0; i < kSynthLen; i++) h2->pending_synth[i] = synth[i];
-            h2->pending_synth_len = kSynthLen;
-            h2->pending_overflow = false;
-            h2->pending_stream = stream_id;
+            h2_invoke_emit(d, stream_id, route, params, param_count, config, synth, kSynthLen);
             return;
         }
         case RouteAction::Proxy:
         default:
+            if (!end_stream && req.has_content_length) {
+                h2_defer_until_data_end(d,
+                                        stream_id,
+                                        headers,
+                                        nheaders,
+                                        req,
+                                        /*buffer_body=*/false,
+                                        RouteAction::Proxy,
+                                        config,
+                                        route,
+                                        params,
+                                        param_count,
+                                        200);
+                return;
+            }
             // TODO(h2): proxy over HTTP/2 needs the upstream state machine
             // driven per stream. Until then, fail closed.
             h2_emit_status(d, stream_id, 503);
@@ -351,16 +587,22 @@ void h2_on_headers_cb(
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
-// DATA frames for a body-reading request: append to pending_synth, finalize at
-// END_STREAM. DATA for any other stream is ignored (flow control already ran).
+// DATA frames for a deferred request: count every body octet, append only when
+// the matched handler reads req.body, and finalize at END_STREAM. DATA for any
+// other stream is ignored (flow control already ran).
 template <typename Loop>
 void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
     if (c.pending_stream != stream_id) return;
-    if (c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+    if (c.pending_body_len > 0xffffffffu - len) {
         c.pending_overflow = true;
     } else {
+        c.pending_body_len += len;
+    }
+    if (c.pending_buffer_body && c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+        c.pending_overflow = true;
+    } else if (c.pending_buffer_body) {
         for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
         c.pending_synth_len += len;
     }

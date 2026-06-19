@@ -7062,6 +7062,50 @@ static u64 h2_echo_body_handler(
     return r.pack();
 }
 
+// A body-reading handler for an h2 request that omitted content-length. The
+// bridge synthesizes a content-length so the HTTP/1-shaped parse exposes the
+// DATA bytes; the handler verifies both the injected header and the body.
+static u64 h2_no_cl_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
+    u32 body_off = len;
+    bool saw_content_length = false;
+    for (u32 i = 0; i + 3 < len; i++) {
+        if (i + 15 <= len && req[i] == 'c' && req[i + 1] == 'o' && req[i + 2] == 'n' &&
+            req[i + 3] == 't' && req[i + 4] == 'e' && req[i + 5] == 'n' && req[i + 6] == 't' &&
+            req[i + 7] == '-' && req[i + 8] == 'l' && req[i + 9] == 'e' && req[i + 10] == 'n' &&
+            req[i + 11] == 'g' && req[i + 12] == 't' && req[i + 13] == 'h' && req[i + 14] == ':') {
+            saw_content_length = true;
+        }
+        if (req[i] == '\r' && req[i + 1] == '\n' && req[i + 2] == '\r' && req[i + 3] == '\n') {
+            body_off = i + 4;
+            break;
+        }
+    }
+    const u32 blen = len - body_off;
+    const bool ok = saw_content_length && blen == 4 && req[body_off] == 'p' &&
+                    req[body_off + 1] == 'i' && req[body_off + 2] == 'n' &&
+                    req[body_off + 3] == 'g';
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              static_cast<u16>(ok ? 200 : 400),
+                              /*upstream_id=*/0,
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+static u64 h2_ignore_body_handler(void* /*conn*/,
+                                  rut::jit::HandlerCtx* /*ctx*/,
+                                  const u8* /*req*/,
+                                  u32 /*len*/,
+                                  void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              200,
+                              /*upstream_id=*/0,
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
 // HTTP/2 request body: HEADERS (no END_STREAM) + a DATA frame; the handler
 // (needs_req_body) runs only after the body arrives and sees it.
 TEST(shard, serves_http2_request_body) {
@@ -7106,6 +7150,55 @@ TEST(shard, serves_http2_request_body) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // handler saw "ping"
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_request_body_with_synthesized_content_length) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_no_cl_body_handler, /*needs_req_body=*/true));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("ping"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
 
     close(c);
     shard.stop();
@@ -7162,6 +7255,107 @@ TEST(shard, serves_http2_request_body_too_large) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 413u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_large_body_for_jit_that_ignores_body) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_ignore_body_handler, /*needs_req_body=*/false));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    static u8 req[32000];
+    u32 n = h2_client_prologue(req);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{"content-length", 14}, {"20000", 5}},
+    };
+    n += http2_write_headers(req + n, sizeof(req) - n, 1, hs, 4, /*end_stream=*/false);
+    static u8 body[10000];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = 'a';
+    n += http2_write_data(req + n, 1, body, sizeof(body), /*end_stream=*/false);
+    n += http2_write_data(req + n, 1, body, sizeof(body), /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, req, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, rejects_http2_content_length_mismatch_on_static_route) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/upload", 'G', 204));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("abc"), 3, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 400u);
 
     close(c);
     shard.stop();
