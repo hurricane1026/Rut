@@ -3103,6 +3103,8 @@ bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl) {
 
 struct TlsIouringHarness : SmallLoop {
     [[maybe_unused]] static constexpr u32 kTlsDrainChunk = SlicePool::kSliceSize;
+    [[maybe_unused]] static constexpr u32 kTlsOutHigh = IoUringEventLoop::kTlsOutHigh;
+    [[maybe_unused]] static constexpr u32 kTlsOutLow = IoUringEventLoop::kTlsOutLow;
     bool sent = false;
     bool closed = false;
 

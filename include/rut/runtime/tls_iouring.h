@@ -135,6 +135,18 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     c.tls_out_inflight = false;
     c.tls_out_inflight_len = 0;
 
+    // Low-watermark resume: the proxy read side pauses the upstream recv once the
+    // ciphertext buffer crosses the high watermark; as it drains back below the
+    // low watermark, re-arm the read so producer and consumer ping-pong inside
+    // [low, high] instead of the buffer growing without bound. Gated on the
+    // io_uring-TLS loop interface (the test harness has no kTlsOutLow).
+    if constexpr (requires { Self::kTlsOutLow; }) {
+        if (c.tls_recv_paused_hw && c.tls_out_buf.len() <= Self::kTlsOutLow) {
+            c.tls_recv_paused_hw = false;
+            if (!c.upstream_recv_armed) loop->submit_recv_upstream(c);
+        }
+    }
+
     // (a) Finish a parked plaintext remainder (the buffer filled mid-chunk)
     // before any completion, so the chunk's tail is never lost.
     if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {

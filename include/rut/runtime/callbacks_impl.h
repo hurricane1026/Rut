@@ -1605,9 +1605,11 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                       Loop::kTlsDrainChunk;
                   }) {
         if (conn.uses_iouring_tls()) {
-            // Watermark backpressure and the parked-remainder (WantWrite) path are
-            // phase 4; here a buffer-full or WANT_READ mid-chunk fails closed
-            // rather than mis-account.
+            // The high watermark keeps the buffer below cap - kTlsRecordMax before
+            // each new read, so one record's ciphertext always fits and NeedRoom
+            // is unreachable here. A NeedRead (proxy body encryption needing peer
+            // input — the client isn't sending during a response, so a deadlock)
+            // fails closed rather than mis-account.
             conn.tls_proxy_stream = true;
             u32 enc = 0;
             const TlsFill kFill =
@@ -1630,9 +1632,17 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             }
             if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
             if (kRemaining > 0) {
+                // Bytes already in upstream_recv_buf — must be encrypted now (not
+                // subject to the watermark, which only gates *new* reads). One
+                // recv's worth (<= a slice) of ciphertext fits under kTlsRecordMax,
+                // so this never overflows even from just below the high watermark.
                 IoEvent synth = {
                     conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
                 on_response_body_recvd<Loop>(lp, conn, synth);  // drain the rest of this recv
+            } else if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
+                // High watermark: stop reading upstream. tls_on_out_drain re-arms
+                // the recv once the buffer drains back below the low watermark.
+                conn.tls_recv_paused_hw = true;
             } else if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) {
                 loop->close_conn(conn);
             }
