@@ -2195,7 +2195,13 @@ void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         }
         return;
     }
-    if (ev.result <= 0) {
+    if (ev.result < 0) {
+        // Hard error (e.g. ECONNRESET): the stream is not cleanly half-closed —
+        // don't advertise a successful upgrade. Close immediately.
+        loop->close_conn(conn);
+        return;
+    }
+    if (ev.result == 0) {
         conn.ws_pre_tunnel_upstream_closed = true;
         // Stop polling the hung-up upstream fd so a slow 101 drain to the client
         // doesn't spin the level-triggered loop on redelivered EPOLLHUP. The fd
@@ -2251,6 +2257,21 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
                    &on_ws_upstream_to_client_sent<Loop>,
                    &on_ws_upstream_recv<Loop>,
                    &on_ws_client_to_upstream_sent<Loop>);
+    conn.upstream_recv_paused_for_send = false;
+    if (conn.ws_pre_tunnel_upstream_closed) {
+        // Backend already half-closed during the 101 drain: enter drain mode
+        // immediately rather than arming new client reads. Flush any buffered
+        // bytes both ways (early upstream→client frames + buffered post-upgrade
+        // client→upstream bytes), then tear down once everything has drained.
+        conn.ws_upstream_eof = true;
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    (void)kRemaining;
     if (conn.recv_buf.len() > 0) {
         if (!ws_try_send_client_to_upstream(loop, conn)) {
             loop->close_conn(conn);
@@ -2265,15 +2286,6 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     if (conn.upstream_recv_buf.len() > 0) {
         if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
     } else {
-        conn.upstream_recv_paused_for_send = false;
-        if (kRemaining == 0 && conn.ws_pre_tunnel_upstream_closed) {
-            // Backend already closed: enter drain mode rather than closing now, so
-            // a client→upstream send just kicked above (buffered post-upgrade
-            // bytes) flushes before teardown instead of being truncated.
-            conn.ws_upstream_eof = true;
-            ws_close_if_drained(loop, conn);
-            return;
-        }
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
@@ -2333,12 +2345,18 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // response plus any bytes the backend already sent (early frames) to the
     // client, then run the connection as a transparent full-duplex tunnel.
     if (resp.status_code == 101) {
-        if (!conn.req_wants_upgrade) {
-            // The client never sent Connection: upgrade, so a 101 here is a
-            // protocol violation — a misbehaving or hostile backend trying to
-            // hijack the connection. Installing a tunnel would forward any
-            // pipelined bytes (e.g. the next HTTP request) raw to the upstream.
-            // Refuse: tear the connection down instead of tunneling.
+        // The client→upstream request upload must be fully drained before we can
+        // pivot the upstream send slot to the tunnel: otherwise a still-pending
+        // request body send completion would be misread as a tunnel send (or
+        // strand the upload). A gated upgrade (GET, no body) has nothing pending.
+        const bool kReqUploadPending =
+            (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
+            (conn.req_body_mode == BodyMode::Chunked &&
+             conn.req_chunk_parser.state != ChunkedParser::State::Complete);
+        if (!conn.req_wants_upgrade || kReqUploadPending) {
+            // No client upgrade intent (a misbehaving/hostile backend trying to
+            // hijack the connection — installing a tunnel would forward pipelined
+            // bytes raw upstream), or the request upload is not finished. Refuse.
             loop->close_conn(conn);
             return;
         }
@@ -2354,13 +2372,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
-        // Pause client reads until the tunnel slots are installed: a partial 101
-        // send arms the client fd EPOLLIN|EPOLLOUT (and an io_uring multishot recv
-        // may still be live), so client bytes arriving mid-drain would dispatch
-        // with on_recv == nullptr and could -ENOBUFS a valid upgrade. on_ws_101_sent
-        // re-arms the client recv once the tunnel is up. Preserves the 101 send's
-        // EPOLLOUT (ws_pause_client_recv uses preserve_send_interest).
-        if (!ws_pause_client_recv(loop, conn)) loop->close_conn(conn);
+        // Stop reading from the client until the tunnel slots are installed: a
+        // partial 101 send arms the client fd EPOLLIN|EPOLLOUT (and an io_uring
+        // multishot recv may still be live), so client bytes arriving mid-drain
+        // would dispatch with on_recv == nullptr. Use ws_stop_client_poll (not
+        // ws_pause_client_recv) so epoll also drops EPOLLRDHUP — otherwise a
+        // client FIN during a backpressured 101 send would spin the loop on
+        // redelivered Recv/0. It preserves the 101 send's EPOLLOUT and cancels
+        // the io_uring recv; on_ws_101_sent re-arms once the tunnel is up.
+        ws_stop_client_poll(loop, conn);
         return;
     }
 #endif

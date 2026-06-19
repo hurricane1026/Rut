@@ -1133,6 +1133,23 @@ TEST(websocket, pre_tunnel_backend_close_defers) {
     CHECK_EQ(loop.conns[cid].fd, 42);  // not closed mid-handshake
 }
 
+// A negative pre-tunnel recv (e.g. ECONNRESET) is a hard failure, not a clean
+// EOF — close immediately rather than advertising a successful upgrade.
+TEST(websocket, pre_tunnel_recv_error_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_pre_tunnel_upstream_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ECONNRESET));
+    CHECK(!conn->ws_pre_tunnel_upstream_closed);  // not a deferred clean close
+    CHECK_EQ(loop.conns[cid].fd, -1);             // closed immediately
+}
+
 // Backend FIN with no pending send and an empty buffer tears the tunnel down.
 TEST(websocket, backend_eof_no_pending_closes) {
     SmallLoop loop;
@@ -5053,6 +5070,35 @@ TEST(streaming, _101_without_client_upgrade_is_rejected) {
 
     CHECK(!conn->is_ws_tunnel);        // no tunnel installed
     CHECK_EQ(loop.conns[cid].fd, -1);  // connection refused/closed
+}
+
+// A 101 must be refused while the client→upstream request upload is still in
+// flight — installing the tunnel would strand/mix the pending request body send.
+TEST(streaming, _101_rejected_while_request_upload_pending) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->req_wants_upgrade = true;
+    conn->req_body_mode = BodyMode::ContentLength;
+    conn->req_body_remaining = 16;  // request body not finished uploading
+
+    const char* resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+    u32 resp_len = 0;
+    while (resp[resp_len]) resp_len++;
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
+    conn->upstream_recv_buf.commit(resp_len);
+
+    loop.backend.inject(make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(resp_len)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK(!conn->is_ws_tunnel);        // no tunnel while upload pending
+    CHECK_EQ(loop.conns[cid].fd, -1);  // refused
 }
 #endif
 
