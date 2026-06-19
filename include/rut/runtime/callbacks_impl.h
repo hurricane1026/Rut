@@ -14,6 +14,7 @@
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
 
@@ -188,21 +189,24 @@ void pipeline_dispatch(Loop* loop, Connection& conn);
 // upstream read lets TCP flow control backpressure the backend, and sending whole
 // buffers as produced keeps the downstream path simple and never splits a send.
 // Single-writer per shard, so the bucket needs no atomics.
+// Advance the @throttle virtual-time bucket by `len` bytes (no-op when the route
+// has no throttle). Factored out so the io_uring-TLS proxy path, which encrypts
+// directly into tls_out_buf instead of calling client_send, keeps the same
+// byte-rate accounting (otherwise watermark backpressure would bound memory but
+// not enforce the configured rate).
+inline void throttle_advance(Connection& conn, u32 len) {
+    if (conn.throttle_down_bps == 0) return;
+    const u64 kNowNs = monotonic_ns();
+    const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
+    // len*1e9/bps at full precision per chunk (a precomputed ns-per-byte would
+    // truncate to 0 above ~1 GB/s). len*1e9 <= ~4.3e18 for u32 len, within u64.
+    conn.throttle_tat_ns =
+        kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
+}
+
 template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
-    if (conn.throttle_down_bps != 0) {
-        const u64 kNowNs = monotonic_ns();
-        const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
-        // Advance the bucket by the time `len` bytes "should" take: len/bps
-        // seconds, in ns. Compute len*1e9/bps at full precision per chunk rather
-        // than from a precomputed ns-per-byte — the latter (1e9/bps) truncates to
-        // 0 for bps >= 1e9, which would silently disable throttling above ~1 GB/s
-        // (and clamping it to 1 would silently cap every faster rate at 1 GB/s).
-        // len*1e9 <= ~4.3e18 for u32 len, well within u64; one divide per throttled
-        // chunk is negligible on an already-rate-limited path.
-        conn.throttle_tat_ns =
-            kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
-    }
+    throttle_advance(conn, len);
     return loop->submit_send(conn, buf, len);
 }
 
@@ -1545,6 +1549,16 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         if (conn.resp_body_mode == BodyMode::UntilClose) {
+            if (conn.uses_iouring_tls()) {
+                // Body ends at upstream EOF, but any ciphertext still in
+                // tls_out_buf must flush first — closing now would truncate it.
+                // Mark complete-on-drain; if nothing is buffered, complete now.
+                conn.tls_proxy_stream = true;
+                conn.resp_fully_buffered = true;
+                if (!conn.tls_out_inflight && conn.tls_out_buf.len() == 0)
+                    proxy_stream_complete<Loop>(loop, conn);
+                return;
+            }
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
             loop->epoch_leave();
             loop->close_conn(conn);
@@ -1578,6 +1592,52 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             if (kChunkStatus == ChunkStatus::NeedMore) break;
         }
         send_len = pos;
+    }
+
+    // Proxy-over-TLS on io_uring: encrypt this body chunk straight into the owned
+    // tls_out_buf (read/drain decoupled — no client_send / on_response_body_sent
+    // round-trip). The request completes from tls_on_out_drain once the buffer
+    // empties with resp_fully_buffered set. The `if constexpr` compiles this only
+    // for loops with the io_uring-TLS send interface (Epoll terminates TLS inside
+    // the backend and never reaches here with uses_iouring_tls()).
+    if constexpr (requires(Loop* l, Connection& cc) {
+                      l->submit_send_raw(cc, static_cast<const u8*>(nullptr), 0u);
+                      Loop::kTlsDrainChunk;
+                  }) {
+        if (conn.uses_iouring_tls()) {
+            // Watermark backpressure and the parked-remainder (WantWrite) path are
+            // phase 4; here a buffer-full or WANT_READ mid-chunk fails closed
+            // rather than mis-account.
+            conn.tls_proxy_stream = true;
+            u32 enc = 0;
+            const TlsFill kFill =
+                tls_fill_output<Loop>(loop, conn, conn.upstream_recv_buf.data(), send_len, enc);
+            if (kFill != TlsFill::Done) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.resp_body_sent += enc;  // enc == send_len on Done
+            throttle_advance(conn, enc);
+            const bool kBodyDone =
+                (conn.resp_body_mode == BodyMode::ContentLength && conn.resp_body_remaining == 0) ||
+                (conn.resp_body_mode == BodyMode::Chunked &&
+                 conn.resp_chunk_parser.state == ChunkedParser::State::Complete);
+            conn.upstream_send_len = enc;
+            const u32 kRemaining = consume_upstream_sent(conn);  // shift past encrypted chunk
+            if (kBodyDone) {
+                conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
+                return;
+            }
+            if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
+            if (kRemaining > 0) {
+                IoEvent synth = {
+                    conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+                on_response_body_recvd<Loop>(lp, conn, synth);  // drain the rest of this recv
+            } else if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) {
+                loop->close_conn(conn);
+            }
+            return;
+        }
     }
 
     conn.resp_body_sent += send_len;
