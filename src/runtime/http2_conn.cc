@@ -29,11 +29,26 @@ void Http2Conn::init() {
     last_stream_id = 0;
     cont_stream = 0;
     cont_end_stream = false;
+    cont_discard = false;
     hdr_block_len = 0;
     nstreams = 0;
     pending_stream = 0;
+    pending_body_start = 0;
     pending_synth_len = 0;
+    pending_body_len = 0;
+    pending_content_length = 0;
+    pending_has_content_length = false;
+    pending_buffer_body = false;
     pending_overflow = false;
+    pending_route_config = nullptr;
+    pending_route = nullptr;
+    pending_route_action = RouteAction::Static;
+    pending_static_status = 200;
+    pending_jit_fn = nullptr;
+    pending_route_param_count = 0;
+    for (u32 i = 0; i < kMaxRouteParams; i++) {
+        pending_route_params[i] = {};
+    }
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
@@ -218,11 +233,13 @@ Str h2_canon_path(Str path) {
 }
 
 bool h2_value_to_u32(Str v, u32* out) {
-    if (v.len == 0 || v.len > 9) return false;
+    if (v.len == 0) return false;
     u32 acc = 0;
     for (u32 i = 0; i < v.len; i++) {
         if (v.ptr[i] < '0' || v.ptr[i] > '9') return false;
-        acc = acc * 10 + static_cast<u32>(v.ptr[i] - '0');
+        const u32 digit = static_cast<u32>(v.ptr[i] - '0');
+        if (acc > 429496729u || (acc == 429496729u && digit > 5u)) return false;
+        acc = acc * 10 + digit;
     }
     *out = acc;
     return true;
@@ -269,6 +286,9 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
 
     bool have_method = false;
     bool have_path = false;
+    bool have_authority = false;
+    bool have_scheme = false;
+    bool have_content_length = false;
     bool seen_regular = false;
     for (u32 i = 0; i < n; i++) {
         const Str kName = hs[i].name;
@@ -291,12 +311,17 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
                 req->path_canon = h2_canon_path(kValue);
                 have_path = true;
             } else if (h2_str_eq(kName, ":authority")) {
+                if (have_authority) return false;
                 if (req->header_count >= kMaxHeaders) return false;
                 req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+                have_authority = true;
             } else if (!h2_str_eq(kName, ":scheme")) {
                 // :scheme is recognized and dropped; any other pseudo-header
                 // (incl. response pseudo-headers like :status) is malformed.
                 return false;
+            } else {
+                if (have_scheme) return false;
+                have_scheme = true;
             }
             continue;
         }
@@ -310,10 +335,10 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req) {
         req->headers[req->header_count++] = {kName, kValue};
         if (h2_str_eq(kName, "content-length")) {
             u32 cl = 0;
-            if (h2_value_to_u32(kValue, &cl)) {
-                req->content_length = cl;
-                req->has_content_length = true;
-            }
+            if (have_content_length || !h2_value_to_u32(kValue, &cl)) return false;
+            have_content_length = true;
+            req->content_length = cl;
+            req->has_content_length = true;
         }
     }
     return have_method && have_path;
@@ -345,7 +370,40 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream) {
     }
     c.hdr_block_len = 0;
     c.cont_stream = 0;
+    c.cont_discard = false;
     if (c.on_headers) c.on_headers(c.cb_ctx, c, stream_id, hs, nh, end_stream);
+    return Http2Error::NoError;
+}
+
+// Decode a second header block we will not deliver (illegal repeat, or request
+// trailers), keeping the HPACK decoder dynamic table in sync. When has_pseudo is
+// non-null it reports whether the block contained any pseudo-header (a ':' name),
+// which disqualifies it from being valid trailers (RFC 7540 §8.1.2.1).
+Http2Error discard_headers(Http2Conn& c, bool* has_pseudo = nullptr) {
+    hpack::Header hs[Http2Conn::kMaxHeadersPerReq];
+    u32 nh = 0;
+    if (!hpack::decode_header_block(c.hpack_dec,
+                                    c.hdr_block,
+                                    c.hdr_block_len,
+                                    c.hdr_scratch,
+                                    Http2Conn::kHeaderScratchCap,
+                                    hs,
+                                    Http2Conn::kMaxHeadersPerReq,
+                                    &nh)) {
+        return Http2Error::CompressionError;
+    }
+    if (has_pseudo) {
+        *has_pseudo = false;
+        for (u32 i = 0; i < nh; i++) {
+            if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') {
+                *has_pseudo = true;
+                break;
+            }
+        }
+    }
+    c.hdr_block_len = 0;
+    c.cont_stream = 0;
+    c.cont_discard = false;
     return Http2Error::NoError;
 }
 
@@ -355,6 +413,27 @@ Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
     for (u32 i = 0; i < n; i++) c.hdr_block[c.hdr_block_len + i] = p[i];
     c.hdr_block_len += n;
     return Http2Error::NoError;
+}
+
+void clear_pending_upload(Http2Conn& c, u32 stream_id) {
+    if (c.pending_stream != stream_id) return;
+    c.pending_stream = 0;
+    c.pending_body_start = 0;
+    c.pending_synth_len = 0;
+    c.pending_body_len = 0;
+    c.pending_content_length = 0;
+    c.pending_has_content_length = false;
+    c.pending_buffer_body = false;
+    c.pending_overflow = false;
+    c.pending_route_config = nullptr;
+    c.pending_route = nullptr;
+    c.pending_route_action = RouteAction::Static;
+    c.pending_static_status = 200;
+    c.pending_jit_fn = nullptr;
+    c.pending_route_param_count = 0;
+    for (u32 i = 0; i < kMaxRouteParams; i++) {
+        c.pending_route_params[i] = {};
+    }
 }
 
 }  // namespace
@@ -429,6 +508,39 @@ static Http2Error handle_frame(Http2Conn& c,
                     return Http2Error::NoError;
                 }
             }
+            if (s->got_headers) {
+                // A second HEADERS block on an already-open stream is either
+                // request trailers (RFC 7540 §8.1: END_STREAM set, stream still
+                // receiving body) or an illegal second request header block.
+                // Decode it either way to keep the HPACK decoder in sync, then
+                // finalize the buffered upload (trailers) or reset the stream.
+                const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
+                const Http2Error kAe = append_fragment(c, p, n);
+                if (kAe != Http2Error::NoError) return kAe;
+                if (h.flags & http2_flag::kEndHeaders) {
+                    bool has_pseudo = false;
+                    const Http2Error kDe = discard_headers(c, &has_pseudo);
+                    if (kDe != Http2Error::NoError) return kDe;
+                    // Valid request trailers: END_STREAM, no pseudo-headers, on a
+                    // stream still receiving its body.
+                    if (kEndStream && !has_pseudo && s->state == Http2StreamState::Open) {
+                        s->state = Http2StreamState::HalfClosedRemote;
+                        if (c.pending_stream == h.stream_id && c.on_data)
+                            c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
+                        return Http2Error::NoError;
+                    }
+                    if (w.room(kFrameHeaderSize + 4))
+                        w.len +=
+                            write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
+                    clear_pending_upload(c, h.stream_id);
+                    s->state = Http2StreamState::Closed;
+                    return Http2Error::NoError;
+                }
+                c.cont_stream = h.stream_id;
+                c.cont_end_stream = kEndStream;  // carry END_STREAM for trailers
+                c.cont_discard = true;
+                return Http2Error::NoError;
+            }
             s->got_headers = true;
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
             const Http2Error kAe = append_fragment(c, p, n);
@@ -450,6 +562,24 @@ static Http2Error handle_frame(Http2Conn& c,
             if (kAe != Http2Error::NoError) return kAe;
             if (h.flags & http2_flag::kEndHeaders) {
                 Http2Stream* s = c.find_stream(h.stream_id);
+                if (c.cont_discard) {
+                    const bool kTrailerEnd = c.cont_end_stream;  // before discard resets
+                    bool has_pseudo = false;
+                    const Http2Error kDe = discard_headers(c, &has_pseudo);
+                    if (kDe != Http2Error::NoError) return kDe;
+                    if (kTrailerEnd && !has_pseudo && s && s->state == Http2StreamState::Open) {
+                        s->state = Http2StreamState::HalfClosedRemote;
+                        if (c.pending_stream == h.stream_id && c.on_data)
+                            c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
+                        return Http2Error::NoError;
+                    }
+                    if (w.room(kFrameHeaderSize + 4))
+                        w.len +=
+                            write_rst_stream(w.out + w.len, h.stream_id, Http2Error::ProtocolError);
+                    clear_pending_upload(c, h.stream_id);
+                    if (s) s->state = Http2StreamState::Closed;
+                    return Http2Error::NoError;
+                }
                 if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
                 return finish_headers(c, h.stream_id, c.cont_end_stream);
             }
@@ -550,6 +680,7 @@ static Http2Error handle_frame(Http2Conn& c,
         case Http2FrameType::RstStream: {
             if (h.stream_id == 0 || h.length != 4) return Http2Error::ProtocolError;
             Http2Stream* s = c.find_stream(h.stream_id);
+            clear_pending_upload(c, h.stream_id);
             if (s) s->state = Http2StreamState::Closed;
             if (c.on_reset)
                 c.on_reset(c.cb_ctx, c, h.stream_id, static_cast<Http2Error>(read_u32(payload)));

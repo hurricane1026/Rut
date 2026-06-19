@@ -140,10 +140,17 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return;
     const ParsedRequest& req = pc.req;
-    if (!req.has_content_length || pc.header_end >= req_len || req.content_length == 0) return;
-
     const u32 available = req_len - pc.header_end;
-    if (available < req.content_length) return;
+    if (available == 0) return;
+
+    if (req.chunked) return;
+    // Without a Content-Length the body framing is undefined: in HTTP/1
+    // keep-alive the trailing octets are the next pipelined request, not this
+    // request's body. The HTTP/2 bridge synthesizes a Content-Length for
+    // DATA-only bodies (see h2_finish_body) so they take the path below.
+    if (!req.has_content_length) return;
+    if (req.content_length == 0 || available < req.content_length) return;
+
     *out_ptr = reinterpret_cast<const char*>(req_data + pc.header_end);
     *out_len = req.content_length;
 }

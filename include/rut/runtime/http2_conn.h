@@ -4,6 +4,8 @@
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/route_params.h"
+#include "rut/runtime/route_table.h"
 
 // HTTP/2 connection engine (RFC 7540): drives the client preface, the SETTINGS
 // handshake, the frame loop, per-stream HEADERS/CONTINUATION assembly (HPACK
@@ -35,6 +37,16 @@ struct Http2Conn;
 struct Http2Result {
     u32 consumed;  // inbound bytes consumed (whole frames + preface only)
     bool close;    // connection error or GOAWAY emitted — flush out, then close
+};
+
+// Trivially-constructible mirror of RouteParam (which carries default member
+// initializers) so that Http2Conn — allocated from a SlabPool that requires
+// trivial constructibility — can snapshot matched route params inline.
+struct H2RouteParam {
+    const char* name;
+    u32 name_len;
+    const char* value;
+    u32 value_len;
 };
 
 struct Http2Conn {
@@ -74,6 +86,7 @@ struct Http2Conn {
     u32 last_stream_id;    // highest peer-initiated stream id seen
     u32 cont_stream;       // stream awaiting CONTINUATION (0 = none)
     bool cont_end_stream;  // END_STREAM flagged on the pending HEADERS
+    bool cont_discard;     // pending header block should be decoded, then reset
     u32 hdr_block_len;
     u8 hdr_block[kHeaderBlockCap];
     u8 hdr_scratch[kHeaderScratchCap];
@@ -81,16 +94,37 @@ struct Http2Conn {
     Http2Stream streams[kMaxStreams];
     u32 nstreams;
 
-    // Pending body-reading request awaiting DATA frames. The serving layer
-    // synthesizes the HTTP/1 request headers here at HEADERS time and appends
-    // body as DATA arrives; at END_STREAM it re-parses pending_synth (a valid
-    // HTTP/1 request) to route + invoke the handler. One at a time: a second
-    // concurrent body upload is refused (503). pending_stream == 0 means none.
-    // Kept trivial (no routing types) so Http2Conn stays SlabPool-poolable.
+    // Pending request awaiting DATA frames. For body-reading handlers the
+    // serving layer appends DATA after synthesized HTTP/1 request headers; for
+    // routes that only need Content-Length validation it keeps only the headers
+    // and counts DATA bytes. One at a time for now: pending_stream == 0 means none.
+    // A route snapshot is captured at END_HEADERS so delayed DATA handling does not
+    // re-match if config swaps between HEADERS and DATA.
     static constexpr u32 kBodySynthCap = 16384;
     u32 pending_stream;
+    u32 pending_body_start;
     u32 pending_synth_len;
+    u32 pending_body_len;
+    u32 pending_content_length;
+    bool pending_has_content_length;
+    bool pending_buffer_body;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
+    // Snapshot of matched route decisions at END_HEADERS time for deferred
+    // requests. This keeps delayed DATA handlers stable when config changes
+    // between HEADERS and DATA frames.
+    const RouteConfig* pending_route_config;
+    const RouteEntry* pending_route;
+    RouteAction pending_route_action;
+    u16 pending_static_status;
+    jit::HandlerFn pending_jit_fn;
+    // Route param VALUES the matcher produced point into hdr_scratch, which the
+    // engine reuses for the next decoded header block. The snapshot re-anchors
+    // each value into pending_synth — a stable, per-connection verbatim copy of
+    // the request (including the path the values are substrings of) — so a
+    // concurrently multiplexed stream's HEADERS can't clobber req.param(). Param
+    // NAMES point into the snapshotted RouteConfig and stay valid.
+    H2RouteParam pending_route_params[kMaxRouteParams];
+    u32 pending_route_param_count;
     u8 pending_synth[kBodySynthCap];
 
     // Set callbacks (any may be null) then call init().
