@@ -2310,6 +2310,34 @@ TEST(rate_limit, token_bucket_gcra) {
     CHECK(rl.allow_key(kKey, 0, 0, 1000));
 }
 
+TEST(rate_limit, exceeded_helper_meters_and_isolates) {
+    using namespace rut;
+    struct NoGlobalLoop {
+    } loop;  // no global_rl member → shard-only limiter
+    RateLimitRuleSet rules;
+    rules.count = 1;
+    rules.rules[0].emit_interval_us = 10;
+    rules.rules[0].tau_us = 20;  // burst capacity 3
+    rules.rules[0].scope = RateLimitScope::Shard;
+    rules.rules[0].key.count = 0;  // empty key → per-peer-IP
+    RateLimitKeyInput in;
+    in.peer_addr = 0x0100007F;
+
+    // No rules → never exceeded.
+    RateLimitRuleSet none;
+    CHECK(!rate_limit_exceeded(&loop, none, 0, in, 1000));
+
+    // Fresh bucket admits a burst of 3 at the same instant, then trips. This is
+    // the shared logic the HTTP/1 and HTTP/2 dispatch paths both call.
+    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
+    CHECK(!rate_limit_exceeded(&loop, rules, 0, in, 1000));
+    CHECK(rate_limit_exceeded(&loop, rules, 0, in, 1000));  // 4th → over the burst
+
+    // A different route index folds into a separate bucket scope.
+    CHECK(!rate_limit_exceeded(&loop, rules, 1, in, 1000));
+}
+
 TEST(global_rate_limit, token_bucket_shared) {
     using namespace rut;
     GlobalRateLimiter rl{};
@@ -2406,6 +2434,27 @@ TEST(rate_limit_key, extractors) {
     CHECK(cookie_value(in, "sid", 3).eq(Str{"zzz", 3}));
     CHECK(cookie_value(in, "tenant", 6).eq(Str{"acme", 4}));
     CHECK(param_value(in, "id", 2).eq(Str{"777", 3}));
+}
+
+TEST(rate_limit_key, query_uses_full_target_not_capped_path) {
+    using namespace rut;
+    using namespace rut::rl_detail;
+    // The request line carries the full query; `path` mimics the
+    // Connection::kMaxReqPathLen (64-byte) cap that truncates it before `uid`.
+    const char* raw = "GET /s?prefix=aaaaaaaaaaaaaaaaaaaaaaaa&uid=42 HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char* capped_path = "/s?prefix=aaaaaaaaaaaaaaaaaaaaaaaa";  // truncated, no uid
+    RateLimitKeyInput in = make_key_input(raw, capped_path, nullptr, 0);
+
+    // Read from the full request target in req_buf, not the truncated path.
+    CHECK(query_value(in, "uid", 3).eq(Str{"42", 2}));
+    CHECK(request_target(in).len > 36u);  // full target, not the ~34-byte capped path
+
+    // Fallback to the (capped) path when req_buf is unavailable: the value past
+    // the cutoff is then invisible — exactly the bug the full-target read fixes.
+    RateLimitKeyInput no_buf = in;
+    no_buf.req_buf = nullptr;
+    no_buf.req_header_end = 0;
+    CHECK(query_value(no_buf, "uid", 3).empty());
 }
 
 TEST(rate_limit_key, composition) {

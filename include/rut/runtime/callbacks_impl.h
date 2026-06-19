@@ -12,6 +12,7 @@
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/prometheus.h"
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
@@ -533,9 +534,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // empty = per-client-IP). The limiter is per-shard (one thread each), so a
     // thread_local table needs no atomics — same rationale as the parse cache.
     if (route && route->rate_limit.count > 0 && config) {
-        static thread_local RateLimiter rate_limiter{};
-        const u32 kRouteIdx = static_cast<u32>(route - config->routes);
-        const u64 kNowUs = monotonic_us();
         u32 path_len = 0;
         while (path_len < Connection::kMaxReqPathLen && conn.req_path[path_len] != '\0') path_len++;
         RateLimitKeyInput key_in;
@@ -546,29 +544,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         key_in.path_len = path_len;
         key_in.params = route_params;
         key_in.param_count = route_param_count;
-        // Global-scope rules go to the process-shared GlobalRateLimiter (exact
-        // cluster-wide cap); shard-scope rules use this shard's thread_local
-        // table. If no shared limiter is wired (e.g. a minimal embedding), a
-        // global rule degrades to per-shard.
-        GlobalRateLimiter* grl = nullptr;
-        if constexpr (requires { loop->global_rl; }) grl = loop->global_rl;
-        bool over_limit = false;
-        for (u32 ri = 0; ri < route->rate_limit.count; ri++) {
-            const RateLimitRule& rule = route->rate_limit.rules[ri];
-            // Fold the rule index into the key scope so stacked rules never share
-            // a counter even when their key components overlap.
-            const u32 kScope = kRouteIdx * kMaxRateLimitRules + ri;
-            const u64 kKey = rate_limit_key(kScope, rule.key.comps, rule.key.count, key_in);
-            const bool kOk =
-                (rule.scope == RateLimitScope::Global && grl != nullptr)
-                    ? grl->allow_key(kKey, rule.emit_interval_us, rule.tau_us, kNowUs)
-                    : rate_limiter.allow_key(kKey, rule.emit_interval_us, rule.tau_us, kNowUs);
-            if (!kOk) {
-                over_limit = true;
-                break;
-            }
-        }
-        if (over_limit) {
+        const u32 kRouteIdx = static_cast<u32>(route - config->routes);
+        if (rate_limit_exceeded(loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
             conn.resp_status = 429;
             format_static_response(conn, 429, /*keep_alive=*/false);
             conn.keep_alive = false;
@@ -2579,6 +2556,13 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+
+    // One-shot proxy response complete (header-only / small Content-Length that
+    // finished in the first read). Release the backend concurrency slot promptly
+    // — like on_response_body_sent — so keep-alive clients don't pin the slot
+    // until the downstream connection closes (which would make max_inflight=1
+    // shed every subsequent request even with an idle backend).
+    release_upstream_slot(loop, conn);
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();

@@ -477,10 +477,13 @@ public:
             c.upstream_slot_held = false;
         }
         // If a yield is scheduled, drop its heap entry now so a long wait
-        // doesn't keep an unused heap slot occupied until its deadline.
-        // Only the pending_handler_fn path can have an entry; no-op
-        // otherwise. Rearm in case this conn owned the heap's top.
-        if (c.pending_handler_fn) {
+        // doesn't keep an unused heap slot occupied until its deadline. Both a
+        // pending JIT handler and a @throttle-paused proxy pump park on the heap
+        // (arm_yield_timer / arm_throttle_timer); a throttled connection sets
+        // throttle_paused, not pending_handler_fn, so a client that disconnects
+        // behind a long low-rate throttle would otherwise leave a stale entry
+        // until its deadline. Rearm in case this conn owned the heap's top.
+        if (c.pending_handler_fn || c.throttle_paused) {
             if (yield_heap.remove_by_conn(c.id) > 0) rearm_yield_timerfd();
         }
         if (c.fd >= 0) {
