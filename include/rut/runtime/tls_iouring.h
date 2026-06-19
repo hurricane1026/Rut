@@ -60,7 +60,17 @@ enum class TlsFill : u8 {
 // false (caller fails closed) if the send can't be queued.
 template <class Self>
 bool tls_ensure_draining(Self* loop, Connection& c) {
-    if (c.tls_out_inflight || c.tls_out_buf.len() == 0) return true;
+    if (c.tls_out_inflight) {
+        // A send is already draining its chunk; its completion must still reach
+        // tls_on_out_drain even if the upper layer overwrote on_send via
+        // transition_to_sending() — e.g. a response started while a control/
+        // handshake flight is in flight. Otherwise the raw Send CQE is dispatched
+        // as the response completion, tls_out_inflight is never cleared, and the
+        // output buffer/accounting get stuck.
+        c.on_send = &tls_on_out_drain<Self>;
+        return true;
+    }
+    if (c.tls_out_buf.len() == 0) return true;
     const u32 kAvail = c.tls_out_buf.len();
     const u32 kN = kAvail < Self::kTlsDrainChunk ? kAvail : Self::kTlsDrainChunk;
     if (!loop->submit_send_raw(c, c.tls_out_buf.data(), kN)) return false;
@@ -133,8 +143,11 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         }
         if (kSt == TlsFill::NeedRoom) return;  // still full — resume at the next drain
         if (kSt == TlsFill::NeedRead) {
+            // SSL_write needs peer input to retry. If no recv is armed and we
+            // can't queue one (SQ pressure), nothing will ever deliver that input
+            // — fail closed instead of hanging until the idle timeout.
             c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-            if (!c.recv_armed) loop->submit_recv(c);
+            if (!c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
             return;
         }
         // Done: remainder fully encrypted — fall through.
@@ -316,7 +329,10 @@ void tls_process(Self* loop, Connection& c) {
         if (c.tls_in_buf.len() == 0 || c.recv_buf.write_avail() == 0) break;
         tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
     }
-    if (!c.tls_out_inflight && !c.recv_armed) loop->submit_recv(c);
+    // Fail closed if a needed recv can't be armed: reaching here with no armed
+    // recv means peer input is required to make progress (e.g. a pending
+    // SSL_write WANT_READ), so a failed submit would otherwise hang the conn.
+    if (!c.tls_out_inflight && !c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
 }
 
 // on_recv handler for TLS connections: validate the recv, then drive the engine.
@@ -362,8 +378,9 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
         return;
     }
     if (kSt == TlsFill::NeedRead) {
+        // Need peer input again to retry — fail closed if no recv can be armed.
         c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-        if (!c.recv_armed) loop->submit_recv(c);
+        if (!c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
     }
     // NeedRoom resumes at the next drain; Done drains via tls_on_out_drain.
 }

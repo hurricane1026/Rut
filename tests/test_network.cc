@@ -1454,6 +1454,23 @@ TEST(tls_iouring, ensure_draining_empty_buffer_is_noop) {
     CHECK(!conn.tls_out_inflight);
 }
 
+// A response started while a control/handshake flight is in flight overwrites
+// on_send via transition_to_sending(); tls_ensure_draining must restore the
+// drain hook so the in-flight send's Send CQE still clears tls_out_inflight
+// (rather than being dispatched as the response completion → stuck buffer).
+TEST(tls_iouring, ensure_draining_restores_hook_while_inflight) {
+    Connection conn;
+    conn.reset();
+    conn.id = 9;
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;            // a ciphertext send is already draining
+    conn.on_send = &tls_pending_send_probe;  // upper layer overwrote it (response start)
+    // inflight → returns true without touching the loop (safe to pass nullptr).
+    CHECK(tls_ensure_draining<IoUringEventLoop>(nullptr, conn));
+    CHECK(conn.on_send == &tls_on_out_drain<IoUringEventLoop>);  // hook restored
+    CHECK(conn.tls_out_inflight);                                // still inflight, untouched
+}
+
 TEST(tls_iouring, input_buffer_fits_full_ciphertext_record) {
     CHECK_GE(IoUringEventLoop::kTlsInputSize, SlicePool::kSliceSize + 1024);
 }
