@@ -1214,6 +1214,52 @@ TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
     CHECK(saw);  // buffered client bytes forwarded upstream
 }
 
+// If the backend half-closed during the 101 drain AND both early upstream bytes
+// and buffered client bytes exist, on_ws_101_sent must enter drain mode: flush
+// BOTH directions before closing, never arm new client reads, and tear down only
+// once both drained.
+TEST(websocket, upgrade_101_sent_drains_both_when_backend_closed_pretunnel) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+    conn->ws_pre_tunnel_upstream_closed = true;  // backend FIN during the 101 drain
+    const u32 cid = conn->id;
+
+    const u8 early[] = {'H', 'E', 'L', 'L', 'O'};  // early upstream→client bytes
+    REQUIRE_EQ(conn->upstream_recv_buf.write(early, sizeof(early)), sizeof(early));
+    const u8 cb[] = {'H', 'I'};  // buffered client→upstream bytes
+    REQUIRE_EQ(conn->recv_buf.write(cb, sizeof(cb)), sizeof(cb));
+
+    loop.backend.op_count = 0;
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK(conn->ws_upstream_eof);                        // entered drain mode (not a fresh tunnel)
+    CHECK_EQ(loop.conns[cid].fd, 42);                    // not closed — both sends draining
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);  // did NOT arm new client reads
+    bool to_upstream = false, to_client = false;
+    for (u32 i = 0; i < loop.backend.op_count; i++) {
+        const MockOp& op = loop.backend.ops[i];
+        if (op.type == MockOp::Send && op.fd == 43) to_upstream = true;  // client→upstream
+        if (op.type == MockOp::Send && op.fd == 42) to_client = true;    // upstream→client
+    }
+    CHECK(to_upstream);  // buffered client bytes flushed to upstream
+    CHECK(to_client);    // early upstream bytes flushed to client
+
+    // Both directions drain → only then does the tunnel close.
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, sizeof(cb)));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // upstream→client still draining
+    on_ws_upstream_to_client_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Send, sizeof(early)));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // both drained → closed
+}
+
 // Entering tunnel mode must release the upstream max_inflight slot so a
 // long-lived tunnel doesn't hold an in-flight request slot for its lifetime.
 TEST(websocket, upgrade_101_sent_releases_upstream_slot) {
