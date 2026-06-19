@@ -69,11 +69,15 @@ Apply the same pattern, bounded to fit Rut's C1000K / zero-idle-overhead
 philosophy. **The single behavioral change is encrypt-timing: eager instead of
 lazy.** Everything else is the backpressure + continuation timing around it.
 
-> `client_send` over io_uring TLS **synchronously `SSL_write`s the whole chunk
-> into an owned, bounded ciphertext output buffer at submit time.** The plaintext
-> is consumed into owned ciphertext immediately, so `upstream_recv_buf` is no
-> longer aliased across the Send CQE. One in-flight raw send drains the ciphertext
-> buffer; upstream reads pause above a high watermark and resume below a low one.
+> `client_send` over io_uring TLS **encrypts plaintext into an owned, bounded
+> ciphertext output buffer**, with one in-flight raw send draining it. Plaintext is
+> consumed into owned ciphertext as it is encrypted, so `upstream_recv_buf` is no
+> longer aliased across the Send CQE. The proxy keeps reading and encrypting ahead
+> of the socket, bounded by a high/low watermark that pauses/resumes upstream
+> reads — that read-side read-ahead (not any early continuation) is where the
+> throughput comes from. **No continuation is ever fired synchronously at submit;
+> all completions fire on the real drain CQE** (see §3.0), which is what keeps the
+> shared callers' ordering intact.
 
 This removes the depth-1 queue entirely and dissolves the root cause of all three
 findings.
@@ -99,134 +103,210 @@ enum class TlsOutputMode : u8 { UserspaceRecord, Ktls };  // per-connection, set
 //   Ktls:            copy/zero-copy the plaintext into out_buf; kernel/NIC encrypts on send
 ```
 
+### 3.0 Two send shapes — never fire a continuation early
+
+The design review (codex on this doc) showed that firing the upper-layer
+continuation **synchronously at submit** is unsafe: it runs while a raw send is
+in flight (so the next Send CQE no longer reaches `tls_on_out_drain`), and it
+breaks callers that rely on async ordering — e.g. JIT `wait(send)`
+(`handle_jit_outcome` calls `client_send(...)` then `pause_recv(...)`), and
+`on_response_sent`/`on_jit_wait_send_sent` which validate via `ev.result`. So the
+revised rule is **no continuation is ever fired synchronously; every completion
+fires on the real drain CQE.** Two send shapes share the owned buffer:
+
+- **Single-shot send** (a JIT/static response, `wait(send)`, a handshake flight):
+  one logical `client_send`. Keep #129's model: save the upper-layer continuation
+  in `tls_pending_on_send`, encrypt into the buffer, and fire that continuation
+  **on the real full-drain CQE** with the sent length — exactly the existing
+  async ordering. Unchanged semantics; only the staging buffer grows from one
+  slice to `tls_out_buf`.
+- **Proxy streaming body** (the only path that issues many sends back-to-back):
+  decouple **read-side** (encrypt upstream chunks into `tls_out_buf`, driven by
+  upstream-recv CQEs, bounded by the watermark) from **write-side** (one send
+  drains the buffer). There is **no per-chunk continuation** — the throughput
+  comes from reading/encrypting ahead of the socket, and the request completes
+  when the body is fully buffered *and* the buffer fully drained.
+
+This roots out the "fire while in flight" / "wait(send) reentrancy" / "deferred
+length" findings: generic continuations are never deferred or early-fired.
+
 ### 3.1 Data structures (`connection_base.h`)
 
 Remove (depth-1 queue): `tls_send_q_src`, `tls_send_q_len`.
 
-Change `tls_out` from a single 16 KiB slice into a bounded owned ciphertext buffer:
+Change `tls_out` from a single 16 KiB slice into a bounded owned output buffer:
 
 ```cpp
 Buffer  tls_out_buf;        // owned ciphertext output (Buffer has consume()/compact())
                             // backed by an mmap region of kTlsOutBufCap, like tls_in
-bool    tls_out_inflight;   // keep: one raw send drains tls_out_buf at a time
+bool    tls_out_inflight;   // one raw send drains tls_out_buf at a time
 ```
 
-Add backpressure / deferred-continuation state:
+Keep, unchanged, the single-shot continuation: `tls_pending_on_send`,
+`tls_send_src/len/off` (now: plaintext not yet encrypted because the buffer
+filled — both for a single-shot send larger than the buffer *and* the proxy
+`WantWrite` fallback). Add proxy-streaming state:
 
 ```cpp
-Callback tls_deferred_on_send;  // upper-layer continuation deferred at high watermark
-bool     tls_recv_paused_hw;    // upstream recv paused for backpressure (resume at low)
+bool tls_recv_paused_hw;   // upstream recv paused for backpressure (resume at low watermark)
+bool resp_fully_buffered;  // whole proxy body has been read+encrypted into tls_out_buf
 ```
 
-Keep `tls_send_src/len/off` but **narrow their meaning**: used only by the
-fallback branch where a single chunk's ciphertext exceeds the buffer's free space
-and `SSL_write` returns `WantWrite` mid-chunk (see §3.4). Normal path no longer
-holds plaintext across calls.
+No `tls_deferred_on_send` / no early-fire (removed — see §3.0).
 
 Constants (`iouring_event_loop.h`):
 
 ```cpp
-kTlsOutBufCap = 4 * SlicePool::kSliceSize;  // 64 KiB — bounded; throughput/memory knob
-kTlsOutHigh   = 3 * SlicePool::kSliceSize;  // pause upstream recv above this
-kTlsOutLow    = 1 * SlicePool::kSliceSize;  // resume below this
+kTlsRecordMax = SlicePool::kSliceSize + 256;  // worst-case ciphertext for one ≤16 KiB chunk
+kTlsOutBufCap = 4 * SlicePool::kSliceSize;     // 64 KiB — bounded; throughput/memory knob
+kTlsOutHigh   = kTlsOutBufCap - kTlsRecordMax; // pause upstream recv above this …
+kTlsOutLow    = kTlsOutBufCap / 4;             // … resume below this
 ```
 
-Invariant: `kTlsOutBufCap − kTlsOutHigh ≥ one upstream chunk's worst-case
-ciphertext` (~16 KiB + record/AEAD overhead) so a chunk we're allowed to accept
-always encrypts fully in one shot (avoids the mid-chunk `WantWrite` fallback in
-the common case). `tls_setup` allocates the `kTlsOutBufCap` mmap; `tls_teardown`
-/`reset` clean it up.
+**Invariant (codex P2):** `kTlsOutBufCap − kTlsOutHigh ≥ kTlsRecordMax`, i.e. the
+guaranteed free space above the high watermark must cover one full upstream chunk
+**plus TLS record/AEAD expansion** — otherwise a normal full chunk just below the
+high watermark hits the `WantWrite` fallback every time. Deriving `kTlsOutHigh`
+from `kTlsRecordMax` (not "cap − one slice") enforces it. `tls_setup` allocates
+the `kTlsOutBufCap` mmap; `tls_teardown`/`reset` clean it up.
 
-### 3.2 Submit — `submit_send_impl` TLS branch (`iouring_event_loop.h`)
+### 3.2 `fill_output` — encrypt into the buffer (`tls_iouring.h`)
+
+The one primitive both send shapes use. It must **loop on partial writes** and
+**commit produced ciphertext every iteration** (codex P1 ×2):
 
 ```text
-submit_send_tls(conn, src, len, cont = conn.on_send):
-  # 1) synchronously encrypt the whole chunk into the owned ciphertext buffer
-  set_output(engine, tls_out_buf.write_ptr, tls_out_buf.write_avail)
-  SSL_write(engine, src, len)             # expected to consume the whole chunk
-    if WantWrite (not enough room) -> §3.4 fallback (hold remainder + pause); return true
-  tls_out_buf.commit(produced ciphertext)
+fill_output(conn, src, len) -> (consumed, status):    # status ∈ {Done, NeedRoom, NeedRead, Fatal}
+  off = 0
+  while off < len:
+     set_output(engine, tls_out_buf.write_ptr, tls_out_buf.write_avail)
+     w, st = SSL_write(engine, src+off, len-off)
+     # The custom BIO writes ciphertext into the output region BEFORE SSL_write
+     # returns (incl. on WantWrite), so commit whatever it produced EVERY pass —
+     # else those bytes never drain and the low watermark never arrives.
+     tls_out_buf.commit(tls_engine_output_len(engine))
+     if !ensure_draining(conn): return (off, Fatal)        # submit_send_raw failure → close
+     if w > 0: off += w; continue                          # PARTIAL_WRITE: positive < len is legal
+     if st == WantWrite: return (off, NeedRoom)            # buffer full mid-chunk
+     if st == WantRead:  return (off, NeedRead)            # post-handshake control needs a read
+     return (off, Fatal)
+  return (len, Done)
 
-  # 2) ensure one raw send is draining the buffer
+ensure_draining(conn):                                      # one in-flight send draining the buffer
   if !tls_out_inflight and tls_out_buf.len() > 0:
-     submit_send_raw(conn, tls_out_buf.data(), tls_out_buf.len())
+     if !submit_send_raw(conn, tls_out_buf.data(), tls_out_buf.len()): return false   # codex P2
      tls_out_inflight = true
-     conn.on_send = tls_on_out_drain       # always the TLS drain hook  (fixes P1-a)
-
-  # 3) signal the upper layer it may advance — gated by the high watermark
-  if tls_out_buf.len() < kTlsOutHigh:
-     fire(cont, result = len)              # fire on_response_body_sent with THIS chunk's len (fixes P1-b)
-  else:
-     tls_deferred_on_send = cont           # high watermark: defer until drained to low
-     pause_upstream_recv(conn); tls_recv_paused_hw = true
+     conn.on_send = tls_on_out_drain
   return true
 ```
 
-The shared proxy code (`on_response_body_recvd`) is **unchanged**: it still sets
-`upstream_send_len = send_len; transition_to_sending(on_response_body_sent);
-client_send(...)`. The only difference is that `client_send` now encrypts
-synchronously and (when below the high watermark) fires `on_response_body_sent`
-synchronously — at which point `consume_upstream_sent` consumes exactly this
-chunk (`upstream_send_len` is still this chunk's length → correct accounting).
+### 3.3 Submit paths (`submit_send_impl` / proxy read path)
 
-### 3.3 Drain — `tls_on_out_drain` (renamed `tls_on_out_sent`, `tls_iouring.h`)
+**Single-shot** (`submit_send_impl` TLS branch) — same shape as #129, async
+completion:
+```text
+tls_pending_on_send = conn.on_send          # the upper-layer continuation
+conn.on_send        = tls_on_out_drain
+tls_send_src/len/off = src/len/0            # remainder if the buffer can't take it all yet
+(consumed, status) = fill_output(conn, src, len)
+on Fatal: return false (caller closes)
+tls_send_off = consumed                     # drain handler resumes encryption (NeedRoom/NeedRead)
+# continuation fires later, from tls_on_out_drain, on full drain — NOT here
+return true
+```
+
+**Proxy streaming body** — the io_uring-TLS branch of `on_response_body_recvd`
+calls `fill_output` directly instead of the generic `client_send`:
+```text
+(consumed, status) = fill_output(conn, upstream_recv_buf.data(), send_len)
+on Fatal: close; return
+consume_upstream(conn, consumed)            # drop the bytes we actually encrypted; compact
+advance resp_body_remaining / chunked state by consumed
+if status == NeedRoom:                       # buffer filled mid-chunk
+   tls_send_src = upstream_recv_buf.data(); tls_send_len = (remainder)   # valid: recv is paused
+   pause_upstream_recv(conn); tls_recv_paused_hw = true; return
+if status == NeedRead:
+   tls_pending_on_recv = tls_resume_pending_send_recv; submit_recv(conn); return
+# chunk fully encrypted:
+if whole body read+encrypted: resp_fully_buffered = true; return   # completion happens at drain
+if tls_out_buf.len() >= kTlsOutHigh: pause_upstream_recv(conn); tls_recv_paused_hw = true
+else: re-arm upstream recv
+```
+
+### 3.4 Drain — `tls_on_out_drain` (renamed `tls_on_out_sent`, `tls_iouring.h`)
 
 ```text
 tls_on_out_drain(conn, ev):
   tls_out_inflight = false
   if ev.result < 0: close; return
-  partial-send aware: advance by ev.result; tls_out_buf.consume(ev.result); compact
+  partial-send aware: if send_progress < submitted → resubmit remainder; on_send=drain; return
+  tls_out_buf.consume(bytes sent); compact
 
-  if tls_out_buf.len() > 0:                # more ciphertext queued — submit next send
-     submit_send_raw(...); tls_out_inflight = true; conn.on_send = tls_on_out_drain; return
+  # (a) finish a parked plaintext remainder FIRST, before any completion (codex P1)
+  if tls_send_src and tls_send_off < tls_send_len:
+     (consumed, status) = fill_output(conn, tls_send_src + tls_send_off, tls_send_len - tls_send_off)
+     on Fatal: close; return
+     tls_send_off += consumed
+     if proxy-stream: consume_upstream(conn, consumed); advance body state
+     if status in {NeedRoom, NeedRead}: handle (park again / submit_recv); return
+     tls_send_src = null                      # remainder fully encrypted
 
-  # buffer drained (or this was a handshake/control flight with no continuation)
-  if tls_deferred_on_send and tls_out_buf.len() <= kTlsOutLow:
-     cont = tls_deferred_on_send; tls_deferred_on_send = null
-     if tls_recv_paused_hw: resume_upstream_recv(conn); tls_recv_paused_hw = false
-     fire(cont, result = ...)              # low-watermark callback: proxy advances
-  else:
-     # existing tail preserved: handshake continuation / pending_handler_fn / submit_recv
+  if tls_out_buf.len() > 0: ensure_draining(conn); return   # more ciphertext to push
+
+  # (b) buffer empty
+  if single-shot and tls_pending_on_send:     # fire the upper-layer continuation NOW (async, real len)
+     fire(tls_pending_on_send, result = total_plaintext_sent); tls_pending_on_send = null; return
+  if proxy-stream and resp_fully_buffered:     # body fully buffered AND fully drained
+     proxy_stream_complete(conn); return       # = body-done tail (release slot, keep-alive, pipeline)
+  if proxy-stream and tls_recv_paused_hw:       # backpressure relieved
+     resume_upstream_recv(conn); tls_recv_paused_hw = false; return
+  # else: handshake/control flight tail (existing tls_process / pending_handler_fn / submit_recv)
 ```
 
-`on_send` is `tls_on_out_drain` for the whole in-flight period (reset on every
-`submit_send_raw`), so `transition_to_sending` can't clobber it. The proxy
-continuation is invoked directly by the TLS layer, never via a raw Send CQE.
+`on_send` is `tls_on_out_drain` for the whole in-flight period (re-set on every
+`ensure_draining`), so `transition_to_sending` can't clobber it.
 
-### 3.4 Edge cases
+### 3.5 Edge cases
 
-1. **Single chunk's ciphertext > buffer free space (`WantWrite` mid-chunk).**
-   The §3.1 capacity invariant avoids it normally; the fallback holds the
-   un-encrypted remainder in `tls_send_src/off/len` (pointing into
-   `upstream_recv_buf`, valid because **we pause upstream recv**, keeping it
-   stable) and resumes encryption at the low watermark.
-2. **Handshake / control flights (NewSessionTicket, KeyUpdate).** Also flow
-   through `tls_out_buf` but with **no upper-layer continuation** (`cont = null`);
-   `tls_deferred_on_send` stays null and the existing handshake tail runs.
-3. **`SSL_write` returns `WANT_READ`** (e.g. a KeyUpdate must be read first).
-   Preserve #129's `tls_resume_pending_send_recv` path: `submit_recv` first, then
-   continue encrypting after the control message is consumed.
-4. **Partial socket send.** `submit_send_raw` completion may be `< len`; the
-   drain handler must advance by `send_progress` (mirror `on_h2_sent`), not
-   assume the buffer is fully drained.
-5. **Close / teardown.** Discard unsent ciphertext on `close_conn`; `reset()`
-   clears `tls_deferred_on_send`/`tls_recv_paused_hw`; `tls_teardown` frees the
-   `tls_out` mmap.
-6. **epoll unaffected.** All changes live in `tls_iouring.h` and the io_uring TLS
-   branch of `submit_send_impl`. The shared `on_response_body_recvd/sent`,
-   `consume_upstream_sent` keep the same signature and semantics ("consume one
-   `upstream_send_len` chunk") — only *when* the continuation fires differs, and
-   only on the io_uring TLS path. epoll TLS (terminated in-backend) and plaintext
-   keep firing from the real send completion.
+1. **Buffer fills mid-chunk (`WantWrite`).** The §3.1 invariant prevents it for a
+   normal chunk below the high watermark; the fallback parks the un-encrypted
+   remainder in `tls_send_src/off/len` (pointing into `upstream_recv_buf`, stable
+   because upstream recv is paused) and the drain handler §3.4(a) **finishes
+   encrypting it before** any completion fires (codex P1) — so a chunk's tail is
+   never lost and the continuation never runs against shifted data.
+2. **Handshake / control flights (NewSessionTicket, KeyUpdate).** Flow through
+   `tls_out_buf` with no upper-layer continuation (`tls_pending_on_send == null`);
+   §3.4's handshake tail runs.
+3. **`SSL_write` returns `WANT_READ`.** Preserve #129's
+   `tls_resume_pending_send_recv` path: `submit_recv` first, resume encryption
+   after the control message is consumed.
+4. **Partial socket send.** `submit_send_raw` completion may be `< submitted`;
+   the drain handler resubmits the remainder (mirror `on_h2_sent`).
+5. **`submit_send_raw` failure (SQ pressure).** `ensure_draining` returns false →
+   the submit path returns false / closes, like existing call sites — never
+   leaves ciphertext queued with no drain event (codex P2).
+6. **Close / teardown.** Discard unsent ciphertext on `close_conn`; `reset()`
+   clears `tls_recv_paused_hw`/`resp_fully_buffered`/`tls_send_*`; `tls_teardown`
+   frees the `tls_out` mmap.
+7. **epoll unaffected.** Changes live in `tls_iouring.h` and the io_uring TLS
+   branches of `submit_send_impl` / `on_response_body_recvd`. The proxy-stream
+   completion tail (`proxy_stream_complete`) is the body-done logic factored out
+   of `on_response_body_sent`; epoll TLS (in-backend) and plaintext keep the
+   existing synchronous send-completion flow.
 
-### 3.5 How this resolves the review
+### 3.6 How this resolves the design review (codex on this doc)
 
 | Finding | Resolution |
 |---|---|
-| P1-a (`on_send` not restored) | No queued-pointer juggling; `on_send` is always `tls_on_out_drain` while in flight; continuation fired directly, not via CQE. |
-| P1-b (wrong continuation/length) | Each chunk fires its continuation at its own accept time with its own `upstream_send_len`. |
-| Root cause (alias / accounting) | Eager encrypt → `upstream_recv_buf` is free to reuse after submit; accounting consumes exactly the submitted chunk. |
-| P2 (test doesn't exercise queue) | New test forces the high/low watermark path (§5). |
+| P1 — preserve the TLS drain hook before firing continuations | No continuation is fired at submit; `on_send` stays `tls_on_out_drain` for the whole in-flight period (§3.0, §3.4). |
+| P1 — resume fallback encryption before firing the continuation | §3.4(a) finishes the parked remainder before any completion. |
+| P1 — avoid inline completion for `wait(send)` sends | Single-shot continuations fire only on the real drain CQE (§3.0/§3.3), preserving the `client_send` → `pause_recv` ordering. |
+| P1 — commit ciphertext before entering `WantWrite` fallback | `fill_output` commits `tls_engine_output_len()` and ensures a drain **every** iteration (§3.2). |
+| P1 — loop until `SSL_write` consumes the whole chunk | `fill_output` loops on positive partial writes (`SSL_MODE_ENABLE_PARTIAL_WRITE`) until `Done`/retry (§3.2). |
+| P2 — leave TLS overhead room above the high watermark | `kTlsOutHigh = kTlsOutBufCap − kTlsRecordMax` (§3.1). |
+| P2 — store the deferred send result length | No deferred generic continuation exists anymore; single-shot fires with the real sent length (§3.4). |
+| P2 — handle raw send submission failure | `ensure_draining` checks `submit_send_raw` and fails closed (§3.2/§3.5). |
+| (original #130) root cause: alias / accounting | Encrypt-into-owned-buffer → `upstream_recv_buf` consumed at encrypt time, never aliased across a CQE. |
 
 ## 4. Memory / throughput tradeoff
 
@@ -241,14 +321,24 @@ can be a compile-time constant or per-shard config.
 
 **Local (unit, `test_network.cc`, drives the functions directly):**
 
-- `tls_out_buf` append/drain/compact + offset correctness.
-- Watermark: fill to ≥ high → `pause` set + continuation deferred; drain to ≤ low
-  → `resume` + deferred continuation fired.
-- Per-chunk continuation fires with the correct length (two chunks → assert
-  `consume_upstream_sent` called twice, each with its own length).
-- Fallback: a chunk whose ciphertext overflows → remainder held + pause, resumes.
-- Handshake flight (no continuation) doesn't spuriously fire a continuation;
-  partial socket send continues.
+- `fill_output`: loops on partial `SSL_write` until the whole chunk is consumed;
+  commits produced ciphertext every pass; `WantWrite` → `NeedRoom` with the
+  already-produced bytes committed and a drain ensured; `submit_send_raw` failure
+  → `Fatal`/close.
+- Single-shot: continuation fires **only** on the real full-drain CQE, with the
+  total sent length — never synchronously at submit (guards the `wait(send)` /
+  `on_response_sent` ordering).
+- Watermark: read-side fills to ≥ high → upstream recv paused; drain to ≤ low →
+  resumed. No generic continuation is deferred or early-fired.
+- Proxy stream accounting: two chunks → `upstream_recv_buf` consumed by the
+  encrypted byte count at each fill; request completes only when
+  `resp_fully_buffered` **and** the buffer is empty.
+- Fallback: a chunk whose ciphertext overflows the free space → remainder parked
+  + pause; drain handler finishes encrypting it **before** completing the chunk.
+- Watermark headroom: a full chunk just below the high watermark encrypts in one
+  shot (no `WantWrite`) — guards `kTlsOutHigh = cap − kTlsRecordMax`.
+- Handshake flight (no `tls_pending_on_send`) doesn't spuriously fire a
+  continuation; partial socket send resubmits the remainder.
 
 **CI-only (integration, `test_integration.cc`, real io_uring + TLS sockets):**
 
@@ -262,19 +352,26 @@ can be a compile-time constant or per-shard config.
 
 ## 6. Phasing & rollback
 
-0. Add fields + `tls_out_buf` alloc/free + constants (pure addition, no behavior
-   change). Compiles.
-1. `submit_send_impl` TLS branch → eager encrypt into the buffer + fire
-   continuation (no watermark yet; buffer large enough not to fill). Unit tests.
-2. `tls_on_out_drain` → drain the buffer + continuation/resume. Delete
-   `tls_send_q_*`. Unit tests.
-3. Add high/low watermark backpressure + pause/resume + deferred continuation.
-   Unit tests.
-4. Rewrite the integration test to force backpressure. CI validates.
+0. Add fields + `tls_out_buf` mmap alloc/free + constants; delete the depth-1
+   queue (`tls_send_q_*`). Pure plumbing, no behavior change. Compiles.
+1. `fill_output` + `ensure_draining` (loop on partial writes, commit-every-pass,
+   submit-failure → close). Unit tests for the primitive in isolation.
+2. **Single-shot** path on the buffer: `submit_send_impl` stages into
+   `tls_out_buf`, `tls_on_out_drain` fires `tls_pending_on_send` on full drain
+   (async — same semantics as #129). Unit tests. *This alone already supersedes
+   #129/#130 for single-shot; the proxy still serializes.*
+3. **Proxy streaming** read/drain decoupling: `on_response_body_recvd` io_uring-
+   TLS branch calls `fill_output`; `resp_fully_buffered` + `proxy_stream_complete`
+   in the drain handler. No watermark yet (buffer sized so it won't fill under
+   test). Unit tests.
+4. High/low watermark backpressure: pause/resume upstream recv; the `WantWrite`
+   fallback + §3.4(a) remainder-finish. Unit tests.
+5. Rewrite the integration test to deterministically force backpressure. CI.
 
-**Rollback:** each phase is an independent commit. If CI surfaces a problem, fall
-back to phase 2 (no watermark, buffer sized large) — still correct, just less
-aggressive on throughput than the full watermark version.
+**Rollback:** each phase is an independent commit. If CI surfaces a problem after
+phase 3/4, fall back to phase 2 (single-shot on the buffer; proxy stays
+serialized like #129 but without the spurious close) — still correct, just
+without the streaming throughput win.
 
 **Risks:** the io_uring TLS path is the most delicate state machine here and is
 **not locally runtime-validatable** (sandbox limitation); the eager-encrypt
