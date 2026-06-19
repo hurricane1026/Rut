@@ -307,15 +307,21 @@ public:
             return false;
         }
         u8* in = static_cast<u8*>(in_region);
-        u8* out = pool.alloc();
-        if (!out) {
+        // Owned ciphertext output buffer (kTlsOutBufCap, mmap like tls_in) — see
+        // docs/iouring-tls-output-buffer.md. tls_out_slice holds the mmap base
+        // for teardown; tls_out_buf is the Buffer view used for staging+draining.
+        void* out_region = mmap(
+            nullptr, kTlsOutBufCap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (out_region == MAP_FAILED) {
             munmap(in, kTlsInputSize);
             tls_engine_free(c.tls_engine);
             return false;
         }
+        u8* out = static_cast<u8*>(out_region);
         c.tls_in_slice = in;
         c.tls_in_buf.bind(in, kTlsInputSize);
         c.tls_out_slice = out;
+        c.tls_out_buf.bind(out, kTlsOutBufCap);
         c.tls_active = true;
         c.tls_handshake_complete = false;
         c.tls_pending_on_recv = &on_header_received<Self>;
@@ -328,6 +334,13 @@ public:
         munmap(c.tls_in_slice, kTlsInputSize);
         c.tls_in_slice = nullptr;
         c.tls_in_buf.bind(nullptr, 0);
+    }
+
+    void free_tls_out_buf(ConnectionBase& c) {
+        if (!c.tls_out_slice) return;  // tls_out_slice is the mmap base (see tls_setup)
+        munmap(c.tls_out_slice, kTlsOutBufCap);
+        c.tls_out_slice = nullptr;
+        c.tls_out_buf.bind(nullptr, 0);
     }
 
     void reclaim_slot(u32 cid) {
@@ -344,10 +357,7 @@ public:
             conns[cid].upstream_recv_slice = nullptr;
         }
         free_tls_in_buf(conns[cid]);
-        if (conns[cid].tls_out_slice) {
-            pool.free(conns[cid].tls_out_slice);
-            conns[cid].tls_out_slice = nullptr;
-        }
+        free_tls_out_buf(conns[cid]);
         free_stack[free_top++] = cid;
         for (u32 i = 0; i < pending_free_count; i++) {
             if (pending_free[i] == cid) {
@@ -375,10 +385,7 @@ public:
                     conns[cid].upstream_recv_slice = nullptr;
                 }
                 free_tls_in_buf(conns[cid]);
-                if (conns[cid].tls_out_slice) {
-                    pool.free(conns[cid].tls_out_slice);
-                    conns[cid].tls_out_slice = nullptr;
-                }
+                free_tls_out_buf(conns[cid]);
                 free_stack[free_top++] = cid;
             } else {
                 pending_free[remaining++] = cid;
@@ -437,7 +444,7 @@ public:
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             free_tls_in_buf(c);
-            if (c.tls_out_slice) pool.free(c.tls_out_slice);
+            free_tls_out_buf(c);
             c.reset();
             free_stack[free_top++] = cid;
             return;
