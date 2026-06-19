@@ -254,6 +254,16 @@ struct ConnectionBase {
     Buffer tls_out_buf;
     // A tls_out_buf send is in flight; the buffer cannot be reused until its CQE.
     bool tls_out_inflight;
+    // Bytes the in-flight raw send covers. Read-ahead may append more ciphertext
+    // to tls_out_buf after the SQE captured its length, so the drain handler must
+    // consume against this, not the (possibly grown) tls_out_buf.len(). See
+    // docs/iouring-tls-output-buffer.md §3.1.
+    u32 tls_out_inflight_len;
+    // Proxy-over-TLS streaming backpressure state (io_uring). Per-response, not
+    // per-connection — cleared at the keep-alive request boundary, not only reset().
+    bool tls_recv_paused_hw;   // upstream recv paused at the high watermark
+    bool resp_fully_buffered;  // whole proxy body read+encrypted into tls_out_buf
+    bool tls_proxy_stream;     // mid proxy-over-TLS body (vs single-shot / handshake)
     // Plaintext awaiting encryption for an app-data send. Encryption may need
     // several rounds when the ciphertext doesn't fit tls_out_buf in one shot; the
     // send-completion handler resumes from tls_send_off and only fires the real
@@ -432,6 +442,10 @@ struct ConnectionBase {
         tls_out_slice = nullptr;
         tls_out_buf.bind(nullptr, 0);
         tls_out_inflight = false;
+        tls_out_inflight_len = 0;
+        tls_recv_paused_hw = false;
+        resp_fully_buffered = false;
+        tls_proxy_stream = false;
         tls_send_src = nullptr;
         tls_send_len = 0;
         tls_send_off = 0;

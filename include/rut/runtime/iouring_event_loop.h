@@ -66,6 +66,17 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
+    // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
+    // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
+    static constexpr u32 kTlsRecordMax =
+        SlicePool::kSliceSize + 256;  // 1 chunk's worst-case ciphertext
+    static constexpr u32 kTlsOutBufCap =
+        4 * SlicePool::kSliceSize;  // 64 KiB — bounded throughput knob
+    static constexpr u32 kTlsOutHigh =
+        kTlsOutBufCap - kTlsRecordMax;                    // pause upstream recv above this
+    static constexpr u32 kTlsOutLow = kTlsOutBufCap / 4;  // resume below this
+    static constexpr u32 kTlsDrainChunk =
+        SlicePool::kSliceSize;  // a raw send submits ≤ this at once
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
