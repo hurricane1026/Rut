@@ -235,6 +235,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     if (route->rate_limit.count > 0) {
         u8 rl_synth[8192];
         const u32 kRlLen = h2_synth_h1_request(headers, nheaders, rl_synth, sizeof(rl_synth));
+        if (kRlLen == 0 && rate_limit_needs_req_buf(route->rate_limit)) {
+            // The HTTP/1 synthesis overflowed the scratch buffer (header block too
+            // large), so a header/query/cookie key would extract empty and collapse
+            // distinct callers into one bucket — a padded request could then throttle
+            // unrelated keys. Reject instead of metering an empty key. (IP/param-only
+            // rules don't read the buffer, so they fall through and meter normally.)
+            h2_emit_status(d, stream_id, 431);  // Request Header Fields Too Large
+            return;
+        }
         RateLimitKeyInput key_in;
         key_in.peer_addr = d.conn->peer_addr;
         key_in.req_buf = kRlLen ? rl_synth : nullptr;

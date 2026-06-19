@@ -115,4 +115,27 @@ struct RateLimitRuleSet {
     }
 };
 
+// True if any rule keys on a request-buffer-derived component (header / query /
+// cookie). A caller that cannot supply a request buffer — e.g. an HTTP/2 request
+// whose HTTP/1 synthesis overflowed its scratch buffer — must reject rather than
+// meter with an empty buffer, which would extract every such component as empty
+// and collapse distinct callers into one shared bucket. IP and route-param keys
+// don't read the buffer, so they meter correctly regardless.
+inline bool rate_limit_needs_req_buf(const RateLimitRuleSet& rs) {
+    for (u8 i = 0; i < rs.count; i++) {
+        const RateLimitKeySpec& k = rs.rules[i].key;
+        for (u8 j = 0; j < k.count; j++) {
+            switch (k.comps[j].kind) {
+                case RateLimitKeyKind::Header:
+                case RateLimitKeyKind::Query:
+                case RateLimitKeyKind::Cookie:
+                    return true;
+                default:
+                    break;
+            }
+        }
+    }
+    return false;
+}
+
 }  // namespace rut

@@ -1098,6 +1098,38 @@ TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     rir.destroy();
 }
 
+// rate_limit_needs_req_buf gates the h2 synth-overflow reject: header/query/
+// cookie keys read the request buffer (must reject when it's unavailable rather
+// than meter an empty key and collapse callers); ip/param keys don't.
+TEST(rate_limit, needs_req_buf_only_for_buffer_keys) {
+    using namespace rut;
+    RateLimitRuleSet ip_only;
+    REQUIRE(ip_only.add_rule(100, 1) >= 0);  // default Ip key (no components)
+    CHECK(!rate_limit_needs_req_buf(ip_only));
+
+    RateLimitRuleSet param_only;
+    REQUIRE(param_only.add_rule(100, 1) >= 0);
+    REQUIRE(param_only.rules[0].key.add(RateLimitKeyKind::Param, "id", 2));
+    CHECK(!rate_limit_needs_req_buf(param_only));
+
+    const RateLimitKeyKind buffer_kinds[3] = {
+        RateLimitKeyKind::Header, RateLimitKeyKind::Query, RateLimitKeyKind::Cookie};
+    for (u32 i = 0; i < 3; i++) {
+        RateLimitRuleSet rs;
+        REQUIRE(rs.add_rule(100, 1) >= 0);
+        REQUIRE(rs.rules[0].key.add(buffer_kinds[i], "k", 1));
+        CHECK(rate_limit_needs_req_buf(rs));
+    }
+
+    // A buffer key on a *second* stacked rule still trips the gate.
+    RateLimitRuleSet mixed;
+    REQUIRE(mixed.add_rule(100, 1) >= 0);
+    REQUIRE(mixed.rules[0].key.add(RateLimitKeyKind::Ip, nullptr, 0));
+    REQUIRE(mixed.add_rule(10, 1) >= 0);
+    REQUIRE(mixed.rules[1].key.add(RateLimitKeyKind::Cookie, "sid", 3));
+    CHECK(rate_limit_needs_req_buf(mixed));
+}
+
 // A single `by:` source (no list) and the param/query/cookie sources parse.
 TEST(rate_limit_dsl, by_single_source) {
     using namespace rut;
