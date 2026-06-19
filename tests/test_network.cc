@@ -4,11 +4,13 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include "test.h"
@@ -50,6 +52,15 @@ TEST(accept, at_capacity) {
     loop.free_top = 0;
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 99));
     CHECK_EQ(loop.free_top, 0u);
+}
+
+TEST(event_loop, default_alloc_h2_refuses) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    CHECK(!loop.alloc_h2(*c));
+    CHECK(c->h2 == nullptr);
 }
 
 // === Recv ===
@@ -1341,6 +1352,126 @@ TEST(legacy_loop, accessors_and_free_release_slices) {
     CHECK_EQ(c->recv_slice, nullptr);
     CHECK_EQ(c->upstream_recv_slice, nullptr);
     loop->shutdown();
+}
+
+namespace {
+bool g_tls_pending_send_called = false;
+u32 g_tls_pending_send_result = 0;
+bool g_tls_set_slots_recv_called = false;
+
+void tls_pending_send_probe(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_tls_pending_send_called = true;
+    g_tls_pending_send_result = static_cast<u32>(ev.result);
+    conn.on_send = nullptr;
+}
+
+void tls_set_slots_recv_probe(void*, Connection&, IoEvent) {
+    g_tls_set_slots_recv_called = true;
+}
+
+void tls_set_slots_send_probe(void*, Connection&, IoEvent) {}
+}  // namespace
+
+TEST(connection_base, set_slots_redirects_recv_slot_for_iouring_tls) {
+    Connection conn;
+    u8 tls_in_storage[SmallLoop::kBufSize];
+    u8 tls_out_storage[SmallLoop::kBufSize];
+    conn.reset();
+    conn.id = 77;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(0x1);
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+
+    g_tls_set_slots_recv_called = false;
+    conn.set_slots(&tls_set_slots_recv_probe, &tls_set_slots_send_probe, nullptr, nullptr);
+
+    CHECK(conn.uses_iouring_tls());
+    CHECK(conn.on_recv == nullptr);
+    CHECK(conn.tls_pending_on_recv == &tls_set_slots_recv_probe);
+    CHECK(g_tls_set_slots_recv_called == false);
+    conn.tls_engine.ssl = nullptr;
+}
+
+TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
+    TlsEngine engine;
+    u8 in[16];
+    u8 out[16];
+    tls_engine_set_input(engine, in, sizeof(in));
+    tls_engine_set_output(engine, out, sizeof(out));
+
+    CHECK_EQ(tls_engine_input_consumed(engine), 0u);
+    CHECK_EQ(tls_engine_output_len(engine), 0u);
+
+    engine.in_off = 4;
+    CHECK_EQ(tls_engine_input_consumed(engine), 4u);
+
+    engine.out_len = 7;
+    CHECK_EQ(tls_engine_output_len(engine), 7u);
+}
+
+TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
+    Connection conn;
+    u8 recv_storage[SmallLoop::kBufSize];
+    u8 send_storage[SmallLoop::kBufSize];
+    conn.reset();
+    conn.id = 7;
+    conn.fd = 42;
+    conn.recv_slice = recv_storage;
+    conn.send_slice = send_storage;
+    conn.recv_buf.bind(recv_storage, SmallLoop::kBufSize);
+    conn.send_buf.bind(send_storage, SmallLoop::kBufSize);
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;
+    conn.tls_send_src = reinterpret_cast<const u8*>("plain");
+    conn.tls_send_len = 5;
+    conn.tls_send_off = 5;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+    conn.on_send = &tls_on_out_sent<IoUringEventLoop>;
+    g_tls_pending_send_called = false;
+    g_tls_pending_send_result = 0;
+
+    tls_on_out_sent<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
+
+    CHECK(g_tls_pending_send_called);
+    CHECK_EQ(g_tls_pending_send_result, 5u);
+    CHECK(!conn.tls_out_inflight);
+    CHECK(conn.tls_send_src == nullptr);
+    CHECK_EQ(conn.tls_send_len, 0u);
+    CHECK(conn.tls_pending_on_send == nullptr);
+}
+
+TEST(tls_iouring, queued_send_keeps_tls_completion_hook_during_inflight_flight) {
+    // A response send issued while a control/handshake ciphertext flight is still
+    // draining must leave on_send pointing at tls_on_out_sent, so the in-flight
+    // Send CQE resumes the TLS layer instead of being mis-handled as this
+    // response's completion. transition_to_sending() overwrote on_send with the
+    // upper-layer continuation (saved in tls_pending_on_send) just before the
+    // send funneled through tls_pump_send.
+    Connection conn;
+    conn.reset();
+    conn.id = 11;
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;            // a prior flight is still draining
+    conn.on_send = &tls_pending_send_probe;  // clobbered upper-layer continuation
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+
+    CHECK(tls_pump_send<IoUringEventLoop>(nullptr, conn));
+    CHECK(conn.on_send == &tls_on_out_sent<IoUringEventLoop>);  // hook restored
+    CHECK(conn.tls_out_inflight);                               // queued send waits
+    CHECK(conn.tls_pending_on_send == &tls_pending_send_probe);
+}
+
+TEST(tls_iouring, flush_out_no_output_is_noop) {
+    Connection conn;
+    conn.reset();
+    conn.id = 8;
+    CHECK(tls_flush_out<IoUringEventLoop>(nullptr, conn));
+    CHECK(!conn.tls_out_inflight);
+}
+
+TEST(tls_iouring, input_buffer_fits_full_ciphertext_record) {
+    CHECK_GE(IoUringEventLoop::kTlsInputSize, SlicePool::kSliceSize + 1024);
 }
 
 // Two proxy cycles on same connection (keep-alive)

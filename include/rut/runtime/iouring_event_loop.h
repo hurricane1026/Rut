@@ -19,10 +19,13 @@
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/timer_wheel.h"
+#include "rut/runtime/tls.h"
+#include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -62,6 +65,7 @@ private:
 
 public:
     static constexpr u32 kMaxConns = 16384;
+    static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
@@ -75,6 +79,10 @@ public:
     // separate knob. TODO: a dedicated connect-timeout if hung connects matter.
     static constexpr u32 kDefaultUpstreamTimeout = 30;
     SlicePool pool;
+    // TLS server context (cert/key/ALPN). When set, accepted connections
+    // terminate TLS via the event-loop TlsEngine (see tls_iouring.h). Null =
+    // plaintext. Mirrors EpollEventLoop::tls_server.
+    TlsServerContext* tls_server = nullptr;
     // Per-shard HTTP/2 engine pool (see EpollEventLoop). Lazily handed out on
     // h2 upgrade; bounded, over-cap upgrades close the connection.
     static constexpr u32 kH2PoolCap = 2048;
@@ -162,8 +170,11 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        // 3 slices max per connection: recv + send + upstream_recv (lazy).
-        TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
+        // Plaintext needs recv + send + lazy upstream_recv. TLS termination adds
+        // one long-lived ciphertext output slice per connection. TLS input uses
+        // a slightly larger mmap buffer so one full ciphertext record fits.
+        // tls_server is wired after init(), so reserve for the TLS-capable case.
+        TRY_VOID(pool.init(kMaxConns * 5, pool_prealloc));
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
@@ -273,6 +284,41 @@ public:
         return true;
     }
 
+    // Initialize TLS termination on a freshly accepted connection: create the
+    // engine, allocate the ciphertext in/out slices, and point on_recv at the
+    // TLS driver. Returns false (and rolls back) if the engine or pool fails.
+    bool tls_setup(Connection& c) {
+        if (!tls_engine_init(c.tls_engine, tls_server)) return false;
+        void* in_region = mmap(
+            nullptr, kTlsInputSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (in_region == MAP_FAILED) {
+            tls_engine_free(c.tls_engine);
+            return false;
+        }
+        u8* in = static_cast<u8*>(in_region);
+        u8* out = pool.alloc();
+        if (!out) {
+            munmap(in, kTlsInputSize);
+            tls_engine_free(c.tls_engine);
+            return false;
+        }
+        c.tls_in_slice = in;
+        c.tls_in_buf.bind(in, kTlsInputSize);
+        c.tls_out_slice = out;
+        c.tls_active = true;
+        c.tls_handshake_complete = false;
+        c.tls_pending_on_recv = &on_header_received<Self>;
+        c.on_recv = &tls_recv<Self>;
+        return true;
+    }
+
+    void free_tls_in_buf(ConnectionBase& c) {
+        if (!c.tls_in_slice) return;
+        munmap(c.tls_in_slice, kTlsInputSize);
+        c.tls_in_slice = nullptr;
+        c.tls_in_buf.bind(nullptr, 0);
+    }
+
     void reclaim_slot(u32 cid) {
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
@@ -285,6 +331,11 @@ public:
         if (conns[cid].upstream_recv_slice) {
             pool.free(conns[cid].upstream_recv_slice);
             conns[cid].upstream_recv_slice = nullptr;
+        }
+        free_tls_in_buf(conns[cid]);
+        if (conns[cid].tls_out_slice) {
+            pool.free(conns[cid].tls_out_slice);
+            conns[cid].tls_out_slice = nullptr;
         }
         free_stack[free_top++] = cid;
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -311,6 +362,11 @@ public:
                 if (conns[cid].upstream_recv_slice) {
                     pool.free(conns[cid].upstream_recv_slice);
                     conns[cid].upstream_recv_slice = nullptr;
+                }
+                free_tls_in_buf(conns[cid]);
+                if (conns[cid].tls_out_slice) {
+                    pool.free(conns[cid].tls_out_slice);
+                    conns[cid].tls_out_slice = nullptr;
                 }
                 free_stack[free_top++] = cid;
             } else {
@@ -361,11 +417,16 @@ public:
             h2_pool.free(c.h2);
             c.h2 = nullptr;
         }
+        // The TlsEngine owns only the SSL object (+ its custom BIO), never the
+        // io_uring-referenced slices — safe to free now even with ops in flight.
+        if (c.tls_engine.ssl) tls_engine_free(c.tls_engine);
         // If no ops are in flight, reclaim immediately.
         if (c.pending_ops == 0) {
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+            free_tls_in_buf(c);
+            if (c.tls_out_slice) pool.free(c.tls_out_slice);
             c.reset();
             free_stack[free_top++] = cid;
             return;
@@ -374,17 +435,23 @@ public:
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         u8* us = c.upstream_recv_slice;
+        u8* tin = c.tls_in_slice;
+        u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
         c.reset();
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
+        conns[cid].tls_in_slice = tin;
+        conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
         pending_free[pending_free_count++] = cid;
     }
 
     bool submit_recv_impl(Connection& c) {
-        if (c.recv_paused_for_send) {
+        const bool tls_send_needs_recv =
+            c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
+        if (c.recv_paused_for_send && !tls_send_needs_recv) {
             c.recv_pause_rearm_pending = true;
             return true;
         }
@@ -401,13 +468,43 @@ public:
         return false;
     }
 
-    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
+    // Raw client send — bytes go to the wire as-is (plaintext, or already-
+    // encrypted ciphertext from the TLS layer).
+    bool submit_send_raw(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) {
             c.pending_ops++;
             c.send_armed = true;
             return true;
         }
         return false;
+    }
+
+    bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
+        if (c.tls_active) {
+            // A send still mid-encryption (its plaintext didn't fit one TLS
+            // record / tls_out_slice) must not be overwritten or its remainder is
+            // lost. The upper layer serializes client sends via pause/resume, so
+            // this only arises for reverse-proxy streaming of body chunks larger
+            // than one TLS record; fail safe (caller closes) rather than corrupt.
+            // TODO: depth-1 queue to support proxy-over-TLS streaming of >16KB
+            // chunks on io_uring.
+            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
+                close_conn(c);
+                return false;
+            }
+            // Encrypt via the TlsEngine; ciphertext is sent by tls_pump_send.
+            c.tls_pending_on_send = c.on_send;
+            c.tls_send_src = buf;
+            c.tls_send_len = len;
+            c.tls_send_off = 0;
+            if (tls_pump_send<Self>(this, c)) return true;
+            c.tls_pending_on_send = nullptr;
+            c.tls_send_src = nullptr;
+            c.tls_send_len = 0;
+            c.tls_send_off = 0;
+            return false;
+        }
+        return submit_send_raw(c, buf, len);
     }
 
     bool submit_connect_impl(Connection& c, const void* addr, u32 addr_len) {
@@ -461,6 +558,8 @@ public:
 
     bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
+        if (c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>)
+            return true;
         c.recv_pause_cancel_pending = true;
         if (!c.recv_armed) return true;
         return backend.pause_recv(c.fd, c.id);
@@ -757,7 +856,9 @@ public:
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                         if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
                     }
-                    if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
+                    const bool has_recv_slot =
+                        conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);
+                    if (has_recv_slot || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
@@ -770,6 +871,14 @@ public:
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                            if (conn.uses_iouring_tls() && ev.type == IoEventType::Recv) {
+                                conn.tls_pending_on_recv =
+                                    &tls_resume_pending_handler_recv<IoUringEventLoop>;
+                                tls_recv<IoUringEventLoop>(this, conn, ev);
+                                if (conn.tls_active && conn.pending_handler_fn)
+                                    conn.tls_pending_on_recv = nullptr;
+                                break;
+                            }
                             if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
@@ -854,7 +963,16 @@ private:
         }
         c->state = ConnState::ReadingHeader;
         c->keep_alive = !draining_.load(std::memory_order_relaxed);
-        c->on_recv = &on_header_received<Self>;
+        if (tls_server) {
+            if (!tls_setup(*c)) {
+                ::close(c->fd);
+                c->fd = -1;
+                this->free_conn(*c);
+                return;
+            }
+        } else {
+            c->on_recv = &on_header_received<Self>;
+        }
         timer.add(c, keepalive_timeout);
         if (metrics) metrics->on_accept();
         this->submit_recv(*c);
@@ -878,7 +996,16 @@ private:
             }
             c->state = ConnState::ReadingHeader;
             c->keep_alive = !draining_.load(std::memory_order_relaxed);
-            c->on_recv = &on_header_received<Self>;
+            if (tls_server) {
+                if (!tls_setup(*c)) {
+                    ::close(c->fd);
+                    c->fd = -1;
+                    this->free_conn(*c);
+                    continue;
+                }
+            } else {
+                c->on_recv = &on_header_received<Self>;
+            }
             timer.add(c, keepalive_timeout);
             if (metrics) metrics->on_accept();
             this->submit_recv(*c);

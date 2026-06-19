@@ -6,6 +6,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/tls_engine.h"
 
 #include <linux/time_types.h>
 #include <openssl/base.h>
@@ -66,7 +67,11 @@ struct ConnectionBase {
     // Set all 4 slots atomically. Full state transitions MUST use this
     // to prevent stale callbacks in slots that aren't explicitly changed.
     void set_slots(Callback recv, Callback send, Callback up_recv, Callback up_send) {
-        on_recv = recv;
+        if (uses_iouring_tls()) {
+            tls_pending_on_recv = recv;
+        } else {
+            on_recv = recv;
+        }
         on_send = send;
         on_upstream_recv = up_recv;
         on_upstream_send = up_send;
@@ -93,6 +98,8 @@ struct ConnectionBase {
         state = ConnState::ExecHandler;
         clear_slots();
     }
+
+    bool uses_iouring_tls() const { return tls_active && tls_engine.ssl != nullptr; }
 
     // Check if any slot is active (for dispatch guard).
     bool has_active_slot() const {
@@ -233,6 +240,29 @@ struct ConnectionBase {
     // HTTP/1 connections (they pay nothing).
     Http2Conn* h2;
     SSL* tls;
+
+    // --- io_uring TLS termination (event-loop-layer) ---
+    // The epoll backend terminates TLS with a socket BIO inside the backend
+    // (SSL does its own recv/send on readiness). io_uring can't — SSL must never
+    // touch the fd — so it drives a TlsEngine over the custom zero-copy BIO from
+    // the event-loop layer. These fields are unused by the epoll path (it uses
+    // `tls` above); io_uring leaves `tls` null and uses `tls_engine`.
+    TlsEngine tls_engine;
+    u8* tls_in_slice;  // ciphertext arriving from the network (recv lands here)
+    Buffer tls_in_buf;
+    u8* tls_out_slice;  // ciphertext to send: handshake flights + encrypted app data
+    Buffer tls_out_buf;
+    // A tls_out_buf send is in flight; the buffer cannot be reused until its CQE.
+    bool tls_out_inflight;
+    // Plaintext awaiting encryption for an app-data send. Encryption may need
+    // several rounds when the ciphertext doesn't fit tls_out_buf in one shot; the
+    // send-completion handler resumes from tls_send_off and only fires the real
+    // continuation (tls_pending_on_send) once all plaintext is encrypted+sent.
+    const u8* tls_send_src;
+    u32 tls_send_len;
+    u32 tls_send_off;
+    Callback tls_pending_on_recv;
+    Callback tls_pending_on_send;
 
     // HTTP pipelining state
     u16 pipeline_depth;      // pipelined requests processed on this connection
@@ -393,6 +423,20 @@ struct ConnectionBase {
         protocol = ConnProtocol::Http11;
         h2 = nullptr;  // pool slot is released by free_conn_impl, not reset()
         tls = nullptr;
+        // tls_engine.ssl is SSL_free'd by close_conn_impl before reset(); null
+        // here purely for hygiene on slot reuse (no double-free).
+        tls_engine.ssl = nullptr;
+        tls_engine.handshake_done = false;
+        tls_in_slice = nullptr;
+        tls_in_buf.bind(nullptr, 0);
+        tls_out_slice = nullptr;
+        tls_out_buf.bind(nullptr, 0);
+        tls_out_inflight = false;
+        tls_send_src = nullptr;
+        tls_send_len = 0;
+        tls_send_off = 0;
+        tls_pending_on_recv = nullptr;
+        tls_pending_on_send = nullptr;
         pipeline_depth = 0;
         pipeline_stash_len = 0;
         req_header_end = 0;

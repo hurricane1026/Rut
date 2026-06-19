@@ -655,9 +655,13 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             i32 buf_result = cqe->res;
             if (cqe->res > 0 && conn_id < max_conns) {
                 u32 nbytes = static_cast<u32>(cqe->res);
+                // TLS client connections receive ciphertext: land it in
+                // tls_in_buf so the event-loop TLS layer can decrypt into
+                // recv_buf (plaintext). Upstream + plaintext use their buffers.
                 auto& target_buf = (type == IoEventType::UpstreamRecv)
                                        ? conns[conn_id].upstream_recv_buf
-                                       : conns[conn_id].recv_buf;
+                                   : conns[conn_id].tls_active ? conns[conn_id].tls_in_buf
+                                                               : conns[conn_id].recv_buf;
                 const u8* src = buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
                 u32 avail = target_buf.write_avail();
                 u32 to_copy = nbytes < avail ? nbytes : avail;

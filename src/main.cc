@@ -526,21 +526,10 @@ int main(int argc, char** argv) {
 #endif
 
     i32 rc = 0;
-    if (tls_server) {
-        write_str("Backend: epoll (TLS)\n");
-        rc = run_shards<EpollEventLoop>(port,
-                                        shard_count,
-                                        pin_cpus,
-                                        drain_secs,
-                                        pool_prealloc,
-                                        tls_server,
-                                        access_log_path,
-                                        access_log_compress,
-                                        access_log_level,
-                                        route_config,
-                                        serve_metrics);
-    } else if (detect_io_uring()) {
-        write_str("Backend: io_uring\n");
+    // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
+    // whenever available — TLS no longer forces the epoll fallback.
+    if (detect_io_uring()) {
+        write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
         rc = run_shards<IoUringEventLoop>(port,
                                           shard_count,
                                           pin_cpus,
@@ -552,8 +541,22 @@ int main(int argc, char** argv) {
                                           access_log_level,
                                           route_config,
                                           serve_metrics);
+        if (rc != 0 && tls_server) {
+            write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
+            rc = run_shards<EpollEventLoop>(port,
+                                            shard_count,
+                                            pin_cpus,
+                                            drain_secs,
+                                            pool_prealloc,
+                                            tls_server,
+                                            access_log_path,
+                                            access_log_compress,
+                                            access_log_level,
+                                            route_config,
+                                            serve_metrics);
+        }
     } else {
-        write_str("Backend: epoll\n");
+        write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
         rc = run_shards<EpollEventLoop>(port,
                                         shard_count,
                                         pin_cpus,

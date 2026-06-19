@@ -170,6 +170,10 @@ struct Buffer {
         len_ = n;
     }
 
+    // Drop the first n already-consumed bytes, shifting the remainder to the
+    // front (compaction). n is clamped to len_. Used by the io_uring TLS recv
+    // path to retain a partial ciphertext record after SSL_read drained the
+    // complete records.
     void consume(u32 n) noexcept {
         if (released_) __builtin_trap();
         if (n >= len_) {

@@ -18,6 +18,7 @@
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/tls.h"
+#include "rut/runtime/tls_engine.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <atomic>
@@ -2712,6 +2713,41 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     loop->shutdown();
 }
 
+TEST(uring, tls_send_want_read_recv_survives_send_pause) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(0x1);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+    conn.recv_armed = true;
+    conn.recv_paused_for_send = false;
+    conn.recv_pause_cancel_pending = false;
+    conn.recv_pause_rearm_pending = false;
+
+    CHECK(loop->pause_recv(conn));
+    CHECK(conn.recv_paused_for_send);
+    CHECK(conn.recv_armed);
+    CHECK(!conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_pause_rearm_pending);
+
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    CHECK(loop->submit_recv(conn));
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK(!conn.recv_pause_rearm_pending);
+
+    conn.tls_engine.ssl = nullptr;
+    loop->shutdown();
+}
+
 // HandlerFn stub that yields on an upstream recv — never invoked by the test
 // below, only used as a non-null pending_handler_fn.
 static u64 upstream_recv_yield_handler(void* /*conn*/,
@@ -2869,6 +2905,372 @@ TEST(shard, serves_https_requests) {
 TEST(tls, rejects_invalid_private_key_file) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestCertPath);
     CHECK(!tls_ctx.has_value());
+}
+
+// Drives the production zero-copy TlsEngine (the io_uring TLS bridge) entirely
+// in memory: a real TLS 1.3 handshake against a BoringSSL client over an
+// in-memory BIO pair, then an app-data echo each direction. No sockets, no event
+// loop — proves the custom-BIO bridge + handshake/read/write before the engine
+// is spliced into the completion-model backend.
+TEST(tls_engine, memory_loopback_handshake_and_echo) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsEngine eng;
+    REQUIRE(tls_engine_init(eng, tls_ctx.value()).has_value());
+
+    // Client endpoint: plain BoringSSL over a mem-BIO pair (test-only; malloc is
+    // fine here). c_wbio carries client→server ciphertext, c_rbio server→client.
+    SSL_CTX* cctx = create_test_client_ctx();
+    REQUIRE(cctx != nullptr);
+    SSL* client = SSL_new(cctx);
+    REQUIRE(client != nullptr);
+    BIO* c_rbio = BIO_new(BIO_s_mem());
+    BIO* c_wbio = BIO_new(BIO_s_mem());
+    REQUIRE(c_rbio != nullptr);
+    REQUIRE(c_wbio != nullptr);
+    SSL_set_bio(client, c_rbio, c_wbio);  // SSL takes ownership of both
+    SSL_set_connect_state(client);
+
+    static u8 server_out[16384];  // server→client ciphertext staging
+    u8 c2s[16384];                // client→server ciphertext staging
+
+    // Ping-pong the handshake flights until both ends complete.
+    bool client_done = false;
+    for (int i = 0; i < 64 && !(client_done && eng.handshake_done); i++) {
+        const int kRc = SSL_do_handshake(client);
+        if (kRc == 1) client_done = true;
+        int c2s_n = BIO_read(c_wbio, c2s, sizeof(c2s));
+        if (c2s_n < 0) c2s_n = 0;
+
+        tls_engine_set_input(eng, c2s, static_cast<u32>(c2s_n));
+        tls_engine_set_output(eng, server_out, sizeof(server_out));
+        const TlsOp kSt = tls_engine_handshake(eng);
+        CHECK(kSt != TlsOp::Error);
+        const u32 kOutN = tls_engine_output_len(eng);
+        if (kOutN > 0) BIO_write(c_rbio, server_out, static_cast<int>(kOutN));
+    }
+    CHECK(client_done);
+    CHECK(eng.handshake_done);
+
+    // App data client→server: client encrypts "ping", engine decrypts it.
+    CHECK(SSL_write(client, "ping", 4) == 4);
+    const int kCipherIn = BIO_read(c_wbio, c2s, sizeof(c2s));
+    CHECK(kCipherIn > 0);
+    tls_engine_set_input(eng, c2s, static_cast<u32>(kCipherIn));
+    tls_engine_set_output(eng, server_out, sizeof(server_out));
+    u8 plain[64];
+    TlsOp rst = TlsOp::Error;
+    const i32 kGot = tls_engine_read(eng, plain, sizeof(plain), rst);
+    CHECK(kGot == 4);
+    CHECK(memcmp(plain, "ping", 4) == 0);
+
+    // App data server→client: engine encrypts "pong", client decrypts it.
+    tls_engine_set_output(eng, server_out, sizeof(server_out));
+    TlsOp wst = TlsOp::Error;
+    const i32 kWrote = tls_engine_write(eng, reinterpret_cast<const u8*>("pong"), 4, wst);
+    CHECK(kWrote == 4);
+    CHECK(wst == TlsOp::Ok);
+    const u32 kCipherOut = tls_engine_output_len(eng);
+    CHECK(kCipherOut > 0);
+    BIO_write(c_rbio, server_out, static_cast<int>(kCipherOut));
+    char cbuf[64];
+    const int kClientRead = SSL_read(client, cbuf, sizeof(cbuf));
+    CHECK(kClientRead == 4);
+    CHECK(memcmp(cbuf, "pong", 4) == 0);
+
+    SSL_free(client);
+    SSL_CTX_free(cctx);
+    tls_engine_free(eng);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+namespace {
+// In-memory BoringSSL client peered to a server TlsEngine over a mem-BIO pair.
+// Drives the TLS 1.3 handshake to completion so app-data tests can start from a
+// live session. These exercise the engine logic the io_uring serving path relies
+// on (continuation, multi-record decrypt, partial feed, close) but which the
+// io_uring e2e can't run in this sandbox.
+struct TlsClientPeer {
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+    BIO* rbio = nullptr;  // server->client ciphertext in (we BIO_write here)
+    BIO* wbio = nullptr;  // client->server ciphertext out (we BIO_read here)
+    void destroy() {
+        if (ssl) SSL_free(ssl);  // frees rbio/wbio too
+        if (ctx) SSL_CTX_free(ctx);
+    }
+};
+
+bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl) {
+    cl.ctx = create_test_client_ctx();
+    if (!cl.ctx) return false;
+    cl.ssl = SSL_new(cl.ctx);
+    if (!cl.ssl) return false;
+    cl.rbio = BIO_new(BIO_s_mem());
+    cl.wbio = BIO_new(BIO_s_mem());
+    if (!cl.rbio || !cl.wbio) return false;
+    SSL_set_bio(cl.ssl, cl.rbio, cl.wbio);
+    SSL_set_connect_state(cl.ssl);
+    u8 sout[16384];
+    u8 c2s[16384];
+    bool client_done = false;
+    for (int i = 0; i < 64 && !(client_done && eng.handshake_done); i++) {
+        if (SSL_do_handshake(cl.ssl) == 1) client_done = true;
+        int c2s_n = BIO_read(cl.wbio, c2s, sizeof(c2s));
+        if (c2s_n < 0) c2s_n = 0;
+        tls_engine_set_input(eng, c2s, static_cast<u32>(c2s_n));
+        tls_engine_set_output(eng, sout, sizeof(sout));
+        if (tls_engine_handshake(eng) == TlsOp::Error) return false;
+        const u32 on = tls_engine_output_len(eng);
+        if (on > 0) BIO_write(cl.rbio, sout, static_cast<int>(on));
+    }
+    return client_done && eng.handshake_done;
+}
+
+struct TlsIouringHarness : SmallLoop {
+    bool sent = false;
+    bool closed = false;
+
+    bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
+        sent = len > 0;
+        return true;
+    }
+
+    void close_conn(Connection& conn) {
+        closed = true;
+        conn.tls_active = false;
+    }
+
+    void disarm_yield_timer(Connection& /*conn*/) {}
+};
+
+bool g_tls_iouring_plain_recv_called = false;
+u32 g_tls_iouring_plain_recv_result = 0;
+
+void tls_iouring_plain_recv_probe(void* /*lp*/, Connection& /*conn*/, IoEvent ev) {
+    g_tls_iouring_plain_recv_called = true;
+    g_tls_iouring_plain_recv_result = static_cast<u32>(ev.result);
+}
+}  // namespace
+
+// Encrypt a payload far larger than the output buffer, forcing the WantWrite /
+// flush-and-continue loop that tls_pump_send + tls_on_out_sent drive over
+// tls_out_slice on io_uring (the exact path the sandbox can't e2e-test).
+TEST(tls_engine, encrypt_continuation_large_payload) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsEngine eng;
+    REQUIRE(tls_engine_init(eng, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(eng, cl));
+
+    static u8 pt[40000];
+    for (u32 i = 0; i < sizeof(pt); i++) pt[i] = static_cast<u8>(i * 31u + 7u);
+
+    // Small output buffer (smaller than the payload and than a max TLS record) so
+    // a single submit needs several flushes — mirrors tls_out_slice filling up.
+    u8 outbuf[4096];
+    u32 off = 0;
+    int guard = 0;
+    while (off < sizeof(pt) && guard++ < 5000) {
+        tls_engine_set_output(eng, outbuf, sizeof(outbuf));
+        TlsOp st = TlsOp::Ok;
+        while (off < sizeof(pt)) {
+            const i32 w = tls_engine_write(eng, pt + off, static_cast<u32>(sizeof(pt)) - off, st);
+            if (w > 0) {
+                off += static_cast<u32>(w);
+                continue;
+            }
+            break;  // WantWrite (buffer full) or error
+        }
+        CHECK(st != TlsOp::Error);
+        const u32 cn = tls_engine_output_len(eng);
+        if (cn > 0) BIO_write(cl.rbio, outbuf, static_cast<int>(cn));
+        if (cn == 0 && st != TlsOp::WantWrite) break;
+    }
+    CHECK_EQ(off, static_cast<u32>(sizeof(pt)));
+
+    // Client decrypts the whole stream back.
+    static u8 got[40000];
+    u32 got_len = 0;
+    for (int i = 0; i < 4000 && got_len < sizeof(got); i++) {
+        const int r = SSL_read(cl.ssl, got + got_len, static_cast<int>(sizeof(got) - got_len));
+        if (r <= 0) break;
+        got_len += static_cast<u32>(r);
+    }
+    CHECK_EQ(got_len, static_cast<u32>(sizeof(got)));
+    CHECK(got_len == sizeof(got) && memcmp(got, pt, sizeof(pt)) == 0);
+
+    cl.destroy();
+    tls_engine_free(eng);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// Decrypt a multi-record payload delivered in one input buffer — mirrors a recv
+// completion that lands several TLS records at once (tls_process's decrypt loop).
+TEST(tls_engine, decrypt_multi_record_one_feed) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsEngine eng;
+    REQUIRE(tls_engine_init(eng, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(eng, cl));
+
+    static u8 pt[40000];
+    for (u32 i = 0; i < sizeof(pt); i++) pt[i] = static_cast<u8>(i * 17u + 3u);
+
+    // Client encrypts the payload (BoringSSL splits it into multiple records).
+    u32 sent = 0;
+    while (sent < sizeof(pt)) {
+        const int w = SSL_write(cl.ssl, pt + sent, static_cast<int>(sizeof(pt) - sent));
+        REQUIRE(w > 0);
+        sent += static_cast<u32>(w);
+    }
+    static u8 cipher[48000];
+    int cipher_len = BIO_read(cl.wbio, cipher, sizeof(cipher));
+    REQUIRE(cipher_len > 0);
+
+    // Feed it all at once; decrypt loop drains every complete record.
+    tls_engine_set_input(eng, cipher, static_cast<u32>(cipher_len));
+    static u8 got[40000];
+    u32 got_len = 0;
+    for (int i = 0; i < 4000 && got_len < sizeof(got); i++) {
+        TlsOp st = TlsOp::Ok;
+        const i32 n = tls_engine_read(eng, got + got_len, sizeof(got) - got_len, st);
+        if (n > 0) {
+            got_len += static_cast<u32>(n);
+            continue;
+        }
+        CHECK(st == TlsOp::WantRead);
+        break;
+    }
+    CHECK_EQ(got_len, static_cast<u32>(sizeof(got)));
+    CHECK(got_len == sizeof(got) && memcmp(got, pt, sizeof(pt)) == 0);
+
+    cl.destroy();
+    tls_engine_free(eng);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// Feed one record's ciphertext one byte at a time: tls_engine_read returns
+// WantRead until the full record is in, then the plaintext. Verifies the custom
+// BIO's retry path + SSL's partial-record buffering across incremental feeds —
+// the io_uring case where a record spans multiple recv completions.
+TEST(tls_engine, decrypt_partial_record_byte_feed) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsEngine eng;
+    REQUIRE(tls_engine_init(eng, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(eng, cl));
+
+    const char kMsg[] = "the quick brown fox jumps over the lazy dog";
+    const u32 kMsgLen = static_cast<u32>(sizeof(kMsg) - 1);
+    REQUIRE(SSL_write(cl.ssl, kMsg, static_cast<int>(kMsgLen)) == static_cast<int>(kMsgLen));
+    static u8 cipher[4096];
+    const int cipher_len = BIO_read(cl.wbio, cipher, sizeof(cipher));
+    REQUIRE(cipher_len > 0);
+
+    u8 got[256];
+    u32 got_len = 0;
+    bool saw_want_read = false;
+    for (int i = 0; i < cipher_len; i++) {
+        tls_engine_set_input(eng, cipher + i, 1);  // one ciphertext byte
+        TlsOp st = TlsOp::Ok;
+        const i32 n = tls_engine_read(eng, got + got_len, sizeof(got) - got_len, st);
+        if (n > 0) {
+            got_len += static_cast<u32>(n);
+        } else if (st == TlsOp::WantRead) {
+            saw_want_read = true;  // expected before the record completes
+        } else {
+            CHECK(false);  // no error/close mid-record
+        }
+    }
+    CHECK(saw_want_read);
+    CHECK_EQ(got_len, kMsgLen);
+    CHECK(got_len == kMsgLen && memcmp(got, kMsg, kMsgLen) == 0);
+
+    cl.destroy();
+    tls_engine_free(eng);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// A peer close_notify surfaces as TlsOp::Closed (the clean-shutdown signal the
+// io_uring tls_recv path turns into a connection close).
+TEST(tls_engine, peer_close_notify_reports_closed) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsEngine eng;
+    REQUIRE(tls_engine_init(eng, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(eng, cl));
+
+    SSL_shutdown(cl.ssl);  // emits close_notify into wbio
+    static u8 cipher[4096];
+    const int cipher_len = BIO_read(cl.wbio, cipher, sizeof(cipher));
+    REQUIRE(cipher_len > 0);
+
+    tls_engine_set_input(eng, cipher, static_cast<u32>(cipher_len));
+    u8 got[64];
+    TlsOp st = TlsOp::Ok;
+    const i32 n = tls_engine_read(eng, got, sizeof(got), st);
+    CHECK_EQ(n, 0);
+    CHECK(st == TlsOp::Closed);
+
+    cl.destroy();
+    tls_engine_free(eng);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, close_notify_with_plaintext_disables_keepalive) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    TlsIouringHarness loop;
+    Connection conn;
+    u8 recv_storage[4096];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 3;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.keep_alive = true;
+    conn.recv_slice = recv_storage;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.tls_pending_on_recv = &tls_iouring_plain_recv_probe;
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+
+    static constexpr char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE(SSL_write(cl.ssl, kReq, static_cast<int>(sizeof(kReq) - 1)) ==
+            static_cast<int>(sizeof(kReq) - 1));
+    (void)SSL_shutdown(cl.ssl);
+
+    const int cipher_len =
+        BIO_read(cl.wbio, conn.tls_in_buf.write_ptr(), conn.tls_in_buf.write_avail());
+    REQUIRE(cipher_len > 0);
+    conn.tls_in_buf.commit(static_cast<u32>(cipher_len));
+
+    g_tls_iouring_plain_recv_called = false;
+    g_tls_iouring_plain_recv_result = 0;
+    tls_process<TlsIouringHarness>(&loop, conn);
+
+    CHECK(g_tls_iouring_plain_recv_called);
+    CHECK_EQ(g_tls_iouring_plain_recv_result, static_cast<u32>(sizeof(kReq) - 1));
+    CHECK(!conn.keep_alive);
+    CHECK(!loop.closed);
+
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
+    destroy_tls_server_context(tls_ctx.value());
 }
 
 // === HTTP/2 end-to-end (cleartext h2c over the real epoll serving path) ===
@@ -3129,6 +3531,112 @@ TEST(shard, serves_http2_cleartext_iouring) {
     close(lfd);
 }
 
+// TLS termination over io_uring: the event-loop TlsEngine drives BoringSSL over
+// the custom zero-copy BIO (handshake + decrypt + encrypt), no socket BIO. Same
+// serving path as the epoll TLS test above; only the I/O model differs. Skipped
+// where io_uring async socket ops don't complete; exercised on real Linux/CI.
+TEST(shard, serves_https_requests_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    // Two requests on one connection — exercises keep-alive decrypt across
+    // multiple ciphertext recvs and response encryption per request.
+    for (int req = 0; req < 2; req++) {
+        REQUIRE(ssl_write_all(ssl, HTTP_REQ, HTTP_REQ_LEN));
+        char buf[4096];
+        i32 n = SSL_read(ssl, buf, sizeof(buf));
+        CHECK(n > 0);
+        if (n > 0) CHECK(has_200(buf, n));
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// Multiple simultaneous TLS connections on one io_uring shard — exercises
+// concurrent handshakes and per-connection TLS slice allocation. Skipped where
+// io_uring async socket ops are unavailable; exercised on real Linux/CI.
+TEST(shard, concurrent_https_clients_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    constexpr int kClients = 4;
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    i32 fds[kClients];
+    SSL* ssls[kClients];
+    for (int i = 0; i < kClients; i++) {
+        fds[i] = connect_to(port);
+        REQUIRE(fds[i] >= 0);
+        set_socket_timeouts(fds[i], 2);
+        ssls[i] = SSL_new(client_ctx);
+        REQUIRE(ssls[i] != nullptr);
+        REQUIRE(SSL_set_fd(ssls[i], fds[i]) == 1);
+        REQUIRE(SSL_connect(ssls[i]) == 1);
+    }
+    for (int i = 0; i < kClients; i++) {
+        REQUIRE(ssl_write_all(ssls[i], HTTP_REQ, HTTP_REQ_LEN));
+    }
+    for (int i = 0; i < kClients; i++) {
+        char buf[4096];
+        i32 n = SSL_read(ssls[i], buf, sizeof(buf));
+        CHECK(n > 0);
+        if (n > 0) CHECK(has_200(buf, n));
+        SSL_shutdown(ssls[i]);
+        SSL_free(ssls[i]);
+        close(fds[i]);
+    }
+    SSL_CTX_free(client_ctx);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
 TEST(shard, serves_http2_routed) {
     // A real RouteConfig: /health is a static 204; an unmatched path falls
     // through to the default 200.
@@ -3336,6 +3844,65 @@ TEST(shard, serves_http2_over_tls_alpn) {
     CHECK(tls_negotiated_protocol(ssl) == AlpnProtocol::H2);
 
     // Send the h2 client preface + SETTINGS + a GET / over TLS.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/", 1);
+    REQUIRE(ssl_write_all(ssl, reinterpret_cast<const char*>(out), n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int a = 0; a < 6 && total < sizeof(resp); a++) {
+        i32 got = SSL_read(ssl, resp + total, static_cast<i32>(sizeof(resp) - total));
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// HTTP/2 over TLS on io_uring: ALPN selects h2 (tls_iouring.h sets the protocol
+// from tls_negotiated_protocol), then the engine-decrypted preface routes into
+// the h2 serving path transparently. Skipped where io_uring async socket ops are
+// unavailable; exercised on real Linux/CI.
+TEST(shard, serves_http2_over_tls_alpn_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath, /*offer_h2=*/true);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    const u8 alpn[] = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    SSL_CTX_set_alpn_protos(client_ctx, alpn, sizeof(alpn));
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+    CHECK(tls_negotiated_protocol(ssl) == AlpnProtocol::H2);
+
     u8 out[512];
     u32 n = h2_client_prologue(out);
     n += h2_client_get(out + n, sizeof(out) - n, 1, "/", 1);
