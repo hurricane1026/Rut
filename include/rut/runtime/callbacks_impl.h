@@ -255,7 +255,9 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
         return;
     }
     if (throttle_pause_before_pump<Loop>(loop, conn, 0)) return;
-    if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+    // Unconditional (see tls_on_out_drain): submit_recv_upstream self-guards the
+    // armed/cancel-pending race and only fails on a real add_recv error.
+    if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
 }
 
 template <typename Loop>
@@ -280,7 +282,16 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
     conn.throttle_paused = true;
     conn.throttle_pending_len = pending_remaining;  // stash for resume
     if constexpr (requires { loop->pause_upstream_recv(conn); }) {
-        loop->pause_upstream_recv(conn);
+        // On io_uring the pause is a cancel SQE that can fail to queue under SQ
+        // pressure, leaving the multishot recv live. For io_uring TLS that lets the
+        // live recv keep encrypting body bytes (a parked tail can even corrupt on
+        // overflow), so fail closed like the watermark/body-done pause paths. The
+        // plaintext path self-heals (its -ENOBUFS handling pauses on overflow), so
+        // leave it unchanged. (epoll's pause can't fail.)
+        if (!loop->pause_upstream_recv(conn) && conn.uses_iouring_tls()) {
+            loop->close_conn(conn);
+            return true;  // caller returns; conn is closed
+        }
     }
     // Arm the per-shard precise (sub-second) timer for the exact deficit. If the
     // loop can't (heap full / no support), fall back to the 1-second keepalive
@@ -1599,6 +1610,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // and the pump already re-armed or @throttle-paused); leave that state
         // untouched so we neither undo a re-arm nor undo a pause.
         if (ev.result == -ENOBUFS) {
+            // A parked proxy tail occupies upstream_recv_buf while its pause cancel
+            // is still in flight. A raced multishot CQE that overflowed the buffer
+            // had its uncopied suffix discarded by the backend (only the prefix was
+            // copied behind the tail) — replaying just that prefix would silently
+            // truncate the body, so fail closed instead of treating it as a pause.
+            if (conn.tls_proxy_stream && conn.tls_send_src) {
+                loop->close_conn(conn);
+                return;
+            }
             if (conn.upstream_recv_buf.write_avail() == 0) loop->pause_upstream_recv(conn);
             return;
         }
@@ -1733,7 +1753,9 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
-            if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) {
+            // Unconditional (see tls_on_out_drain): submit_recv_upstream self-guards
+            // the armed/cancel-pending race and fails only on a real add_recv error.
+            if (!loop->submit_recv_upstream(conn)) {
                 loop->close_conn(conn);
             }
             return;

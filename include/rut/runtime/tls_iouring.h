@@ -154,11 +154,18 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         if (c.tls_recv_paused_hw && c.tls_out_buf.len() <= Self::kTlsOutLow) {
             c.tls_recv_paused_hw = false;
             // Re-check @throttle so the watermark resume doesn't bypass the byte
-            // rate; if throttle pauses, its timer re-arms. Otherwise re-arm now and
-            // fail closed if the recv can't be queued (else the stream sits idle
-            // until timeout — the pause flag is already cleared so no drain retries).
-            if (!throttle_pause_before_pump<Self>(loop, c, 0) && !c.upstream_recv_armed &&
-                !loop->submit_recv_upstream(c)) {
+            // rate. If throttle pauses, its timer re-arms the read later — but it
+            // can also fail closed (cancel SQE couldn't queue), so bail if it did.
+            // Otherwise re-arm now. submit_recv_upstream is called unconditionally
+            // (never guarded on upstream_recv_armed): when it races ahead of the
+            // pause cancel CQE the recv is still "armed" but about to be cancelled,
+            // and submit_recv_upstream sets the rearm-pending flag the cancel
+            // handler needs; it returns false only on a real add_recv failure.
+            // Re-arming is a side effect — drain still continues below to push any
+            // remaining ciphertext.
+            if (throttle_pause_before_pump<Self>(loop, c, 0)) {
+                if (!c.tls_active) return;  // throttle pause failed and closed
+            } else if (!loop->submit_recv_upstream(c)) {
                 loop->close_conn(c);
                 return;
             }
@@ -380,6 +387,12 @@ void tls_process(Self* loop, Connection& c) {
                 if (kFs == TlsFill::NeedRead)
                     c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
             }
+            // For a proxy stream, the plaintext just decrypted is the client's
+            // pipelined NEXT request. Parsing/dispatching it now — mid-response,
+            // while the body is still being proxied/drained — would reorder HTTP/1.1
+            // pipelining and clobber per-request proxy state. Leave it buffered in
+            // recv_buf; proxy_stream_complete dispatches it once the response ends.
+            if (c.tls_proxy_stream) return;
             pending_recv = &on_header_received<Self>;
         } else if (!pending_recv) {
             pending_recv = &on_header_received<Self>;
