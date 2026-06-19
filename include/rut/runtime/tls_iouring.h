@@ -46,6 +46,63 @@ void tls_resume_pending_handler_recv(void* lp, Connection& c, IoEvent ev);
 template <class Self>
 void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent ev);
 
+// Owned ciphertext output buffer primitives (see docs/iouring-tls-output-buffer.md).
+// Why fill_output stopped before the whole chunk was consumed.
+enum class TlsFill : u8 {
+    Done,      // all `len` plaintext encrypted into tls_out_buf
+    NeedRoom,  // output buffer filled mid-chunk (SSL_write WantWrite) — resume at drain
+    NeedRead,  // SSL_write needs peer input (post-handshake control) — submit a recv
+    Fatal,     // crypto error or raw-send submission failure — caller closes
+};
+
+// Ensure exactly one raw send is draining tls_out_buf. Submits at most
+// kTlsDrainChunk per SQE so the drain handler runs at slice granularity (the
+// backend has full-send semantics — see the design doc), and records the
+// SQE-captured length so read-ahead appends don't confuse the drain. Returns
+// false (caller fails closed) if the send can't be queued.
+template <class Self>
+bool tls_ensure_draining(Self* loop, Connection& c) {
+    if (c.tls_out_inflight || c.tls_out_buf.len() == 0) return true;
+    const u32 kAvail = c.tls_out_buf.len();
+    const u32 kN = kAvail < Self::kTlsDrainChunk ? kAvail : Self::kTlsDrainChunk;
+    if (!loop->submit_send_raw(c, c.tls_out_buf.data(), kN)) return false;
+    c.tls_out_inflight = true;
+    c.tls_out_inflight_len = kN;
+    c.on_send = &tls_on_out_sent<Self>;  // phase 2 renames this to tls_on_out_drain
+    return true;
+}
+
+// Encrypt plaintext src[0..len) into the owned tls_out_buf, keeping a send
+// draining as it fills. Loops on partial SSL_write (SSL_MODE_ENABLE_PARTIAL_WRITE
+// means a positive result < len is legal) and commits produced ciphertext every
+// pass — the custom BIO writes into the output region before SSL_write returns
+// (incl. on WantWrite), so committing each pass keeps those bytes drainable.
+// `out_consumed` returns how much plaintext was encrypted.
+template <class Self>
+TlsFill tls_fill_output(Self* loop, Connection& c, const u8* src, u32 len, u32& out_consumed) {
+    u32 off = 0;
+    while (off < len) {
+        tls_engine_set_output(c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
+        TlsOp st = TlsOp::Ok;
+        const i32 kW = tls_engine_write(c.tls_engine, src + off, len - off, st);
+        c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));  // commit every pass
+        if (!tls_ensure_draining<Self>(loop, c)) {
+            out_consumed = off;
+            return TlsFill::Fatal;
+        }
+        if (kW > 0) {
+            off += static_cast<u32>(kW);
+            continue;
+        }
+        out_consumed = off;
+        if (st == TlsOp::WantWrite) return TlsFill::NeedRoom;
+        if (st == TlsOp::WantRead) return TlsFill::NeedRead;
+        return TlsFill::Fatal;
+    }
+    out_consumed = len;
+    return TlsFill::Done;
+}
+
 // Send ciphertext staged in tls_out_slice. The bytes are already encrypted, so
 // this uses the raw (non-TLS) send. Marks the buffer in-flight; the completion
 // lands in tls_on_out_sent.
