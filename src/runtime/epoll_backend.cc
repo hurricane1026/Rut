@@ -145,6 +145,7 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd) {
         downstream_fd_map[i] = -1;
         upstream_fd_map[i] = -1;
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+        upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
     }
 
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -217,8 +218,54 @@ void EpollBackend::add_accept() {
 
 bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     if (conn_id < kMaxFdMap) downstream_fd_map[conn_id] = fd;
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLIN);
+    // Re-arming the recv must not clobber an in-flight downstream send on the
+    // same fd: a single fd carries one epoll interest mask, so a bare EPOLLIN
+    // would drop a pending send's EPOLLOUT and stall it. This happens in the
+    // full-duplex WebSocket tunnel when the client→upstream send completes and
+    // we resume client reads while an upstream→client send is still draining on
+    // the client fd. Mirror pause_recv: register as the pending send's type and
+    // OR in EPOLLOUT so the send still drains (dispatch routes the read as Recv
+    // and chains EPOLLOUT to handle_epollout).
+    IoEventType type = IoEventType::Recv;
+    u32 events = EPOLLIN;
+    if (conn_id < kMaxFdMap) {
+        const auto& ss = send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd == fd) {
+            type = ss.type;
+            if (ss.tls) {
+                if (ss.tls_wait_events != EPOLLIN) events |= EPOLLOUT;
+            } else {
+                events |= EPOLLOUT;
+            }
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
     return true;
+}
+
+void EpollBackend::quiesce_recv(u32 conn_id, bool upstream) {
+    if (conn_id >= kMaxFdMap) return;
+    i32 fd = upstream ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
+    if (fd < 0) return;
+    const auto& ss = upstream ? upstream_send_state[conn_id] : send_state[conn_id];
+    if (ss.remaining > 0 && ss.fd == fd) {
+        // Keep flushing the in-flight send. Downstream registers type=Send so the
+        // EPOLLOUT dispatches against send_state; upstream keeps type=UpstreamRecv
+        // (handle_epollout routes any non-Send type to upstream_send_state). No
+        // EPOLLIN/EPOLLRDHUP, so the half-close can't re-fire.
+        IoEventType type = upstream ? IoEventType::UpstreamRecv : ss.type;
+        u32 events = (ss.tls && ss.tls_wait_events == EPOLLIN) ? EPOLLIN : EPOLLOUT;
+        set_fd_interest(epoll_fd, fd, conn_id, type, events);
+    } else {
+        // Nothing to flush — remove the fd so EPOLLHUP/ERR can't spin the loop.
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    }
+}
+
+void EpollBackend::clear_send_state(u32 conn_id) {
+    if (conn_id >= kMaxFdMap) return;
+    send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+    upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
 }
 
 void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
@@ -236,7 +283,7 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     u32 events = EPOLLRDHUP;
     if (preserve_send_interest) {
         const auto& ss = send_state[conn_id];
-        if (ss.remaining > 0 && ss.fd >= 0) {
+        if (ss.remaining > 0 && ss.fd == fd) {
             type = ss.type;
             if (ss.tls) {
                 events = (ss.tls_wait_events == EPOLLIN) ? (EPOLLIN | EPOLLRDHUP)
@@ -249,7 +296,7 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     set_fd_interest(epoll_fd, fd, conn_id, type, events);
 }
 
-void EpollBackend::pause_upstream_recv(u32 conn_id) {
+void EpollBackend::pause_upstream_recv(u32 conn_id, bool preserve_send_interest) {
     if (conn_id >= kMaxFdMap) return;
     i32 fd = upstream_fd_map[conn_id];
     if (fd < 0) return;
@@ -259,7 +306,15 @@ void EpollBackend::pause_upstream_recv(u32 conn_id) {
     // EPOLLHUP/EPOLLERR are still delivered by the kernel regardless, but those
     // are genuine terminal conditions. submit_recv_upstream re-arms EPOLLIN on
     // resume, at which point any buffered upstream bytes surface immediately.
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, 0);
+    IoEventType type = IoEventType::UpstreamRecv;
+    u32 events = 0;
+    if (preserve_send_interest) {
+        const auto& ss = upstream_send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd == fd) {
+            events = EPOLLOUT;
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
 }
 
 bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len) {
@@ -293,7 +348,8 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
     if (conn_id < kMaxFdMap) {
-        send_state[conn_id] = {buf, fd, sent, len - sent, IoEventType::UpstreamSend, false, 0};
+        upstream_send_state[conn_id] = {
+            buf, fd, sent, len - sent, IoEventType::UpstreamSend, false, 0};
     }
 
     struct epoll_event ev;
@@ -306,7 +362,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
     if (rc < 0) {
         i32 err = errno;
         if (conn_id < kMaxFdMap) {
-            send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+            upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
         }
         if (pending_count >= 64) pending_count = 63;
         pending_completions[pending_count].conn_id = conn_id;
@@ -322,7 +378,24 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
 
 bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
     if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
-    set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, EPOLLIN);
+    // Symmetric to add_recv: preserve a pending client→upstream send's EPOLLOUT
+    // when resuming upstream reads, so the upstream→client send completing does
+    // not strand a still-draining client→upstream send on the upstream fd. Keep
+    // type=UpstreamRecv (as pause_upstream_recv does): dispatch routes EPOLLOUT
+    // to upstream_send_state for any non-Send type, and reads to the upstream fd.
+    IoEventType type = IoEventType::UpstreamRecv;
+    u32 events = EPOLLIN;
+    if (conn_id < kMaxFdMap) {
+        const auto& ss = upstream_send_state[conn_id];
+        if (ss.remaining > 0 && ss.fd == fd) {
+            if (ss.tls) {
+                if (ss.tls_wait_events != EPOLLIN) events |= EPOLLOUT;
+            } else {
+                events |= EPOLLOUT;
+            }
+        }
+    }
+    set_fd_interest(epoll_fd, fd, conn_id, type, events);
     return true;
 }
 
@@ -718,14 +791,17 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].more = 0;
             out++;
 
-            if (has_write && conn_id < kMaxFdMap && send_state[conn_id].remaining > 0 &&
-                out < max_events) {
-                goto handle_epollout;
+            if (has_write && conn_id < kMaxFdMap && out < max_events) {
+                if ((type == IoEventType::Send && send_state[conn_id].remaining > 0) ||
+                    (type != IoEventType::Send && upstream_send_state[conn_id].remaining > 0)) {
+                    goto handle_epollout;
+                }
             }
         } else if (has_write) {
         handle_epollout:
             if (conn_id >= kMaxFdMap) continue;
-            auto& ss = send_state[conn_id];
+            auto& ss =
+                (type == IoEventType::Send) ? send_state[conn_id] : upstream_send_state[conn_id];
             if (ss.tls && conn_id >= max_conns) continue;
             if (ss.remaining == 0 || !ss.src || ss.fd < 0) {
                 // No outstanding send associated with this connection.
@@ -797,7 +873,11 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                                         ? IoEventType::UpstreamRecv
                                         : IoEventType::Recv;
             IoEventType emit_type = ss.type;
-            ss = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+            if (type == IoEventType::Send) {
+                ss = {nullptr, -1, 0, 0, IoEventType::Send, false, 0};
+            } else {
+                ss = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+            }
             if (send_fd >= 0) set_fd_interest(epoll_fd, send_fd, conn_id, next_type, EPOLLIN);
 
             events[out].conn_id = conn_id;

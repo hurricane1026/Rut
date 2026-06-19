@@ -200,9 +200,15 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             req->keep_alive = false;
-            return;  // close is sticky — overrides any keep-alive (RFC 7230)
+            req->connection_close = true;  // sticky across duplicate Connection fields
+            req->upgrade = false;          // close is contradictory with upgrade
+            return;                        // close overrides keep-alive (RFC 7230)
         } else if (tok_len == 10 && str_ci_eq(val + tok_start, "keep-alive", 10)) {
             req->keep_alive = true;
+        } else if (tok_len == 7 && str_ci_eq(val + tok_start, "upgrade", 7)) {
+            // Suppress if a close token was seen in any Connection field — a
+            // "close … upgrade" request (even split across fields) is not an upgrade.
+            if (!req->connection_close) req->upgrade = true;
         }
     }
 }
@@ -243,6 +249,19 @@ static inline ParseStatus apply_semantic_header(
                 u32 tok_len = ti - tok_start;
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
                     req->chunked = true;
+                    break;
+                }
+            }
+            return ParseStatus::Complete;
+        }
+    } else if (first == 'u') {
+        if (name_len == 7 && str_ci_eq(name + 1, "pgrade", 6)) {
+            // Require at least one non-OWS token — an empty or whitespace-only
+            // Upgrade header requests no protocol and must not gate a tunnel. A
+            // valid upgrade also needs the Connection: upgrade token.
+            for (u32 i = 0; i < vlen; i++) {
+                if (val[i] != ' ' && val[i] != '\t') {
+                    req->has_upgrade_header = true;
                     break;
                 }
             }

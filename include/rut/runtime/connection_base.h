@@ -137,6 +137,32 @@ struct ConnectionBase {
     u64 throttle_tat_ns;       // GCRA theoretical arrival time (monotonic ns)
     bool throttle_paused;      // pump parked waiting for byte-budget to recover
     u32 throttle_pending_len;  // buffered upstream bytes to replay on resume
+    // After a 101 Switching Protocols response the connection becomes a
+    // transparent full-duplex byte tunnel (WebSocket passthrough): the 4 slots
+    // splice client↔upstream and the keepalive timeout no longer closes it.
+    bool is_ws_tunnel;
+    // WebSocket tunnel send state tracks the submitted prefix in each direction
+    // so raced recv completions can leave later bytes buffered for the next send.
+    bool ws_client_send_pending;
+    bool ws_upstream_send_pending;
+    // Bytes submitted for the current tunnel send. A best-effort recv pause can
+    // still race with already-harvested CQEs, so completion must consume only
+    // the submitted prefix and preserve later buffered bytes.
+    u32 ws_client_send_len;
+    u32 ws_upstream_send_len;
+    // Bytes of the 101 Switching Protocols response sent before entering
+    // tunnel mode (HTTP headers only, excluding any early upstream bytes).
+    u32 ws_upgrade_response_len;
+    // Upstream closed during pre-tunnel 101 handling and should be closed once
+    // tunnel mode is fully entered (after preserving buffered early bytes).
+    bool ws_pre_tunnel_upstream_closed;
+    // A tunnel peer half-closed (FIN/EOF) while its paired send was still
+    // draining. Tear down only after the in-flight frame finishes flushing so
+    // the last frame is not truncated: ws_client_eof gates the client→upstream
+    // drain (on_ws_client_to_upstream_sent), ws_upstream_eof the upstream→client
+    // drain (on_ws_upstream_to_client_sent).
+    bool ws_client_eof;
+    bool ws_upstream_eof;
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -217,6 +243,7 @@ struct ConnectionBase {
     u32 req_content_length;    // original Content-Length value (for send capping)
     u32 req_initial_send_len;  // max bytes to send in initial upstream forward
     bool req_malformed;        // true if request body is malformed (reject)
+    bool req_wants_upgrade;    // client sent Connection: upgrade (gates 101 tunnel)
     BodyMode req_body_mode;
     u32 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
@@ -239,6 +266,9 @@ struct ConnectionBase {
     // True when code asked to recv during a send-wait pause window and the
     // read should be re-armed after the cancel CQE drains.
     bool recv_pause_rearm_pending;
+    bool upstream_recv_paused_for_send;
+    bool upstream_recv_pause_cancel_pending;
+    bool upstream_recv_pause_rearm_pending;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -334,6 +364,15 @@ struct ConnectionBase {
         throttle_tat_ns = 0;
         throttle_paused = false;
         throttle_pending_len = 0;
+        is_ws_tunnel = false;
+        ws_client_send_pending = false;
+        ws_upstream_send_pending = false;
+        ws_client_send_len = 0;
+        ws_upstream_send_len = 0;
+        ws_upgrade_response_len = 0;
+        ws_pre_tunnel_upstream_closed = false;
+        ws_client_eof = false;
+        ws_upstream_eof = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;
@@ -360,6 +399,7 @@ struct ConnectionBase {
         req_content_length = 0;
         req_initial_send_len = 0;
         req_malformed = false;
+        req_wants_upgrade = false;
         req_body_mode = BodyMode::None;
         req_body_remaining = 0;
         req_chunk_parser.reset();
@@ -375,6 +415,9 @@ struct ConnectionBase {
         recv_paused_for_send = false;
         recv_pause_cancel_pending = false;
         recv_pause_rearm_pending = false;
+        upstream_recv_paused_for_send = false;
+        upstream_recv_pause_cancel_pending = false;
+        upstream_recv_pause_rearm_pending = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;

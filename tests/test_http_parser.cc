@@ -764,6 +764,66 @@ TEST(Corpus, InvalidControlCharHeaderValue) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
 }
 
+// A valid upgrade needs BOTH Connection: upgrade AND an Upgrade header — the
+// Connection token alone (hop-by-hop) must not gate the WebSocket 101 tunnel.
+TEST(Corpus, ConnectionUpgradeSetsFlag) {
+    HttpParser parser;
+    ParsedRequest req;
+    const u8 up[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(up, sizeof(up) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.upgrade);
+    CHECK(req.has_upgrade_header);  // gate = upgrade && has_upgrade_header
+
+    // Connection: upgrade with NO Upgrade header → not a valid upgrade.
+    parser.reset();
+    req.reset();
+    const u8 conn_only[] = "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(conn_only, sizeof(conn_only) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.upgrade);
+    CHECK(!req.has_upgrade_header);
+
+    // "close, upgrade" is contradictory — close clears the upgrade intent.
+    parser.reset();
+    req.reset();
+    const u8 close_up[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: upgrade, close\r\nUpgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(close_up, sizeof(close_up) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.upgrade);  // close wins
+    CHECK(!req.keep_alive);
+
+    // close split into a separate Connection field still suppresses upgrade.
+    parser.reset();
+    req.reset();
+    const u8 split[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(split, sizeof(split) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.upgrade);  // close is sticky across Connection fields
+
+    // An empty / whitespace-only Upgrade header requests no protocol.
+    parser.reset();
+    req.reset();
+    const u8 empty_up[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade:  \r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(empty_up, sizeof(empty_up) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.upgrade);
+    CHECK(!req.has_upgrade_header);  // empty Upgrade value → not a valid upgrade
+
+    parser.reset();
+    req.reset();
+    const u8 normal[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(normal, sizeof(normal) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(!req.upgrade);
+    CHECK(!req.has_upgrade_header);
+}
+
 // ============================================================================
 // TEST SUITE 3: Incremental parsing — feed byte-by-byte for every valid vector
 // ============================================================================

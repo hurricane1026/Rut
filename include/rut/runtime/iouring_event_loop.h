@@ -428,20 +428,36 @@ public:
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
-        if (c.upstream_recv_armed) return true;
+        if (c.upstream_recv_paused_for_send) {
+            c.upstream_recv_pause_rearm_pending = true;
+            return true;
+        }
+        if (c.upstream_recv_armed) {
+            if (c.upstream_recv_pause_cancel_pending) c.upstream_recv_pause_rearm_pending = true;
+            return true;
+        }
         if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
+            c.upstream_recv_pause_rearm_pending = false;
             return true;
         }
         return false;
     }
 
-    // io_uring only recvs when an SQE is submitted, so not re-arming the recv
-    // (which throttle_pause_before_pump achieves by returning early) is enough to
-    // backpressure the upstream. Just ensure the armed flag is clear so resume
-    // re-submits the recv. No in-flight recv exists at a pump point.
-    void pause_upstream_recv_impl(Connection& c) { c.upstream_recv_armed = false; }
+    bool pause_upstream_recv_impl(Connection& c) {
+        c.upstream_recv_pause_cancel_pending = true;
+        if (!c.upstream_recv_armed) {
+            c.upstream_recv_pause_cancel_pending = false;
+            return true;
+        }
+        return backend.pause_upstream_recv(c.upstream_fd, c.id);
+    }
+
+    bool pause_upstream_recv_for_send(Connection& c) {
+        c.upstream_recv_paused_for_send = true;
+        return pause_upstream_recv_impl(c);
+    }
 
     bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
@@ -654,6 +670,10 @@ public:
                             respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else if (c->throttle_paused) {
                             throttle_resume<IoUringEventLoop>(this, *c);
+#if RUT_ENABLE_WEBSOCKET
+                        } else if (c->is_ws_tunnel) {
+                            // WebSocket tunnel: no idle keepalive timeout (no-op).
+#endif
                         } else {
                             this->close_conn(*c);
                         }
@@ -708,6 +728,21 @@ public:
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (needs_recv_rearm && !conn.recv_paused_for_send) {
                             if (!this->submit_recv_impl(conn)) {
+                                this->close_conn(conn);
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED &&
+                        conn.upstream_recv_pause_cancel_pending) {
+                        const bool needs_rearm = conn.upstream_recv_pause_rearm_pending;
+                        conn.upstream_recv_pause_rearm_pending = false;
+                        conn.upstream_recv_pause_cancel_pending = false;
+                        conn.upstream_recv_armed = false;
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (needs_rearm && !conn.upstream_recv_paused_for_send) {
+                            if (!this->submit_recv_upstream_impl(conn)) {
                                 this->close_conn(conn);
                                 break;
                             }

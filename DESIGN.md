@@ -1860,6 +1860,40 @@ get /ws/events {
 | `.sendBytes(bytes)` | Replace frame content with binary, then forward |
 | `.inject(text)` | Forward original frame AND send an additional text frame |
 
+**Runtime semantics (passthrough tunnel).**
+
+The current runtime implements transparent **passthrough** (no frame parsing yet;
+frame inspection above is the planned terminate mode). After a proxied upstream
+answers `101 Switching Protocols`, the connection becomes a full-duplex byte
+tunnel: two independent ping-pong loops (read one side → send to the other →
+re-read), each with its own buffer for natural backpressure.
+
+- **Upgrade gating.** A `101` is only honored as a tunnel when the *client*
+  actually requested the upgrade (`Connection: upgrade`). A `101` to a plain
+  keep-alive request is treated as a protocol violation and the connection is
+  closed — a misbehaving or hostile backend cannot hijack the connection and
+  have pipelined bytes forwarded raw.
+
+- **Backpressure.** Each direction pauses its read while its paired send drains,
+  so a slow peer applies TCP flow control to the fast one. Buffered bytes are
+  never split or dropped: a send completion consumes only the submitted prefix
+  and re-sends any bytes that raced in. On io_uring (provided-buffer recv), a
+  buffer-full `-ENOBUFS` means the overflow was already consumed and discarded,
+  so the tunnel fails closed there rather than forwarding a corrupted stream.
+
+- **Connection teardown — drain-then-close (nginx model).** WebSocket shutdown
+  is an *application-level* event (the RFC 6455 Close-frame handshake), not a TCP
+  half-close. So when either peer closes the underlying TCP connection (FIN), the
+  tunnel **stops reading new data but flushes all in-flight and buffered bytes in
+  both directions, then tears down both sides.** It does *not* keep relaying new
+  data after a FIN (true TCP half-close relay), and it never truncates buffered
+  data. This matches nginx's upgraded-connection handling; Envoy and AWS ALB
+  likewise treat WebSocket as TCP passthrough that relies on Close frames for
+  orderly shutdown (Envoy offers optional half-close *relay* for generic
+  `tcp_proxy`, but it is not required for WebSocket). On the level-triggered
+  epoll backend the closing fd's read interest is dropped (so the FIN cannot spin
+  the loop) while any pending send keeps its `EPOLLOUT` so it can finish draining.
+
 #### 3.4.9 Streaming Proxy
 
 For large bodies (file uploads, downloads), stream without buffering:

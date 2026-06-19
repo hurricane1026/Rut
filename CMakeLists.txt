@@ -26,6 +26,13 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 option(RUT_ENABLE_IPO "Enable interprocedural optimization/LTO for Release builds" OFF)
 option(RUT_ENABLE_JIT "Build LLVM/Vectorscan JIT targets" ON)
+# WebSocket/Upgrade passthrough tunnel. ON by default; turn OFF for a minimal
+# build (e.g. a k8s mesh sidecar that never proxies WebSocket) to compile out the
+# 101 tunnel path entirely.
+option(RUT_ENABLE_WEBSOCKET "Build WebSocket/Upgrade passthrough support" ON)
+if(NOT RUT_ENABLE_WEBSOCKET)
+    add_compile_definitions(RUT_ENABLE_WEBSOCKET=0)
+endif()
 if(RUT_ENABLE_IPO)
     # Use CMake's native IPO support only when explicitly requested.
     # In the default developer/test build, keep archives and test linking simple and stable.

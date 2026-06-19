@@ -147,6 +147,11 @@ extern const char kResponse200Close[];
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size);
 
+#if RUT_ENABLE_WEBSOCKET
+template <typename Loop>
+void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev);
+#endif
+
 // ── JIT handler dispatch ───────────────────────────────────────────
 // Route-matched JitHandler action → invoke the compiled handler and
 // translate JitDispatchOutcome into event-loop operations (send, forward,
@@ -262,7 +267,15 @@ void throttle_resume(Loop* loop, Connection& conn) {
     conn.throttle_pending_len = 0;
     if (kRemaining > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+#if RUT_ENABLE_WEBSOCKET
+        if (conn.is_ws_tunnel) {
+            on_ws_upstream_recv<Loop>(static_cast<void*>(loop), conn, synth);
+        } else {
+            on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
+        }
+#else
         on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
+#endif
     } else {
         loop->submit_recv_upstream(conn);
     }
@@ -1882,6 +1895,402 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
 }
 
+#if RUT_ENABLE_WEBSOCKET
+// === WebSocket / Upgrade passthrough: full-duplex byte tunnel ================
+// After a 101 the connection runs as a transparent splice with four fixed slots,
+// two independent ping-pong loops (read one side → send to the other → re-read):
+//   on_recv          = on_ws_client_recv          (client bytes → upstream)
+//   on_upstream_send = on_ws_client_to_upstream_sent
+//   on_upstream_recv = on_ws_upstream_recv         (upstream bytes → client)
+//   on_send          = on_ws_upstream_to_client_sent
+// Either side closing tears down both. A stale -ENOBUFS (recv buffer full while
+// the paired send drains it) is ignored rather than treated as a close.
+
+template <typename Loop>
+bool ws_pause_client_recv(Loop* loop, Connection& conn) {
+    // Prefer the loop-level pause_recv(Connection&): the io_uring loop needs it
+    // to set recv_paused_for_send / recv_pause_cancel_pending and cancel the
+    // multishot recv on the correct fd. It must be checked BEFORE the backend
+    // 2-arg form, because IoUringBackend::pause_recv(i32 fd, u32 conn_id) also
+    // binds to `backend.pause_recv(conn.id, true)` via implicit conversions
+    // (true→u32), which would pause the wrong conn_id and skip the loop flags.
+    // The epoll loop has no pause_recv(Connection&), so it falls through to the
+    // backend form with preserve_send_interest=true (unchanged behavior).
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+        const bool ok = loop->pause_recv(conn);
+        if (ok && !conn.recv_armed) conn.recv_pause_cancel_pending = false;
+        return ok;
+    } else if constexpr (requires(Loop* lp, u32 conn_id) {
+                             lp->backend.pause_recv(conn_id, true);
+                             lp->backend.pause_recv(conn_id);
+                         }) {
+        // epoll-style backend: pause_recv(u32 conn_id, bool preserve=false). The
+        // extra 1-arg requirement excludes io_uring's pause_recv(i32 fd, u32
+        // conn_id) — which would otherwise bind conn.id as the fd and `true` as
+        // conn_id, cancelling the wrong recv (the io_uring loop uses the
+        // pause_recv(Connection&) branch above).
+        loop->backend.pause_recv(conn.id, true);
+    } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_recv(cid); }) {
+        loop->backend.pause_recv(conn.id);
+    }
+    return true;
+}
+
+template <typename Loop>
+bool ws_pause_upstream_recv(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv_for_send(c); }) {
+        return loop->pause_upstream_recv_for_send(conn);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
+        return loop->pause_upstream_recv(conn);
+    } else if constexpr (requires(Loop* lp, u32 cid) { lp->backend.pause_upstream_recv(cid); }) {
+        loop->backend.pause_upstream_recv(conn.id);
+    }
+    return true;
+}
+
+template <typename Loop>
+bool ws_resume_client_recv(Loop* loop, Connection& conn) {
+    conn.recv_paused_for_send = false;
+    return loop->submit_recv(conn);
+}
+
+// Stop reading from the upstream fd while a close is deferred behind a draining
+// send. epoll: drop the read interest (keep a pending send's EPOLLOUT) so a
+// level-triggered FIN can't spin. io_uring: cancel the multishot recv so no NEW
+// bytes are read after the FIN — otherwise the drain-then-close contract (stop
+// reading new data) would be violated and the tunnel would keep relaying.
+template <typename Loop>
+void ws_stop_upstream_poll(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_upstream(c); }) {
+        loop->ws_unpoll_upstream(conn);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
+        (void)loop->pause_upstream_recv(conn);  // async: cancel the multishot recv
+    }
+}
+
+// Symmetric to ws_stop_upstream_poll for the client fd.
+template <typename Loop>
+void ws_stop_client_poll(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_client(c); }) {
+        loop->ws_unpoll_client(conn);
+    } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+        (void)loop->pause_recv(conn);  // async: cancel the multishot recv
+    }
+}
+
+// True for backends whose recv eagerly consumes socket data into a provided
+// buffer (io_uring): a -ENOBUFS there means the overflow bytes were already read
+// from the socket and discarded, so the tunnel cannot recover them by pausing.
+// Sync backends (epoll) leave the bytes in the socket, so pausing is safe.
+template <typename Loop>
+constexpr bool ws_loop_async() {
+    if constexpr (requires { decltype(Loop::backend)::kAsyncIo; }) {
+        return decltype(Loop::backend)::kAsyncIo;
+    } else {
+        return false;
+    }
+}
+
+template <typename Loop>
+bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
+    if (conn.recv_buf.len() == 0) return true;
+    if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
+    const u32 kSendLen = conn.recv_buf.len();
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), kSendLen)) return false;
+    conn.ws_client_send_pending = true;
+    conn.ws_client_send_len = kSendLen;
+    return ws_pause_client_recv(loop, conn);
+}
+
+template <typename Loop>
+bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
+    if (conn.upstream_recv_buf.len() == 0) return true;
+    if (conn.ws_upstream_send_pending) {
+        return ws_pause_upstream_recv(loop, conn);
+    }
+    const u32 kSendLen = conn.upstream_recv_buf.len();
+    if (throttle_pause_before_pump(loop, conn, kSendLen)) return true;
+    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
+    conn.ws_upstream_send_pending = true;
+    conn.ws_upstream_send_len = kSendLen;
+    return ws_pause_upstream_recv(loop, conn);
+}
+
+// nginx-style drain-then-close. Once either peer half-closes (TCP FIN), the
+// tunnel stops reading NEW data but flushes all in-flight/buffered bytes in BOTH
+// directions before tearing down — never truncating data, and never relaying
+// new data after the FIN (WebSocket shutdown is an application-level Close-frame
+// handshake, not a TCP half-close). See DESIGN.md §"WebSocket tunnel teardown".
+inline bool ws_draining(const Connection& conn) {
+    return conn.ws_client_eof || conn.ws_upstream_eof;
+}
+
+template <typename Loop>
+void ws_close_if_drained(Loop* loop, Connection& conn) {
+    if (!conn.ws_client_send_pending && !conn.ws_upstream_send_pending &&
+        conn.recv_buf.len() == 0 && conn.upstream_recv_buf.len() == 0) {
+        loop->close_conn(conn);
+    }
+}
+
+// Flush both directions: kick a send wherever bytes are buffered but no send is
+// in flight, then quiesce both fds — stop new reads (so a level-triggered FIN
+// can't spin) while preserving any pending send's EPOLLOUT so it still drains.
+template <typename Loop>
+bool ws_drain_pump(Loop* loop, Connection& conn) {
+    if (!conn.ws_client_send_pending && conn.recv_buf.len() > 0)
+        if (!ws_try_send_client_to_upstream(loop, conn)) return false;
+    if (!conn.ws_upstream_send_pending && conn.upstream_recv_buf.len() > 0)
+        if (!ws_try_send_upstream_to_client(loop, conn)) return false;
+    ws_stop_client_poll(loop, conn);
+    ws_stop_upstream_poll(loop, conn);
+    return true;
+}
+
+template <typename Loop>
+void on_ws_client_recv(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result == -ENOBUFS) {
+        if constexpr (ws_loop_async<Loop>()) {
+            // io_uring already consumed the socket data into its provided buffer
+            // and discarded what didn't fit (IoUringBackend::wait), so pausing
+            // would forward a corrupted stream. Fail closed instead.
+            loop->close_conn(conn);
+            return;
+        }
+        // recv_buf full while the paired client→upstream send drains it. On
+        // level-triggered epoll the client fd stays readable, so a bare return
+        // busy-loops; pause this direction (resumed by the send callback's
+        // reset + submit_recv). State-aware like on_response_body_recvd: only
+        // pause when truly full — a non-full -ENOBUFS is a stale completion.
+        if (conn.recv_buf.write_avail() == 0) {
+            if (!ws_pause_client_recv(loop, conn)) loop->close_conn(conn);
+        }
+        return;
+    }
+    if (ev.result < 0) {
+        loop->close_conn(conn);  // hard error (e.g. ECONNRESET): not a clean FIN
+        return;
+    }
+    if (ev.result == 0) {
+        // Client half-closed (clean FIN). Enter drain mode: flush both directions'
+        // buffered/in-flight bytes, then tear down once everything has drained.
+        conn.ws_client_eof = true;
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+}
+
+template <typename Loop>
+void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    conn.ws_client_send_pending = false;
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.recv_buf.consume(conn.ws_client_send_len);
+    conn.ws_client_send_len = 0;
+    if (ws_draining(conn)) {
+        // Keep flushing both directions; close once everything has drained.
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    if (conn.recv_buf.len() > 0) {
+        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn))
+        loop->close_conn(conn);
+}
+
+template <typename Loop>
+void on_ws_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result == -ENOBUFS) {
+        if constexpr (ws_loop_async<Loop>()) {
+            loop->close_conn(conn);  // overflow discarded by io_uring (see above)
+            return;
+        }
+        // upstream_recv_buf full while the paired upstream→client send drains it
+        // (see on_ws_client_recv). Pause the upstream direction when truly full.
+        if (conn.upstream_recv_buf.write_avail() == 0) {
+            if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+        }
+        return;
+    }
+    if (ev.result < 0) {
+        loop->close_conn(conn);  // hard error (e.g. ECONNRESET): not a clean FIN
+        return;
+    }
+    if (ev.result == 0) {
+        // Backend half-closed (clean FIN). Mirror on_ws_client_recv: drain both
+        // directions, then tear down once everything has flushed.
+        conn.ws_upstream_eof = true;
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+}
+
+template <typename Loop>
+void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    conn.ws_upstream_send_pending = false;
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.upstream_recv_buf.consume(conn.ws_upstream_send_len);
+    conn.ws_upstream_send_len = 0;
+    if (conn.ws_pre_tunnel_upstream_closed) {
+        // Backend closed during the 101 drain: enter drain mode so a still-pending
+        // or buffered client→upstream send (post-upgrade bytes) flushes before the
+        // tunnel tears down, instead of being truncated.
+        conn.ws_upstream_eof = true;
+    }
+    if (ws_draining(conn)) {
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    if (conn.upstream_recv_buf.len() > 0) {
+        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    conn.upstream_recv_paused_for_send = false;
+    if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream→client direction
+        loop->close_conn(conn);
+        return;
+    }
+    if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+}
+
+template <typename Loop>
+void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result == -ENOBUFS) {
+        if constexpr (ws_loop_async<Loop>()) {
+            loop->close_conn(conn);  // overflow discarded by io_uring
+            return;
+        }
+        if (conn.upstream_recv_buf.write_avail() == 0) {
+            if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+        }
+        return;
+    }
+    if (ev.result < 0) {
+        // Hard error (e.g. ECONNRESET): the stream is not cleanly half-closed —
+        // don't advertise a successful upgrade. Close immediately.
+        loop->close_conn(conn);
+        return;
+    }
+    if (ev.result == 0) {
+        conn.ws_pre_tunnel_upstream_closed = true;
+        // Stop polling the hung-up upstream fd so a slow 101 drain to the client
+        // doesn't spin the level-triggered loop on redelivered EPOLLHUP. The fd
+        // is still ::closed by close_conn once the tunnel is entered/torn down.
+        ws_stop_upstream_poll(loop, conn);
+        return;
+    }
+    if (!ws_pause_upstream_recv(loop, conn)) loop->close_conn(conn);
+}
+
+// The 101 (and any bytes the backend already sent) has been forwarded to the
+// client; switch into tunnel mode and arm both directions.
+template <typename Loop>
+void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.is_ws_tunnel = true;
+    conn.ws_client_send_pending = false;
+    conn.ws_upstream_send_pending = false;
+    conn.ws_client_send_len = 0;
+    conn.ws_upstream_send_len = 0;
+    if (conn.pipeline_stash_len > 0) {
+        // Recover the stashed post-upgrade bytes into recv_buf. If they (plus any
+        // bytes already read) don't fit, fail closed rather than truncate the
+        // tunnel stream.
+        if (!pipeline_recover(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+    // Log only the upgrade request itself: if the client coalesced its first
+    // WebSocket bytes with the request, req_size captured the whole recv_buf, so
+    // the access-log request size would depend on packet framing. Trim to the
+    // parsed header length (an upgrade request has no body).
+    if (conn.req_header_end > 0) conn.req_size = conn.req_header_end;
+    on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
+    // The HTTP request is complete at the 101: release the upstream max_inflight
+    // slot now so a long-lived tunnel doesn't hold an in-flight request slot for
+    // its whole lifetime and shed later requests with 503.
+    release_upstream_slot(loop, conn);
+    loop->epoch_leave();
+    u32 kRemaining = conn.upstream_recv_buf.len();
+    if (kRemaining >= conn.ws_upgrade_response_len) {
+        conn.upstream_send_len = conn.ws_upgrade_response_len;
+        kRemaining = consume_upstream_sent(conn);
+    } else {
+        conn.upstream_send_len = 0;
+    }
+    conn.set_slots(&on_ws_client_recv<Loop>,
+                   &on_ws_upstream_to_client_sent<Loop>,
+                   &on_ws_upstream_recv<Loop>,
+                   &on_ws_client_to_upstream_sent<Loop>);
+    conn.upstream_recv_paused_for_send = false;
+    if (conn.ws_pre_tunnel_upstream_closed) {
+        // Backend already half-closed during the 101 drain: enter drain mode
+        // immediately rather than arming new client reads. Flush any buffered
+        // bytes both ways (early upstream→client frames + buffered post-upgrade
+        // client→upstream bytes), then tear down once everything has drained.
+        conn.ws_upstream_eof = true;
+        if (!ws_drain_pump(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        ws_close_if_drained(loop, conn);
+        return;
+    }
+    (void)kRemaining;
+    if (conn.recv_buf.len() > 0) {
+        if (!ws_try_send_client_to_upstream(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    } else {
+        if (!loop->submit_recv(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+    if (conn.upstream_recv_buf.len() > 0) {
+        if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
+    } else {
+        if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+    }
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
 template <typename Loop>
 void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -1930,6 +2339,51 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.resp_status = resp.status_code;
+
+#if RUT_ENABLE_WEBSOCKET
+    // 101 Switching Protocols → WebSocket/Upgrade passthrough. Forward the 101
+    // response plus any bytes the backend already sent (early frames) to the
+    // client, then run the connection as a transparent full-duplex tunnel.
+    if (resp.status_code == 101) {
+        // The client→upstream request upload must be fully drained before we can
+        // pivot the upstream send slot to the tunnel: otherwise a still-pending
+        // request body send completion would be misread as a tunnel send (or
+        // strand the upload). A gated upgrade (GET, no body) has nothing pending.
+        const bool kReqUploadPending =
+            (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
+            (conn.req_body_mode == BodyMode::Chunked &&
+             conn.req_chunk_parser.state != ChunkedParser::State::Complete);
+        if (!conn.req_wants_upgrade || kReqUploadPending) {
+            // No client upgrade intent (a misbehaving/hostile backend trying to
+            // hijack the connection — installing a tunnel would forward pipelined
+            // bytes raw upstream), or the request upload is not finished. Refuse.
+            loop->close_conn(conn);
+            return;
+        }
+        conn.ws_upgrade_response_len = resp_parser.header_end;
+        conn.ws_pre_tunnel_upstream_closed = false;
+        if (!ws_pause_upstream_recv(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.transition_to_sending(&on_ws_101_sent<Loop>);
+        conn.on_upstream_recv = &on_ws_pre_tunnel_upstream_recv<Loop>;
+        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.ws_upgrade_response_len)) {
+            loop->close_conn(conn);
+            return;
+        }
+        // Stop reading from the client until the tunnel slots are installed: a
+        // partial 101 send arms the client fd EPOLLIN|EPOLLOUT (and an io_uring
+        // multishot recv may still be live), so client bytes arriving mid-drain
+        // would dispatch with on_recv == nullptr. Use ws_stop_client_poll (not
+        // ws_pause_client_recv) so epoll also drops EPOLLRDHUP — otherwise a
+        // client FIN during a backpressured 101 send would spin the loop on
+        // redelivered Recv/0. It preserves the 101 send's EPOLLOUT and cancels
+        // the io_uring recv; on_ws_101_sent re-arms once the tunnel is up.
+        ws_stop_client_poll(loop, conn);
+        return;
+    }
+#endif
 
     if (resp.status_code >= 100 && resp.status_code < 200 && resp.status_code != 101) {
         const u32 kInterimEnd = resp_parser.header_end;

@@ -80,8 +80,10 @@ struct IoUringBackend {
         i32 fd;
         u32 offset;
         u32 remaining;
+        IoEventType type;
     };
     SendState send_state[kMaxSendState];
+    SendState upstream_send_state[kMaxSendState];
 
     // Pending SQE count (for submission)
     u32 pending = 0;
@@ -106,6 +108,7 @@ struct IoUringBackend {
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
+    bool pause_upstream_recv(i32 fd, u32 conn_id);
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).

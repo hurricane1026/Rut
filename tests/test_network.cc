@@ -776,6 +776,573 @@ TEST(rate_limit, disabled_rule_zero_max) {
     CHECK_EQ(rs.rules[0].tau_us, 0u);
 }
 
+#if RUT_ENABLE_WEBSOCKET
+// A WS-tunnel recv callback that gets -ENOBUFS with a full buffer must pause that
+// direction (state-aware), not bare-return into a busy-loop, and must not close
+// the connection. Covers the -ENOBUFS branches in on_ws_client_recv /
+// on_ws_upstream_recv.
+TEST(websocket, enobufs_pauses_not_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    const u32 cid = conn->id;
+
+    // Client→upstream direction: fill recv_buf so write_avail() == 0, deliver
+    // -ENOBUFS → pause, no close.
+    conn->recv_buf.commit(conn->recv_buf.write_avail());
+    CHECK_EQ(conn->recv_buf.write_avail(), 0u);
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseRecv);
+    CHECK_EQ(loop.backend.ops[0].conn_id, cid);
+
+    // Upstream→client direction: same, on upstream_recv_buf.
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_recv_buf.commit(conn->upstream_recv_buf.write_avail());
+    CHECK_EQ(conn->upstream_recv_buf.write_avail(), 0u);
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // still not closed
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[0].conn_id, cid);
+}
+
+// On an async (io_uring-style) backend a tunnel -ENOBUFS means the provided-buffer
+// recv already discarded the overflow, so pausing would forward a corrupted
+// stream. The tunnel must fail closed instead. (Contrast the sync test above.)
+TEST(websocket, enobufs_closes_on_async_backend) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->fd = 42;
+    conn->is_ws_tunnel = true;
+    conn->recv_buf.commit(conn->recv_buf.write_avail());  // full
+    on_ws_client_recv<AsyncSmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // failed closed, not paused
+
+    // Upstream direction is symmetric.
+    Connection* up = loop.alloc_conn();
+    REQUIRE(up != nullptr);
+    const u32 ucid = up->id;
+    up->fd = 43;
+    up->is_ws_tunnel = true;
+    REQUIRE(loop.alloc_upstream_buf(*up));
+    up->upstream_recv_buf.commit(up->upstream_recv_buf.write_avail());
+    on_ws_upstream_recv<AsyncSmallLoop>(
+        &loop, *up, make_ev(ucid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[ucid].fd, -1);  // failed closed
+}
+
+TEST(websocket, tunnel_recv_pauses_until_paired_send_completes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 client_bytes[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->recv_buf.write(client_bytes, sizeof(client_bytes)), sizeof(client_bytes));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 5));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+    CHECK_EQ(loop.backend.ops[1].conn_id, cid);
+
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    const u8 upstream_bytes[] = {'W', 'O', 'R', 'L', 'D'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(upstream_bytes, sizeof(upstream_bytes)),
+               sizeof(upstream_bytes));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 5));
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[1].conn_id, cid);
+
+    conn->recv_paused_for_send = true;
+    loop.backend.op_count = 0;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 5));
+    CHECK(!conn->recv_paused_for_send);
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+}
+
+TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+
+    const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
+               sizeof(early_bytes));
+
+    loop.backend.op_count = 0;
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+
+    CHECK(conn->is_ws_tunnel);
+    CHECK_EQ(conn->upstream_send_len, 0u);
+    CHECK_EQ(conn->upstream_recv_buf.len(), sizeof(early_bytes));
+    CHECK(conn->ws_upstream_send_pending);
+    CHECK_EQ(conn->ws_upstream_send_len, sizeof(early_bytes));
+    REQUIRE_EQ(loop.backend.op_count, 3u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[1].fd, 42);
+    CHECK_EQ(loop.backend.ops[1].send_len, sizeof(early_bytes));
+    CHECK_EQ(loop.backend.ops[2].type, MockOp::PauseUpstreamRecv);
+    CHECK_EQ(loop.backend.ops[2].conn_id, conn->id);
+}
+
+// Bytes that race into recv_buf while a client→upstream tunnel send is in flight
+// must be forwarded next, never dropped: the send-completion consumes ONLY the
+// submitted length and re-sends the remainder, keeping client recv paused until
+// the buffer drains. Regression guard for the buffered-bytes-after-send finding.
+TEST(websocket, client_to_upstream_sent_resends_raced_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 hello[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->recv_buf.write(hello, sizeof(hello)), sizeof(hello));
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 5));
+    REQUIRE(conn->ws_client_send_pending);
+    CHECK_EQ(conn->ws_client_send_len, 5u);
+
+    // More client bytes arrive while the HELLO send is still pending (e.g. a recv
+    // CQE harvested before the pause took effect). They append to recv_buf.
+    const u8 world[] = {'W', 'O', 'R', 'L', 'D'};
+    REQUIRE_EQ(conn->recv_buf.write(world, sizeof(world)), sizeof(world));
+    CHECK_EQ(conn->recv_buf.len(), 10u);
+
+    // HELLO send completes (5 bytes). Consume exactly 5; forward WORLD next.
+    loop.backend.op_count = 0;
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 5));
+    REQUIRE_EQ(conn->recv_buf.len(), 5u);
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 43);
+    CHECK_EQ(loop.backend.ops[0].send_len, 5u);
+    REQUIRE(loop.backend.ops[0].send_buf != nullptr);
+    CHECK_EQ(__builtin_memcmp(loop.backend.ops[0].send_buf, world, sizeof(world)), 0);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseRecv);
+    CHECK(conn->ws_client_send_pending);
+    CHECK_EQ(conn->ws_client_send_len, 5u);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+}
+
+// Symmetric guard for the upstream→client direction: backend bytes that race in
+// while an upstream→client send is in flight are re-sent, not dropped.
+TEST(websocket, upstream_to_client_sent_resends_raced_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 ping[] = {'P', 'I', 'N', 'G'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(ping, sizeof(ping)), sizeof(ping));
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 4));
+    REQUIRE(conn->ws_upstream_send_pending);
+    CHECK_EQ(conn->ws_upstream_send_len, 4u);
+
+    const u8 pong[] = {'P', 'O', 'N', 'G'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(pong, sizeof(pong)), sizeof(pong));
+    CHECK_EQ(conn->upstream_recv_buf.len(), 8u);
+
+    loop.backend.op_count = 0;
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 4));
+    REQUIRE_EQ(conn->upstream_recv_buf.len(), 4u);
+    REQUIRE_EQ(loop.backend.op_count, 2u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Send);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);  // client fd
+    CHECK_EQ(loop.backend.ops[0].send_len, 4u);
+    REQUIRE(loop.backend.ops[0].send_buf != nullptr);
+    CHECK_EQ(__builtin_memcmp(loop.backend.ops[0].send_buf, pong, sizeof(pong)), 0);
+    CHECK_EQ(loop.backend.ops[1].type, MockOp::PauseUpstreamRecv);
+    CHECK(conn->ws_upstream_send_pending);
+    CHECK_EQ(conn->ws_upstream_send_len, 4u);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+}
+
+// A client half-close (FIN) while its client→upstream send is still draining
+// must NOT truncate the last frame: defer the teardown until the send completes,
+// then close. Regression guard for the drain-before-close finding.
+TEST(websocket, client_half_close_defers_until_send_drains) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 bye[] = {'B', 'Y', 'E'};
+    REQUIRE_EQ(conn->recv_buf.write(bye, sizeof(bye)), sizeof(bye));
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 3));
+    REQUIRE(conn->ws_client_send_pending);
+
+    // FIN arrives while the BYE frame is still in flight to the upstream.
+    loop.backend.op_count = 0;
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 0));
+    CHECK(conn->ws_client_eof);
+    CHECK_EQ(loop.conns[cid].fd, 42);                    // deferred, not closed
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);  // no extra send pending
+
+    // The send completes; only now does the tunnel tear down.
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 3));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
+}
+
+// A negative recv error (e.g. ECONNRESET) is NOT a clean FIN — close at once
+// rather than entering the drain path (which could keep forwarding bytes).
+TEST(websocket, recv_error_closes_immediately) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, -ECONNRESET));
+    CHECK(!conn->ws_client_eof);       // not treated as a drainable FIN
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed immediately
+}
+
+// Symmetric guard for a backend half-close while its upstream→client send drains.
+TEST(websocket, backend_half_close_defers_until_send_drains) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    const u8 bye[] = {'B', 'Y', 'E'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(bye, sizeof(bye)), sizeof(bye));
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 3));
+    REQUIRE(conn->ws_upstream_send_pending);
+
+    loop.backend.op_count = 0;
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK(conn->ws_upstream_eof);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // deferred, not closed
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 3));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed after the last frame flushed
+}
+
+// nginx-style drain-then-close: a FIN on one side must flush BOTH directions'
+// in-flight data before tearing down — the opposite direction's pending send is
+// not dropped. The tunnel closes only once both directions have drained.
+TEST(websocket, half_close_drains_both_directions_before_close) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    // A client→upstream send and an independent upstream→client send both in flight.
+    const u8 c2u[] = {'C', '2', 'U'};
+    REQUIRE_EQ(conn->recv_buf.write(c2u, sizeof(c2u)), sizeof(c2u));
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 3));
+    REQUIRE(conn->ws_client_send_pending);
+    const u8 u2c[] = {'U', '2', 'C'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(u2c, sizeof(u2c)), sizeof(u2c));
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 3));
+    REQUIRE(conn->ws_upstream_send_pending);
+
+    // Client FIN while both sends drain → defer.
+    on_ws_client_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Recv, 0));
+    CHECK(conn->ws_client_eof);
+    CHECK_EQ(loop.conns[cid].fd, 42);
+
+    // client→upstream completes; the upstream→client send must still drain.
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, 3));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // opposite direction NOT dropped
+
+    // upstream→client completes → both drained → tunnel tears down.
+    on_ws_upstream_to_client_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 3));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed only after both flushed
+}
+
+// A backend that closes during the pre-tunnel 101 drain must defer teardown
+// (preserve buffered 101 bytes) rather than close mid-handshake.
+TEST(websocket, pre_tunnel_backend_close_defers) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_pre_tunnel_upstream_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK(conn->ws_pre_tunnel_upstream_closed);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed mid-handshake
+}
+
+// A negative pre-tunnel recv (e.g. ECONNRESET) is a hard failure, not a clean
+// EOF — close immediately rather than advertising a successful upgrade.
+TEST(websocket, pre_tunnel_recv_error_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_pre_tunnel_upstream_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ECONNRESET));
+    CHECK(!conn->ws_pre_tunnel_upstream_closed);  // not a deferred clean close
+    CHECK_EQ(loop.conns[cid].fd, -1);             // closed immediately
+}
+
+// Backend FIN with no pending send and an empty buffer tears the tunnel down.
+TEST(websocket, backend_eof_no_pending_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->is_ws_tunnel = true;
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+
+    on_ws_upstream_recv<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // closed
+}
+
+// A pre-tunnel -ENOBUFS (backend filled upstream_recv_buf before the 101 sent)
+// pauses the upstream direction rather than closing the handshake.
+TEST(websocket, pre_tunnel_enobufs_pauses) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    const u32 cid = conn->id;
+    conn->upstream_recv_buf.commit(conn->upstream_recv_buf.write_avail());
+    CHECK_EQ(conn->upstream_recv_buf.write_avail(), 0u);
+
+    loop.backend.op_count = 0;
+    on_ws_pre_tunnel_upstream_recv<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // not closed
+    REQUIRE_EQ(loop.backend.op_count, 1u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::PauseUpstreamRecv);
+}
+
+// on_ws_101_sent forwards client bytes already buffered at tunnel install
+// (e.g. a recovered pipeline stash) into the upstream direction.
+TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+
+    const u8 cb[] = {'H', 'I'};
+    REQUIRE_EQ(conn->recv_buf.write(cb, sizeof(cb)), sizeof(cb));
+
+    loop.backend.op_count = 0;
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK(conn->ws_client_send_pending);
+    bool saw = false;
+    for (u32 i = 0; i < loop.backend.op_count; i++)
+        if (loop.backend.ops[i].type == MockOp::Send && loop.backend.ops[i].fd == 43) saw = true;
+    CHECK(saw);  // buffered client bytes forwarded upstream
+}
+
+// If the backend half-closed during the 101 drain AND both early upstream bytes
+// and buffered client bytes exist, on_ws_101_sent must enter drain mode: flush
+// BOTH directions before closing, never arm new client reads, and tear down only
+// once both drained.
+TEST(websocket, upgrade_101_sent_drains_both_when_backend_closed_pretunnel) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+    conn->ws_pre_tunnel_upstream_closed = true;  // backend FIN during the 101 drain
+    const u32 cid = conn->id;
+
+    const u8 early[] = {'H', 'E', 'L', 'L', 'O'};  // early upstream→client bytes
+    REQUIRE_EQ(conn->upstream_recv_buf.write(early, sizeof(early)), sizeof(early));
+    const u8 cb[] = {'H', 'I'};  // buffered client→upstream bytes
+    REQUIRE_EQ(conn->recv_buf.write(cb, sizeof(cb)), sizeof(cb));
+
+    loop.backend.op_count = 0;
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK(conn->ws_upstream_eof);                        // entered drain mode (not a fresh tunnel)
+    CHECK_EQ(loop.conns[cid].fd, 42);                    // not closed — both sends draining
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);  // did NOT arm new client reads
+    bool to_upstream = false, to_client = false;
+    for (u32 i = 0; i < loop.backend.op_count; i++) {
+        const MockOp& op = loop.backend.ops[i];
+        if (op.type == MockOp::Send && op.fd == 43) to_upstream = true;  // client→upstream
+        if (op.type == MockOp::Send && op.fd == 42) to_client = true;    // upstream→client
+    }
+    CHECK(to_upstream);  // buffered client bytes flushed to upstream
+    CHECK(to_client);    // early upstream bytes flushed to client
+
+    // Both directions drain → only then does the tunnel close.
+    on_ws_client_to_upstream_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamSend, sizeof(cb)));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // upstream→client still draining
+    on_ws_upstream_to_client_sent<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::Send, sizeof(early)));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // both drained → closed
+}
+
+// Entering tunnel mode must release the upstream max_inflight slot so a
+// long-lived tunnel doesn't hold an in-flight request slot for its lifetime.
+TEST(websocket, upgrade_101_sent_releases_upstream_slot) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+    conn->upstream_slot_held = true;  // slot taken at proxy dispatch
+
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK(!conn->upstream_slot_held);  // released at the 101, not held until close
+}
+
+// pipeline_recover must prepend the stash before bytes already read into
+// recv_buf (client frames that raced in before tunnel install), not drop them.
+TEST(websocket, pipeline_recover_preserves_raced_recv_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    const u8 stash[] = {'A', 'B'};  // bytes right after the upgrade request
+    conn->send_buf.reset();
+    REQUIRE_EQ(conn->send_buf.write(stash, sizeof(stash)), sizeof(stash));
+    conn->pipeline_stash_len = sizeof(stash);
+
+    const u8 raced[] = {'C', 'D', 'E'};  // arrived later, before tunnel install
+    conn->recv_buf.reset();
+    REQUIRE_EQ(conn->recv_buf.write(raced, sizeof(raced)), sizeof(raced));
+
+    REQUIRE(pipeline_recover(*conn));
+    REQUIRE_EQ(conn->recv_buf.len(), 5u);
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), "ABCDE", 5), 0);  // stash then raced
+    CHECK_EQ(conn->pipeline_stash_len, 0u);
+}
+
+// The legacy loop's timer tick must NOT close a WebSocket tunnel on idle timeout
+// (the is_ws_tunnel exemption). Covers event_loop.h's `if (is_ws_tunnel) return`.
+TEST(legacy_loop, ws_tunnel_exempt_from_idle_timeout) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = -1;
+    c->is_ws_tunnel = true;
+    loop->timer.add(c, 1);
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 2;  // wheel fires slots[cursor] then advances; add(_,1) needs 2
+    loop->dispatch(tick);
+    // The tunnel was exempted (early return), not closed.
+    CHECK(c->is_ws_tunnel);
+    loop->shutdown();
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+// Cover the legacy EventLoop<Backend> accessors + free_conn slice release.
+TEST(legacy_loop, accessors_and_free_release_slices) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    CHECK(!loop->is_draining());
+    loop->clear_upstream_fd(0);
+    loop->clear_upstream_fd(EventLoop<MockBackend>::kMaxConns - 1);
+
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    REQUIRE(c->recv_slice != nullptr);
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->fd = -1;
+    loop->free_conn(*c);  // must return the pooled slices
+    CHECK_EQ(c->recv_slice, nullptr);
+    CHECK_EQ(c->upstream_recv_slice, nullptr);
+    loop->shutdown();
+}
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;
@@ -4455,6 +5022,7 @@ TEST(streaming, _101_not_skipped) {
     loop.setup();
     auto* conn = setup_proxy_conn(loop);
     REQUIRE(conn != nullptr);
+    conn->req_wants_upgrade = true;  // client sent Connection: upgrade
 
     const char* resp =
         "HTTP/1.1 101 Switching Protocols\r\n"
@@ -4474,11 +5042,111 @@ TEST(streaming, _101_not_skipped) {
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // 101 is terminal — must NOT be skipped.
+    // 101 is terminal — must NOT be skipped as an interim 1xx.
     CHECK_EQ(conn->resp_status, static_cast<u16>(101));
-    // No CL, no chunked, no keep-alive → UntilClose (streaming).
+#if RUT_ENABLE_WEBSOCKET
+    // The idle-timeout exemption starts only after the 101 reaches the client.
+    CHECK(!conn->is_ws_tunnel);
+    REQUIRE(conn->on_send != nullptr);
+    REQUIRE(conn->on_upstream_recv != nullptr);
+    const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
+               sizeof(early_bytes));
+    const u32 early_only_len = sizeof(early_bytes);
+    const u32 header_plus_early_len = resp_len + sizeof(early_bytes);
+    REQUIRE(conn->upstream_recv_buf.len() == early_only_len ||
+            conn->upstream_recv_buf.len() == header_plus_early_len);
+    loop.backend.inject(make_ev(conn->id, IoEventType::UpstreamRecv, 5));
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK(conn->upstream_recv_buf.len() == early_only_len ||
+          conn->upstream_recv_buf.len() == header_plus_early_len);
+    CHECK(!conn->is_ws_tunnel);
+    loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    loop.backend.op_count = 0;
+    n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    CHECK(conn->is_ws_tunnel);
+    REQUIRE_EQ(loop.backend.op_count, 3u);
+    CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
+    CHECK_EQ(loop.backend.ops[0].fd, 42);
+    const MockOp* early_send = nullptr;
+    for (u32 i = 0; i < loop.backend.op_count; i++) {
+        const MockOp& op = loop.backend.ops[i];
+        if (op.type == MockOp::Send && op.fd == 42 && op.send_len == 5u) {
+            early_send = &op;
+            break;
+        }
+    }
+    if (early_send == nullptr) CHECK_EQ(conn->upstream_recv_buf.len(), early_only_len);
+    CHECK_EQ(loop.backend.count_ops(MockOp::PauseUpstreamRecv), 1u);
+#else
+    // Without the WS feature: no CL/chunked/keep-alive → UntilClose (streaming).
     CHECK_EQ(conn->resp_body_mode, BodyMode::UntilClose);
+#endif
 }
+
+#if RUT_ENABLE_WEBSOCKET
+// A 101 from the backend when the client never requested an upgrade is a
+// protocol violation (a hostile backend trying to hijack the connection). The
+// gateway must refuse — not install a tunnel and forward stashed bytes raw.
+TEST(streaming, _101_without_client_upgrade_is_rejected) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->req_wants_upgrade = false;  // client sent a normal request
+
+    const char* resp =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "\r\n";
+    u32 resp_len = 0;
+    while (resp[resp_len]) resp_len++;
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
+    conn->upstream_recv_buf.commit(resp_len);
+
+    loop.backend.inject(make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(resp_len)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK(!conn->is_ws_tunnel);        // no tunnel installed
+    CHECK_EQ(loop.conns[cid].fd, -1);  // connection refused/closed
+}
+
+// A 101 must be refused while the client→upstream request upload is still in
+// flight — installing the tunnel would strand/mix the pending request body send.
+TEST(streaming, _101_rejected_while_request_upload_pending) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    const u32 cid = conn->id;
+    conn->req_wants_upgrade = true;
+    conn->req_body_mode = BodyMode::ContentLength;
+    conn->req_body_remaining = 16;  // request body not finished uploading
+
+    const char* resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+    u32 resp_len = 0;
+    while (resp[resp_len]) resp_len++;
+    conn->upstream_recv_buf.reset();
+    u8* dst = conn->upstream_recv_buf.write_ptr();
+    for (u32 i = 0; i < resp_len; i++) dst[i] = static_cast<u8>(resp[i]);
+    conn->upstream_recv_buf.commit(resp_len);
+
+    loop.backend.inject(make_ev(cid, IoEventType::UpstreamRecv, static_cast<i32>(resp_len)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK(!conn->is_ws_tunnel);        // no tunnel while upload pending
+    CHECK_EQ(loop.conns[cid].fd, -1);  // refused
+}
+#endif
 
 // 205 Reset Content has no body (same as 204/304).
 TEST(streaming, status_205_no_body) {
@@ -6382,6 +7050,193 @@ TEST(epoll_loop, alloc_free_conn) {
     CHECK_EQ(loop->active_count(), 1u);
     loop->free_conn(*c);
     CHECK_EQ(loop->active_count(), 0u);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+// close_conn must drop any in-flight partial-send bookkeeping so a reused
+// conn_id + fd number cannot resurrect a stale send. Without this, pause_recv /
+// add_recv would match the leftover entry (remaining > 0 && ss.fd == fd), arm
+// EPOLLOUT, and send from the dangling ss.src into the new connection's fd.
+TEST(epoll_loop, close_clears_partial_send_state) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+    c->fd = -1;  // no real socket to ::close
+
+    // Simulate a partial client→upstream and upstream→client send still recorded
+    // when the connection closes.
+    loop->backend.send_state[cid] = {
+        reinterpret_cast<const u8*>(0x1000), 7, 0, 16, IoEventType::Send, false, 0};
+    loop->backend.upstream_send_state[cid] = {
+        reinterpret_cast<const u8*>(0x2000), 9, 0, 16, IoEventType::UpstreamSend, false, 0};
+
+    loop->close_conn(*c);
+
+    CHECK_EQ(loop->backend.send_state[cid].remaining, 0u);
+    CHECK_EQ(loop->backend.send_state[cid].fd, -1);
+    CHECK(loop->backend.send_state[cid].src == nullptr);
+    CHECK_EQ(loop->backend.upstream_send_state[cid].remaining, 0u);
+    CHECK_EQ(loop->backend.upstream_send_state[cid].fd, -1);
+    CHECK(loop->backend.upstream_send_state[cid].src == nullptr);
+
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+// ws_unpoll_upstream must remove the upstream fd from the epoll set so a hung-up
+// backend (EPOLLHUP is delivered even with the interest mask zeroed) stops waking
+// the level-triggered loop during a slow pre-tunnel 101 drain. A control fd kept
+// readable guarantees wait() returns promptly instead of blocking on the -1
+// timeout, keeping the test from hanging.
+TEST(epoll_loop, ws_unpoll_upstream_deregisters_upstream_fd) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* up = loop->alloc_conn();
+    auto* ctl = loop->alloc_conn();
+    REQUIRE(up != nullptr);
+    REQUIRE(ctl != nullptr);
+    const u32 up_cid = up->id;
+
+    i32 ufds[2], cfds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, ufds) == 0);
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, cfds) == 0);
+    up->upstream_fd = ufds[0];
+    ctl->fd = cfds[0];
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], up_cid));
+    REQUIRE(loop->backend.add_recv(cfds[0], ctl->id));
+    close(ufds[1]);  // upstream peer closes → fd reports EPOLLHUP
+
+    loop->ws_unpoll_upstream(*up);
+
+    const u8 one = 'x';
+    REQUIRE(write(cfds[1], &one, 1) == 1);  // keep wait() non-blocking
+    IoEvent events[16];
+    u32 n = loop->backend.wait(events, 16, loop->conns, RealLoop::kMaxConns);
+    bool saw_upstream = false, saw_ctl = false;
+    for (u32 i = 0; i < n; i++) {
+        if (events[i].conn_id == up_cid && events[i].type == IoEventType::UpstreamRecv)
+            saw_upstream = true;
+        if (events[i].conn_id == ctl->id && events[i].type == IoEventType::Recv) saw_ctl = true;
+    }
+    CHECK(saw_ctl);        // wait() ran and returned the ready control fd
+    CHECK(!saw_upstream);  // the hung-up upstream fd was deregistered, no spin
+
+    // No-op when there is no upstream fd.
+    up->upstream_fd = -1;
+    loop->ws_unpoll_upstream(*up);
+
+    close(ufds[0]);
+    close(cfds[0]);
+    close(cfds[1]);
+    ctl->fd = -1;
+    loop->free_conn(*up);
+    loop->free_conn(*ctl);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+// Re-arming a recv must preserve a pending opposite-direction send's EPOLLOUT on
+// the same fd (full-duplex tunnel backpressure). Drive the send to completion to
+// prove the EPOLLOUT survived the re-arm; also exercise the TLS-pending branches.
+// Pre-tunnel backend EOF on the real epoll loop: records the deferred close and
+// deregisters the upstream fd (exercises ws_stop_upstream_poll's epoll branch).
+#if RUT_ENABLE_WEBSOCKET
+TEST(epoll_loop, ws_pre_tunnel_backend_eof_defers_and_deregisters) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    c->upstream_fd = fds[0];
+    REQUIRE(loop->backend.add_recv_upstream(fds[0], c->id));
+
+    on_ws_pre_tunnel_upstream_recv<RealLoop>(
+        loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    CHECK(c->ws_pre_tunnel_upstream_closed);  // deferred, flag recorded
+
+    close(fds[0]);
+    close(fds[1]);
+    c->upstream_fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+
+    i32 dfds[2], ufds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, dfds) == 0);
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, ufds) == 0);
+    c->fd = dfds[0];
+    c->upstream_fd = ufds[0];
+
+    // Downstream: an upstream→client send is pending on the client fd. Re-arming
+    // the client recv must keep EPOLLOUT so the send still drains.
+    REQUIRE(loop->backend.add_recv(dfds[0], cid));
+    static const u8 down[] = {'P', 'O', 'N', 'G'};
+    loop->backend.send_state[cid] = {down, dfds[0], 0, sizeof(down), IoEventType::Send, false, 0};
+    REQUIRE(loop->backend.add_recv(dfds[0], cid));
+    IoEvent ev[8];
+    u32 n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
+    bool saw_send = false;
+    for (u32 i = 0; i < n; i++)
+        if (ev[i].conn_id == cid && ev[i].type == IoEventType::Send) saw_send = true;
+    CHECK(saw_send);  // EPOLLOUT preserved across the recv re-arm
+    u8 rb[8];
+    CHECK_EQ(recv(dfds[1], rb, sizeof(rb), MSG_DONTWAIT), static_cast<ssize_t>(sizeof(down)));
+
+    // Upstream: symmetric — a client→upstream send pending on the upstream fd.
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid));
+    static const u8 up[] = {'P', 'I', 'N', 'G'};
+    loop->backend.upstream_send_state[cid] = {
+        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, false, 0};
+    REQUIRE(loop->backend.add_recv_upstream(ufds[0], cid));
+    n = loop->backend.wait(ev, 8, loop->conns, RealLoop::kMaxConns);
+    bool saw_usend = false;
+    for (u32 i = 0; i < n; i++)
+        if (ev[i].conn_id == cid && ev[i].type == IoEventType::UpstreamSend) saw_usend = true;
+    CHECK(saw_usend);
+    CHECK_EQ(recv(ufds[1], rb, sizeof(rb), MSG_DONTWAIT), static_cast<ssize_t>(sizeof(up)));
+
+    // TLS-pending sub-branches: WANT_READ keeps EPOLLIN only, WANT_WRITE adds
+    // EPOLLOUT. Just exercise the re-arm paths (no SSL drive).
+    loop->backend.send_state[cid] = {
+        down, dfds[0], 0, sizeof(down), IoEventType::Send, true, EPOLLIN};
+    CHECK(loop->backend.add_recv(dfds[0], cid));
+    loop->backend.send_state[cid] = {
+        down, dfds[0], 0, sizeof(down), IoEventType::Send, true, EPOLLOUT};
+    CHECK(loop->backend.add_recv(dfds[0], cid));
+    loop->backend.upstream_send_state[cid] = {
+        up, ufds[0], 0, sizeof(up), IoEventType::UpstreamSend, true, EPOLLIN};
+    CHECK(loop->backend.add_recv_upstream(ufds[0], cid));
+
+    loop->backend.clear_send_state(cid);
+    close(dfds[0]);
+    close(dfds[1]);
+    close(ufds[0]);
+    close(ufds[1]);
+    c->fd = -1;
+    c->upstream_fd = -1;
+    loop->free_conn(*c);
     loop->shutdown();
     destroy_real_loop(loop);
 }
@@ -10837,9 +11692,15 @@ TEST(state_invariant, jit_event_yield_starts_runtime_operations) {
     loop.backend.clear_ops();
     handle_jit_outcome<SmallLoop>(
         &loop, *up_recv, outcome, &state_invariant_wait_recv_then_status, true);
-    const MockOp* recv_op = loop.backend.last_op(MockOp::Recv);
-    REQUIRE(recv_op != nullptr);
-    CHECK_EQ(recv_op->fd, 88);
+    const MockOp* upstream_recv_op = nullptr;
+    for (u32 i = 0; i < loop.backend.op_count; i++) {
+        const MockOp& op = loop.backend.ops[i];
+        if (op.type == MockOp::Recv && op.fd == 88) {
+            upstream_recv_op = &op;
+            break;
+        }
+    }
+    REQUIRE(upstream_recv_op != nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 1u);
 }
 

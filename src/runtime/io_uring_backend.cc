@@ -105,7 +105,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd) {
     ring_fd = -1;
     timer_fd = -1;
     timer_read_armed = false;
-    for (u32 i = 0; i < kMaxSendState; i++) send_state[i] = {nullptr, -1, 0, 0};
+    for (u32 i = 0; i < kMaxSendState; i++) {
+        send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send};
+        upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend};
+    }
 
     // Setup io_uring with desired flags
     struct io_uring_params params;
@@ -349,6 +352,13 @@ bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
         encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
 }
 
+bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id) {
+    if (fd < 0 || conn_id >= kMaxSendState) return false;
+    return cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamRecv),
+                               kCancelConnId,
+                               IoEventType::UpstreamRecv);
+}
+
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
@@ -356,7 +366,7 @@ bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
     // Record send state only after acquiring SQE — if kernel returns partial,
     // wait() re-submits the remainder.
     if (conn_id < kMaxSendState) {
-        send_state[conn_id] = {buf, fd, 0, len};
+        send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send};
     }
 
     memset(sqe, 0, sizeof(*sqe));
@@ -376,7 +386,7 @@ bool IoUringBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 l
     if (!sqe) return false;
 
     if (conn_id < kMaxSendState) {
-        send_state[conn_id] = {buf, fd, 0, len};
+        upstream_send_state[conn_id] = {buf, fd, 0, len, IoEventType::UpstreamSend};
     }
 
     memset(sqe, 0, sizeof(*sqe));
@@ -679,7 +689,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // Only emit completion when all bytes sent (or error).
         if ((type == IoEventType::Send || type == IoEventType::UpstreamSend) &&
             conn_id < kMaxSendState) {
-            auto& ss = send_state[conn_id];
+            auto& ss = (type == IoEventType::UpstreamSend) ? upstream_send_state[conn_id]
+                                                           : send_state[conn_id];
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);
                 ss.offset += nw;
@@ -702,7 +713,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     // SQ full — can't re-submit. Emit error to prevent deadlock.
                     ss.remaining = 0;
                     events[count].conn_id = conn_id;
-                    events[count].type = IoEventType::Send;
+                    events[count].type = type;
                     events[count].result = -ENOSPC;
                     events[count].buf_id = 0;
                     events[count].has_buf = 0;
@@ -713,7 +724,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 }
                 // All bytes sent — emit completion with total
                 events[count].conn_id = conn_id;
-                events[count].type = IoEventType::Send;
+                events[count].type = type;
                 events[count].result = static_cast<i32>(ss.offset);
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;

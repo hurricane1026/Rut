@@ -62,6 +62,7 @@ struct EpollBackend {
         u32 tls_wait_events;
     };
     SendState send_state[kMaxFdMap];
+    SendState upstream_send_state[kMaxFdMap];
 
     // --- Interface methods ---
 
@@ -88,7 +89,23 @@ struct EpollBackend {
     // pending upstream data would otherwise keep firing UpstreamRecv and drive the
     // pipeline past the pause. submit_recv_upstream re-arms EPOLLIN on resume.
     // No-op if the conn_id has no registered upstream fd.
-    void pause_upstream_recv(u32 conn_id);
+    void pause_upstream_recv(u32 conn_id, bool preserve_send_interest = false);
+
+    // Stop polling a tunnel fd's READ side (drop EPOLLIN/EPOLLRDHUP so a
+    // level-triggered half-close can't re-fire) while PRESERVING any in-flight
+    // send on that fd (keep its EPOLLOUT so it still drains). If no send is
+    // pending the fd is removed from the epoll set entirely. Used by the
+    // nginx-style drain-then-close path. upstream selects the upstream fd /
+    // upstream_send_state; otherwise the downstream fd / send_state.
+    void quiesce_recv(u32 conn_id, bool upstream);
+
+    // Drop any partial-send bookkeeping for conn_id. MUST be called on close so
+    // a leftover send_state entry (a partial send that was still in flight when
+    // the connection closed) cannot be misread as live after the conn_id and fd
+    // number are reused: pause_recv/add_recv preserve a pending send's EPOLLOUT
+    // keyed on (remaining > 0 && ss.fd == fd), and would otherwise arm EPOLLOUT
+    // and send from the stale ss.src pointer into the new connection's fd.
+    void clear_send_state(u32 conn_id);
 
     // Try immediate send. If partial/EAGAIN, register EPOLLOUT.
     bool add_send(i32 fd, u32 conn_id, const u8* buf, u32 len);

@@ -372,6 +372,24 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Stop polling the upstream fd without closing it (close_conn still ::closes
+    // it). epoll is level-triggered and delivers EPOLLHUP/EPOLLERR even with the
+    // interest mask zeroed, so a backend that closes during the pre-tunnel 101
+    // drain to a slow client would otherwise spin the loop redelivering the EOF.
+    // io_uring needs no equivalent (a cancelled recv does not re-fire), so this
+    // method is epoll-only and the WS callback reaches it via a requires-guard.
+    void ws_unpoll_upstream(Connection& c) {
+        if (c.upstream_fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/true);
+    }
+
+    // Symmetric to ws_unpoll_upstream for the downstream (client) fd: stop epoll
+    // from redelivering a client half-close (EPOLLRDHUP) while a tunnel close is
+    // deferred behind a still-draining client→upstream send. close_conn ::closes
+    // the fd later.
+    void ws_unpoll_client(Connection& c) {
+        if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false);
+    }
+
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;  // already allocated
         u8* s = pool.alloc();
@@ -446,7 +464,9 @@ public:
         return backend.add_recv_upstream(c.upstream_fd, c.id);
     }
 
-    void pause_upstream_recv_impl(Connection& c) { backend.pause_upstream_recv(c.id); }
+    void pause_upstream_recv_impl(Connection& c) {
+        backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
+    }
 
     void close_conn_impl(Connection& c) {
         if (c.req_start_us != 0) epoch_leave();
@@ -480,6 +500,9 @@ public:
         // Clear upstream fd map to prevent stale fd matching after reuse.
         if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = -1;
         if (c.id < EpollBackend::kMaxFdMap) backend.downstream_fd_map[c.id] = -1;
+        // Drop any in-flight partial-send bookkeeping so a reused conn_id+fd
+        // cannot resurrect a stale send (see EpollBackend::clear_send_state).
+        backend.clear_send_state(c.id);
         if (metrics) {
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
@@ -641,6 +664,10 @@ public:
                             // @throttle: a new byte-rate window has opened — resume
                             // the parked client send.
                             throttle_resume<EpollEventLoop>(this, *c);
+#if RUT_ENABLE_WEBSOCKET
+                        } else if (c->is_ws_tunnel) {
+                            // WebSocket tunnel: no idle keepalive timeout (no-op).
+#endif
                         } else {
                             this->close_conn(*c);
                         }
