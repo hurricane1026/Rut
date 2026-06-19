@@ -39,6 +39,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev);
 // owned-buffer drain path (tls_on_out_drain).
 template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn);
+// Defined in callbacks_impl.h — drain-side accounting for a parked proxy-body
+// remainder re-encrypted from the drain / WANT_READ-resume paths.
+template <typename Loop>
+void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly);
 
 template <class Self>
 void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
@@ -158,6 +162,11 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
             loop->close_conn(c);
             return;
         }
+        // For a parked proxy-body remainder, account the bytes just encrypted; when
+        // the remainder finishes this advances the body state (resp_fully_buffered)
+        // and resumes the paused upstream read. (Single-shot sends skip this and
+        // finalize via the buffer-empty branch below.)
+        if (c.tls_proxy_stream) proxy_tls_parked_drained<Self>(loop, c, consumed);
         if (kSt == TlsFill::NeedRoom) return;  // still full — resume at the next drain
         if (kSt == TlsFill::NeedRead) {
             // SSL_write needs peer input to retry. If no recv is armed and we
@@ -202,6 +211,13 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         if (c.resp_fully_buffered) {
             c.tls_proxy_stream = false;
             proxy_stream_complete<Self>(loop, c);
+            // On keep-alive, proxy_stream_complete armed a recv for the next
+            // request — but the client may have already pipelined it, and that
+            // ciphertext is sitting in tls_in_buf from a recv CQE that landed
+            // while we were mid-drain (tls_process bailed on tls_out_inflight). No
+            // further CQE will drive it, so decrypt the buffered request now.
+            if (c.tls_active && !c.tls_out_inflight && c.tls_in_buf.len() > 0)
+                tls_process<Self>(loop, c);
         }
         return;
     } else {
@@ -407,6 +423,10 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
         loop->close_conn(c);
         return;
     }
+    // A parked proxy-body remainder advances its accounting here too (same as the
+    // drain path) — otherwise a NeedRead-resumed proxy chunk would lose its body
+    // bytes / never mark resp_fully_buffered.
+    if (c.tls_proxy_stream) proxy_tls_parked_drained<Self>(loop, c, consumed);
     if (kSt == TlsFill::NeedRead) {
         // Need peer input again to retry — fail closed if no recv can be armed.
         c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;

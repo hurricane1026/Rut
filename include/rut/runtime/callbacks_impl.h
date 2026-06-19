@@ -204,6 +204,47 @@ inline void throttle_advance(Connection& conn, u32 len) {
         kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
 }
 
+// True once the whole proxied response body has been read from the upstream
+// (Content-Length exhausted / chunked trailer seen). UntilClose ends at EOF, not
+// here.
+inline bool proxy_body_complete(const Connection& conn) {
+    return (conn.resp_body_mode == BodyMode::ContentLength && conn.resp_body_remaining == 0) ||
+           (conn.resp_body_mode == BodyMode::Chunked &&
+            conn.resp_chunk_parser.state == ChunkedParser::State::Complete);
+}
+
+// Drain-side accounting for a parked proxy-body remainder: the io_uring-TLS read
+// side parks the unencrypted tail in tls_send_src when tls_fill_output returns
+// NeedRoom/NeedRead, and pauses the upstream read. tls_on_out_drain /
+// tls_resume_pending_send_recv re-encrypt it; `newly` is the plaintext encrypted
+// this pass. Once the whole remainder is in, shift the upstream buffer past it,
+// finalize the body state, and either complete-on-drain or resume the read
+// (honoring the high watermark). Defined here (not in tls_iouring.h) so it can
+// reach consume_upstream_sent / the body state; forward-declared there.
+template <typename Loop>
+void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
+    conn.resp_body_sent += newly;
+    throttle_advance(conn, newly);
+    if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial
+    conn.upstream_send_len = conn.tls_send_len;
+    consume_upstream_sent(conn);  // shift upstream_recv_buf past the parked tail
+    conn.tls_send_src = nullptr;
+    conn.tls_send_len = 0;
+    conn.tls_send_off = 0;
+    if (proxy_body_complete(conn)) {
+        conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
+        loop->pause_upstream_recv(conn);
+        return;
+    }
+    // More body to read. The buffer may still be above the high watermark (we
+    // parked because it filled) — let the drain's low-watermark logic re-arm.
+    if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
+        conn.tls_recv_paused_hw = true;
+        return;
+    }
+    if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+}
+
 template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
     throttle_advance(conn, len);
@@ -1548,11 +1589,20 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             if (conn.upstream_recv_buf.write_avail() == 0) loop->pause_upstream_recv(conn);
             return;
         }
+        // io_uring TLS: the body may be fully buffered and still draining to the
+        // client (the multishot upstream recv was cancelled, but an EOF CQE can
+        // already be queued, or the backend closes right after the response).
+        // Closing now would truncate ciphertext still in tls_out_buf — let the
+        // drain complete the request.
+        if (conn.resp_fully_buffered) return;
         if (conn.resp_body_mode == BodyMode::UntilClose) {
             if (conn.uses_iouring_tls()) {
-                // Body ends at upstream EOF, but any ciphertext still in
-                // tls_out_buf must flush first — closing now would truncate it.
-                // Mark complete-on-drain; if nothing is buffered, complete now.
+                // Close-delimited: EOF is the body terminator, so the downstream
+                // HTTP/1.1 response must also end by closing — force a
+                // non-keepalive completion. Any ciphertext still in tls_out_buf
+                // must flush first, so mark complete-on-drain (complete now only if
+                // nothing is buffered).
+                conn.keep_alive = false;
                 conn.tls_proxy_stream = true;
                 conn.resp_fully_buffered = true;
                 if (!conn.tls_out_inflight && conn.tls_out_buf.len() == 0)
@@ -1605,32 +1655,44 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                       Loop::kTlsDrainChunk;
                   }) {
         if (conn.uses_iouring_tls()) {
-            // The high watermark keeps the buffer below cap - kTlsRecordMax before
-            // each new read, so one record's ciphertext always fits and NeedRoom
-            // is unreachable here. A NeedRead (proxy body encryption needing peer
-            // input — the client isn't sending during a response, so a deadlock)
-            // fails closed rather than mis-account.
             conn.tls_proxy_stream = true;
             u32 enc = 0;
             const TlsFill kFill =
                 tls_fill_output<Loop>(loop, conn, conn.upstream_recv_buf.data(), send_len, enc);
-            if (kFill != TlsFill::Done) {
+            if (kFill == TlsFill::Fatal) {
                 loop->close_conn(conn);
+                return;
+            }
+            if (kFill != TlsFill::Done) {
+                // NeedRoom (buffer filled mid-chunk) or NeedRead (SSL_write needs
+                // peer input, e.g. a TLS 1.3 KeyUpdate during the response). Park
+                // the unencrypted tail and pause the upstream read; the drain (and,
+                // for NeedRead, the next client recv) re-encrypt it via
+                // proxy_tls_parked_drained rather than truncating the download.
+                conn.resp_body_sent += enc;
+                throttle_advance(conn, enc);
+                conn.upstream_send_len = enc;
+                consume_upstream_sent(conn);  // shift past encrypted; tail now at front
+                conn.tls_send_src = conn.upstream_recv_buf.data();
+                conn.tls_send_len = send_len - enc;
+                conn.tls_send_off = 0;
+                loop->pause_upstream_recv(conn);  // multishot recv must be cancelled, not flagged
+                if (kFill == TlsFill::NeedRead) {
+                    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<Loop>;
+                    if (!conn.recv_armed && !loop->submit_recv(conn)) loop->close_conn(conn);
+                }
                 return;
             }
             conn.resp_body_sent += enc;  // enc == send_len on Done
             throttle_advance(conn, enc);
-            const bool kBodyDone =
-                (conn.resp_body_mode == BodyMode::ContentLength && conn.resp_body_remaining == 0) ||
-                (conn.resp_body_mode == BodyMode::Chunked &&
-                 conn.resp_chunk_parser.state == ChunkedParser::State::Complete);
+            const bool kBodyDone = proxy_body_complete(conn);
             conn.upstream_send_len = enc;
             const u32 kRemaining = consume_upstream_sent(conn);  // shift past encrypted chunk
             if (kBodyDone) {
                 conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
+                loop->pause_upstream_recv(conn);  // stop the multishot; no more body to read
                 return;
             }
-            if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
             if (kRemaining > 0) {
                 // Bytes already in upstream_recv_buf — must be encrypted now (not
                 // subject to the watermark, which only gates *new* reads). One
@@ -1639,11 +1701,19 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 IoEvent synth = {
                     conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
                 on_response_body_recvd<Loop>(lp, conn, synth);  // drain the rest of this recv
-            } else if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
-                // High watermark: stop reading upstream. tls_on_out_drain re-arms
-                // the recv once the buffer drains back below the low watermark.
+                return;
+            }
+            // The high watermark is the hard (memory-safety) stop and is checked
+            // BEFORE throttle so the throttle timer's resume never re-arms a read
+            // while the buffer is still full. Below the high watermark the buffer
+            // only drains, so a throttle pause/resume here can't overflow it.
+            if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
                 conn.tls_recv_paused_hw = true;
-            } else if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) {
+                loop->pause_upstream_recv(conn);  // drain re-arms at the low watermark
+                return;
+            }
+            if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
+            if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) {
                 loop->close_conn(conn);
             }
             return;
