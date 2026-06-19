@@ -101,10 +101,25 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
         return 0;
     for (u32 i = 0; i < n; i++) {
         if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') continue;  // pseudo-headers
+        if (hs[i].name.eq(Str{"cookie", 6})) continue;                 // combined below
         if (!put(hs[i].name.ptr, hs[i].name.len) || !put(": ", 2) ||
             !put(hs[i].value.ptr, hs[i].value.len) || !put("\r\n", 2))
             return 0;
     }
+    // HTTP/2 may split Cookie into multiple `cookie` fields (RFC 7540 §8.1.2.5).
+    // Join them into one HTTP/1 `cookie:` header (RFC 6265 form) so everything
+    // downstream — routing, handler parsing, cookie rate-limit keys — sees the
+    // full value instead of just the first field. Emitted after the other headers
+    // (a second pass) so an interleaved header can't split the cookie line.
+    bool cookie_open = false;
+    for (u32 i = 0; i < n; i++) {
+        if (!hs[i].name.eq(Str{"cookie", 6})) continue;
+        if (!put(cookie_open ? "; " : "cookie: ", cookie_open ? 2 : 8) ||
+            !put(hs[i].value.ptr, hs[i].value.len))
+            return 0;
+        cookie_open = true;
+    }
+    if (cookie_open && !put("\r\n", 2)) return 0;
     if (!put("\r\n", 2)) return 0;
     return o;
 }
@@ -194,6 +209,26 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         h2_emit_status(d, stream_id, route ? 503 : 200);
         return;
     }
+    // Meter here (not at HEADERS time) against the route this body request
+    // actually dispatches to — the config may have been reloaded since the
+    // header block arrived. synth is the full stored request, so header/cookie/
+    // query keys all extract correctly (no overflow possible: it was bounded at
+    // HEADERS time). See the kDeferredBody note in h2_dispatch_request.
+    if (route->rate_limit.count > 0) {
+        RateLimitKeyInput key_in;
+        key_in.peer_addr = d.conn->peer_addr;
+        key_in.req_buf = synth;
+        key_in.req_header_end = parser.header_end;
+        key_in.path = req.path.ptr;
+        key_in.path_len = req.path.len;
+        key_in.params = params;
+        key_in.param_count = pc;
+        const u32 kRouteIdx = static_cast<u32>(route - cfg->routes);
+        if (rate_limit_exceeded(d.loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
+            h2_emit_status(d, stream_id, 429);
+            return;
+        }
+    }
     h2_invoke_emit(d, stream_id, route, params, pc, synth, kLen);
 }
 
@@ -232,15 +267,23 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // (see rate_limit_enforce.h), so a route can't be called unmetered over h2.
     // Build an HTTP/1-shaped view so header/query/cookie key components extract
     // identically; IP and route-param keys work regardless of the synth.
-    if (route->rate_limit.count > 0) {
+    // A body-reading handler's dispatch is deferred to h2_finish_body (after the
+    // DATA frames), which re-matches the route against the then-current config.
+    // Meter THERE against the route that actually runs, not here — otherwise a
+    // config reload mid-body could charge a route that never executes (or skip
+    // the metering of the one that does). Immediate dispatches meter here.
+    const bool kDeferredBody = route->action == RouteAction::JitHandler && route->fn &&
+                               route->needs_req_body && !end_stream;
+    if (!kDeferredBody && route->rate_limit.count > 0) {
         u8 rl_synth[8192];
         const u32 kRlLen = h2_synth_h1_request(headers, nheaders, rl_synth, sizeof(rl_synth));
         if (kRlLen == 0 && rate_limit_needs_req_buf(route->rate_limit)) {
             // The HTTP/1 synthesis overflowed the scratch buffer (header block too
-            // large), so a header/query/cookie key would extract empty and collapse
+            // large), so a header/cookie key would extract empty and collapse
             // distinct callers into one bucket — a padded request could then throttle
-            // unrelated keys. Reject instead of metering an empty key. (IP/param-only
-            // rules don't read the buffer, so they fall through and meter normally.)
+            // unrelated keys. Reject instead of metering an empty key. (IP/param keys
+            // don't read the buffer, and query keys fall back to :path below, so they
+            // are not gated here.)
             h2_emit_status(d, stream_id, 431);  // Request Header Fields Too Large
             return;
         }
@@ -248,6 +291,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         key_in.peer_addr = d.conn->peer_addr;
         key_in.req_buf = kRlLen ? rl_synth : nullptr;
         key_in.req_header_end = kRlLen;
+        key_in.path = req.path.ptr;  // :path fallback for query keys on overflow
+        key_in.path_len = req.path.len;
         key_in.params = params;
         key_in.param_count = param_count;
         const u32 kRouteIdx = static_cast<u32>(route - config->routes);

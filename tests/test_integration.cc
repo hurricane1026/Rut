@@ -9,6 +9,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #endif
+#include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/hpack.h"
@@ -1098,23 +1099,27 @@ TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     rir.destroy();
 }
 
-// rate_limit_needs_req_buf gates the h2 synth-overflow reject: header/query/
-// cookie keys read the request buffer (must reject when it's unavailable rather
-// than meter an empty key and collapse callers); ip/param keys don't.
+// rate_limit_needs_req_buf gates the h2 synth-overflow reject: only header/cookie
+// keys must reject when the request buffer is unavailable (they can't be read any
+// other way). ip/param keys don't read the buffer, and query keys fall back to
+// the :path supplied separately — so none of those force a reject.
 TEST(rate_limit, needs_req_buf_only_for_buffer_keys) {
     using namespace rut;
+    // Kinds that do NOT require the request buffer.
+    const RateLimitKeyKind safe_kinds[2] = {RateLimitKeyKind::Param, RateLimitKeyKind::Query};
     RateLimitRuleSet ip_only;
     REQUIRE(ip_only.add_rule(100, 1) >= 0);  // default Ip key (no components)
     CHECK(!rate_limit_needs_req_buf(ip_only));
+    for (u32 i = 0; i < 2; i++) {
+        RateLimitRuleSet rs;
+        REQUIRE(rs.add_rule(100, 1) >= 0);
+        REQUIRE(rs.rules[0].key.add(safe_kinds[i], "k", 1));
+        CHECK(!rate_limit_needs_req_buf(rs));  // param / query: no reject
+    }
 
-    RateLimitRuleSet param_only;
-    REQUIRE(param_only.add_rule(100, 1) >= 0);
-    REQUIRE(param_only.rules[0].key.add(RateLimitKeyKind::Param, "id", 2));
-    CHECK(!rate_limit_needs_req_buf(param_only));
-
-    const RateLimitKeyKind buffer_kinds[3] = {
-        RateLimitKeyKind::Header, RateLimitKeyKind::Query, RateLimitKeyKind::Cookie};
-    for (u32 i = 0; i < 3; i++) {
+    // Kinds that REQUIRE the buffer (no fallback) → must reject on overflow.
+    const RateLimitKeyKind buffer_kinds[2] = {RateLimitKeyKind::Header, RateLimitKeyKind::Cookie};
+    for (u32 i = 0; i < 2; i++) {
         RateLimitRuleSet rs;
         REQUIRE(rs.add_rule(100, 1) >= 0);
         REQUIRE(rs.rules[0].key.add(buffer_kinds[i], "k", 1));
@@ -1128,6 +1133,42 @@ TEST(rate_limit, needs_req_buf_only_for_buffer_keys) {
     REQUIRE(mixed.add_rule(10, 1) >= 0);
     REQUIRE(mixed.rules[1].key.add(RateLimitKeyKind::Cookie, "sid", 3));
     CHECK(rate_limit_needs_req_buf(mixed));
+}
+
+// HTTP/2 may split Cookie into multiple `cookie` fields; the HTTP/1 synthesis
+// must join them into one `cookie:` header so cookie rate-limit keys (and the
+// handler) see the full value rather than only the first field.
+TEST(http2_synth, combines_split_cookie_fields) {
+    using namespace rut;
+    hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/api", 4}},
+        {{"cookie", 6}, {"a=1", 3}},
+        {{"x-test", 6}, {"y", 1}},
+        {{"cookie", 6}, {"sid=xyz", 7}},
+    };
+    u8 out[512];
+    const u32 kLen = h2_synth_h1_request(hs, 5, out, sizeof(out));
+    REQUIRE(kLen > 0);
+    Str s{reinterpret_cast<const char*>(out), kLen};
+    auto count = [&](const char* sub) {
+        u32 sl = 0;
+        while (sub[sl]) sl++;
+        int c = 0;
+        for (u32 i = 0; i + sl <= s.len; i++) {
+            bool m = true;
+            for (u32 j = 0; j < sl; j++)
+                if (s.ptr[i + j] != sub[j]) {
+                    m = false;
+                    break;
+                }
+            if (m) c++;
+        }
+        return c;
+    };
+    CHECK_EQ(count("cookie: "), 1);                  // exactly one Cookie line
+    CHECK_EQ(count("cookie: a=1; sid=xyz\r\n"), 1);  // values joined, RFC 6265 form
+    CHECK_EQ(count("x-test: y\r\n"), 1);             // interleaved header preserved
 }
 
 // A single `by:` source (no list) and the param/query/cookie sources parse.
