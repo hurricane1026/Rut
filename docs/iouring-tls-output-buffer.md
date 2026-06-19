@@ -449,7 +449,7 @@ can be a compile-time constant or per-shard config.
 - Watermark headroom: a full chunk just below the high watermark encrypts in one
   shot (no `WantWrite`) — guards `kTlsOutHigh = cap − kTlsRecordMax`.
 - Handshake flight (no `tls_pending_on_send`) doesn't spuriously fire a
-  continuation; partial socket send resubmits the remainder.
+  continuation.
 - In-flight length: read-ahead appends ciphertext after `ensure_draining`; the
   drain consumes only `ev.result` and partial-detects against
   `tls_out_inflight_len`, never the grown buffer length (no dup/drop).
@@ -527,8 +527,9 @@ This design is intentionally a stepping stone toward offloading the data-path
 crypto to the kernel (kTLS) or the NIC (kTLS + hardware inline offload), which
 Rut lists as a follow-up. The key is the §3 split:
 
-- **Generic transport layer** (owned buffer + one in-flight send + watermark
-  backpressure + per-chunk continuation) is **provider-agnostic** — keep as-is.
+- **Generic transport layer** (owned buffer + one in-flight chunked send +
+  watermark backpressure; single-shot continuation on drain, continuation-free
+  streaming) is **provider-agnostic** — keep as-is.
 - **Output provider** is the only thing offload swaps.
 
 So userspace records and kTLS are two providers of one seam, not two code paths:
@@ -539,11 +540,11 @@ So userspace records and kTLS are two providers of one seam, not two code paths:
 | `Ktls` | BoringSSL in userspace, then keys installed into the socket | write **plaintext** to the fd; kernel (or NIC) frames + AES-GCM encrypts inline | plaintext |
 
 What carries over **unchanged** to kTLS: own-the-bytes (no aliasing
-`upstream_recv_buf` across a send), one in-flight send draining `out_buf`,
-high/low watermark pause/resume, per-chunk continuation with the chunk's own
-length. kTLS is in fact **simpler** — no ciphertext expansion, no `SSL_write`
-`WANT_WRITE`/`WANT_READ` handling, and the §3.4(1) "ciphertext overflow" fallback
-disappears.
+`upstream_recv_buf` across a send), one in-flight chunked send draining `out_buf`,
+high/low watermark pause/resume, the single-shot-continuation-on-drain /
+continuation-free-streaming split. kTLS is in fact **simpler** — no ciphertext
+expansion, no `SSL_write` `WANT_WRITE`/`WANT_READ` handling, and the §3.5(1)
+"ciphertext overflow" fallback disappears.
 
 Mechanics to wire when adding the `Ktls` provider (out of scope for this PR, but
 the seam is reserved now):
