@@ -40,9 +40,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn);
 // Defined in callbacks_impl.h — drain-side accounting for a parked proxy-body
-// remainder re-encrypted from the drain / WANT_READ-resume paths.
+// remainder re-encrypted from the drain / WANT_READ-resume paths. May close the
+// connection (re-check tls_active after calling).
 template <typename Loop>
 void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly);
+// Defined in callbacks_impl.h — @throttle gate: pauses + arms the timer and
+// returns true when the byte-rate budget is in the future. Used to keep the
+// watermark resume from bypassing @throttle.
+template <typename Loop>
+bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remaining);
 
 template <class Self>
 void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
@@ -147,7 +153,15 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     if constexpr (requires { Self::kTlsOutLow; }) {
         if (c.tls_recv_paused_hw && c.tls_out_buf.len() <= Self::kTlsOutLow) {
             c.tls_recv_paused_hw = false;
-            if (!c.upstream_recv_armed) loop->submit_recv_upstream(c);
+            // Re-check @throttle so the watermark resume doesn't bypass the byte
+            // rate; if throttle pauses, its timer re-arms. Otherwise re-arm now and
+            // fail closed if the recv can't be queued (else the stream sits idle
+            // until timeout — the pause flag is already cleared so no drain retries).
+            if (!throttle_pause_before_pump<Self>(loop, c, 0) && !c.upstream_recv_armed &&
+                !loop->submit_recv_upstream(c)) {
+                loop->close_conn(c);
+                return;
+            }
         }
     }
 
@@ -165,8 +179,12 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         // For a parked proxy-body remainder, account the bytes just encrypted; when
         // the remainder finishes this advances the body state (resp_fully_buffered)
         // and resumes the paused upstream read. (Single-shot sends skip this and
-        // finalize via the buffer-empty branch below.)
-        if (c.tls_proxy_stream) proxy_tls_parked_drained<Self>(loop, c, consumed);
+        // finalize via the buffer-empty branch below.) It can replay raced-in bytes
+        // and close on failure — bail if it did.
+        if (c.tls_proxy_stream) {
+            proxy_tls_parked_drained<Self>(loop, c, consumed);
+            if (!c.tls_active) return;
+        }
         if (kSt == TlsFill::NeedRoom) return;  // still full — resume at the next drain
         if (kSt == TlsFill::NeedRead) {
             // SSL_write needs peer input to retry. If no recv is armed and we
@@ -352,6 +370,13 @@ void tls_process(Self* loop, Connection& c) {
                     loop->close_conn(c);
                     return;
                 }
+                // Same parked-proxy-tail accounting as the other resume paths —
+                // without it a NeedRead that unblocks via a recv carrying app data
+                // would drop the just-encrypted body bytes.
+                if (c.tls_proxy_stream) {
+                    proxy_tls_parked_drained<Self>(loop, c, consumed);
+                    if (!c.tls_active) return;
+                }
                 if (kFs == TlsFill::NeedRead)
                     c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
             }
@@ -425,8 +450,11 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
     }
     // A parked proxy-body remainder advances its accounting here too (same as the
     // drain path) — otherwise a NeedRead-resumed proxy chunk would lose its body
-    // bytes / never mark resp_fully_buffered.
-    if (c.tls_proxy_stream) proxy_tls_parked_drained<Self>(loop, c, consumed);
+    // bytes / never mark resp_fully_buffered. It may close on a replay failure.
+    if (c.tls_proxy_stream) {
+        proxy_tls_parked_drained<Self>(loop, c, consumed);
+        if (!c.tls_active) return;
+    }
     if (kSt == TlsFill::NeedRead) {
         // Need peer input again to retry — fail closed if no recv can be armed.
         c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;

@@ -219,29 +219,42 @@ inline bool proxy_body_complete(const Connection& conn) {
 // tls_resume_pending_send_recv re-encrypt it; `newly` is the plaintext encrypted
 // this pass. Once the whole remainder is in, shift the upstream buffer past it,
 // finalize the body state, and either complete-on-drain or resume the read
-// (honoring the high watermark). Defined here (not in tls_iouring.h) so it can
-// reach consume_upstream_sent / the body state; forward-declared there.
+// (honoring the watermark and @throttle). Defined here (not in tls_iouring.h) so
+// it can reach consume_upstream_sent / on_response_body_recvd / the body state;
+// forward-declared there. May close the connection — callers must re-check
+// tls_active before touching conn again.
 template <typename Loop>
 void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
     conn.resp_body_sent += newly;
     throttle_advance(conn, newly);
     if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial
     conn.upstream_send_len = conn.tls_send_len;
-    consume_upstream_sent(conn);  // shift upstream_recv_buf past the parked tail
+    // The multishot recv may have raced more body into upstream_recv_buf behind the
+    // parked tail before the pause took effect; consume_upstream_sent returns it.
+    const u32 kRemaining = consume_upstream_sent(conn);
     conn.tls_send_src = nullptr;
     conn.tls_send_len = 0;
     conn.tls_send_off = 0;
     if (proxy_body_complete(conn)) {
         conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
-        loop->pause_upstream_recv(conn);
+        if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);
         return;
     }
-    // More body to read. The buffer may still be above the high watermark (we
-    // parked because it filled) — let the drain's low-watermark logic re-arm.
+    if (kRemaining > 0) {
+        // Bytes already buffered (the multishot raced them in behind the tail) —
+        // encrypt them now, like the main read path; they're in memory and not
+        // subject to the watermark.
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        on_response_body_recvd<Loop>(loop, conn, synth);
+        return;
+    }
+    // More body expected, buffer drained: honor the high watermark, then @throttle,
+    // before re-arming the (paused) upstream read.
     if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
-        conn.tls_recv_paused_hw = true;
+        conn.tls_recv_paused_hw = true;  // drain's low-watermark logic re-arms
         return;
     }
+    if (throttle_pause_before_pump<Loop>(loop, conn, 0)) return;
     if (!conn.upstream_recv_armed && !loop->submit_recv_upstream(conn)) loop->close_conn(conn);
 }
 
@@ -1676,7 +1689,12 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 conn.tls_send_src = conn.upstream_recv_buf.data();
                 conn.tls_send_len = send_len - enc;
                 conn.tls_send_off = 0;
-                loop->pause_upstream_recv(conn);  // multishot recv must be cancelled, not flagged
+                // Cancel the multishot recv; the cancel SQE can fail to queue under
+                // SQ pressure, leaving it live — fail closed rather than overflow.
+                if (!loop->pause_upstream_recv(conn)) {
+                    loop->close_conn(conn);
+                    return;
+                }
                 if (kFill == TlsFill::NeedRead) {
                     conn.tls_pending_on_recv = &tls_resume_pending_send_recv<Loop>;
                     if (!conn.recv_armed && !loop->submit_recv(conn)) loop->close_conn(conn);
@@ -1690,7 +1708,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             const u32 kRemaining = consume_upstream_sent(conn);  // shift past encrypted chunk
             if (kBodyDone) {
                 conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
-                loop->pause_upstream_recv(conn);  // stop the multishot; no more body to read
+                if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);  // stop multishot
                 return;
             }
             if (kRemaining > 0) {
@@ -1709,7 +1727,9 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             // only drains, so a throttle pause/resume here can't overflow it.
             if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
                 conn.tls_recv_paused_hw = true;
-                loop->pause_upstream_recv(conn);  // drain re-arms at the low watermark
+                // Cancel may fail to queue (SQ full) — close rather than let the
+                // multishot keep filling above the stop line.
+                if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);
                 return;
             }
             if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
