@@ -499,28 +499,38 @@ public:
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
-            // A send still mid-encryption (its plaintext didn't fit one TLS
-            // record / tls_out_slice) must not be overwritten or its remainder is
-            // lost. The upper layer serializes client sends via pause/resume, so
-            // this only arises for reverse-proxy streaming of body chunks larger
-            // than one TLS record; fail safe (caller closes) rather than corrupt.
-            // TODO: depth-1 queue to support proxy-over-TLS streaming of >16KB
-            // chunks on io_uring.
+            // A previous single-shot send still mid-encryption (its plaintext
+            // didn't fit tls_out_buf in one shot) must not be overwritten or its
+            // remainder is lost. The upper layer serializes client sends via
+            // pause/resume; phase 3 decouples proxy streaming. Fail safe (caller
+            // closes) rather than corrupt.
             if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
                 close_conn(c);
                 return false;
             }
-            // Encrypt via the TlsEngine; ciphertext is sent by tls_pump_send.
+            // Encrypt into the owned tls_out_buf; ciphertext drains via
+            // tls_on_out_drain, which fires this continuation once fully sent.
             c.tls_pending_on_send = c.on_send;
             c.tls_send_src = buf;
             c.tls_send_len = len;
             c.tls_send_off = 0;
-            if (tls_pump_send<Self>(this, c)) return true;
-            c.tls_pending_on_send = nullptr;
-            c.tls_send_src = nullptr;
-            c.tls_send_len = 0;
-            c.tls_send_off = 0;
-            return false;
+            u32 consumed = 0;
+            const TlsFill kFs = tls_fill_output<Self>(this, c, buf, len, consumed);
+            c.tls_send_off = consumed;
+            if (kFs == TlsFill::Fatal) {
+                c.tls_pending_on_send = nullptr;
+                c.tls_send_src = nullptr;
+                c.tls_send_len = 0;
+                c.tls_send_off = 0;
+                return false;  // caller closes
+            }
+            if (kFs == TlsFill::NeedRead) {
+                c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+                if (!c.recv_armed) submit_recv(c);
+            }
+            // Done / NeedRoom: the upper-layer continuation fires from
+            // tls_on_out_drain once the whole plaintext is encrypted and sent.
+            return true;
         }
         return submit_send_raw(c, buf, len);
     }

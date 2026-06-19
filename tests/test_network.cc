@@ -1410,10 +1410,11 @@ TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
     CHECK_EQ(tls_engine_output_len(engine), 7u);
 }
 
-TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
+TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     Connection conn;
     u8 recv_storage[SmallLoop::kBufSize];
     u8 send_storage[SmallLoop::kBufSize];
+    u8 tls_out_storage[256];
     conn.reset();
     conn.id = 7;
     conn.fd = 42;
@@ -1421,52 +1422,35 @@ TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
     conn.send_slice = send_storage;
     conn.recv_buf.bind(recv_storage, SmallLoop::kBufSize);
     conn.send_buf.bind(send_storage, SmallLoop::kBufSize);
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
     conn.tls_active = true;
     conn.tls_out_inflight = true;
+    conn.tls_out_inflight_len = 0;  // ciphertext already drained; just complete
     conn.tls_send_src = reinterpret_cast<const u8*>("plain");
     conn.tls_send_len = 5;
-    conn.tls_send_off = 5;
+    conn.tls_send_off = 5;  // fully encrypted — no parked remainder
     conn.tls_pending_on_send = &tls_pending_send_probe;
-    conn.on_send = &tls_on_out_sent<IoUringEventLoop>;
+    conn.on_send = &tls_on_out_drain<IoUringEventLoop>;
     g_tls_pending_send_called = false;
     g_tls_pending_send_result = 0;
 
-    tls_on_out_sent<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
+    tls_on_out_drain<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
 
     CHECK(g_tls_pending_send_called);
-    CHECK_EQ(g_tls_pending_send_result, 5u);
+    CHECK_EQ(g_tls_pending_send_result, 5u);  // fires with the plaintext length
     CHECK(!conn.tls_out_inflight);
     CHECK(conn.tls_send_src == nullptr);
     CHECK_EQ(conn.tls_send_len, 0u);
     CHECK(conn.tls_pending_on_send == nullptr);
 }
 
-TEST(tls_iouring, queued_send_keeps_tls_completion_hook_during_inflight_flight) {
-    // A response send issued while a control/handshake ciphertext flight is still
-    // draining must leave on_send pointing at tls_on_out_sent, so the in-flight
-    // Send CQE resumes the TLS layer instead of being mis-handled as this
-    // response's completion. transition_to_sending() overwrote on_send with the
-    // upper-layer continuation (saved in tls_pending_on_send) just before the
-    // send funneled through tls_pump_send.
-    Connection conn;
-    conn.reset();
-    conn.id = 11;
-    conn.tls_active = true;
-    conn.tls_out_inflight = true;            // a prior flight is still draining
-    conn.on_send = &tls_pending_send_probe;  // clobbered upper-layer continuation
-    conn.tls_pending_on_send = &tls_pending_send_probe;
-
-    CHECK(tls_pump_send<IoUringEventLoop>(nullptr, conn));
-    CHECK(conn.on_send == &tls_on_out_sent<IoUringEventLoop>);  // hook restored
-    CHECK(conn.tls_out_inflight);                               // queued send waits
-    CHECK(conn.tls_pending_on_send == &tls_pending_send_probe);
-}
-
-TEST(tls_iouring, flush_out_no_output_is_noop) {
+TEST(tls_iouring, ensure_draining_empty_buffer_is_noop) {
     Connection conn;
     conn.reset();
     conn.id = 8;
-    CHECK(tls_flush_out<IoUringEventLoop>(nullptr, conn));
+    conn.tls_active = true;
+    // tls_out_buf is empty — nothing to submit, no loop deref.
+    CHECK(tls_ensure_draining<IoUringEventLoop>(nullptr, conn));
     CHECK(!conn.tls_out_inflight);
 }
 

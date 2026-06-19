@@ -3102,6 +3102,7 @@ bool tls_engine_handshake_loopback(TlsEngine& eng, TlsClientPeer& cl) {
 }
 
 struct TlsIouringHarness : SmallLoop {
+    [[maybe_unused]] static constexpr u32 kTlsDrainChunk = SlicePool::kSliceSize;
     bool sent = false;
     bool closed = false;
 
@@ -3128,8 +3129,8 @@ void tls_iouring_plain_recv_probe(void* /*lp*/, Connection& /*conn*/, IoEvent ev
 }  // namespace
 
 // Encrypt a payload far larger than the output buffer, forcing the WantWrite /
-// flush-and-continue loop that tls_pump_send + tls_on_out_sent drive over
-// tls_out_slice on io_uring (the exact path the sandbox can't e2e-test).
+// flush-and-continue loop that tls_fill_output drives over tls_out_buf on
+// io_uring (the exact path the sandbox can't e2e-test).
 TEST(tls_engine, encrypt_continuation_large_payload) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
     REQUIRE(tls_ctx.has_value());

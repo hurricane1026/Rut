@@ -16,7 +16,7 @@
 //     TLS is free to use it as the ciphertext-send completion hook.
 //
 // Ciphertext-out production (handshake flights and encrypted app data) is gated
-// on tls_out_inflight: only one party may write tls_out_slice at a time, or a
+// on tls_out_inflight: only one party may write tls_out_buf at a time, or a
 // fast loopback peer's next flight could overwrite a flight the kernel is still
 // sending.
 
@@ -36,9 +36,7 @@ template <class Self>
 void on_header_received(void* lp, Connection& conn, IoEvent ev);
 
 template <class Self>
-void tls_on_out_sent(void* lp, Connection& c, IoEvent ev);
-template <class Self>
-bool tls_pump_send(Self* loop, Connection& c);
+void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
 template <class Self>
 void tls_process(Self* loop, Connection& c);
 template <class Self>
@@ -68,7 +66,7 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
     if (!loop->submit_send_raw(c, c.tls_out_buf.data(), kN)) return false;
     c.tls_out_inflight = true;
     c.tls_out_inflight_len = kN;
-    c.on_send = &tls_on_out_sent<Self>;  // phase 2 renames this to tls_on_out_drain
+    c.on_send = &tls_on_out_drain<Self>;
     return true;
 }
 
@@ -103,78 +101,53 @@ TlsFill tls_fill_output(Self* loop, Connection& c, const u8* src, u32 len, u32& 
     return TlsFill::Done;
 }
 
-// Send ciphertext staged in tls_out_slice. The bytes are already encrypted, so
-// this uses the raw (non-TLS) send. Marks the buffer in-flight; the completion
-// lands in tls_on_out_sent.
+// Ciphertext-send completion. The io_uring backend has full-send semantics (it
+// re-submits a partial IORING_OP_SEND internally and only emits this event once
+// the whole submitted chunk drained), so ev.result == tls_out_inflight_len.
+// Consume the sent chunk; resume encrypting a parked plaintext remainder; keep a
+// send draining while ciphertext remains; once the buffer is empty fire the
+// single-shot continuation (tls_pending_on_send) or run the handshake tail.
+// Proxy-streaming completion (resp_fully_buffered / watermark) is added in a
+// later phase.
 template <class Self>
-bool tls_flush_out(Self* loop, Connection& c) {
-    const u32 kN = tls_engine_output_len(c.tls_engine);
-    if (kN == 0) return true;
-    if (c.tls_out_inflight) return true;  // a prior flush is still draining
-    if (!loop->submit_send_raw(c, c.tls_out_slice, kN)) return false;
-    c.tls_out_inflight = true;
-    c.on_send = &tls_on_out_sent<Self>;
-    return true;
-}
-
-// Encrypt pending plaintext (tls_send_src/off/len) into tls_out_slice and send.
-// One TLS record's worth at a time when the plaintext exceeds the slice; the
-// rest resumes from tls_on_out_sent once this flight drains.
-template <class Self>
-bool tls_pump_send(Self* loop, Connection& c) {
-    if (c.tls_out_inflight) {
-        // A prior ciphertext flight (a handshake/control flight such as a TLS 1.3
-        // KeyUpdate emitted while reading) is still draining tls_out_slice, so
-        // this plaintext send is queued and resumes from tls_on_out_sent. The
-        // caller reached us via transition_to_sending(), which just overwrote
-        // on_send with the upper-layer continuation (already saved in
-        // tls_pending_on_send). Restore the TLS completion hook so the in-flight
-        // flight's Send CQE drives the TLS layer instead of being mis-handled as
-        // this response's completion.
-        c.on_send = &tls_on_out_sent<Self>;
-        return true;  // resumes on the send completion
-    }
-    tls_engine_set_output(c.tls_engine, c.tls_out_slice, SlicePool::kSliceSize);
-    while (c.tls_send_off < c.tls_send_len) {
-        TlsOp st = TlsOp::Ok;
-        const i32 kW = tls_engine_write(
-            c.tls_engine, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, st);
-        if (kW > 0) {
-            c.tls_send_off += static_cast<u32>(kW);
-            continue;
-        }
-        if (st == TlsOp::WantWrite) break;  // slice full — flush, continue later
-        if (st == TlsOp::WantRead) {
-            c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-            if (!c.recv_armed && !loop->submit_recv(c)) return false;
-            return true;
-        }
-        return false;  // fatal
-    }
-    if (tls_engine_output_len(c.tls_engine) == 0) {
-        c.tls_send_src = nullptr;  // nothing to send (len 0)
-        return true;
-    }
-    return tls_flush_out<Self>(loop, c);
-}
-
-// Ciphertext-send completion. Resumes app-data encryption if plaintext remains,
-// otherwise clears send state and drains any request ciphertext buffered while
-// the response was in flight.
-template <class Self>
-void tls_on_out_sent(void* lp, Connection& c, IoEvent ev) {
+void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
-    c.tls_out_inflight = false;
-    if (ev.result < 0) {
+    if (ev.result <= 0) {
         loop->close_conn(c);
         return;
     }
+    c.tls_out_buf.consume(c.tls_out_inflight_len);
+    c.tls_out_inflight = false;
+    c.tls_out_inflight_len = 0;
+
+    // (a) Finish a parked plaintext remainder (the buffer filled mid-chunk)
+    // before any completion, so the chunk's tail is never lost.
     if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
-        if (!tls_pump_send<Self>(loop, c)) loop->close_conn(c);
+        u32 consumed = 0;
+        const TlsFill kSt = tls_fill_output<Self>(
+            loop, c, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, consumed);
+        c.tls_send_off += consumed;
+        if (kSt == TlsFill::Fatal) {
+            loop->close_conn(c);
+            return;
+        }
+        if (kSt == TlsFill::NeedRoom) return;  // still full — resume at the next drain
+        if (kSt == TlsFill::NeedRead) {
+            c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+            if (!c.recv_armed) loop->submit_recv(c);
+            return;
+        }
+        // Done: remainder fully encrypted — fall through.
+    }
+
+    if (c.tls_out_buf.len() > 0) {  // more ciphertext queued — push the next chunk
+        if (!tls_ensure_draining<Self>(loop, c)) loop->close_conn(c);
         return;
     }
-    // App-data send fully drained (or this was a handshake flight: src null).
-    const u32 completed_len = c.tls_send_len;
+
+    // Buffer empty: app-data send fully drained (or a handshake/control flight,
+    // which has no upper-layer continuation).
+    const u32 kCompletedLen = c.tls_send_len;
     c.tls_send_src = nullptr;
     c.tls_send_len = 0;
     c.tls_send_off = 0;
@@ -185,7 +158,7 @@ void tls_on_out_sent(void* lp, Connection& c, IoEvent ev) {
         IoEvent sev = {};
         sev.conn_id = c.id;
         sev.type = IoEventType::Send;
-        sev.result = static_cast<i32>(completed_len);
+        sev.result = static_cast<i32>(kCompletedLen);
         pending(loop, c, sev);
         if (!c.tls_active) return;
     } else {
@@ -206,33 +179,34 @@ void tls_on_out_sent(void* lp, Connection& c, IoEvent ev) {
 // Deferred entirely while a ciphertext send is in flight (see file header).
 template <class Self>
 void tls_process(Self* loop, Connection& c) {
-    if (c.tls_out_inflight) return;  // can't touch tls_out_slice mid-send
+    if (c.tls_out_inflight) return;  // can't touch tls_out_buf mid-send
     tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
 
     if (!c.tls_engine.handshake_done) {
-        tls_engine_set_output(c.tls_engine, c.tls_out_slice, SlicePool::kSliceSize);
+        tls_engine_set_output(c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
         const TlsOp kSt = tls_engine_handshake(c.tls_engine);
         c.tls_in_buf.consume(tls_engine_input_consumed(c.tls_engine));
         if (kSt == TlsOp::Error) {
             loop->close_conn(c);
             return;
         }
-        if (tls_engine_output_len(c.tls_engine) > 0 && !tls_flush_out<Self>(loop, c)) {
+        c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
+        if (!tls_ensure_draining<Self>(loop, c)) {
             loop->close_conn(c);
             return;
         }
         if (!c.tls_engine.handshake_done) {
-            loop->submit_recv(c);  // await the client's next flight
+            if (!c.tls_out_inflight) loop->submit_recv(c);  // await the client's next flight
             return;
         }
         if (tls_negotiated_protocol(c.tls_engine.ssl) == AlpnProtocol::H2)
             c.protocol = ConnProtocol::Http2;
         c.tls_handshake_complete = true;
-        // The handshake-completion flight just flushed (line above) may include
-        // the TLS 1.3 NewSessionTicket and is still draining tls_out_slice. Don't
-        // fall into the decrypt loop yet — SSL_read can emit control output onto
-        // tls_out_slice (post-handshake messages) and would corrupt the in-flight
-        // flight. tls_on_out_sent re-enters tls_process once the CQE clears it,
+        // The handshake-completion flight just queued (above) may include the
+        // TLS 1.3 NewSessionTicket and is still draining tls_out_buf. Don't fall
+        // into the decrypt loop yet — SSL_read can emit control output (post-
+        // handshake messages) that we'd append to a buffer the kernel is still
+        // sending. tls_on_out_drain re-enters tls_process once the CQE clears it,
         // with the client's pipelined app data still buffered in tls_in_buf.
         if (c.tls_out_inflight) return;
         // Decrypt any app data the client pipelined after its Finished.
@@ -244,10 +218,13 @@ void tls_process(Self* loop, Connection& c) {
         return;
     }
 
-    tls_engine_set_output(c.tls_engine, c.tls_out_slice, SlicePool::kSliceSize);
     for (;;) {
         const u32 kBefore = c.recv_buf.len();
         bool saw_close_notify = false;
+        // SSL_read can emit control ciphertext (e.g. a KeyUpdate response) into
+        // the output region; point it at the current tls_out_buf write position
+        // each round so produced bytes append, never overwrite queued ciphertext.
+        tls_engine_set_output(c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
         for (;;) {
             const u32 kAvail = c.recv_buf.write_avail();
             if (kAvail == 0) break;
@@ -269,7 +246,8 @@ void tls_process(Self* loop, Connection& c) {
             }
             if (st == TlsOp::WantWrite) {
                 c.tls_in_buf.consume(tls_engine_input_consumed(c.tls_engine));
-                if (!tls_flush_out<Self>(loop, c)) loop->close_conn(c);
+                c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
+                if (!tls_ensure_draining<Self>(loop, c)) loop->close_conn(c);
                 return;
             }
             loop->close_conn(c);  // fatal
@@ -278,19 +256,20 @@ void tls_process(Self* loop, Connection& c) {
         const u32 kConsumed = tls_engine_input_consumed(c.tls_engine);
         c.tls_in_buf.consume(kConsumed);
         const bool kHasControlOutput = tls_engine_output_len(c.tls_engine) > 0;
+        if (kHasControlOutput) c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));
         if (c.recv_buf.len() <= kBefore) {
             if (kConsumed > 0 && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>) {
                 tls_resume_pending_send_recv<Self>(loop, c, {});
                 return;
             }
             if (kHasControlOutput) {
-                if (!tls_flush_out<Self>(loop, c)) loop->close_conn(c);
+                if (!tls_ensure_draining<Self>(loop, c)) loop->close_conn(c);
                 return;
             }
             break;  // produced nothing this round
         }
         if (saw_close_notify) c.keep_alive = false;
-        if (kHasControlOutput && !tls_flush_out<Self>(loop, c)) {
+        if (kHasControlOutput && !tls_ensure_draining<Self>(loop, c)) {
             loop->close_conn(c);
             return;
         }
@@ -302,9 +281,20 @@ void tls_process(Self* loop, Connection& c) {
         auto pending_recv = c.tls_pending_on_recv;
         if (pending_recv == &tls_resume_pending_send_recv<Self>) {
             c.tls_pending_on_recv = nullptr;
-            if (!tls_pump_send<Self>(loop, c)) {
-                loop->close_conn(c);
-                return;
+            if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
+                u32 consumed = 0;
+                const TlsFill kFs = tls_fill_output<Self>(loop,
+                                                          c,
+                                                          c.tls_send_src + c.tls_send_off,
+                                                          c.tls_send_len - c.tls_send_off,
+                                                          consumed);
+                c.tls_send_off += consumed;
+                if (kFs == TlsFill::Fatal) {
+                    loop->close_conn(c);
+                    return;
+                }
+                if (kFs == TlsFill::NeedRead)
+                    c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
             }
             pending_recv = &on_header_received<Self>;
         } else if (!pending_recv) {
@@ -363,7 +353,19 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
     auto* loop = static_cast<Self*>(lp);
     c.tls_pending_on_recv = nullptr;
     if (!c.tls_send_src || c.tls_send_off >= c.tls_send_len) return;
-    if (!tls_pump_send<Self>(loop, c)) loop->close_conn(c);
+    u32 consumed = 0;
+    const TlsFill kSt = tls_fill_output<Self>(
+        loop, c, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, consumed);
+    c.tls_send_off += consumed;
+    if (kSt == TlsFill::Fatal) {
+        loop->close_conn(c);
+        return;
+    }
+    if (kSt == TlsFill::NeedRead) {
+        c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+        if (!c.recv_armed) loop->submit_recv(c);
+    }
+    // NeedRoom resumes at the next drain; Done drains via tls_on_out_drain.
 }
 
 }  // namespace rut
