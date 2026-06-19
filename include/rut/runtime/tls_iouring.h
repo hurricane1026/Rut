@@ -34,6 +34,11 @@ namespace rut {
 // Defined in callbacks_impl.h — the HTTP recv entrypoint we hand plaintext to.
 template <class Self>
 void on_header_received(void* lp, Connection& conn, IoEvent ev);
+// Defined in callbacks_impl.h — proxy body fully forwarded: release the upstream
+// slot, complete the request, continue keep-alive. Shared with the io_uring-TLS
+// owned-buffer drain path (tls_on_out_drain).
+template <typename Loop>
+void proxy_stream_complete(Loop* loop, Connection& conn);
 
 template <class Self>
 void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
@@ -167,6 +172,8 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     auto pending = c.tls_pending_on_send;
     c.tls_pending_on_send = nullptr;
     if (pending) {
+        // Single-shot send (response / wait(send)): fire the upper-layer
+        // continuation now, on the real drain CQE, with the plaintext length.
         c.on_send = pending;
         IoEvent sev = {};
         sev.conn_id = c.id;
@@ -174,6 +181,17 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         sev.result = static_cast<i32>(kCompletedLen);
         pending(loop, c, sev);
         if (!c.tls_active) return;
+    } else if (c.tls_proxy_stream) {
+        // Proxy streaming body (read/drain decoupled): the request completes only
+        // when the whole body is buffered AND the buffer is empty. Otherwise the
+        // body is still arriving — stay idle and wait for the next upstream recv;
+        // do NOT fall into the handshake tail (it would clear on_send / submit a
+        // client recv mid-body and read pipelined data out of order).
+        if (c.resp_fully_buffered) {
+            c.tls_proxy_stream = false;
+            proxy_stream_complete<Self>(loop, c);
+        }
+        return;
     } else {
         c.on_send = nullptr;  // handshake/control flight; no upper-layer continuation
     }
