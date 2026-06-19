@@ -526,7 +526,18 @@ public:
             }
             if (kFs == TlsFill::NeedRead) {
                 c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-                if (!c.recv_armed) submit_recv(c);
+                // SSL_write needs peer input to retry. If no recv is armed and one
+                // can't be queued (SQ pressure), nothing will ever deliver that
+                // input — fail closed rather than hang until the idle timeout
+                // (mirrors the resume/drain WANT_READ paths).
+                if (!c.recv_armed && !submit_recv(c)) {
+                    c.tls_pending_on_recv = nullptr;
+                    c.tls_pending_on_send = nullptr;
+                    c.tls_send_src = nullptr;
+                    c.tls_send_len = 0;
+                    c.tls_send_off = 0;
+                    return false;  // caller closes
+                }
             }
             // Done / NeedRoom: the upper-layer continuation fires from
             // tls_on_out_drain once the whole plaintext is encrypted and sent.
