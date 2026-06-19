@@ -78,6 +78,27 @@ lazy.** Everything else is the backpressure + continuation timing around it.
 This removes the depth-1 queue entirely and dissolves the root cause of all three
 findings.
 
+This design also splits cleanly into two layers, which matters for future TLS
+hardware/kernel offload (see §7):
+
+- **Generic transport layer** — owned output buffer, one in-flight send,
+  high/low watermark backpressure, per-chunk continuation. Independent of how the
+  bytes are produced.
+- **Output provider** — the "plaintext → sendable bytes" step. Today there is one
+  provider (userspace records: BoringSSL `SSL_write` → ciphertext). kTLS / NIC
+  inline offload is a second provider that swaps only this step (write plaintext;
+  kernel/NIC encrypts), reusing the generic layer unchanged.
+
+To keep that seam open, the buffer and the fill step are named neutrally rather
+than baked to "ciphertext / SSL_write":
+
+```cpp
+enum class TlsOutputMode : u8 { UserspaceRecord, Ktls };  // per-connection, set at handshake
+// fill_output(conn, plaintext, len) -> consumed
+//   UserspaceRecord: SSL_write the plaintext into out_buf (produces ciphertext)
+//   Ktls:            copy/zero-copy the plaintext into out_buf; kernel/NIC encrypts on send
+```
+
 ### 3.1 Data structures (`connection_base.h`)
 
 Remove (depth-1 queue): `tls_send_q_src`, `tls_send_q_len`.
@@ -261,3 +282,61 @@ continuation is invoked synchronously, so the recursion depth (proxy pump →
 client_send → fire continuation → proxy pump …) must be confirmed bounded
 (≈ `kTlsOutBufCap / chunk` ≈ 4 levels; the codebase already has a similar bounded
 recursion in the `kRemaining > 0` proxy path). CI is the backstop for both.
+
+## 7. Forward compatibility: kTLS / NIC inline TLS offload
+
+This design is intentionally a stepping stone toward offloading the data-path
+crypto to the kernel (kTLS) or the NIC (kTLS + hardware inline offload), which
+Rut lists as a follow-up. The key is the §3 split:
+
+- **Generic transport layer** (owned buffer + one in-flight send + watermark
+  backpressure + per-chunk continuation) is **provider-agnostic** — keep as-is.
+- **Output provider** is the only thing offload swaps.
+
+So userspace records and kTLS are two providers of one seam, not two code paths:
+
+| Provider | Handshake | Data path | `out_buf` holds |
+|---|---|---|---|
+| `UserspaceRecord` (today) | BoringSSL in userspace | `SSL_write` → ciphertext | ciphertext |
+| `Ktls` | BoringSSL in userspace, then keys installed into the socket | write **plaintext** to the fd; kernel (or NIC) frames + AES-GCM encrypts inline | plaintext |
+
+What carries over **unchanged** to kTLS: own-the-bytes (no aliasing
+`upstream_recv_buf` across a send), one in-flight send draining `out_buf`,
+high/low watermark pause/resume, per-chunk continuation with the chunk's own
+length. kTLS is in fact **simpler** — no ciphertext expansion, no `SSL_write`
+`WANT_WRITE`/`WANT_READ` handling, and the §3.4(1) "ciphertext overflow" fallback
+disappears.
+
+Mechanics to wire when adding the `Ktls` provider (out of scope for this PR, but
+the seam is reserved now):
+
+1. **Mode switch at handshake completion.** After BoringSSL finishes the
+   handshake, install the negotiated keys into the socket
+   (`setsockopt(TCP_ULP, "tls")` + `TLS_TX`/`TLS_RX`) and set
+   `conn.tls_output_mode = Ktls`. The generic layer then routes `fill_output`
+   to a plaintext copy instead of `SSL_write`.
+2. **io_uring transport.** kTLS works with `IORING_OP_SEND`/`SENDMSG`. True
+   zero-copy (`IORING_OP_SEND_ZC`) + NIC inline offload has kernel-version / NIC
+   dependencies; its "buffer stays pinned until the zero-copy completion
+   notification" requirement maps directly onto this design's "one in-flight
+   send, don't reuse until completion" discipline — so SEND_ZC can later let the
+   `Ktls` provider send plaintext **directly from `upstream_recv_buf`** (no copy)
+   by holding it until the ZC completion.
+3. **Post-handshake control records (KeyUpdate, etc.).** Under kTLS some are
+   handled by the kernel and some surface to userspace via control messages
+   (`cmsg` / `TLS_GET_RECORD_TYPE`). Handled inside the provider; orthogonal to
+   the buffering/backpressure logic.
+4. **Capability probe + fallback.** Not every kernel/NIC supports the offload.
+   Probe at startup (or per connection) and fall back to `UserspaceRecord` —
+   the same pattern as the existing io_uring→epoll backend fallback.
+
+Naming consequence for this PR (Phase 0): name the buffer `tls_out_buf` and the
+fill step neutrally (a `fill_output`/provider indirection) rather than hard-wiring
+"ciphertext"/`SSL_write`, and reserve `TlsOutputMode` even though only
+`UserspaceRecord` is implemented now. That keeps kTLS a drop-in provider later
+instead of a rewrite.
+
+> External **TLS-terminating appliance** (a separate box doing TLS, Rut speaking
+> plaintext to it) is a different thing entirely: there Rut isn't doing TLS, so
+> this whole path is bypassed and the plaintext send path applies — trivially
+> "supported" because there is no TLS in Rut's data path.
