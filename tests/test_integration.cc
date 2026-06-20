@@ -2955,6 +2955,25 @@ TEST(uring, upstream_recv_pause_active_response_terminal_is_delivered) {
     loop->shutdown();
 }
 
+// When the connection is being torn down (upstream_fd < 0), the cancel's own CQE must
+// account the cancel but NOT re-arm a recv on the dead fd.
+TEST(uring, upstream_recv_pause_cancel_no_rearm_after_close) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.upstream_recv_armed = false;  // recv already drained; cancel still in flight
+    conn.upstream_fd = -1;             // close_conn closed the upstream
+
+    loop->dispatch(pause_cancel_cqe(conn.id));
+    CHECK(!conn.upstream_recv_pause_cancel_pending);  // cancel accounted
+    CHECK(!conn.upstream_recv_armed);                 // NOT re-armed on the dead fd
+    loop->shutdown();
+}
+
 // Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
 // pending, and re-arms once the late cancel CQE arrives after the handler has
 // already asked to keep reading.
@@ -7625,6 +7644,63 @@ TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     loop->shutdown();
     close(listen_fd);
     destroy_real_loop(loop);
+}
+
+// Same WebSocket passthrough, but on io_uring — exercises the 101 handshake's
+// pre-tunnel recv pause (ws_pause_upstream_recv → the tracked user_data cancel) and
+// on_ws_101_sent re-arming submit_recv_upstream on the SAME upstream fd. The re-arm
+// must wait for the cancel's own completion to drain; if the in-flight cancel could
+// match the re-armed tunnel recv (Codex P1-C), the echo below would hang. Runs on
+// real io_uring (CI) and under ASan.
+TEST(websocket_e2e, passthrough_tunnel_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    using namespace rut;
+    WsEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/ws", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->config_ptr = &active;  // plaintext (no tls_server)
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 5);
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));  // upgrade relayed
+
+    // Multiple echo rounds: a tunnel recv silently cancelled by the same-fd re-arm
+    // race would hang one of these reads.
+    REQUIRE(send_all(c, "HELLO", 5));
+    i32 m = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(m >= 5 && buf_contains(buf, static_cast<u32>(m), "HELLO", 5));
+
+    REQUIRE(send_all(c, "WORLD", 5));
+    i32 k = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(k >= 5 && buf_contains(buf, static_cast<u32>(k), "WORLD", 5));
+
+    close(c);
+    backend.teardown();
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
 }
 #endif
 

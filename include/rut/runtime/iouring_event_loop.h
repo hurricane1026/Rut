@@ -619,7 +619,12 @@ public:
     // Returns false only if the re-arm failed under SQ pressure (caller must close).
     bool try_deferred_upstream_rearm(Connection& c) {
         if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_armed ||
-            !c.upstream_recv_pause_rearm_pending || c.upstream_recv_paused_for_send) {
+            !c.upstream_recv_pause_rearm_pending || c.upstream_recv_paused_for_send ||
+            c.upstream_fd < 0) {
+            // upstream_fd < 0 ⇒ the connection is being torn down (close_conn closed the
+            // upstream) — don't re-arm a recv on a dead fd. A live deferred re-arm always
+            // has upstream_fd >= 0, since rearm_pending is only set by a submit_recv_-
+            // upstream call, which happens only once the upstream is connected.
             return true;
         }
         c.upstream_recv_pause_rearm_pending = false;
