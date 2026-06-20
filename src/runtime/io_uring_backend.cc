@@ -23,6 +23,12 @@
 #define IORING_ASYNC_CANCEL_ALL (1U << 0)
 #endif
 
+// Cancel by file descriptor instead of by user_data (kernel 5.19+). Cancels ops
+// on sqe->fd rather than matching sqe->addr against a user_data value.
+#ifndef IORING_ASYNC_CANCEL_FD
+#define IORING_ASYNC_CANCEL_FD (1U << 1)
+#endif
+
 namespace rut {
 
 // Sentinel conn_id for timer events (same value as epoll backend)
@@ -352,11 +358,42 @@ bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
         encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
 }
 
+bool IoUringBackend::cancel_by_fd(i32 fd, u32 conn_id, IoEventType type, u32 aux) {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) {
+        if (pending > 0) {
+            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed > 0) pending -= static_cast<u32>(flushed);
+        }
+        sqe = get_sqe();
+        if (!sqe) return false;
+    }
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_ASYNC_CANCEL;
+    // Cancel by fd (not user_data): the target op is identified by the file
+    // descriptor it runs on, captured here at issue time. CANCEL_ALL cancels every
+    // op on the fd (we only ever have the one recv).
+    sqe->fd = fd;
+    sqe->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL;
+    sqe->user_data = encode_user_data(conn_id, type, aux);
+
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id) {
     if (fd < 0 || conn_id >= kMaxSendState) return false;
-    return cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamRecv),
-                               kCancelConnId,
-                               IoEventType::UpstreamRecv);
+    // Cancel by fd, not by user_data. The upstream recv's user_data is keyed on
+    // conn_id (the connection slot), which is reused across keep-alive requests and
+    // outlives the fd — so a user_data cancel issued for one response could match a
+    // later request's recv (same conn_id, NEW fd) and cancel it. Binding the cancel
+    // to this specific fd, captured while it is still the live upstream socket, makes
+    // that collision structurally impossible: the next request's recv is on a
+    // different fd. The cancel's own completion uses kCancelConnId (consumed
+    // silently); the recv's -ECANCELED still routes to the connection as before.
+    return cancel_by_fd(fd, kCancelConnId, IoEventType::UpstreamRecv);
 }
 
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
