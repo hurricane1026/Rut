@@ -1610,15 +1610,20 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // and the pump already re-armed or @throttle-paused); leave that state
         // untouched so we neither undo a re-arm nor undo a pause.
         if (ev.result == -ENOBUFS) {
-            // A parked proxy tail occupies upstream_recv_buf while its pause cancel
-            // is still in flight. A raced multishot CQE that overflowed the buffer
-            // had its uncopied suffix discarded by the backend (only the prefix was
-            // copied behind the tail) — replaying just that prefix would silently
-            // truncate the body, so fail closed instead of treating it as a pause.
-            if (conn.tls_proxy_stream && conn.tls_send_src) {
+            // For an io_uring TLS proxy stream, -ENOBUFS means the backend already
+            // discarded the uncopied suffix of an overflowing multishot CQE (it
+            // copies min(nbytes, avail) and reports -ENOBUFS — see io_uring_backend).
+            // Those upstream body bytes are gone and can never be replayed, so any
+            // tls_proxy_stream overflow must fail closed — not only the parked-tail
+            // case. A single wait() batch harvests the whole CQE burst before the
+            // first callback drains the buffer, so the 16 KiB upstream_recv_buf can
+            // overflow even when no tail is parked (tls_send_src == nullptr).
+            if (conn.tls_proxy_stream) {
                 loop->close_conn(conn);
                 return;
             }
+            // Plaintext path: the same bytes remain on the level-triggered fd and
+            // are re-read after the pause, so a benign pause-on-full self-heals.
             if (conn.upstream_recv_buf.write_avail() == 0) loop->pause_upstream_recv(conn);
             return;
         }
@@ -1650,6 +1655,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+
+    // A TLS proxy tail is parked at the front of upstream_recv_buf (tls_send_src),
+    // and the multishot recv may have raced a positive CQE in behind it before
+    // pause_upstream_recv's cancel landed. Defer: re-running tls_fill_output over
+    // upstream_recv_buf.data() now would re-encrypt the parked tail (the drain path
+    // still owns it via tls_send_src/off) and double-count the body. The parked
+    // drain replays these appended bytes once the remainder finishes
+    // (proxy_tls_parked_drained → consume_upstream_sent → synthetic recv).
+    if (conn.tls_proxy_stream && conn.tls_send_src) return;
 
     const u32 kDataLen = conn.upstream_recv_buf.len();
     u32 send_len = kDataLen;
@@ -1778,6 +1792,7 @@ template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn) {
     conn.tls_proxy_stream = false;
     conn.resp_fully_buffered = false;
+    conn.tls_recv_paused_hw = false;  // per-response; must not leak into the next request
     conn.upstream_recv_buf.reset();
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 

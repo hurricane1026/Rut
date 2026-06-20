@@ -150,8 +150,15 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     // low watermark, re-arm the read so producer and consumer ping-pong inside
     // [low, high] instead of the buffer growing without bound. Gated on the
     // io_uring-TLS loop interface (the test harness has no kTlsOutLow).
+    //
+    // Skip once resp_fully_buffered: if the final upstream CQE raced in after the
+    // HW pause (marking the body complete with tls_recv_paused_hw still set), the
+    // response is only waiting for ciphertext to drain — re-arming the read would
+    // pull stale bytes that proxy_stream_complete then mistakes for the next
+    // pipelined response. The empty-buffer branch below runs proxy_stream_complete.
     if constexpr (requires { Self::kTlsOutLow; }) {
-        if (c.tls_recv_paused_hw && c.tls_out_buf.len() <= Self::kTlsOutLow) {
+        if (c.tls_recv_paused_hw && !c.resp_fully_buffered &&
+            c.tls_out_buf.len() <= Self::kTlsOutLow) {
             c.tls_recv_paused_hw = false;
             // Re-check @throttle so the watermark resume doesn't bypass the byte
             // rate. If throttle pauses, its timer re-arms the read later — but it
