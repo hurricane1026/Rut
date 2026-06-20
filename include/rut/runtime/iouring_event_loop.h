@@ -572,6 +572,20 @@ public:
             if (c.upstream_recv_pause_cancel_pending) c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
+        // Defer-until-cancel-drains: a prior pause's cancel SQE is still in flight
+        // (its -ECANCELED hasn't been harvested) even though the recv is no longer
+        // marked armed — e.g. proxy_stream_complete cleared upstream_recv_armed at
+        // the keep-alive boundary while the body-done cancel was still pending.
+        // Arming a new multishot recv now would give it the same
+        // (conn_id, UpstreamRecv) user_data the stale cancel matches, so that
+        // cancel could silently cancel this fresh recv, hanging the next proxied
+        // response. Wait: the -ECANCELED handler clears the flag and re-arms via
+        // upstream_recv_pause_rearm_pending. (epoll's pause is synchronous and
+        // never sets this flag, so this path is io_uring-only by construction.)
+        if (c.upstream_recv_pause_cancel_pending) {
+            c.upstream_recv_pause_rearm_pending = true;
+            return true;
+        }
         if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
             c.pending_ops++;
             c.upstream_recv_armed = true;
