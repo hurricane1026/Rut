@@ -144,6 +144,34 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
 
+  sanitizer:
+    name: Sanitizer (ASan+UBSan)
+    runs-on: ubuntu-24.04
+    # ubuntu-24.04 has a 6.x kernel, so the real-io_uring integration tests
+    # (proxy-over-TLS keep-alive, watermark backpressure, recv re-arm) actually
+    # run here under AddressSanitizer — the detector for the io_uring async-cancel /
+    # recv lifecycle bugs that are otherwise only reasoned about. JIT is off (its
+    # generated code isn't instrumented).
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-dev
+      - name: Configure
+        run: cmake -B build -G Ninja -DRUT_ENABLE_JIT=OFF -DRUT_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: ninja -C build
+      - name: Test
+        # halt_on_error=1: fail the job on the first ASan/UBSan report.
+        # detect_leaks=0: the per-shard mmap arenas are intentionally never freed.
+        run: |
+          ASAN_OPTIONS=halt_on_error=1:detect_leaks=0 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+          ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 300
+
   bench-simd-x86:
     name: SIMD scan_uri bench (x86)
     runs-on: ubuntu-24.04

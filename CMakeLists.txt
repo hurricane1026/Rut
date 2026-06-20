@@ -41,6 +41,19 @@ option(RUT_ENABLE_WEBSOCKET "Build WebSocket/Upgrade passthrough support" ON)
 if(NOT RUT_ENABLE_WEBSOCKET)
     add_compile_definitions(RUT_ENABLE_WEBSOCKET=0)
 endif()
+
+# AddressSanitizer (+ UBSan) build. OFF by default; the CI "Sanitizer" job turns it
+# ON to catch use-after-free / overflow / lifetime bugs across the runtime — in
+# particular the io_uring async-cancel / recv re-arm lifecycle, which is otherwise
+# only reasoned about. Pair with RUT_ENABLE_JIT=OFF (the JIT'd code isn't
+# instrumented). Keeps frame pointers for readable reports.
+option(RUT_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+if(RUT_SANITIZE)
+    set(_RUT_SAN "-fsanitize=address,undefined -fno-omit-frame-pointer")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${_RUT_SAN}")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${_RUT_SAN}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${_RUT_SAN}")
+endif()
 if(RUT_ENABLE_IPO)
     # Use CMake's native IPO support only when explicitly requested.
     # In the default developer/test build, keep archives and test linking simple and stable.
