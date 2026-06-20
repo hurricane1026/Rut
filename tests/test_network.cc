@@ -1475,6 +1475,93 @@ TEST(tls_iouring, input_buffer_fits_full_ciphertext_record) {
     CHECK_GE(IoUringEventLoop::kTlsInputSize, SlicePool::kSliceSize + 1024);
 }
 
+// Round-4 race fix #F: a TLS proxy-stream -ENOBUFS with NO parked tail must fail
+// closed. A wait() batch harvests the whole multishot CQE burst into the 16 KiB
+// upstream_recv_buf before the first callback drains it, so it can overflow even
+// with tls_send_src == nullptr; the backend already discarded the uncopied
+// suffix, so pause+replay would silently truncate the proxied download.
+TEST(tls_iouring, proxy_stream_enobufs_without_parked_tail_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->tls_proxy_stream = true;
+    conn->tls_send_src = nullptr;  // no parked tail (the newly-covered case)
+    const u32 cid = conn->id;
+
+    on_response_body_recvd<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // fail closed
+
+    // Contrast: a plaintext (non-proxy-TLS) -ENOBUFS on a full buffer still
+    // self-heals by pausing, not closing — the broadened guard didn't regress it.
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* plain = loop.find_fd(43);
+    REQUIRE(plain != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*plain));
+    plain->upstream_recv_buf.commit(plain->upstream_recv_buf.write_avail());  // full
+    const u32 pcid = plain->id;
+    on_response_body_recvd<SmallLoop>(
+        &loop, *plain, make_ev(pcid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[pcid].fd, 43);  // paused, not closed
+}
+
+// Round-4 race fix #H: while a TLS proxy tail is parked (tls_send_src points into
+// upstream_recv_buf), a raced multishot upstream CQE must be deferred. Re-running
+// the encrypt path now would double-encrypt the parked tail (the drain path still
+// owns it) and double-count the body; the parked-drain replay owns those bytes.
+TEST(tls_iouring, proxy_stream_defers_raced_cqe_while_tail_parked) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->tls_proxy_stream = true;
+    const u8 raced[] = {'A', 'B', 'C', 'D'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(raced, sizeof(raced)), sizeof(raced));
+    conn->tls_send_src = conn->upstream_recv_buf.data();  // tail parked at front
+    conn->tls_send_len = 8;
+    conn->tls_send_off = 0;
+    const u32 cid = conn->id;
+    const u32 kBefore = conn->upstream_recv_buf.len();
+
+    loop.backend.op_count = 0;
+    on_response_body_recvd<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 4));
+    CHECK_EQ(loop.conns[cid].fd, 42);                  // not closed
+    CHECK_EQ(loop.backend.op_count, 0u);               // deferred — no encrypt/send/recv op
+    CHECK_EQ(conn->upstream_recv_buf.len(), kBefore);  // buffer untouched
+    CHECK(conn->tls_send_src != nullptr);              // tail still parked for the drain
+}
+
+// Round-4 race fix #C (cross-request half): proxy_stream_complete must clear
+// tls_recv_paused_hw at the keep-alive boundary, so a high-watermark pause from
+// one response can't leak into the next request and let the low-watermark resume
+// spuriously re-arm the upstream read. (The in-request resume gate itself —
+// tls_on_out_drain skipping the resume when resp_fully_buffered — needs the real
+// IoUringEventLoop TLS-drain interface and is exercised by the real-io_uring
+// proxy_tls_iouring.large_body_streams_through_watermark integration test.)
+TEST(tls_iouring, proxy_stream_complete_clears_hw_pause) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->tls_proxy_stream = true;
+    conn->resp_fully_buffered = true;
+    conn->tls_recv_paused_hw = true;
+    conn->keep_alive = true;  // stays open, so the flag is readable afterward
+    const u32 cid = conn->id;
+
+    proxy_stream_complete<SmallLoop>(&loop, *conn);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // kept alive
+    CHECK(!conn->tls_recv_paused_hw);  // cleared at the keep-alive boundary
+    CHECK(!conn->tls_proxy_stream);    // per-response state reset
+    CHECK(!conn->resp_fully_buffered);
+}
+
 // Two proxy cycles on same connection (keep-alive)
 TEST(proxy, keepalive_two_cycles) {
     SmallLoop loop;
