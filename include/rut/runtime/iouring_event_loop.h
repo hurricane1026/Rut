@@ -907,7 +907,18 @@ public:
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
-                        if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+                        if (ev.type == IoEventType::UpstreamRecv) {
+                            conn.upstream_recv_armed = false;
+                            // If a pause_upstream_recv cancel was racing this recv it
+                            // lost: the recv completed normally (this is not the
+                            // -ECANCELED branch above), so the cancel will -ENOENT and
+                            // no -ECANCELED arrives to clear the pending-cancel flag.
+                            // Clear it here, or the defer-until-cancel-drains path in
+                            // submit_recv_upstream_impl waits forever for a completion
+                            // that never comes. (rearm_pending is left intact so the
+                            // send-pause re-arm path still fires.)
+                            conn.upstream_recv_pause_cancel_pending = false;
+                        }
                     }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);
