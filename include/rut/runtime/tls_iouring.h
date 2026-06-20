@@ -391,8 +391,19 @@ void tls_process(Self* loop, Connection& c) {
                     proxy_tls_parked_drained<Self>(loop, c, consumed);
                     if (!c.tls_active) return;
                 }
-                if (kFs == TlsFill::NeedRead)
+                if (kFs == TlsFill::NeedRead) {
                     c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+                    // The driving Recv CQE may have been terminal (!more), so
+                    // dispatch already cleared recv_armed. Arm a recv (like the
+                    // other NeedRead paths) so a future CQE drives the retry —
+                    // otherwise the proxy-stream early return below exits with no
+                    // armed recv and, if no ciphertext send was queued, the
+                    // download stalls until timeout. Fail closed if it can't queue.
+                    if (!c.recv_armed && !loop->submit_recv(c)) {
+                        loop->close_conn(c);
+                        return;
+                    }
+                }
             }
             // For a proxy stream, the plaintext just decrypted is the client's
             // pipelined NEXT request. Parsing/dispatching it now — mid-response,
