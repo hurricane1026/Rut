@@ -4176,6 +4176,171 @@ TEST(proxy_tls_iouring, large_body_streams_through_watermark) {
     destroy_tls_server_context(tls_ctx.value());
 }
 
+// Serves one Content-Length response per accepted connection, then closes — so each
+// proxied request makes a fresh upstream connect on a NEW fd. Exercises keep-alive
+// proxy reuse: every request's body completion fires pause_upstream_recv (now
+// cancel-by-fd), and the next request's upstream recv must not be hung/truncated by
+// a stale cancel matching it.
+struct ReuseUpstream {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    u32 body_len = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~ReuseUpstream() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<ReuseUpstream*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                usleep(500);  // non-blocking listen socket (EAGAIN) — poll
+                continue;
+            }
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            char hdr[128];
+            const int hn = snprintf(
+                hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", s->body_len);
+            bool ok = hn > 0 && send_all(client, hdr, static_cast<u32>(hn));
+            u8 chunk[8192];
+            u32 sent = 0;
+            while (ok && sent < s->body_len) {
+                u32 n = s->body_len - sent;
+                if (n > sizeof(chunk)) n = sizeof(chunk);
+                for (u32 i = 0; i < n; i++) chunk[i] = static_cast<u8>((sent + i) & 0xff);
+                ok = send_all(client, reinterpret_cast<char*>(chunk), n);
+                sent += n;
+            }
+            close(client);  // fresh upstream connect per proxied request
+        }
+        return nullptr;
+    }
+
+    bool setup(u32 blen) {
+        body_len = blen;
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Regression for the upstream-recv cancel-collision (now fixed by cancel-by-fd):
+// many keep-alive proxied requests over one TLS connection, each ending in a body
+// completion that cancels the upstream recv. A stale cancel matching the next
+// request's recv would hang or truncate it — so all must complete intact. Runs on
+// real io_uring (CI), under ASan in the sanitizer job.
+TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    using namespace rut;
+
+    constexpr u32 kBody = 16u * 1024u;  // real stream (> one TLS record), fast
+    constexpr u32 kRequests = 30u;
+    ReuseUpstream backend;
+    REQUIRE(backend.setup(kBody));
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/dl", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    shard.loop->config_ptr = &active;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 5);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
+    static u8 in[64u * 1024u];
+    u32 completed = 0;
+    for (u32 r = 0; r < kRequests; r++) {
+        if (!ssl_write_all(ssl, kReq, sizeof(kReq) - 1)) break;
+        u32 total = 0, body_off = 0, body_seen = 0;
+        bool hdr_done = false;
+        while (body_seen < kBody && total < sizeof(in)) {
+            const i32 n = SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total));
+            if (n <= 0) break;  // a collision-cancelled recv surfaces here as a hang/EOF
+            total += static_cast<u32>(n);
+            if (!hdr_done) {
+                for (u32 i = 3; i < total; i++) {
+                    if (in[i - 3] == '\r' && in[i - 2] == '\n' && in[i - 1] == '\r' &&
+                        in[i] == '\n') {
+                        hdr_done = true;
+                        body_off = i + 1;
+                        break;
+                    }
+                }
+            }
+            if (hdr_done) body_seen = total - body_off;
+        }
+        if (!hdr_done || body_seen < kBody) break;
+        bool pattern_ok = true;
+        for (u32 i = 0; i < kBody; i++) {
+            if (in[body_off + i] != static_cast<u8>(i & 0xff)) {
+                pattern_ok = false;
+                break;
+            }
+        }
+        if (!pattern_ok) break;
+        completed++;
+    }
+    CHECK_EQ(completed, kRequests);  // every keep-alive request completed intact
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    backend.teardown();
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
 // === ALPN selection (pure logic, no crypto) ===
 
 TEST(alpn, picks_h2_when_offered_and_requested) {
