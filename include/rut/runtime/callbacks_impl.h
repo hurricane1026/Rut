@@ -241,9 +241,11 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
         return;
     }
     if (kRemaining > 0) {
-        // Bytes already buffered (the multishot raced them in behind the tail) —
-        // encrypt them now, like the main read path; they're in memory and not
-        // subject to the watermark.
+        // Bytes already buffered (the multishot raced them in behind the tail).
+        // Honor @throttle before replaying them (same as the main read path), so
+        // raced body data parks for the byte budget instead of bursting past the
+        // configured rate; they stay in upstream_recv_buf and replay on the timer.
+        if (throttle_pause_before_pump<Loop>(loop, conn, kRemaining)) return;
         IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
         on_response_body_recvd<Loop>(loop, conn, synth);
         return;
@@ -1760,10 +1762,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             if (kRemaining > 0) {
-                // Bytes already in upstream_recv_buf — must be encrypted now (not
-                // subject to the watermark, which only gates *new* reads). One
-                // recv's worth (<= a slice) of ciphertext fits under kTlsRecordMax,
-                // so this never overflows even from just below the high watermark.
+                // Bytes already in upstream_recv_buf (the multishot raced them in).
+                // Honor @throttle before replaying them, like the plaintext path:
+                // throttle_advance above may have pushed throttle_tat_ns into the
+                // future, so park the buffered remainder for the byte budget (it
+                // stays in upstream_recv_buf — no memory growth — and replays on the
+                // throttle timer) rather than bursting past the configured rate.
+                if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
+                // Not throttled: encrypt now (memory safety — the watermark only
+                // gates *new* reads; one recv's worth fits under kTlsRecordMax).
                 IoEvent synth = {
                     conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
                 on_response_body_recvd<Loop>(lp, conn, synth);  // drain the rest of this recv
@@ -1811,6 +1818,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // completes (parked/raced tail) before the timer fires, clear the pause so a
     // leaked tick is a no-op — both backends dispatch throttle_resume only while
     // throttle_paused — instead of resuming a pump against the next request's state.
+    const bool kWasThrottled = conn.throttle_paused;
     conn.throttle_paused = false;
     conn.throttle_pending_len = 0;
     conn.upstream_recv_buf.reset();
@@ -1830,6 +1838,18 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     if (!conn.keep_alive || loop->is_draining()) {
         loop->close_conn(conn);
         return;
+    }
+
+    // If this response was throttled, arm_throttle_timer pulled the connection off
+    // the keepalive wheel (the precise timer owned its wakeup). Now that the
+    // throttle pause is cleared (its timer tick is a no-op), restore the normal
+    // keepalive deadline — otherwise an idle keep-alive client could hold the slot
+    // open indefinitely (precise-timer path) or be closed at the short throttle
+    // delay (wheel fallback) instead of keepalive_timeout. The pipeline paths below
+    // dispatch a buffered request immediately (which re-refreshes), but the idle
+    // header-read path has no other wakeup to re-arm it.
+    if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); }) {
+        if (kWasThrottled) loop->timer.refresh(&conn, loop->keepalive_timeout);
     }
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {

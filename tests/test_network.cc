@@ -1566,6 +1566,31 @@ TEST(tls_iouring, proxy_stream_complete_clears_hw_pause) {
     CHECK_EQ(conn->throttle_pending_len, 0u);
 }
 
+// Round-6 #A: a throttled response completed via proxy_stream_complete with the
+// throttle pause cleared (round-5 #4) must restore the keepalive deadline —
+// arm_throttle_timer had pulled the connection off the keepalive wheel, and the
+// now-no-op throttle timer would otherwise leave an idle keep-alive client with no
+// deadline at all.
+TEST(tls_iouring, proxy_stream_complete_restores_keepalive_after_throttle) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    loop.timer.remove(conn);            // arm_throttle_timer pulled it off the wheel
+    REQUIRE(conn->timer_node.empty());  // confirm: no keepalive deadline armed
+    conn->tls_proxy_stream = true;
+    conn->resp_fully_buffered = true;
+    conn->throttle_paused = true;  // completing while throttled
+    conn->keep_alive = true;
+    const u32 cid = conn->id;
+
+    proxy_stream_complete<SmallLoop>(&loop, *conn);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // kept alive
+    CHECK(!conn->timer_node.empty());  // keepalive timer restored (back on the wheel)
+}
+
 // Round-5 #3: when the final body chunk parked a TLS proxy tail (body parser
 // complete, but resp_fully_buffered not set until the tail drains), a racing
 // upstream EOF must be ignored — the drain owns the remaining body bytes. A tail
