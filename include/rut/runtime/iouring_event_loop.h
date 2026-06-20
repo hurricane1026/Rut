@@ -604,12 +604,12 @@ public:
         return backend.pause_upstream_recv(c.upstream_fd, c.id);
     }
 
-    bool pause_upstream_recv_for_send(Connection& c) {
+    [[nodiscard]] bool pause_upstream_recv_for_send(Connection& c) {
         c.upstream_recv_paused_for_send = true;
         return pause_upstream_recv_impl(c);
     }
 
-    bool pause_recv(Connection& c) {
+    [[nodiscard]] bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
         if (c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>)
             return true;

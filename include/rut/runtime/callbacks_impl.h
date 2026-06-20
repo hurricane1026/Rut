@@ -1629,9 +1629,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 loop->close_conn(conn);
                 return;
             }
-            // Plaintext path: the same bytes remain on the level-triggered fd and
-            // are re-read after the pause, so a benign pause-on-full self-heals.
-            if (conn.upstream_recv_buf.write_avail() == 0) loop->pause_upstream_recv(conn);
+            // Plaintext path. On epoll the bytes remain on the level-triggered fd
+            // and are re-read after the pause, which can't fail (returns true), so
+            // this is a benign pause-on-full. On io_uring the pause is an async
+            // cancel that can fail under SQ pressure — and a still-live provided-
+            // buffer multishot keeps discarding overflow bytes (truncation), so fail
+            // closed there. (uses_iouring_tls is false here; the gate is io_uring-vs-
+            // epoll, expressed via the nodiscard'd pause returning false only on io_uring.)
+            if (conn.upstream_recv_buf.write_avail() == 0 && !loop->pause_upstream_recv(conn))
+                loop->close_conn(conn);
             return;
         }
         // io_uring TLS: the body may be fully buffered and still draining to the
@@ -2164,7 +2170,7 @@ bool ws_pause_client_recv(Loop* loop, Connection& conn) {
 }
 
 template <typename Loop>
-bool ws_pause_upstream_recv(Loop* loop, Connection& conn) {
+[[nodiscard]] bool ws_pause_upstream_recv(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv_for_send(c); }) {
         return loop->pause_upstream_recv_for_send(conn);
     } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {

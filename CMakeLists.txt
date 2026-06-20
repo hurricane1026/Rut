@@ -22,6 +22,14 @@ endif()
 # Core compiler flags per DESIGN.md: no exceptions, no RTTI, no C++ stdlib
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic -Wswitch-enum")
+# Make ignoring a [[nodiscard]] result a hard error (not just a warning). This is
+# the automated guard for the fail-closed invariant on the io_uring async-pause
+# helpers (pause_upstream_recv / _for_send / pause_recv / ws_pause_upstream_recv):
+# they return false when a cancel SQE can't queue under SQ pressure, and every
+# caller must fail closed. Any future commit that adds a call ignoring the result
+# fails to compile. Scoped to -Werror=unused-result only (not a blanket -Werror),
+# and the whole tree (incl. vendored boringssl/zstd) already builds clean under it.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror=unused-result")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 option(RUT_ENABLE_IPO "Enable interprocedural optimization/LTO for Release builds" OFF)
