@@ -2865,6 +2865,61 @@ TEST(uring, pause_upstream_recv_user_data_spares_concurrent_send) {
     backend.shutdown();
 }
 
+// The upstream-recv pause cancel can resolve two ways, and BOTH must clear the
+// pending-cancel flag and fire the deferred re-arm — otherwise a keep-alive proxy
+// response that deferred its re-arm behind the cancel stalls with no upstream recv
+// armed until upstream_timeout. These drive each outcome deterministically with a
+// synthetic terminal CQE, instead of relying on the cancel/recv timing race actually
+// landing one way or the other.
+TEST(uring, upstream_recv_pause_cancel_wins_clears_and_rearms) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);  // no io_uring here — add_recv_upstream can't queue; skip
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    conn.upstream_fd = 42;
+    conn.pending_ops = 1;
+    conn.upstream_recv_armed = true;
+    conn.upstream_recv_paused_for_send = false;
+    conn.upstream_recv_pause_cancel_pending = true;  // a pause cancel is in flight
+    conn.upstream_recv_pause_rearm_pending = true;   // a re-arm was deferred behind it
+
+    // Cancel wins: the recv completes as -ECANCELED.
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));
+
+    CHECK(!conn.upstream_recv_pause_cancel_pending);
+    CHECK(!conn.upstream_recv_pause_rearm_pending);
+    CHECK(conn.upstream_recv_armed);  // the deferred re-arm fired
+    loop->shutdown();
+}
+
+TEST(uring, upstream_recv_pause_cancel_loses_clears_and_rearms) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    conn.upstream_fd = 42;
+    conn.pending_ops = 1;
+    conn.upstream_recv_armed = true;
+    conn.upstream_recv_paused_for_send = false;
+    conn.upstream_recv_pause_cancel_pending = true;
+    conn.upstream_recv_pause_rearm_pending = true;
+
+    // Cancel loses the race: the recv completes normally first (a terminal CQE, not
+    // -ECANCELED), so the cancel will -ENOENT and no -ECANCELED ever arrives. The
+    // generic-accounting branch must still clear the pending-cancel flag (or the
+    // defer in submit_recv_upstream_impl waits forever) and fire the deferred re-arm.
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 0));
+
+    CHECK(!conn.upstream_recv_pause_cancel_pending);
+    CHECK(!conn.upstream_recv_pause_rearm_pending);
+    CHECK(conn.upstream_recv_armed);  // the deferred re-arm fired
+    loop->shutdown();
+}
+
 // Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
 // pending, and re-arms once the late cancel CQE arrives after the handler has
 // already asked to keep reading.
@@ -4390,90 +4445,106 @@ struct ReuseUpstream {
 // completion that cancels the upstream recv. A stale cancel matching the next
 // request's recv would hang or truncate it — so all must complete intact. Runs on
 // real io_uring (CI), under ASan in the sanitizer job.
-TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
-    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+// Drive kRequests keep-alive proxied requests over one TLS connection against
+// ReuseUpstream (which closes after each response, so every request makes a fresh
+// upstream connect → a cancel-by-fd at each body completion). Returns how many
+// completed with an intact kBody-byte pattern body — a stale cancel matching the
+// next request's recv would hang/truncate one, dropping the count. Shared by the GET
+// and POST reuse regressions; uses plain early returns (no CHECK) so the caller
+// owns the assertion.
+static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kRequests) {
     using namespace rut;
-
-    constexpr u32 kBody = 16u * 1024u;  // real stream (> one TLS record), fast
-    constexpr u32 kRequests = 30u;
     ReuseUpstream backend;
-    REQUIRE(backend.setup(kBody));
+    if (!backend.setup(kBody)) return 0;
 
     RouteConfig cfg{};
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
-    REQUIRE(id.has_value());
-    REQUIRE(cfg.add_proxy("/dl", 0, id.value()));
+    if (!id.has_value()) return 0;
+    if (!cfg.add_proxy("/dl", 0, id.value())) return 0;  // method 0 matches GET and POST
     const RouteConfig* active = &cfg;
 
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
-    REQUIRE(tls_ctx.has_value());
+    if (!tls_ctx.has_value()) return 0;
 
     Shard<IoUringEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
-    REQUIRE(lfd >= 0);
+    if (lfd < 0) return 0;
     u16 port = get_port(lfd);
-    REQUIRE(shard.init(0, lfd).has_value());
+    if (!shard.init(0, lfd).has_value()) return 0;
     shard.loop->tls_server = tls_ctx.value();
     shard.loop->config_ptr = &active;
-    REQUIRE(shard.spawn(-1).has_value());
+    if (!shard.spawn(-1).has_value()) return 0;
     usleep(50000);
 
     SSL_CTX* client_ctx = create_test_client_ctx();
-    REQUIRE(client_ctx != nullptr);
     i32 c = connect_to(port);
-    REQUIRE(c >= 0);
-    set_socket_timeouts(c, 5);
-    SSL* ssl = SSL_new(client_ctx);
-    REQUIRE(ssl != nullptr);
-    REQUIRE(SSL_set_fd(ssl, c) == 1);
-    REQUIRE(SSL_connect(ssl) == 1);
-
-    const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
-    static u8 in[64u * 1024u];
+    SSL* ssl = (client_ctx != nullptr && c >= 0) ? SSL_new(client_ctx) : nullptr;
     u32 completed = 0;
-    for (u32 r = 0; r < kRequests; r++) {
-        if (!ssl_write_all(ssl, kReq, sizeof(kReq) - 1)) break;
-        u32 total = 0, body_off = 0, body_seen = 0;
-        bool hdr_done = false;
-        while (body_seen < kBody && total < sizeof(in)) {
-            const i32 n = SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total));
-            if (n <= 0) break;  // a collision-cancelled recv surfaces here as a hang/EOF
-            total += static_cast<u32>(n);
-            if (!hdr_done) {
-                for (u32 i = 3; i < total; i++) {
-                    if (in[i - 3] == '\r' && in[i - 2] == '\n' && in[i - 1] == '\r' &&
-                        in[i] == '\n') {
-                        hdr_done = true;
-                        body_off = i + 1;
-                        break;
+    if (ssl != nullptr && SSL_set_fd(ssl, c) == 1 && SSL_connect(ssl) == 1) {
+        set_socket_timeouts(c, 5);
+        static u8 in[64u * 1024u];
+        for (u32 r = 0; r < kRequests; r++) {
+            if (!ssl_write_all(ssl, req, req_len)) break;
+            u32 total = 0, body_off = 0, body_seen = 0;
+            bool hdr_done = false;
+            while (body_seen < kBody && total < sizeof(in)) {
+                const i32 n = SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total));
+                if (n <= 0) break;  // a collision-cancelled recv surfaces here as a hang/EOF
+                total += static_cast<u32>(n);
+                if (!hdr_done) {
+                    for (u32 i = 3; i < total; i++) {
+                        if (in[i - 3] == '\r' && in[i - 2] == '\n' && in[i - 1] == '\r' &&
+                            in[i] == '\n') {
+                            hdr_done = true;
+                            body_off = i + 1;
+                            break;
+                        }
                     }
                 }
+                if (hdr_done) body_seen = total - body_off;
             }
-            if (hdr_done) body_seen = total - body_off;
-        }
-        if (!hdr_done || body_seen < kBody) break;
-        bool pattern_ok = true;
-        for (u32 i = 0; i < kBody; i++) {
-            if (in[body_off + i] != static_cast<u8>(i & 0xff)) {
-                pattern_ok = false;
-                break;
+            if (!hdr_done || body_seen < kBody) break;
+            bool pattern_ok = true;
+            for (u32 i = 0; i < kBody; i++) {
+                if (in[body_off + i] != static_cast<u8>(i & 0xff)) {
+                    pattern_ok = false;
+                    break;
+                }
             }
+            if (!pattern_ok) break;
+            completed++;
         }
-        if (!pattern_ok) break;
-        completed++;
     }
-    CHECK_EQ(completed, kRequests);  // every keep-alive request completed intact
 
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(c);
-    SSL_CTX_free(client_ctx);
+    if (ssl != nullptr) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    if (c >= 0) close(c);
+    if (client_ctx != nullptr) SSL_CTX_free(client_ctx);
     backend.teardown();
     shard.stop();
     shard.join();
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
+    return completed;
+}
+
+TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 16u * 1024u, 30u), 30u);
+}
+
+// Same reuse stress with POST: each request forwards a request body to the upstream
+// before the response streams back, so the proxy exercises the request-body upload
+// path ahead of every cancel-by-fd. All 30 must still complete intact.
+TEST(proxy_tls_iouring, keepalive_reuse_post_body_no_cancel_collision) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    const char kReq[] =
+        "POST /dl HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 16u * 1024u, 30u), 30u);
 }
 
 // Informational proxy latency/throughput benchmark (keep-alive, real io_uring).
