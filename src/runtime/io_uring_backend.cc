@@ -23,18 +23,14 @@
 #define IORING_ASYNC_CANCEL_ALL (1U << 0)
 #endif
 
-// Cancel by file descriptor instead of by user_data (kernel 5.19+). Cancels ops
-// on sqe->fd rather than matching sqe->addr against a user_data value.
-#ifndef IORING_ASYNC_CANCEL_FD
-#define IORING_ASYNC_CANCEL_FD (1U << 1)
-#endif
-
 namespace rut {
 
 // Sentinel conn_id for timer events (same value as epoll backend)
 static constexpr u32 kTimerConnId = 0xFFFFFE;
 // Sentinel conn_id for cancel completions (must not collide with real conn_ids or timer)
 static constexpr u32 kCancelConnId = 0xFFFFFD;
+// kPauseCancelAux (the pause-cancel completion tag) is defined in io_event.h so the
+// event loop can recognize it on IoEvent::aux.
 
 // --- Syscall wrappers (no liburing) ---
 
@@ -358,61 +354,18 @@ bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
         encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
 }
 
-bool IoUringBackend::cancel_by_fd(i32 fd, u32 conn_id, IoEventType type, u32 aux) {
-    io_uring_sqe* sqe = get_sqe();
-    if (!sqe) {
-        if (pending > 0) {
-            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-            if (flushed > 0) pending -= static_cast<u32>(flushed);
-        }
-        sqe = get_sqe();
-        if (!sqe) return false;
-    }
-
-    memset(sqe, 0, sizeof(*sqe));
-    sqe->opcode = IORING_OP_ASYNC_CANCEL;
-    // Cancel by fd (not user_data): the target op is identified by the file
-    // descriptor it runs on, captured here at issue time. CANCEL_ALL cancels every
-    // op on the fd (we only ever have the one recv).
-    sqe->fd = fd;
-    sqe->cancel_flags = IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL;
-    sqe->user_data = encode_user_data(conn_id, type, aux);
-
-    sqe_advance_tail(sq_tail);
-    pending++;
-    return true;
-}
-
-// Recv-only cancel by user_data. Used when an upstream SEND may be in flight on the
-// same fd (a WS full-duplex tunnel, or an overlapping request-body upload), where
-// cancel-by-fd would also cancel the send and corrupt it. The user_data is keyed on
-// conn_id (reused across keep-alive requests), so it could in principle match a
-// later request's recv — but every caller of this variant is mid-stream, far from
-// the next request, so the cancel drains long before any reuse.
+// Pause the multishot upstream recv by cancelling it by user_data (recv-only — it
+// never touches a concurrent upstream send, unlike a cancel-by-fd). The cancel's OWN
+// completion is tagged with the real conn_id + kPauseCancelAux, so it routes to the
+// connection rather than being silently dropped: the loop counts it in pending_ops
+// (pinning the slot until it drains) and re-arms the recv only once it arrives — so
+// the in-flight cancel can never match a freshly-armed recv on the reused conn_id.
 bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id) {
     if (fd < 0 || conn_id >= kMaxSendState) return false;
     return cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamRecv),
-                               kCancelConnId,
-                               IoEventType::UpstreamRecv);
-}
-
-// Cancel by fd. Used when no upstream send is in flight (every proxy response-
-// streaming pause — the request is fully sent before the response body streams).
-// Collision-proof across keep-alive reuse, BUT only if the cancel reaches the kernel
-// while `fd` is still the live upstream socket. The cancel SQE is otherwise merely
-// queued; run() wouldn't submit it until the next wait(), by which point
-// proxy_stream_complete may have closed `fd` and a pipelined next request reused the
-// fd number — the fd-keyed cancel would then hit the NEW request's recv. So flush the
-// SQ here: IORING_OP_ASYNC_CANCEL is processed at submission, binding the cancel to
-// the old socket before it can be closed/reused.
-bool IoUringBackend::pause_upstream_recv_by_fd(i32 fd, u32 conn_id) {
-    if (fd < 0 || conn_id >= kMaxSendState) return false;
-    if (!cancel_by_fd(fd, kCancelConnId, IoEventType::UpstreamRecv)) return false;
-    if (pending > 0) {
-        i32 submitted = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-        if (submitted > 0) pending -= static_cast<u32>(submitted);
-    }
-    return true;
+                               conn_id,
+                               IoEventType::UpstreamRecv,
+                               kPauseCancelAux);
 }
 
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
@@ -691,6 +644,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;
                 events[count].more = 0;
+                events[count].aux = 0;
                 count++;
             }
             // Re-submit read on timerfd for next tick
@@ -739,6 +693,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             events[count].buf_id = 0;
             events[count].has_buf = 0;
             events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
+            events[count].aux = static_cast<u8>(aux);  // 0 for recv data
             head++;
             count++;
             continue;
@@ -778,6 +733,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     events[count].buf_id = 0;
                     events[count].has_buf = 0;
                     events[count].more = 0;
+                    events[count].aux = 0;
                     head++;
                     count++;
                     continue;
@@ -789,6 +745,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;
                 events[count].more = 0;
+                events[count].aux = 0;
                 head++;
                 count++;
                 continue;
@@ -803,6 +760,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].buf_id = 0;
         events[count].has_buf = 0;
         events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
+        // Forward the decoded aux so dispatch can recognize a pause cancel's own
+        // completion (UpstreamRecv + kPauseCancelAux); 0 for every normal op.
+        events[count].aux = static_cast<u8>(aux);
 
         head++;
         count++;

@@ -108,11 +108,9 @@ struct IoUringBackend {
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
-    // Recv-only (cancel by user_data) — use when an upstream send may share the fd.
+    // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
+    // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
     bool pause_upstream_recv(i32 fd, u32 conn_id);
-    // Collision-proof across keep-alive reuse (cancel by fd) — use only when no
-    // upstream send is in flight, since it cancels every op on the fd.
-    bool pause_upstream_recv_by_fd(i32 fd, u32 conn_id);
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).
@@ -182,12 +180,6 @@ private:
     // conn_id for tracked close-path cancels, or kCancelConnId for fire-and-
     // forget cancels that should be consumed silently.
     bool cancel_by_user_data(u64 target, u32 conn_id, IoEventType type, u32 aux = 0);
-
-    // Submit a cancel SQE that cancels all ops on `fd` (IORING_ASYNC_CANCEL_FD,
-    // kernel 5.19+). Unlike cancel_by_user_data, the target is the file descriptor,
-    // so the cancel can never match a later op submitted with the same user_data on
-    // a different fd. conn_id/type/aux encode the cancel CQE's own user_data.
-    bool cancel_by_fd(i32 fd, u32 conn_id, IoEventType type, u32 aux = 0);
 
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();

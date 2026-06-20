@@ -596,21 +596,34 @@ public:
     }
 
     bool pause_upstream_recv_impl(Connection& c) {
+        if (!c.upstream_recv_armed) return true;                // nothing armed — no cancel, no CQE
+        if (c.upstream_recv_pause_cancel_pending) return true;  // a cancel already in flight
+        // Cancel the multishot recv by user_data — recv-only, so a concurrent upstream
+        // send (WS tunnel, overlapping body upload) is never touched. The cancel is
+        // COUNTED in pending_ops and its own completion (tagged kPauseCancelAux) is what
+        // re-arms the recv (see try_deferred_upstream_rearm): the recv is re-armed only
+        // after the cancel drains, so the in-flight cancel can never match a freshly-
+        // armed recv on the reused conn_id, and the slot can't be reclaimed until then.
+        if (!backend.pause_upstream_recv(c.upstream_fd, c.id)) return false;
         c.upstream_recv_pause_cancel_pending = true;
-        if (!c.upstream_recv_armed) {
-            c.upstream_recv_pause_cancel_pending = false;
+        c.pending_ops++;
+        return true;
+    }
+
+    // Re-arm an upstream recv that a pause deferred, but ONLY once BOTH the old recv and
+    // its pause cancel have drained — armed cleared by the recv's CQE, cancel_pending
+    // cleared by the cancel's own CQE (kPauseCancelAux). Re-arming before the cancel
+    // drains would let it match the fresh recv on the reused conn_id. The recv and
+    // cancel CQEs can arrive in either order, so both terminal branches call this; it
+    // fires from whichever lands second. No-op unless a re-arm was actually deferred.
+    // Returns false only if the re-arm failed under SQ pressure (caller must close).
+    bool try_deferred_upstream_rearm(Connection& c) {
+        if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_armed ||
+            !c.upstream_recv_pause_rearm_pending || c.upstream_recv_paused_for_send) {
             return true;
         }
-        // Cancel-by-fd is collision-proof across keep-alive reuse (the next request's
-        // recv is on a different fd), but it cancels EVERY op on the fd. Only use it
-        // when no upstream send is in flight — true for every proxy response-streaming
-        // pause, since the request is fully sent before the response body streams.
-        // When a send IS in flight (a WS full-duplex tunnel, or an overlapping
-        // request-body upload), cancel by user_data so the send survives; those call
-        // sites are mid-stream, far from the next request, so the user_data reuse
-        // cannot collide before the cancel drains.
-        if (c.upstream_send_armed) return backend.pause_upstream_recv(c.upstream_fd, c.id);
-        return backend.pause_upstream_recv_by_fd(c.upstream_fd, c.id);
+        c.upstream_recv_pause_rearm_pending = false;
+        return submit_recv_upstream_impl(c);
     }
 
     [[nodiscard]] bool pause_upstream_recv_for_send(Connection& c) {
@@ -895,19 +908,24 @@ public:
                         }
                         break;
                     }
-                    if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED &&
-                        conn.upstream_recv_pause_cancel_pending) {
-                        const bool needs_rearm = conn.upstream_recv_pause_rearm_pending;
-                        conn.upstream_recv_pause_rearm_pending = false;
+                    // The pause cancel's OWN completion (real conn_id + kPauseCancelAux,
+                    // counted in pending_ops). The cancel has fully drained, so a freshly-
+                    // armed recv on this conn_id can no longer be matched by it — re-arm
+                    // now if the recv side has also drained. Carries no data.
+                    if (ev.type == IoEventType::UpstreamRecv && ev.aux == kPauseCancelAux) {
+                        if (conn.pending_ops > 0) conn.pending_ops--;
                         conn.upstream_recv_pause_cancel_pending = false;
+                        if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        break;
+                    }
+                    if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED) {
+                        // The recv was cancelled (cancel won the race). Don't clear
+                        // cancel_pending or re-arm here — the cancel's own CQE owns that,
+                        // and may not have drained yet. Just account the recv; re-arm
+                        // fires from whichever of {recv, cancel} CQE lands second.
                         conn.upstream_recv_armed = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
-                        if (needs_rearm && !conn.upstream_recv_paused_for_send) {
-                            if (!this->submit_recv_upstream_impl(conn)) {
-                                this->close_conn(conn);
-                                break;
-                            }
-                        }
+                        if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
                         break;
                     }
                     // Async CQE accounting: decrement pending_ops on final CQE.
@@ -916,38 +934,22 @@ public:
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
-                        if (ev.type == IoEventType::UpstreamRecv &&
-                            conn.upstream_recv_pause_cancel_pending) {
+                        if (ev.type == IoEventType::UpstreamRecv) {
+                            // Recv ended normally. If a pause cancel lost the race it will
+                            // still post its own CQE to clear cancel_pending and own the
+                            // re-arm; here just account and re-arm if both sides drained.
                             conn.upstream_recv_armed = false;
-                            // The pause cancel lost the race: this recv completed
-                            // normally (not the -ECANCELED branch above), so the cancel
-                            // will -ENOENT and no -ECANCELED arrives to clear the
-                            // pending-cancel flag. Clear it (else the defer path in
-                            // submit_recv_upstream_impl waits forever) AND fire any
-                            // deferred re-arm — mirroring the -ECANCELED branch — or a
-                            // keep-alive proxy response deferred by that path sits with
-                            // no upstream recv armed until upstream_timeout. (Skip when
-                            // paused_for_send: that re-arm fires on send completion.)
-                            conn.upstream_recv_pause_cancel_pending = false;
-                            const bool kNeedsRearm = conn.upstream_recv_pause_rearm_pending;
-                            conn.upstream_recv_pause_rearm_pending = false;
-                            if (kNeedsRearm && !conn.upstream_recv_paused_for_send) {
-                                if (!this->submit_recv_upstream_impl(conn)) {
-                                    this->close_conn(conn);
-                                    break;
-                                }
+                            if (!this->try_deferred_upstream_rearm(conn)) {
+                                this->close_conn(conn);
+                                break;
                             }
-                            // This terminal CQE belongs to the PREVIOUS request's
-                            // recv (its body was already complete — that's why the
-                            // pause fired). Having used it only to clear the cancel
-                            // bookkeeping and re-arm, do NOT deliver it: the slots may
-                            // now point at the next pipelined request's
-                            // on_upstream_response, where an EOF (result==0, empty
-                            // buffer) would wrongly close that fresh request. Mirror
-                            // the -ECANCELED branch and stop here.
-                            break;
-                        } else if (ev.type == IoEventType::UpstreamRecv) {
-                            conn.upstream_recv_armed = false;
+                            // Suppress delivery of a post-body terminal: the response body
+                            // is already complete (that's why the pause fired), so these
+                            // bytes are stale and the slot may now point at the next
+                            // pipelined request's on_upstream_response, where an EOF would
+                            // wrongly close it. Active-response pauses (body still
+                            // streaming) carry real bytes — fall through to deliver.
+                            if (conn.resp_fully_buffered) break;
                         }
                     }
                     const bool has_recv_slot =

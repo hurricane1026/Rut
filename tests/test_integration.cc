@@ -2753,7 +2753,7 @@ static u32 fill_socket_send_buffer(i32 fd, i32 peer) {
 // timerfd from init() wakes wait() so this can't deadlock if an expected CQE never
 // arrives — the loop drains and the caller's assertions fail cleanly instead.
 struct UpstreamCqeProbe {
-    bool recv_done = false, send_done = false;
+    bool recv_done = false, send_done = false, cancel_done = false;
     i32 recv_result = 0, send_result = 0;
 };
 static void drain_upstream_cqes(IoUringBackend& backend,
@@ -2766,8 +2766,14 @@ static void drain_upstream_cqes(IoUringBackend& backend,
         for (u32 i = 0; i < n; ++i) {
             if (events[i].conn_id != conn.id) continue;
             if (events[i].type == IoEventType::UpstreamRecv) {
-                p.recv_done = true;
-                p.recv_result = events[i].result;
+                // The pause cancel's own completion is tagged kPauseCancelAux; the
+                // recv it cancels carries aux 0.
+                if (events[i].aux == kPauseCancelAux) {
+                    p.cancel_done = true;
+                } else {
+                    p.recv_done = true;
+                    p.recv_result = events[i].result;
+                }
             } else if (events[i].type == IoEventType::UpstreamSend) {
                 p.send_done = true;
                 p.send_result = events[i].result;
@@ -2776,48 +2782,10 @@ static void drain_upstream_cqes(IoUringBackend& backend,
     }
 }
 
-// cancel-by-fd cancels EVERY op on the upstream fd — including a concurrent upstream
-// send. This is why pause_upstream_recv_impl only uses it when no send is in flight.
-TEST(uring, pause_upstream_recv_by_fd_cancels_concurrent_send) {
-    i32 fds[2];
-    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-
-    IoUringBackend backend;
-    auto init_rc = backend.init(0, -1);
-    if (!init_rc) {
-        close(fds[0]);
-        close(fds[1]);
-        SKIP("io_uring init failed");
-    }
-    fill_socket_send_buffer(fds[0], fds[1]);
-
-    TestConn tc;
-    tc.init(0, fds[0]);
-    Connection& conn = tc.conn;
-
-    static u8 payload[64u * 1024u];
-    REQUIRE(backend.add_recv_upstream(fds[0], conn.id));
-    REQUIRE(backend.add_send_upstream(fds[0], conn.id, payload, sizeof(payload)));
-    IoEvent ev[8]{};
-    backend.wait(ev, 8, &conn, 1);  // submit; buffer is full so neither completes
-
-    REQUIRE(backend.pause_upstream_recv_by_fd(fds[0], conn.id));
-
-    UpstreamCqeProbe p;
-    drain_upstream_cqes(backend, conn, p, 8);
-    CHECK(p.recv_done);
-    CHECK_EQ(p.recv_result, -ECANCELED);
-    CHECK(p.send_done);  // the send was cancelled too — the whole point of the guard
-    CHECK_EQ(p.send_result, -ECANCELED);
-
-    close(fds[0]);
-    close(fds[1]);
-    backend.shutdown();
-}
-
-// cancel-by-user_data (the variant used when a send is in flight) targets only the
-// recv: the concurrent upstream send survives and completes once the peer drains.
-TEST(uring, pause_upstream_recv_user_data_spares_concurrent_send) {
+// The pause cancel is recv-only (cancel by user_data): it cancels the multishot
+// upstream recv but never a concurrent upstream send, and it posts its OWN tracked
+// completion (kPauseCancelAux) so the loop re-arms only after the cancel drains.
+TEST(uring, pause_upstream_recv_cancels_recv_spares_send) {
     i32 fds[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
@@ -2840,13 +2808,14 @@ TEST(uring, pause_upstream_recv_user_data_spares_concurrent_send) {
     IoEvent ev[8]{};
     backend.wait(ev, 8, &conn, 1);  // submit; buffer is full so neither completes
 
-    REQUIRE(backend.pause_upstream_recv(fds[0], conn.id));  // user_data: recv only
+    REQUIRE(backend.pause_upstream_recv(fds[0], conn.id));  // recv-only cancel
 
     UpstreamCqeProbe p;
-    drain_upstream_cqes(backend, conn, p, 4);
+    drain_upstream_cqes(backend, conn, p, 8);
     CHECK(p.recv_done);
-    CHECK_EQ(p.recv_result, -ECANCELED);
-    CHECK(!p.send_done);  // send NOT cancelled — still pending behind the full buffer
+    CHECK_EQ(p.recv_result, -ECANCELED);  // the recv was cancelled
+    CHECK(p.cancel_done);                 // the cancel posted its own tracked completion
+    CHECK(!p.send_done);                  // the concurrent send was NOT cancelled — still pending
 
     // Drain the peer AND reap, interleaved, until the pending send completes —
     // proving it survived the cancel. The send is 64 KiB but the buffers were shrunk,
@@ -2872,64 +2841,117 @@ static void mark_upstream_recv_delivered(void* /*lp*/, Connection& /*conn*/, IoE
     g_upstream_recv_delivered = true;
 }
 
-// The upstream-recv pause cancel can resolve two ways, and BOTH must clear the
-// pending-cancel flag and fire the deferred re-arm — otherwise a keep-alive proxy
-// response that deferred its re-arm behind the cancel stalls with no upstream recv
-// armed until upstream_timeout. These drive each outcome deterministically with a
-// synthetic terminal CQE, instead of relying on the cancel/recv timing race actually
-// landing one way or the other.
-TEST(uring, upstream_recv_pause_cancel_wins_clears_and_rearms) {
+// A pause cancel's own tracked completion (kPauseCancelAux) as a synthetic CQE.
+static IoEvent pause_cancel_cqe(u32 conn_id) {
+    IoEvent e = make_ev(conn_id, IoEventType::UpstreamRecv, 0);
+    e.aux = kPauseCancelAux;
+    return e;
+}
+
+// Set conn into "armed recv + counted pause cancel in flight, re-arm deferred" — the
+// state pause_upstream_recv_impl leaves behind. pending_ops = 2 (the recv + the cancel).
+static void arm_paused_upstream(Connection& conn) {
+    conn.upstream_fd = 42;
+    conn.pending_ops = 2;
+    conn.upstream_recv_armed = true;
+    conn.upstream_recv_paused_for_send = false;
+    conn.upstream_recv_pause_cancel_pending = true;
+    conn.upstream_recv_pause_rearm_pending = true;
+    conn.resp_fully_buffered = false;
+    conn.on_upstream_recv = &mark_upstream_recv_delivered;
+    g_upstream_recv_delivered = false;
+}
+
+// The re-arm must fire from the CANCEL's own completion, never from the recv CQE —
+// otherwise the still-in-flight cancel could match the freshly-armed recv on the
+// reused conn_id. These drive both CQE orderings deterministically.
+
+// Cancel wins, recv CQE arrives first: account the recv, but DON'T re-arm until the
+// cancel's own CQE drains.
+TEST(uring, upstream_recv_pause_cancel_wins_recv_first_rearms_on_cancel) {
     auto loop = std::make_unique<IoUringEventLoop>();
     if (!loop->init(0, -1)) {
         CHECK(true);  // no io_uring here — add_recv_upstream can't queue; skip
         return;
     }
     Connection& conn = loop->conns[0];
-    conn.upstream_fd = 42;
-    conn.pending_ops = 1;
-    conn.upstream_recv_armed = true;
-    conn.upstream_recv_paused_for_send = false;
-    conn.upstream_recv_pause_cancel_pending = true;  // a pause cancel is in flight
-    conn.upstream_recv_pause_rearm_pending = true;   // a re-arm was deferred behind it
+    arm_paused_upstream(conn);
 
-    // Cancel wins: the recv completes as -ECANCELED.
     loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));
+    CHECK(!conn.upstream_recv_armed);
+    CHECK(conn.upstream_recv_pause_cancel_pending);  // cancel still in flight
+    CHECK(conn.upstream_recv_pause_rearm_pending);   // re-arm still deferred — NOT yet
+    CHECK_EQ(conn.pending_ops, 1u);                  // recv accounted; cancel pending
 
+    loop->dispatch(pause_cancel_cqe(conn.id));  // cancel drains
     CHECK(!conn.upstream_recv_pause_cancel_pending);
     CHECK(!conn.upstream_recv_pause_rearm_pending);
-    CHECK(conn.upstream_recv_armed);  // the deferred re-arm fired
+    CHECK(conn.upstream_recv_armed);  // re-armed only after cancel drained
+    CHECK_EQ(conn.pending_ops, 1u);   // cancel -1, re-arm +1
     loop->shutdown();
 }
 
-TEST(uring, upstream_recv_pause_cancel_loses_clears_and_rearms) {
+// Cancel wins, the cancel's CQE arrives first: don't re-arm yet (recv still armed),
+// then re-arm when the recv CQE lands.
+TEST(uring, upstream_recv_pause_cancel_cqe_first_rearms_on_recv) {
     auto loop = std::make_unique<IoUringEventLoop>();
     if (!loop->init(0, -1)) {
         CHECK(true);
         return;
     }
     Connection& conn = loop->conns[0];
-    conn.upstream_fd = 42;
-    conn.pending_ops = 1;
-    conn.upstream_recv_armed = true;
-    conn.upstream_recv_paused_for_send = false;
-    conn.upstream_recv_pause_cancel_pending = true;
-    conn.upstream_recv_pause_rearm_pending = true;
-    // The slot already points at the NEXT request's handler (the deferred re-arm is
-    // for a pipelined request). If the stale terminal were delivered here, an EOF
-    // would wrongly close that fresh request — so it must NOT reach this handler.
-    conn.on_upstream_recv = &mark_upstream_recv_delivered;
-    g_upstream_recv_delivered = false;
+    arm_paused_upstream(conn);
 
-    // Cancel loses the race: the recv completes normally first (a terminal CQE, not
-    // -ECANCELED), so the cancel will -ENOENT and no -ECANCELED ever arrives. The
-    // generic-accounting branch must still clear the pending-cancel flag (or the
-    // defer in submit_recv_upstream_impl waits forever) and fire the deferred re-arm.
-    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 0));
-
+    loop->dispatch(pause_cancel_cqe(conn.id));  // cancel drains first
     CHECK(!conn.upstream_recv_pause_cancel_pending);
+    CHECK(conn.upstream_recv_armed);                // recv CQE not seen → still armed
+    CHECK(conn.upstream_recv_pause_rearm_pending);  // re-arm still deferred — NOT yet
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));
+    CHECK(conn.upstream_recv_armed);  // re-armed once the recv drained too
     CHECK(!conn.upstream_recv_pause_rearm_pending);
-    CHECK(conn.upstream_recv_armed);    // the deferred re-arm fired
-    CHECK(!g_upstream_recv_delivered);  // the stale terminal was NOT delivered (P2)
+    loop->shutdown();
+}
+
+// Cancel loses at a keep-alive boundary (body complete): the recv completes normally,
+// but its bytes are stale and the slot may point at the next request — suppress
+// delivery, and still re-arm on the cancel's own CQE.
+TEST(uring, upstream_recv_pause_cancel_loses_suppresses_stale_and_rearms) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.resp_fully_buffered = true;  // body already complete — terminal is stale
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 0));  // normal EOF
+    CHECK(!conn.upstream_recv_armed);
+    CHECK(conn.upstream_recv_pause_cancel_pending);  // cancel still in flight
+    CHECK(!g_upstream_recv_delivered);               // stale post-body terminal NOT delivered (P2)
+
+    loop->dispatch(pause_cancel_cqe(conn.id));
+    CHECK(conn.upstream_recv_armed);  // re-armed after cancel drained
+    CHECK(!g_upstream_recv_delivered);
+    loop->shutdown();
+}
+
+// Cancel loses while the response body is STILL streaming (watermark/throttle pause):
+// the terminal carries real body bytes, so it MUST be delivered (P1-B regression).
+TEST(uring, upstream_recv_pause_active_response_terminal_is_delivered) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.resp_fully_buffered = false;                // body still streaming — bytes are real
+    conn.upstream_recv_pause_rearm_pending = false;  // watermark pause: no reuse re-arm
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 128));  // final data chunk
+    CHECK(g_upstream_recv_delivered);  // active-response bytes ARE delivered (P1-B)
     loop->shutdown();
 }
 
