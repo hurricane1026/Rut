@@ -4341,6 +4341,118 @@ TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
     destroy_tls_server_context(tls_ctx.value());
 }
 
+// Informational proxy latency/throughput benchmark (keep-alive, real io_uring).
+// Gated behind RUT_BENCH so it only runs in the dedicated bench CI job; prints
+// req/s and p50/p99 per-request latency to the log so a change like cancel-by-fd
+// (off the per-byte path → expected no-op) can be eyeballed against history. NOT a
+// pass/fail perf gate (shared CI runners are too noisy for a stable threshold) — it
+// asserts only that every request completes, so a gross regression that hangs or
+// truncates still fails the job.
+TEST(proxy_tls_iouring, keepalive_latency_bench) {
+    if (std::getenv("RUT_BENCH") == nullptr) SKIP("set RUT_BENCH=1 to run the proxy bench");
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    using namespace rut;
+
+    constexpr u32 kBody = 4u * 1024u;
+    constexpr u32 kN = 5000u;
+    ReuseUpstream backend;
+    REQUIRE(backend.setup(kBody));
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/dl", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->tls_server = tls_ctx.value();
+    shard.loop->config_ptr = &active;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 5);
+    SSL* ssl = SSL_new(client_ctx);
+    REQUIRE(ssl != nullptr);
+    REQUIRE(SSL_set_fd(ssl, c) == 1);
+    REQUIRE(SSL_connect(ssl) == 1);
+
+    const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
+    static u8 in[64u * 1024u];
+    static u64 lat_ns[kN];
+    u32 completed = 0;
+    auto now_ns = []() -> u64 {
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        return static_cast<u64>(t.tv_sec) * 1000000000ull + static_cast<u64>(t.tv_nsec);
+    };
+    const u64 t0 = now_ns();
+    for (u32 r = 0; r < kN; r++) {
+        const u64 ta = now_ns();
+        if (!ssl_write_all(ssl, kReq, sizeof(kReq) - 1)) break;
+        u32 total = 0, body_off = 0, body_seen = 0;
+        bool hdr_done = false;
+        while (body_seen < kBody && total < sizeof(in)) {
+            const i32 n = SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total));
+            if (n <= 0) break;
+            total += static_cast<u32>(n);
+            if (!hdr_done) {
+                for (u32 i = 3; i < total; i++) {
+                    if (in[i - 3] == '\r' && in[i - 2] == '\n' && in[i - 1] == '\r' &&
+                        in[i] == '\n') {
+                        hdr_done = true;
+                        body_off = i + 1;
+                        break;
+                    }
+                }
+            }
+            if (hdr_done) body_seen = total - body_off;
+        }
+        if (!hdr_done || body_seen < kBody) break;
+        lat_ns[completed++] = now_ns() - ta;
+    }
+    const u64 total_ns = now_ns() - t0;
+    REQUIRE_EQ(completed, kN);
+
+    std::sort(lat_ns, lat_ns + completed);
+    const u32 kP50Idx = completed / 2;
+    const u32 kP99Idx = completed * 99 / 100;
+    const double rps = static_cast<double>(completed) * 1e9 / static_cast<double>(total_ns);
+    const double p50_us = static_cast<double>(lat_ns[kP50Idx]) / 1e3;
+    const double p99_us = static_cast<double>(lat_ns[kP99Idx]) / 1e3;
+    const u32 kBodyKiB = kBody / 1024u;
+    fprintf(stderr,
+            "[bench] proxy keep-alive over TLS: %u reqs in %.1f ms => %.0f req/s | "
+            "p50=%.1f us p99=%.1f us (body=%u KiB)\n",
+            completed,
+            static_cast<double>(total_ns) / 1e6,
+            rps,
+            p50_us,
+            p99_us,
+            kBodyKiB);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(c);
+    SSL_CTX_free(client_ctx);
+    backend.teardown();
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
 // === ALPN selection (pure logic, no crypto) ===
 
 TEST(alpn, picks_h2_when_offered_and_requested) {
