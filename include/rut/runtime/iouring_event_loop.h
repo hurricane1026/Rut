@@ -907,17 +907,29 @@ public:
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
-                        if (ev.type == IoEventType::UpstreamRecv) {
+                        if (ev.type == IoEventType::UpstreamRecv &&
+                            conn.upstream_recv_pause_cancel_pending) {
                             conn.upstream_recv_armed = false;
-                            // If a pause_upstream_recv cancel was racing this recv it
-                            // lost: the recv completed normally (this is not the
-                            // -ECANCELED branch above), so the cancel will -ENOENT and
-                            // no -ECANCELED arrives to clear the pending-cancel flag.
-                            // Clear it here, or the defer-until-cancel-drains path in
-                            // submit_recv_upstream_impl waits forever for a completion
-                            // that never comes. (rearm_pending is left intact so the
-                            // send-pause re-arm path still fires.)
+                            // The pause cancel lost the race: this recv completed
+                            // normally (not the -ECANCELED branch above), so the cancel
+                            // will -ENOENT and no -ECANCELED arrives to clear the
+                            // pending-cancel flag. Clear it (else the defer path in
+                            // submit_recv_upstream_impl waits forever) AND fire any
+                            // deferred re-arm — mirroring the -ECANCELED branch — or a
+                            // keep-alive proxy response deferred by that path sits with
+                            // no upstream recv armed until upstream_timeout. (Skip when
+                            // paused_for_send: that re-arm fires on send completion.)
                             conn.upstream_recv_pause_cancel_pending = false;
+                            const bool kNeedsRearm = conn.upstream_recv_pause_rearm_pending;
+                            conn.upstream_recv_pause_rearm_pending = false;
+                            if (kNeedsRearm && !conn.upstream_recv_paused_for_send) {
+                                if (!this->submit_recv_upstream_impl(conn)) {
+                                    this->close_conn(conn);
+                                    break;
+                                }
+                            }
+                        } else if (ev.type == IoEventType::UpstreamRecv) {
+                            conn.upstream_recv_armed = false;
                         }
                     }
                     const bool has_recv_slot =
