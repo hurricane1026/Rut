@@ -601,7 +601,16 @@ public:
             c.upstream_recv_pause_cancel_pending = false;
             return true;
         }
-        return backend.pause_upstream_recv(c.upstream_fd, c.id);
+        // Cancel-by-fd is collision-proof across keep-alive reuse (the next request's
+        // recv is on a different fd), but it cancels EVERY op on the fd. Only use it
+        // when no upstream send is in flight — true for every proxy response-streaming
+        // pause, since the request is fully sent before the response body streams.
+        // When a send IS in flight (a WS full-duplex tunnel, or an overlapping
+        // request-body upload), cancel by user_data so the send survives; those call
+        // sites are mid-stream, far from the next request, so the user_data reuse
+        // cannot collide before the cancel drains.
+        if (c.upstream_send_armed) return backend.pause_upstream_recv(c.upstream_fd, c.id);
+        return backend.pause_upstream_recv_by_fd(c.upstream_fd, c.id);
     }
 
     [[nodiscard]] bool pause_upstream_recv_for_send(Connection& c) {

@@ -108,7 +108,11 @@ struct IoUringBackend {
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
+    // Recv-only (cancel by user_data) — use when an upstream send may share the fd.
     bool pause_upstream_recv(i32 fd, u32 conn_id);
+    // Collision-proof across keep-alive reuse (cancel by fd) — use only when no
+    // upstream send is in flight, since it cancels every op on the fd.
+    bool pause_upstream_recv_by_fd(i32 fd, u32 conn_id);
 
     // Submit a send (or zero-copy send).
     // Returns false if SQ is full (no SQE submitted).

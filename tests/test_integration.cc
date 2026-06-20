@@ -2730,6 +2730,141 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     backend.shutdown();
 }
 
+// Shrink both ends' socket buffers and write directly until EAGAIN, so a
+// subsequently submitted io_uring send on `fd` has nowhere to go and stays pending
+// (a CQE only arrives on cancel or once the peer drains). Returns bytes pre-filled.
+static u32 fill_socket_send_buffer(i32 fd, i32 peer) {
+    int small = 4096;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    static u8 junk[4096];
+    u32 total = 0;
+    for (;;) {
+        const ssize_t n = ::send(fd, junk, sizeof(junk), MSG_DONTWAIT);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (total > 4u * 1024u * 1024u) break;  // guard against an unbounded buffer
+    }
+    return total;
+}
+
+// Collect up to `attempts` rounds of CQEs, recording whether the upstream recv and
+// upstream send each completed and with what result. The default 1s periodic
+// timerfd from init() wakes wait() so this can't deadlock if an expected CQE never
+// arrives — the loop drains and the caller's assertions fail cleanly instead.
+struct UpstreamCqeProbe {
+    bool recv_done = false, send_done = false;
+    i32 recv_result = 0, send_result = 0;
+};
+static void drain_upstream_cqes(IoUringBackend& backend,
+                                Connection& conn,
+                                UpstreamCqeProbe& p,
+                                u32 attempts) {
+    IoEvent events[8]{};
+    for (u32 a = 0; a < attempts; ++a) {
+        const u32 n = backend.wait(events, 8, &conn, 1);
+        for (u32 i = 0; i < n; ++i) {
+            if (events[i].conn_id != conn.id) continue;
+            if (events[i].type == IoEventType::UpstreamRecv) {
+                p.recv_done = true;
+                p.recv_result = events[i].result;
+            } else if (events[i].type == IoEventType::UpstreamSend) {
+                p.send_done = true;
+                p.send_result = events[i].result;
+            }
+        }
+    }
+}
+
+// cancel-by-fd cancels EVERY op on the upstream fd — including a concurrent upstream
+// send. This is why pause_upstream_recv_impl only uses it when no send is in flight.
+TEST(uring, pause_upstream_recv_by_fd_cancels_concurrent_send) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    IoUringBackend backend;
+    auto init_rc = backend.init(0, -1);
+    if (!init_rc) {
+        close(fds[0]);
+        close(fds[1]);
+        SKIP("io_uring init failed");
+    }
+    fill_socket_send_buffer(fds[0], fds[1]);
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+
+    static u8 payload[64u * 1024u];
+    REQUIRE(backend.add_recv_upstream(fds[0], conn.id));
+    REQUIRE(backend.add_send_upstream(fds[0], conn.id, payload, sizeof(payload)));
+    IoEvent ev[8]{};
+    backend.wait(ev, 8, &conn, 1);  // submit; buffer is full so neither completes
+
+    REQUIRE(backend.pause_upstream_recv_by_fd(fds[0], conn.id));
+
+    UpstreamCqeProbe p;
+    drain_upstream_cqes(backend, conn, p, 8);
+    CHECK(p.recv_done);
+    CHECK_EQ(p.recv_result, -ECANCELED);
+    CHECK(p.send_done);  // the send was cancelled too — the whole point of the guard
+    CHECK_EQ(p.send_result, -ECANCELED);
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+// cancel-by-user_data (the variant used when a send is in flight) targets only the
+// recv: the concurrent upstream send survives and completes once the peer drains.
+TEST(uring, pause_upstream_recv_user_data_spares_concurrent_send) {
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    IoUringBackend backend;
+    auto init_rc = backend.init(0, -1);
+    if (!init_rc) {
+        close(fds[0]);
+        close(fds[1]);
+        SKIP("io_uring init failed");
+    }
+    const u32 prefilled = fill_socket_send_buffer(fds[0], fds[1]);
+
+    TestConn tc;
+    tc.init(0, fds[0]);
+    Connection& conn = tc.conn;
+
+    static u8 payload[64u * 1024u];
+    REQUIRE(backend.add_recv_upstream(fds[0], conn.id));
+    REQUIRE(backend.add_send_upstream(fds[0], conn.id, payload, sizeof(payload)));
+    IoEvent ev[8]{};
+    backend.wait(ev, 8, &conn, 1);  // submit; buffer is full so neither completes
+
+    REQUIRE(backend.pause_upstream_recv(fds[0], conn.id));  // user_data: recv only
+
+    UpstreamCqeProbe p;
+    drain_upstream_cqes(backend, conn, p, 4);
+    CHECK(p.recv_done);
+    CHECK_EQ(p.recv_result, -ECANCELED);
+    CHECK(!p.send_done);  // send NOT cancelled — still pending behind the full buffer
+
+    // Drain the peer so the pending send can complete, proving it survived the cancel.
+    static u8 sink[8192];
+    u32 drained = 0;
+    while (drained < prefilled) {
+        const ssize_t n = ::recv(fds[1], sink, sizeof(sink), MSG_DONTWAIT);
+        if (n <= 0) break;
+        drained += static_cast<u32>(n);
+    }
+    drain_upstream_cqes(backend, conn, p, 8);
+    CHECK(p.send_done);
+    CHECK_GT(p.send_result, 0);  // the send completed successfully, not -ECANCELED
+
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
 // Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
 // pending, and re-arms once the late cancel CQE arrives after the handler has
 // already asked to keep reading.

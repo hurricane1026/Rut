@@ -383,16 +383,26 @@ bool IoUringBackend::cancel_by_fd(i32 fd, u32 conn_id, IoEventType type, u32 aux
     return true;
 }
 
+// Recv-only cancel by user_data. Used when an upstream SEND may be in flight on the
+// same fd (a WS full-duplex tunnel, or an overlapping request-body upload), where
+// cancel-by-fd would also cancel the send and corrupt it. The user_data is keyed on
+// conn_id (reused across keep-alive requests), so it could in principle match a
+// later request's recv — but every caller of this variant is mid-stream, far from
+// the next request, so the cancel drains long before any reuse.
 bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id) {
     if (fd < 0 || conn_id >= kMaxSendState) return false;
-    // Cancel by fd, not by user_data. The upstream recv's user_data is keyed on
-    // conn_id (the connection slot), which is reused across keep-alive requests and
-    // outlives the fd — so a user_data cancel issued for one response could match a
-    // later request's recv (same conn_id, NEW fd) and cancel it. Binding the cancel
-    // to this specific fd, captured while it is still the live upstream socket, makes
-    // that collision structurally impossible: the next request's recv is on a
-    // different fd. The cancel's own completion uses kCancelConnId (consumed
-    // silently); the recv's -ECANCELED still routes to the connection as before.
+    return cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamRecv),
+                               kCancelConnId,
+                               IoEventType::UpstreamRecv);
+}
+
+// Cancel by fd. Used when no upstream send is in flight (every proxy response-
+// streaming pause — the request is fully sent before the response body streams).
+// Collision-proof across keep-alive reuse: the cancel is bound to this fd, captured
+// while it is the live upstream socket, so the next request's recv (a different fd)
+// can never match it. The recv's -ECANCELED still routes to the connection.
+bool IoUringBackend::pause_upstream_recv_by_fd(i32 fd, u32 conn_id) {
+    if (fd < 0 || conn_id >= kMaxSendState) return false;
     return cancel_by_fd(fd, kCancelConnId, IoEventType::UpstreamRecv);
 }
 
