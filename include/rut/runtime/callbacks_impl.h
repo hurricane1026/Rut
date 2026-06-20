@@ -346,8 +346,13 @@ void throttle_resume(Loop* loop, Connection& conn) {
 #else
         on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
 #endif
-    } else {
-        loop->submit_recv_upstream(conn);
+    } else if (!loop->submit_recv_upstream(conn)) {
+        // Deferred re-arm: the low-watermark watermark resume cleared
+        // tls_recv_paused_hw and left the retry to throttle_resume.
+        // submit_recv_upstream can fail under io_uring SQ pressure; with the
+        // watermark flag already gone there is nothing left to retry and no CQE is
+        // guaranteed, so fail closed rather than stall the response until timeout.
+        loop->close_conn(conn);
     }
 }
 
@@ -1652,6 +1657,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
+        // A parked TLS proxy tail still owns the final body bytes: the body parser
+        // already completed (resp_body_remaining hit 0 / chunk parser Complete
+        // before tls_fill_output parked the unencrypted remainder), but
+        // resp_fully_buffered isn't set until proxy_tls_parked_drained finishes it.
+        // A racing upstream EOF in that window must not drop the draining
+        // ciphertext — it is complete-on-drain, so ignore it. (A tail parked
+        // mid-body — body NOT complete — is a genuine upstream truncation, so fall
+        // through to close.)
+        if (conn.tls_proxy_stream && conn.tls_send_src && proxy_body_complete(conn)) return;
         loop->close_conn(conn);
         return;
     }
@@ -1793,6 +1807,12 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     conn.tls_proxy_stream = false;
     conn.resp_fully_buffered = false;
     conn.tls_recv_paused_hw = false;  // per-response; must not leak into the next request
+    // A throttle pause + armed throttle timer are also per-response. If the body
+    // completes (parked/raced tail) before the timer fires, clear the pause so a
+    // leaked tick is a no-op — both backends dispatch throttle_resume only while
+    // throttle_paused — instead of resuming a pump against the next request's state.
+    conn.throttle_paused = false;
+    conn.throttle_pending_len = 0;
     conn.upstream_recv_buf.reset();
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 

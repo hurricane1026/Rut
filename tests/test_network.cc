@@ -1552,7 +1552,9 @@ TEST(tls_iouring, proxy_stream_complete_clears_hw_pause) {
     conn->tls_proxy_stream = true;
     conn->resp_fully_buffered = true;
     conn->tls_recv_paused_hw = true;
-    conn->keep_alive = true;  // stays open, so the flag is readable afterward
+    conn->throttle_paused = true;  // round-5 #4: a throttle pause must not leak
+    conn->throttle_pending_len = 99;
+    conn->keep_alive = true;  // stays open, so the flags are readable afterward
     const u32 cid = conn->id;
 
     proxy_stream_complete<SmallLoop>(&loop, *conn);
@@ -1560,6 +1562,62 @@ TEST(tls_iouring, proxy_stream_complete_clears_hw_pause) {
     CHECK(!conn->tls_recv_paused_hw);  // cleared at the keep-alive boundary
     CHECK(!conn->tls_proxy_stream);    // per-response state reset
     CHECK(!conn->resp_fully_buffered);
+    CHECK(!conn->throttle_paused);  // #4: throttle pause cleared (leaked tick no-ops)
+    CHECK_EQ(conn->throttle_pending_len, 0u);
+}
+
+// Round-5 #3: when the final body chunk parked a TLS proxy tail (body parser
+// complete, but resp_fully_buffered not set until the tail drains), a racing
+// upstream EOF must be ignored — the drain owns the remaining body bytes. A tail
+// parked mid-body (body NOT complete) is a genuine truncation and still closes.
+TEST(tls_iouring, proxy_stream_parked_complete_tail_ignores_eof) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->tls_proxy_stream = true;
+    conn->tls_send_src = conn->upstream_recv_buf.data();  // tail parked
+    conn->tls_send_len = 4;
+    conn->resp_body_mode = BodyMode::ContentLength;
+    conn->resp_body_remaining = 0;  // body parser already complete
+    const u32 cid = conn->id;
+    on_response_body_recvd<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // EOF ignored — complete-on-drain
+
+    // Contrast: tail parked mid-body (more body expected) → EOF is a truncation.
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* trunc = loop.find_fd(43);
+    REQUIRE(trunc != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*trunc));
+    trunc->tls_proxy_stream = true;
+    trunc->tls_send_src = trunc->upstream_recv_buf.data();
+    trunc->tls_send_len = 4;
+    trunc->resp_body_mode = BodyMode::ContentLength;
+    trunc->resp_body_remaining = 10;  // body NOT complete
+    const u32 tcid = trunc->id;
+    on_response_body_recvd<SmallLoop>(&loop, *trunc, make_ev(tcid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.conns[tcid].fd, -1);  // truncation → closed
+}
+
+// Round-5 #2: throttle_resume's deferred re-arm (kRemaining == 0) must fail closed
+// when submit_recv_upstream can't queue under SQ pressure — otherwise the watermark
+// flag is already gone and nothing retries, stalling the response until timeout.
+TEST(tls_iouring, throttle_resume_fails_closed_when_rearm_fails) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->throttle_paused = true;
+    conn->throttle_pending_len = 0;  // kRemaining == 0 → the deferred re-arm path
+    conn->throttle_down_bps = 0;     // budget available → proceeds to re-arm
+    const u32 cid = conn->id;
+
+    loop.backend.fail_upstream_recv = true;  // simulate io_uring SQ pressure
+    throttle_resume<SmallLoop>(&loop, *conn);
+    CHECK_EQ(loop.conns[cid].fd, -1);  // fail closed, not silently stalled
 }
 
 // Two proxy cycles on same connection (keep-alive)
