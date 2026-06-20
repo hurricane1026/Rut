@@ -193,7 +193,12 @@ jobs:
       - name: Build
         run: ninja -C build test_integration
       - name: Bench
-        run: RUT_BENCH=1 ./build/tests/test_integration 2>&1 | grep -E '\[bench\]|keepalive_latency_bench'
+        # set -o pipefail so a failing test run (non-zero exit) isn't masked by grep's
+        # exit status — otherwise the bench's "every request completes" assertion is
+        # silently dropped whenever grep matches a line.
+        run: |
+          set -o pipefail
+          RUT_BENCH=1 ./build/tests/test_integration 2>&1 | grep -E '\[bench\]|keepalive_latency_bench'
 
   bench-simd-x86:
     name: SIMD scan_uri bench (x86)

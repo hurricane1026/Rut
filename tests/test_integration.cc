@@ -2848,21 +2848,28 @@ TEST(uring, pause_upstream_recv_user_data_spares_concurrent_send) {
     CHECK_EQ(p.recv_result, -ECANCELED);
     CHECK(!p.send_done);  // send NOT cancelled — still pending behind the full buffer
 
-    // Drain the peer so the pending send can complete, proving it survived the cancel.
+    // Drain the peer AND reap, interleaved, until the pending send completes —
+    // proving it survived the cancel. The send is 64 KiB but the buffers were shrunk,
+    // so it drains over many windows; draining `prefilled` once frees only one window
+    // and the send would still be partly pending. Keep going until send_done.
     static u8 sink[8192];
-    u32 drained = 0;
-    while (drained < prefilled) {
-        const ssize_t n = ::recv(fds[1], sink, sizeof(sink), MSG_DONTWAIT);
-        if (n <= 0) break;
-        drained += static_cast<u32>(n);
+    (void)prefilled;
+    for (u32 a = 0; a < 64 && !p.send_done; ++a) {
+        while (::recv(fds[1], sink, sizeof(sink), MSG_DONTWAIT) > 0) {
+        }
+        drain_upstream_cqes(backend, conn, p, 1);
     }
-    drain_upstream_cqes(backend, conn, p, 8);
     CHECK(p.send_done);
     CHECK_GT(p.send_result, 0);  // the send completed successfully, not -ECANCELED
 
     close(fds[0]);
     close(fds[1]);
     backend.shutdown();
+}
+
+static bool g_upstream_recv_delivered = false;
+static void mark_upstream_recv_delivered(void* /*lp*/, Connection& /*conn*/, IoEvent /*ev*/) {
+    g_upstream_recv_delivered = true;
 }
 
 // The upstream-recv pause cancel can resolve two ways, and BOTH must clear the
@@ -2907,6 +2914,11 @@ TEST(uring, upstream_recv_pause_cancel_loses_clears_and_rearms) {
     conn.upstream_recv_paused_for_send = false;
     conn.upstream_recv_pause_cancel_pending = true;
     conn.upstream_recv_pause_rearm_pending = true;
+    // The slot already points at the NEXT request's handler (the deferred re-arm is
+    // for a pipelined request). If the stale terminal were delivered here, an EOF
+    // would wrongly close that fresh request — so it must NOT reach this handler.
+    conn.on_upstream_recv = &mark_upstream_recv_delivered;
+    g_upstream_recv_delivered = false;
 
     // Cancel loses the race: the recv completes normally first (a terminal CQE, not
     // -ECANCELED), so the cancel will -ENOENT and no -ECANCELED ever arrives. The
@@ -2916,7 +2928,8 @@ TEST(uring, upstream_recv_pause_cancel_loses_clears_and_rearms) {
 
     CHECK(!conn.upstream_recv_pause_cancel_pending);
     CHECK(!conn.upstream_recv_pause_rearm_pending);
-    CHECK(conn.upstream_recv_armed);  // the deferred re-arm fired
+    CHECK(conn.upstream_recv_armed);    // the deferred re-arm fired
+    CHECK(!g_upstream_recv_delivered);  // the stale terminal was NOT delivered (P2)
     loop->shutdown();
 }
 
@@ -4534,7 +4547,10 @@ static u32 run_keepalive_reuse(const char* req, u32 req_len, u32 kBody, u32 kReq
 TEST(proxy_tls_iouring, keepalive_reuse_no_cancel_collision) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     const char kReq[] = "GET /dl HTTP/1.1\r\nHost: x\r\n\r\n";
-    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 16u * 1024u, 30u), 30u);
+    // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
+    // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
+    // as a cancel-collision. Still a real multi-recv stream that pauses per request.
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
 }
 
 // Same reuse stress with POST: each request forwards a request body to the upstream
@@ -4544,7 +4560,10 @@ TEST(proxy_tls_iouring, keepalive_reuse_post_body_no_cancel_collision) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     const char kReq[] =
         "POST /dl HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
-    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 16u * 1024u, 30u), 30u);
+    // 8 KiB body: comfortably under the 16 KiB upstream_recv_buf even with headers,
+    // so a one-batch loopback harvest can't -ENOBUFS-truncate the tail and masquerade
+    // as a cancel-collision. Still a real multi-recv stream that pauses per request.
+    CHECK_EQ(run_keepalive_reuse(kReq, sizeof(kReq) - 1, 8u * 1024u, 30u), 30u);
 }
 
 // Informational proxy latency/throughput benchmark (keep-alive, real io_uring).
@@ -4628,25 +4647,11 @@ TEST(proxy_tls_iouring, keepalive_latency_bench) {
         lat_ns[completed++] = now_ns() - ta;
     }
     const u64 total_ns = now_ns() - t0;
-    REQUIRE_EQ(completed, kN);
 
-    std::sort(lat_ns, lat_ns + completed);
-    const u32 kP50Idx = completed / 2;
-    const u32 kP99Idx = completed * 99 / 100;
-    const double rps = static_cast<double>(completed) * 1e9 / static_cast<double>(total_ns);
-    const double p50_us = static_cast<double>(lat_ns[kP50Idx]) / 1e3;
-    const double p99_us = static_cast<double>(lat_ns[kP99Idx]) / 1e3;
-    const u32 kBodyKiB = kBody / 1024u;
-    fprintf(stderr,
-            "[bench] proxy keep-alive over TLS: %u reqs in %.1f ms => %.0f req/s | "
-            "p50=%.1f us p99=%.1f us (body=%u KiB)\n",
-            completed,
-            static_cast<double>(total_ns) / 1e6,
-            rps,
-            p50_us,
-            p99_us,
-            kBodyKiB);
-
+    // Tear down BEFORE asserting. Shard has no destructor that stops its thread, so an
+    // early return on a failed assertion would leave the io_uring shard running with
+    // pointers to this frame's config/TLS state — a leaked thread and a later flaky
+    // crash. Stop everything first, then report and assert.
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(c);
@@ -4657,6 +4662,27 @@ TEST(proxy_tls_iouring, keepalive_latency_bench) {
     shard.shutdown();
     close(lfd);
     destroy_tls_server_context(tls_ctx.value());
+
+    if (completed > 0) {
+        std::sort(lat_ns, lat_ns + completed);
+        const u32 kP50Idx = completed / 2;
+        const u32 kP99Idx = completed * 99 / 100;
+        const double rps = static_cast<double>(completed) * 1e9 / static_cast<double>(total_ns);
+        const double p50_us = static_cast<double>(lat_ns[kP50Idx]) / 1e3;
+        const double p99_us = static_cast<double>(lat_ns[kP99Idx]) / 1e3;
+        const u32 kBodyKiB = kBody / 1024u;
+        fprintf(stderr,
+                "[bench] proxy keep-alive over TLS: %u reqs in %.1f ms => %.0f req/s | "
+                "p50=%.1f us p99=%.1f us (body=%u KiB)\n",
+                completed,
+                static_cast<double>(total_ns) / 1e6,
+                rps,
+                p50_us,
+                p99_us,
+                kBodyKiB);
+    }
+    CHECK_EQ(completed, kN);  // non-fatal: teardown already ran, so a hang/truncation
+                              // regression fails cleanly without leaking the shard
 }
 
 // === ALPN selection (pure logic, no crypto) ===

@@ -937,6 +937,15 @@ public:
                                     break;
                                 }
                             }
+                            // This terminal CQE belongs to the PREVIOUS request's
+                            // recv (its body was already complete — that's why the
+                            // pause fired). Having used it only to clear the cancel
+                            // bookkeeping and re-arm, do NOT deliver it: the slots may
+                            // now point at the next pipelined request's
+                            // on_upstream_response, where an EOF (result==0, empty
+                            // buffer) would wrongly close that fresh request. Mirror
+                            // the -ECANCELED branch and stop here.
+                            break;
                         } else if (ev.type == IoEventType::UpstreamRecv) {
                             conn.upstream_recv_armed = false;
                         }

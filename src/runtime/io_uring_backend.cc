@@ -398,12 +398,21 @@ bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id) {
 
 // Cancel by fd. Used when no upstream send is in flight (every proxy response-
 // streaming pause — the request is fully sent before the response body streams).
-// Collision-proof across keep-alive reuse: the cancel is bound to this fd, captured
-// while it is the live upstream socket, so the next request's recv (a different fd)
-// can never match it. The recv's -ECANCELED still routes to the connection.
+// Collision-proof across keep-alive reuse, BUT only if the cancel reaches the kernel
+// while `fd` is still the live upstream socket. The cancel SQE is otherwise merely
+// queued; run() wouldn't submit it until the next wait(), by which point
+// proxy_stream_complete may have closed `fd` and a pipelined next request reused the
+// fd number — the fd-keyed cancel would then hit the NEW request's recv. So flush the
+// SQ here: IORING_OP_ASYNC_CANCEL is processed at submission, binding the cancel to
+// the old socket before it can be closed/reused.
 bool IoUringBackend::pause_upstream_recv_by_fd(i32 fd, u32 conn_id) {
     if (fd < 0 || conn_id >= kMaxSendState) return false;
-    return cancel_by_fd(fd, kCancelConnId, IoEventType::UpstreamRecv);
+    if (!cancel_by_fd(fd, kCancelConnId, IoEventType::UpstreamRecv)) return false;
+    if (pending > 0) {
+        i32 submitted = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        if (submitted > 0) pending -= static_cast<u32>(submitted);
+    }
+    return true;
 }
 
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
