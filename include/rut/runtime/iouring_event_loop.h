@@ -66,6 +66,17 @@ private:
 public:
     static constexpr u32 kMaxConns = 16384;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
+    // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
+    // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
+    static constexpr u32 kTlsRecordMax =
+        SlicePool::kSliceSize + 256;  // 1 chunk's worst-case ciphertext
+    static constexpr u32 kTlsOutBufCap =
+        4 * SlicePool::kSliceSize;  // 64 KiB — bounded throughput knob
+    static constexpr u32 kTlsOutHigh =
+        kTlsOutBufCap - kTlsRecordMax;                    // pause upstream recv above this
+    static constexpr u32 kTlsOutLow = kTlsOutBufCap / 4;  // resume below this
+    static constexpr u32 kTlsDrainChunk =
+        SlicePool::kSliceSize;  // a raw send submits ≤ this at once
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
     // Deadline (seconds; coarse 1s timer-wheel resolution) for a connection in
     // the Proxying state. SCOPE: the post-connect phase only — from the upstream
@@ -296,15 +307,21 @@ public:
             return false;
         }
         u8* in = static_cast<u8*>(in_region);
-        u8* out = pool.alloc();
-        if (!out) {
+        // Owned ciphertext output buffer (kTlsOutBufCap, mmap like tls_in) — see
+        // docs/iouring-tls-output-buffer.md. tls_out_slice holds the mmap base
+        // for teardown; tls_out_buf is the Buffer view used for staging+draining.
+        void* out_region = mmap(
+            nullptr, kTlsOutBufCap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (out_region == MAP_FAILED) {
             munmap(in, kTlsInputSize);
             tls_engine_free(c.tls_engine);
             return false;
         }
+        u8* out = static_cast<u8*>(out_region);
         c.tls_in_slice = in;
         c.tls_in_buf.bind(in, kTlsInputSize);
         c.tls_out_slice = out;
+        c.tls_out_buf.bind(out, kTlsOutBufCap);
         c.tls_active = true;
         c.tls_handshake_complete = false;
         c.tls_pending_on_recv = &on_header_received<Self>;
@@ -317,6 +334,13 @@ public:
         munmap(c.tls_in_slice, kTlsInputSize);
         c.tls_in_slice = nullptr;
         c.tls_in_buf.bind(nullptr, 0);
+    }
+
+    void free_tls_out_buf(ConnectionBase& c) {
+        if (!c.tls_out_slice) return;  // tls_out_slice is the mmap base (see tls_setup)
+        munmap(c.tls_out_slice, kTlsOutBufCap);
+        c.tls_out_slice = nullptr;
+        c.tls_out_buf.bind(nullptr, 0);
     }
 
     void reclaim_slot(u32 cid) {
@@ -333,10 +357,7 @@ public:
             conns[cid].upstream_recv_slice = nullptr;
         }
         free_tls_in_buf(conns[cid]);
-        if (conns[cid].tls_out_slice) {
-            pool.free(conns[cid].tls_out_slice);
-            conns[cid].tls_out_slice = nullptr;
-        }
+        free_tls_out_buf(conns[cid]);
         free_stack[free_top++] = cid;
         for (u32 i = 0; i < pending_free_count; i++) {
             if (pending_free[i] == cid) {
@@ -364,10 +385,7 @@ public:
                     conns[cid].upstream_recv_slice = nullptr;
                 }
                 free_tls_in_buf(conns[cid]);
-                if (conns[cid].tls_out_slice) {
-                    pool.free(conns[cid].tls_out_slice);
-                    conns[cid].tls_out_slice = nullptr;
-                }
+                free_tls_out_buf(conns[cid]);
                 free_stack[free_top++] = cid;
             } else {
                 pending_free[remaining++] = cid;
@@ -426,7 +444,7 @@ public:
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             free_tls_in_buf(c);
-            if (c.tls_out_slice) pool.free(c.tls_out_slice);
+            free_tls_out_buf(c);
             c.reset();
             free_stack[free_top++] = cid;
             return;
@@ -481,28 +499,49 @@ public:
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
-            // A send still mid-encryption (its plaintext didn't fit one TLS
-            // record / tls_out_slice) must not be overwritten or its remainder is
-            // lost. The upper layer serializes client sends via pause/resume, so
-            // this only arises for reverse-proxy streaming of body chunks larger
-            // than one TLS record; fail safe (caller closes) rather than corrupt.
-            // TODO: depth-1 queue to support proxy-over-TLS streaming of >16KB
-            // chunks on io_uring.
+            // A previous single-shot send still mid-encryption (its plaintext
+            // didn't fit tls_out_buf in one shot) must not be overwritten or its
+            // remainder is lost. The upper layer serializes client sends via
+            // pause/resume; phase 3 decouples proxy streaming. Fail safe (caller
+            // closes) rather than corrupt.
             if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
                 close_conn(c);
                 return false;
             }
-            // Encrypt via the TlsEngine; ciphertext is sent by tls_pump_send.
+            // Encrypt into the owned tls_out_buf; ciphertext drains via
+            // tls_on_out_drain, which fires this continuation once fully sent.
             c.tls_pending_on_send = c.on_send;
             c.tls_send_src = buf;
             c.tls_send_len = len;
             c.tls_send_off = 0;
-            if (tls_pump_send<Self>(this, c)) return true;
-            c.tls_pending_on_send = nullptr;
-            c.tls_send_src = nullptr;
-            c.tls_send_len = 0;
-            c.tls_send_off = 0;
-            return false;
+            u32 consumed = 0;
+            const TlsFill kFs = tls_fill_output<Self>(this, c, buf, len, consumed);
+            c.tls_send_off = consumed;
+            if (kFs == TlsFill::Fatal) {
+                c.tls_pending_on_send = nullptr;
+                c.tls_send_src = nullptr;
+                c.tls_send_len = 0;
+                c.tls_send_off = 0;
+                return false;  // caller closes
+            }
+            if (kFs == TlsFill::NeedRead) {
+                c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
+                // SSL_write needs peer input to retry. If no recv is armed and one
+                // can't be queued (SQ pressure), nothing will ever deliver that
+                // input — fail closed rather than hang until the idle timeout
+                // (mirrors the resume/drain WANT_READ paths).
+                if (!c.recv_armed && !submit_recv(c)) {
+                    c.tls_pending_on_recv = nullptr;
+                    c.tls_pending_on_send = nullptr;
+                    c.tls_send_src = nullptr;
+                    c.tls_send_len = 0;
+                    c.tls_send_off = 0;
+                    return false;  // caller closes
+                }
+            }
+            // Done / NeedRoom: the upper-layer continuation fires from
+            // tls_on_out_drain once the whole plaintext is encrypted and sent.
+            return true;
         }
         return submit_send_raw(c, buf, len);
     }

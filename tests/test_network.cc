@@ -1410,10 +1410,11 @@ TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
     CHECK_EQ(tls_engine_output_len(engine), 7u);
 }
 
-TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
+TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     Connection conn;
     u8 recv_storage[SmallLoop::kBufSize];
     u8 send_storage[SmallLoop::kBufSize];
+    u8 tls_out_storage[256];
     conn.reset();
     conn.id = 7;
     conn.fd = 42;
@@ -1421,57 +1422,227 @@ TEST(tls_iouring, flush_completion_invokes_saved_send_continuation) {
     conn.send_slice = send_storage;
     conn.recv_buf.bind(recv_storage, SmallLoop::kBufSize);
     conn.send_buf.bind(send_storage, SmallLoop::kBufSize);
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
     conn.tls_active = true;
     conn.tls_out_inflight = true;
+    conn.tls_out_inflight_len = 0;  // ciphertext already drained; just complete
     conn.tls_send_src = reinterpret_cast<const u8*>("plain");
     conn.tls_send_len = 5;
-    conn.tls_send_off = 5;
+    conn.tls_send_off = 5;  // fully encrypted — no parked remainder
     conn.tls_pending_on_send = &tls_pending_send_probe;
-    conn.on_send = &tls_on_out_sent<IoUringEventLoop>;
+    conn.on_send = &tls_on_out_drain<IoUringEventLoop>;
     g_tls_pending_send_called = false;
     g_tls_pending_send_result = 0;
 
-    tls_on_out_sent<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
+    tls_on_out_drain<IoUringEventLoop>(nullptr, conn, make_ev(conn.id, IoEventType::Send, 9));
 
     CHECK(g_tls_pending_send_called);
-    CHECK_EQ(g_tls_pending_send_result, 5u);
+    CHECK_EQ(g_tls_pending_send_result, 5u);  // fires with the plaintext length
     CHECK(!conn.tls_out_inflight);
     CHECK(conn.tls_send_src == nullptr);
     CHECK_EQ(conn.tls_send_len, 0u);
     CHECK(conn.tls_pending_on_send == nullptr);
 }
 
-TEST(tls_iouring, queued_send_keeps_tls_completion_hook_during_inflight_flight) {
-    // A response send issued while a control/handshake ciphertext flight is still
-    // draining must leave on_send pointing at tls_on_out_sent, so the in-flight
-    // Send CQE resumes the TLS layer instead of being mis-handled as this
-    // response's completion. transition_to_sending() overwrote on_send with the
-    // upper-layer continuation (saved in tls_pending_on_send) just before the
-    // send funneled through tls_pump_send.
-    Connection conn;
-    conn.reset();
-    conn.id = 11;
-    conn.tls_active = true;
-    conn.tls_out_inflight = true;            // a prior flight is still draining
-    conn.on_send = &tls_pending_send_probe;  // clobbered upper-layer continuation
-    conn.tls_pending_on_send = &tls_pending_send_probe;
-
-    CHECK(tls_pump_send<IoUringEventLoop>(nullptr, conn));
-    CHECK(conn.on_send == &tls_on_out_sent<IoUringEventLoop>);  // hook restored
-    CHECK(conn.tls_out_inflight);                               // queued send waits
-    CHECK(conn.tls_pending_on_send == &tls_pending_send_probe);
-}
-
-TEST(tls_iouring, flush_out_no_output_is_noop) {
+TEST(tls_iouring, ensure_draining_empty_buffer_is_noop) {
     Connection conn;
     conn.reset();
     conn.id = 8;
-    CHECK(tls_flush_out<IoUringEventLoop>(nullptr, conn));
+    conn.tls_active = true;
+    // tls_out_buf is empty — nothing to submit, no loop deref.
+    CHECK(tls_ensure_draining<IoUringEventLoop>(nullptr, conn));
     CHECK(!conn.tls_out_inflight);
+}
+
+// A response started while a control/handshake flight is in flight overwrites
+// on_send via transition_to_sending(); tls_ensure_draining must restore the
+// drain hook so the in-flight send's Send CQE still clears tls_out_inflight
+// (rather than being dispatched as the response completion → stuck buffer).
+TEST(tls_iouring, ensure_draining_restores_hook_while_inflight) {
+    Connection conn;
+    conn.reset();
+    conn.id = 9;
+    conn.tls_active = true;
+    conn.tls_out_inflight = true;            // a ciphertext send is already draining
+    conn.on_send = &tls_pending_send_probe;  // upper layer overwrote it (response start)
+    // inflight → returns true without touching the loop (safe to pass nullptr).
+    CHECK(tls_ensure_draining<IoUringEventLoop>(nullptr, conn));
+    CHECK(conn.on_send == &tls_on_out_drain<IoUringEventLoop>);  // hook restored
+    CHECK(conn.tls_out_inflight);                                // still inflight, untouched
 }
 
 TEST(tls_iouring, input_buffer_fits_full_ciphertext_record) {
     CHECK_GE(IoUringEventLoop::kTlsInputSize, SlicePool::kSliceSize + 1024);
+}
+
+// Round-4 race fix #F: a TLS proxy-stream -ENOBUFS with NO parked tail must fail
+// closed. A wait() batch harvests the whole multishot CQE burst into the 16 KiB
+// upstream_recv_buf before the first callback drains it, so it can overflow even
+// with tls_send_src == nullptr; the backend already discarded the uncopied
+// suffix, so pause+replay would silently truncate the proxied download.
+TEST(tls_iouring, proxy_stream_enobufs_without_parked_tail_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->tls_proxy_stream = true;
+    conn->tls_send_src = nullptr;  // no parked tail (the newly-covered case)
+    const u32 cid = conn->id;
+
+    on_response_body_recvd<SmallLoop>(
+        &loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[cid].fd, -1);  // fail closed
+
+    // Contrast: a plaintext (non-proxy-TLS) -ENOBUFS on a full buffer still
+    // self-heals by pausing, not closing — the broadened guard didn't regress it.
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* plain = loop.find_fd(43);
+    REQUIRE(plain != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*plain));
+    plain->upstream_recv_buf.commit(plain->upstream_recv_buf.write_avail());  // full
+    const u32 pcid = plain->id;
+    on_response_body_recvd<SmallLoop>(
+        &loop, *plain, make_ev(pcid, IoEventType::UpstreamRecv, -ENOBUFS));
+    CHECK_EQ(loop.conns[pcid].fd, 43);  // paused, not closed
+}
+
+// Round-4 race fix #H: while a TLS proxy tail is parked (tls_send_src points into
+// upstream_recv_buf), a raced multishot upstream CQE must be deferred. Re-running
+// the encrypt path now would double-encrypt the parked tail (the drain path still
+// owns it) and double-count the body; the parked-drain replay owns those bytes.
+TEST(tls_iouring, proxy_stream_defers_raced_cqe_while_tail_parked) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->tls_proxy_stream = true;
+    const u8 raced[] = {'A', 'B', 'C', 'D'};
+    REQUIRE_EQ(conn->upstream_recv_buf.write(raced, sizeof(raced)), sizeof(raced));
+    conn->tls_send_src = conn->upstream_recv_buf.data();  // tail parked at front
+    conn->tls_send_len = 8;
+    conn->tls_send_off = 0;
+    const u32 cid = conn->id;
+    const u32 kBefore = conn->upstream_recv_buf.len();
+
+    loop.backend.op_count = 0;
+    on_response_body_recvd<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 4));
+    CHECK_EQ(loop.conns[cid].fd, 42);                  // not closed
+    CHECK_EQ(loop.backend.op_count, 0u);               // deferred — no encrypt/send/recv op
+    CHECK_EQ(conn->upstream_recv_buf.len(), kBefore);  // buffer untouched
+    CHECK(conn->tls_send_src != nullptr);              // tail still parked for the drain
+}
+
+// Round-4 race fix #C (cross-request half): proxy_stream_complete must clear
+// tls_recv_paused_hw at the keep-alive boundary, so a high-watermark pause from
+// one response can't leak into the next request and let the low-watermark resume
+// spuriously re-arm the upstream read. (The in-request resume gate itself —
+// tls_on_out_drain skipping the resume when resp_fully_buffered — needs the real
+// IoUringEventLoop TLS-drain interface and is exercised by the real-io_uring
+// proxy_tls_iouring.large_body_streams_through_watermark integration test.)
+TEST(tls_iouring, proxy_stream_complete_clears_hw_pause) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->tls_proxy_stream = true;
+    conn->resp_fully_buffered = true;
+    conn->tls_recv_paused_hw = true;
+    conn->throttle_paused = true;  // round-5 #4: a throttle pause must not leak
+    conn->throttle_pending_len = 99;
+    conn->keep_alive = true;  // stays open, so the flags are readable afterward
+    const u32 cid = conn->id;
+
+    proxy_stream_complete<SmallLoop>(&loop, *conn);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // kept alive
+    CHECK(!conn->tls_recv_paused_hw);  // cleared at the keep-alive boundary
+    CHECK(!conn->tls_proxy_stream);    // per-response state reset
+    CHECK(!conn->resp_fully_buffered);
+    CHECK(!conn->throttle_paused);  // #4: throttle pause cleared (leaked tick no-ops)
+    CHECK_EQ(conn->throttle_pending_len, 0u);
+}
+
+// Round-6 #A: a throttled response completed via proxy_stream_complete with the
+// throttle pause cleared (round-5 #4) must restore the keepalive deadline —
+// arm_throttle_timer had pulled the connection off the keepalive wheel, and the
+// now-no-op throttle timer would otherwise leave an idle keep-alive client with no
+// deadline at all.
+TEST(tls_iouring, proxy_stream_complete_restores_keepalive_after_throttle) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    loop.timer.remove(conn);            // arm_throttle_timer pulled it off the wheel
+    REQUIRE(conn->timer_node.empty());  // confirm: no keepalive deadline armed
+    conn->tls_proxy_stream = true;
+    conn->resp_fully_buffered = true;
+    conn->throttle_paused = true;  // completing while throttled
+    conn->keep_alive = true;
+    const u32 cid = conn->id;
+
+    proxy_stream_complete<SmallLoop>(&loop, *conn);
+    CHECK_EQ(loop.conns[cid].fd, 42);  // kept alive
+    CHECK(!conn->timer_node.empty());  // keepalive timer restored (back on the wheel)
+}
+
+// Round-5 #3: when the final body chunk parked a TLS proxy tail (body parser
+// complete, but resp_fully_buffered not set until the tail drains), a racing
+// upstream EOF must be ignored — the drain owns the remaining body bytes. A tail
+// parked mid-body (body NOT complete) is a genuine truncation and still closes.
+TEST(tls_iouring, proxy_stream_parked_complete_tail_ignores_eof) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->tls_proxy_stream = true;
+    conn->tls_send_src = conn->upstream_recv_buf.data();  // tail parked
+    conn->tls_send_len = 4;
+    conn->resp_body_mode = BodyMode::ContentLength;
+    conn->resp_body_remaining = 0;  // body parser already complete
+    const u32 cid = conn->id;
+    on_response_body_recvd<SmallLoop>(&loop, *conn, make_ev(cid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.conns[cid].fd, 42);  // EOF ignored — complete-on-drain
+
+    // Contrast: tail parked mid-body (more body expected) → EOF is a truncation.
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* trunc = loop.find_fd(43);
+    REQUIRE(trunc != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*trunc));
+    trunc->tls_proxy_stream = true;
+    trunc->tls_send_src = trunc->upstream_recv_buf.data();
+    trunc->tls_send_len = 4;
+    trunc->resp_body_mode = BodyMode::ContentLength;
+    trunc->resp_body_remaining = 10;  // body NOT complete
+    const u32 tcid = trunc->id;
+    on_response_body_recvd<SmallLoop>(&loop, *trunc, make_ev(tcid, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.conns[tcid].fd, -1);  // truncation → closed
+}
+
+// Round-5 #2: throttle_resume's deferred re-arm (kRemaining == 0) must fail closed
+// when submit_recv_upstream can't queue under SQ pressure — otherwise the watermark
+// flag is already gone and nothing retries, stalling the response until timeout.
+TEST(tls_iouring, throttle_resume_fails_closed_when_rearm_fails) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->throttle_paused = true;
+    conn->throttle_pending_len = 0;  // kRemaining == 0 → the deferred re-arm path
+    conn->throttle_down_bps = 0;     // budget available → proceeds to re-arm
+    const u32 cid = conn->id;
+
+    loop.backend.fail_upstream_recv = true;  // simulate io_uring SQ pressure
+    throttle_resume<SmallLoop>(&loop, *conn);
+    CHECK_EQ(loop.conns[cid].fd, -1);  // fail closed, not silently stalled
 }
 
 // Two proxy cycles on same connection (keep-alive)

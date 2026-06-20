@@ -14,6 +14,7 @@
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
 
@@ -188,21 +189,82 @@ void pipeline_dispatch(Loop* loop, Connection& conn);
 // upstream read lets TCP flow control backpressure the backend, and sending whole
 // buffers as produced keeps the downstream path simple and never splits a send.
 // Single-writer per shard, so the bucket needs no atomics.
+// Advance the @throttle virtual-time bucket by `len` bytes (no-op when the route
+// has no throttle). Factored out so the io_uring-TLS proxy path, which encrypts
+// directly into tls_out_buf instead of calling client_send, keeps the same
+// byte-rate accounting (otherwise watermark backpressure would bound memory but
+// not enforce the configured rate).
+inline void throttle_advance(Connection& conn, u32 len) {
+    if (conn.throttle_down_bps == 0) return;
+    const u64 kNowNs = monotonic_ns();
+    const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
+    // len*1e9/bps at full precision per chunk (a precomputed ns-per-byte would
+    // truncate to 0 above ~1 GB/s). len*1e9 <= ~4.3e18 for u32 len, within u64.
+    conn.throttle_tat_ns =
+        kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
+}
+
+// True once the whole proxied response body has been read from the upstream
+// (Content-Length exhausted / chunked trailer seen). UntilClose ends at EOF, not
+// here.
+inline bool proxy_body_complete(const Connection& conn) {
+    return (conn.resp_body_mode == BodyMode::ContentLength && conn.resp_body_remaining == 0) ||
+           (conn.resp_body_mode == BodyMode::Chunked &&
+            conn.resp_chunk_parser.state == ChunkedParser::State::Complete);
+}
+
+// Drain-side accounting for a parked proxy-body remainder: the io_uring-TLS read
+// side parks the unencrypted tail in tls_send_src when tls_fill_output returns
+// NeedRoom/NeedRead, and pauses the upstream read. tls_on_out_drain /
+// tls_resume_pending_send_recv re-encrypt it; `newly` is the plaintext encrypted
+// this pass. Once the whole remainder is in, shift the upstream buffer past it,
+// finalize the body state, and either complete-on-drain or resume the read
+// (honoring the watermark and @throttle). Defined here (not in tls_iouring.h) so
+// it can reach consume_upstream_sent / on_response_body_recvd / the body state;
+// forward-declared there. May close the connection — callers must re-check
+// tls_active before touching conn again.
+template <typename Loop>
+void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
+    conn.resp_body_sent += newly;
+    throttle_advance(conn, newly);
+    if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial
+    conn.upstream_send_len = conn.tls_send_len;
+    // The multishot recv may have raced more body into upstream_recv_buf behind the
+    // parked tail before the pause took effect; consume_upstream_sent returns it.
+    const u32 kRemaining = consume_upstream_sent(conn);
+    conn.tls_send_src = nullptr;
+    conn.tls_send_len = 0;
+    conn.tls_send_off = 0;
+    if (proxy_body_complete(conn)) {
+        conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
+        if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);
+        return;
+    }
+    if (kRemaining > 0) {
+        // Bytes already buffered (the multishot raced them in behind the tail).
+        // Honor @throttle before replaying them (same as the main read path), so
+        // raced body data parks for the byte budget instead of bursting past the
+        // configured rate; they stay in upstream_recv_buf and replay on the timer.
+        if (throttle_pause_before_pump<Loop>(loop, conn, kRemaining)) return;
+        IoEvent synth = {conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+        on_response_body_recvd<Loop>(loop, conn, synth);
+        return;
+    }
+    // More body expected, buffer drained: honor the high watermark, then @throttle,
+    // before re-arming the (paused) upstream read.
+    if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
+        conn.tls_recv_paused_hw = true;  // drain's low-watermark logic re-arms
+        return;
+    }
+    if (throttle_pause_before_pump<Loop>(loop, conn, 0)) return;
+    // Unconditional (see tls_on_out_drain): submit_recv_upstream self-guards the
+    // armed/cancel-pending race and only fails on a real add_recv error.
+    if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
+}
+
 template <typename Loop>
 bool client_send(Loop* loop, Connection& conn, const u8* buf, u32 len) {
-    if (conn.throttle_down_bps != 0) {
-        const u64 kNowNs = monotonic_ns();
-        const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
-        // Advance the bucket by the time `len` bytes "should" take: len/bps
-        // seconds, in ns. Compute len*1e9/bps at full precision per chunk rather
-        // than from a precomputed ns-per-byte — the latter (1e9/bps) truncates to
-        // 0 for bps >= 1e9, which would silently disable throttling above ~1 GB/s
-        // (and clamping it to 1 would silently cap every faster rate at 1 GB/s).
-        // len*1e9 <= ~4.3e18 for u32 len, well within u64; one divide per throttled
-        // chunk is negligible on an already-rate-limited path.
-        conn.throttle_tat_ns =
-            kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
-    }
+    throttle_advance(conn, len);
     return loop->submit_send(conn, buf, len);
 }
 
@@ -222,7 +284,16 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
     conn.throttle_paused = true;
     conn.throttle_pending_len = pending_remaining;  // stash for resume
     if constexpr (requires { loop->pause_upstream_recv(conn); }) {
-        loop->pause_upstream_recv(conn);
+        // On io_uring the pause is a cancel SQE that can fail to queue under SQ
+        // pressure, leaving the multishot recv live. For io_uring TLS that lets the
+        // live recv keep encrypting body bytes (a parked tail can even corrupt on
+        // overflow), so fail closed like the watermark/body-done pause paths. The
+        // plaintext path self-heals (its -ENOBUFS handling pauses on overflow), so
+        // leave it unchanged. (epoll's pause can't fail.)
+        if (!loop->pause_upstream_recv(conn) && conn.uses_iouring_tls()) {
+            loop->close_conn(conn);
+            return true;  // caller returns; conn is closed
+        }
     }
     // Arm the per-shard precise (sub-second) timer for the exact deficit. If the
     // loop can't (heap full / no support), fall back to the 1-second keepalive
@@ -277,8 +348,13 @@ void throttle_resume(Loop* loop, Connection& conn) {
 #else
         on_response_body_recvd<Loop>(static_cast<void*>(loop), conn, synth);
 #endif
-    } else {
-        loop->submit_recv_upstream(conn);
+    } else if (!loop->submit_recv_upstream(conn)) {
+        // Deferred re-arm: the low-watermark watermark resume cleared
+        // tls_recv_paused_hw and left the retry to throttle_resume.
+        // submit_recv_upstream can fail under io_uring SQ pressure; with the
+        // watermark flag already gone there is nothing left to retry and no CQE is
+        // guaranteed, so fail closed rather than stall the response until timeout.
+        loop->close_conn(conn);
     }
 }
 
@@ -1541,18 +1617,69 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // and the pump already re-armed or @throttle-paused); leave that state
         // untouched so we neither undo a re-arm nor undo a pause.
         if (ev.result == -ENOBUFS) {
+            // For an io_uring TLS proxy stream, -ENOBUFS means the backend already
+            // discarded the uncopied suffix of an overflowing multishot CQE (it
+            // copies min(nbytes, avail) and reports -ENOBUFS — see io_uring_backend).
+            // Those upstream body bytes are gone and can never be replayed, so any
+            // tls_proxy_stream overflow must fail closed — not only the parked-tail
+            // case. A single wait() batch harvests the whole CQE burst before the
+            // first callback drains the buffer, so the 16 KiB upstream_recv_buf can
+            // overflow even when no tail is parked (tls_send_src == nullptr).
+            if (conn.tls_proxy_stream) {
+                loop->close_conn(conn);
+                return;
+            }
+            // Plaintext path: the same bytes remain on the level-triggered fd and
+            // are re-read after the pause, so a benign pause-on-full self-heals.
             if (conn.upstream_recv_buf.write_avail() == 0) loop->pause_upstream_recv(conn);
             return;
         }
+        // io_uring TLS: the body may be fully buffered and still draining to the
+        // client (the multishot upstream recv was cancelled, but an EOF CQE can
+        // already be queued, or the backend closes right after the response).
+        // Closing now would truncate ciphertext still in tls_out_buf — let the
+        // drain complete the request.
+        if (conn.resp_fully_buffered) return;
         if (conn.resp_body_mode == BodyMode::UntilClose) {
+            if (conn.uses_iouring_tls()) {
+                // Close-delimited: EOF is the body terminator, so the downstream
+                // HTTP/1.1 response must also end by closing — force a
+                // non-keepalive completion. Any ciphertext still in tls_out_buf
+                // must flush first, so mark complete-on-drain (complete now only if
+                // nothing is buffered).
+                conn.keep_alive = false;
+                conn.tls_proxy_stream = true;
+                conn.resp_fully_buffered = true;
+                if (!conn.tls_out_inflight && conn.tls_out_buf.len() == 0)
+                    proxy_stream_complete<Loop>(loop, conn);
+                return;
+            }
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
             loop->epoch_leave();
             loop->close_conn(conn);
             return;
         }
+        // A parked TLS proxy tail still owns the final body bytes: the body parser
+        // already completed (resp_body_remaining hit 0 / chunk parser Complete
+        // before tls_fill_output parked the unencrypted remainder), but
+        // resp_fully_buffered isn't set until proxy_tls_parked_drained finishes it.
+        // A racing upstream EOF in that window must not drop the draining
+        // ciphertext — it is complete-on-drain, so ignore it. (A tail parked
+        // mid-body — body NOT complete — is a genuine upstream truncation, so fall
+        // through to close.)
+        if (conn.tls_proxy_stream && conn.tls_send_src && proxy_body_complete(conn)) return;
         loop->close_conn(conn);
         return;
     }
+
+    // A TLS proxy tail is parked at the front of upstream_recv_buf (tls_send_src),
+    // and the multishot recv may have raced a positive CQE in behind it before
+    // pause_upstream_recv's cancel landed. Defer: re-running tls_fill_output over
+    // upstream_recv_buf.data() now would re-encrypt the parked tail (the drain path
+    // still owns it via tls_send_src/off) and double-count the body. The parked
+    // drain replays these appended bytes once the remainder finishes
+    // (proxy_tls_parked_drained → consume_upstream_sent → synthetic recv).
+    if (conn.tls_proxy_stream && conn.tls_send_src) return;
 
     const u32 kDataLen = conn.upstream_recv_buf.len();
     u32 send_len = kDataLen;
@@ -1580,10 +1707,185 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         send_len = pos;
     }
 
+    // Proxy-over-TLS on io_uring: encrypt this body chunk straight into the owned
+    // tls_out_buf (read/drain decoupled — no client_send / on_response_body_sent
+    // round-trip). The request completes from tls_on_out_drain once the buffer
+    // empties with resp_fully_buffered set. The `if constexpr` compiles this only
+    // for loops with the io_uring-TLS send interface (Epoll terminates TLS inside
+    // the backend and never reaches here with uses_iouring_tls()).
+    if constexpr (requires(Loop* l, Connection& cc) {
+                      l->submit_send_raw(cc, static_cast<const u8*>(nullptr), 0u);
+                      Loop::kTlsDrainChunk;
+                  }) {
+        if (conn.uses_iouring_tls()) {
+            conn.tls_proxy_stream = true;
+            u32 enc = 0;
+            const TlsFill kFill =
+                tls_fill_output<Loop>(loop, conn, conn.upstream_recv_buf.data(), send_len, enc);
+            if (kFill == TlsFill::Fatal) {
+                loop->close_conn(conn);
+                return;
+            }
+            if (kFill != TlsFill::Done) {
+                // NeedRoom (buffer filled mid-chunk) or NeedRead (SSL_write needs
+                // peer input, e.g. a TLS 1.3 KeyUpdate during the response). Park
+                // the unencrypted tail and pause the upstream read; the drain (and,
+                // for NeedRead, the next client recv) re-encrypt it via
+                // proxy_tls_parked_drained rather than truncating the download.
+                conn.resp_body_sent += enc;
+                throttle_advance(conn, enc);
+                conn.upstream_send_len = enc;
+                consume_upstream_sent(conn);  // shift past encrypted; tail now at front
+                conn.tls_send_src = conn.upstream_recv_buf.data();
+                conn.tls_send_len = send_len - enc;
+                conn.tls_send_off = 0;
+                // Cancel the multishot recv; the cancel SQE can fail to queue under
+                // SQ pressure, leaving it live — fail closed rather than overflow.
+                if (!loop->pause_upstream_recv(conn)) {
+                    loop->close_conn(conn);
+                    return;
+                }
+                if (kFill == TlsFill::NeedRead) {
+                    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<Loop>;
+                    if (!conn.recv_armed && !loop->submit_recv(conn)) loop->close_conn(conn);
+                }
+                return;
+            }
+            conn.resp_body_sent += enc;  // enc == send_len on Done
+            throttle_advance(conn, enc);
+            const bool kBodyDone = proxy_body_complete(conn);
+            conn.upstream_send_len = enc;
+            const u32 kRemaining = consume_upstream_sent(conn);  // shift past encrypted chunk
+            if (kBodyDone) {
+                conn.resp_fully_buffered = true;  // completes when tls_out_buf drains
+                if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);  // stop multishot
+                return;
+            }
+            if (kRemaining > 0) {
+                // Bytes already in upstream_recv_buf (the multishot raced them in).
+                // Honor @throttle before replaying them, like the plaintext path:
+                // throttle_advance above may have pushed throttle_tat_ns into the
+                // future, so park the buffered remainder for the byte budget (it
+                // stays in upstream_recv_buf — no memory growth — and replays on the
+                // throttle timer) rather than bursting past the configured rate.
+                if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
+                // Not throttled: encrypt now (memory safety — the watermark only
+                // gates *new* reads; one recv's worth fits under kTlsRecordMax).
+                IoEvent synth = {
+                    conn.id, static_cast<i32>(kRemaining), 0, 0, IoEventType::UpstreamRecv, 0};
+                on_response_body_recvd<Loop>(lp, conn, synth);  // drain the rest of this recv
+                return;
+            }
+            // The high watermark is the hard (memory-safety) stop and is checked
+            // BEFORE throttle so the throttle timer's resume never re-arms a read
+            // while the buffer is still full. Below the high watermark the buffer
+            // only drains, so a throttle pause/resume here can't overflow it.
+            if (conn.tls_out_buf.len() >= Loop::kTlsOutHigh) {
+                conn.tls_recv_paused_hw = true;
+                // Cancel may fail to queue (SQ full) — close rather than let the
+                // multishot keep filling above the stop line.
+                if (!loop->pause_upstream_recv(conn)) loop->close_conn(conn);
+                return;
+            }
+            if (throttle_pause_before_pump(loop, conn, kRemaining)) return;
+            // Unconditional (see tls_on_out_drain): submit_recv_upstream self-guards
+            // the armed/cancel-pending race and fails only on a real add_recv error.
+            if (!loop->submit_recv_upstream(conn)) {
+                loop->close_conn(conn);
+            }
+            return;
+        }
+    }
+
     conn.resp_body_sent += send_len;
     conn.upstream_send_len = send_len;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
     client_send(loop, conn, conn.upstream_recv_buf.data(), send_len);
+}
+
+// The proxy response body is fully forwarded: release the upstream slot,
+// complete the request, close upstream, and continue the connection (keep-alive
+// pipeline / next request). Factored out of on_response_body_sent so the
+// io_uring-TLS owned-buffer path (tls_on_out_drain, see docs/iouring-tls-output-
+// buffer.md) shares the exact completion logic. tls_proxy_stream /
+// resp_fully_buffered are per-response — cleared here, the keep-alive boundary.
+template <typename Loop>
+void proxy_stream_complete(Loop* loop, Connection& conn) {
+    conn.tls_proxy_stream = false;
+    conn.resp_fully_buffered = false;
+    conn.tls_recv_paused_hw = false;  // per-response; must not leak into the next request
+    // A throttle pause + armed throttle timer are also per-response. If the body
+    // completes (parked/raced tail) before the timer fires, clear the pause so a
+    // leaked tick is a no-op — both backends dispatch throttle_resume only while
+    // throttle_paused — instead of resuming a pump against the next request's state.
+    const bool kWasThrottled = conn.throttle_paused;
+    conn.throttle_paused = false;
+    conn.throttle_pending_len = 0;
+    conn.upstream_recv_buf.reset();
+    release_upstream_slot(loop, conn);  // free the backend slot promptly
+
+    on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
+    loop->epoch_leave();
+
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    loop->clear_upstream_fd(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+
+    if (!conn.keep_alive || loop->is_draining()) {
+        loop->close_conn(conn);
+        return;
+    }
+
+    // If this response was throttled, arm_throttle_timer pulled the connection off
+    // the keepalive wheel (the precise timer owned its wakeup). Now that the
+    // throttle pause is cleared (its timer tick is a no-op), restore the normal
+    // keepalive deadline — otherwise an idle keep-alive client could hold the slot
+    // open indefinitely (precise-timer path) or be closed at the short throttle
+    // delay (wheel fallback) instead of keepalive_timeout. The pipeline paths below
+    // dispatch a buffered request immediately (which re-refreshes), but the idle
+    // header-read path has no other wakeup to re-arm it.
+    if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); }) {
+        if (kWasThrottled) loop->timer.refresh(&conn, loop->keepalive_timeout);
+    }
+
+    if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
+        const u16 kStashLen = conn.pipeline_stash_len;
+        const u32 kLateLen = conn.recv_buf.len();
+        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
+            conn.pipeline_stash_len = 0;
+            conn.send_buf.reset();
+            loop->close_conn(conn);
+            return;
+        }
+        conn.pipeline_stash_len = 0;
+        conn.upstream_recv_buf.reset();
+        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
+        conn.recv_buf.reset();
+        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
+        conn.upstream_recv_buf.reset();
+        conn.send_buf.reset();
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (pipeline_recover(conn)) {
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    if (conn.recv_buf.len() > 0) {
+        conn.pipeline_depth++;
+        pipeline_dispatch<Loop>(loop, conn);
+        return;
+    }
+    conn.pipeline_depth = 0;
+    conn.recv_buf.reset();
+    conn.transition_to_reading_header(&on_header_received<Loop>);
+    loop->submit_recv(conn);
 }
 
 template <typename Loop>
@@ -1606,59 +1908,7 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (body_done) {
-        conn.upstream_recv_buf.reset();
-        release_upstream_slot(loop, conn);  // free the backend slot promptly
-
-        on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
-        loop->epoch_leave();
-
-        if (conn.upstream_fd >= 0) {
-            ::close(conn.upstream_fd);
-            conn.upstream_fd = -1;
-        }
-        loop->clear_upstream_fd(conn.id);
-        conn.upstream_recv_armed = false;
-        conn.upstream_send_armed = false;
-
-        if (!conn.keep_alive || loop->is_draining()) {
-            loop->close_conn(conn);
-            return;
-        }
-
-        if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
-            const u16 kStashLen = conn.pipeline_stash_len;
-            const u32 kLateLen = conn.recv_buf.len();
-            if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
-                conn.pipeline_stash_len = 0;
-                conn.send_buf.reset();
-                loop->close_conn(conn);
-                return;
-            }
-            conn.pipeline_stash_len = 0;
-            conn.upstream_recv_buf.reset();
-            conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
-            conn.recv_buf.reset();
-            conn.recv_buf.write(conn.send_buf.data(), kStashLen);
-            conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
-            conn.upstream_recv_buf.reset();
-            conn.send_buf.reset();
-            conn.pipeline_depth++;
-            pipeline_dispatch<Loop>(loop, conn);
-            return;
-        }
-        if (pipeline_recover(conn)) {
-            pipeline_dispatch<Loop>(loop, conn);
-            return;
-        }
-        if (conn.recv_buf.len() > 0) {
-            conn.pipeline_depth++;
-            pipeline_dispatch<Loop>(loop, conn);
-            return;
-        }
-        conn.pipeline_depth = 0;
-        conn.recv_buf.reset();
-        conn.transition_to_reading_header(&on_header_received<Loop>);
-        loop->submit_recv(conn);
+        proxy_stream_complete<Loop>(loop, conn);
         return;
     }
 
