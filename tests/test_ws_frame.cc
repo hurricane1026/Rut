@@ -158,6 +158,16 @@ TEST(ws_frame_reject, non_minimal_lengths) {
     const u8 f64[] = {0x82, 127, 0, 0, 0, 0, 0, 0, 0x00, 0x64};  // 64-bit encoding of 100
     CHECK(parse_is(f64, sizeof(f64), false, ParseStatus::Error));
 }
+TEST(ws_frame_reject, close_one_byte_payload) {
+    // §5.5.1: a Close body must start with a 2-byte status code, so length 1 is malformed.
+    const u8 bad[] = {0x88, 0x01, 0x03};  // Close, FIN, 1-byte body
+    CHECK(parse_is(bad, sizeof(bad), false, ParseStatus::Error));
+    // 0-byte (no body) and 2-byte (status code) Close frames remain valid.
+    const u8 empty[] = {0x88, 0x00};
+    CHECK(parse_is(empty, sizeof(empty), false, ParseStatus::Complete));
+    const u8 code[] = {0x88, 0x02, 0x03, 0xE8};  // status 1000
+    CHECK(parse_is(code, sizeof(code), false, ParseStatus::Complete));
+}
 
 // === Unmask ===
 

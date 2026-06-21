@@ -33,6 +33,9 @@ ParseStatus ws_parse_header(const u8* buf, u32 len, bool require_mask, WsFrameHe
     if (ws_opcode_is_control(opcode)) {
         if (!fin) return ParseStatus::Error;
         if (len7 > 125) return ParseStatus::Error;
+        // §5.5.1: a Close body, if present, MUST start with a 2-byte status code, so a
+        // 1-byte payload is malformed. (0 = no body is fine; 2..125 carry code+reason.)
+        if (opcode == WsOpcode::Close && len7 == 1) return ParseStatus::Error;
     }
 
     // §5.1 mask-direction enforcement: client->server MUST be masked, server->client
