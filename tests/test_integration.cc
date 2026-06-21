@@ -9080,6 +9080,22 @@ TEST(route, dsl_return_websocket_enters_proxy_state) {
 }
 #endif
 
+// Regression: `websocket` must stay usable as an ordinary identifier (here, an
+// upstream name) because it's a CONTEXTUAL builder, not a reserved keyword. Making it
+// a keyword broke this (and `.websocket` variant literals). Frontend-only — no JIT.
+TEST(route, websocket_is_not_a_reserved_identifier) {
+    using namespace rut;
+    const char* src = "upstream websocket\nroute GET \"/x\" { return forward(websocket) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);  // parses: `upstream websocket` + `forward(websocket)` use it as an ident
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);  // analyzes: forward(websocket) resolves the upstream named "websocket"
+    delete hir.value();
+}
+
 // populate_route_config requires bodies / header sets / routes to
 // start empty (there's no merge semantics). Upstreams are more
 // flexible: either empty (helper binds from the module) or exactly

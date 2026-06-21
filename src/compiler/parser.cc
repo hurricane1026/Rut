@@ -924,13 +924,18 @@ struct Parser {
                 return stmt;
             }
 
-            // `return websocket(<name>)` — proxy to a WebSocket upstream. Phase 0 lowers
-            // to the SAME ForwardUpstream terminator as `forward`: the runtime auto-
-            // establishes the full-duplex passthrough tunnel when the client requested an
-            // Upgrade and the upstream answers 101. (Per-frame `{ frame ... }` blocks and
-            // subprotocol/maxMessageSize kwargs are later phases.) The user still guards
-            // `req.upgrade == .websocket` themselves, as in DESIGN §3.4.8.
-            if (take(TokenType::KwWebsocket)) {
+            // `return websocket(<name>)` — proxy to a WebSocket upstream. Recognized
+            // CONTEXTUALLY (ident text `websocket` followed by `(`), not via a reserved
+            // keyword, so `.websocket` variant literals and identifiers named `websocket`
+            // still parse — mirrors how `response` is handled. Phase 0 lowers to the SAME
+            // ForwardUpstream terminator as `forward`: the runtime auto-establishes the
+            // full-duplex passthrough tunnel when the client requested an Upgrade and the
+            // upstream answers 101 (a non-upgrade request just proxies normally, so the
+            // route is safe with no edge guard). Per-frame `{ frame ... }`, subprotocol/
+            // maxMessageSize kwargs, and a typed `req.upgrade` guard are later phases.
+            if (cur().type == TokenType::Ident && cur().text.eq({"websocket", 9}) &&
+                peek().type == TokenType::LParen) {
+                pos++;  // consume `websocket`
                 auto lparen = expect(TokenType::LParen);
                 if (!lparen) return core::make_unexpected(lparen.error());
                 auto name = expect(TokenType::Ident);
