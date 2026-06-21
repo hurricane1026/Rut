@@ -29,6 +29,8 @@ namespace rut {
 static constexpr u32 kTimerConnId = 0xFFFFFE;
 // Sentinel conn_id for cancel completions (must not collide with real conn_ids or timer)
 static constexpr u32 kCancelConnId = 0xFFFFFD;
+// kPauseCancelAux (the pause-cancel completion tag) is defined in io_event.h so the
+// event loop can recognize it on IoEvent::aux.
 
 // --- Syscall wrappers (no liburing) ---
 
@@ -352,11 +354,18 @@ bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
         encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
 }
 
+// Pause the multishot upstream recv by cancelling it by user_data (recv-only — it
+// never touches a concurrent upstream send, unlike a cancel-by-fd). The cancel's OWN
+// completion is tagged with the real conn_id + kPauseCancelAux, so it routes to the
+// connection rather than being silently dropped: the loop counts it in pending_ops
+// (pinning the slot until it drains) and re-arms the recv only once it arrives — so
+// the in-flight cancel can never match a freshly-armed recv on the reused conn_id.
 bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id) {
     if (fd < 0 || conn_id >= kMaxSendState) return false;
     return cancel_by_user_data(encode_user_data(conn_id, IoEventType::UpstreamRecv),
-                               kCancelConnId,
-                               IoEventType::UpstreamRecv);
+                               conn_id,
+                               IoEventType::UpstreamRecv,
+                               kPauseCancelAux);
 }
 
 bool IoUringBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
@@ -635,6 +644,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;
                 events[count].more = 0;
+                events[count].aux = 0;
                 count++;
             }
             // Re-submit read on timerfd for next tick
@@ -683,6 +693,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             events[count].buf_id = 0;
             events[count].has_buf = 0;
             events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
+            events[count].aux = static_cast<u8>(aux);  // 0 for recv data
             head++;
             count++;
             continue;
@@ -722,6 +733,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     events[count].buf_id = 0;
                     events[count].has_buf = 0;
                     events[count].more = 0;
+                    events[count].aux = 0;
                     head++;
                     count++;
                     continue;
@@ -733,6 +745,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].buf_id = 0;
                 events[count].has_buf = 0;
                 events[count].more = 0;
+                events[count].aux = 0;
                 head++;
                 count++;
                 continue;
@@ -747,6 +760,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].buf_id = 0;
         events[count].has_buf = 0;
         events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
+        // Forward the decoded aux so dispatch can recognize a pause cancel's own
+        // completion (UpstreamRecv + kPauseCancelAux); 0 for every normal op.
+        events[count].aux = static_cast<u8>(aux);
 
         head++;
         count++;

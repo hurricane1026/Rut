@@ -108,6 +108,8 @@ struct IoUringBackend {
     // Pause downstream recv while a send wait is pending.
     // Uses a silent cancel CQE so the event loop does not have to special-case it.
     bool pause_recv(i32 fd, u32 conn_id);
+    // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
+    // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
     bool pause_upstream_recv(i32 fd, u32 conn_id);
 
     // Submit a send (or zero-copy send).

@@ -155,6 +155,18 @@ add_library(rut_runtime STATIC
 target_include_directories(rut_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
+
+# Make ignoring a [[nodiscard]] result a hard error in the runtime — the automated
+# guard for the fail-closed invariant on the io_uring async-pause helpers
+# (pause_upstream_recv / _for_send / pause_recv / ws_pause_upstream_recv): they
+# return false when a cancel SQE can't queue under SQ pressure, and every caller
+# must fail closed. callbacks.cc explicitly instantiates the pause callers
+# (on_response_body_recvd<IoUringEventLoop> etc.), so a future commit that ignores a
+# result fails to compile here. Scoped to this target (not global): glibc marks
+# write()/read() warn_unused_result at -O2, and GCC does NOT honor a (void) cast on
+# those, so a blanket flag would break the test/bench harness and third_party — the
+# runtime itself is warn_unused_result-clean.
+target_compile_options(rut_runtime PRIVATE -Werror=unused-result)
 target_link_libraries(rut_runtime
     zstd_compress
     ssl

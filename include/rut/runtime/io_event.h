@@ -25,6 +25,11 @@ enum class IoEventType : u8 {
 static_assert(static_cast<u8>(IoEventType::Count) == 8u,
               "IoEventType should keep all runtime event tags and remain small");
 
+// user_data aux tag marking a pause cancel's OWN completion (vs the recv CQE it
+// cancels, aux 0). Shared by the io_uring backend (sets it) and the event loop
+// (recognizes it via IoEvent::aux to re-arm only after the cancel has drained).
+inline constexpr u8 kPauseCancelAux = 1;
+
 // Unified completion event — field order optimized for minimal padding.
 struct IoEvent {
     u32 conn_id;
@@ -32,7 +37,9 @@ struct IoEvent {
     u16 buf_id;  // provided buffer id (io_uring only; valid iff has_buf != 0)
     u8 has_buf;  // non-zero if this event owns a provided buffer in buf_id
     IoEventType type;
-    u8 more;  // non-zero if the SQE will produce more CQEs (multishot recv)
+    u8 more;     // non-zero if the SQE will produce more CQEs (multishot recv)
+    u8 aux = 0;  // decoded user_data aux tag; kPauseCancelAux marks a pause cancel's
+                 // own completion (distinct from the recv CQE it cancels)
 };
 
 }  // namespace rut

@@ -569,7 +569,24 @@ public:
             return true;
         }
         if (c.upstream_recv_armed) {
-            if (c.upstream_recv_pause_cancel_pending) c.upstream_recv_pause_rearm_pending = true;
+            // armed can be a DOOMED recv: after a pause cancel, the in-flight recv is
+            // being cancelled (its -ECANCELED is pending) even though armed is still set.
+            // If either the cancel or that recv terminal is still in flight, this isn't a
+            // live recv we can rely on — remember the re-arm so it fires once both drain.
+            if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight)
+                c.upstream_recv_pause_rearm_pending = true;
+            return true;
+        }
+        // Defer-until-drains: a prior pause's cancel SQE and/or the cancelled recv are
+        // still in flight even though upstream_recv_armed is clear (proxy_stream_complete
+        // clears it at the keep-alive boundary while both are still pending). Arming a new
+        // multishot recv now would give it the same (conn_id, UpstreamRecv) user_data the
+        // stale cancel matches, OR let the stale recv terminal clobber the fresh recv's
+        // armed flag. Wait: the cancel CQE clears cancel_pending and the recv terminal
+        // clears cancel_inflight; try_deferred_upstream_rearm re-arms once both are clear.
+        // (epoll's pause is synchronous and never sets these, so this is io_uring-only.)
+        if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight) {
+            c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
         if (backend.add_recv_upstream(c.upstream_fd, c.id)) {
@@ -582,20 +599,63 @@ public:
     }
 
     bool pause_upstream_recv_impl(Connection& c) {
-        c.upstream_recv_pause_cancel_pending = true;
-        if (!c.upstream_recv_armed) {
-            c.upstream_recv_pause_cancel_pending = false;
+        if (!c.upstream_recv_armed) return true;  // nothing armed — no cancel, no CQE
+        if (c.upstream_recv_pause_cancel_pending) {
+            // A cancel is already in flight (e.g. a mid-body watermark pause). If the body
+            // has SINCE completed — a parked/buffered tail finished it and re-paused here
+            // with resp_fully_buffered set — upgrade the stale marker so the in-flight
+            // recv's terminal/data is still treated as stale post-body data. The early
+            // return must not leave terminal_stale at its mid-body value of false.
+            if (c.resp_fully_buffered) c.upstream_recv_terminal_stale = true;
             return true;
         }
-        return backend.pause_upstream_recv(c.upstream_fd, c.id);
+        // Cancel the multishot recv by user_data — recv-only, so a concurrent upstream
+        // send (WS tunnel, overlapping body upload) is never touched. The cancel is
+        // COUNTED in pending_ops and its own completion (tagged kPauseCancelAux) is what
+        // re-arms the recv (see try_deferred_upstream_rearm): the recv is re-armed only
+        // after the cancel drains, so the in-flight cancel can never match a freshly-
+        // armed recv on the reused conn_id, and the slot can't be reclaimed until then.
+        if (!backend.pause_upstream_recv(c.upstream_fd, c.id)) return false;
+        c.upstream_recv_pause_cancel_pending = true;
+        // The armed recv will now produce a terminal CQE (-ECANCELED, or a normal
+        // completion that beat the cancel). Track it independently of upstream_recv_armed
+        // so the re-arm waits for it even after proxy_stream_complete clears armed.
+        c.upstream_recv_cancel_inflight = true;
+        // Capture whether the body was already complete: if so, the cancelled recv's
+        // terminal is stale post-body data to suppress. Captured now because
+        // proxy_stream_complete clears resp_fully_buffered before that terminal drains.
+        c.upstream_recv_terminal_stale = c.resp_fully_buffered;
+        c.pending_ops++;
+        return true;
     }
 
-    bool pause_upstream_recv_for_send(Connection& c) {
+    // Re-arm an upstream recv that a pause deferred, but ONLY once BOTH the old recv and
+    // its pause cancel have drained — armed cleared by the recv's CQE, cancel_pending
+    // cleared by the cancel's own CQE (kPauseCancelAux). Re-arming before the cancel
+    // drains would let it match the fresh recv on the reused conn_id. The recv and
+    // cancel CQEs can arrive in either order, so both terminal branches call this; it
+    // fires from whichever lands second. No-op unless a re-arm was actually deferred.
+    // Returns false only if the re-arm failed under SQ pressure (caller must close).
+    bool try_deferred_upstream_rearm(Connection& c) {
+        if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight ||
+            c.upstream_recv_armed || !c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_paused_for_send || c.upstream_fd < 0) {
+            // upstream_fd < 0 ⇒ the connection is being torn down (close_conn closed the
+            // upstream) — don't re-arm a recv on a dead fd. A live deferred re-arm always
+            // has upstream_fd >= 0, since rearm_pending is only set by a submit_recv_-
+            // upstream call, which happens only once the upstream is connected.
+            return true;
+        }
+        c.upstream_recv_pause_rearm_pending = false;
+        return submit_recv_upstream_impl(c);
+    }
+
+    [[nodiscard]] bool pause_upstream_recv_for_send(Connection& c) {
         c.upstream_recv_paused_for_send = true;
         return pause_upstream_recv_impl(c);
     }
 
-    bool pause_recv(Connection& c) {
+    [[nodiscard]] bool pause_recv(Connection& c) {
         c.recv_paused_for_send = true;
         if (c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>)
             return true;
@@ -872,18 +932,71 @@ public:
                         }
                         break;
                     }
-                    if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED &&
-                        conn.upstream_recv_pause_cancel_pending) {
-                        const bool needs_rearm = conn.upstream_recv_pause_rearm_pending;
-                        conn.upstream_recv_pause_rearm_pending = false;
-                        conn.upstream_recv_pause_cancel_pending = false;
-                        conn.upstream_recv_armed = false;
+                    // The pause cancel's OWN completion (real conn_id + kPauseCancelAux,
+                    // counted in pending_ops). The cancel has fully drained, so a freshly-
+                    // armed recv on this conn_id can no longer be matched by it — re-arm
+                    // now if the recv side has also drained. Carries no data.
+                    if (ev.type == IoEventType::UpstreamRecv && ev.aux == kPauseCancelAux) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
-                        if (needs_rearm && !conn.upstream_recv_paused_for_send) {
-                            if (!this->submit_recv_upstream_impl(conn)) {
-                                this->close_conn(conn);
+                        conn.upstream_recv_pause_cancel_pending = false;
+                        if (conn.fd < 0) {
+                            // Connection already closed — this is a stale/close-path cancel
+                            // completion. The early break below skips the generic
+                            // pending_ops==0 reclaim, so reclaim here if it was the last op,
+                            // or the slot leaks and proxy churn exhausts the table.
+                            if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                            break;
+                        }
+                        if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        break;
+                    }
+                    if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED) {
+                        // The recv was cancelled (cancel won the race). Don't clear
+                        // cancel_pending or re-arm here — the cancel's own CQE owns that,
+                        // and may not have drained yet. Account the recv and mark its
+                        // terminal drained; re-arm fires from whichever of {recv, cancel}
+                        // CQE lands second.
+                        conn.upstream_recv_armed = false;
+                        conn.upstream_recv_cancel_inflight = false;
+                        conn.upstream_recv_terminal_stale = false;
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (conn.fd < 0) {
+                            // Closed conn (e.g. the close-path cancel of an armed upstream
+                            // recv): reclaim the slot if this drained the last op, since the
+                            // break skips the generic reclaim below.
+                            if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                            break;
+                        }
+                        if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        break;
+                    }
+                    // Stale post-body recv data/terminal. A body-done pause cancelled this
+                    // recv (cancel_inflight) at the keep-alive boundary, but its already-
+                    // harvested multishot CQEs — both F_MORE data and the final terminal —
+                    // still arrive, and wait() has already appended their bytes to
+                    // upstream_recv_buf. Roll those bytes back and NEVER deliver: once
+                    // proxy_stream_complete repoints the slot to the next pipelined request,
+                    // delivering or leaving stale bytes would corrupt/close it. (The next
+                    // request's recv can't have produced data yet — it re-arms only after
+                    // THIS recv drains.) Only the final CQE accounts/drains the recv.
+                    if (ev.type == IoEventType::UpstreamRecv &&
+                        conn.upstream_recv_cancel_inflight && conn.upstream_recv_terminal_stale) {
+                        if (ev.result > 0) {
+                            const u32 stale = static_cast<u32>(ev.result);
+                            if (conn.upstream_recv_buf.len() >= stale)
+                                conn.upstream_recv_buf.set_len(conn.upstream_recv_buf.len() -
+                                                               stale);
+                        }
+                        if (!ev.more) {
+                            conn.upstream_recv_armed = false;
+                            conn.upstream_recv_cancel_inflight = false;
+                            conn.upstream_recv_terminal_stale = false;
+                            if (conn.pending_ops > 0) conn.pending_ops--;
+                            if (conn.fd < 0) {
+                                if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
                                 break;
                             }
+                            if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
                         }
                         break;
                     }
@@ -893,7 +1006,26 @@ public:
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
-                        if (ev.type == IoEventType::UpstreamRecv) conn.upstream_recv_armed = false;
+                        if (ev.type == IoEventType::UpstreamRecv) {
+                            // Recv ended normally and is NOT stale (the stale case is handled
+                            // and dropped above). If a pause cancel lost the race its own CQE
+                            // still clears cancel_pending and owns the re-arm; here just
+                            // account, mark the recv terminal drained, and re-arm if both
+                            // sides drained, then fall through to deliver the real bytes.
+                            conn.upstream_recv_armed = false;
+                            conn.upstream_recv_cancel_inflight = false;
+                            conn.upstream_recv_terminal_stale = false;
+                            if (conn.fd < 0) {
+                                // Closed conn: reclaim if this was the last op (the break
+                                // below skips the generic pending_ops==0 reclaim).
+                                if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                                break;
+                            }
+                            if (!this->try_deferred_upstream_rearm(conn)) {
+                                this->close_conn(conn);
+                                break;
+                            }
+                        }
                     }
                     const bool has_recv_slot =
                         conn.on_recv && (!conn.uses_iouring_tls() || conn.tls_pending_on_recv);
