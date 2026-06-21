@@ -1,6 +1,7 @@
 #include "rut/compiler/parser.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/runtime/http_parser.h"
 #include <memory>
 
@@ -935,6 +936,7 @@ struct Parser {
             // maxMessageSize kwargs, and a typed `req.upgrade` guard are later phases.
             if (cur().type == TokenType::Ident && cur().text.eq({"websocket", 9}) &&
                 peek().type == TokenType::LParen) {
+#if RUT_ENABLE_WEBSOCKET
                 pos++;  // consume `websocket`
                 auto lparen = expect(TokenType::LParen);
                 if (!lparen) return core::make_unexpected(lparen.error());
@@ -946,6 +948,13 @@ struct Parser {
                 stmt.name = name.value()->text;
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;
+#else
+                // WebSocket tunnel support is compiled out (RUT_ENABLE_WEBSOCKET=0): the
+                // runtime has no 101/tunnel path, so reject `websocket(...)` at compile
+                // time rather than silently lowering it to a plain forward that can never
+                // establish the full-duplex tunnel.
+                return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+#endif
             }
 
             // Peek for the response builder. We recognise `response`

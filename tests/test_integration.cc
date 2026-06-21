@@ -9013,6 +9013,9 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
 // onto the proxy connect path — identical to `forward`, since the runtime auto-tunnels
 // on a 101. Same shape as dsl_return_forward_enters_proxy_state: 9999 has nothing
 // listening → ECONNREFUSED → 502, which proves the handler returned Forward.
+// Gated on RUT_ENABLE_WEBSOCKET: in a WS-disabled build websocket() is a parse error
+// (see websocket_rejected_when_tunnel_disabled), so this builder test can't run there.
+#if RUT_ENABLE_WEBSOCKET
 TEST(route, dsl_return_websocket_enters_proxy_state) {
     using namespace rut;
 
@@ -9078,6 +9081,7 @@ TEST(route, dsl_return_websocket_enters_proxy_state) {
     engine.shutdown();
     rir.destroy();
 }
+#endif  // RUT_ENABLE_WEBSOCKET
 #endif
 
 // Regression: `websocket` must stay usable as an ordinary identifier (here, an
@@ -9095,6 +9099,20 @@ TEST(route, websocket_is_not_a_reserved_identifier) {
     REQUIRE(hir);  // analyzes: forward(websocket) resolves the upstream named "websocket"
     delete hir.value();
 }
+
+#if !RUT_ENABLE_WEBSOCKET
+// In a RUT_ENABLE_WEBSOCKET=0 build the runtime has no 101/tunnel path, so a
+// `websocket(...)` route must be REJECTED at compile time, not silently lowered to a
+// plain forward that can never tunnel. (Compiles/runs only in WS-disabled builds.)
+TEST(route, websocket_rejected_when_tunnel_disabled) {
+    using namespace rut;
+    const char* src = "upstream backend\nroute GET \"/ws\" { return websocket(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // unsupported syntax when WebSocket support is compiled out
+}
+#endif  // !RUT_ENABLE_WEBSOCKET
 
 // populate_route_config requires bodies / header sets / routes to
 // start empty (there's no merge semantics). Upstreams are more

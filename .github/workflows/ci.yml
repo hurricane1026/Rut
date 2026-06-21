@@ -144,6 +144,28 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
 
+  test-no-websocket:
+    name: Build & Test (no WebSocket)
+    runs-on: ubuntu-24.04
+    # RUT_ENABLE_WEBSOCKET=0 is a shipped config (minimal mesh sidecars that never
+    # proxy WebSocket). Build it so the #if RUT_ENABLE_WEBSOCKET runtime paths compile
+    # out cleanly AND the parser rejects websocket() routes
+    # (websocket_rejected_when_tunnel_disabled). JIT off — the gate test is frontend-only.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-dev
+      - name: Configure
+        run: cmake -B build -G Ninja -DRUT_ENABLE_WEBSOCKET=OFF -DRUT_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: ninja -C build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+
   sanitizer:
     name: Sanitizer (ASan+UBSan)
     runs-on: ubuntu-24.04
