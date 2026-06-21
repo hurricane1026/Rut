@@ -122,6 +122,17 @@ target_include_directories(test_hpack PRIVATE
 add_test(NAME test_hpack COMMAND test_hpack)
 set_tests_properties(test_hpack PROPERTIES LABELS "unit")
 
+# RFC 6455 WebSocket frame codec (src/runtime/ws_frame.cc).
+add_executable(test_ws_frame test_ws_frame.cc)
+target_link_libraries(test_ws_frame rut_runtime)
+target_include_directories(test_ws_frame PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME test_ws_frame COMMAND test_ws_frame)
+set_tests_properties(test_ws_frame PROPERTIES LABELS "unit")
+
 # Differential HPACK test against the vendored nghttp2 reference.
 add_executable(test_hpack_diff test_hpack_diff.cc)
 target_link_libraries(test_hpack_diff rut_runtime nghttp2_ref)
