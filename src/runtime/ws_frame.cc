@@ -87,6 +87,14 @@ void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]) {
 
 u32 ws_write_header(
     u8* out, WsOpcode op, bool fin, bool masked, const u8 mask_key[4], u64 payload_len) {
+    // Refuse to serialize anything ws_parse_header would reject, so the writer can never
+    // put a protocol-invalid frame on the wire. Return 0 (never a valid header length —
+    // the minimum is 2) to signal "rejected, nothing written".
+    //   - §5.5: control frames (Close/Ping/Pong) cannot use extended length (>125 bytes).
+    //   - §5.2: the 64-bit length's most-significant bit is reserved zero.
+    if (ws_opcode_is_control(op) && payload_len > kWsMaxControlPayload) return 0;
+    if (payload_len >= (static_cast<u64>(1) << 63)) return 0;
+
     out[0] = static_cast<u8>((fin ? 0x80 : 0x00) | static_cast<u8>(op));
     const u8 mask_bit = masked ? 0x80 : 0x00;
     u32 offset;

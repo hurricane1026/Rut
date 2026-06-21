@@ -209,6 +209,20 @@ TEST(ws_frame_write, header_lengths) {
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Text, true, true, key, 70000), 14u);   // +4 mask
 }
 
+TEST(ws_frame_write, refuses_frames_the_parser_would_reject) {
+    u8 hdr[kWsMaxHeaderSize];
+    const u8 key[4] = {0, 0, 0, 0};
+    // Control frames cannot use extended length (>125) — would emit a frame the parser
+    // rejects (oversized_control_frame). Refused → 0, nothing written.
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 200), 0u);
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Ping, true, false, key, 126), 0u);
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Pong, true, true, key, 1000), 0u);
+    // 64-bit length with the reserved high bit set (sixty_four_bit_msb_set) → refused.
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Binary, true, false, key, 1ull << 63), 0u);
+    // Boundary: control frame at exactly 125 still serializes.
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 125), 2u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
