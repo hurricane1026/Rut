@@ -924,6 +924,25 @@ struct Parser {
                 return stmt;
             }
 
+            // `return websocket(<name>)` — proxy to a WebSocket upstream. Phase 0 lowers
+            // to the SAME ForwardUpstream terminator as `forward`: the runtime auto-
+            // establishes the full-duplex passthrough tunnel when the client requested an
+            // Upgrade and the upstream answers 101. (Per-frame `{ frame ... }` blocks and
+            // subprotocol/maxMessageSize kwargs are later phases.) The user still guards
+            // `req.upgrade == .websocket` themselves, as in DESIGN §3.4.8.
+            if (take(TokenType::KwWebsocket)) {
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto name = expect(TokenType::Ident);
+                if (!name) return core::make_unexpected(name.error());
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.kind = AstStmtKind::ForwardUpstream;
+                stmt.name = name.value()->text;
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
+
             // Peek for the response builder. We recognise `response`
             // by the literal identifier text; no dedicated keyword yet
             // because `response` is also a valid identifier elsewhere.
