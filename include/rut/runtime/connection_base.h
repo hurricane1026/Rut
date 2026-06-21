@@ -182,10 +182,15 @@ struct ConnectionBase {
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
     WsInspector ws_c2u;             // client->upstream inspection state (masked)
     WsInspector ws_u2c;             // upstream->client inspection state (unmasked)
-    u8* ws_c2u_msg = nullptr;       // c->u reassembly slice (persists across reads)
-    u8* ws_c2u_out = nullptr;       // c->u re-framed output slice (sent upstream)
-    u8* ws_u2c_msg = nullptr;       // u->c reassembly slice
-    u8* ws_u2c_out = nullptr;       // u->c re-framed output slice (sent to client)
+    // Reassembly scratch, one per direction (pure CPU — never kernel-referenced, so freed
+    // immediately on close). The re-framed output is written IN PLACE over the recv buffer
+    // (ws_inspect's output is always <= its consumed input), so no separate output slice is
+    // needed. ws_*_consumed remembers the unconsumed-tail start across an in-flight send so
+    // the sent callback can compact the partial trailing frame to the front.
+    u8* ws_c2u_msg = nullptr;  // client->upstream reassembly slice
+    u8* ws_u2c_msg = nullptr;  // upstream->client reassembly slice
+    u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
+    u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -452,9 +457,9 @@ struct ConnectionBase {
         ws_c2u.message_len = 0;
         ws_u2c.message_len = 0;
         ws_c2u_msg = nullptr;
-        ws_c2u_out = nullptr;
         ws_u2c_msg = nullptr;
-        ws_u2c_out = nullptr;
+        ws_c2u_consumed = 0;
+        ws_u2c_consumed = 0;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

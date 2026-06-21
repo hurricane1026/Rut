@@ -520,6 +520,16 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
+        // kernel op), so reclaim them now regardless of the async deferred path below.
+        if (c.ws_c2u_msg) {
+            pool.free(c.ws_c2u_msg);
+            c.ws_c2u_msg = nullptr;
+        }
+        if (c.ws_u2c_msg) {
+            pool.free(c.ws_u2c_msg);
+            c.ws_u2c_msg = nullptr;
+        }
         if constexpr (Backend::kAsyncIo) {
             // Async backend (io_uring): if no ops are in flight (the close
             // was triggered by the final CQE), reclaim immediately — no

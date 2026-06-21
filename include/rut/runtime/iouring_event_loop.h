@@ -295,6 +295,21 @@ public:
         return true;
     }
 
+    // Two WebSocket terminate-mode reassembly slices (one per direction). All-or-nothing.
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
+        if (c.ws_c2u_msg) return true;  // already allocated
+        u8* a = pool.alloc();
+        u8* b = pool.alloc();
+        if (!a || !b) {
+            if (a) pool.free(a);
+            if (b) pool.free(b);
+            return false;
+        }
+        c.ws_c2u_msg = a;
+        c.ws_u2c_msg = b;
+        return true;
+    }
+
     // Initialize TLS termination on a freshly accepted connection: create the
     // engine, allocate the ciphertext in/out slices, and point on_recv at the
     // TLS driver. Returns false (and rolls back) if the engine or pool fails.
@@ -438,6 +453,17 @@ public:
         // The TlsEngine owns only the SSL object (+ its custom BIO), never the
         // io_uring-referenced slices — safe to free now even with ops in flight.
         if (c.tls_engine.ssl) tls_engine_free(c.tls_engine);
+        // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
+        // kernel op — the re-framed output goes in place in the recv slices), so reclaim
+        // them now too, regardless of in-flight ops.
+        if (c.ws_c2u_msg) {
+            pool.free(c.ws_c2u_msg);
+            c.ws_c2u_msg = nullptr;
+        }
+        if (c.ws_u2c_msg) {
+            pool.free(c.ws_u2c_msg);
+            c.ws_u2c_msg = nullptr;
+        }
         // If no ops are in flight, reclaim immediately.
         if (c.pending_ops == 0) {
             if (c.recv_slice) pool.free(c.recv_slice);

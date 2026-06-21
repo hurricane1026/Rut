@@ -399,6 +399,23 @@ public:
         return true;
     }
 
+    // Acquire the two WebSocket terminate-mode reassembly slices (one per direction).
+    // All-or-nothing: frees a partial acquisition on pool exhaustion. Freed in
+    // free_conn_impl (pure CPU scratch — never kernel-referenced).
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
+        if (c.ws_c2u_msg) return true;  // already allocated
+        u8* a = pool.alloc();
+        u8* b = pool.alloc();
+        if (!a || !b) {
+            if (a) pool.free(a);
+            if (b) pool.free(b);
+            return false;
+        }
+        c.ws_c2u_msg = a;
+        c.ws_u2c_msg = b;
+        return true;
+    }
+
     // --- CRTP implementations (no if constexpr — epoll only) ---
 
     Connection* alloc_conn_impl() {
@@ -438,6 +455,8 @@ public:
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);
         if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+        if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
+        if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
         if (c.h2) h2_pool.free(c.h2);
         c.reset();
         free_stack[free_top++] = cid;
