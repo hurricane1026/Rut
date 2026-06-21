@@ -14,11 +14,14 @@
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/slice_pool.h"   // SlicePool::kSliceSize (terminate reassembly cap)
 #include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
 #include "rut/runtime/traffic_capture.h"
 #include "rut/runtime/upstream_pool.h"
+#include "rut/runtime/ws_terminate.h"  // ws_inspect for terminate-mode tunnels
 
 #include <errno.h>
+#include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1456,6 +1459,55 @@ inline void rewrite_request_line_path(Connection& conn) {
     }
 }
 
+#if RUT_ENABLE_WEBSOCKET
+// Remove the `Sec-WebSocket-Extensions` request header (in place) before forwarding a
+// terminate-route upgrade, so client and backend can't negotiate a per-message extension
+// (permessage-deflate) the inspection engine can't read — its frames would carry RSV1 and
+// be failed. Same in-place mechanics as rewrite_request_line_path: the header sits in the
+// buffered request, so trailing bytes shift up and the forward length / header_end shrink.
+inline void strip_ws_extensions(Connection& conn) {
+    u8* buf = conn.recv_slice;
+    const u32 total = conn.recv_buf.len();
+    if (buf == nullptr || total == 0) return;
+    static constexpr char kHdr[] = "sec-websocket-extensions:";
+    static constexpr u32 kHdrLen = sizeof(kHdr) - 1;
+    u32 i = 0, line_start = 0;
+    bool found = false;
+    while (i + kHdrLen <= total) {  // i is always at a line start
+        bool match = true;
+        for (u32 j = 0; j < kHdrLen; j++) {
+            u8 c = buf[i + j];
+            if (c >= 'A' && c <= 'Z') c = static_cast<u8>(c - 'A' + 'a');
+            if (c != static_cast<u8>(kHdr[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            line_start = i;
+            found = true;
+            break;
+        }
+        while (i < total && buf[i] != '\n') i++;  // skip to next line
+        i++;
+    }
+    if (!found) return;
+    u32 line_end = line_start;
+    while (line_end < total && buf[line_end] != '\n') line_end++;
+    if (line_end < total) line_end++;  // include the LF
+    const u32 removed = line_end - line_start;
+    __builtin_memmove(buf + line_start, buf + line_end, static_cast<size_t>(total - line_end));
+    conn.recv_buf.set_len(total - removed);
+    if (conn.req_initial_send_len > line_start) {
+        conn.req_initial_send_len =
+            conn.req_initial_send_len > removed ? conn.req_initial_send_len - removed : 0;
+    }
+    if (conn.req_header_end > line_start) {
+        conn.req_header_end = conn.req_header_end > removed ? conn.req_header_end - removed : 0;
+    }
+}
+#endif
+
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -1501,6 +1553,10 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // forward(set_path:) — rewrite the request line before forwarding (no-op
     // unless a path override was recorded by the JIT handler).
     rewrite_request_line_path(conn);
+#if RUT_ENABLE_WEBSOCKET
+    // Terminate routes must not let the backend negotiate a per-message extension.
+    if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);
+#endif
     u32 req_send_len =
         conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
     if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
@@ -2145,6 +2201,35 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 // Either side closing tears down both. A stale -ENOBUFS (recv buffer full while
 // the paired send drains it) is ignored rather than treated as a close.
 
+#if RUT_ENABLE_WEBSOCKET
+// Arm terminate mode at the 101: acquire the two reassembly slices, initialize both
+// per-direction inspectors (client->upstream masked, upstream->client unmasked), bound the
+// message cap to one slice, and seed the outbound mask PRNG with real entropy. Returns
+// false if the slice pool is exhausted (or the loop has no pool) — the caller closes.
+template <typename Loop>
+bool ws_arm_terminate(Loop* loop, Connection& conn) {
+    if constexpr (requires(Loop* lp, Connection& c) { lp->alloc_ws_terminate_bufs(c); }) {
+        if (!loop->alloc_ws_terminate_bufs(conn)) return false;
+        u32 cap = conn.ws_max_message_size;
+        const u32 kCap = SlicePool::kSliceSize - kWsMaxHeaderSize;
+        if (cap == 0 || cap > kCap) cap = kCap;
+        conn.ws_c2u.reset();
+        conn.ws_c2u.masked = true;  // client->upstream is client-role on both ends → masked
+        conn.ws_c2u.max_message_size = cap;
+        conn.ws_u2c.reset();
+        conn.ws_u2c.masked = false;  // upstream->client is server-role on both ends → unmasked
+        conn.ws_u2c.max_message_size = cap;
+        u64 seed = 0;
+        RAND_bytes(reinterpret_cast<u8*>(&seed), sizeof(seed));
+        conn.ws_c2u.mask_rng = seed;  // only the masked direction emits fresh mask keys
+        conn.is_ws_terminate = true;
+        return true;
+    } else {
+        return false;
+    }
+}
+#endif
+
 template <typename Loop>
 bool ws_pause_client_recv(Loop* loop, Connection& conn) {
     // Prefer the loop-level pause_recv(Connection&): the io_uring loop needs it
@@ -2234,6 +2319,40 @@ template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     if (conn.recv_buf.len() == 0) return true;
     if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.is_ws_terminate) {
+        // Terminate: parse/reassemble/inspect the client frames and re-frame the result
+        // IN PLACE over recv_buf (output is always <= consumed input). Send the produced
+        // prefix; the unconsumed (partial trailing) bytes are dropped via consume() in the
+        // sent callback once the send drains.
+        u32 consumed = 0, produced = 0;
+        const WsInspectStatus st = ws_inspect(conn.ws_c2u,
+                                              conn.recv_buf.data(),
+                                              conn.recv_buf.len(),
+                                              const_cast<u8*>(conn.recv_buf.data()),
+                                              conn.recv_buf.len(),
+                                              conn.ws_c2u_msg,
+                                              conn.ws_max_message_size,
+                                              conn.ws_handler,
+                                              &conn,
+                                              &consumed,
+                                              &produced);
+        if (st == WsInspectStatus::Error) return false;  // caller closes
+        if (produced > 0) {
+            conn.ws_c2u_consumed = consumed;
+            if (st == WsInspectStatus::Close) conn.ws_terminate_close = true;
+            if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), produced)) return false;
+            conn.ws_client_send_pending = true;
+            conn.ws_client_send_len = produced;
+            return ws_pause_client_recv(loop, conn);
+        }
+        // Nothing to forward yet (partial frame) or every message was dropped: discard the
+        // consumed bytes and keep recv armed for the rest of the next frame.
+        if (consumed > 0) conn.recv_buf.consume(consumed);
+        if (st == WsInspectStatus::Close) return false;  // caller closes
+        return true;
+    }
+#endif
     const u32 kSendLen = conn.recv_buf.len();
     if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), kSendLen)) return false;
     conn.ws_client_send_pending = true;
@@ -2247,6 +2366,39 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
     if (conn.ws_upstream_send_pending) {
         return ws_pause_upstream_recv(loop, conn);
     }
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.is_ws_terminate) {
+        // Mirror of the client->upstream terminate path, on upstream_recv_buf. Frames here
+        // are unmasked (server role). @throttle pacing is intentionally bypassed in
+        // terminate mode: a throttle park would re-enter this function and re-inspect the
+        // same (already advanced) reassembler state — terminate + @throttle is a later
+        // combination.
+        u32 consumed = 0, produced = 0;
+        const WsInspectStatus st = ws_inspect(conn.ws_u2c,
+                                              conn.upstream_recv_buf.data(),
+                                              conn.upstream_recv_buf.len(),
+                                              const_cast<u8*>(conn.upstream_recv_buf.data()),
+                                              conn.upstream_recv_buf.len(),
+                                              conn.ws_u2c_msg,
+                                              conn.ws_max_message_size,
+                                              conn.ws_handler,
+                                              &conn,
+                                              &consumed,
+                                              &produced);
+        if (st == WsInspectStatus::Error) return false;
+        if (produced > 0) {
+            conn.ws_u2c_consumed = consumed;
+            if (st == WsInspectStatus::Close) conn.ws_terminate_close = true;
+            if (!client_send(loop, conn, conn.upstream_recv_buf.data(), produced)) return false;
+            conn.ws_upstream_send_pending = true;
+            conn.ws_upstream_send_len = produced;
+            return ws_pause_upstream_recv(loop, conn);
+        }
+        if (consumed > 0) conn.upstream_recv_buf.consume(consumed);
+        if (st == WsInspectStatus::Close) return false;
+        return true;
+    }
+#endif
     const u32 kSendLen = conn.upstream_recv_buf.len();
     if (throttle_pause_before_pump(loop, conn, kSendLen)) return true;
     if (!client_send(loop, conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
@@ -2333,6 +2485,33 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.is_ws_terminate) {
+        // Drop the consumed prefix (the re-framed output we just sent + any dropped
+        // frames), keeping the partial trailing frame at the front for the next read.
+        conn.recv_buf.consume(conn.ws_c2u_consumed);
+        conn.ws_c2u_consumed = 0;
+        conn.ws_client_send_len = 0;
+        if (conn.ws_terminate_close) {
+            loop->close_conn(conn);
+            return;
+        }
+        if (ws_draining(conn)) {
+            if (!ws_drain_pump(loop, conn)) {
+                loop->close_conn(conn);
+                return;
+            }
+            ws_close_if_drained(loop, conn);
+            return;
+        }
+        // Resume client recv (paused for this send) so the partial frame can complete, and
+        // pump the opposite direction for anything that arrived meanwhile.
+        if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn)) {
+            loop->close_conn(conn);
+        }
+        return;
+    }
+#endif
     conn.recv_buf.consume(conn.ws_client_send_len);
     conn.ws_client_send_len = 0;
     if (ws_draining(conn)) {
@@ -2393,6 +2572,33 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+#if RUT_ENABLE_WEBSOCKET
+    if (conn.is_ws_terminate) {
+        conn.upstream_recv_buf.consume(conn.ws_u2c_consumed);
+        conn.ws_u2c_consumed = 0;
+        conn.ws_upstream_send_len = 0;
+        if (conn.ws_terminate_close) {
+            loop->close_conn(conn);
+            return;
+        }
+        if (conn.ws_pre_tunnel_upstream_closed) conn.ws_upstream_eof = true;
+        if (ws_draining(conn)) {
+            if (!ws_drain_pump(loop, conn)) {
+                loop->close_conn(conn);
+                return;
+            }
+            ws_close_if_drained(loop, conn);
+            return;
+        }
+        conn.upstream_recv_paused_for_send = false;
+        if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream->client direction
+            loop->close_conn(conn);
+            return;
+        }
+        if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+#endif
     conn.upstream_recv_buf.consume(conn.ws_upstream_send_len);
     conn.ws_upstream_send_len = 0;
     if (conn.ws_pre_tunnel_upstream_closed) {
@@ -2465,6 +2671,14 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_upstream_send_pending = false;
     conn.ws_client_send_len = 0;
     conn.ws_upstream_send_len = 0;
+#if RUT_ENABLE_WEBSOCKET
+    // Arm terminate-mode inspection before any early upstream frames are flushed, so they
+    // flow through ws_inspect like the rest of the data phase.
+    if (conn.is_ws_terminate_route && !ws_arm_terminate(loop, conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+#endif
     if (conn.pipeline_stash_len > 0) {
         // Recover the stashed post-upgrade bytes into recv_buf. If they (plus any
         // bytes already read) don't fit, fail closed rather than truncate the

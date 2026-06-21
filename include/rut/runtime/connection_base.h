@@ -191,6 +191,7 @@ struct ConnectionBase {
     u8* ws_u2c_msg = nullptr;  // upstream->client reassembly slice
     u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
     u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
+    bool ws_terminate_close;   // ws_inspect asked to close; tear down after the send drains
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -460,6 +461,7 @@ struct ConnectionBase {
         ws_u2c_msg = nullptr;
         ws_c2u_consumed = 0;
         ws_u2c_consumed = 0;
+        ws_terminate_close = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;
