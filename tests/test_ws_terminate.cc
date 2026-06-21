@@ -288,7 +288,73 @@ TEST(ws_terminate, close_frame_forwards_and_signals_close) {
     WsInspectStatus s = ws_inspect(
         st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
     CHECK(s == WsInspectStatus::Close);
-    CHECK_EQ(produced, in_len);  // the Close was forwarded before signaling
+    CHECK_EQ(produced, in_len);  // the Close (re-framed, unmasked → identical bytes) forwarded
+}
+
+TEST(ws_terminate, close_valid_code_with_reason_forwards) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[32];
+    const u8 body[] = {0x03, 0xE8, 'b', 'y', 'e'};  // 1000 + UTF-8 reason
+    u32 in_len = build(in, WsOpcode::Close, true, false, body, 5);
+
+    u8 out[32], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Close);
+    CHECK(produced > 0u);
+}
+
+TEST(ws_terminate, close_reserved_status_code_errors) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[16];
+    const u8 body[] = {0x03, 0xEE};  // 1006 — reserved (abnormal closure, local-only)
+    u32 in_len = build(in, WsOpcode::Close, true, false, body, 2);
+
+    u8 out[16], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Error);
+}
+
+TEST(ws_terminate, close_invalid_utf8_reason_errors) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[16];
+    const u8 body[] = {0x03, 0xE8, 0xFF};  // 1000 + invalid-UTF-8 reason byte
+    u32 in_len = build(in, WsOpcode::Close, true, false, body, 3);
+
+    u8 out[16], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Error);
+}
+
+// Masked control frames are re-keyed, not forwarded verbatim — the client's mask key must
+// not leak onto the outbound (gateway->upstream) frame.
+TEST(ws_terminate, masked_control_frame_is_rekeyed) {
+    WsInspector st = make_state(/*masked=*/true);
+    Recorder r;
+    u8 in[16];
+    const u8 body[] = {'h', 'i'};
+    u32 in_len = build(in, WsOpcode::Ping, true, true, body, 2);  // masked with kKeyIn
+
+    u8 out[16], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Ok);
+    WsFrameHeader h;
+    u8 pl[8];
+    CHECK(parse_one(out, produced, true, &h, pl) == produced);
+    CHECK(h.opcode == WsOpcode::Ping);
+    CHECK(h.masked);
+    CHECK(memcmp(h.mask_key, kKeyIn, 4) != 0);  // fresh key, not the client's
+    CHECK_EQ(memcmp(pl, body, 2), 0);           // payload preserved
 }
 
 TEST(ws_terminate, handler_close_emits_close_and_stops) {

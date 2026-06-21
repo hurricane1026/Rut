@@ -3,14 +3,6 @@
 namespace rut {
 
 namespace {
-// Copy `n` bytes verbatim from `src` into out[*produced..], bounds-checked.
-bool emit_verbatim(u8* out, u32 out_cap, u32* produced, const u8* src, u32 n) {
-    if (*produced + n > out_cap) return false;
-    for (u32 i = 0; i < n; i++) out[*produced + i] = src[i];
-    *produced += n;
-    return true;
-}
-
 // Advance a splitmix64 PRNG and derive a fresh 4-byte masking key — RFC 6455 §5.3 wants a
 // new unpredictable key per client->server frame, so the inspector can't reuse one fixed
 // key. Unpredictability comes from the caller's entropy seed (mask_rng); this only spreads
@@ -68,6 +60,38 @@ bool utf8_valid(const u8* s, u64 n) {
     }
     return true;
 }
+
+// RFC 6455 §7.4: status codes an endpoint may put on the wire in a Close frame. Rejects
+// the unassigned (<1000, 1016-2999, >4999) and the local-only/reserved 1004/1005/1006/1015.
+bool valid_close_code(u32 code) {
+    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
+           (code >= 3000 && code <= 4999);
+}
+
+// Re-serialize one frame (header + `len`-byte cleartext payload) into out[*produced..],
+// masking the payload with a fresh key when `masked`. Returns false if it won't fit or the
+// header is refused.
+bool emit_frame(u8* out,
+                u32 out_cap,
+                u32* produced,
+                WsOpcode op,
+                const u8* payload,
+                u64 len,
+                bool masked,
+                u64& mask_rng) {
+    u8 key[4] = {0, 0, 0, 0};
+    if (masked) next_mask_key(mask_rng, key);
+    u8 hdr[kWsMaxHeaderSize];
+    const u32 hdr_len = ws_write_header(hdr, op, /*fin=*/true, masked, key, len);
+    if (hdr_len == 0) return false;
+    if (*produced + hdr_len + len > out_cap) return false;
+    for (u32 i = 0; i < hdr_len; i++) out[*produced + i] = hdr[i];
+    u8* dst = out + *produced + hdr_len;
+    for (u64 i = 0; i < len; i++) dst[i] = payload[i];
+    if (masked) ws_unmask(dst, len, key);
+    *produced += hdr_len + static_cast<u32>(len);
+    return true;
+}
 }  // namespace
 
 WsInspectStatus ws_inspect(WsInspector& st,
@@ -110,10 +134,29 @@ WsInspectStatus ws_inspect(WsInspector& st,
         const u8* payload = p + h.header_len;
 
         if (ws_opcode_is_control(h.opcode)) {
-            // Ping/Pong/Close pass through untouched — they're already valid frames for
-            // the outbound side (same role, same masking expectation), so forwarding the
-            // exact bytes is correct and avoids re-masking a control payload.
-            if (!emit_verbatim(out, out_cap, produced, p, static_cast<u32>(frame_total))) {
+            // Copy + unmask the control payload (<=125 bytes) so we can validate it and
+            // re-serialize it with our own framing — terminate mode owns the outbound
+            // side, so it must not leak the client's mask key or relay a malformed body.
+            u8 cbuf[kWsMaxControlPayload];
+            for (u64 i = 0; i < h.payload_len; i++) cbuf[i] = payload[i];
+            if (st.masked) ws_unmask(cbuf, h.payload_len, h.mask_key);
+
+            // §7.4/§5.5.1: a Close body, if present, is a 2-byte status code (which must be
+            // a valid wire code) followed by a UTF-8 reason. Fail the tunnel otherwise.
+            if (h.opcode == WsOpcode::Close && h.payload_len >= 2) {
+                const u32 code = (static_cast<u32>(cbuf[0]) << 8) | cbuf[1];
+                if (!valid_close_code(code)) return WsInspectStatus::Error;
+                if (!utf8_valid(cbuf + 2, h.payload_len - 2)) return WsInspectStatus::Error;
+            }
+
+            if (!emit_frame(out,
+                            out_cap,
+                            produced,
+                            h.opcode,
+                            cbuf,
+                            h.payload_len,
+                            st.masked,
+                            st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
             *consumed += static_cast<u32>(frame_total);
@@ -145,29 +188,17 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // Message complete — invoke the handler and act on its verdict.
         const WsFrameAction action = handler(ctx, msg_op, msg_buf, total);
         if (action == WsFrameAction::Forward) {
-            // Re-serialize the whole message as a single (unfragmented) frame, with a
-            // fresh masking key when this direction is masked.
-            u8 key[4] = {0, 0, 0, 0};
-            if (st.masked) next_mask_key(st.mask_rng, key);
-            u8 hdr[kWsMaxHeaderSize];
-            const u32 hdr_len = ws_write_header(hdr, msg_op, /*fin=*/true, st.masked, key, total);
-            if (hdr_len == 0) return WsInspectStatus::Error;
-            if (*produced + hdr_len + total > out_cap) return WsInspectStatus::Error;
-            for (u32 i = 0; i < hdr_len; i++) out[*produced + i] = hdr[i];
-            u8* out_payload = out + *produced + hdr_len;
-            for (u64 i = 0; i < total; i++) out_payload[i] = msg_buf[i];
-            if (st.masked) ws_unmask(out_payload, total, key);
-            *produced += hdr_len + static_cast<u32>(total);
+            // Re-serialize the whole message as a single (unfragmented) frame.
+            if (!emit_frame(
+                    out, out_cap, produced, msg_op, msg_buf, total, st.masked, st.mask_rng)) {
+                return WsInspectStatus::Error;
+            }
         } else if (action == WsFrameAction::Close) {
             // Emit an empty Close (no body) and end the stream.
-            u8 key[4] = {0, 0, 0, 0};
-            if (st.masked) next_mask_key(st.mask_rng, key);
-            u8 hdr[kWsMaxHeaderSize];
-            const u32 hdr_len =
-                ws_write_header(hdr, WsOpcode::Close, /*fin=*/true, st.masked, key, 0);
-            if (*produced + hdr_len > out_cap) return WsInspectStatus::Error;
-            for (u32 i = 0; i < hdr_len; i++) out[*produced + i] = hdr[i];
-            *produced += hdr_len;
+            if (!emit_frame(
+                    out, out_cap, produced, WsOpcode::Close, msg_buf, 0, st.masked, st.mask_rng)) {
+                return WsInspectStatus::Error;
+            }
             st.message_len = 0;
             return WsInspectStatus::Close;
         }
