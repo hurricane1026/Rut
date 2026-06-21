@@ -309,6 +309,13 @@ struct ConnectionBase {
     bool upstream_recv_paused_for_send;
     bool upstream_recv_pause_cancel_pending;
     bool upstream_recv_pause_rearm_pending;
+    // True from when a pause cancel is issued until the CANCELLED recv's own terminal
+    // CQE (-ECANCELED, or a normal completion that beat the cancel) has drained. Unlike
+    // upstream_recv_armed — which proxy_stream_complete clears at the keep-alive
+    // boundary while the old recv is still in flight — this is cleared ONLY by that
+    // terminal CQE, so it is the reliable "the cancelled recv has not yet drained"
+    // signal that gates re-arm (alongside upstream_recv_pause_cancel_pending).
+    bool upstream_recv_cancel_inflight;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -476,6 +483,7 @@ struct ConnectionBase {
         upstream_recv_paused_for_send = false;
         upstream_recv_pause_cancel_pending = false;
         upstream_recv_pause_rearm_pending = false;
+        upstream_recv_cancel_inflight = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;

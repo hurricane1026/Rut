@@ -569,20 +569,23 @@ public:
             return true;
         }
         if (c.upstream_recv_armed) {
-            if (c.upstream_recv_pause_cancel_pending) c.upstream_recv_pause_rearm_pending = true;
+            // armed can be a DOOMED recv: after a pause cancel, the in-flight recv is
+            // being cancelled (its -ECANCELED is pending) even though armed is still set.
+            // If either the cancel or that recv terminal is still in flight, this isn't a
+            // live recv we can rely on — remember the re-arm so it fires once both drain.
+            if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight)
+                c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        // Defer-until-cancel-drains: a prior pause's cancel SQE is still in flight
-        // (its -ECANCELED hasn't been harvested) even though the recv is no longer
-        // marked armed — e.g. proxy_stream_complete cleared upstream_recv_armed at
-        // the keep-alive boundary while the body-done cancel was still pending.
-        // Arming a new multishot recv now would give it the same
-        // (conn_id, UpstreamRecv) user_data the stale cancel matches, so that
-        // cancel could silently cancel this fresh recv, hanging the next proxied
-        // response. Wait: the -ECANCELED handler clears the flag and re-arms via
-        // upstream_recv_pause_rearm_pending. (epoll's pause is synchronous and
-        // never sets this flag, so this path is io_uring-only by construction.)
-        if (c.upstream_recv_pause_cancel_pending) {
+        // Defer-until-drains: a prior pause's cancel SQE and/or the cancelled recv are
+        // still in flight even though upstream_recv_armed is clear (proxy_stream_complete
+        // clears it at the keep-alive boundary while both are still pending). Arming a new
+        // multishot recv now would give it the same (conn_id, UpstreamRecv) user_data the
+        // stale cancel matches, OR let the stale recv terminal clobber the fresh recv's
+        // armed flag. Wait: the cancel CQE clears cancel_pending and the recv terminal
+        // clears cancel_inflight; try_deferred_upstream_rearm re-arms once both are clear.
+        // (epoll's pause is synchronous and never sets these, so this is io_uring-only.)
+        if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight) {
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
@@ -606,6 +609,10 @@ public:
         // armed recv on the reused conn_id, and the slot can't be reclaimed until then.
         if (!backend.pause_upstream_recv(c.upstream_fd, c.id)) return false;
         c.upstream_recv_pause_cancel_pending = true;
+        // The armed recv will now produce a terminal CQE (-ECANCELED, or a normal
+        // completion that beat the cancel). Track it independently of upstream_recv_armed
+        // so the re-arm waits for it even after proxy_stream_complete clears armed.
+        c.upstream_recv_cancel_inflight = true;
         c.pending_ops++;
         return true;
     }
@@ -618,9 +625,9 @@ public:
     // fires from whichever lands second. No-op unless a re-arm was actually deferred.
     // Returns false only if the re-arm failed under SQ pressure (caller must close).
     bool try_deferred_upstream_rearm(Connection& c) {
-        if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_armed ||
-            !c.upstream_recv_pause_rearm_pending || c.upstream_recv_paused_for_send ||
-            c.upstream_fd < 0) {
+        if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight ||
+            c.upstream_recv_armed || !c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_paused_for_send || c.upstream_fd < 0) {
             // upstream_fd < 0 ⇒ the connection is being torn down (close_conn closed the
             // upstream) — don't re-arm a recv on a dead fd. A live deferred re-arm always
             // has upstream_fd >= 0, since rearm_pending is only set by a submit_recv_-
@@ -926,9 +933,11 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED) {
                         // The recv was cancelled (cancel won the race). Don't clear
                         // cancel_pending or re-arm here — the cancel's own CQE owns that,
-                        // and may not have drained yet. Just account the recv; re-arm
-                        // fires from whichever of {recv, cancel} CQE lands second.
+                        // and may not have drained yet. Account the recv and mark its
+                        // terminal drained; re-arm fires from whichever of {recv, cancel}
+                        // CQE lands second.
                         conn.upstream_recv_armed = false;
+                        conn.upstream_recv_cancel_inflight = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
                         break;
@@ -942,8 +951,10 @@ public:
                         if (ev.type == IoEventType::UpstreamRecv) {
                             // Recv ended normally. If a pause cancel lost the race it will
                             // still post its own CQE to clear cancel_pending and own the
-                            // re-arm; here just account and re-arm if both sides drained.
+                            // re-arm; here just account, mark the recv terminal drained,
+                            // and re-arm if both sides drained.
                             conn.upstream_recv_armed = false;
+                            conn.upstream_recv_cancel_inflight = false;
                             if (!this->try_deferred_upstream_rearm(conn)) {
                                 this->close_conn(conn);
                                 break;

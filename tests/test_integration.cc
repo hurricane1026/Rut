@@ -22,6 +22,7 @@
 #include "rut/runtime/tls_engine.h"
 #include "test.h"
 #include "test_helpers.h"
+#include <algorithm>  // std::sort in the proxy latency bench
 #include <atomic>
 #include <memory>
 
@@ -2857,6 +2858,7 @@ static void arm_paused_upstream(Connection& conn) {
     conn.upstream_recv_paused_for_send = false;
     conn.upstream_recv_pause_cancel_pending = true;
     conn.upstream_recv_pause_rearm_pending = true;
+    conn.upstream_recv_cancel_inflight = true;  // the cancelled recv's terminal is pending
     conn.resp_fully_buffered = false;
     conn.on_upstream_recv = &mark_upstream_recv_delivered;
     g_upstream_recv_delivered = false;
@@ -2904,12 +2906,67 @@ TEST(uring, upstream_recv_pause_cancel_cqe_first_rearms_on_recv) {
 
     loop->dispatch(pause_cancel_cqe(conn.id));  // cancel drains first
     CHECK(!conn.upstream_recv_pause_cancel_pending);
-    CHECK(conn.upstream_recv_armed);                // recv CQE not seen → still armed
+    CHECK(conn.upstream_recv_cancel_inflight);      // the recv's terminal hasn't drained
     CHECK(conn.upstream_recv_pause_rearm_pending);  // re-arm still deferred — NOT yet
 
     loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));
+    CHECK(!conn.upstream_recv_cancel_inflight);
     CHECK(conn.upstream_recv_armed);  // re-armed once the recv drained too
     CHECK(!conn.upstream_recv_pause_rearm_pending);
+    loop->shutdown();
+}
+
+// Codex P1 (623): at a keep-alive boundary proxy_stream_complete clears
+// upstream_recv_armed while the old recv + cancel are still in flight. If the cancel's
+// CQE arrives before the old recv's -ECANCELED, re-arm must NOT fire yet — otherwise the
+// fresh recv would be armed and the stale -ECANCELED would then clobber it. The
+// cancel_inflight flag (not the early-cleared armed flag) is what holds the re-arm back.
+TEST(uring, upstream_recv_pause_cancel_first_armed_cleared_waits_for_recv) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.upstream_recv_armed = false;  // proxy_stream_complete cleared it; recv still in flight
+
+    loop->dispatch(pause_cancel_cqe(conn.id));  // cancel drains first
+    CHECK(!conn.upstream_recv_pause_cancel_pending);
+    CHECK(conn.upstream_recv_cancel_inflight);  // old recv's terminal still pending
+    CHECK(!conn.upstream_recv_armed);           // NOT re-armed on a not-yet-drained recv
+    CHECK(conn.upstream_recv_pause_rearm_pending);
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));  // recv drains
+    CHECK(!conn.upstream_recv_cancel_inflight);
+    CHECK(conn.upstream_recv_armed);  // re-armed only after BOTH drained
+    loop->shutdown();
+}
+
+// Codex P1 (573): if the cancel CQE wins, upstream_recv_armed is still set but the recv
+// is doomed. A send-drain that calls submit_recv_upstream in that window must REMEMBER
+// the re-arm (via cancel_inflight), or the stale -ECANCELED clears armed with no re-arm
+// scheduled and the upstream direction stalls forever.
+TEST(uring, upstream_recv_pause_submit_in_window_remembers_rearm) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.upstream_recv_pause_rearm_pending = false;  // no re-arm requested yet
+
+    loop->dispatch(pause_cancel_cqe(conn.id));  // cancel wins; recv terminal still in flight
+    CHECK(conn.upstream_recv_cancel_inflight);
+    CHECK(conn.upstream_recv_armed);  // doomed recv, but armed is still set
+
+    // Send-drain asks to keep reading in the window — must remember the re-arm.
+    CHECK(loop->submit_recv_upstream_impl(conn));
+    CHECK(conn.upstream_recv_pause_rearm_pending);  // remembered despite cancel_pending cleared
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));  // recv drains
+    CHECK(conn.upstream_recv_armed);  // re-armed, not left permanently stalled
     loop->shutdown();
 }
 
