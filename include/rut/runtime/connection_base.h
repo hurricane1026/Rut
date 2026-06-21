@@ -7,6 +7,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/tls_engine.h"
+#include "rut/runtime/ws_terminate.h"
 
 #include <linux/time_types.h>
 #include <openssl/base.h>
@@ -170,6 +171,21 @@ struct ConnectionBase {
     // drain (on_ws_upstream_to_client_sent).
     bool ws_client_eof;
     bool ws_upstream_eof;
+
+    // WebSocket TERMINATE mode (vs the passthrough tunnel above). Set from the matched
+    // route at request time; `is_ws_terminate` is armed at the 101 transition once the
+    // per-direction inspection buffers are acquired. In terminate mode the data phase is
+    // parsed/inspected/re-framed per message (ws_inspect) instead of spliced raw.
+    bool is_ws_terminate_route;     // matched route requested terminate (vs passthrough)
+    bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
+    WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
+    u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
+    WsInspector ws_c2u;             // client->upstream inspection state (masked)
+    WsInspector ws_u2c;             // upstream->client inspection state (unmasked)
+    u8* ws_c2u_msg = nullptr;       // c->u reassembly slice (persists across reads)
+    u8* ws_c2u_out = nullptr;       // c->u re-framed output slice (sent upstream)
+    u8* ws_u2c_msg = nullptr;       // u->c reassembly slice
+    u8* ws_u2c_out = nullptr;       // u->c re-framed output slice (sent to client)
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -427,6 +443,18 @@ struct ConnectionBase {
         ws_pre_tunnel_upstream_closed = false;
         ws_client_eof = false;
         ws_upstream_eof = false;
+        is_ws_terminate_route = false;
+        is_ws_terminate = false;
+        ws_handler = nullptr;
+        ws_max_message_size = 0;
+        ws_c2u.reset();
+        ws_u2c.reset();
+        ws_c2u.message_len = 0;
+        ws_u2c.message_len = 0;
+        ws_c2u_msg = nullptr;
+        ws_c2u_out = nullptr;
+        ws_u2c_msg = nullptr;
+        ws_u2c_out = nullptr;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

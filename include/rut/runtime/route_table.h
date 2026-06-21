@@ -11,6 +11,7 @@
 #include "rut/runtime/route_canon.h"   // canonicalize_request
 #include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
+#include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn (terminate-mode routes)
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -94,6 +95,13 @@ struct RouteEntry {
     // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
+    // WebSocket TERMINATE mode (Proxy routes only). When `ws_terminate` is set, a 101
+    // upgrade enters frame-inspection mode instead of the raw passthrough tunnel: each
+    // reassembled message is handed to `ws_frame_handler` (forward/drop/close), bounded by
+    // `ws_max_message_size`. Off (default) keeps the passthrough behavior.
+    bool ws_terminate = false;
+    WsMessageHandlerFn ws_frame_handler = nullptr;
+    u32 ws_max_message_size = 0;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -428,6 +436,25 @@ struct RouteConfig {
             return false;  // active dispatch at capacity — fail loud
         }
         route_count++;
+        return true;
+    }
+
+    // Add a Proxy route that TERMINATES WebSocket upgrades: on a 101 the data phase is
+    // frame-inspected and each message handed to `handler` (forward/drop/close), bounded
+    // by `max_message_size` (clamped to one buffer slice). Same failure modes as
+    // add_proxy() plus a null-handler / zero-size check. The C++ surface for terminate
+    // routes; the .rut compiler emits this in a later slice.
+    bool add_ws_terminate(const char* path,
+                          u8 method,
+                          u16 upstream_id,
+                          WsMessageHandlerFn handler,
+                          u32 max_message_size) {
+        if (handler == nullptr || max_message_size == 0) return false;
+        if (!add_proxy(path, method, upstream_id)) return false;
+        auto& r = routes[route_count - 1];
+        r.ws_terminate = true;
+        r.ws_frame_handler = handler;
+        r.ws_max_message_size = max_message_size;
         return true;
     }
 

@@ -679,6 +679,12 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.upstream_fd = kUpstreamFd;
         conn.upstream_idx = route->upstream_id;
+#if RUT_ENABLE_WEBSOCKET
+        // Carry terminate-mode config onto the connection; armed at the 101 transition.
+        conn.is_ws_terminate_route = route->ws_terminate;
+        conn.ws_handler = route->ws_frame_handler;
+        conn.ws_max_message_size = route->ws_max_message_size;
+#endif
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
