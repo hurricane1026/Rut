@@ -2860,6 +2860,7 @@ static void arm_paused_upstream(Connection& conn) {
     conn.upstream_recv_pause_cancel_pending = true;
     conn.upstream_recv_pause_rearm_pending = true;
     conn.upstream_recv_cancel_inflight = true;  // the cancelled recv's terminal is pending
+    conn.upstream_recv_terminal_stale = false;  // active-stream pause by default
     conn.resp_fully_buffered = false;
     conn.on_upstream_recv = &mark_upstream_recv_delivered;
     g_upstream_recv_delivered = false;
@@ -2982,7 +2983,7 @@ TEST(uring, upstream_recv_pause_cancel_loses_suppresses_stale_and_rearms) {
     }
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
-    conn.resp_fully_buffered = true;  // body already complete — terminal is stale
+    conn.upstream_recv_terminal_stale = true;  // pause fired at body-done — terminal is stale
 
     loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 0));  // normal EOF
     CHECK(!conn.upstream_recv_armed);
@@ -3010,6 +3011,28 @@ TEST(uring, upstream_recv_pause_active_response_terminal_is_delivered) {
 
     loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 128));  // final data chunk
     CHECK(g_upstream_recv_delivered);  // active-response bytes ARE delivered (P1-B)
+    loop->shutdown();
+}
+
+// Codex P1 (983): proxy_stream_complete clears resp_fully_buffered at the keep-alive
+// boundary before the old recv's terminal drains. Suppression must read the flag
+// captured at PAUSE time, not the live resp_fully_buffered — else a stale post-body
+// terminal is delivered to the next request's repointed slot and corrupts it.
+TEST(uring, upstream_recv_stale_terminal_suppressed_after_resp_cleared) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.upstream_recv_terminal_stale = true;         // pause fired at body-done
+    conn.resp_fully_buffered = false;                 // proxy_stream_complete already cleared it
+    conn.upstream_recv_pause_cancel_pending = false;  // cancel already drained
+    conn.upstream_recv_cancel_inflight = true;        // this terminal IS the recv draining
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, 0));  // stale post-body EOF
+    CHECK(!g_upstream_recv_delivered);  // suppressed even though resp_fully_buffered == false
     loop->shutdown();
 }
 

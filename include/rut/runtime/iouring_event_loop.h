@@ -613,6 +613,10 @@ public:
         // completion that beat the cancel). Track it independently of upstream_recv_armed
         // so the re-arm waits for it even after proxy_stream_complete clears armed.
         c.upstream_recv_cancel_inflight = true;
+        // Capture whether the body was already complete: if so, the cancelled recv's
+        // terminal is stale post-body data to suppress. Captured now because
+        // proxy_stream_complete clears resp_fully_buffered before that terminal drains.
+        c.upstream_recv_terminal_stale = c.resp_fully_buffered;
         c.pending_ops++;
         return true;
     }
@@ -946,6 +950,7 @@ public:
                         // CQE lands second.
                         conn.upstream_recv_armed = false;
                         conn.upstream_recv_cancel_inflight = false;
+                        conn.upstream_recv_terminal_stale = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (conn.fd < 0) {
                             // Closed conn (e.g. the close-path cancel of an armed upstream
@@ -970,17 +975,27 @@ public:
                             // and re-arm if both sides drained.
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
+                            const bool kStaleTerminal = conn.upstream_recv_terminal_stale;
+                            conn.upstream_recv_terminal_stale = false;
+                            if (conn.fd < 0) {
+                                // Closed conn: reclaim if this was the last op (the breaks
+                                // below skip the generic pending_ops==0 reclaim).
+                                if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                                break;
+                            }
                             if (!this->try_deferred_upstream_rearm(conn)) {
                                 this->close_conn(conn);
                                 break;
                             }
-                            // Suppress delivery of a post-body terminal: the response body
-                            // is already complete (that's why the pause fired), so these
-                            // bytes are stale and the slot may now point at the next
-                            // pipelined request's on_upstream_response, where an EOF would
-                            // wrongly close it. Active-response pauses (body still
-                            // streaming) carry real bytes — fall through to deliver.
-                            if (conn.resp_fully_buffered) break;
+                            // Suppress a stale post-body terminal: the pause fired at the
+                            // keep-alive boundary (body already complete), so these bytes
+                            // are stale and the slot may now point at the next pipelined
+                            // request's on_upstream_response, where an EOF would wrongly
+                            // close it. Read from the captured flag, not resp_fully_buffered,
+                            // which proxy_stream_complete has already cleared. Active-
+                            // response pauses (body still streaming) carry real bytes — fall
+                            // through to deliver.
+                            if (kStaleTerminal) break;
                         }
                     }
                     const bool has_recv_slot =
