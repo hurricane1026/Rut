@@ -164,9 +164,16 @@ WsInspectStatus ws_inspect(WsInspector& st,
             continue;
         }
 
-        // Data frame (Text/Binary/Continuation): accumulate its unmasked payload into the
-        // reassembly buffer (bound already checked above), then ask the reassembler
-        // whether the message is complete.
+        // Data frame (Text/Binary/Continuation). When fragmentation is disallowed (the
+        // in-place tunnel mode), a Continuation frame or a non-final data frame means a
+        // message would span reads — which the in-place re-frame can't size — so fail
+        // closed before touching the buffer.
+        if (st.reject_fragmented && (h.opcode == WsOpcode::Continuation || !h.fin)) {
+            return WsInspectStatus::Error;
+        }
+
+        // Accumulate the (unmasked) payload into the reassembly buffer (bound already
+        // checked above), then ask the reassembler whether the message is complete.
         for (u64 i = 0; i < h.payload_len; i++) msg_buf[st.message_len + i] = payload[i];
         if (st.masked) ws_unmask(msg_buf + st.message_len, h.payload_len, h.mask_key);
 

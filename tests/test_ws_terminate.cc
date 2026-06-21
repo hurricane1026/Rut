@@ -257,6 +257,39 @@ TEST(ws_terminate, fragmented_message_handler_sees_whole) {
     CHECK_EQ(memcmp(pl, "AAABB", 5), 0);  // "AAA" + "BB"
 }
 
+// reject_fragmented (the in-place tunnel mode) fails closed on a fragmented message — a
+// non-final data frame or a Continuation — instead of reassembling it.
+TEST(ws_terminate, reject_fragmented_fails_closed) {
+    WsInspector st = make_state(false);
+    st.reject_fragmented = true;
+    Recorder r;
+    u8 in[64], out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    // First fragment (Text, FIN=0) is rejected immediately.
+    const u8 a[] = {'A', 'A', 'A'};
+    u32 n1 = build(in, WsOpcode::Text, /*fin=*/false, false, a, 3);
+    CHECK(ws_inspect(
+              st, in, n1, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);
+    // A bare Continuation is rejected too.
+    WsInspector st2 = make_state(false);
+    st2.reject_fragmented = true;
+    u32 n2 = build(in, WsOpcode::Continuation, /*fin=*/true, false, a, 3);
+    CHECK(
+        ws_inspect(
+            st2, in, n2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+    // A single-frame (FIN=1) message is still accepted.
+    WsInspector st3 = make_state(false);
+    st3.reject_fragmented = true;
+    u32 n3 = build(in, WsOpcode::Text, /*fin=*/true, false, a, 3);
+    CHECK(
+        ws_inspect(
+            st3, in, n3, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Ok);
+}
+
 // === Control pass-through ===
 
 TEST(ws_terminate, ping_passes_through_verbatim) {

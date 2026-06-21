@@ -8058,6 +8058,65 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     destroy_real_loop(loop);
 }
 
+// v1 terminate is single-frame only: a fragmented client message (a data frame with
+// FIN=0) is failed closed rather than mis-reassembled by the in-place re-frame.
+TEST(websocket_e2e, terminate_rejects_fragmented) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+    char buf[1024];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));
+
+    // A masked first fragment (Text, FIN=0): the gateway must tear the tunnel down.
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 fr[64];
+    u32 hl = ws_write_header(fr, WsOpcode::Text, /*fin=*/false, true, kKey, 3);
+    fr[hl] = 'A';
+    fr[hl + 1] = 'A';
+    fr[hl + 2] = 'A';
+    ws_unmask(fr + hl, 3, kKey);
+    REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + 3));
+    bool closed = false;
+    for (int i = 0; i < 5; i++) {
+        if (recv_timeout(c, buf, sizeof(buf), 2000) <= 0) {
+            closed = true;
+            break;
+        }
+    }
+    CHECK(closed);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // Same terminate round-trip on io_uring: exercises the multishot-recv re-arm on the
 // produced==0 path (a dropped/partial frame leaves recv armed) and the same-fd pause/
 // re-arm during the in-place inspected send.

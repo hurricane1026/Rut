@@ -2216,9 +2216,11 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.reset();
         conn.ws_c2u.masked = true;  // client->upstream is client-role on both ends → masked
         conn.ws_c2u.max_message_size = cap;
+        conn.ws_c2u.reject_fragmented = true;  // in-place re-frame: single-frame messages only
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;  // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.max_message_size = cap;
+        conn.ws_u2c.reject_fragmented = true;
         u64 seed = 0;
         RAND_bytes(reinterpret_cast<u8*>(&seed), sizeof(seed));
         conn.ws_c2u.mask_rng = seed;  // only the masked direction emits fresh mask keys
