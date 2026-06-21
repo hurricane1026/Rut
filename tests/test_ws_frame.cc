@@ -230,6 +230,93 @@ TEST(ws_frame_write, refuses_frames_the_parser_would_reject) {
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 2), 2u);
 }
 
+// === Message reassembly (RFC 6455 §5.4) ===
+
+namespace {
+// Minimal header for the assembler (it reads only opcode/fin/payload_len).
+WsFrameHeader mh(WsOpcode op, bool fin, u64 len) {
+    WsFrameHeader h{};
+    h.opcode = op;
+    h.fin = fin;
+    h.payload_len = len;
+    return h;
+}
+struct FeedResult {
+    WsMessageStatus st;
+    WsOpcode opcode;
+    u64 total;
+};
+FeedResult feed(WsMessageAssembler& m, WsOpcode op, bool fin, u64 len, u64 max) {
+    FeedResult r{};
+    r.opcode = WsOpcode::Continuation;
+    r.st = ws_message_feed(m, mh(op, fin, len), max, &r.opcode, &r.total);
+    return r;
+}
+}  // namespace
+
+TEST(ws_message, single_unfragmented_text) {
+    WsMessageAssembler m;
+    FeedResult r = feed(m, WsOpcode::Text, true, 5, 0);
+    CHECK(r.st == WsMessageStatus::Complete);
+    CHECK(r.opcode == WsOpcode::Text);
+    CHECK_EQ(r.total, 5u);
+    CHECK(!m.in_fragmented);  // state reset after completion
+}
+
+TEST(ws_message, single_unfragmented_binary) {
+    WsMessageAssembler m;
+    FeedResult r = feed(m, WsOpcode::Binary, true, 9, 0);
+    CHECK(r.st == WsMessageStatus::Complete);
+    CHECK(r.opcode == WsOpcode::Binary);
+    CHECK_EQ(r.total, 9u);
+}
+
+TEST(ws_message, fragmented_reassembles) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Text, false, 10, 0).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Continuation, false, 20, 0).st == WsMessageStatus::NeedMore);
+    FeedResult last = feed(m, WsOpcode::Continuation, true, 5, 0);
+    CHECK(last.st == WsMessageStatus::Complete);
+    CHECK(last.opcode == WsOpcode::Text);  // message opcode from the FIRST frame
+    CHECK_EQ(last.total, 35u);
+}
+
+TEST(ws_message, continuation_without_start_is_error) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Continuation, true, 5, 0).st == WsMessageStatus::Error);
+}
+
+TEST(ws_message, new_data_frame_mid_message_is_error) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Text, false, 10, 0).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Binary, true, 5, 0).st == WsMessageStatus::Error);
+}
+
+TEST(ws_message, control_frame_rejected) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Ping, true, 0, 0).st == WsMessageStatus::Error);
+    CHECK(feed(m, WsOpcode::Close, true, 2, 0).st == WsMessageStatus::Error);
+}
+
+TEST(ws_message, max_message_size_single_frame) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Text, true, 100, 64).st == WsMessageStatus::Error);  // over cap
+    WsMessageAssembler m2;
+    CHECK(feed(m2, WsOpcode::Text, true, 64, 64).st == WsMessageStatus::Complete);  // at cap
+}
+
+TEST(ws_message, max_message_size_across_fragments) {
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Binary, false, 40, 64).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Continuation, true, 30, 64).st == WsMessageStatus::Error);  // 70>64
+}
+
+TEST(ws_message, max_message_size_overflow_safe) {
+    // payload_len near u64 max must not wrap past the cap check.
+    WsMessageAssembler m;
+    CHECK(feed(m, WsOpcode::Text, true, ~0ull, 1024).st == WsMessageStatus::Error);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
