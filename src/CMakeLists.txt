@@ -145,6 +145,7 @@ add_library(rut_runtime STATIC
     runtime/hpack.cc
     runtime/chunked_parser.cc
     runtime/ws_frame.cc
+    runtime/ws_terminate.cc
     runtime/access_log.cc
     runtime/traffic_capture.cc
     runtime/route_art.cc

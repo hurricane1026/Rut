@@ -64,4 +64,38 @@ void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]);
 u32 ws_write_header(
     u8* out, WsOpcode op, bool fin, bool masked, const u8 mask_key[4], u64 payload_len);
 
+// ── Message reassembly (RFC 6455 §5.4) ─────────────────────────────
+// A data *message* is one Text/Binary frame (FIN=0 when fragmented) followed by zero or
+// more Continuation frames, ending with FIN=1. Control frames (Close/Ping/Pong) may
+// interleave between fragments but are handled per-frame and must NOT be fed here.
+// `WsMessageAssembler` tracks the in-progress message and enforces maxMessageSize; the
+// caller copies each frame's (already-unmasked) payload into its own message buffer.
+
+enum class WsMessageStatus : u8 {
+    Complete,  // a full message is ready (out params populated)
+    NeedMore,  // fragment accepted; awaiting more frames
+    Error,     // protocol violation or maxMessageSize exceeded — fail the tunnel
+};
+
+struct WsMessageAssembler {
+    bool in_fragmented = false;                // mid-way through a fragmented message
+    WsOpcode message_opcode = WsOpcode::Text;  // opcode of the message being assembled
+    u64 accumulated_len = 0;                   // payload bytes seen so far this message
+
+    void reset() {
+        in_fragmented = false;
+        message_opcode = WsOpcode::Text;
+        accumulated_len = 0;
+    }
+};
+
+// Feed one DATA or CONTINUATION frame header (control frames are rejected here). On
+// Complete, *out_opcode = the message opcode (Text/Binary) and *out_total_len = the full
+// reassembled payload length. `max_message_size` == 0 means unbounded.
+WsMessageStatus ws_message_feed(WsMessageAssembler& m,
+                                const WsFrameHeader& h,
+                                u64 max_message_size,
+                                WsOpcode* out_opcode,
+                                u64* out_total_len);
+
 }  // namespace rut
