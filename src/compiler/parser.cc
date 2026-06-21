@@ -934,6 +934,9 @@ struct Parser {
             // upstream answers 101 (a non-upgrade request just proxies normally, so the
             // route is safe with no edge guard). Per-frame `{ frame ... }`, subprotocol/
             // maxMessageSize kwargs, and a typed `req.upgrade` guard are later phases.
+            // NOTE: for now `websocket(x)` is indistinguishable from `forward(x)` after
+            // parse — the keyword is intent/documentation only. A distinct WS-only route
+            // marker is a later phase if "a forward that must NOT tunnel" is ever needed.
             if (cur().type == TokenType::Ident && cur().text.eq({"websocket", 9}) &&
                 peek().type == TokenType::LParen) {
 #if RUT_ENABLE_WEBSOCKET

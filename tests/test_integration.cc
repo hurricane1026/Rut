@@ -9100,6 +9100,21 @@ TEST(route, websocket_is_not_a_reserved_identifier) {
     delete hir.value();
 }
 
+// Regression: `.websocket` must still parse as a variant literal — it broke when
+// `websocket` was a reserved keyword (the leading-dot path expects an Ident after `.`).
+// Parse-only: the typed `req.upgrade` guard isn't wired yet (a later phase), so this
+// only asserts the DESIGN guard SHAPE lexes/parses, not that it analyzes.
+TEST(route, dot_websocket_variant_literal_parses) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/ws\" { guard req.upgrade == .websocket else { return 400 } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);  // `.websocket` parses as a variant literal; `websocket` is not a keyword
+    delete ast.value();
+}
+
 #if !RUT_ENABLE_WEBSOCKET
 // In a RUT_ENABLE_WEBSOCKET=0 build the runtime has no 101/tunnel path, so a
 // `websocket(...)` route must be REJECTED at compile time, not silently lowered to a
