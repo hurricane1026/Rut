@@ -217,10 +217,17 @@ TEST(ws_frame_write, refuses_frames_the_parser_would_reject) {
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 200), 0u);
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Ping, true, false, key, 126), 0u);
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Pong, true, true, key, 1000), 0u);
+    // Fragmented control frame (fin=false) — parser rejects (fragmented_control_frame).
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Ping, false, false, key, 0), 0u);
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, false, false, key, 2), 0u);
+    // Close with a 1-byte body — parser rejects (close_one_byte_payload).
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 1), 0u);
     // 64-bit length with the reserved high bit set (sixty_four_bit_msb_set) → refused.
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Binary, true, false, key, 1ull << 63), 0u);
-    // Boundary: control frame at exactly 125 still serializes.
+    // Boundaries that still serialize: control at exactly 125, and an empty/2-byte Close.
     CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 125), 2u);
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 0), 2u);
+    CHECK_EQ(ws_write_header(hdr, WsOpcode::Close, true, false, key, 2), 2u);
 }
 
 int main(int argc, char** argv) {
