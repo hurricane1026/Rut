@@ -2347,9 +2347,12 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
             return ws_pause_client_recv(loop, conn);
         }
         // Nothing to forward yet (partial frame) or every message was dropped: discard the
-        // consumed bytes and keep recv armed for the rest of the next frame.
+        // consumed bytes and keep receiving the rest of the next frame. We didn't pause, so
+        // an async multishot recv stays armed; a sync (epoll) recv is one-shot and must be
+        // re-armed explicitly (the passthrough path never relies on auto-rearm).
         if (consumed > 0) conn.recv_buf.consume(consumed);
         if (st == WsInspectStatus::Close) return false;  // caller closes
+        if constexpr (!ws_loop_async<Loop>()) return ws_resume_client_recv(loop, conn);
         return true;
     }
 #endif
@@ -2396,6 +2399,10 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         }
         if (consumed > 0) conn.upstream_recv_buf.consume(consumed);
         if (st == WsInspectStatus::Close) return false;
+        if constexpr (!ws_loop_async<Loop>()) {  // epoll: re-arm the one-shot upstream recv
+            conn.upstream_recv_paused_for_send = false;
+            return loop->submit_recv_upstream(conn);
+        }
         return true;
     }
 #endif

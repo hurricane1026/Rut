@@ -7953,11 +7953,13 @@ struct WsFrameEchoServer {
     }
 };
 
-// Terminate handler: drop a 4-byte "DROP" text message, forward everything else.
+// Terminate handler: close on "BYE", drop "DROP", forward everything else.
 static rut::WsFrameAction terminate_test_handler(void*,
                                                  rut::WsOpcode op,
                                                  const rut::u8* p,
                                                  rut::u64 len) {
+    if (op == rut::WsOpcode::Text && len == 3 && memcmp(p, "BYE", 3) == 0)
+        return rut::WsFrameAction::Close;
     if (op == rut::WsOpcode::Text && len == 4 && memcmp(p, "DROP", 4) == 0)
         return rut::WsFrameAction::Drop;
     return rut::WsFrameAction::Forward;
@@ -8028,11 +8030,26 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     CHECK(recv_text(pl, &pn));
     CHECK(pn == 4 && memcmp(pl, "PING", 4) == 0);
 
-    // Drop: "DROP" never reaches the backend; the following "PONG" still round-trips.
+    // Drop: "DROP" arrives alone (the sleep forces the produced==0 path — a dropped
+    // message with no forward, after which recv must stay/re-arm), then "PONG" round-trips.
     send_text("DROP", 4);
+    usleep(50000);
     send_text("PONG", 4);
     CHECK(recv_text(pl, &pn));
     CHECK(pn == 4 && memcmp(pl, "PONG", 4) == 0);
+
+    // Close: the handler returns Close on "BYE" — the gateway tears the tunnel down. The
+    // client may first see a Close frame, then EOF; read until the connection closes.
+    send_text("BYE", 3);
+    char tail[256];
+    bool closed = false;
+    for (int i = 0; i < 5; i++) {
+        if (recv_timeout(c, tail, sizeof(tail), 2000) <= 0) {
+            closed = true;
+            break;
+        }
+    }
+    CHECK(closed);
 
     close(c);
     lt.stop();
