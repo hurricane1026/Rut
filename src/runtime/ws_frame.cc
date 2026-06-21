@@ -124,4 +124,42 @@ u32 ws_write_header(
     return offset;
 }
 
+WsMessageStatus ws_message_feed(WsMessageAssembler& m,
+                                const WsFrameHeader& h,
+                                u64 max_message_size,
+                                WsOpcode* out_opcode,
+                                u64* out_total_len) {
+    // Control frames are handled per-frame, never reassembled (§5.4).
+    if (ws_opcode_is_control(h.opcode)) return WsMessageStatus::Error;
+
+    if (h.opcode == WsOpcode::Continuation) {
+        // A continuation is only meaningful once a message has been started.
+        if (!m.in_fragmented) return WsMessageStatus::Error;
+    } else {
+        // A new Text/Binary frame must not arrive in the middle of another message.
+        if (m.in_fragmented) return WsMessageStatus::Error;
+        m.message_opcode = h.opcode;
+        m.accumulated_len = 0;
+        m.in_fragmented = true;
+    }
+
+    // Enforce maxMessageSize before accumulating. Written as a subtraction so an
+    // attacker-controlled 64-bit payload_len can't wrap accumulated_len + payload_len
+    // past the cap. accumulated_len <= max_message_size holds by induction, so
+    // (max_message_size - accumulated_len) never underflows.
+    if (max_message_size != 0 && h.payload_len > max_message_size - m.accumulated_len) {
+        m.reset();
+        return WsMessageStatus::Error;
+    }
+    m.accumulated_len += h.payload_len;
+
+    if (h.fin) {
+        *out_opcode = m.message_opcode;
+        *out_total_len = m.accumulated_len;
+        m.reset();
+        return WsMessageStatus::Complete;
+    }
+    return WsMessageStatus::NeedMore;
+}
+
 }  // namespace rut
