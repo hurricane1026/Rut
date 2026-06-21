@@ -599,8 +599,16 @@ public:
     }
 
     bool pause_upstream_recv_impl(Connection& c) {
-        if (!c.upstream_recv_armed) return true;                // nothing armed — no cancel, no CQE
-        if (c.upstream_recv_pause_cancel_pending) return true;  // a cancel already in flight
+        if (!c.upstream_recv_armed) return true;  // nothing armed — no cancel, no CQE
+        if (c.upstream_recv_pause_cancel_pending) {
+            // A cancel is already in flight (e.g. a mid-body watermark pause). If the body
+            // has SINCE completed — a parked/buffered tail finished it and re-paused here
+            // with resp_fully_buffered set — upgrade the stale marker so the in-flight
+            // recv's terminal/data is still treated as stale post-body data. The early
+            // return must not leave terminal_stale at its mid-body value of false.
+            if (c.resp_fully_buffered) c.upstream_recv_terminal_stale = true;
+            return true;
+        }
         // Cancel the multishot recv by user_data — recv-only, so a concurrent upstream
         // send (WS tunnel, overlapping body upload) is never touched. The cancel is
         // COUNTED in pending_ops and its own completion (tagged kPauseCancelAux) is what
@@ -962,6 +970,36 @@ public:
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
                         break;
                     }
+                    // Stale post-body recv data/terminal. A body-done pause cancelled this
+                    // recv (cancel_inflight) at the keep-alive boundary, but its already-
+                    // harvested multishot CQEs — both F_MORE data and the final terminal —
+                    // still arrive, and wait() has already appended their bytes to
+                    // upstream_recv_buf. Roll those bytes back and NEVER deliver: once
+                    // proxy_stream_complete repoints the slot to the next pipelined request,
+                    // delivering or leaving stale bytes would corrupt/close it. (The next
+                    // request's recv can't have produced data yet — it re-arms only after
+                    // THIS recv drains.) Only the final CQE accounts/drains the recv.
+                    if (ev.type == IoEventType::UpstreamRecv &&
+                        conn.upstream_recv_cancel_inflight && conn.upstream_recv_terminal_stale) {
+                        if (ev.result > 0) {
+                            const u32 stale = static_cast<u32>(ev.result);
+                            if (conn.upstream_recv_buf.len() >= stale)
+                                conn.upstream_recv_buf.set_len(conn.upstream_recv_buf.len() -
+                                                               stale);
+                        }
+                        if (!ev.more) {
+                            conn.upstream_recv_armed = false;
+                            conn.upstream_recv_cancel_inflight = false;
+                            conn.upstream_recv_terminal_stale = false;
+                            if (conn.pending_ops > 0) conn.pending_ops--;
+                            if (conn.fd < 0) {
+                                if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                                break;
+                            }
+                            if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        }
+                        break;
+                    }
                     // Async CQE accounting: decrement pending_ops on final CQE.
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
@@ -969,17 +1007,17 @@ public:
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
                         if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
                         if (ev.type == IoEventType::UpstreamRecv) {
-                            // Recv ended normally. If a pause cancel lost the race it will
-                            // still post its own CQE to clear cancel_pending and own the
-                            // re-arm; here just account, mark the recv terminal drained,
-                            // and re-arm if both sides drained.
+                            // Recv ended normally and is NOT stale (the stale case is handled
+                            // and dropped above). If a pause cancel lost the race its own CQE
+                            // still clears cancel_pending and owns the re-arm; here just
+                            // account, mark the recv terminal drained, and re-arm if both
+                            // sides drained, then fall through to deliver the real bytes.
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
-                            const bool kStaleTerminal = conn.upstream_recv_terminal_stale;
                             conn.upstream_recv_terminal_stale = false;
                             if (conn.fd < 0) {
-                                // Closed conn: reclaim if this was the last op (the breaks
-                                // below skip the generic pending_ops==0 reclaim).
+                                // Closed conn: reclaim if this was the last op (the break
+                                // below skips the generic pending_ops==0 reclaim).
                                 if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
                                 break;
                             }
@@ -987,15 +1025,6 @@ public:
                                 this->close_conn(conn);
                                 break;
                             }
-                            // Suppress a stale post-body terminal: the pause fired at the
-                            // keep-alive boundary (body already complete), so these bytes
-                            // are stale and the slot may now point at the next pipelined
-                            // request's on_upstream_response, where an EOF would wrongly
-                            // close it. Read from the captured flag, not resp_fully_buffered,
-                            // which proxy_stream_complete has already cleared. Active-
-                            // response pauses (body still streaming) carry real bytes — fall
-                            // through to deliver.
-                            if (kStaleTerminal) break;
                         }
                     }
                     const bool has_recv_slot =

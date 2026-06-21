@@ -3036,6 +3036,54 @@ TEST(uring, upstream_recv_stale_terminal_suppressed_after_resp_cleared) {
     loop->shutdown();
 }
 
+// Codex P1/P2 (978/998): a body-done pause's recv can still deliver in-flight multishot
+// DATA CQEs (F_MORE) whose bytes wait() already appended to upstream_recv_buf. Those must
+// be discarded AND rolled back — not just the final terminal — or the next pipelined
+// request parses the leftover bytes as its response.
+TEST(uring, upstream_recv_stale_data_cqe_discarded_and_rolled_back) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);
+    conn.upstream_recv_terminal_stale = true;  // body-done pause
+
+    // Simulate wait() having appended 100 stale bytes to the upstream recv buffer.
+    static u8 backing[4096];
+    conn.upstream_recv_buf.bind(backing, sizeof(backing));
+    conn.upstream_recv_buf.commit(100);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 100u);
+
+    // A stale multishot DATA CQE (F_MORE, not terminal): discard + roll back, recv stays
+    // in flight.
+    loop->dispatch(make_ev_more(conn.id, IoEventType::UpstreamRecv, 100, /*more=*/1));
+    CHECK(!g_upstream_recv_delivered);           // not delivered to the (repointed) slot
+    CHECK_EQ(conn.upstream_recv_buf.len(), 0u);  // stale bytes rolled back
+    CHECK(conn.upstream_recv_cancel_inflight);   // still draining (F_MORE is not terminal)
+    loop->shutdown();
+}
+
+// Codex P1 (603): a mid-body watermark pause captured terminal_stale=false; if the body
+// then completes and re-pauses while that first cancel is still in flight, the early
+// return must upgrade the stale marker (resp_fully_buffered is now true).
+TEST(uring, upstream_recv_repause_after_body_done_upgrades_stale) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    arm_paused_upstream(conn);                  // cancel already in flight
+    conn.upstream_recv_terminal_stale = false;  // captured mid-body
+    conn.resp_fully_buffered = true;            // the parked tail just finished the body
+
+    CHECK(loop->pause_upstream_recv_impl(conn));  // re-pause (no second cancel issued)
+    CHECK(conn.upstream_recv_terminal_stale);     // upgraded to stale
+    loop->shutdown();
+}
+
 // When the connection is being torn down (upstream_fd < 0), the cancel's own CQE must
 // account the cancel but NOT re-arm a recv on the dead fd.
 TEST(uring, upstream_recv_pause_cancel_no_rearm_after_close) {
