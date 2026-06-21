@@ -40,12 +40,20 @@ enum class WsInspectStatus : u8 {
 
 // Per-direction inspection state. One instance per tunnel direction; persists across
 // recv chunks because frames and messages span reads.
+//
+// Extension contract: ws_parse_header rejects any RSV bit, so this engine assumes NO
+// per-message extension (e.g. permessage-deflate) is in effect. A terminating tunnel
+// MUST therefore strip `Sec-WebSocket-Extensions` from the relayed upgrade handshake
+// (enforced at the handshake by the tunnel-wiring slice) so client and backend never
+// negotiate one — otherwise valid compressed frames carry RSV1 and are failed here.
 struct WsInspector {
-    bool masked = false;                // this direction's frames are masked (client->upstream)
-    u8 out_mask_key[4] = {0, 0, 0, 0};  // key used to mask re-emitted frames when `masked`
-    u64 max_message_size = 0;           // 0 = unbounded
-    WsMessageAssembler assembler;       // fragmentation state across frames
-    u64 message_len = 0;                // bytes accumulated into the message buffer so far
+    bool masked = false;           // this direction's frames are masked (client->upstream)
+    u64 mask_rng = 0;              // PRNG state for fresh per-frame outbound mask keys when
+                                   // `masked`; the caller MUST seed it with real entropy
+                                   // (e.g. RAND_bytes) per RFC 6455 §5.3 unpredictability.
+    u64 max_message_size = 0;      // 0 = unbounded
+    WsMessageAssembler assembler;  // fragmentation state across frames
+    u64 message_len = 0;           // bytes accumulated into the message buffer so far
 
     void reset() {
         assembler.reset();
@@ -57,11 +65,18 @@ struct WsInspector {
 //   - data frames: unmask, accumulate into `msg_buf[0..msg_cap)`, and on message
 //     completion invoke `handler`; on Forward, re-serialize the message into
 //     `out[0..out_cap)`; on Drop, emit nothing; on Close, emit a Close frame and stop.
-//   - control frames (Ping/Pong/Close): passed through (re-serialized into `out`); a
-//     Close additionally ends the stream.
-// A partial trailing frame is left unconsumed for the next call. Sets *consumed (input
-// bytes processed) and *produced (output bytes written). Returns Error on any framing
-// violation, an over-cap message, or insufficient output capacity.
+//     Text messages are rejected (Error) unless the reassembled payload is valid UTF-8.
+//   - control frames (Ping/Pong/Close): passed through verbatim into `out`; a Close
+//     additionally ends the stream.
+// A partial trailing frame is left unconsumed for the next call; an oversized frame
+// (advertised length exceeds msg_cap or max_message_size) fails closed immediately rather
+// than waiting for its payload. Sets *consumed (input bytes processed) and *produced
+// (output bytes written). Returns Error on any framing violation, an over-cap message,
+// invalid UTF-8 text, or insufficient output capacity.
+//
+// PRECONDITION: `msg_buf` (capacity `msg_cap` >= max_message_size) must be the SAME
+// stable buffer on every call for this `st` — a fragmented message accumulates into it
+// across calls, so a per-read scratch buffer would lose earlier fragments.
 WsInspectStatus ws_inspect(WsInspector& st,
                            const u8* in,
                            u32 in_len,

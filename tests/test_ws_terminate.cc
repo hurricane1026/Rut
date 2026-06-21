@@ -33,7 +33,6 @@ WsFrameAction record(void* c, WsOpcode op, const u8* payload, u64 len) {
 }
 
 const u8 kKeyIn[4] = {0x11, 0x22, 0x33, 0x44};
-const u8 kKeyOut[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 
 // Build one frame (header + masked-or-plain payload) into buf; return total bytes.
 u32 build(u8* buf, WsOpcode op, bool fin, bool masked, const u8* payload, u32 len) {
@@ -55,7 +54,7 @@ WsInspector make_state(bool masked) {
     WsInspector st;
     st.masked = masked;
     st.max_message_size = 1u << 20;
-    for (int i = 0; i < 4; i++) st.out_mask_key[i] = kKeyOut[i];
+    st.mask_rng = 0xC0FFEEull;  // deterministic seed (real tunnels seed with entropy)
     return st;
 }
 
@@ -110,8 +109,79 @@ TEST(ws_terminate, forward_masked_reframes_with_out_key) {
     u8 pl[64];
     CHECK(parse_one(out, produced, true, &h, pl) == produced);
     CHECK(h.masked);
-    CHECK_EQ(h.mask_key[0], kKeyOut[0]);
     CHECK_EQ(memcmp(pl, msg, 4), 0);
+}
+
+// Each re-framed masked message gets a fresh mask key (RFC 6455 §5.3) — two messages in
+// one chunk must not carry the same key.
+TEST(ws_terminate, masked_frames_get_fresh_keys) {
+    WsInspector st = make_state(/*masked=*/true);
+    Recorder r;
+    u8 in[64];
+    const u8 m1[] = {'a', 'a', 'a', 'a'};
+    const u8 m2[] = {'b', 'b', 'b', 'b'};
+    u32 n = build(in, WsOpcode::Binary, true, true, m1, 4);
+    n += build(in + n, WsOpcode::Binary, true, true, m2, 4);
+
+    u8 out[128], mbuf[256];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, n, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 2);
+    WsFrameHeader h1, h2;
+    u8 pl[16];
+    u32 f1 = parse_one(out, produced, true, &h1, pl);
+    parse_one(out + f1, produced - f1, true, &h2, pl);
+    // Different keys across the two outbound frames.
+    CHECK(memcmp(h1.mask_key, h2.mask_key, 4) != 0);
+}
+
+// === UTF-8 validation (§8.1) ===
+
+TEST(ws_terminate, valid_utf8_text_forwards) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[32];
+    const u8 msg[] = {0xC3, 0xA9, 'o'};  // "éo" — valid 2-byte + ASCII
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 3);
+
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 1);
+}
+
+TEST(ws_terminate, invalid_utf8_text_errors) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[32];
+    const u8 msg[] = {0xFF, 0xFE};  // not valid UTF-8 lead bytes
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 2);
+
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);  // failed before reaching the handler
+}
+
+TEST(ws_terminate, invalid_utf8_only_rejects_text_not_binary) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[32];
+    const u8 msg[] = {0xFF, 0xFE};  // same bytes, but as Binary they're fine
+    u32 in_len = build(in, WsOpcode::Binary, true, false, msg, 2);
+
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 1);
 }
 
 // === Drop ===
