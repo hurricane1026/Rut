@@ -2852,6 +2852,7 @@ static IoEvent pause_cancel_cqe(u32 conn_id) {
 // Set conn into "armed recv + counted pause cancel in flight, re-arm deferred" — the
 // state pause_upstream_recv_impl leaves behind. pending_ops = 2 (the recv + the cancel).
 static void arm_paused_upstream(Connection& conn) {
+    conn.fd = 7;  // live downstream fd (>= 0) — a live proxying conn, not a closed one
     conn.upstream_fd = 42;
     conn.pending_ops = 2;
     conn.upstream_recv_armed = true;
@@ -3028,6 +3029,31 @@ TEST(uring, upstream_recv_pause_cancel_no_rearm_after_close) {
     loop->dispatch(pause_cancel_cqe(conn.id));
     CHECK(!conn.upstream_recv_pause_cancel_pending);  // cancel accounted
     CHECK(!conn.upstream_recv_armed);                 // NOT re-armed on the dead fd
+    loop->shutdown();
+}
+
+// Codex P1 (943): a close-path cancel's -ECANCELED arriving as the LAST in-flight op of
+// an already-closed conn must reclaim the slot. The early -ECANCELED/cancel-CQE branches
+// break before the generic pending_ops==0 reclaim, so without an inline reclaim the slot
+// leaks and proxy close churn eventually exhausts the connection table.
+TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+    Connection& conn = loop->conns[0];
+    conn.fd = -1;  // already closed (close_conn ran)
+    conn.upstream_fd = -1;
+    conn.pending_ops = 1;  // the cancelled upstream recv is the last in-flight op
+    conn.upstream_recv_armed = true;
+    loop->free_top = 0;  // pretend the table is fully allocated (room for one reclaim)
+    loop->pending_free[loop->pending_free_count++] = conn.id;  // close_conn deferred this slot
+
+    loop->dispatch(make_ev(conn.id, IoEventType::UpstreamRecv, -ECANCELED));
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(loop->pending_free_count, 0u);  // reclaim removed it from the pending-free list
+    CHECK_EQ(loop->free_top, 1u);            // and pushed the slot back onto the free stack
     loop->shutdown();
 }
 

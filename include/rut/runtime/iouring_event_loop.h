@@ -927,6 +927,14 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv && ev.aux == kPauseCancelAux) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         conn.upstream_recv_pause_cancel_pending = false;
+                        if (conn.fd < 0) {
+                            // Connection already closed — this is a stale/close-path cancel
+                            // completion. The early break below skips the generic
+                            // pending_ops==0 reclaim, so reclaim here if it was the last op,
+                            // or the slot leaks and proxy churn exhausts the table.
+                            if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                            break;
+                        }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
                         break;
                     }
@@ -939,6 +947,13 @@ public:
                         conn.upstream_recv_armed = false;
                         conn.upstream_recv_cancel_inflight = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
+                        if (conn.fd < 0) {
+                            // Closed conn (e.g. the close-path cancel of an armed upstream
+                            // recv): reclaim the slot if this drained the last op, since the
+                            // break skips the generic reclaim below.
+                            if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                            break;
+                        }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
                         break;
                     }
