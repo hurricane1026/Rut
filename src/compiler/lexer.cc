@@ -53,6 +53,10 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"route", 5})) return TokenType::KwRoute;
     if (text.eq({"return", 6})) return TokenType::KwReturn;
     if (text.eq({"forward", 7})) return TokenType::KwForward;
+    // `websocket` is recognized CONTEXTUALLY in the parser (only `websocket(` in
+    // return position is the builder), NOT reserved as a keyword — otherwise the
+    // `.websocket` variant literal (e.g. `req.upgrade == .websocket`) and any
+    // identifier named `websocket` would stop parsing. Mirrors how `response` works.
     if (text.eq({"wait", 4})) return TokenType::KwWait;
     if (text.eq({"true", 4})) return TokenType::KwTrue;
     if (text.eq({"false", 5})) return TokenType::KwFalse;

@@ -9007,7 +9007,127 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     engine.shutdown();
     rir.destroy();
 }
+
+// Phase 0 WebSocket surface: `return websocket(<ident>)` must compile through the same
+// lex/parse/analyze/MIR/RIR/codegen pipeline into HandlerAction::Forward and dispatch
+// onto the proxy connect path — identical to `forward`, since the runtime auto-tunnels
+// on a 101. Same shape as dsl_return_forward_enters_proxy_state: 9999 has nothing
+// listening → ECONNREFUSED → 502, which proves the handler returned Forward.
+// Gated on RUT_ENABLE_WEBSOCKET: in a WS-disabled build websocket() is a parse error
+// (see websocket_rejected_when_tunnel_disabled), so this builder test can't run there.
+#if RUT_ENABLE_WEBSOCKET
+TEST(route, dsl_return_websocket_enters_proxy_state) {
+    using namespace rut;
+
+    const char* src = "upstream backend\nroute GET \"/ws\" { return websocket(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9999).has_value());
+    REQUIRE(cfg.add_jit_handler("/ws", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /ws HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[1024];
+    i32 total = 0;
+    while (total < static_cast<i32>(sizeof(buf))) {
+        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+        if (n <= 0) break;
+        total += n;
+        if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
+    }
+    CHECK_GT(total, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(total), "HTTP/1.1 502", 12));  // entered proxy path
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+#endif  // RUT_ENABLE_WEBSOCKET
 #endif
+
+// Regression: `websocket` must stay usable as an ordinary identifier (here, an
+// upstream name) because it's a CONTEXTUAL builder, not a reserved keyword. Making it
+// a keyword broke this (and `.websocket` variant literals). Frontend-only — no JIT.
+TEST(route, websocket_is_not_a_reserved_identifier) {
+    using namespace rut;
+    const char* src = "upstream websocket\nroute GET \"/x\" { return forward(websocket) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);  // parses: `upstream websocket` + `forward(websocket)` use it as an ident
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);  // analyzes: forward(websocket) resolves the upstream named "websocket"
+    delete hir.value();
+}
+
+// Regression: `.websocket` must still parse as a variant literal — it broke when
+// `websocket` was a reserved keyword (the leading-dot path expects an Ident after `.`).
+// Parse-only: the typed `req.upgrade` guard isn't wired yet (a later phase), so this
+// only asserts the DESIGN guard SHAPE lexes/parses, not that it analyzes.
+TEST(route, dot_websocket_variant_literal_parses) {
+    using namespace rut;
+    const char* src =
+        "route GET \"/ws\" { guard req.upgrade == .websocket else { return 400 } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);  // `.websocket` parses as a variant literal; `websocket` is not a keyword
+    delete ast.value();
+}
+
+#if !RUT_ENABLE_WEBSOCKET
+// In a RUT_ENABLE_WEBSOCKET=0 build the runtime has no 101/tunnel path, so a
+// `websocket(...)` route must be REJECTED at compile time, not silently lowered to a
+// plain forward that can never tunnel. (Compiles/runs only in WS-disabled builds.)
+TEST(route, websocket_rejected_when_tunnel_disabled) {
+    using namespace rut;
+    const char* src = "upstream backend\nroute GET \"/ws\" { return websocket(backend) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // unsupported syntax when WebSocket support is compiled out
+}
+#endif  // !RUT_ENABLE_WEBSOCKET
 
 // populate_route_config requires bodies / header sets / routes to
 // start empty (there's no merge semantics). Upstreams are more

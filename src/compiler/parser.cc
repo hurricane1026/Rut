@@ -1,6 +1,7 @@
 #include "rut/compiler/parser.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/runtime/http_parser.h"
 #include <memory>
 
@@ -922,6 +923,41 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;
+            }
+
+            // `return websocket(<name>)` — proxy to a WebSocket upstream. Recognized
+            // CONTEXTUALLY (ident text `websocket` followed by `(`), not via a reserved
+            // keyword, so `.websocket` variant literals and identifiers named `websocket`
+            // still parse — mirrors how `response` is handled. Phase 0 lowers to the SAME
+            // ForwardUpstream terminator as `forward`: the runtime auto-establishes the
+            // full-duplex passthrough tunnel when the client requested an Upgrade and the
+            // upstream answers 101 (a non-upgrade request just proxies normally, so the
+            // route is safe with no edge guard). Per-frame `{ frame ... }`, subprotocol/
+            // maxMessageSize kwargs, and a typed `req.upgrade` guard are later phases.
+            // NOTE: for now `websocket(x)` is indistinguishable from `forward(x)` after
+            // parse — the keyword is intent/documentation only. A distinct WS-only route
+            // marker is a later phase if "a forward that must NOT tunnel" is ever needed.
+            if (cur().type == TokenType::Ident && cur().text.eq({"websocket", 9}) &&
+                peek().type == TokenType::LParen) {
+#if RUT_ENABLE_WEBSOCKET
+                pos++;  // consume `websocket`
+                auto lparen = expect(TokenType::LParen);
+                if (!lparen) return core::make_unexpected(lparen.error());
+                auto name = expect(TokenType::Ident);
+                if (!name) return core::make_unexpected(name.error());
+                auto rparen = expect(TokenType::RParen);
+                if (!rparen) return core::make_unexpected(rparen.error());
+                stmt.kind = AstStmtKind::ForwardUpstream;
+                stmt.name = name.value()->text;
+                stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+#else
+                // WebSocket tunnel support is compiled out (RUT_ENABLE_WEBSOCKET=0): the
+                // runtime has no 101/tunnel path, so reject `websocket(...)` at compile
+                // time rather than silently lowering it to a plain forward that can never
+                // establish the full-duplex tunnel.
+                return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+#endif
             }
 
             // Peek for the response builder. We recognise `response`
