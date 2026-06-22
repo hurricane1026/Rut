@@ -58,7 +58,8 @@ language choices — the design must stay inside them or call out the specific r
 ### 1.2 What Phase 4 actually is
 
 The **inspect-only verdict handler** — single-frame Text/Binary ≤ ~16 KB, returning
-`forward` / `drop` / bare `close` (1000) — is a **pure front-end / codegen task**: no new
+`forward` / `drop` / bare `close` (no status code — forward leg 1005, echo 1000; see §5) — is
+a **pure front-end / codegen task**: no new
 tunnel logic. Each richer capability (`close(code)`, `frame.fromClient`, >16 KB / fragmented
 messages, modify) needs **one specific, small runtime change**, enumerated in §8 — they are
 *not* free, and the design tags each one rather than implying "no core changes".
@@ -253,9 +254,11 @@ its codegen is a **subset** of the existing handler codegen. Stages:
    a frame-handler statement block. Bare `websocket(<name>)` stays the existing
    `ForwardUpstream` (passthrough).
 2. **Type-check** — bind `frame` to a `Frame` type in the block's scope; allow only
-   `forward` / `drop` / `close` terminators; require a verdict on every path; permit reads of
-   `frame.*`, comparisons, `guard`/`if`/`match`, and pure builtins (regex, `validate`, `json`).
-   Forbid I/O (`forward`, `wait`, `notify`, state mutation) in v1.
+   `forward` / `drop` / bare `close` terminators (no `close(code)` in v1 — §5/§9); require a
+   verdict on every path; permit reads of `frame.opcode/text/binary/payload/len`, comparisons,
+   `guard`/`if`/`match`, and the regex builtin (`re"…"`, already exists). **`frame.json` /
+   `validate(_, Schema)` are NOT in v1** — they need the JSON builtin (§8), scheduled after A–E.
+   Forbid I/O (`wait`, `notify`, state mutation) in v1.
 3. **RIR** — lower the verdict graph; map `frame.opcode/payload/len/fromClient` to the ABI
    args; `return <verdict>` → a `WsFrameAction` constant; constant-fold route kwargs.
 4. **JIT codegen** — emit a function matching the frame-handler ABI; the route's
