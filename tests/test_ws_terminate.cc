@@ -184,6 +184,71 @@ TEST(ws_terminate, invalid_utf8_only_rejects_text_not_binary) {
     CHECK_EQ(r.calls, 1);
 }
 
+// 3- and 4-byte UTF-8 sequences (exercises the 0xE0/0xF0 lead-byte decode paths).
+TEST(ws_terminate, valid_utf8_three_and_four_byte) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[32];
+    const u8 msg[] = {0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80};  // "€😀" (3-byte + 4-byte)
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 7);
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    CHECK(ws_inspect(st,
+                     in,
+                     in_len,
+                     out,
+                     sizeof(out),
+                     mbuf,
+                     sizeof(mbuf),
+                     record,
+                     &r,
+                     &consumed,
+                     &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 1);
+    // A truncated 3-byte sequence (lead with no continuations) is rejected.
+    WsInspector st2 = make_state(false);
+    const u8 bad[] = {0xE2, 0x82};  // 3-byte lead, only 1 continuation
+    u32 n2 = build(in, WsOpcode::Text, true, false, bad, 2);
+    CHECK(
+        ws_inspect(
+            st2, in, n2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+}
+
+// emit_frame out-capacity failures on the control and Close-action paths.
+TEST(ws_terminate, output_capacity_control_and_close) {
+    Recorder r;
+    u8 in[32], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    // A forwarded Ping with an out buffer too small for its re-frame.
+    WsInspector st = make_state(false);
+    const u8 body[] = {1, 2, 3, 4, 5};
+    u32 n = build(in, WsOpcode::Ping, true, false, body, 5);
+    u8 tiny[3];  // < 2 header + 5 payload
+    CHECK(
+        ws_inspect(
+            st, in, n, tiny, sizeof(tiny), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+    // A handler-requested Close with no room for even the 2-byte Close frame.
+    WsInspector st2 = make_state(false);
+    r.close_now = true;
+    const u8 m[] = {'x'};
+    u32 n2 = build(in, WsOpcode::Text, true, false, m, 1);
+    u8 none[1];
+    CHECK(ws_inspect(st2,
+                     in,
+                     n2,
+                     none,
+                     sizeof(none),
+                     mbuf,
+                     sizeof(mbuf),
+                     record,
+                     &r,
+                     &consumed,
+                     &produced) == WsInspectStatus::Error);
+    r.close_now = false;
+}
+
 // === Drop ===
 
 TEST(ws_terminate, drop_emits_nothing) {
