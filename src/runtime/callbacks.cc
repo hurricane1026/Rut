@@ -111,6 +111,7 @@ void capture_request_metadata(Connection& conn) {
     conn.req_chunk_parser.reset();
     conn.req_malformed = false;
     conn.req_wants_upgrade = false;
+    conn.req_upgrade_is_websocket = false;
     conn.req_header_end = 0;
     conn.req_initial_send_len = 0;
     conn.req_content_length = 0;
@@ -127,6 +128,7 @@ void capture_request_metadata(Connection& conn) {
         // Require BOTH Connection: upgrade and an Upgrade header — Connection is
         // hop-by-hop, so the token alone is not a valid client upgrade request.
         conn.req_wants_upgrade = req.upgrade && req.has_upgrade_header;
+        conn.req_upgrade_is_websocket = req.upgrade_is_websocket;
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;

@@ -774,7 +774,18 @@ TEST(Corpus, ConnectionUpgradeSetsFlag) {
     REQUIRE_EQ(static_cast<u8>(parse_raw(up, sizeof(up) - 1, &req, &parser)),
                static_cast<u8>(ParseStatus::Complete));
     CHECK(req.upgrade);
-    CHECK(req.has_upgrade_header);  // gate = upgrade && has_upgrade_header
+    CHECK(req.has_upgrade_header);    // gate = upgrade && has_upgrade_header
+    CHECK(req.upgrade_is_websocket);  // the token is specifically "websocket"
+
+    // A non-WebSocket upgrade (e.g. h2c) sets has_upgrade_header but NOT upgrade_is_websocket,
+    // so terminate mode won't arm on it.
+    parser.reset();
+    req.reset();
+    const u8 h2c[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(h2c, sizeof(h2c) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_upgrade_header);
+    CHECK(!req.upgrade_is_websocket);
 
     // Connection: upgrade with NO Upgrade header → not a valid upgrade.
     parser.reset();

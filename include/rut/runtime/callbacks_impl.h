@@ -2547,7 +2547,11 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         // Bytes can race into recv_buf while the send was in flight (the recv pause is
         // best-effort): re-inspect them now so an already-complete frame isn't stranded
-        // until the client sends more. ws_try_send re-arms recv itself on a partial frame.
+        // until the client sends more. The send is done, so clear the pause first — if the
+        // re-inspection produces nothing (a dropped/partial frame) it re-arms rather than
+        // sending, and a stale recv_paused_for_send would mis-handle the next completion;
+        // ws_try_send re-sets it via ws_pause_client_recv if it does send.
+        conn.recv_paused_for_send = false;
         if (conn.recv_buf.len() > 0) {
             if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
             return;
@@ -2638,12 +2642,13 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         // Re-inspect bytes that raced into upstream_recv_buf during the send before
-        // re-arming (a complete frame mustn't wait for the next backend read).
+        // re-arming (a complete frame mustn't wait for the next backend read). Clear the
+        // pause first so a zero-output re-inspection that re-arms doesn't leave it stale.
+        conn.upstream_recv_paused_for_send = false;
         if (conn.upstream_recv_buf.len() > 0) {
             if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
             return;
         }
-        conn.upstream_recv_paused_for_send = false;
         if (!loop->submit_recv_upstream(conn)) {  // re-arm upstream->client direction
             loop->close_conn(conn);
             return;
@@ -2726,8 +2731,12 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.ws_upstream_send_len = 0;
 #if RUT_ENABLE_WEBSOCKET
     // Arm terminate-mode inspection before any early upstream frames are flushed, so they
-    // flow through ws_inspect like the rest of the data phase.
-    if (conn.is_ws_terminate_route && !ws_arm_terminate(loop, conn)) {
+    // flow through ws_inspect like the rest of the data phase. Only arm for a genuine
+    // WebSocket handshake (Upgrade: websocket) — a 101 for another upgrade protocol (e.g.
+    // h2c) on the same route falls through to the opaque passthrough tunnel, which relays
+    // bytes correctly, rather than mis-parsing them as WebSocket frames.
+    if (conn.is_ws_terminate_route && conn.req_upgrade_is_websocket &&
+        !ws_arm_terminate(loop, conn)) {
         loop->close_conn(conn);
         return;
     }

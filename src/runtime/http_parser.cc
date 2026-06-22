@@ -262,6 +262,13 @@ static inline ParseStatus apply_semantic_header(
             for (u32 i = 0; i < vlen; i++) {
                 if (val[i] != ' ' && val[i] != '\t') {
                     req->has_upgrade_header = true;
+                    // Record whether the first token is specifically "websocket" so
+                    // terminate mode only arms on a real WS handshake (not e.g. h2c).
+                    if (vlen - i >= 9 && str_ci_eq(val + i, "websocket", 9) &&
+                        (vlen - i == 9 || val[i + 9] == ' ' || val[i + 9] == '\t' ||
+                         val[i + 9] == ',')) {
+                        req->upgrade_is_websocket = true;
+                    }
                     break;
                 }
             }

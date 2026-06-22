@@ -449,6 +449,16 @@ struct RouteConfig {
                           u16 upstream_id,
                           WsMessageHandlerFn handler,
                           u32 max_message_size) {
+#if !RUT_ENABLE_WEBSOCKET
+        // The 101/tunnel path is compiled out in this build — a terminate route could
+        // never enter terminate mode, so fail loud instead of publishing an unusable route.
+        (void)path;
+        (void)method;
+        (void)upstream_id;
+        (void)handler;
+        (void)max_message_size;
+        return false;
+#else
         if (handler == nullptr || max_message_size == 0) return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
@@ -456,6 +466,7 @@ struct RouteConfig {
         r.ws_frame_handler = handler;
         r.ws_max_message_size = max_message_size;
         return true;
+#endif
     }
 
     // Set a route's rate limit to a single token-bucket rule (`max` per
