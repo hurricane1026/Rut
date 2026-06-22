@@ -641,6 +641,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // would round to 0 and silently disable throttling for rates >= ~1 GB/s.
     conn.throttle_down_bps = route ? route->throttle_down_bps : 0;
     conn.throttle_tat_ns = 0;
+#if RUT_ENABLE_WEBSOCKET
+    // Per-request terminate config from the matched route, set for EVERY request (not just
+    // the Proxy branch) so stale state from a prior keep-alive request — e.g. a terminate
+    // route that returned a normal response, followed by a JIT websocket()/forward() — can
+    // never mis-arm a later 101 as terminate.
+    const bool ws_term = route && route->action == RouteAction::Proxy && route->ws_terminate;
+    conn.is_ws_terminate_route = ws_term;
+    conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
+    conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
+#endif
 
     if (route && route->action == RouteAction::Proxy) {
         conn.state = ConnState::Proxying;
@@ -682,12 +692,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.upstream_fd = kUpstreamFd;
         conn.upstream_idx = route->upstream_id;
-#if RUT_ENABLE_WEBSOCKET
-        // Carry terminate-mode config onto the connection; armed at the 101 transition.
-        conn.is_ws_terminate_route = route->ws_terminate;
-        conn.ws_handler = route->ws_frame_handler;
-        conn.ws_max_message_size = route->ws_max_message_size;
-#endif
+        // (terminate-mode config is set unconditionally above, for every request)
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
@@ -1467,13 +1472,16 @@ inline void rewrite_request_line_path(Connection& conn) {
 // buffered request, so trailing bytes shift up and the forward length / header_end shrink.
 inline void strip_ws_extensions(Connection& conn) {
     u8* buf = conn.recv_slice;
-    const u32 total = conn.recv_buf.len();
-    if (buf == nullptr || total == 0) return;
+    if (buf == nullptr) return;
     static constexpr char kHdr[] = "sec-websocket-extensions:";
     static constexpr u32 kHdrLen = sizeof(kHdr) - 1;
-    u32 i = 0, line_start = 0;
-    bool found = false;
-    while (i + kHdrLen <= total) {  // i is always at a line start
+    // Scan ONLY the parsed header block — never the coalesced post-upgrade frame bytes a
+    // client may have packed after the request, and remove EVERY matching field (repeated
+    // HTTP header fields are legal), so the backend can't still negotiate an extension.
+    u32 limit = conn.req_header_end > 0 ? conn.req_header_end : conn.recv_buf.len();
+    if (limit > conn.recv_buf.len()) limit = conn.recv_buf.len();
+    u32 i = 0;
+    while (i + kHdrLen <= limit) {  // i is always at a line start
         bool match = true;
         for (u32 j = 0; j < kHdrLen; j++) {
             u8 c = buf[i + j];
@@ -1484,26 +1492,26 @@ inline void strip_ws_extensions(Connection& conn) {
             }
         }
         if (match) {
-            line_start = i;
-            found = true;
-            break;
+            const u32 total = conn.recv_buf.len();
+            u32 line_end = i;
+            while (line_end < total && buf[line_end] != '\n') line_end++;
+            if (line_end < total) line_end++;  // include the LF
+            const u32 removed = line_end - i;
+            __builtin_memmove(buf + i, buf + line_end, static_cast<size_t>(total - line_end));
+            conn.recv_buf.set_len(total - removed);
+            limit -= removed;  // the header block shrank; the next line is now at i
+            if (conn.req_initial_send_len > i) {
+                conn.req_initial_send_len =
+                    conn.req_initial_send_len > removed ? conn.req_initial_send_len - removed : 0;
+            }
+            if (conn.req_header_end > i) {
+                conn.req_header_end =
+                    conn.req_header_end > removed ? conn.req_header_end - removed : 0;
+            }
+            continue;  // re-check at i (the next field) for duplicates
         }
-        while (i < total && buf[i] != '\n') i++;  // skip to next line
+        while (i < limit && buf[i] != '\n') i++;  // skip to next line
         i++;
-    }
-    if (!found) return;
-    u32 line_end = line_start;
-    while (line_end < total && buf[line_end] != '\n') line_end++;
-    if (line_end < total) line_end++;  // include the LF
-    const u32 removed = line_end - line_start;
-    __builtin_memmove(buf + line_start, buf + line_end, static_cast<size_t>(total - line_end));
-    conn.recv_buf.set_len(total - removed);
-    if (conn.req_initial_send_len > line_start) {
-        conn.req_initial_send_len =
-            conn.req_initial_send_len > removed ? conn.req_initial_send_len - removed : 0;
-    }
-    if (conn.req_header_end > line_start) {
-        conn.req_header_end = conn.req_header_end > removed ? conn.req_header_end - removed : 0;
     }
 }
 #endif
@@ -2222,7 +2230,8 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_u2c.max_message_size = cap;
         conn.ws_u2c.reject_fragmented = true;
         u64 seed = 0;
-        RAND_bytes(reinterpret_cast<u8*>(&seed), sizeof(seed));
+        // Fail closed on an RNG failure rather than emit predictable mask keys (§5.3).
+        if (RAND_bytes(reinterpret_cast<u8*>(&seed), sizeof(seed)) != 1) return false;
         conn.ws_c2u.mask_rng = seed;  // only the masked direction emits fresh mask keys
         conn.is_ws_terminate = true;
         return true;
@@ -2342,7 +2351,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
         if (st == WsInspectStatus::Error) return false;  // caller closes
         if (produced > 0) {
             conn.ws_c2u_consumed = consumed;
-            if (st == WsInspectStatus::Close) conn.ws_terminate_close = true;
+            if (st == WsInspectStatus::Close) conn.ws_c2u_closing = true;
             if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), produced)) return false;
             conn.ws_client_send_pending = true;
             conn.ws_client_send_len = produced;
@@ -2350,11 +2359,15 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
         }
         // Nothing to forward yet (partial frame) or every message was dropped: discard the
         // consumed bytes and keep receiving the rest of the next frame. We didn't pause, so
-        // an async multishot recv stays armed; a sync (epoll) recv is one-shot and must be
-        // re-armed explicitly (the passthrough path never relies on auto-rearm).
+        // a sync (epoll, one-shot) recv must be re-armed; an async multishot recv stays
+        // armed UNLESS this was its terminal completion (recv_armed cleared) — re-arm then.
         if (consumed > 0) conn.recv_buf.consume(consumed);
         if (st == WsInspectStatus::Close) return false;  // caller closes
-        if constexpr (!ws_loop_async<Loop>()) return ws_resume_client_recv(loop, conn);
+        if constexpr (ws_loop_async<Loop>()) {
+            if (!conn.recv_armed) return ws_resume_client_recv(loop, conn);
+        } else {
+            return ws_resume_client_recv(loop, conn);
+        }
         return true;
     }
 #endif
@@ -2393,7 +2406,7 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         if (st == WsInspectStatus::Error) return false;
         if (produced > 0) {
             conn.ws_u2c_consumed = consumed;
-            if (st == WsInspectStatus::Close) conn.ws_terminate_close = true;
+            if (st == WsInspectStatus::Close) conn.ws_u2c_closing = true;
             if (!client_send(loop, conn, conn.upstream_recv_buf.data(), produced)) return false;
             conn.ws_upstream_send_pending = true;
             conn.ws_upstream_send_len = produced;
@@ -2401,7 +2414,14 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         }
         if (consumed > 0) conn.upstream_recv_buf.consume(consumed);
         if (st == WsInspectStatus::Close) return false;
-        if constexpr (!ws_loop_async<Loop>()) {  // epoll: re-arm the one-shot upstream recv
+        // Sync (epoll): re-arm the one-shot upstream recv. Async: re-arm only if the
+        // terminal multishot completion cleared upstream_recv_armed.
+        if constexpr (ws_loop_async<Loop>()) {
+            if (!conn.upstream_recv_armed) {
+                conn.upstream_recv_paused_for_send = false;
+                return loop->submit_recv_upstream(conn);
+            }
+        } else {
             conn.upstream_recv_paused_for_send = false;
             return loop->submit_recv_upstream(conn);
         }
@@ -2501,7 +2521,7 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.recv_buf.consume(conn.ws_c2u_consumed);
         conn.ws_c2u_consumed = 0;
         conn.ws_client_send_len = 0;
-        if (conn.ws_terminate_close) {
+        if (conn.ws_c2u_closing) {  // the Close we just sent on THIS direction has drained
             loop->close_conn(conn);
             return;
         }
@@ -2513,8 +2533,14 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
             ws_close_if_drained(loop, conn);
             return;
         }
-        // Resume client recv (paused for this send) so the partial frame can complete, and
-        // pump the opposite direction for anything that arrived meanwhile.
+        // Bytes can race into recv_buf while the send was in flight (the recv pause is
+        // best-effort): re-inspect them now so an already-complete frame isn't stranded
+        // until the client sends more. ws_try_send re-arms recv itself on a partial frame.
+        if (conn.recv_buf.len() > 0) {
+            if (!ws_try_send_client_to_upstream(loop, conn)) loop->close_conn(conn);
+            return;
+        }
+        // Resume client recv (paused for this send), and pump the opposite direction.
         if (!ws_resume_client_recv(loop, conn) || !ws_try_send_upstream_to_client(loop, conn)) {
             loop->close_conn(conn);
         }
@@ -2586,7 +2612,7 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_recv_buf.consume(conn.ws_u2c_consumed);
         conn.ws_u2c_consumed = 0;
         conn.ws_upstream_send_len = 0;
-        if (conn.ws_terminate_close) {
+        if (conn.ws_u2c_closing) {  // the Close we just sent on THIS direction has drained
             loop->close_conn(conn);
             return;
         }
@@ -2597,6 +2623,12 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             ws_close_if_drained(loop, conn);
+            return;
+        }
+        // Re-inspect bytes that raced into upstream_recv_buf during the send before
+        // re-arming (a complete frame mustn't wait for the next backend read).
+        if (conn.upstream_recv_buf.len() > 0) {
+            if (!ws_try_send_upstream_to_client(loop, conn)) loop->close_conn(conn);
             return;
         }
         conn.upstream_recv_paused_for_send = false;

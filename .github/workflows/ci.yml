@@ -534,6 +534,8 @@ jobs:
             build/tests/test_hpack \
             build/tests/test_hpack_diff \
             build/tests/test_http2_conn \
+            build/tests/test_ws_frame \
+            build/tests/test_ws_terminate \
             build/tests/test_expected \
             build/tests/test_drain \
             build/tests/test_access_log \
