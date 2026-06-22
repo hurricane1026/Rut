@@ -46,9 +46,14 @@ language choices — the design must stay inside them or call out the specific r
 - **Text / Binary only.** The engine passes Ping/Pong/Close **through** before the handler
   path, so a frame handler is *never* invoked for control frames — `frame.opcode` is only
   `.text` or `.binary`.
-- **`close` carries no status code today.** `WsMessageHandlerFn` returns only `WsFrameAction`
-  and `ws_emit_close_frame` always emits **1000**; `close(code)` needs the handler to *carry*
-  the code (a runtime ABI item — see §8), otherwise every handler close is 1000.
+- **`close` carries no status code today, and the two legs differ.** `WsMessageHandlerFn`
+  returns only `WsFrameAction`, so the handler has no channel for a code. On a `Close` verdict,
+  `ws_inspect` emits an **empty (no-status) Close** to the *forward* peer
+  (`emit_frame(..., WsOpcode::Close, msg_buf, 0, ...)` — that peer sees **1005 No Status**),
+  while the queued **echo** to the other peer uses `ws_emit_close_frame` (**1000**). So even
+  bare `close` is not uniformly 1000. `close(code)` needs the code threaded through the handler
+  return path **and** both emit sites (the `ws_inspect` forward Close *and* `ws_emit_close_frame`)
+  — see §8.
 
 ### 1.2 What Phase 4 actually is
 
@@ -98,15 +103,18 @@ handler. Per DESIGN.md §3.6, the block is a *compile-time construct*, not a clo
 current message is the implicit binding `frame`.
 
 ```swift
-route "/ws" {
-    websocket(chat, maxMessageSize: 8.KB) {   // ≤ ~16 KB in v1 (one slice; see §1.1)
+route GET "/ws" {
+    websocket(chat, maxMessageSize: 8kb) {   // ≤ ~16 KB in v1 (one slice; see §1.1)
         // runs once per (single-frame) Text/Binary message, both directions
         guard let text = frame.text else { return drop }   // .text is error-capable: not-Text → drop
-        guard frame.len <= 4.KB else { return close }      // v1: bare close = 1000 (see §5)
+        guard frame.len <= 4kb else { return close }       // v1: bare close (see §5)
         return forward
     }
 }
 ```
+(Route form: `route GET "/path" { … }` — a method is required. **Grammar note:** the Slice A
+parser requires `return websocket(x) { … }` as the route's last statement; the bare
+`websocket(x) { … }` shown here is the target spelling, pending the decision in §10.6.)
 
 Direction-aware (one handler, distinguished by `frame.fromClient` — needs the §8 ABI bump):
 
@@ -130,19 +138,23 @@ websocket(chat) {
 }
 ```
 
-Terse single-message form (sugar, optional — lowers to the same handler):
+Terse single-message form (sugar, optional — lowers to the same handler). Rut has no `? :`
+ternary (`?` is reserved for nil checks), so the one-liner uses a `match` expression:
 
 ```swift
-websocket(chat, frame: => frame.opcode == .text ? forward : drop)
+websocket(chat, frame: => match frame.opcode { .text => forward, .binary => drop })
 ```
 
 ### `maxMessageSize`
-Required-ish kwarg (defaults to a route/global cap). It bounds the reassembly buffer and is
-enforced by the engine **before** the handler runs (an over-cap message is failed closed
-without dispatch). `frame.len` inside the handler is the post-reassembly length, always
-`<= maxMessageSize`. **v1 hard cap: ~16 KB** — the runtime clamps to one slice
-(`SlicePool::kSliceSize - kWsMaxHeaderSize`), so a larger value is silently clamped and the
-examples stay under it. Lifting the cap is a runtime item (§8).
+**Required in v1.** `add_ws_terminate` rejects `max_message_size == 0` and there is no
+route/global WebSocket default for the compiler to fall back on, so omitting the kwarg would
+lower to an unusable route. Slice D must therefore either require `maxMessageSize:` on every
+terminate route or pass a fixed nonzero default (recommended: **the v1 cap, ~16 KB / one
+slice**). It bounds the reassembly buffer and is enforced by the engine **before** the handler
+runs (an over-cap message fails closed without dispatch). `frame.len` is the post-reassembly
+length, always `<= maxMessageSize`. **v1 hard cap: ~16 KB** — the runtime clamps to one slice
+(`SlicePool::kSliceSize - kWsMaxHeaderSize`); a larger value is silently clamped. Lifting the
+cap is a runtime item (§8).
 
 ---
 
@@ -180,14 +192,18 @@ A top-level implicit `forward` fallthrough is a possible ergonomic option (TBD �
 |---------|---------------|
 | `return forward` | re-serialize the message for the peer and send it on — **implemented** |
 | `return drop` | silently discard (the peer never sees it) — **implemented** |
-| `return close` | emit a Close frame to **both** peers, drain, tear down — the merged bidirectional Close handshake — **implemented (status 1000)** |
+| `return close` | emit a Close to **both** peers, drain, tear down — the merged bidirectional Close handshake — **implemented (see status note below)** |
 | `return close(code)` | the same, with a chosen RFC 6455 status — **needs a runtime change** |
 
-**v1: `close` only, status 1000.** `WsMessageHandlerFn` returns only a `WsFrameAction`, and
-`ws_emit_close_frame` always emits 1000, so the handler currently has no channel to carry a
-status code. `close(code)` — with `.normal` (1000), `.tooBig` (1009), `.invalidData` (1007),
-`.policyViolation` (1008), … — requires extending the handler's return path to carry the code
-(a small runtime/ABI item, §8). Until then, `close` is unparameterized and resolves to 1000.
+**v1: bare `close` only — and the two legs carry different status.** `WsMessageHandlerFn`
+returns only a `WsFrameAction`, so the handler has no channel for a code. On `Close`,
+`ws_inspect` emits an **empty (no-status) Close** to the *forward* peer (that peer reads
+**1005 No Status**) while the queued **echo** to the other peer is **1000** via
+`ws_emit_close_frame`. So even bare `close` is not uniformly 1000 today. `close(code)` — with
+`.normal` (1000), `.tooBig` (1009), `.invalidData` (1007), `.policyViolation` (1008), … —
+requires threading the code through the handler return path **and** both emit sites (the
+`ws_inspect` forward Close AND `ws_emit_close_frame`), per §8. Until then, only the
+unparameterized `close` is accepted (§9 Slice B type-checks bare `close` only).
 
 ---
 
@@ -199,17 +215,21 @@ surface:
 
 ```swift
 websocket(chat) {
-    guard var s = frame.text else { return forward }
-    frame.text = s.redact(re"\\b\\d{16}\\b")   // rewrite payload before forwarding
+    guard let s = frame.text else { return forward }
+    var redacted = s.redact(re"\b\d{16}\b")    // mutable local for the rewrite
+    frame.text = redacted                       // rewrite payload before forwarding
     return forward
 }
 ```
 
-Runtime requirement: today `ws_inspect` re-frames the **same** reassembled bytes. Modify means
-the handler writes a (possibly shorter/longer) payload that the engine re-frames instead. The
-engine already owns an output buffer per direction; modify routes the handler's output buffer
-into the re-frame step. **Recommend landing inspect-only (verdicts) first, then modify as 4b**
-— modify changes the engine's data path; verdicts do not.
+Runtime requirement (larger than "wire an existing buffer"): today `ws_inspect` re-frames the
+message **in place over the recv buffer** — there is **no separate per-direction output slice**
+(see `connection_base.h` / `callbacks_impl.h`: the in-place single-slice constraint). A
+modified payload can be **longer** than the consumed input, so in-place output is unsound.
+Modify therefore needs the runtime to **own bounded output storage per direction** (an output
+slice, sized within the message cap) plus the **send-drain state** to flush it — not just
+routing into a buffer that already exists. **Recommend landing inspect-only (verdicts) first,
+then modify as 4b** — modify adds real buffer + data-path machinery; verdicts do not.
 
 Injection (emitting frames the peer never sent — heartbeats, fan-out) is explicitly **later**;
 it needs the engine to interleave gateway-originated frames with the tunnel stream.
@@ -256,11 +276,11 @@ The inspect-only v1 (single-frame Text/Binary ≤ ~16 KB; `forward`/`drop`/bare-
 | Capability | Runtime work | Without it |
 |------------|--------------|------------|
 | `frame.fromClient` | `WsMessageHandlerFn` gains a `bool from_client` (or richer `ctx`); engine passes the leg | ship v1 with **no direction**; one handler, both legs identical |
-| `close(code)` | extend the handler's return path to carry an RFC 6455 code (e.g. `WsFrameAction` → a `{action, code}` pair, or a thread-local on the ctx) so `ws_inspect`/`ws_emit_close_frame` use it | `close` is unparameterized → **always 1000** |
+| `close(code)` | extend the handler return path to carry an RFC 6455 code (`WsFrameAction` → `{action, code}`, or a ctx field) **and** apply it at *both* emit sites — the `ws_inspect` forward Close and `ws_emit_close_frame` | bare `close` only: forward peer gets **1005 No Status**, echo gets **1000** |
 | Messages > ~16 KB | a **multi-slice reassembly buffer** (today `ws_arm_terminate` clamps to one slice) | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
 | Fragmented messages | the **same** multi-slice / separate-output buffer (lifts `reject_fragmented`) | fragmented messages fail closed before the handler |
 | `frame.json` / `validate(_, Schema)` | a JSON value type + parser builtin (regex `re"…"`/Vectorscan already exists) | ship `frame.text` + regex-based validation first |
-| `frame.text =` / modify (§6) | route the handler's output buffer into the re-frame step | verdict-only; no payload rewrite |
+| `frame.text =` / modify (§6) | **add** a bounded per-direction output slice + send-drain state (none exists — re-frame is in-place; modified output can exceed the input) | verdict-only; no payload rewrite |
 
 These are all *small and independent*; the recommended path lands the no-runtime-change v1
 first, then adds direction + `close(code)` (both tiny), then the multi-slice buffer (lifts the
@@ -273,13 +293,19 @@ size cap **and** fragmentation together), then JSON, then modify (4b).
 | Slice | Layer | Deliverable | Size | Risk |
 |-------|-------|-------------|------|------|
 | **A** | parser | `websocket(){…}` block + kwargs → `WsTerminate` AST; bare form unchanged | S | low |
-| **B** | type checker | `Frame` type + `frame.*` accessors + `forward`/`drop`/`close(code)` verdicts + exhaustiveness | M | med (new typed object + terminator rules) |
-| **C** | RIR + JIT | frame-handler ABI emission (verdict function); map `frame.*`→args | M | **highest** (new handler kind through codegen) |
-| **D** | compiler→runtime | emit `add_ws_terminate` with the JIT pointer; passthrough unchanged | S | low |
-| **E** | tests | `.rut` fixtures compiled+JIT'd+run e2e over a socket (forward/drop/close, direction) | M | low |
-| **4b** | runtime+lang | `frame.text =`/`frame.payload =` modify → engine re-frames handler output | M | med (touches engine data path) |
+| **B** | type checker | `Frame` type + `frame.*` accessors + `forward`/`drop`/**bare `close`** verdicts + exhaustiveness. NO `close(code)` (needs the §8 runtime change) and NO `frame.fromClient` (needs the §8 ABI bump) in v1 | M | med (new typed object + terminator rules) |
+| **C** | RIR + JIT | frame-handler ABI emission (verdict function); map `frame.opcode/payload/len`→args | M | **highest** (new handler kind through codegen) |
+| **D** | compiler→runtime | emit `add_ws_terminate` with the JIT pointer (+ required `maxMessageSize`); passthrough unchanged | S | low |
+| **E** | tests | `.rut` fixtures compiled+JIT'd+run e2e over a socket: forward / drop / bare close. **No direction** (it needs the ABI bump, which lands after E) | M | low |
+| **dir** | runtime+lang | `WsMessageHandlerFn` direction-ABI bump + `frame.fromClient` + its e2e coverage | S | low |
+| **code** | runtime+lang | `close(code)` — thread the code through the return path + both emit sites | S | low |
+| **4b** | runtime+lang | `frame.text =`/`frame.payload =` modify → new output slice + send-drain + re-frame from handler output | M | med (touches engine data path) |
 
-Recommended order: A → B → C → D → E (inspect-only v1), then direction ABI, then 4b modify.
+Recommended order: **A → B → C → D → E** is the inspect-only v1 (single-frame, no direction,
+bare `close`, no modify — *zero runtime change*). Then **dir** (direction ABI + `fromClient`),
+**code** (`close(code)`), the multi-slice buffer (size cap + fragmentation), JSON, and **4b**
+(modify) — each its own slice. Direction and `close(code)` are intentionally **out of A–E**
+because they need the runtime changes A–E deliberately avoid.
 
 ---
 
@@ -303,6 +329,12 @@ Recommended order: A → B → C → D → E (inspect-only v1), then direction A
    require `frame.text?` / `match frame.opcode` at every site. *Leaning: error-capable — it
    keeps the guard idiom consistent with `req.body(User)`; confirm against the final optional
    semantics in DESIGN.md §3.3.7.*
+6. **`return websocket(x) { … }` vs bare `websocket(x) { … }`?** The current parser requires
+   `return` for terminators and they must be the route body's last statement, so Slice A landed
+   the `return` form. The examples here use the bare form (matching DESIGN.md's `websocket { }`
+   sketch), which reads cleaner — only the frame verdicts are `return`s, not the route
+   terminator. *Leaning: decide before Slice B — either accept the nested-`return` form, or add
+   a bare-`websocket`-statement terminator. Examples should track whichever wins.*
 
 ---
 
@@ -313,20 +345,20 @@ are tagged with the §8 runtime item they need.
 
 ```swift
 // Chat moderation: drop profanity client→upstream, pass everything else.
-// (needs §8: direction ABI for fromClient)
-route "/chat" {
-    websocket(chatBackend, maxMessageSize: 8.KB) {
+// (needs the direction slice for fromClient)
+route GET "/chat" {
+    websocket(chatBackend, maxMessageSize: 8kb) {
         guard frame.fromClient else { return forward }
         guard let text = frame.text else { return drop }   // .text errors for Binary → drop
-        guard not text.matches(re"(?i)\\b(badword|slur)\\b") else { return drop }
+        guard not text.matches(re"(?i)\b(badword|slur)\b") else { return drop }
         return forward
     }
 }
 
 // API protection: every client message must be valid Order JSON, else close.
-// (needs §8: direction ABI, JSON builtin, and close(code) for the 1007 status)
-route "/orders/stream" {
-    websocket(orderService, maxMessageSize: 8.KB) {
+// (needs the direction slice, JSON builtin, and the close(code) slice for the 1007 status)
+route GET "/orders/stream" {
+    websocket(orderService, maxMessageSize: 8kb) {
         if frame.fromClient {
             guard let order = frame.json else { return close(.invalidData) }  // 1007
             guard validate(order, OrderSchema) else { return close(.invalidData) }
@@ -336,9 +368,9 @@ route "/orders/stream" {
 }
 
 // Pure v1 (no runtime changes): text-only, size-bounded, bare close.
-route "/echo" {
-    websocket(echoBackend, maxMessageSize: 4.KB) {
-        guard let _ = frame.text else { return close }   // bare close = 1000
+route GET "/echo" {
+    websocket(echoBackend, maxMessageSize: 4kb) {
+        guard let _ = frame.text else { return close }   // bare close (forward leg: 1005; echo: 1000)
         return forward
     }
 }
