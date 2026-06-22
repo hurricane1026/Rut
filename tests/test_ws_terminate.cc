@@ -276,6 +276,28 @@ TEST(ws_terminate, fragmented_header_rejected_before_payload) {
         WsInspectStatus::Error);
 }
 
+// ws_emit_close_frame builds a valid Close frame (status 1000) for the close handshake,
+// in both the unmasked (server->client) and masked (client->upstream) forms.
+TEST(ws_terminate, emit_close_frame_unmasked_and_masked) {
+    u8 out[16];
+    u64 rng = 0xC0FFEE;
+    u32 n = ws_emit_close_frame(out, sizeof(out), /*masked=*/false, rng);
+    WsFrameHeader h;
+    CHECK(ws_parse_header(out, n, /*require_mask=*/false, &h) == ParseStatus::Complete);
+    CHECK(h.opcode == WsOpcode::Close);
+    CHECK_EQ(h.payload_len, 2u);
+    CHECK(out[h.header_len] == 0x03 && out[h.header_len + 1] == 0xE8);  // 1000 Normal Closure
+
+    u8 mout[16];
+    u32 mn = ws_emit_close_frame(mout, sizeof(mout), /*masked=*/true, rng);
+    WsFrameHeader mh;
+    u8 pl[8];
+    CHECK(parse_one(mout, mn, /*masked=*/true, &mh, pl) == mn);
+    CHECK(mh.opcode == WsOpcode::Close);
+    CHECK(mh.masked);
+    CHECK(pl[0] == 0x03 && pl[1] == 0xE8);  // unmasks back to 1000
+}
+
 // === Drop ===
 
 TEST(ws_terminate, drop_emits_nothing) {

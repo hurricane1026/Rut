@@ -96,4 +96,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
                            u32* consumed,
                            u32* produced);
 
+// Serialize a Close frame (status 1000 Normal Closure) into out for the terminate close
+// handshake. `masked` true for the gateway→backend (client-role) leg, false for
+// gateway→client. Advances mask_rng when masked. Returns bytes written, 0 on overflow.
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng);
+
 }  // namespace rut

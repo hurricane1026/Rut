@@ -8066,9 +8066,21 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     CHECK(recv_text(pl, &pn));
     CHECK(pn == 4 && memcmp(pl, "PONG", 4) == 0);
 
-    // Close: the handler returns Close on "BYE" — the gateway tears the tunnel down. The
-    // client may first see a Close frame, then EOF; read until the connection closes.
+    // Close handshake: the handler returns Close on "BYE". Terminate must send a Close frame
+    // BACK to the client (RFC 6455 §5.5.1) before tearing the TCP down — a graceful close,
+    // not an abnormal EOF/1006. Expect a Close frame (opcode 0x8) first, then EOF.
     send_text("BYE", 3);
+    u8 cf[256];
+    i32 m = recv_timeout(c, reinterpret_cast<char*>(cf), sizeof(cf), 2000);
+    bool got_close = false;
+    if (m >= 2) {
+        WsFrameHeader ch;
+        if (ws_parse_header(cf, static_cast<u32>(m), false, &ch) == ParseStatus::Complete &&
+            ch.opcode == WsOpcode::Close) {
+            got_close = true;
+        }
+    }
+    CHECK(got_close);  // the client received the Close echo, not a bare TCP FIN
     char tail[256];
     bool closed = false;
     for (int i = 0; i < 5; i++) {

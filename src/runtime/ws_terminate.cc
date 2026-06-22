@@ -219,4 +219,11 @@ WsInspectStatus ws_inspect(WsInspector& st,
     return WsInspectStatus::Ok;
 }
 
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng) {
+    const u8 code[2] = {0x03, 0xE8};  // 1000 Normal Closure
+    u32 produced = 0;
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, code, 2, masked, mask_rng)) return 0;
+    return produced;
+}
+
 }  // namespace rut

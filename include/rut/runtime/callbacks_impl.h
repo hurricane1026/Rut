@@ -2326,8 +2326,51 @@ constexpr bool ws_loop_async() {
     }
 }
 
+// Drive the bidirectional Close handshake: submit a Close frame on each peer's send slot
+// when it's idle (deferring on a busy slot), skip a peer that already half-closed, and
+// close once both slots' Close frames have drained. Idempotent — safe to call from the
+// trigger and from both sent callbacks. Returns false on a submit failure (caller closes).
+template <typename Loop>
+bool ws_drive_close(Loop* loop, Connection& conn) {
+    // A peer that already FIN'd can't receive a Close — treat its slot as satisfied.
+    if (conn.ws_client_eof) conn.ws_close_client_need = false;
+    if (conn.ws_upstream_eof) conn.ws_close_upstream_need = false;
+    // Client slot (upstream->client, unmasked): send the echo Close if idle.
+    if (conn.ws_close_client_need && !conn.ws_upstream_send_pending) {
+        const u32 n = ws_emit_close_frame(conn.ws_close_frame_client,
+                                          sizeof(conn.ws_close_frame_client),
+                                          /*masked=*/false,
+                                          conn.ws_u2c.mask_rng);
+        if (n == 0 || !client_send(loop, conn, conn.ws_close_frame_client, n)) return false;
+        conn.ws_upstream_send_pending = true;
+        conn.ws_close_client_need = false;
+        conn.ws_close_client_inflight = true;
+    }
+    // Upstream slot (client->upstream, masked): send the echo Close if idle.
+    if (conn.ws_close_upstream_need && !conn.ws_client_send_pending) {
+        const u32 n = ws_emit_close_frame(conn.ws_close_frame_upstream,
+                                          sizeof(conn.ws_close_frame_upstream),
+                                          /*masked=*/true,
+                                          conn.ws_c2u.mask_rng);
+        if (n == 0 || !loop->submit_send_upstream(conn, conn.ws_close_frame_upstream, n))
+            return false;
+        conn.ws_client_send_pending = true;
+        conn.ws_close_upstream_need = false;
+        conn.ws_close_upstream_inflight = true;
+    }
+    // Both slots have finished their Close (none pending, none draining) → tear down.
+    if (!conn.ws_close_client_need && !conn.ws_close_client_inflight &&
+        !conn.ws_close_upstream_need && !conn.ws_close_upstream_inflight) {
+        loop->close_conn(conn);
+    }
+    return true;
+}
+
 template <typename Loop>
 bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
+    // Once a Close handshake is under way, no more data is forwarded — ignore further bytes
+    // (the handshake drives teardown). Prevents relaying frames after the Close.
+    if (conn.ws_closing) return true;
     if (conn.recv_buf.len() == 0) return true;
     if (conn.ws_client_send_pending) return ws_pause_client_recv(loop, conn);
 #if RUT_ENABLE_WEBSOCKET
@@ -2351,10 +2394,19 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
         if (st == WsInspectStatus::Error) return false;  // caller closes
         if (produced > 0) {
             conn.ws_c2u_consumed = consumed;
-            if (st == WsInspectStatus::Close) conn.ws_c2u_closing = true;
+            if (st == WsInspectStatus::Close) {
+                // The produced send carries the Close to the upstream; the client must get a
+                // Close back too (handshake). Start the upstream slot in-flight + queue the
+                // client echo, then close once both drain.
+                conn.ws_closing = true;
+                conn.ws_close_upstream_inflight = true;
+                conn.ws_close_client_need = true;
+            }
             if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), produced)) return false;
             conn.ws_client_send_pending = true;
             conn.ws_client_send_len = produced;
+            if (conn.ws_closing)
+                return ws_drive_close(loop, conn);  // send the client echo now if idle
             return ws_pause_client_recv(loop, conn);
         }
         // Nothing to forward yet (partial frame) or every message was dropped: discard the
@@ -2391,6 +2443,7 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
+    if (conn.ws_closing) return true;  // close handshake under way — stop forwarding data
     if (conn.upstream_recv_buf.len() == 0) return true;
     if (conn.ws_upstream_send_pending) {
         return ws_pause_upstream_recv(loop, conn);
@@ -2417,10 +2470,18 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         if (st == WsInspectStatus::Error) return false;
         if (produced > 0) {
             conn.ws_u2c_consumed = consumed;
-            if (st == WsInspectStatus::Close) conn.ws_u2c_closing = true;
+            if (st == WsInspectStatus::Close) {
+                // The produced send carries the Close to the client; the upstream must get a
+                // Close back too. Start the client slot in-flight + queue the upstream echo.
+                conn.ws_closing = true;
+                conn.ws_close_client_inflight = true;
+                conn.ws_close_upstream_need = true;
+            }
             if (!client_send(loop, conn, conn.upstream_recv_buf.data(), produced)) return false;
             conn.ws_upstream_send_pending = true;
             conn.ws_upstream_send_len = produced;
+            if (conn.ws_closing)
+                return ws_drive_close(loop, conn);  // send the upstream echo now if idle
             return ws_pause_upstream_recv(loop, conn);
         }
         if (consumed > 0) conn.upstream_recv_buf.consume(consumed);
@@ -2542,8 +2603,9 @@ void on_ws_client_to_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.recv_buf.consume(conn.ws_c2u_consumed);
         conn.ws_c2u_consumed = 0;
         conn.ws_client_send_len = 0;
-        if (conn.ws_c2u_closing) {  // the Close we just sent on THIS direction has drained
-            loop->close_conn(conn);
+        if (conn.ws_closing) {  // a Close drained on the upstream slot — advance the handshake
+            conn.ws_close_upstream_inflight = false;
+            if (!ws_drive_close(loop, conn)) loop->close_conn(conn);
             return;
         }
         if (ws_draining(conn)) {
@@ -2637,8 +2699,9 @@ void on_ws_upstream_to_client_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_recv_buf.consume(conn.ws_u2c_consumed);
         conn.ws_u2c_consumed = 0;
         conn.ws_upstream_send_len = 0;
-        if (conn.ws_u2c_closing) {  // the Close we just sent on THIS direction has drained
-            loop->close_conn(conn);
+        if (conn.ws_closing) {  // a Close drained on the client slot — advance the handshake
+            conn.ws_close_client_inflight = false;
+            if (!ws_drive_close(loop, conn)) loop->close_conn(conn);
             return;
         }
         if (conn.ws_pre_tunnel_upstream_closed) conn.ws_upstream_eof = true;
