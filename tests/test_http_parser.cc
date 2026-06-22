@@ -787,6 +787,16 @@ TEST(Corpus, ConnectionUpgradeSetsFlag) {
     CHECK(req.has_upgrade_header);
     CHECK(!req.upgrade_is_websocket);
 
+    // "websocket" later in a comma-separated Upgrade list is still detected.
+    parser.reset();
+    req.reset();
+    const u8 list[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: h2c, websocket\r\n\r\n";
+    REQUIRE_EQ(static_cast<u8>(parse_raw(list, sizeof(list) - 1, &req, &parser)),
+               static_cast<u8>(ParseStatus::Complete));
+    CHECK(req.has_upgrade_header);
+    CHECK(req.upgrade_is_websocket);
+
     // Connection: upgrade with NO Upgrade header → not a valid upgrade.
     parser.reset();
     req.reset();

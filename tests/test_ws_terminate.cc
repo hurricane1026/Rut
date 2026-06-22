@@ -249,6 +249,33 @@ TEST(ws_terminate, output_capacity_control_and_close) {
     r.close_now = false;
 }
 
+// A fragmented frame's header alone (FIN=0) must be rejected immediately in terminate mode
+// — before the payload arrives — so a peer can't wedge the tunnel by sending a fragment
+// header and then stalling (the whole-frame wait would otherwise leave it "incomplete").
+TEST(ws_terminate, fragmented_header_rejected_before_payload) {
+    WsInspector st = make_state(/*masked=*/false);
+    st.reject_fragmented = true;
+    Recorder r;
+    u8 in[16];
+    // FIN=0, Text, declares a 100-byte payload — but supply only the 2-byte header.
+    u32 hl = ws_write_header(in, WsOpcode::Text, /*fin=*/false, /*masked=*/false, kKeyIn, 100);
+    u8 out[64], mbuf[256];
+    u32 consumed = 0, produced = 0;
+    CHECK(ws_inspect(
+              st, in, hl, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);  // rejected at the header, handler never reached
+    // A Continuation opcode is likewise rejected up front.
+    WsInspector st2 = make_state(/*masked=*/false);
+    st2.reject_fragmented = true;
+    u32 hl2 =
+        ws_write_header(in, WsOpcode::Continuation, /*fin=*/true, /*masked=*/false, kKeyIn, 50);
+    CHECK(
+        ws_inspect(
+            st2, in, hl2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+}
+
 // === Drop ===
 
 TEST(ws_terminate, drop_emits_nothing) {

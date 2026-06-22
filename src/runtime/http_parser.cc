@@ -256,20 +256,22 @@ static inline ParseStatus apply_semantic_header(
         }
     } else if (first == 'u') {
         if (name_len == 7 && str_ci_eq(name + 1, "pgrade", 6)) {
-            // Require at least one non-OWS token — an empty or whitespace-only
-            // Upgrade header requests no protocol and must not gate a tunnel. A
-            // valid upgrade also needs the Connection: upgrade token.
-            for (u32 i = 0; i < vlen; i++) {
-                if (val[i] != ' ' && val[i] != '\t') {
-                    req->has_upgrade_header = true;
-                    // Record whether the first token is specifically "websocket" so
-                    // terminate mode only arms on a real WS handshake (not e.g. h2c).
-                    if (vlen - i >= 9 && str_ci_eq(val + i, "websocket", 9) &&
-                        (vlen - i == 9 || val[i + 9] == ' ' || val[i + 9] == '\t' ||
-                         val[i + 9] == ',')) {
-                        req->upgrade_is_websocket = true;
-                    }
-                    break;
+            // Walk the comma-separated token list. has_upgrade_header = any non-OWS token
+            // (an empty/whitespace-only Upgrade requests no protocol and must not gate a
+            // tunnel). upgrade_is_websocket = a "websocket" token ANYWHERE in the list — a
+            // client may offer e.g. "Upgrade: h2c, websocket", and terminate must still see
+            // the WebSocket offer. A token may carry a "/version" suffix.
+            u32 i = 0;
+            while (i < vlen) {
+                while (i < vlen && (val[i] == ' ' || val[i] == '\t' || val[i] == ',')) i++;
+                if (i >= vlen) break;
+                u32 ts = i;
+                while (i < vlen && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
+                const u32 tlen = i - ts;
+                req->has_upgrade_header = true;
+                if (tlen >= 9 && str_ci_eq(val + ts, "websocket", 9) &&
+                    (tlen == 9 || val[ts + 9] == '/')) {
+                    req->upgrade_is_websocket = true;
                 }
             }
             return ParseStatus::Complete;

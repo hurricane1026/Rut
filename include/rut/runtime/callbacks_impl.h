@@ -2371,6 +2371,10 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
             return true;
         }
         if constexpr (ws_loop_async<Loop>()) {
+            // If a pre-tunnel recv cancel is still in flight, recv_armed is still true but
+            // the cancel will clear it — mark a deferred re-arm so its completion re-arms,
+            // otherwise a zero-output (dropped/partial) first frame strands the client recv.
+            if (conn.recv_pause_cancel_pending) conn.recv_pause_rearm_pending = true;
             if (!conn.recv_armed) return ws_resume_client_recv(loop, conn);
         } else {
             return ws_resume_client_recv(loop, conn);
@@ -2429,6 +2433,11 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         // Sync (epoll): re-arm the one-shot upstream recv. Async: re-arm only if the
         // terminal multishot completion cleared upstream_recv_armed.
         if constexpr (ws_loop_async<Loop>()) {
+            // A pre-tunnel upstream recv cancel in flight will clear upstream_recv_armed —
+            // mark a deferred re-arm so its completion re-arms (a zero-output early backend
+            // frame coalesced with the 101 would otherwise stop further backend reads).
+            if (conn.upstream_recv_pause_cancel_pending)
+                conn.upstream_recv_pause_rearm_pending = true;
             if (!conn.upstream_recv_armed) {
                 conn.upstream_recv_paused_for_send = false;
                 return loop->submit_recv_upstream(conn);
@@ -2732,11 +2741,12 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
 #if RUT_ENABLE_WEBSOCKET
     // Arm terminate-mode inspection before any early upstream frames are flushed, so they
     // flow through ws_inspect like the rest of the data phase. Only arm for a genuine
-    // WebSocket handshake (Upgrade: websocket) — a 101 for another upgrade protocol (e.g.
-    // h2c) on the same route falls through to the opaque passthrough tunnel, which relays
-    // bytes correctly, rather than mis-parsing them as WebSocket frames.
+    // WebSocket handshake: the client must have offered "websocket" AND the backend's 101
+    // must have SELECTED it (the response is authoritative). A 101 negotiating another
+    // offered protocol (e.g. h2c from "Upgrade: websocket, h2c") falls through to the opaque
+    // passthrough tunnel, which relays bytes correctly, rather than mis-parsing them.
     if (conn.is_ws_terminate_route && conn.req_upgrade_is_websocket &&
-        !ws_arm_terminate(loop, conn)) {
+        conn.resp_upgrade_is_websocket && !ws_arm_terminate(loop, conn)) {
         loop->close_conn(conn);
         return;
     }
@@ -2803,6 +2813,32 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     } else {
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
+}
+// Case-insensitive scan of a comma/whitespace-separated header value for an exact token
+// (optionally carrying a "/version" suffix), e.g. "websocket" in "h2c, websocket".
+inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tlen) {
+    auto lc = [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
+    };
+    u32 i = 0;
+    while (i < vlen) {
+        while (i < vlen && (v[i] == ' ' || v[i] == '\t' || v[i] == ',')) i++;
+        if (i >= vlen) break;
+        const u32 ts = i;
+        while (i < vlen && v[i] != ',' && v[i] != ' ' && v[i] != '\t') i++;
+        const u32 n = i - ts;
+        if (n >= tlen && (n == tlen || v[ts + tlen] == '/')) {
+            bool eq = true;
+            for (u32 k = 0; k < tlen; k++) {
+                if (lc(v[ts + k]) != lc(tok[k])) {
+                    eq = false;
+                    break;
+                }
+            }
+            if (eq) return true;
+        }
+    }
+    return false;
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
@@ -2873,6 +2909,27 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             // hijack the connection — installing a tunnel would forward pipelined
             // bytes raw upstream), or the request upload is not finished. Refuse.
             loop->close_conn(conn);
+            return;
+        }
+        // The 101 is authoritative for what was actually negotiated (the request's offer
+        // is only a proposal). Record whether the backend selected WebSocket — terminate
+        // arms on THIS, not the request — and refuse a response extension terminate can't
+        // honor (ws_inspect rejects RSV1 compressed frames), so we never send the client a
+        // 101 advertising an extension that would break the first compressed frame.
+        conn.resp_upgrade_is_websocket = false;
+        bool resp_has_ws_ext = false;
+        for (u32 i = 0; i < resp.header_count; i++) {
+            const Str nm = resp.headers[i].name;
+            const Str vl = resp.headers[i].value;
+            if (ws_value_has_token(nm.ptr, nm.len, "upgrade", 7)) {
+                if (ws_value_has_token(vl.ptr, vl.len, "websocket", 9))
+                    conn.resp_upgrade_is_websocket = true;
+            } else if (ws_value_has_token(nm.ptr, nm.len, "sec-websocket-extensions", 24)) {
+                if (vl.len > 0) resp_has_ws_ext = true;
+            }
+        }
+        if (conn.is_ws_terminate_route && resp_has_ws_ext) {
+            loop->close_conn(conn);  // backend negotiated an extension terminate can't process
             return;
         }
         conn.ws_upgrade_response_len = resp_parser.header_end;

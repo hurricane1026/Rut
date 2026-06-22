@@ -117,6 +117,15 @@ WsInspectStatus ws_inspect(WsInspector& st,
         if (ps == ParseStatus::Incomplete) break;  // partial header — wait for more bytes
         if (ps == ParseStatus::Error) return WsInspectStatus::Error;
 
+        // Reject fragmentation the instant the header proves it — before waiting for (or
+        // buffering) the payload. The in-place re-frame can't size a message spanning reads,
+        // and deferring the check past the whole-frame wait below lets a peer wedge the
+        // tunnel by sending only a fragmented frame's header (FIN=0) and then stalling.
+        if (st.reject_fragmented && !ws_opcode_is_control(h.opcode) &&
+            (h.opcode == WsOpcode::Continuation || !h.fin)) {
+            return WsInspectStatus::Error;
+        }
+
         // Fail closed on an oversized data frame as soon as its header is known — before
         // waiting for (and buffering) a payload we'd reject once complete. message_len is
         // the bytes already accumulated for an in-progress fragmented message (0 for a
@@ -164,14 +173,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
             continue;
         }
 
-        // Data frame (Text/Binary/Continuation). When fragmentation is disallowed (the
-        // in-place tunnel mode), a Continuation frame or a non-final data frame means a
-        // message would span reads — which the in-place re-frame can't size — so fail
-        // closed before touching the buffer.
-        if (st.reject_fragmented && (h.opcode == WsOpcode::Continuation || !h.fin)) {
-            return WsInspectStatus::Error;
-        }
-
+        // Data frame (Text/Binary). Fragmentation was already rejected at the header (above),
+        // so reaching here means a whole, final, single-frame message.
         // Accumulate the (unmasked) payload into the reassembly buffer (bound already
         // checked above), then ask the reassembler whether the message is complete.
         for (u64 i = 0; i < h.payload_len; i++) msg_buf[st.message_len + i] = payload[i];

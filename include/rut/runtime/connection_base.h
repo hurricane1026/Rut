@@ -305,12 +305,13 @@ struct ConnectionBase {
     u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
 
     // Body streaming state (proxy large body support)
-    u32 req_header_end;             // offset past request headers (\r\n\r\n)
-    u32 req_content_length;         // original Content-Length value (for send capping)
-    u32 req_initial_send_len;       // max bytes to send in initial upstream forward
-    bool req_malformed;             // true if request body is malformed (reject)
-    bool req_wants_upgrade;         // client sent Connection: upgrade (gates 101 tunnel)
-    bool req_upgrade_is_websocket;  // the Upgrade token was specifically "websocket"
+    u32 req_header_end;              // offset past request headers (\r\n\r\n)
+    u32 req_content_length;          // original Content-Length value (for send capping)
+    u32 req_initial_send_len;        // max bytes to send in initial upstream forward
+    bool req_malformed;              // true if request body is malformed (reject)
+    bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
+    bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
+    bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
     BodyMode req_body_mode;
     u32 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
@@ -514,6 +515,7 @@ struct ConnectionBase {
         req_malformed = false;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
+        resp_upgrade_is_websocket = false;
         req_body_mode = BodyMode::None;
         req_body_remaining = 0;
         req_chunk_parser.reset();
