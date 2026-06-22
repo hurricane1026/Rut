@@ -47,11 +47,18 @@ enum class WsInspectStatus : u8 {
 // (enforced at the handshake by the tunnel-wiring slice) so client and backend never
 // negotiate one — otherwise valid compressed frames carry RSV1 and are failed here.
 struct WsInspector {
-    bool masked = false;           // this direction's frames are masked (client->upstream)
-    u64 mask_rng = 0;              // PRNG state for fresh per-frame outbound mask keys when
-                                   // `masked`; the caller MUST seed it with real entropy
-                                   // (e.g. RAND_bytes) per RFC 6455 §5.3 unpredictability.
-    u64 max_message_size = 0;      // 0 = unbounded
+    bool masked = false;       // this direction's frames are masked (client->upstream)
+    u64 mask_rng = 0;          // PRNG state for fresh per-frame outbound mask keys when
+                               // `masked`; the caller MUST seed it with real entropy
+                               // (e.g. RAND_bytes) per RFC 6455 §5.3 unpredictability.
+    u64 max_message_size = 0;  // 0 = unbounded
+    // Reject fragmented messages (a Continuation frame, or a data frame with FIN=0) with
+    // Error. The in-place tunnel integration uses this: it re-frames over the recv buffer,
+    // which is only sound when a message's output fits its single frame's consumed input —
+    // a fragmented message completing in a later (smaller) read would overflow. Single-
+    // frame terminate is the v1; spanning-read fragmentation support needs a separate
+    // output buffer. Off by default (the engine still reassembles for non-tunnel callers).
+    bool reject_fragmented = false;
     WsMessageAssembler assembler;  // fragmentation state across frames
     u64 message_len = 0;           // bytes accumulated into the message buffer so far
 
@@ -88,5 +95,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
                            void* ctx,
                            u32* consumed,
                            u32* produced);
+
+// Serialize a Close frame (status 1000 Normal Closure) into out for the terminate close
+// handshake. `masked` true for the gateway→backend (client-role) leg, false for
+// gateway→client. Advances mask_rng when masked. Returns bytes written, 0 on overflow.
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng);
 
 }  // namespace rut

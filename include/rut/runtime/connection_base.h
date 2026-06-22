@@ -7,6 +7,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/tls_engine.h"
+#include "rut/runtime/ws_terminate.h"
 
 #include <linux/time_types.h>
 #include <openssl/base.h>
@@ -171,6 +172,42 @@ struct ConnectionBase {
     bool ws_client_eof;
     bool ws_upstream_eof;
 
+    // WebSocket TERMINATE mode (vs the passthrough tunnel above). Set from the matched
+    // route at request time; `is_ws_terminate` is armed at the 101 transition once the
+    // per-direction inspection buffers are acquired. In terminate mode the data phase is
+    // parsed/inspected/re-framed per message (ws_inspect) instead of spliced raw.
+    bool is_ws_terminate_route;     // matched route requested terminate (vs passthrough)
+    bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
+    WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
+    u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
+    WsInspector ws_c2u;             // client->upstream inspection state (masked)
+    WsInspector ws_u2c;             // upstream->client inspection state (unmasked)
+    // Reassembly scratch, one per direction (pure CPU — never kernel-referenced, so freed
+    // immediately on close). The re-framed output is written IN PLACE over the recv buffer
+    // (ws_inspect's output is always <= its consumed input), so no separate output slice is
+    // needed. ws_*_consumed remembers the unconsumed-tail start across an in-flight send so
+    // the sent callback can compact the partial trailing frame to the front.
+    u8* ws_c2u_msg = nullptr;  // client->upstream reassembly slice
+    u8* ws_u2c_msg = nullptr;  // upstream->client reassembly slice
+    u32 ws_c2u_consumed;       // recv_buf bytes consumed by the in-flight c->u send
+    u32 ws_u2c_consumed;       // upstream_recv_buf bytes consumed by the in-flight u->c send
+    // Bidirectional Close handshake (RFC 6455 §5.5.1). When a Close is determined (a peer
+    // sent Close, or the handler returned Close), terminate sends a Close frame to BOTH
+    // peers and tears the connection down only once both Close sends have drained — so a
+    // policy/peer close is graceful (the initiating client sees a Close, not EOF/1006). Per
+    // send slot: `_need` = a Close still to submit on this slot, `_inflight` = a Close is
+    // draining on it. close_conn fires when ws_closing and neither need nor inflight is set
+    // on either slot. The forward Close (emitted by ws_inspect) starts its slot _inflight;
+    // the echo Close (built into ws_close_frame_*) is submitted on the opposite slot.
+    bool ws_closing;
+    bool ws_close_client_need;        // Close still to send on the client slot (u->c)
+    bool ws_close_client_inflight;    // a Close is draining on the client slot
+    bool ws_close_upstream_need;      // Close still to send on the upstream slot (c->u)
+    bool ws_close_upstream_inflight;  // a Close is draining on the upstream slot
+    u8 ws_close_frame_client[12];     // echo Close frame to the client (unmasked, persists during
+                                      // send)
+    u8 ws_close_frame_upstream[12];   // echo Close frame to the upstream (masked)
+
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
     //     entry and dispatches. On yield the runtime stores next_state here.
@@ -279,11 +316,13 @@ struct ConnectionBase {
     u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
 
     // Body streaming state (proxy large body support)
-    u32 req_header_end;        // offset past request headers (\r\n\r\n)
-    u32 req_content_length;    // original Content-Length value (for send capping)
-    u32 req_initial_send_len;  // max bytes to send in initial upstream forward
-    bool req_malformed;        // true if request body is malformed (reject)
-    bool req_wants_upgrade;    // client sent Connection: upgrade (gates 101 tunnel)
+    u32 req_header_end;              // offset past request headers (\r\n\r\n)
+    u32 req_content_length;          // original Content-Length value (for send capping)
+    u32 req_initial_send_len;        // max bytes to send in initial upstream forward
+    bool req_malformed;              // true if request body is malformed (reject)
+    bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
+    bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
+    bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
     BodyMode req_body_mode;
     u32 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
@@ -427,6 +466,23 @@ struct ConnectionBase {
         ws_pre_tunnel_upstream_closed = false;
         ws_client_eof = false;
         ws_upstream_eof = false;
+        is_ws_terminate_route = false;
+        is_ws_terminate = false;
+        ws_handler = nullptr;
+        ws_max_message_size = 0;
+        ws_c2u.reset();
+        ws_u2c.reset();
+        ws_c2u.message_len = 0;
+        ws_u2c.message_len = 0;
+        ws_c2u_msg = nullptr;
+        ws_u2c_msg = nullptr;
+        ws_c2u_consumed = 0;
+        ws_u2c_consumed = 0;
+        ws_closing = false;
+        ws_close_client_need = false;
+        ws_close_client_inflight = false;
+        ws_close_upstream_need = false;
+        ws_close_upstream_inflight = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;
@@ -472,6 +528,8 @@ struct ConnectionBase {
         req_initial_send_len = 0;
         req_malformed = false;
         req_wants_upgrade = false;
+        req_upgrade_is_websocket = false;
+        resp_upgrade_is_websocket = false;
         req_body_mode = BodyMode::None;
         req_body_remaining = 0;
         req_chunk_parser.reset();

@@ -297,8 +297,9 @@ public:
             conns[i].shard_id = static_cast<u8>(id);
             free_stack[i] = i;
         }
-        // 3 slices max per connection: recv + send + upstream_recv (lazy).
-        TRY_VOID(pool.init(kMaxConns * 3, pool_prealloc));
+        // Up to 5 slices per connection (lazy): recv + send + upstream_recv + the two
+        // WebSocket terminate-mode reassembly slices. Matches the io_uring loop.
+        TRY_VOID(pool.init(kMaxConns * 5, pool_prealloc));
         auto be = backend.init(id, lfd);
         if (!be) {
             pool.destroy();
@@ -483,6 +484,23 @@ public:
         return true;
     }
 
+    // Two WebSocket terminate-mode reassembly slices (one per direction). All-or-nothing;
+    // freed in free_conn_impl. Without this the legacy EventLoop's ws_arm_terminate would
+    // hit the requires-guard's false branch and close a terminate tunnel at the 101.
+    bool alloc_ws_terminate_bufs(ConnectionBase& c) {
+        if (c.ws_c2u_msg) return true;  // already allocated
+        u8* a = pool.alloc();
+        u8* b = pool.alloc();
+        if (!a || !b) {
+            if (a) pool.free(a);
+            if (b) pool.free(b);
+            return false;
+        }
+        c.ws_c2u_msg = a;
+        c.ws_u2c_msg = b;
+        return true;
+    }
+
     // Clear upstream fd mapping (no-op for legacy template — epoll/iouring
     // concrete loops handle their own fd maps).
     void clear_upstream_fd(u32 /*conn_id*/) {}
@@ -520,6 +538,16 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
+        // kernel op), so reclaim them now regardless of the async deferred path below.
+        if (c.ws_c2u_msg) {
+            pool.free(c.ws_c2u_msg);
+            c.ws_c2u_msg = nullptr;
+        }
+        if (c.ws_u2c_msg) {
+            pool.free(c.ws_u2c_msg);
+            c.ws_u2c_msg = nullptr;
+        }
         if constexpr (Backend::kAsyncIo) {
             // Async backend (io_uring): if no ops are in flight (the close
             // was triggered by the final CQE), reclaim immediately — no

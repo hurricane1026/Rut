@@ -54,15 +54,16 @@ struct ParsedRequest {
     Header headers[kMaxHeaders];
     u32 header_count;
 
-    u32 content_length;       // From Content-Length header, 0 if absent.
-    bool keep_alive;          // Derived from Connection header + HTTP version.
-    bool chunked;             // Transfer-Encoding: chunked
-    bool has_content_length;  // True if Content-Length header was seen.
-    bool upgrade;             // Connection: upgrade token present
-    bool has_upgrade_header;  // Upgrade: header present (both required for a
-                              // valid upgrade — Connection is hop-by-hop alone)
-    bool connection_close;    // a Connection: close token was seen (sticky across
-                              // duplicate Connection fields — suppresses upgrade)
+    u32 content_length;         // From Content-Length header, 0 if absent.
+    bool keep_alive;            // Derived from Connection header + HTTP version.
+    bool chunked;               // Transfer-Encoding: chunked
+    bool has_content_length;    // True if Content-Length header was seen.
+    bool upgrade;               // Connection: upgrade token present
+    bool has_upgrade_header;    // Upgrade: header present (both required for a
+                                // valid upgrade — Connection is hop-by-hop alone)
+    bool upgrade_is_websocket;  // the Upgrade: token is specifically "websocket"
+    bool connection_close;      // a Connection: close token was seen (sticky across
+                                // duplicate Connection fields — suppresses upgrade)
 
     void reset() {
         method = HttpMethod::Unknown;
@@ -76,6 +77,7 @@ struct ParsedRequest {
         has_content_length = false;
         upgrade = false;
         has_upgrade_header = false;
+        upgrade_is_websocket = false;
         connection_close = false;
     }
 };

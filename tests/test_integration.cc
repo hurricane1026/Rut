@@ -7678,6 +7678,20 @@ static u64 return_200_with_body_99_handler(void* /*conn*/,
     return r.pack();
 }
 
+// Drain a full HTTP response header block (through the terminating CRLFCRLF) into buf, so a
+// TCP-split 101 can't leave trailing header bytes in the socket for a later WebSocket frame
+// read to misparse as a giant frame (which stalls the read). Returns total bytes read.
+static u32 recv_http_headers(i32 fd, char* buf, u32 cap) {
+    u32 total = 0;
+    while (total < cap) {
+        i32 n = recv_timeout(fd, buf + total, static_cast<i32>(cap - total), 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (total >= 4 && buf_contains(buf, total, "\r\n\r\n", 4)) break;
+    }
+    return total;
+}
+
 // A backend that completes a WebSocket upgrade (sends 101) then echoes every
 // byte it receives — verifies the gateway's full-duplex passthrough tunnel.
 struct WsEchoServer {
@@ -7782,8 +7796,8 @@ TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
 
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));  // upgrade relayed
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));  // upgrade relayed
 
     REQUIRE(send_all(c, "HELLO", 5));
     i32 m = recv_timeout(c, buf, sizeof(buf), 2000);
@@ -7836,8 +7850,8 @@ TEST(websocket_e2e, passthrough_tunnel_iouring) {
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
 
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));  // upgrade relayed
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));  // upgrade relayed
 
     // Multiple echo rounds: a tunnel recv silently cancelled by the same-fd re-arm
     // race would hang one of these reads.
@@ -7848,6 +7862,381 @@ TEST(websocket_e2e, passthrough_tunnel_iouring) {
     REQUIRE(send_all(c, "WORLD", 5));
     i32 k = recv_timeout(c, buf, sizeof(buf), 2000);
     CHECK(k >= 5 && buf_contains(buf, static_cast<u32>(k), "WORLD", 5));
+
+    close(c);
+    backend.teardown();
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A frame-aware WebSocket echo backend for terminate-mode tests: completes the upgrade,
+// then for each (masked, client-role) frame the gateway sends, unmasks it and echoes the
+// payload back as an unmasked (server-role) frame of the same opcode.
+struct WsFrameEchoServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+    ~WsFrameEchoServer() { teardown(); }
+    static void* run(void* arg) {
+        auto* s = static_cast<WsFrameEchoServer*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[2048];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            const char k101[] =
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
+                "Upgrade\r\n\r\n";
+            (void)send_all(client, k101, sizeof(k101) - 1);
+            rut::u8 acc[8192];
+            rut::u32 have = 0;
+            while (s->running.load(std::memory_order_acquire)) {
+                i32 n = recv_timeout(client,
+                                     reinterpret_cast<char*>(acc + have),
+                                     static_cast<i32>(sizeof(acc) - have),
+                                     200);
+                if (n == 0) break;
+                if (n < 0) continue;
+                have += static_cast<rut::u32>(n);
+                rut::u32 off = 0;
+                for (;;) {
+                    rut::WsFrameHeader h;
+                    if (rut::ws_parse_header(acc + off, have - off, true, &h) !=
+                        rut::ParseStatus::Complete)
+                        break;
+                    const rut::u64 ftotal = h.header_len + h.payload_len;
+                    if (have - off < ftotal) break;
+                    rut::u8 pl[8192];
+                    for (rut::u64 i = 0; i < h.payload_len; i++)
+                        pl[i] = acc[off + h.header_len + i];
+                    rut::ws_unmask(pl, h.payload_len, h.mask_key);
+                    rut::u8 out[8192];
+                    rut::u8 key[4] = {0, 0, 0, 0};
+                    rut::u32 hl =
+                        rut::ws_write_header(out, h.opcode, true, false, key, h.payload_len);
+                    for (rut::u64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
+                    (void)send_all(client,
+                                   reinterpret_cast<char*>(out),
+                                   hl + static_cast<rut::u32>(h.payload_len));
+                    off += static_cast<rut::u32>(ftotal);
+                }
+                if (off > 0)
+                    for (rut::u32 i = 0; i < have - off; i++) acc[i] = acc[off + i];
+                have -= off;
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Terminate handler: close on "BYE", drop "DROP", forward everything else.
+static rut::WsFrameAction terminate_test_handler(void*,
+                                                 rut::WsOpcode op,
+                                                 const rut::u8* p,
+                                                 rut::u64 len) {
+    if (op == rut::WsOpcode::Text && len == 3 && memcmp(p, "BYE", 3) == 0)
+        return rut::WsFrameAction::Close;
+    if (op == rut::WsOpcode::Text && len == 4 && memcmp(p, "DROP", 4) == 0)
+        return rut::WsFrameAction::Drop;
+    return rut::WsFrameAction::Forward;
+}
+
+// End-to-end terminate mode: the gateway parses/reassembles/re-frames frames in both
+// directions (not a raw splice). Proves the handler's Forward/Drop verdicts take effect
+// over a real socket, and that Sec-WebSocket-Extensions is stripped from the upgrade.
+TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    // Upgrade carrying Sec-WebSocket-Extensions — terminate mode must strip it.
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Extensions: permessage-deflate\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+    char buf[1024];
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    auto send_text = [&](const char* s, u32 slen) {
+        u8 fr[256];
+        u32 hl = ws_write_header(fr, WsOpcode::Text, true, true, kKey, slen);
+        for (u32 i = 0; i < slen; i++) fr[hl + i] = static_cast<u8>(s[i]);
+        ws_unmask(fr + hl, slen, kKey);  // mask the payload
+        REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + slen));
+    };
+    // Accumulate across recvs until a WHOLE frame (header + payload) is present — a single
+    // recv() can split or coalesce frames, and ws_parse_header reports Complete on the
+    // header alone, so parsing one recv would read a partial payload.
+    u8 racc[2048];
+    u32 rhave = 0;
+    auto recv_text = [&](u8* out, u32* outlen) -> bool {
+        for (int tries = 0; tries < 50; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                *outlen = static_cast<u32>(h.payload_len);
+                const u32 total = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
+                rhave -= total;
+                return true;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 2000);
+            if (m <= 0) return false;
+            rhave += static_cast<u32>(m);
+        }
+        return false;
+    };
+
+    // Forward: "PING" round-trips through inspect → re-frame → backend echo → inspect.
+    send_text("PING", 4);
+    u8 pl[256];
+    u32 pn = 0;
+    CHECK(recv_text(pl, &pn));
+    CHECK(pn == 4 && memcmp(pl, "PING", 4) == 0);
+
+    // Drop: "DROP" arrives alone (the sleep forces the produced==0 path — a dropped
+    // message with no forward, after which recv must stay/re-arm), then "PONG" round-trips.
+    send_text("DROP", 4);
+    usleep(50000);
+    send_text("PONG", 4);
+    CHECK(recv_text(pl, &pn));
+    CHECK(pn == 4 && memcmp(pl, "PONG", 4) == 0);
+
+    // Close handshake: the handler returns Close on "BYE". Terminate must send a Close frame
+    // BACK to the client (RFC 6455 §5.5.1) before tearing the TCP down — a graceful close,
+    // not an abnormal EOF/1006. Expect a Close frame (opcode 0x8) first, then EOF.
+    send_text("BYE", 3);
+    u8 cf[256];
+    i32 m = recv_timeout(c, reinterpret_cast<char*>(cf), sizeof(cf), 2000);
+    bool got_close = false;
+    if (m >= 2) {
+        WsFrameHeader ch;
+        if (ws_parse_header(cf, static_cast<u32>(m), false, &ch) == ParseStatus::Complete &&
+            ch.opcode == WsOpcode::Close) {
+            got_close = true;
+        }
+    }
+    CHECK(got_close);  // the client received the Close echo, not a bare TCP FIN
+    char tail[256];
+    bool closed = false;
+    for (int i = 0; i < 5; i++) {
+        if (recv_timeout(c, tail, sizeof(tail), 2000) <= 0) {
+            closed = true;
+            break;
+        }
+    }
+    CHECK(closed);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// v1 terminate is single-frame only: a fragmented client message (a data frame with
+// FIN=0) is failed closed rather than mis-reassembled by the in-place re-frame.
+TEST(websocket_e2e, terminate_rejects_fragmented) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+    char buf[1024];
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
+
+    // A masked first fragment (Text, FIN=0): the gateway must tear the tunnel down.
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 fr[64];
+    u32 hl = ws_write_header(fr, WsOpcode::Text, /*fin=*/false, true, kKey, 3);
+    fr[hl] = 'A';
+    fr[hl + 1] = 'A';
+    fr[hl + 2] = 'A';
+    ws_unmask(fr + hl, 3, kKey);
+    REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + 3));
+    bool closed = false;
+    for (int i = 0; i < 5; i++) {
+        if (recv_timeout(c, buf, sizeof(buf), 2000) <= 0) {
+            closed = true;
+            break;
+        }
+    }
+    CHECK(closed);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Same terminate round-trip on io_uring: exercises the multishot-recv re-arm on the
+// produced==0 path (a dropped/partial frame leaves recv armed) and the same-fd pause/
+// re-arm during the in-place inspected send.
+TEST(websocket_e2e, terminate_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.loop->config_ptr = &active;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 5);
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+    char buf[1024];
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    auto send_text = [&](const char* s, u32 slen) {
+        u8 fr[256];
+        u32 hl = ws_write_header(fr, WsOpcode::Text, true, true, kKey, slen);
+        for (u32 i = 0; i < slen; i++) fr[hl + i] = static_cast<u8>(s[i]);
+        ws_unmask(fr + hl, slen, kKey);
+        REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + slen));
+    };
+    // Accumulate across recvs until a WHOLE frame (header + payload) is present — a single
+    // recv() can split or coalesce frames, and ws_parse_header reports Complete on the
+    // header alone, so parsing one recv would read a partial payload.
+    u8 racc[2048];
+    u32 rhave = 0;
+    auto recv_text = [&](u8* out, u32* outlen) -> bool {
+        for (int tries = 0; tries < 50; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                *outlen = static_cast<u32>(h.payload_len);
+                const u32 total = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
+                rhave -= total;
+                return true;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 2000);
+            if (m <= 0) return false;
+            rhave += static_cast<u32>(m);
+        }
+        return false;
+    };
+
+    send_text("HELLO", 5);
+    u8 pl[256];
+    u32 pn = 0;
+    CHECK(recv_text(pl, &pn));
+    CHECK(pn == 5 && memcmp(pl, "HELLO", 5) == 0);
+
+    send_text("DROP", 4);  // dropped at the gateway
+    send_text("WORLD", 5);
+    CHECK(recv_text(pl, &pn));
+    CHECK(pn == 5 && memcmp(pl, "WORLD", 5) == 0);
 
     close(c);
     backend.teardown();

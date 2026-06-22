@@ -117,6 +117,15 @@ WsInspectStatus ws_inspect(WsInspector& st,
         if (ps == ParseStatus::Incomplete) break;  // partial header — wait for more bytes
         if (ps == ParseStatus::Error) return WsInspectStatus::Error;
 
+        // Reject fragmentation the instant the header proves it — before waiting for (or
+        // buffering) the payload. The in-place re-frame can't size a message spanning reads,
+        // and deferring the check past the whole-frame wait below lets a peer wedge the
+        // tunnel by sending only a fragmented frame's header (FIN=0) and then stalling.
+        if (st.reject_fragmented && !ws_opcode_is_control(h.opcode) &&
+            (h.opcode == WsOpcode::Continuation || !h.fin)) {
+            return WsInspectStatus::Error;
+        }
+
         // Fail closed on an oversized data frame as soon as its header is known — before
         // waiting for (and buffering) a payload we'd reject once complete. message_len is
         // the bytes already accumulated for an in-progress fragmented message (0 for a
@@ -164,9 +173,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
             continue;
         }
 
-        // Data frame (Text/Binary/Continuation): accumulate its unmasked payload into the
-        // reassembly buffer (bound already checked above), then ask the reassembler
-        // whether the message is complete.
+        // Data frame (Text/Binary). Fragmentation was already rejected at the header (above),
+        // so reaching here means a whole, final, single-frame message.
+        // Accumulate the (unmasked) payload into the reassembly buffer (bound already
+        // checked above), then ask the reassembler whether the message is complete.
         for (u64 i = 0; i < h.payload_len; i++) msg_buf[st.message_len + i] = payload[i];
         if (st.masked) ws_unmask(msg_buf + st.message_len, h.payload_len, h.mask_key);
 
@@ -207,6 +217,13 @@ WsInspectStatus ws_inspect(WsInspector& st,
     }
 
     return WsInspectStatus::Ok;
+}
+
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng) {
+    const u8 code[2] = {0x03, 0xE8};  // 1000 Normal Closure
+    u32 produced = 0;
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, code, 2, masked, mask_rng)) return 0;
+    return produced;
 }
 
 }  // namespace rut

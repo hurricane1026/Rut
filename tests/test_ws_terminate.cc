@@ -184,6 +184,120 @@ TEST(ws_terminate, invalid_utf8_only_rejects_text_not_binary) {
     CHECK_EQ(r.calls, 1);
 }
 
+// 3- and 4-byte UTF-8 sequences (exercises the 0xE0/0xF0 lead-byte decode paths).
+TEST(ws_terminate, valid_utf8_three_and_four_byte) {
+    WsInspector st = make_state(false);
+    Recorder r;
+    u8 in[32];
+    const u8 msg[] = {0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80};  // "€😀" (3-byte + 4-byte)
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 7);
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    CHECK(ws_inspect(st,
+                     in,
+                     in_len,
+                     out,
+                     sizeof(out),
+                     mbuf,
+                     sizeof(mbuf),
+                     record,
+                     &r,
+                     &consumed,
+                     &produced) == WsInspectStatus::Ok);
+    CHECK_EQ(r.calls, 1);
+    // A truncated 3-byte sequence (lead with no continuations) is rejected.
+    WsInspector st2 = make_state(false);
+    const u8 bad[] = {0xE2, 0x82};  // 3-byte lead, only 1 continuation
+    u32 n2 = build(in, WsOpcode::Text, true, false, bad, 2);
+    CHECK(
+        ws_inspect(
+            st2, in, n2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+}
+
+// emit_frame out-capacity failures on the control and Close-action paths.
+TEST(ws_terminate, output_capacity_control_and_close) {
+    Recorder r;
+    u8 in[32], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    // A forwarded Ping with an out buffer too small for its re-frame.
+    WsInspector st = make_state(false);
+    const u8 body[] = {1, 2, 3, 4, 5};
+    u32 n = build(in, WsOpcode::Ping, true, false, body, 5);
+    u8 tiny[3];  // < 2 header + 5 payload
+    CHECK(
+        ws_inspect(
+            st, in, n, tiny, sizeof(tiny), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+    // A handler-requested Close with no room for even the 2-byte Close frame.
+    WsInspector st2 = make_state(false);
+    r.close_now = true;
+    const u8 m[] = {'x'};
+    u32 n2 = build(in, WsOpcode::Text, true, false, m, 1);
+    u8 none[1];
+    CHECK(ws_inspect(st2,
+                     in,
+                     n2,
+                     none,
+                     sizeof(none),
+                     mbuf,
+                     sizeof(mbuf),
+                     record,
+                     &r,
+                     &consumed,
+                     &produced) == WsInspectStatus::Error);
+    r.close_now = false;
+}
+
+// A fragmented frame's header alone (FIN=0) must be rejected immediately in terminate mode
+// — before the payload arrives — so a peer can't wedge the tunnel by sending a fragment
+// header and then stalling (the whole-frame wait would otherwise leave it "incomplete").
+TEST(ws_terminate, fragmented_header_rejected_before_payload) {
+    WsInspector st = make_state(/*masked=*/false);
+    st.reject_fragmented = true;
+    Recorder r;
+    u8 in[16];
+    // FIN=0, Text, declares a 100-byte payload — but supply only the 2-byte header.
+    u32 hl = ws_write_header(in, WsOpcode::Text, /*fin=*/false, /*masked=*/false, kKeyIn, 100);
+    u8 out[64], mbuf[256];
+    u32 consumed = 0, produced = 0;
+    CHECK(ws_inspect(
+              st, in, hl, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);  // rejected at the header, handler never reached
+    // A Continuation opcode is likewise rejected up front.
+    WsInspector st2 = make_state(/*masked=*/false);
+    st2.reject_fragmented = true;
+    u32 hl2 =
+        ws_write_header(in, WsOpcode::Continuation, /*fin=*/true, /*masked=*/false, kKeyIn, 50);
+    CHECK(
+        ws_inspect(
+            st2, in, hl2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+}
+
+// ws_emit_close_frame builds a valid Close frame (status 1000) for the close handshake,
+// in both the unmasked (server->client) and masked (client->upstream) forms.
+TEST(ws_terminate, emit_close_frame_unmasked_and_masked) {
+    u8 out[16];
+    u64 rng = 0xC0FFEE;
+    u32 n = ws_emit_close_frame(out, sizeof(out), /*masked=*/false, rng);
+    WsFrameHeader h;
+    CHECK(ws_parse_header(out, n, /*require_mask=*/false, &h) == ParseStatus::Complete);
+    CHECK(h.opcode == WsOpcode::Close);
+    CHECK_EQ(h.payload_len, 2u);
+    CHECK(out[h.header_len] == 0x03 && out[h.header_len + 1] == 0xE8);  // 1000 Normal Closure
+
+    u8 mout[16];
+    u32 mn = ws_emit_close_frame(mout, sizeof(mout), /*masked=*/true, rng);
+    WsFrameHeader mh;
+    u8 pl[8];
+    CHECK(parse_one(mout, mn, /*masked=*/true, &mh, pl) == mn);
+    CHECK(mh.opcode == WsOpcode::Close);
+    CHECK(mh.masked);
+    CHECK(pl[0] == 0x03 && pl[1] == 0xE8);  // unmasks back to 1000
+}
+
 // === Drop ===
 
 TEST(ws_terminate, drop_emits_nothing) {
@@ -255,6 +369,39 @@ TEST(ws_terminate, fragmented_message_handler_sees_whole) {
     CHECK_EQ(h.payload_len, 5u);
     CHECK(h.fin);
     CHECK_EQ(memcmp(pl, "AAABB", 5), 0);  // "AAA" + "BB"
+}
+
+// reject_fragmented (the in-place tunnel mode) fails closed on a fragmented message — a
+// non-final data frame or a Continuation — instead of reassembling it.
+TEST(ws_terminate, reject_fragmented_fails_closed) {
+    WsInspector st = make_state(false);
+    st.reject_fragmented = true;
+    Recorder r;
+    u8 in[64], out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    // First fragment (Text, FIN=0) is rejected immediately.
+    const u8 a[] = {'A', 'A', 'A'};
+    u32 n1 = build(in, WsOpcode::Text, /*fin=*/false, false, a, 3);
+    CHECK(ws_inspect(
+              st, in, n1, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+          WsInspectStatus::Error);
+    CHECK_EQ(r.calls, 0);
+    // A bare Continuation is rejected too.
+    WsInspector st2 = make_state(false);
+    st2.reject_fragmented = true;
+    u32 n2 = build(in, WsOpcode::Continuation, /*fin=*/true, false, a, 3);
+    CHECK(
+        ws_inspect(
+            st2, in, n2, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Error);
+    // A single-frame (FIN=1) message is still accepted.
+    WsInspector st3 = make_state(false);
+    st3.reject_fragmented = true;
+    u32 n3 = build(in, WsOpcode::Text, /*fin=*/true, false, a, 3);
+    CHECK(
+        ws_inspect(
+            st3, in, n3, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
+        WsInspectStatus::Ok);
 }
 
 // === Control pass-through ===

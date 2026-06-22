@@ -3854,8 +3854,9 @@ TEST(slice_conn, real_eventloop_pool_init) {
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    // Lazy commit: pool starts empty, max set to 3 * kMaxConns (recv+send+upstream).
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 3);
+    // Lazy commit: pool starts empty, max set to 5 * kMaxConns (recv + send + upstream +
+    // the two WebSocket terminate-mode reassembly slices).
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 5);
     CHECK_EQ(loop->pool.count, 0u);
 
     // Alloc a connection — triggers lazy grow, consumes 2 slices
@@ -6225,13 +6226,14 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
 }
 
 // Pool sized for 3 slices per connection (recv + send + upstream_recv).
-TEST(buffer_isolation, pool_sized_for_three_slices) {
+TEST(buffer_isolation, pool_sized_for_five_slices) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 3);
+    // recv + send + upstream_recv + the two WebSocket terminate reassembly slices.
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 5);
 
     loop->shutdown();
     destroy_real_loop(loop);
