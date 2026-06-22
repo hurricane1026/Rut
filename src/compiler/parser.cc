@@ -947,8 +947,25 @@ struct Parser {
                 if (!name) return core::make_unexpected(name.error());
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
-                stmt.kind = AstStmtKind::ForwardUpstream;
                 stmt.name = name.value()->text;
+                // A trailing `{ ... }` block makes this TERMINATE mode (the gateway
+                // parses/inspects each message); a bare `websocket(x)` stays the passthrough
+                // ForwardUpstream tunnel. The block is the per-message frame handler; its
+                // body is stored on then_stmt (reused like For), parsed by the general
+                // statement parser (per-message verdicts are a follow-up slice).
+                if (cur().type == TokenType::LBrace) {
+                    auto lbrace = expect(TokenType::LBrace);
+                    if (!lbrace) return core::make_unexpected(lbrace.error());
+                    auto body = parse_braced_stmt_body(*lbrace.value());
+                    if (!body) return core::make_unexpected(body.error());
+                    auto body_ptr = alloc_stmt(body.value());
+                    if (!body_ptr) return core::make_unexpected(body_ptr.error());
+                    stmt.kind = AstStmtKind::WsTerminate;
+                    stmt.then_stmt = body_ptr.value();
+                    stmt.span = Span{start.start, body.value().span.end, start.line, start.col};
+                    return stmt;
+                }
+                stmt.kind = AstStmtKind::ForwardUpstream;
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;
 #else

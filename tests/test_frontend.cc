@@ -1215,6 +1215,43 @@ TEST(frontend, parse_return_forward_name) {
     CHECK_EQ(term.upstream_index, 0u);
 }
 
+TEST(frontend, parse_return_websocket_bare_is_passthrough) {
+    // A bare `websocket(<upstream>)` (no trailing block) stays the passthrough tunnel —
+    // the same ForwardUpstream terminator as `forward`, unchanged from Phase 0.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    const auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    const auto& stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
+    CHECK(stmt.name.eq(lit("ws")));
+}
+
+TEST(frontend, parse_return_websocket_block_is_terminate) {
+    // A trailing `{ ... }` block turns it into TERMINATE mode (WsTerminate) — the block is
+    // the per-message frame handler, parsed onto `then_stmt`. (Slice A: parser + AST only;
+    // per-message verdicts + type-checking are follow-up slices, so the body here uses an
+    // already-parseable terminator.)
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { return forward(ws) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    const auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    const auto& stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
+    CHECK(stmt.name.eq(lit("ws")));
+    REQUIRE(stmt.then_stmt != nullptr);  // the frame-handler body
+    CHECK_EQ(static_cast<u8>(stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
+}
+
 TEST(frontend, parse_return_forward_rejects_bare_forward_statement) {
     // Bare `forward <name>` is no longer accepted — the keyword only
     // parses as part of the `return forward(<name>)` builder. Keep a
