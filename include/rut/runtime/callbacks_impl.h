@@ -2363,6 +2363,13 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
         // armed UNLESS this was its terminal completion (recv_armed cleared) — re-arm then.
         if (consumed > 0) conn.recv_buf.consume(consumed);
         if (st == WsInspectStatus::Close) return false;  // caller closes
+        if ((conn.ws_client_eof || conn.ws_upstream_eof)) {
+            // Peer FIN'd and the drain stops new reads, so a leftover partial frame can
+            // never complete — drop it so ws_close_if_drained (which needs an empty buffer)
+            // can tear down, instead of a partial-frame-then-FIN wedging the tunnel open.
+            conn.recv_buf.consume(conn.recv_buf.len());
+            return true;
+        }
         if constexpr (ws_loop_async<Loop>()) {
             if (!conn.recv_armed) return ws_resume_client_recv(loop, conn);
         } else {
@@ -2414,6 +2421,11 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
         }
         if (consumed > 0) conn.upstream_recv_buf.consume(consumed);
         if (st == WsInspectStatus::Close) return false;
+        if ((conn.ws_client_eof ||
+             conn.ws_upstream_eof)) {  // drain can't complete a partial frame — drop it so we close
+            conn.upstream_recv_buf.consume(conn.upstream_recv_buf.len());
+            return true;
+        }
         // Sync (epoll): re-arm the one-shot upstream recv. Async: re-arm only if the
         // terminal multishot completion cleared upstream_recv_armed.
         if constexpr (ws_loop_async<Loop>()) {
