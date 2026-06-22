@@ -7678,6 +7678,20 @@ static u64 return_200_with_body_99_handler(void* /*conn*/,
     return r.pack();
 }
 
+// Drain a full HTTP response header block (through the terminating CRLFCRLF) into buf, so a
+// TCP-split 101 can't leave trailing header bytes in the socket for a later WebSocket frame
+// read to misparse as a giant frame (which stalls the read). Returns total bytes read.
+static u32 recv_http_headers(i32 fd, char* buf, u32 cap) {
+    u32 total = 0;
+    while (total < cap) {
+        i32 n = recv_timeout(fd, buf + total, static_cast<i32>(cap - total), 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+        if (total >= 4 && buf_contains(buf, total, "\r\n\r\n", 4)) break;
+    }
+    return total;
+}
+
 // A backend that completes a WebSocket upgrade (sends 101) then echoes every
 // byte it receives — verifies the gateway's full-duplex passthrough tunnel.
 struct WsEchoServer {
@@ -7782,8 +7796,8 @@ TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
 
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));  // upgrade relayed
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));  // upgrade relayed
 
     REQUIRE(send_all(c, "HELLO", 5));
     i32 m = recv_timeout(c, buf, sizeof(buf), 2000);
@@ -7836,8 +7850,8 @@ TEST(websocket_e2e, passthrough_tunnel_iouring) {
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
 
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));  // upgrade relayed
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));  // upgrade relayed
 
     // Multiple echo rounds: a tunnel recv silently cancelled by the same-fd re-arm
     // race would hang one of these reads.
@@ -7999,8 +8013,8 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
         "Sec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
 
     const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
     auto send_text = [&](const char* s, u32 slen) {
@@ -8010,17 +8024,31 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
         ws_unmask(fr + hl, slen, kKey);  // mask the payload
         REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + slen));
     };
+    // Accumulate across recvs until a WHOLE frame (header + payload) is present — a single
+    // recv() can split or coalesce frames, and ws_parse_header reports Complete on the
+    // header alone, so parsing one recv would read a partial payload.
+    u8 racc[2048];
+    u32 rhave = 0;
     auto recv_text = [&](u8* out, u32* outlen) -> bool {
-        char rb[512];
-        i32 m = recv_timeout(c, rb, sizeof(rb), 2000);
-        if (m <= 0) return false;
-        WsFrameHeader h;
-        if (ws_parse_header(reinterpret_cast<u8*>(rb), static_cast<u32>(m), false, &h) !=
-            ParseStatus::Complete)
-            return false;
-        for (u64 i = 0; i < h.payload_len; i++) out[i] = static_cast<u8>(rb[h.header_len + i]);
-        *outlen = static_cast<u32>(h.payload_len);
-        return true;
+        for (int tries = 0; tries < 50; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                *outlen = static_cast<u32>(h.payload_len);
+                const u32 total = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
+                rhave -= total;
+                return true;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 2000);
+            if (m <= 0) return false;
+            rhave += static_cast<u32>(m);
+        }
+        return false;
     };
 
     // Forward: "PING" round-trips through inspect → re-frame → backend echo → inspect.
@@ -8089,8 +8117,8 @@ TEST(websocket_e2e, terminate_rejects_fragmented) {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
 
     // A masked first fragment (Text, FIN=0): the gateway must tear the tunnel down.
     const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
@@ -8149,8 +8177,8 @@ TEST(websocket_e2e, terminate_iouring) {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
-    CHECK(n > 0 && buf_contains(buf, static_cast<u32>(n), "101", 3));
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
 
     const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
     auto send_text = [&](const char* s, u32 slen) {
@@ -8160,17 +8188,31 @@ TEST(websocket_e2e, terminate_iouring) {
         ws_unmask(fr + hl, slen, kKey);
         REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + slen));
     };
+    // Accumulate across recvs until a WHOLE frame (header + payload) is present — a single
+    // recv() can split or coalesce frames, and ws_parse_header reports Complete on the
+    // header alone, so parsing one recv would read a partial payload.
+    u8 racc[2048];
+    u32 rhave = 0;
     auto recv_text = [&](u8* out, u32* outlen) -> bool {
-        char rb[512];
-        i32 m = recv_timeout(c, rb, sizeof(rb), 2000);
-        if (m <= 0) return false;
-        WsFrameHeader h;
-        if (ws_parse_header(reinterpret_cast<u8*>(rb), static_cast<u32>(m), false, &h) !=
-            ParseStatus::Complete)
-            return false;
-        for (u64 i = 0; i < h.payload_len; i++) out[i] = static_cast<u8>(rb[h.header_len + i]);
-        *outlen = static_cast<u32>(h.payload_len);
-        return true;
+        for (int tries = 0; tries < 50; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                *outlen = static_cast<u32>(h.payload_len);
+                const u32 total = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
+                rhave -= total;
+                return true;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 2000);
+            if (m <= 0) return false;
+            rhave += static_cast<u32>(m);
+        }
+        return false;
     };
 
     send_text("HELLO", 5);
