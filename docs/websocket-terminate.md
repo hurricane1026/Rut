@@ -113,9 +113,11 @@ route GET "/ws" {
     }
 }
 ```
-(Route form: `route GET "/path" { … }` — a method is required. **Grammar note:** the Slice A
-parser requires `return websocket(x) { … }` as the route's last statement; the bare
-`websocket(x) { … }` shown here is the target spelling, pending the decision in §10.6.)
+(Route form: `route GET "/path" { … }` — a method is required. **Grammar note:** today main
+parses only `return websocket(<ident>)` (no block); the *proposed* Slice A (PR #144, not yet
+merged) adds the `return websocket(x) { … }` block form, where the terminator must be the
+route's last statement. The bare `websocket(x) { … }` shown here is the target spelling,
+pending the decision in §10.6.)
 
 Direction-aware (one handler, distinguished by `frame.fromClient` — needs the §8 ABI bump):
 
@@ -259,12 +261,20 @@ its codegen is a **subset** of the existing handler codegen. Stages:
    `guard`/`if`/`match`, and the regex builtin (`re"…"`, already exists). **`frame.json` /
    `validate(_, Schema)` are NOT in v1** — they need the JSON builtin (§8), scheduled after A–E.
    Forbid I/O (`wait`, `notify`, state mutation) in v1.
-3. **RIR** — lower the verdict graph; map `frame.opcode/payload/len/fromClient` to the ABI
-   args; `return <verdict>` → a `WsFrameAction` constant; constant-fold route kwargs.
+3. **RIR** — lower the verdict graph; map `frame.opcode/payload/len` to the ABI args
+   (**not** `fromClient` — that arg only exists after the dir-slice ABI bump);
+   `return <verdict>` → a `WsFrameAction` constant; constant-fold route kwargs.
 4. **JIT codegen** — emit a function matching the frame-handler ABI; the route's
    `ws_frame_handler` pointer is its address.
 5. **Route wiring** — emit `add_ws_terminate(path, method, upstream_id, <jit_ptr>, maxMsg)`
    instead of the passthrough forward; bare `websocket(x)` keeps emitting passthrough.
+   **Caveat (Slice D is not a one-line swap):** `add_ws_terminate` registers a *direct Proxy*
+   route with **no HTTP handler**, and the runtime only arms terminate for `RouteAction::Proxy
+   && ws_terminate`. So any **pre-upgrade route logic** in the `.rut` body (auth, `guard`s,
+   `@decorator`s before the `websocket` terminator) would be **dropped**. v1 must therefore
+   either (a) **forbid** pre-upgrade statements on a terminate route (the `websocket` block is
+   the whole body), or (b) add a **JIT-route arm path** that runs the route's handler and then
+   enters terminate. *Recommend (a) for v1* — flagged as decision §10.7.
 
 The route table is already shaped for this (`RouteConfig` holds both `jit::HandlerFn fn` and
 `WsMessageHandlerFn ws_frame_handler`).
@@ -280,14 +290,15 @@ The inspect-only v1 (single-frame Text/Binary ≤ ~16 KB; `forward`/`drop`/bare-
 |------------|--------------|------------|
 | `frame.fromClient` | `WsMessageHandlerFn` gains a `bool from_client` (or richer `ctx`); engine passes the leg | ship v1 with **no direction**; one handler, both legs identical |
 | `close(code)` | extend the handler return path to carry an RFC 6455 code (`WsFrameAction` → `{action, code}`, or a ctx field) **and** apply it at *both* emit sites — the `ws_inspect` forward Close and `ws_emit_close_frame` | bare `close` only: forward peer gets **1005 No Status**, echo gets **1000** |
-| Messages > ~16 KB | a **multi-slice reassembly buffer** (today `ws_arm_terminate` clamps to one slice) | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
-| Fragmented messages | the **same** multi-slice / separate-output buffer (lifts `reject_fragmented`) | fragmented messages fail closed before the handler |
+| Fragmented messages (within the ~16 KB cap) | a **separate per-direction output buffer** — the assembler already reassembles fragments into its message buffer, but in-place re-framing can overflow the final read, which is why `reject_fragmented` is set; an output buffer (the *same* one modify needs) lifts it | fragmented messages fail closed before the handler |
+| Messages > ~16 KB | a **multi-slice reassembly buffer** (today `ws_arm_terminate` clamps to one slice) — *independent* of fragmentation | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
 | `frame.json` / `validate(_, Schema)` | a JSON value type + parser builtin (regex `re"…"`/Vectorscan already exists) | ship `frame.text` + regex-based validation first |
 | `frame.text =` / modify (§6) | **add** a bounded per-direction output slice + send-drain state (none exists — re-frame is in-place; modified output can exceed the input) | verdict-only; no payload rewrite |
 
 These are all *small and independent*; the recommended path lands the no-runtime-change v1
-first, then adds direction + `close(code)` (both tiny), then the multi-slice buffer (lifts the
-size cap **and** fragmentation together), then JSON, then modify (4b).
+first, then adds direction + `close(code)` (both tiny). The **output buffer** (fragmentation +
+modify) and the **multi-slice reassembly buffer** (>16 KB) are *separate* pieces — adding the
+output buffer lifts `reject_fragmented` without touching the size cap, and vice versa.
 
 ---
 
@@ -295,7 +306,7 @@ size cap **and** fragmentation together), then JSON, then modify (4b).
 
 | Slice | Layer | Deliverable | Size | Risk |
 |-------|-------|-------------|------|------|
-| **A** | parser | `websocket(){…}` block + kwargs → `WsTerminate` AST; bare form unchanged | S | low |
+| **A** | parser | `websocket(x){…}` block → `WsTerminate` AST; bare form unchanged. (PR #144 — kwargs deferred; `maxMessageSize:` is added with D and must parse via the existing `IntLit + kb/mb` ByteSize path, since `8kb` is two tokens, not a single literal) | S | low |
 | **B** | type checker | `Frame` type + `frame.*` accessors + `forward`/`drop`/**bare `close`** verdicts + exhaustiveness. NO `close(code)` (needs the §8 runtime change) and NO `frame.fromClient` (needs the §8 ABI bump) in v1 | M | med (new typed object + terminator rules) |
 | **C** | RIR + JIT | frame-handler ABI emission (verdict function); map `frame.opcode/payload/len`→args | M | **highest** (new handler kind through codegen) |
 | **D** | compiler→runtime | emit `add_ws_terminate` with the JIT pointer (+ required `maxMessageSize`); passthrough unchanged | S | low |
@@ -306,9 +317,10 @@ size cap **and** fragmentation together), then JSON, then modify (4b).
 
 Recommended order: **A → B → C → D → E** is the inspect-only v1 (single-frame, no direction,
 bare `close`, no modify — *zero runtime change*). Then **dir** (direction ABI + `fromClient`),
-**code** (`close(code)`), the multi-slice buffer (size cap + fragmentation), JSON, and **4b**
-(modify) — each its own slice. Direction and `close(code)` are intentionally **out of A–E**
-because they need the runtime changes A–E deliberately avoid.
+**code** (`close(code)`), the **output buffer** (lifts fragmentation; shared with **4b** modify),
+the **multi-slice reassembly buffer** (lifts the >16 KB cap, independent), and JSON — each its
+own slice. Direction and `close(code)` are intentionally **out of A–E** because they need the
+runtime changes A–E deliberately avoid.
 
 ---
 
@@ -333,11 +345,17 @@ because they need the runtime changes A–E deliberately avoid.
    keeps the guard idiom consistent with `req.body(User)`; confirm against the final optional
    semantics in DESIGN.md §3.3.7.*
 6. **`return websocket(x) { … }` vs bare `websocket(x) { … }`?** The current parser requires
-   `return` for terminators and they must be the route body's last statement, so Slice A landed
-   the `return` form. The examples here use the bare form (matching DESIGN.md's `websocket { }`
-   sketch), which reads cleaner — only the frame verdicts are `return`s, not the route
-   terminator. *Leaning: decide before Slice B — either accept the nested-`return` form, or add
-   a bare-`websocket`-statement terminator. Examples should track whichever wins.*
+   `return` for terminators and they must be the route body's last statement, so the proposed
+   Slice A (PR #144) uses the `return` form. The examples here use the bare form (matching
+   DESIGN.md's `websocket { }` sketch), which reads cleaner — only the frame verdicts are
+   `return`s, not the route terminator. *Leaning: decide before Slice B — either accept the
+   nested-`return` form, or add a bare-`websocket`-statement terminator. Examples should track
+   whichever wins.*
+7. **Pre-upgrade route logic on a terminate route?** `add_ws_terminate` makes a direct Proxy
+   route with no HTTP handler, so route-body statements before the `websocket` terminator
+   (auth, `guard`s, `@decorator`s) would be dropped. *Leaning: forbid them in v1 — the
+   `websocket(){}` block is the whole terminate route body — and add a JIT-route arm path later
+   if pre-upgrade logic is needed (§7 Slice D caveat).*
 
 ---
 
