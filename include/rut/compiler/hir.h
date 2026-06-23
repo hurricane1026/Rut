@@ -909,7 +909,6 @@ struct HirWsHandler {
     bool has_forward_payload = false;
     u32 forward_payload_expr = 0xffffffffu;
     u32 upstream_index = 0;
-    u32 max_message_size = 0;  // 0 = engine default; set when the cap kwarg lands
     Span span{};
 };
 

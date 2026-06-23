@@ -5045,13 +5045,19 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     return false;
 }
 
+// Resolve an upstream by name; UnknownUpstream (at `span`) when absent. Shared by the route
+// terminator (analyze_term), wait-arg resolution, and the WebSocket terminate handler.
+static FrontendResult<u32> find_upstream_index_by_name(const HirModule& mod, Str name, Span span) {
+    for (u32 i = 0; i < mod.upstreams.len; i++) {
+        if (mod.upstreams[i].name.eq(name)) return i;
+    }
+    return frontend_error(FrontendError::UnknownUpstream, span, name);
+}
+
 static FrontendResult<u32> find_wait_upstream_index(const HirModule& mod, const AstExpr& arg) {
     if (arg.kind != AstExprKind::Ident)
         return frontend_error(FrontendError::UnsupportedSyntax, arg.span);
-    for (u32 i = 0; i < mod.upstreams.len; i++) {
-        if (mod.upstreams[i].name.eq(arg.name)) return i;
-    }
-    return frontend_error(FrontendError::UnknownUpstream, arg.span, arg.name);
+    return find_upstream_index_by_name(mod, arg.name, arg.span);
 }
 
 static bool wait_req_body_arg(const AstExpr& arg) {
@@ -7921,17 +7927,10 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     }
 
-    u32 upstream_index = mod.upstreams.len;
-    for (u32 j = 0; j < mod.upstreams.len; j++) {
-        if (mod.upstreams[j].name.eq(stmt.name)) {
-            upstream_index = j;
-            break;
-        }
-    }
-    if (upstream_index == mod.upstreams.len)
-        return frontend_error(FrontendError::UnknownUpstream, stmt.span, stmt.name);
+    auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
+    if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
-    term.upstream_index = upstream_index;
+    term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
     return term;
 }
@@ -9277,15 +9276,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         // accept only the forward-only body (Slice B); the route carries a HirWsHandler
         // instead of an HTTP terminator and `control` stays unused. Lowering rejects it
         // until the frame-handler JIT path lands (Slices C–E).
-        u32 upstream_index = mod.upstreams.len;
-        for (u32 j = 0; j < mod.upstreams.len; j++) {
-            if (mod.upstreams[j].name.eq(stmt.name)) {
-                upstream_index = j;
-                break;
-            }
-        }
-        if (upstream_index == mod.upstreams.len)
-            return frontend_error(FrontendError::UnknownUpstream, stmt.span, stmt.name);
+        auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
+        if (!upstream_index) return core::make_unexpected(upstream_index.error());
         // The body collapses to a single statement (parser rejects empty blocks and unwraps
         // one-statement blocks), so the body is exactly one Expr statement `frame.forward(...)`.
         // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method
@@ -9306,8 +9298,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         route->is_ws_terminate = true;
         route->ws_handler.default_verdict = WsVerdict::Forward;
-        route->ws_handler.upstream_index = upstream_index;
-        route->ws_handler.max_message_size = 0;
+        route->ws_handler.upstream_index = upstream_index.value();
         route->ws_handler.span = stmt.span;
         if (call.args.len == 1) {
             // Modify form: the payload must be a definite Str (text-frame content). Binary
