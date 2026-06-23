@@ -59,9 +59,15 @@ musl 静态二进制里 **`dlopen` 永远失败**,所以 DESIGN §16 原计划�
 (那 22 个 `rut_helper_*`,见 `jit_engine.cc:46-69`),所以加载器只干四件事:
 
 1. `mmap` 产物的代码/数据段
-2. 套用重定位(`R_X86_64_64` / `PC32` / `PLT32` / `GOTPCREL` 等)
+2. 套用重定位 ——**按目标 arch 分**:x86_64 是 `R_X86_64_64` / `PC32` / `PLT32` / `GOTPCREL` 等;
+   arm64 是 `R_AARCH64_ABS64` / `CALL26` / `ADR_PREL_PG_HI21` / `ADD_ABS_LO12_NC` 等(§4 说产物
+   per-arch,故加载器的重定位表也 per-arch,不能只实现 x86_64,否则 arm64 handler 无法加载)
 3. 把固定的 `rut_helper_*` ABI 表地址填进去(查静态表,非符号名搜索)
-4. `mprotect(PROT_EXEC)`,定位入口,交给 RCU
+4. `mprotect(PROT_EXEC)` 切可执行
+5. **arm64 额外一步:i-cache flush** —— AArch64 数据/指令 cache 分离,刚写进去的 handler 指令在
+   执行前必须 `__builtin___clear_cache(start, end)`;否则即便重定位 + `mprotect` 都成功,CPU 仍可能
+   跳进 stale 指令。x86_64 cache 一致,免此步
+6. 定位入口,交给 RCU
 
 这是 LLVM RuntimeDyld / musl `ld.so` 的一个**符号集固定**的子集,几百行而非几千行。
 **复杂度应压给 master**:让 master(带 LLVM、少数、自控)把 handler 预链接成自包含 PIC
@@ -85,9 +91,12 @@ LLVM-free 的 `hs_runtime` 库。所以 node 侧不是"只换 DB 指针"就能�
 (b) DB 从"烤进 IR 的进程内指针"(`jit_engine.cc:251-256`,跨机器无意义)改为
 **序列化进产物 + node 反序列化按 handle 接上**。
 
-注意:① **ISA 对齐**——`FAT_RUNTIME=OFF` 下扫描引擎单 ISA,master 编 DB 的目标 ISA 必须
-≤ node 运行时基线;② **版本耦合**——序列化 DB 版本绑定,master/node 用同一 vendored
-Vectorscan 天然满足。
+注意:① **目标 arch / ISA 对齐**——`hs_platform_info_t` 只收窄 tune / CPU-feature 位,**不跨 arch**:
+Vectorscan 反序列化会拒绝为不同 platform/CPU-type 编的 DB,所以 x86_64 master 用 x86 `libhs` 编出的 DB
+**在 arm64 node 上反序列化直接失败**。§4 既承诺 x86-64 + arm64 分发,regex 路径就需要 **per-target-arch
+的 DB 编译**——master 侧按每个 node 目标 arch 各编一份(用对应 arch 的 Vectorscan 编译器 / 交叉编),
+不能一份 x86 DB 通吃;同 arch 内再保证编 DB 的目标 ISA ≤ node 运行时基线(`FAT_RUNTIME=OFF` 单 ISA);
+② **版本耦合**——序列化 DB 版本绑定,master/node 用同一 vendored Vectorscan 天然满足。
 
 单体 rut 仍用全量 Vectorscan,保留多模式 SIMD 能力。**放弃了自研 DFA 方案**(那需要写
 编译器+执行器两套,而 Vectorscan 序列化几乎零新代码)。
@@ -126,9 +135,13 @@ BoringSSL 在 musl-static 下能编能跑,比 OpenSSL 自包含得多(无 provid
 | vendored vectorscan `hs_runtime`(FAT_RUNTIME=OFF,static)musl 编译 | ✅ 成功,`libhs_runtime.a` 1.73MB |
 | TLS(**vendored BoringSSL** static,`third_party/boringssl`)musl 静态链 | ⏳ **待复跑确认**(原始实测链的是系统 OpenSSL;harness 已改为 vendored BoringSSL 但未在 musl 环境重跑) |
 | 最终二进制 `readelf -d` | **零 NEEDED**;`ldd` = "Not a valid dynamic program" |
-| **libstdc++ / 异常符号** | **0** —— rut 本就 no-STL,vectorscan runtime 那 13 个 `.cpp` 只用模板+SIMD intrinsics,不碰 STL/异常 |
+| **libstdc++ / 异常符号(derisk 二进制)** | **0** —— derisk.c + `hs_runtime` + BoringSSL 全程 no-STL,vectorscan runtime 那 13 个 `.cpp` 只用模板+SIMD intrinsics,不碰 STL/异常 |
 
-**关键收获:rut-node 整个二进制可不背任何 C++ 运行时,只靠 musl libc。**
+**关键收获(有前提):** derisk 二进制(`hs_runtime` + BoringSSL)不背任何 C++ 运行时。但这**只覆盖
+扫描 + TLS 库,不是真正的 `rut_runtime`**——后者 `src/runtime/tls.cc` / `tls_engine.cc` 现在用
+`std::once_flag` / `std::call_once`(`tls.cc:15-18`),会拉进 libstdc++/libsupc++。所以 "rut-node
+零 C++ 运行时" 成立的**前提是先把这些 `std::call_once` 换成 C 级 once**(`pthread_once` 或
+atomic+spin)。在那之前,要么把 runtime 源纳入 harness 一起测,要么把结论限定到 "扫描 + TLS 库层"。
 
 > **复现修正(2026-06-23):** 早期 harness 链的是 Alpine `openssl-libs-static`(系统 OpenSSL),
 > 而不是 vendored BoringSSL —— 与本节"BoringSSL"结论及下面的体积数不符,也违反"不引系统
