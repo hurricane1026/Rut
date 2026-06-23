@@ -1,8 +1,8 @@
 # rut-node:静态、零依赖的边缘分发
 
-> 状态:设计 + 去风险已验证(2026-06-22)。实现未开始。
-> 本文记录 rut-master / rut-node 切分的设计结论,以及 musl-static、零 `.so`
-> 分发的实测去风险数据。
+> 状态:设计完成;去风险**部分验证**(2026-06-22 跑过,但当时 harness 链的是系统
+> OpenSSL,见 §5 复现修正)。musl-static / 零 `.so` / 零 libstdc++ 已验证;**BoringSSL
+> 链接 + 体积仍待在修正后的 harness 上复跑确认**。实现未开始。
 
 ## 1. 动机
 
@@ -121,7 +121,7 @@ BoringSSL 在 musl-static 下能编能跑,比 OpenSSL 自包含得多(无 provid
 |---|---|
 | musl 静态编 C | ✅ 完美,`readelf -d` 无 `.dynamic`,零 NEEDED |
 | vendored vectorscan `hs_runtime`(FAT_RUNTIME=OFF,static)musl 编译 | ✅ 成功,`libhs_runtime.a` 1.73MB |
-| TLS(**vendored BoringSSL** static,`third_party/boringssl`)musl 静态链 | ✅ 链通 |
+| TLS(**vendored BoringSSL** static,`third_party/boringssl`)musl 静态链 | ⏳ **待复跑确认**(原始实测链的是系统 OpenSSL;harness 已改为 vendored BoringSSL 但未在 musl 环境重跑) |
 | 最终二进制 `readelf -d` | **零 NEEDED**;`ldd` = "Not a valid dynamic program" |
 | **libstdc++ / 异常符号** | **0** —— rut 本就 no-STL,vectorscan runtime 那 13 个 `.cpp` 只用模板+SIMD intrinsics,不碰 STL/异常 |
 
@@ -144,7 +144,7 @@ BoringSSL 在 musl-static 下能编能跑,比 OpenSSL 自包含得多(无 provid
 |---|---|---|
 | musl 地板 | **13 KB** | 实测 |
 | 正则(vectorscan `hs_runtime`) | **~1.15 MB** | 实测 |
-| TLS(**BoringSSL**) | **~2.5 MB** | 实测(OpenSSL 同测法 4.25MB;gc 对其 provider 体系几乎无效,故选 BoringSSL) |
+| TLS(**BoringSSL**) | **~2.5 MB**(⏳ 待复跑) | OpenSSL 同测法 4.25MB(gc 对其 provider 体系几乎无效,故选 BoringSSL)。BoringSSL 的 2.5MB 需在修正后的 harness(vendored BoringSSL)上复测确认——原始实测链的是系统 OpenSSL。 |
 | rut runtime + 自写 h2 | ~0.3–0.6 MB | 估算(node 构建未成型) |
 
 档位:
