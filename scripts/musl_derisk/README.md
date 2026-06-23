@@ -76,9 +76,13 @@ docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
     echo "FAIL: 仍有动态依赖"; readelf -d /tmp/derisk_musl | grep NEEDED; exit 1
   fi
   echo "零 NEEDED ✓"
-  # C++ 运行时/异常:operator new/delete (_Zn*/_Zd*)、STL (_ZSt/_ZNSt)、EH (__cxa_*/__gxx_personality)
-  cxx=$(nm /tmp/derisk_musl | grep -cE "_ZNSt|_ZSt|_Zn[wa]|_Zd[la]|__cxa_|__gxx_personality" || true)
-  [ "$cxx" -eq 0 ] || { echo "FAIL: $cxx 个 C++ 运行时/异常符号"; nm /tmp/derisk_musl | grep -E "_ZNSt|_ZSt|_Zn[wa]|_Zd[la]|__cxa_|__gxx_personality"; exit 1; }
+  # C++ 运行时/异常:operator new/delete (_Zn*/_Zd*)、STL (_ZSt/_ZNSt)、EH。
+  # 只匹配 *异常处理* 的 __cxa_(throw/catch/allocate_exception/rethrow/unexpected/bad),
+  # 不匹配 musl 正常的 __cxa_atexit/__cxa_finalize —— 那是 libc 退出钩子,g++ 驱动的链即便
+  # 没拉进任何 STL/EH 也会带上,否则会把合法 repro 误判失败。
+  CXXPAT='_ZNSt|_ZSt|_Zn[wa]|_Zd[la]|__gxx_personality|__cxa_(throw|begin_catch|end_catch|allocate_exception|free_exception|rethrow|call_unexpected|bad_)'
+  cxx=$(nm /tmp/derisk_musl | grep -cE "$CXXPAT" || true)
+  [ "$cxx" -eq 0 ] || { echo "FAIL: $cxx 个 C++ 运行时/异常符号"; nm /tmp/derisk_musl | grep -E "$CXXPAT"; exit 1; }
   echo "C++ 运行时符号 0 ✓"
 
   strip /tmp/derisk_musl

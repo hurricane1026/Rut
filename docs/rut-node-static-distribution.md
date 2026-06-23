@@ -78,8 +78,11 @@ Hyperscan / Vectorscan 本就是 "中心编译 → 序列化 → 下发 → 节�
 - **master**:`hs_compile_multi` → `hs_serialize_database` 序列化进 handler 产物
 - **node**:只链 `hs_runtime`(运行时库,无编译器)→ `hs_deserialize_database` → `hs_scan`
 
-现 node 侧扫描代码已存在(`runtime_helpers.cc:529` 的 `hs_scan`/`hs_alloc_scratch`);
-唯一要改的是 DB 从"烤进 IR 的进程内指针"(`jit_engine.cc:251-256`,跨机器无意义)改为
+扫描调用本身已存在(`runtime_helpers.cc:529` 的 `hs_scan`/`hs_alloc_scratch`),但**它现在
+编进 `rut_jit` target,而 `rut_jit` 链 LLVM + 完整 `hs`**(`src/CMakeLists.txt`)——不是
+LLVM-free 的 `hs_runtime` 库。所以 node 侧不是"只换 DB 指针"就能复用:要做两件事——
+(a) 把这段扫描代码**拆进一个 node-safe、只链 `hs_runtime`(无 LLVM、无完整 `hs`)的 target**;
+(b) DB 从"烤进 IR 的进程内指针"(`jit_engine.cc:251-256`,跨机器无意义)改为
 **序列化进产物 + node 反序列化按 handle 接上**。
 
 注意:① **ISA 对齐**——`FAT_RUNTIME=OFF` 下扫描引擎单 ISA,master 编 DB 的目标 ISA 必须
@@ -175,9 +178,10 @@ distro/distroless 基础层)。
 |---|---|---|---|
 | ① | 产物格式 + 无 LLVM 加载器 | 净新增(最大) | 产物格式要同时装 handler PIC 码 + 序列化的 Vectorscan DB |
 | ② | 正则改 serialize/deserialize + 链 `hs_runtime` | 小 | 与 ① 耦合 |
-| ③ | BoringSSL + `hs_runtime` 的 musl-static 构建 | **已验证** | 独立 |
+| ③ | BoringSSL + `hs_runtime` 的 musl-static 构建 | ⏳ **待复跑**(见 §5.1) | 独立 |
 
-①② 必须一起设计(产物格式预留 DB 位置),③ 已实测通过。
+①② 必须一起设计(产物格式预留 DB 位置)。③ 的 musl-static + zero-`.so` 已验证,但
+**BoringSSL 部分**原始实测链的是系统 OpenSSL,改用 vendored BoringSSL 的 harness 尚未在 musl 重跑。
 
 ## 7. 复现
 
