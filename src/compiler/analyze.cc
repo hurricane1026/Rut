@@ -9286,12 +9286,13 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         }
         if (upstream_index == mod.upstreams.len)
             return frontend_error(FrontendError::UnknownUpstream, stmt.span, stmt.name);
-        // The body collapses to a single statement (parser rejects empty blocks and
-        // unwraps one-statement blocks), so the forward-only body is exactly one Expr
-        // statement `frame.forward()`. (`forward` is the proxy-terminator keyword, but the
-        // parser accepts it as a method name after `.`, and the `frame.` receiver keeps it
-        // distinct from `return forward(upstream)`.) Drop/close, accessors, guards and
-        // multi-statement bodies are follow-up slices — reject them for now.
+        // The body collapses to a single statement (parser rejects empty blocks and unwraps
+        // one-statement blocks), so the body is exactly one Expr statement `frame.forward(...)`.
+        // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method
+        // name after `.`, and the `frame.` receiver keeps it distinct from
+        // `return forward(upstream)`.) `frame.forward()` forwards the message unchanged;
+        // `frame.forward(payload)` forwards a rewritten Str payload (the modify form). Drop/
+        // close, frame accessors, guards and multi-statement bodies are follow-up slices.
         const AstStatement* body = stmt.then_stmt;
         if (body == nullptr || body->kind != AstStmtKind::Expr)
             return frontend_error(FrontendError::UnsupportedSyntax, body ? body->span : stmt.span);
@@ -9299,13 +9300,30 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         const bool is_frame_forward = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
                                       call.lhs->kind == AstExprKind::Ident &&
                                       call.lhs->name.eq({"frame", 5}) &&
-                                      call.name.eq({"forward", 7}) && call.args.len == 0;
-        if (!is_frame_forward) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+                                      call.name.eq({"forward", 7});
+        // forward() or forward(payload) — at most one argument.
+        if (!is_frame_forward || call.args.len > 1)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         route->is_ws_terminate = true;
         route->ws_handler.default_verdict = WsVerdict::Forward;
         route->ws_handler.upstream_index = upstream_index;
         route->ws_handler.max_message_size = 0;
         route->ws_handler.span = stmt.span;
+        if (call.args.len == 1) {
+            // Modify form: the payload must be a definite Str (text-frame content). Binary
+            // payloads + opcode matching are a follow-up; runtime emit is Phase 4b.
+            if (call.args[0] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            auto payload = analyze_expr(
+                *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
+            if (!payload) return core::make_unexpected(payload.error());
+            if (payload->type != HirTypeKind::Str || payload->may_nil || payload->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+            if (!route->exprs.push(payload.value()))
+                return frontend_error(FrontendError::TooManyItems, call.span);
+            route->ws_handler.has_forward_payload = true;
+            route->ws_handler.forward_payload_expr = route->exprs.len - 1;
+        }
         return {};
     }
 #endif

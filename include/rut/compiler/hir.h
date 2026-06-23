@@ -902,6 +902,12 @@ enum class WsVerdict : u8 {
 // Slice B: forward-only, so just the default verdict + the resolved upstream.
 struct HirWsHandler {
     WsVerdict default_verdict = WsVerdict::Forward;
+    // `frame.forward(payload)` modify form: forward a rewritten message instead of the
+    // original. The payload expression (Str-typed) is stored in HirRoute.exprs;
+    // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).
+    // Lowering the modify path (the bounded output buffer) is Phase 4b; build_mir still rejects.
+    bool has_forward_payload = false;
+    u32 forward_payload_expr = 0xffffffffu;
     u32 upstream_index = 0;
     u32 max_message_size = 0;  // 0 = engine default; set when the cap kwarg lands
     Span span{};

@@ -1298,29 +1298,56 @@ TEST(frontend, build_mir_rejects_ws_terminate_until_codegen) {
     CHECK(!mir);  // lowering refuses until Slices C–E
 }
 
-TEST(frontend, parse_websocket_frame_forward_with_arg) {
-    // `frame.forward(payload)` is the Phase 4b modify-and-send form. It must PARSE as a
-    // MethodCall on `frame` named "forward" with ONE arg — NOT get mis-routed into the
-    // `forward(upstream)` proxy terminator by the contextual-keyword rule. (Slice B analyze
-    // still rejects args; this only locks the parse shape so 4b can lower it.)
+TEST(frontend, analyze_accepts_websocket_forward_payload) {
+    // `frame.forward(payload)` is the modify-and-send form. It must PARSE as a MethodCall on
+    // `frame` named "forward" with ONE arg — NOT get mis-routed into the `forward(upstream)`
+    // proxy terminator by the contextual-keyword rule — and analyze accepts it when the arg is
+    // a Str payload, recording has_forward_payload. (Runtime emit is Phase 4b; build_mir
+    // still rejects.)
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(ws) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(\"hi\") } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    REQUIRE_EQ(ast->items.len, 2u);
     const auto& stmt = ast->items[1].route.statements[0];
     REQUIRE_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
     REQUIRE(stmt.then_stmt != nullptr);
-    CHECK_EQ(static_cast<u8>(stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Expr));
     const auto& call = stmt.then_stmt->expr;
     CHECK_EQ(static_cast<u8>(call.kind), static_cast<u8>(AstExprKind::MethodCall));
     CHECK(call.name.eq(lit("forward")));  // member name, not a terminator
     REQUIRE(call.lhs != nullptr);
-    CHECK(call.lhs->name.eq(lit("frame")));  // receiver is `frame`
-    CHECK_EQ(call.args.len, 1u);             // the payload arg
-    // Slice B accepts only the zero-arg form; the arg form is rejected for now (Phase 4b).
+    CHECK(call.lhs->name.eq(lit("frame")));
+    CHECK_EQ(call.args.len, 1u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK(hir->routes[0].is_ws_terminate);
+    CHECK(hir->routes[0].ws_handler.has_forward_payload);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].ws_handler.default_verdict),
+             static_cast<u8>(WsVerdict::Forward));
+}
+
+TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
+    // The modify payload must be a Str (text-frame content). A non-Str arg is rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(123) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);  // payload is not Str
+}
+
+TEST(frontend, analyze_rejects_websocket_forward_two_args) {
+    // forward takes at most one payload; two args is rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(\"a\", \"b\") } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     CHECK(!hir);
 }
