@@ -851,13 +851,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
     for (u32 i = 0; i < module.routes.len; i++) {
 #if RUT_ENABLE_WEBSOCKET
-        // WebSocket terminate-mode frame handlers analyze into a HirWsHandler, but they
-        // compile via a separate verdict-function JIT path that does not exist yet
-        // (Slices C–E). Reject here so analyze can type-check the handler while the
-        // pipeline still refuses to emit code for it.
-        if (module.routes[i].is_ws_terminate)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  module.routes[i].ws_handler.span);
+        // WebSocket terminate-mode frame handlers don't go through the HTTP MIR/RIR pipeline —
+        // a constant verdict needs no request parsing / response building / state machine. The
+        // serve loader emits them directly (jit::emit_ws_handler) and registers them via
+        // RouteConfig::add_ws_terminate. Skip them here so the HTTP routes still build.
+        if (module.routes[i].is_ws_terminate) continue;
 #endif
         MirFunction fn{};
         fn.span = module.routes[i].span;

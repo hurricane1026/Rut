@@ -1349,9 +1349,10 @@ TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
     CHECK(!hir);
 }
 
-TEST(frontend, build_mir_rejects_ws_terminate_until_codegen) {
-    // The forward-only handler type-checks (analyze OK), but the verdict-function JIT path
-    // doesn't exist yet, so build_mir rejects it — the not-yet-implemented seam lives there.
+TEST(frontend, build_mir_skips_ws_terminate_route) {
+    // A ws-terminate route compiles via the frame-handler JIT path in the serve loader, NOT
+    // the HTTP MIR/RIR pipeline, so build_mir SKIPS it (rather than rejecting): a ws-only
+    // program produces a valid MIR module with zero HTTP functions.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
     auto lexed = lex(lit(src));
@@ -1361,7 +1362,8 @@ TEST(frontend, build_mir_rejects_ws_terminate_until_codegen) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
-    CHECK(!mir);  // lowering refuses until Slices C–E
+    REQUIRE(mir);                      // build succeeds (the ws route is skipped, not rejected)
+    CHECK_EQ(mir->functions.len, 0u);  // no HTTP function emitted for the ws route
 }
 
 TEST(frontend, analyze_accepts_websocket_forward_payload) {

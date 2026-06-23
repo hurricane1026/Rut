@@ -9,6 +9,11 @@
 #include "rut/compiler/parser.h"
 #include "rut/jit/codegen.h"
 #include "rut/runtime/compile_to_config.h"
+#if RUT_ENABLE_WEBSOCKET
+#include "rut/runtime/slice_pool.h"    // SlicePool::kSliceSize (terminate cap)
+#include "rut/runtime/ws_frame.h"      // kWsMaxHeaderSize
+#include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn
+#endif
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -172,6 +177,20 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     auto cg = jit::codegen(out.rir.module);
     if (!cg.ok) return false;
 
+#if RUT_ENABLE_WEBSOCKET
+    // Emit a constant-verdict frame handler into the SAME module for each terminate route,
+    // before compile() takes ownership of cg.mod. Symbols ws_handler_<n>, dense in HIR order.
+    {
+        u32 ws_n = 0;
+        for (u32 i = 0; i < ir.hir->routes.len; i++) {
+            if (!ir.hir->routes[i].is_ws_terminate) continue;
+            const u8 verdict = static_cast<u8>(ir.hir->routes[i].ws_handler.default_verdict);
+            if (!jit::emit_ws_handler(cg.mod, cg.ctx, verdict, ws_n)) return false;
+            ws_n++;
+        }
+    }
+#endif
+
     err.stage = LoadStage::JitCompile;
     if (!out.engine.init()) return false;
     out.jit_inited = true;
@@ -188,6 +207,36 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     err.stage = LoadStage::Register;
     if (!populate_route_config(out.config, out.rir.module)) return false;
     if (!register_jit_routes(out.config, out.rir.module, out.engine)) return false;
+
+#if RUT_ENABLE_WEBSOCKET
+    // Register each terminate route: look up its compiled verdict fn and publish a proxy +
+    // frame-handler route. max_message_size defaults to the engine's single-slice cap (the
+    // `maxMessageSize:` kwarg is a follow-up; arm-time clamps further anyway).
+    {
+        constexpr u32 kWsDefaultMaxMessageSize = SlicePool::kSliceSize - kWsMaxHeaderSize;
+        u32 ws_n = 0;
+        for (u32 i = 0; i < ir.hir->routes.len; i++) {
+            const auto& route = ir.hir->routes[i];
+            if (!route.is_ws_terminate) continue;
+            char sym[64];
+            jit::format_ws_handler_symbol(ws_n, sym, sizeof(sym));
+            auto* addr = out.engine.lookup(sym);
+            if (!addr) return false;
+            auto handler = reinterpret_cast<WsMessageHandlerFn>(addr);
+            if (route.path.len >= RouteEntry::kMaxPathLen) return false;
+            char path[RouteEntry::kMaxPathLen];
+            for (u32 j = 0; j < route.path.len; j++) path[j] = route.path.ptr[j];
+            path[route.path.len] = '\0';
+            if (!out.config.add_ws_terminate(path,
+                                             route.method,
+                                             static_cast<u16>(route.ws_handler.upstream_index),
+                                             handler,
+                                             kWsDefaultMaxMessageSize))
+                return false;
+            ws_n++;
+        }
+    }
+#endif
 
     return true;
 }
