@@ -11,6 +11,9 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
+#if RUT_ENABLE_WEBSOCKET
+#include "rut/runtime/ws_terminate.h"
+#endif
 #include "test.h"
 #include <filesystem>
 #include <fstream>
@@ -18262,6 +18265,51 @@ TEST(jit_dispatch, null_handler_returns_error_outcome) {
     auto o = invoke_jit_handler(nullptr, nullptr, ctx, nullptr, 0, nullptr);
     CHECK_EQ(static_cast<u8>(o.kind), static_cast<u8>(JitDispatchOutcome::Kind::Error));
 }
+
+#if RUT_ENABLE_WEBSOCKET
+// Compile a `websocket(x){ frame.<verdict>() }` program end-to-end through the constant-verdict
+// frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL), and return
+// the verdict the compiled function actually produces. Returns 255 on any failure.
+static WsFrameAction jit_ws_verdict(const char* src) {
+    constexpr auto kFail = static_cast<WsFrameAction>(255);
+    auto lexed = lex(lit(src));
+    if (!lexed) return kFail;
+    auto ast = parse_file_heap(lexed.value());
+    if (!ast) return kFail;
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir) return kFail;
+    if (hir->routes.len != 1 || !hir->routes[0].is_ws_terminate) return kFail;
+    const u8 verdict = static_cast<u8>(hir->routes[0].ws_handler.default_verdict);
+
+    auto cg = codegen_ws_handler(verdict, 0);
+    if (!cg.ok) return kFail;
+    JitEngine engine;
+    if (!engine.init() || !engine.compile(cg.mod, cg.ctx)) return kFail;
+    auto fn = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
+    const WsFrameAction r = fn ? fn(nullptr, WsOpcode::Text, nullptr, 0) : kFail;
+    engine.shutdown();
+    return r;
+}
+
+TEST(jit, ws_handler_forward_returns_forward) {
+    // frame.forward() compiles to a verdict function that, when called, returns Forward.
+    CHECK(jit_ws_verdict(
+              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n") ==
+          WsFrameAction::Forward);
+}
+
+TEST(jit, ws_handler_drop_returns_drop) {
+    CHECK(jit_ws_verdict(
+              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop() } }\n") ==
+          WsFrameAction::Drop);
+}
+
+TEST(jit, ws_handler_close_returns_close) {
+    CHECK(jit_ws_verdict(
+              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close() } }\n") ==
+          WsFrameAction::Close);
+}
+#endif  // RUT_ENABLE_WEBSOCKET
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
