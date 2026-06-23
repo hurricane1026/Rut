@@ -27,13 +27,19 @@ git submodule update --init --depth 1 third_party/boringssl third_party/vectorsc
 
 docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
   set -e
-  # build-base 给 g++;go + perl 是 BoringSSL 配置/生成所需(见其 BUILDING.md)。
+  # build-base 给 g++;go + perl 是 BoringSSL 配置/生成所需(见其 BUILDING.md);
+  # file 给 BusyBox 没有的 file(1)(下面用它确认真静态)。
   apk add --no-cache build-base cmake samurai boost-dev ragel python3 \
-    pkgconf sqlite-dev linux-headers go perl
+    pkgconf sqlite-dev linux-headers go perl file
 
   # 保守 ISA 基线:FAT_RUNTIME=OFF 默认 -march=native,会把 runtime 钉死在构建机的
-  # AVX2/AVX512 上,older x86-64-v2 节点跑不了。显式压到 x86-64-v2(SSE4.2)。
-  VS_FLAGS="-march=x86-64-v2"
+  # AVX2/AVX512 上,older 节点跑不了。按容器架构选基线(arm64 镜像下 -march=x86-64-v2
+  # 会被编译器直接拒,所以 gate 在 uname -m 上)。
+  case "$(uname -m)" in
+    x86_64)  VS_FLAGS="-march=x86-64-v2" ;;   # SSE4.2 基线
+    aarch64) VS_FLAGS="-march=armv8-a" ;;     # ARMv8 基线
+    *)       VS_FLAGS="" ;;
+  esac
 
   # 1) vendored Vectorscan:full(给 gen_db 编译用)+ runtime(给 derisk 节点用)
   cmake -B /tmp/vs -G Ninja /repo/third_party/vectorscan \

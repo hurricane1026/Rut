@@ -13,8 +13,10 @@
 
 #include <hs_common.h>   // hs_valid_platform / hs_deserialize_database / hs_free_database
 #include <hs_runtime.h>  // hs_scan / hs_alloc_scratch / hs_free_scratch / hs_scratch_t
-#include <openssl/sha.h>  // BoringSSL
-#include <openssl/ssl.h>  // BoringSSL TLS
+#include <openssl/bio.h>  // BoringSSL: mem BIO for the in-process handshake
+#include <openssl/rand.h>  // BoringSSL: RAND_bytes (RNG path)
+#include <openssl/sha.h>   // BoringSSL
+#include <openssl/ssl.h>   // BoringSSL TLS
 
 static int on_match(unsigned int id, unsigned long long from, unsigned long long to,
                     unsigned int flags, void* ctx) {
@@ -35,11 +37,45 @@ int main(int argc, char** argv) {
     // --- BoringSSL: 哈希 + TLS 上下文 (确保链到 crypto + ssl) ---
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256((const unsigned char*)"rut", 3, digest);
+    // RNG is the most common musl-static TLS failure (entropy/getrandom). Exercise it.
+    unsigned char rnd[32];
+    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+        fprintf(stderr, "FAIL: RAND_bytes (BoringSSL RNG)\n");
+        return 1;
+    }
     SSL_CTX* ctx = SSL_CTX_new(TLS_method());
     if (!ctx) {
         fprintf(stderr, "FAIL: SSL_CTX_new (BoringSSL TLS)\n");
         return 1;
     }
+    // Drive a real handshake start, not just ctx alloc: a client SSL over a mem BIO must
+    // generate a ClientHello (crypto init + key share + record layer all run). With no server
+    // the handshake parks at WANT_READ after writing the ClientHello — that's success here.
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) {
+        fprintf(stderr, "FAIL: SSL_new\n");
+        return 1;
+    }
+    BIO* rbio = BIO_new(BIO_s_mem());
+    BIO* wbio = BIO_new(BIO_s_mem());
+    if (!rbio || !wbio) {
+        fprintf(stderr, "FAIL: BIO_new\n");
+        return 1;
+    }
+    SSL_set_bio(ssl, rbio, wbio);  // takes ownership; freed by SSL_free
+    SSL_set_connect_state(ssl);
+    int hr = SSL_do_handshake(ssl);
+    int se = SSL_get_error(ssl, hr);
+    if (se != SSL_ERROR_WANT_READ) {  // expected: ClientHello sent, waiting for ServerHello
+        fprintf(stderr, "FAIL: SSL_do_handshake err=%d (expected WANT_READ=%d)\n", se,
+                SSL_ERROR_WANT_READ);
+        return 1;
+    }
+    if (BIO_pending(wbio) <= 0) {  // the ClientHello bytes must have been produced
+        fprintf(stderr, "FAIL: no ClientHello emitted (TLS record/crypto path)\n");
+        return 1;
+    }
+    SSL_free(ssl);
     SSL_CTX_free(ctx);
 
     // --- vectorscan runtime: 当前 CPU 必须被这份 (FAT_RUNTIME=OFF) runtime 支持 ---
