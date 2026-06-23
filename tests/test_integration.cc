@@ -7684,7 +7684,10 @@ static u64 return_200_with_body_99_handler(void* /*conn*/,
 static u32 recv_http_headers(i32 fd, char* buf, u32 cap) {
     u32 total = 0;
     while (total < cap) {
-        i32 n = recv_timeout(fd, buf + total, static_cast<i32>(cap - total), 2000);
+        // Generous timeout: on a loaded/shared CI runner the test thread, the backend echo
+        // thread, and the gateway LoopThread contend on few cores, so a proxied 101 can take
+        // well over a second to round-trip. 2s flaked under load; 10s is safe headroom.
+        i32 n = recv_timeout(fd, buf + total, static_cast<i32>(cap - total), 10000);
         if (n <= 0) break;
         total += static_cast<u32>(n);
         if (total >= 4 && buf_contains(buf, total, "\r\n\r\n", 4)) break;
@@ -7883,18 +7886,34 @@ struct WsFrameEchoServer {
     ~WsFrameEchoServer() { teardown(); }
     static void* run(void* arg) {
         auto* s = static_cast<WsFrameEchoServer*>(arg);
+        // Blocking accept: on a constrained/loaded runner a non-blocking usleep(1000) poll
+        // thread gets starved by the gateway's event loop, delaying the upstream accept past
+        // the upgrade timeout. A blocking accept is woken by the kernel the instant the
+        // gateway connects, regardless of scheduling pressure; teardown() closes listen_fd to
+        // unblock it (accept then returns EBADF → break).
+        {
+            int fl = fcntl(s->listen_fd, F_GETFL, 0);
+            if (fl != -1) (void)fcntl(s->listen_fd, F_SETFL, fl & ~O_NONBLOCK);
+        }
         while (s->running.load(std::memory_order_acquire)) {
             i32 client = accept(s->listen_fd, nullptr, nullptr);
             if (client < 0) {
                 if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    usleep(1000);
-                    continue;
-                }
-                break;
+                break;  // EBADF on teardown's close, or a real error → stop
             }
+            // Read the FULL upgrade request (through the terminating CRLFCRLF) before
+            // responding — like a real WebSocket server. Responding after a single bounded
+            // recv could send the 101 while the gateway was still sending the request, racing
+            // the gateway's request-send against the early response under load.
             char req[2048];
-            (void)recv_timeout(client, req, sizeof(req), 1000);
+            u32 rlen = 0;
+            while (rlen < sizeof(req)) {
+                i32 rn =
+                    recv_timeout(client, req + rlen, static_cast<i32>(sizeof(req) - rlen), 2000);
+                if (rn <= 0) break;
+                rlen += static_cast<u32>(rn);
+                if (rlen >= 4 && buf_contains(req, rlen, "\r\n\r\n", 4)) break;
+            }
             const char k101[] =
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
                 "Upgrade\r\n\r\n";
@@ -7956,13 +7975,16 @@ struct WsFrameEchoServer {
     }
     void teardown() {
         running.store(false, std::memory_order_release);
+        // Close the listener BEFORE joining: the run thread may be parked in a blocking
+        // accept(), which a close (+ shutdown) unblocks with EBADF so it can see !running.
+        if (listen_fd >= 0) {
+            ::shutdown(listen_fd, SHUT_RDWR);
+            close(listen_fd);
+            listen_fd = -1;
+        }
         if (started) {
             pthread_join(thread, nullptr);
             started = false;
-        }
-        if (listen_fd >= 0) {
-            close(listen_fd);
-            listen_fd = -1;
         }
     }
 };
@@ -8044,7 +8066,7 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
             i32 m = recv_timeout(c,
                                  reinterpret_cast<char*>(racc + rhave),
                                  static_cast<i32>(sizeof(racc) - rhave),
-                                 2000);
+                                 10000);  // generous for loaded CI (see recv_http_headers)
             if (m <= 0) return false;
             rhave += static_cast<u32>(m);
         }
@@ -8071,7 +8093,7 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     // not an abnormal EOF/1006. Expect a Close frame (opcode 0x8) first, then EOF.
     send_text("BYE", 3);
     u8 cf[256];
-    i32 m = recv_timeout(c, reinterpret_cast<char*>(cf), sizeof(cf), 2000);
+    i32 m = recv_timeout(c, reinterpret_cast<char*>(cf), sizeof(cf), 10000);
     bool got_close = false;
     if (m >= 2) {
         WsFrameHeader ch;
@@ -8084,7 +8106,7 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     char tail[256];
     bool closed = false;
     for (int i = 0; i < 5; i++) {
-        if (recv_timeout(c, tail, sizeof(tail), 2000) <= 0) {
+        if (recv_timeout(c, tail, sizeof(tail), 10000) <= 0) {
             closed = true;
             break;
         }
@@ -8143,7 +8165,7 @@ TEST(websocket_e2e, terminate_rejects_fragmented) {
     REQUIRE(send_all(c, reinterpret_cast<char*>(fr), hl + 3));
     bool closed = false;
     for (int i = 0; i < 5; i++) {
-        if (recv_timeout(c, buf, sizeof(buf), 2000) <= 0) {
+        if (recv_timeout(c, buf, sizeof(buf), 10000) <= 0) {
             closed = true;
             break;
         }
@@ -8220,7 +8242,7 @@ TEST(websocket_e2e, terminate_iouring) {
             i32 m = recv_timeout(c,
                                  reinterpret_cast<char*>(racc + rhave),
                                  static_cast<i32>(sizeof(racc) - rhave),
-                                 2000);
+                                 10000);  // generous for loaded CI (see recv_http_headers)
             if (m <= 0) return false;
             rhave += static_cast<u32>(m);
         }
