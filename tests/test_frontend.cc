@@ -1215,6 +1215,7 @@ TEST(frontend, parse_return_forward_name) {
     CHECK_EQ(term.upstream_index, 0u);
 }
 
+#if RUT_ENABLE_WEBSOCKET
 TEST(frontend, parse_return_websocket_bare_is_passthrough) {
     // A bare `websocket(<upstream>)` (no trailing block) stays the passthrough tunnel —
     // the same ForwardUpstream terminator as `forward`, unchanged from Phase 0.
@@ -1251,6 +1252,30 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
     REQUIRE(stmt.then_stmt != nullptr);  // the frame-handler body
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
 }
+
+TEST(frontend, analyze_rejects_websocket_terminate_until_lowering) {
+    // The frame-handler HIR/lowering isn't built yet, so analyze must REJECT a terminate
+    // route — not silently treat it as a passthrough ForwardUpstream (which would drop the
+    // frame block). Parsing still succeeds; analysis fails.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { return forward(ws) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);  // terminate-mode analysis is rejected for now
+}
+#else
+TEST(frontend, websocket_rejected_when_disabled) {
+    // -DRUT_ENABLE_WEBSOCKET=0: the parser rejects `websocket(...)` outright.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);  // UnsupportedSyntax in the WebSocket-disabled build
+}
+#endif  // RUT_ENABLE_WEBSOCKET
 
 TEST(frontend, parse_return_forward_rejects_bare_forward_statement) {
     // Bare `forward <name>` is no longer accepted — the keyword only

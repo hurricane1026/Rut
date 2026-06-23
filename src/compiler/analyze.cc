@@ -7911,6 +7911,14 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return term;
     }
 
+    // WebSocket TERMINATE mode (`websocket(x) { ... }`) parses to WsTerminate, but the
+    // frame-handler HIR/lowering (Slice B/C/D) does not exist yet. Reject it explicitly —
+    // otherwise it falls through to the ForwardUpstream resolution below and a terminate
+    // route would silently compile as a transparent passthrough tunnel, dropping the block.
+    if (stmt.kind == AstStmtKind::WsTerminate) {
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    }
+
     u32 upstream_index = mod.upstreams.len;
     for (u32 j = 0; j < mod.upstreams.len; j++) {
         if (mod.upstreams[j].name.eq(stmt.name)) {
