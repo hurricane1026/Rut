@@ -47,13 +47,13 @@ docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
     -DCMAKE_C_FLAGS="$VS_FLAGS" -DCMAKE_CXX_FLAGS="$VS_FLAGS" \
     -DBUILD_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF \
     -DBUILD_UNIT=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF
-  ninja -C /tmp/vs hs hs_runtime
+  samu -C /tmp/vs hs hs_runtime   # Alpine 的 samurai 装的是 samu,不是 ninja
   VS_FULL=$(find /tmp/vs -name libhs.a | head -1)
   VS_RT=$(find /tmp/vs -name libhs_runtime.a | head -1)
 
   # 2) vendored BoringSSL(不装 openssl-*;rut-node 发的就是 BoringSSL)
   cmake -B /tmp/bssl -G Ninja /repo/third_party/boringssl -DCMAKE_BUILD_TYPE=Release
-  ninja -C /tmp/bssl ssl crypto
+  samu -C /tmp/bssl ssl crypto
   BSSL_SSL=$(find /tmp/bssl -name libssl.a | head -1)
   BSSL_CRYPTO=$(find /tmp/bssl -name libcrypto.a | head -1)
   [ -n "$VS_FULL" ] && [ -n "$VS_RT" ] && [ -n "$BSSL_SSL" ] && [ -n "$BSSL_CRYPTO" ] \
@@ -80,7 +80,9 @@ docker run --rm -v "$PWD":/repo alpine:3.20 sh -c '
   # 只匹配 *异常处理* 的 __cxa_(throw/catch/allocate_exception/rethrow/unexpected/bad),
   # 不匹配 musl 正常的 __cxa_atexit/__cxa_finalize —— 那是 libc 退出钩子,g++ 驱动的链即便
   # 没拉进任何 STL/EH 也会带上,否则会把合法 repro 误判失败。
-  CXXPAT='_ZNSt|_ZSt|_Zn[wa]|_Zd[la]|__gxx_personality|__cxa_(throw|begin_catch|end_catch|allocate_exception|free_exception|rethrow|call_unexpected|bad_)'
+  # 注意:这里必须用双引号。整个脚本已被外层 sh -c 的单引号包住,内层再出现单引号会提前
+  # 闭合外层(本注释也因此不含任何单引号)。此正则不含会被双引号展开的字符,双引号安全。
+  CXXPAT="_ZNSt|_ZSt|_Zn[wa]|_Zd[la]|__gxx_personality|__cxa_(throw|begin_catch|end_catch|allocate_exception|free_exception|rethrow|call_unexpected|bad_)"
   cxx=$(nm /tmp/derisk_musl | grep -cE "$CXXPAT" || true)
   [ "$cxx" -eq 0 ] || { echo "FAIL: $cxx 个 C++ 运行时/异常符号"; nm /tmp/derisk_musl | grep -E "$CXXPAT"; exit 1; }
   echo "C++ 运行时符号 0 ✓"
