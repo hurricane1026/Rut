@@ -4,6 +4,9 @@
 
 #include "rut/serve_loader.h"
 #include "test.h"
+#if RUT_ENABLE_WEBSOCKET
+#include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn / WsFrameAction / WsOpcode
+#endif
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -43,6 +46,35 @@ TEST(serve_loader, status_routes_load) {
     CHECK_EQ(program.config.route_count, 2u);
     program.destroy();
 }
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
+    // End-to-end (Phase 4 D/E): a `websocket(x){ frame.drop() }` route compiles, its constant
+    // verdict is JIT'd, and it's published as a terminate route whose frame handler — when
+    // called — returns the compiled verdict.
+    const std::string dir = "/tmp/rut_serve_loader_ws";
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame.drop() } }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    bool found = false;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        const auto& r = program.config.routes[i];
+        if (!r.ws_terminate) continue;
+        found = true;
+        REQUIRE(r.ws_frame_handler != nullptr);
+        CHECK(r.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0) == WsFrameAction::Drop);
+    }
+    CHECK(found);
+    program.destroy();
+}
+#endif
 
 TEST(serve_loader, missing_file_fails_at_read) {
     LoadedProgram program;

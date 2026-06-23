@@ -1646,4 +1646,60 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     return {c.llvm_mod, c.llvm_ctx, true};
 }
 
+u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {
+    if (!out || out_size == 0) return 0;
+    static constexpr char kPrefix[] = "ws_handler_";
+    u32 pos = 0;
+    while (kPrefix[pos] && pos + 1 < out_size) {
+        out[pos] = kPrefix[pos];
+        pos++;
+    }
+    // Append the decimal id (digits produced in reverse, then reversed into place).
+    char digits[10];
+    u32 nd = 0;
+    u32 v = id;
+    do {
+        digits[nd++] = static_cast<char>('0' + (v % 10));
+        v /= 10;
+    } while (v != 0 && nd < 10);
+    for (u32 i = 0; i < nd && pos + 1 < out_size; i++) out[pos++] = digits[nd - 1 - i];
+    out[pos] = '\0';
+    return pos;
+}
+
+bool emit_ws_handler(LLVMModuleRef mod, LLVMContextRef ctx, u8 verdict, u32 id) {
+    if (!mod || !ctx) return false;
+    LLVMTypeRef i8_ty = LLVMInt8TypeInContext(ctx);
+    LLVMTypeRef i64_ty = LLVMInt64TypeInContext(ctx);
+    LLVMTypeRef ptr_ty = LLVMPointerTypeInContext(ctx, 0);
+    // (ctx, opcode, payload, len) -> verdict, matching WsMessageHandlerFn's C ABI.
+    LLVMTypeRef params[4] = {ptr_ty, i8_ty, ptr_ty, i64_ty};
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8_ty, params, 4, 0);
+
+    char sym[64];
+    format_ws_handler_symbol(id, sym, sizeof(sym));
+    LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
+    if (!fn) return false;
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+    LLVMBuilderRef builder = LLVMCreateBuilderInContext(ctx);
+    if (!builder) return false;
+    LLVMPositionBuilderAtEnd(builder, entry);
+    // Constant verdict: ignore the message, return the compile-time WsFrameAction.
+    LLVMBuildRet(builder, LLVMConstInt(i8_ty, verdict, /*SignExtend=*/0));
+    LLVMDisposeBuilder(builder);
+    return true;
+}
+
+CodegenResult codegen_ws_handler(u8 verdict, u32 id) {
+    LLVMContextRef ctx = LLVMContextCreate();
+    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext("rut_ws_handler", ctx);
+    if (!emit_ws_handler(mod, ctx, verdict, id)) {
+        LLVMDisposeModule(mod);
+        LLVMContextDispose(ctx);
+        return {nullptr, nullptr, false};
+    }
+    return {mod, ctx, true};
+}
+
 }  // namespace rut::jit
