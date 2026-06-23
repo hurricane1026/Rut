@@ -908,6 +908,9 @@ struct HirWsHandler {
     // Lowering the modify path (the bounded output buffer) is Phase 4b; build_mir still rejects.
     bool has_forward_payload = false;
     u32 forward_payload_expr = 0xffffffffu;
+    // `frame.close(code)` status code (default 1000 = normal closure). Only meaningful when
+    // default_verdict == Close. Validated to RFC 6455 application close codes in analyze.
+    u16 close_code = 1000;
     u32 upstream_index = 0;
     Span span{};
 };

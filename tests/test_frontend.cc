@@ -1271,16 +1271,82 @@ TEST(frontend, analyze_accepts_websocket_forward_only) {
              static_cast<u8>(WsVerdict::Forward));
 }
 
-TEST(frontend, analyze_rejects_websocket_drop_for_now) {
-    // Drop/close verdicts, frame accessors and guards are follow-up slices. Slice B accepts
-    // only forward-only, so `frame.drop()` must be rejected — documents the slice boundary.
+TEST(frontend, analyze_accepts_websocket_drop) {
+    // `frame.drop()` → Drop verdict.
     const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    CHECK(!hir);  // not yet supported
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK(hir->routes[0].is_ws_terminate);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].ws_handler.default_verdict),
+             static_cast<u8>(WsVerdict::Drop));
+}
+
+TEST(frontend, analyze_accepts_websocket_close_default_code) {
+    // `frame.close()` → Close verdict, default code 1000.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].ws_handler.default_verdict),
+             static_cast<u8>(WsVerdict::Close));
+    CHECK_EQ(hir->routes[0].ws_handler.close_code, static_cast<u16>(1000));
+}
+
+TEST(frontend, analyze_accepts_websocket_close_with_code) {
+    // `frame.close(1008)` → Close verdict, policy-violation code.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close(1008) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].ws_handler.default_verdict),
+             static_cast<u8>(WsVerdict::Close));
+    CHECK_EQ(hir->routes[0].ws_handler.close_code, static_cast<u16>(1008));
+}
+
+TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
+    // 1006 (abnormal closure) must never be sent on the wire → rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close(1006) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_websocket_drop_with_args) {
+    // drop takes no arguments.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop(1) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
+TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
+    // Only forward/drop/close are verdicts; an unknown frame method is rejected.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.bogus() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
 }
 
 TEST(frontend, build_mir_rejects_ws_terminate_until_codegen) {

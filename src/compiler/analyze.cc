@@ -9273,47 +9273,80 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 #if RUT_ENABLE_WEBSOCKET
     if (stmt.kind == AstStmtKind::WsTerminate) {
         // Terminate-mode frame handler `websocket(x) { ... }`. Resolve the upstream, then
-        // accept only the forward-only body (Slice B); the route carries a HirWsHandler
+        // accept a single per-message verdict statement; the route carries a HirWsHandler
         // instead of an HTTP terminator and `control` stays unused. Lowering rejects it
         // until the frame-handler JIT path lands (Slices C–E).
         auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
         if (!upstream_index) return core::make_unexpected(upstream_index.error());
         // The body collapses to a single statement (parser rejects empty blocks and unwraps
-        // one-statement blocks), so the body is exactly one Expr statement `frame.forward(...)`.
+        // one-statement blocks), so the body is exactly one Expr statement `frame.<verdict>(...)`:
+        //   frame.forward()         forward unchanged
+        //   frame.forward(payload)  forward a rewritten Str payload (modify; runtime = 4b)
+        //   frame.drop()            drop the message
+        //   frame.close() / (code)  close the tunnel (default 1000)
         // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method
         // name after `.`, and the `frame.` receiver keeps it distinct from
-        // `return forward(upstream)`.) `frame.forward()` forwards the message unchanged;
-        // `frame.forward(payload)` forwards a rewritten Str payload (the modify form). Drop/
-        // close, frame accessors, guards and multi-statement bodies are follow-up slices.
+        // `return forward(upstream)`.) Frame accessors, guards and multi-statement bodies are
+        // follow-up slices.
         const AstStatement* body = stmt.then_stmt;
         if (body == nullptr || body->kind != AstStmtKind::Expr)
             return frontend_error(FrontendError::UnsupportedSyntax, body ? body->span : stmt.span);
         const AstExpr& call = body->expr;
-        const bool is_frame_forward = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
-                                      call.lhs->kind == AstExprKind::Ident &&
-                                      call.lhs->name.eq({"frame", 5}) &&
-                                      call.name.eq({"forward", 7});
-        // forward() or forward(payload) — at most one argument.
-        if (!is_frame_forward || call.args.len > 1)
-            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        const bool is_frame_method = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
+                                     call.lhs->kind == AstExprKind::Ident &&
+                                     call.lhs->name.eq({"frame", 5});
+        if (!is_frame_method) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         route->is_ws_terminate = true;
-        route->ws_handler.default_verdict = WsVerdict::Forward;
         route->ws_handler.upstream_index = upstream_index.value();
         route->ws_handler.span = stmt.span;
-        if (call.args.len == 1) {
-            // Modify form: the payload must be a definite Str (text-frame content). Binary
-            // payloads + opcode matching are a follow-up; runtime emit is Phase 4b.
-            if (call.args[0] == nullptr)
+
+        if (call.name.eq({"forward", 7})) {
+            if (call.args.len > 1)  // forward() or forward(payload)
                 return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-            auto payload = analyze_expr(
-                *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
-            if (!payload) return core::make_unexpected(payload.error());
-            if (payload->type != HirTypeKind::Str || payload->may_nil || payload->may_error)
-                return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
-            if (!route->exprs.push(payload.value()))
-                return frontend_error(FrontendError::TooManyItems, call.span);
-            route->ws_handler.has_forward_payload = true;
-            route->ws_handler.forward_payload_expr = route->exprs.len - 1;
+            route->ws_handler.default_verdict = WsVerdict::Forward;
+            if (call.args.len == 1) {
+                // Modify form: the payload must be a definite Str (text-frame content). Binary
+                // payloads + opcode matching are a follow-up; runtime emit is Phase 4b.
+                if (call.args[0] == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+                auto payload = analyze_expr(
+                    *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
+                if (!payload) return core::make_unexpected(payload.error());
+                if (payload->type != HirTypeKind::Str || payload->may_nil || payload->may_error)
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+                if (!route->exprs.push(payload.value()))
+                    return frontend_error(FrontendError::TooManyItems, call.span);
+                route->ws_handler.has_forward_payload = true;
+                route->ws_handler.forward_payload_expr = route->exprs.len - 1;
+            }
+        } else if (call.name.eq({"drop", 4})) {
+            if (call.args.len != 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            route->ws_handler.default_verdict = WsVerdict::Drop;
+        } else if (call.name.eq({"close", 5})) {
+            if (call.args.len > 1)  // close() or close(code)
+                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            route->ws_handler.default_verdict = WsVerdict::Close;
+            if (call.args.len == 1) {
+                if (call.args[0] == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+                auto code = analyze_expr(
+                    *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
+                if (!code) return core::make_unexpected(code.error());
+                ConstValue cv{};
+                if (code->type != HirTypeKind::I32 ||
+                    !const_eval_expr(code.value(), route->locals.data, route->locals.len, &cv, 0) ||
+                    cv.type != HirTypeKind::I32)
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+                // RFC 6455 §7.4.1 application close codes: 1000–4999, excluding the reserved
+                // codes a sender must never put on the wire (1004/1005/1006/1015).
+                const i32 c = cv.int_value;
+                if (c < 1000 || c > 4999 || c == 1004 || c == 1005 || c == 1006 || c == 1015)
+                    return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+                route->ws_handler.close_code = static_cast<u16>(c);
+            }
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
         }
         return {};
     }
