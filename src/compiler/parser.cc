@@ -86,6 +86,41 @@ struct Parser {
         return block;
     }
 
+#if RUT_ENABLE_WEBSOCKET
+    // Parse a WebSocket terminate-mode frame-handler body `{ ... }`. Distinct from
+    // parse_braced_stmt_body because frame verdicts are **bare method-call statements**
+    // (`frame.forward()`), which the general statement parser (parse_stmt) deliberately
+    // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
+    // accepts only bare expression statements; guards/match over `frame` are follow-up slices.
+    // Mirrors parse_braced_stmt_body's empty-block rejection and one-statement unwrap so analyze
+    // sees the same body shape.
+    FrontendResult<AstStatement> parse_ws_frame_body(const Token& lbrace_tok) {
+        AstStatement block{};
+        block.kind = AstStmtKind::Block;
+        block.span = span_from(lbrace_tok);
+        while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            auto expr = parse_expr();
+            if (!expr) return core::make_unexpected(expr.error());
+            AstStatement st{};
+            st.kind = AstStmtKind::Expr;
+            st.expr = expr.value();
+            st.span = expr->span;
+            auto ptr = alloc_stmt(st);
+            if (!ptr) return core::make_unexpected(ptr.error());
+            if (!block.block_stmts.push(ptr.value()))
+                return frontend_error(FrontendError::TooManyItems, expr->span);
+        }
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+        if (block.block_stmts.len == 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*rbrace.value()), kEmptyBlockDetail);
+        block.span.end = rbrace.value()->end;
+        if (block.block_stmts.len == 1) return *block.block_stmts[0];
+        return block;
+    }
+#endif
+
     FrontendResult<AstStatement> parse_func_guard_stmt(const Token& guard_tok) {
         AstStatement stmt{};
         stmt.kind = AstStmtKind::Guard;
@@ -555,7 +590,12 @@ struct Parser {
             }
             if (!take(TokenType::Dot)) break;
             const Token* field_name = nullptr;
-            if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc) {
+            // After `.` the token is a member name, not a statement keyword, so a reserved
+            // word there is unambiguous. `func` is already allowed; `forward` is allowed too
+            // so the WebSocket frame verdict can be spelled `frame.forward()` even though
+            // `forward` is the proxy-terminator keyword (the `frame.` receiver disambiguates).
+            if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc ||
+                cur().type == TokenType::KwForward) {
                 field_name = &cur();
                 pos++;
             } else {
@@ -956,7 +996,7 @@ struct Parser {
                 if (cur().type == TokenType::LBrace) {
                     auto lbrace = expect(TokenType::LBrace);
                     if (!lbrace) return core::make_unexpected(lbrace.error());
-                    auto body = parse_braced_stmt_body(*lbrace.value());
+                    auto body = parse_ws_frame_body(*lbrace.value());
                     if (!body) return core::make_unexpected(body.error());
                     auto body_ptr = alloc_stmt(body.value());
                     if (!body_ptr) return core::make_unexpected(body_ptr.error());

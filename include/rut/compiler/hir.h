@@ -886,6 +886,27 @@ struct HirForLoop {
     HirForLoopBody body{};
 };
 
+// WebSocket terminate-mode frame-handler verdict. Mirrors the runtime
+// `WsFrameAction` (ws_terminate.h): the per-message disposition the JIT'd
+// handler returns. Slice B only produces `Forward` (forward-only / empty
+// body); Drop/Close are follow-up slices.
+enum class WsVerdict : u8 {
+    Forward,
+    Drop,
+    Close,
+};
+
+// HIR of a `websocket(<upstream>) { <frame-handler> }` terminate route. A frame
+// handler is a pure verdict function `(opcode, payload, len) -> WsVerdict`, not
+// an HTTP terminator, so it lives beside HirRoute.control rather than in it.
+// Slice B: forward-only, so just the default verdict + the resolved upstream.
+struct HirWsHandler {
+    WsVerdict default_verdict = WsVerdict::Forward;
+    u32 upstream_index = 0;
+    u32 max_message_size = 0;  // 0 = engine default; set when the cap kwarg lands
+    Span span{};
+};
+
 struct HirRoute {
     struct DecoratorRef {
         Span span{};
@@ -928,6 +949,12 @@ struct HirRoute {
     RateLimitRuleSet rate_limit{};
     // @throttle decorator → client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    // WebSocket terminate mode: when the route body is `websocket(x){...}`, this
+    // route has no HTTP terminator — `ws_handler` carries the frame-handler
+    // verdict instead and `control` is unused. (Slice B; lowering rejects it
+    // until the JIT path lands.)
+    bool is_ws_terminate = false;
+    HirWsHandler ws_handler{};
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -944,7 +971,9 @@ struct HirRoute {
           control(other.control),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
-          throttle_down_bps(other.throttle_down_bps) {
+          throttle_down_bps(other.throttle_down_bps),
+          is_ws_terminate(other.is_ws_terminate),
+          ws_handler(other.ws_handler) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -963,6 +992,8 @@ struct HirRoute {
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        is_ws_terminate = other.is_ws_terminate;
+        ws_handler = other.ws_handler;
         rebase_from(other);
         return *this;
     }
@@ -980,7 +1011,9 @@ struct HirRoute {
           control(other.control),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
-          throttle_down_bps(other.throttle_down_bps) {
+          throttle_down_bps(other.throttle_down_bps),
+          is_ws_terminate(other.is_ws_terminate),
+          ws_handler(other.ws_handler) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -999,6 +1032,8 @@ struct HirRoute {
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        is_ws_terminate = other.is_ws_terminate;
+        ws_handler = other.ws_handler;
         rebase_from(other);
         return *this;
     }
