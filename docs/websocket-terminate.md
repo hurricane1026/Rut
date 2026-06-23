@@ -38,11 +38,16 @@ language choices — the design must stay inside them or call out the specific r
 
 - **Single-frame messages only.** The tunnel arms the inspector with `reject_fragmented = true`
   (both directions), so a fragmented WebSocket message (`FIN=0` / continuation) **fails closed
-  before the handler** — it does *not* run "once per reassembled message". Multi-frame
-  reassembly needs a separate output buffer (lifts in lockstep with the size cap below).
+  before the handler** — it does *not* run "once per reassembled message". The assembler can
+  already reassemble fragments within the cap; what's missing is a separate per-direction
+  **output** buffer (in-place re-frame overflows the final read), so this is **independent** of
+  the size cap below (§8).
 - **Max message ≈ one slice (~16 KB).** `ws_arm_terminate` clamps the cap to
   `SlicePool::kSliceSize - kWsMaxHeaderSize` (~16 KB); a larger `maxMessageSize` is silently
-  clamped and an over-cap message fails closed. Lifting it needs a multi-slice reassembly buffer.
+  clamped and an over-cap message fails closed. Lifting it needs **both** a multi-slice
+  reassembly buffer **and a larger/streaming input path** — `ws_inspect` only acts once
+  `avail >= header_len + payload_len`, and the callers feed it one slice-backed recv buffer, so
+  an unfragmented 64 KB frame never becomes fully available to inspect (§8).
 - **Text / Binary only.** The engine passes Ping/Pong/Close **through** before the handler
   path, so a frame handler is *never* invoked for control frames — `frame.opcode` is only
   `.text` or `.binary`.
@@ -108,7 +113,7 @@ route GET "/ws" {
     websocket(chat, maxMessageSize: 8kb) {   // ≤ ~16 KB in v1 (one slice; see §1.1)
         // runs once per (single-frame) Text/Binary message, both directions
         guard let text = frame.text else { return drop }   // .text is error-capable: not-Text → drop
-        guard frame.len <= 4kb else { return close }       // v1: bare close (see §5)
+        guard frame.len <= 4096 else { return close }      // bytes (see frame.len note in §4)
         return forward
     }
 }
@@ -173,7 +178,7 @@ reach it.
 | `frame.text` | error-capable `string` | the payload as UTF-8 text; **errors if the frame is Binary** (engine already UTF-8-validates Text). Use with `guard let` |
 | `frame.binary` | error-capable `bytes` | the payload; **errors if the frame is Text** |
 | `frame.payload` | `bytes` | raw reassembled payload (always valid) |
-| `frame.len` | `ByteSize` | payload length (`<= maxMessageSize`) |
+| `frame.len` | integer (bytes) | payload length (`<= maxMessageSize`). **v1 is a plain integer** so `frame.len <= 4096` parses with the existing expression grammar — `4kb` is *not* a valid expression literal today (the `IntLit + kb/mb` ByteSize form is special-cased for decorator/kwarg parsing, not general expressions). Typing it `ByteSize` + allowing `4kb` in handler expressions is a Slice B dependency (deferred). |
 | `frame.fromClient` | `bool` | direction: client→upstream (`true`) vs upstream→client (`false`) — *needs the §8 direction-ABI bump; omit from v1 if not landed* |
 | `frame.json` | error-capable `Json` | payload parsed as JSON; errors on parse failure — *depends on a JSON builtin (§8)* |
 
@@ -291,7 +296,7 @@ The inspect-only v1 (single-frame Text/Binary ≤ ~16 KB; `forward`/`drop`/bare-
 | `frame.fromClient` | `WsMessageHandlerFn` gains a `bool from_client` (or richer `ctx`); engine passes the leg | ship v1 with **no direction**; one handler, both legs identical |
 | `close(code)` | extend the handler return path to carry an RFC 6455 code (`WsFrameAction` → `{action, code}`, or a ctx field) **and** apply it at *both* emit sites — the `ws_inspect` forward Close and `ws_emit_close_frame` | bare `close` only: forward peer gets **1005 No Status**, echo gets **1000** |
 | Fragmented messages (within the ~16 KB cap) | a **separate per-direction output buffer** — the assembler already reassembles fragments into its message buffer, but in-place re-framing can overflow the final read, which is why `reject_fragmented` is set; an output buffer (the *same* one modify needs) lifts it | fragmented messages fail closed before the handler |
-| Messages > ~16 KB | a **multi-slice reassembly buffer** (today `ws_arm_terminate` clamps to one slice) — *independent* of fragmentation | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
+| Messages > ~16 KB | a multi-slice reassembly buffer **and a larger/streaming input path** — `ws_inspect` waits for `avail >= header_len + payload_len` and the callers feed one slice-backed recv buffer, so a 64 KB *unfragmented* frame never becomes fully available; reassembly storage alone isn't enough (or require clients to fragment into slice-sized frames). *Independent* of the fragmentation/output-buffer work | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
 | `frame.json` / `validate(_, Schema)` | a JSON value type + parser builtin (regex `re"…"`/Vectorscan already exists) | ship `frame.text` + regex-based validation first |
 | `frame.text =` / modify (§6) | **add** a bounded per-direction output slice + send-drain state (none exists — re-frame is in-place; modified output can exceed the input) | verdict-only; no payload rewrite |
 
@@ -330,9 +335,10 @@ runtime changes A–E deliberately avoid.
    matches "handlers must return a Response"), or default to `forward` when the block ends
    (terser, since most messages pass)? *Leaning: explicit, with `=> forward` sugar for the
    common one-liner.*
-2. **`fromClient` in v1 or deferred?** It needs the small ABI bump (§8). *Leaning: include it
-   — direction-awareness is core to the real use cases (Kong's size/schema plugins are
-   per-direction).*
+2. **`fromClient` in v1 or deferred?** It needs the small ABI bump (§8), so to keep A–E
+   zero-runtime-change it is **deferred to the dedicated `dir` slice** (right after E) — *not*
+   in v1. Direction-awareness is still core to the real use cases (Kong's size/schema plugins
+   are per-direction), so `dir` is the very next slice; it is just not part of the no-runtime v1.
 3. **Modify (§6) in Phase 4 or 4b?** *Leaning: 4b — keep v1 verdict-only so the engine data
    path is untouched.*
 4. **Declarative sugar surface** — offer `maxMessageSize:` / `allow:` / `drop: re"..."`
