@@ -5045,13 +5045,19 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     return false;
 }
 
+// Resolve an upstream by name; UnknownUpstream (at `span`) when absent. Shared by the route
+// terminator (analyze_term), wait-arg resolution, and the WebSocket terminate handler.
+static FrontendResult<u32> find_upstream_index_by_name(const HirModule& mod, Str name, Span span) {
+    for (u32 i = 0; i < mod.upstreams.len; i++) {
+        if (mod.upstreams[i].name.eq(name)) return i;
+    }
+    return frontend_error(FrontendError::UnknownUpstream, span, name);
+}
+
 static FrontendResult<u32> find_wait_upstream_index(const HirModule& mod, const AstExpr& arg) {
     if (arg.kind != AstExprKind::Ident)
         return frontend_error(FrontendError::UnsupportedSyntax, arg.span);
-    for (u32 i = 0; i < mod.upstreams.len; i++) {
-        if (mod.upstreams[i].name.eq(arg.name)) return i;
-    }
-    return frontend_error(FrontendError::UnknownUpstream, arg.span, arg.name);
+    return find_upstream_index_by_name(mod, arg.name, arg.span);
 }
 
 static bool wait_req_body_arg(const AstExpr& arg) {
@@ -7911,17 +7917,20 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         return term;
     }
 
-    u32 upstream_index = mod.upstreams.len;
-    for (u32 j = 0; j < mod.upstreams.len; j++) {
-        if (mod.upstreams[j].name.eq(stmt.name)) {
-            upstream_index = j;
-            break;
-        }
+    // A `websocket(x) { ... }` terminate handler is only supported as the route's tail
+    // terminator (handled in analyze_control_stmt, which builds the HirWsHandler). Reaching
+    // analyze_term means it appears in a NESTED terminator position — a match arm, if/else
+    // branch, or guard-fail body — which Slice B does not support. Reject explicitly so it
+    // never falls through to the ForwardUpstream resolution below (which would silently
+    // compile a terminate route as a transparent passthrough tunnel, dropping the block).
+    if (stmt.kind == AstStmtKind::WsTerminate) {
+        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     }
-    if (upstream_index == mod.upstreams.len)
-        return frontend_error(FrontendError::UnknownUpstream, stmt.span, stmt.name);
+
+    auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
+    if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
-    term.upstream_index = upstream_index;
+    term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
     return term;
 }
@@ -9260,6 +9269,55 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         }
         return {};
     }
+
+#if RUT_ENABLE_WEBSOCKET
+    if (stmt.kind == AstStmtKind::WsTerminate) {
+        // Terminate-mode frame handler `websocket(x) { ... }`. Resolve the upstream, then
+        // accept only the forward-only body (Slice B); the route carries a HirWsHandler
+        // instead of an HTTP terminator and `control` stays unused. Lowering rejects it
+        // until the frame-handler JIT path lands (Slices C–E).
+        auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
+        if (!upstream_index) return core::make_unexpected(upstream_index.error());
+        // The body collapses to a single statement (parser rejects empty blocks and unwraps
+        // one-statement blocks), so the body is exactly one Expr statement `frame.forward(...)`.
+        // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method
+        // name after `.`, and the `frame.` receiver keeps it distinct from
+        // `return forward(upstream)`.) `frame.forward()` forwards the message unchanged;
+        // `frame.forward(payload)` forwards a rewritten Str payload (the modify form). Drop/
+        // close, frame accessors, guards and multi-statement bodies are follow-up slices.
+        const AstStatement* body = stmt.then_stmt;
+        if (body == nullptr || body->kind != AstStmtKind::Expr)
+            return frontend_error(FrontendError::UnsupportedSyntax, body ? body->span : stmt.span);
+        const AstExpr& call = body->expr;
+        const bool is_frame_forward = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
+                                      call.lhs->kind == AstExprKind::Ident &&
+                                      call.lhs->name.eq({"frame", 5}) &&
+                                      call.name.eq({"forward", 7});
+        // forward() or forward(payload) — at most one argument.
+        if (!is_frame_forward || call.args.len > 1)
+            return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+        route->is_ws_terminate = true;
+        route->ws_handler.default_verdict = WsVerdict::Forward;
+        route->ws_handler.upstream_index = upstream_index.value();
+        route->ws_handler.span = stmt.span;
+        if (call.args.len == 1) {
+            // Modify form: the payload must be a definite Str (text-frame content). Binary
+            // payloads + opcode matching are a follow-up; runtime emit is Phase 4b.
+            if (call.args[0] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+            auto payload = analyze_expr(
+                *call.args[0], route, mod, route->locals.data, route->locals.len, nullptr);
+            if (!payload) return core::make_unexpected(payload.error());
+            if (payload->type != HirTypeKind::Str || payload->may_nil || payload->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
+            if (!route->exprs.push(payload.value()))
+                return frontend_error(FrontendError::TooManyItems, call.span);
+            route->ws_handler.has_forward_payload = true;
+            route->ws_handler.forward_payload_expr = route->exprs.len - 1;
+        }
+        return {};
+    }
+#endif
 
     route->control.kind = HirControlKind::Direct;
     auto term = analyze_term(stmt, mod);
@@ -15407,7 +15465,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             break;
         }
 
-        if (route.control.kind == HirControlKind::Direct &&
+        // A ws-terminate route carries a HirWsHandler, not a direct_term, so its empty
+        // direct_term is expected — don't flag it as a missing terminator.
+        if (!route.is_ws_terminate && route.control.kind == HirControlKind::Direct &&
             route.control.direct_term.span.end == 0 && route.control.direct_term.span.start == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
 

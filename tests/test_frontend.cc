@@ -1215,6 +1215,153 @@ TEST(frontend, parse_return_forward_name) {
     CHECK_EQ(term.upstream_index, 0u);
 }
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, parse_return_websocket_bare_is_passthrough) {
+    // A bare `websocket(<upstream>)` (no trailing block) stays the passthrough tunnel —
+    // the same ForwardUpstream terminator as `forward`, unchanged from Phase 0.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    const auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    const auto& stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
+    CHECK(stmt.name.eq(lit("ws")));
+}
+
+TEST(frontend, parse_return_websocket_block_is_terminate) {
+    // A trailing `{ ... }` block turns it into TERMINATE mode (WsTerminate) — the block is the
+    // per-message frame handler, parsed onto `then_stmt`. Frame verdicts are bare method calls
+    // (`frame.forward()`), parsed by the dedicated frame-body parser (parse_ws_frame_body), so
+    // the one-statement body unwraps to an Expr/MethodCall statement.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 2u);
+    const auto& route = ast->items[1].route;
+    REQUIRE_EQ(route.statements.len, 1u);
+    const auto& stmt = route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
+    CHECK(stmt.name.eq(lit("ws")));
+    REQUIRE(stmt.then_stmt != nullptr);  // the frame-handler body
+    CHECK_EQ(static_cast<u8>(stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Expr));
+    CHECK_EQ(static_cast<u8>(stmt.then_stmt->expr.kind), static_cast<u8>(AstExprKind::MethodCall));
+}
+
+TEST(frontend, analyze_accepts_websocket_forward_only) {
+    // Slice B: the forward-only frame handler `frame.forward()` analyzes into a HirWsHandler
+    // on the route (verdict Forward) instead of an HTTP terminator.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK(hir->routes[0].is_ws_terminate);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].ws_handler.default_verdict),
+             static_cast<u8>(WsVerdict::Forward));
+}
+
+TEST(frontend, analyze_rejects_websocket_drop_for_now) {
+    // Drop/close verdicts, frame accessors and guards are follow-up slices. Slice B accepts
+    // only forward-only, so `frame.drop()` must be rejected — documents the slice boundary.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);  // not yet supported
+}
+
+TEST(frontend, build_mir_rejects_ws_terminate_until_codegen) {
+    // The forward-only handler type-checks (analyze OK), but the verdict-function JIT path
+    // doesn't exist yet, so build_mir rejects it — the not-yet-implemented seam lives there.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    CHECK(!mir);  // lowering refuses until Slices C–E
+}
+
+TEST(frontend, analyze_accepts_websocket_forward_payload) {
+    // `frame.forward(payload)` is the modify-and-send form. It must PARSE as a MethodCall on
+    // `frame` named "forward" with ONE arg — NOT get mis-routed into the `forward(upstream)`
+    // proxy terminator by the contextual-keyword rule — and analyze accepts it when the arg is
+    // a Str payload, recording has_forward_payload. (Runtime emit is Phase 4b; build_mir
+    // still rejects.)
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(\"hi\") } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& stmt = ast->items[1].route.statements[0];
+    REQUIRE_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
+    REQUIRE(stmt.then_stmt != nullptr);
+    const auto& call = stmt.then_stmt->expr;
+    CHECK_EQ(static_cast<u8>(call.kind), static_cast<u8>(AstExprKind::MethodCall));
+    CHECK(call.name.eq(lit("forward")));  // member name, not a terminator
+    REQUIRE(call.lhs != nullptr);
+    CHECK(call.lhs->name.eq(lit("frame")));
+    CHECK_EQ(call.args.len, 1u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK(hir->routes[0].is_ws_terminate);
+    CHECK(hir->routes[0].ws_handler.has_forward_payload);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].ws_handler.default_verdict),
+             static_cast<u8>(WsVerdict::Forward));
+}
+
+TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
+    // The modify payload must be a Str (text-frame content). A non-Str arg is rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(123) } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);  // payload is not Str
+}
+
+TEST(frontend, analyze_rejects_websocket_forward_two_args) {
+    // forward takes at most one payload; two args is rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(\"a\", \"b\") } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+#else
+TEST(frontend, websocket_rejected_when_disabled) {
+    // -DRUT_ENABLE_WEBSOCKET=0: the parser rejects `websocket(...)` outright.
+    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);  // UnsupportedSyntax in the WebSocket-disabled build
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
 TEST(frontend, parse_return_forward_rejects_bare_forward_statement) {
     // Bare `forward <name>` is no longer accepted — the keyword only
     // parses as part of the `return forward(<name>)` builder. Keep a
