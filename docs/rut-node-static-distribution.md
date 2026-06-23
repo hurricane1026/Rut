@@ -121,11 +121,17 @@ BoringSSL 在 musl-static 下能编能跑,比 OpenSSL 自包含得多(无 provid
 |---|---|
 | musl 静态编 C | ✅ 完美,`readelf -d` 无 `.dynamic`,零 NEEDED |
 | vendored vectorscan `hs_runtime`(FAT_RUNTIME=OFF,static)musl 编译 | ✅ 成功,`libhs_runtime.a` 1.73MB |
-| TLS(BoringSSL / OpenSSL static)musl 静态链 | ✅ 链通 |
+| TLS(**vendored BoringSSL** static,`third_party/boringssl`)musl 静态链 | ✅ 链通 |
 | 最终二进制 `readelf -d` | **零 NEEDED**;`ldd` = "Not a valid dynamic program" |
 | **libstdc++ / 异常符号** | **0** —— rut 本就 no-STL,vectorscan runtime 那 13 个 `.cpp` 只用模板+SIMD intrinsics,不碰 STL/异常 |
 
 **关键收获:rut-node 整个二进制可不背任何 C++ 运行时,只靠 musl libc。**
+
+> **复现修正(2026-06-23):** 早期 harness 链的是 Alpine `openssl-libs-static`(系统 OpenSSL),
+> 而不是 vendored BoringSSL —— 与本节"BoringSSL"结论及下面的体积数不符,也违反"不引系统
+> OpenSSL"的项目约束。`scripts/musl_derisk/` 已改为**现场编 `third_party/boringssl` 并链其
+> `.a`**、头走 vendored `-I`、各断言 fail-hard、`nm` 在 strip 前。**BoringSSL 的链通与体积数
+> 应在修正后的 harness 上重跑确认**(本次修正未在 musl 环境复跑)。
 
 ### 5.2 构建工具链
 
