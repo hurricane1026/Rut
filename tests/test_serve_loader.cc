@@ -108,6 +108,36 @@ TEST(serve_loader, websocket_terminate_len_guard_branches_on_length) {
     CHECK(h(nullptr, WsOpcode::Text, nullptr, 100) == WsFrameAction::Forward);   // under cap
     program.destroy();
 }
+
+TEST(serve_loader, websocket_terminate_opcode_guard_drops_binary) {
+    // Opcode discrimination end-to-end: `guard frame.isText else { frame.drop() }` then forward
+    // — a text-only handler. The JIT'd handler must branch on the opcode param: forward Text,
+    // drop Binary.
+    const std::string dir = "/tmp/rut_serve_loader_ws_opcode";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  guard frame.isText else { frame.drop() }\n"
+                                        "  frame.forward()\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    WsMessageHandlerFn h = nullptr;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (program.config.routes[i].ws_terminate) {
+            h = program.config.routes[i].ws_frame_handler;
+            break;
+        }
+    }
+    REQUIRE(h != nullptr);
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100) == WsFrameAction::Forward);  // text -> forward
+    CHECK(h(nullptr, WsOpcode::Binary, nullptr, 100) == WsFrameAction::Drop);   // binary -> drop
+    program.destroy();
+}
 #endif
 
 TEST(serve_loader, missing_file_fails_at_read) {

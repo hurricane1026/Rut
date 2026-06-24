@@ -900,15 +900,18 @@ enum class WsVerdict : u8 {
 // handler is a pure verdict function `(opcode, payload, len) -> WsVerdict`, not
 // an HTTP terminator, so it lives beside HirRoute.control rather than in it.
 // Slice B: forward-only, so just the default verdict + the resolved upstream.
-// One `guard frame.len <cmp> <bound> else { <verdict> }` in a terminate handler. `cmp` is the
-// comparison written in the source; when it is FALSE for a message, the handler yields
-// `verdict` (the else branch). Evaluated against the reassembled message length.
+// One guard in a terminate handler — a condition on a frame accessor that, when FALSE for a
+// message, yields `verdict` (the else branch). Two accessors so far:
+//   Len    — `guard frame.len <cmp> N`        : the reassembled message length (the len param)
+//   Opcode — `guard frame.isText`/`isBinary`  : the message opcode (== Text / == Binary)
 struct WsLenGuard {
+    enum class Accessor : u8 { Len, Opcode };
     // Rut's comparison operators are only `<` `>` `==` (no `<=`/`>=`/`!=`), so these three
-    // cover every guard condition analyze can produce.
+    // cover every guard condition analyze can produce. Opcode guards always use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
+    Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
-    u32 bound = 0;                        // the integer literal (bytes) frame.len is compared to
+    u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
     WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
 };
 

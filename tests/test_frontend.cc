@@ -1367,8 +1367,32 @@ TEST(frontend, analyze_accepts_websocket_len_guard) {
     const auto& h = hir->routes[0].ws_handler;
     CHECK_EQ(static_cast<u8>(h.default_verdict), static_cast<u8>(WsVerdict::Forward));
     REQUIRE_EQ(h.len_guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].accessor), static_cast<u8>(WsLenGuard::Accessor::Len));
     CHECK_EQ(static_cast<u8>(h.len_guards[0].cmp), static_cast<u8>(WsLenGuard::Cmp::Lt));
     CHECK_EQ(h.len_guards[0].bound, 4096u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].verdict), static_cast<u8>(WsVerdict::Drop));
+}
+
+TEST(frontend, analyze_accepts_websocket_opcode_guard) {
+    // `guard frame.isText else { frame.drop() }` then forward → one opcode guard (Opcode, Eq,
+    // Text=1, Drop) plus the default Forward verdict — a text-only handler.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "  guard frame.isText else { frame.drop() }\n"
+        "  frame.forward()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& h = hir->routes[0].ws_handler;
+    REQUIRE_EQ(h.len_guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].accessor),
+             static_cast<u8>(WsLenGuard::Accessor::Opcode));
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].cmp), static_cast<u8>(WsLenGuard::Cmp::Eq));
+    CHECK_EQ(h.len_guards[0].bound, 1u);  // WsOpcode Text
     CHECK_EQ(static_cast<u8>(h.len_guards[0].verdict), static_cast<u8>(WsVerdict::Drop));
 }
 
