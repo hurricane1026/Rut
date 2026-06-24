@@ -99,16 +99,25 @@ struct Parser {
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-            auto expr = parse_expr();
-            if (!expr) return core::make_unexpected(expr.error());
             AstStatement st{};
-            st.kind = AstStmtKind::Expr;
-            st.expr = expr.value();
-            st.span = expr->span;
+            if (cur().type == TokenType::KwGuard) {
+                // `guard <cond> else { <verdict> }` — a conditional verdict.
+                const Token gt = cur();
+                pos++;
+                auto g = parse_ws_frame_guard(gt);
+                if (!g) return core::make_unexpected(g.error());
+                st = g.value();
+            } else {
+                auto expr = parse_expr();
+                if (!expr) return core::make_unexpected(expr.error());
+                st.kind = AstStmtKind::Expr;
+                st.expr = expr.value();
+                st.span = expr->span;
+            }
             auto ptr = alloc_stmt(st);
             if (!ptr) return core::make_unexpected(ptr.error());
             if (!block.block_stmts.push(ptr.value()))
-                return frontend_error(FrontendError::TooManyItems, expr->span);
+                return frontend_error(FrontendError::TooManyItems, st.span);
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
@@ -118,6 +127,35 @@ struct Parser {
         block.span.end = rbrace.value()->end;
         if (block.block_stmts.len == 1) return *block.block_stmts[0];
         return block;
+    }
+
+    // Parse a frame-handler guard: `guard <cond> else { <verdict> }`. The condition is an
+    // expression (analyze accepts only `frame.len <cmp> N` for now); the else body is a single
+    // bare frame verdict (frame.drop()/forward()/close()). Reuses AstStmtKind::Guard with
+    // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
+    FrontendResult<AstStatement> parse_ws_frame_guard(const Token& guard_tok) {
+        auto cond = parse_expr();
+        if (!cond) return core::make_unexpected(cond.error());
+        auto kw_else = expect(TokenType::KwElse);
+        if (!kw_else) return core::make_unexpected(kw_else.error());
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        auto verdict = parse_expr();
+        if (!verdict) return core::make_unexpected(verdict.error());
+        AstStatement vstmt{};
+        vstmt.kind = AstStmtKind::Expr;
+        vstmt.expr = verdict.value();
+        vstmt.span = verdict->span;
+        auto vptr = alloc_stmt(vstmt);
+        if (!vptr) return core::make_unexpected(vptr.error());
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+        AstStatement stmt{};
+        stmt.kind = AstStmtKind::Guard;
+        stmt.expr = cond.value();
+        stmt.else_stmt = vptr.value();
+        stmt.span = Span{guard_tok.start, rbrace.value()->end, guard_tok.line, guard_tok.col};
+        return stmt;
     }
 #endif
 

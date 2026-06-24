@@ -900,8 +900,25 @@ enum class WsVerdict : u8 {
 // handler is a pure verdict function `(opcode, payload, len) -> WsVerdict`, not
 // an HTTP terminator, so it lives beside HirRoute.control rather than in it.
 // Slice B: forward-only, so just the default verdict + the resolved upstream.
+// One `guard frame.len <cmp> <bound> else { <verdict> }` in a terminate handler. `cmp` is the
+// comparison written in the source; when it is FALSE for a message, the handler yields
+// `verdict` (the else branch). Evaluated against the reassembled message length.
+struct WsLenGuard {
+    // Rut's comparison operators are only `<` `>` `==` (no `<=`/`>=`/`!=`), so these three
+    // cover every guard condition analyze can produce.
+    enum class Cmp : u8 { Lt, Gt, Eq };
+    Cmp cmp = Cmp::Lt;
+    u32 bound = 0;                        // the integer literal (bytes) frame.len is compared to
+    WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
+};
+
 struct HirWsHandler {
     WsVerdict default_verdict = WsVerdict::Forward;
+    // `guard frame.len <cmp> N else { <verdict> }` checks, in source order, evaluated before the
+    // default verdict; the first failing guard's verdict wins. (frame.len maps to the message
+    // length the engine passes; richer accessors — text/payload/opcode — are a follow-up.)
+    static constexpr u32 kMaxLenGuards = 4;
+    FixedVec<WsLenGuard, kMaxLenGuards> len_guards;
     // `frame.forward(payload)` modify form: forward a rewritten message instead of the
     // original. The payload expression (Str-typed) is stored in HirRoute.exprs;
     // forward_payload_expr is its index there (0xffffffffu when has_forward_payload is false).

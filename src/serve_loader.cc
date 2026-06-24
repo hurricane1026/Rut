@@ -178,14 +178,27 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     if (!cg.ok) return false;
 
 #if RUT_ENABLE_WEBSOCKET
-    // Emit a constant-verdict frame handler into the SAME module for each terminate route,
-    // before compile() takes ownership of cg.mod. Symbols ws_handler_<n>, dense in HIR order.
+    // Emit a frame handler into the SAME module for each terminate route, before compile() takes
+    // ownership of cg.mod. Symbols ws_handler_<n>, dense in HIR order. Each handler checks its
+    // frame.len guards then returns the default verdict.
     {
         u32 ws_n = 0;
         for (u32 i = 0; i < ir.hir->routes.len; i++) {
+            const HirWsHandler& h = ir.hir->routes[i].ws_handler;
             if (!ir.hir->routes[i].is_ws_terminate) continue;
-            const u8 verdict = static_cast<u8>(ir.hir->routes[i].ws_handler.default_verdict);
-            if (!jit::emit_ws_handler(cg.mod, cg.ctx, verdict, ws_n)) return false;
+            jit::WsLenGuardSpec guards[HirWsHandler::kMaxLenGuards];
+            for (u32 g = 0; g < h.len_guards.len; g++) {
+                guards[g].cmp = static_cast<u8>(h.len_guards[g].cmp);
+                guards[g].bound = h.len_guards[g].bound;
+                guards[g].verdict = static_cast<u8>(h.len_guards[g].verdict);
+            }
+            if (!jit::emit_ws_handler(cg.mod,
+                                      cg.ctx,
+                                      static_cast<u8>(h.default_verdict),
+                                      guards,
+                                      h.len_guards.len,
+                                      ws_n))
+                return false;
             ws_n++;
         }
     }

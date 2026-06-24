@@ -74,6 +74,40 @@ TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
     CHECK(found);
     program.destroy();
 }
+
+TEST(serve_loader, websocket_terminate_len_guard_branches_on_length) {
+    // Conditional verdict end-to-end: `guard frame.len < 4096 else { frame.drop() }` then
+    // forward. The JIT'd handler must branch on the message length — drop at/over the cap,
+    // forward under it. Proves parser -> analyze -> HIR guards -> branching codegen -> serve all
+    // wire up and the compiled function actually computes the right verdict per length. (Rut has
+    // no <= operator, so the cap is exclusive: len < 4096.)
+    const std::string dir = "/tmp/rut_serve_loader_ws_guard";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  guard frame.len < 4096 else { frame.drop() }\n"
+                                        "  frame.forward()\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    WsMessageHandlerFn h = nullptr;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (program.config.routes[i].ws_terminate) {
+            h = program.config.routes[i].ws_frame_handler;
+            break;
+        }
+    }
+    REQUIRE(h != nullptr);
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 5000) == WsFrameAction::Drop);  // over cap -> drop
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 4096) == WsFrameAction::Drop);  // at cap (< is excl)
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 4095) == WsFrameAction::Forward);  // just under
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100) == WsFrameAction::Forward);   // under cap
+    program.destroy();
+}
 #endif
 
 TEST(serve_loader, missing_file_fails_at_read) {
