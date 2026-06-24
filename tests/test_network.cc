@@ -1225,6 +1225,30 @@ TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
     CHECK(saw);  // buffered client bytes forwarded upstream
 }
 
+// io_uring regression: with NO buffered post-upgrade client bytes, on_ws_101_sent must re-arm
+// the client recv via ws_resume_client_recv (which clears recv_paused_for_send), NOT a bare
+// submit_recv. ws_stop_client_poll paused the client recv on the 101 path (io_uring:
+// recv_paused_for_send = true); a bare submit_recv no-ops while that flag is set, and with no
+// client send ever in flight to clear it the tunnel would stall and never read further frames.
+TEST(websocket, upgrade_101_sent_rearms_client_recv_when_no_buffered_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->upstream_fd = 43;
+    conn->resp_status = 101;
+    conn->ws_upgrade_response_len = 64;
+    REQUIRE_EQ(conn->recv_buf.len(), 0u);  // no buffered client bytes -> the no-buffered path
+    // Simulate ws_stop_client_poll having paused the client recv on the io_uring 101 path.
+    conn->recv_paused_for_send = true;
+
+    on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
+    CHECK(conn->is_ws_tunnel);
+    CHECK_FALSE(conn->recv_paused_for_send);  // re-armed (was stuck true before the fix → stall)
+}
+
 // If the backend half-closed during the 101 drain AND both early upstream bytes
 // and buffered client bytes exist, on_ws_101_sent must enter drain mode: flush
 // BOTH directions before closing, never arm new client reads, and tear down only

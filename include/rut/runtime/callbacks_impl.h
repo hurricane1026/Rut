@@ -2861,12 +2861,20 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     (void)kRemaining;
     if (conn.recv_buf.len() > 0) {
+        // Buffered post-upgrade client bytes: send them upstream. recv stays paused while that
+        // send is in flight (correct backpressure); on_ws_client_to_upstream_sent resumes via
+        // ws_resume_client_recv, which clears recv_paused_for_send.
         if (!ws_try_send_client_to_upstream(loop, conn)) {
             loop->close_conn(conn);
             return;
         }
     } else {
-        if (!loop->submit_recv(conn)) {
+        // No buffered bytes: re-arm the client recv via ws_resume_client_recv, NOT a bare
+        // submit_recv. ws_stop_client_poll paused this recv on the 101 path (io_uring:
+        // recv_paused_for_send = true), and a bare submit_recv no-ops while that flag is set
+        // (it only marks recv_pause_rearm_pending) — so with no client send ever in flight to
+        // clear it, the tunnel would stall and never read further client frames.
+        if (!ws_resume_client_recv(loop, conn)) {
             loop->close_conn(conn);
             return;
         }
