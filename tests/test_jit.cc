@@ -18281,7 +18281,7 @@ static WsFrameAction jit_ws_verdict(const char* src) {
     if (hir->routes.len != 1 || !hir->routes[0].is_ws_terminate) return kFail;
     const u8 verdict = static_cast<u8>(hir->routes[0].ws_handler.default_verdict);
 
-    auto cg = codegen_ws_handler(verdict, 0);
+    auto cg = codegen_ws_handler(verdict, nullptr, 0, 0);
     if (!cg.ok) return kFail;
     JitEngine engine;
     if (!engine.init() || !engine.compile(cg.mod, cg.ctx)) return kFail;

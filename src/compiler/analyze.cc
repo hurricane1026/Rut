@@ -5045,6 +5045,70 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     return false;
 }
 
+#if RUT_ENABLE_WEBSOCKET
+// `frame.len` field access — the reassembled message length, the only frame accessor in this
+// slice (frame.text/payload/opcode are follow-ups).
+static bool ws_is_frame_len(const AstExpr& e) {
+    return e.kind == AstExprKind::Field && e.lhs != nullptr && e.lhs->kind == AstExprKind::Ident &&
+           e.lhs->name.eq({"frame", 5}) && e.name.eq({"len", 3});
+}
+
+// A bare frame verdict `frame.drop()/close()/forward()` (no args) → WsVerdict, for guard
+// else-branches. The payload/close-code forms (frame.forward(x), frame.close(code)) are
+// default-verdict only, so they are rejected here.
+static FrontendResult<WsVerdict> analyze_bare_frame_verdict(const AstExpr& call) {
+    const bool is_frame = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
+                          call.lhs->kind == AstExprKind::Ident && call.lhs->name.eq({"frame", 5});
+    if (!is_frame || call.args.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+    if (call.name.eq({"forward", 7})) return WsVerdict::Forward;
+    if (call.name.eq({"drop", 4})) return WsVerdict::Drop;
+    if (call.name.eq({"close", 5})) return WsVerdict::Close;
+    return frontend_error(FrontendError::UnsupportedSyntax, call.span);
+}
+
+// Match a guard condition `frame.len <cmp> <int-literal>` (or its mirror `N <cmp> frame.len`),
+// normalized so cmp reads `len <cmp> bound`. Any other shape → UnsupportedSyntax.
+static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, WsVerdict verdict) {
+    if (cond.lhs == nullptr || cond.rhs == nullptr)
+        return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+    const AstExpr& lhs = *cond.lhs;
+    const AstExpr& rhs = *cond.rhs;
+    bool len_left = false;
+    const AstExpr* num = nullptr;
+    if (ws_is_frame_len(lhs) && rhs.kind == AstExprKind::IntLit) {
+        len_left = true;
+        num = &rhs;
+    } else if (ws_is_frame_len(rhs) && lhs.kind == AstExprKind::IntLit) {
+        len_left = false;
+        num = &lhs;
+    } else {
+        return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+    }
+    if (num->int_value < 0) return frontend_error(FrontendError::UnsupportedSyntax, num->span);
+    using Cmp = WsLenGuard::Cmp;
+    Cmp cmp;
+    switch (cond.kind) {  // mirror the operator when frame.len is on the right
+        case AstExprKind::Lt:
+            cmp = len_left ? Cmp::Lt : Cmp::Gt;
+            break;
+        case AstExprKind::Gt:
+            cmp = len_left ? Cmp::Gt : Cmp::Lt;
+            break;
+        case AstExprKind::Eq:
+            cmp = Cmp::Eq;
+            break;
+        default:
+            return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
+    }
+    WsLenGuard g{};
+    g.cmp = cmp;
+    g.bound = static_cast<u32>(num->int_value);
+    g.verdict = verdict;
+    return g;
+}
+#endif
+
 // Resolve an upstream by name; UnknownUpstream (at `span`) when absent. Shared by the route
 // terminator (analyze_term), wait-arg resolution, and the WebSocket terminate handler.
 static FrontendResult<u32> find_upstream_index_by_name(const HirModule& mod, Str name, Span span) {
@@ -9278,27 +9342,53 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         // until the frame-handler JIT path lands (Slices C–E).
         auto upstream_index = find_upstream_index_by_name(mod, stmt.name, stmt.span);
         if (!upstream_index) return core::make_unexpected(upstream_index.error());
-        // The body collapses to a single statement (parser rejects empty blocks and unwraps
-        // one-statement blocks), so the body is exactly one Expr statement `frame.<verdict>(...)`:
-        //   frame.forward()         forward unchanged
-        //   frame.forward(payload)  forward a rewritten Str payload (modify; runtime = 4b)
-        //   frame.drop()            drop the message
-        //   frame.close() / (code)  close the tunnel (default 1000)
-        // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method
-        // name after `.`, and the `frame.` receiver keeps it distinct from
-        // `return forward(upstream)`.) Frame accessors, guards and multi-statement bodies are
-        // follow-up slices.
+        // The body is either a single verdict Expr statement, or a Block of
+        // `guard frame.len <cmp> N else { <verdict> }` statements followed by a final (default)
+        // verdict Expr:
+        //   frame.forward()        forward unchanged      frame.drop()  drop the message
+        //   frame.forward(payload) rewrite a Str payload  frame.close() / (code)  close
+        // (`forward` is the proxy-terminator keyword, but the parser accepts it as a method name
+        // after `.`.) Guard else-verdicts are bare frame.drop()/close()/forward(); richer frame
+        // accessors and conditions are follow-up slices.
+        route->is_ws_terminate = true;
+        route->ws_handler.upstream_index = upstream_index.value();
+        route->ws_handler.span = stmt.span;
+
         const AstStatement* body = stmt.then_stmt;
-        if (body == nullptr || body->kind != AstStmtKind::Expr)
-            return frontend_error(FrontendError::UnsupportedSyntax, body ? body->span : stmt.span);
-        const AstExpr& call = body->expr;
+        if (body == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+        const AstExpr* default_call = nullptr;
+        if (body->kind == AstStmtKind::Expr) {
+            default_call = &body->expr;
+        } else if (body->kind == AstStmtKind::Block) {
+            const u32 stmt_count = body->block_stmts.len;
+            if (stmt_count == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+            for (u32 i = 0; i + 1 < stmt_count; i++) {  // all but the last are guards
+                const AstStatement* gs = body->block_stmts[i];
+                if (gs == nullptr || gs->kind != AstStmtKind::Guard || gs->else_stmt == nullptr ||
+                    gs->else_stmt->kind != AstStmtKind::Expr)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          gs ? gs->span : body->span);
+                auto gv = analyze_bare_frame_verdict(gs->else_stmt->expr);
+                if (!gv) return core::make_unexpected(gv.error());
+                auto g = analyze_frame_len_cond(gs->expr, gv.value());
+                if (!g) return core::make_unexpected(g.error());
+                if (!route->ws_handler.len_guards.push(g.value()))
+                    return frontend_error(FrontendError::TooManyItems, gs->span);
+            }
+            const AstStatement* last = body->block_stmts[stmt_count - 1];
+            if (last == nullptr || last->kind != AstStmtKind::Expr)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      last ? last->span : body->span);
+            default_call = &last->expr;
+        } else {
+            return frontend_error(FrontendError::UnsupportedSyntax, body->span);
+        }
+        const AstExpr& call = *default_call;
         const bool is_frame_method = call.kind == AstExprKind::MethodCall && call.lhs != nullptr &&
                                      call.lhs->kind == AstExprKind::Ident &&
                                      call.lhs->name.eq({"frame", 5});
         if (!is_frame_method) return frontend_error(FrontendError::UnsupportedSyntax, call.span);
-        route->is_ws_terminate = true;
-        route->ws_handler.upstream_index = upstream_index.value();
-        route->ws_handler.span = stmt.span;
 
         if (call.name.eq({"forward", 7})) {
             if (call.args.len > 1)  // forward() or forward(payload)

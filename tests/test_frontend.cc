@@ -1349,6 +1349,45 @@ TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
     CHECK(!hir);
 }
 
+TEST(frontend, analyze_accepts_websocket_len_guard) {
+    // `guard frame.len < 4096 else { frame.drop() }` then forward → one len-guard (Lt, 4096,
+    // Drop) plus the default Forward verdict. (Rut's comparison ops are < > ==; there is no <=.)
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "  guard frame.len < 4096 else { frame.drop() }\n"
+        "  frame.forward()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& h = hir->routes[0].ws_handler;
+    CHECK_EQ(static_cast<u8>(h.default_verdict), static_cast<u8>(WsVerdict::Forward));
+    REQUIRE_EQ(h.len_guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].cmp), static_cast<u8>(WsLenGuard::Cmp::Lt));
+    CHECK_EQ(h.len_guards[0].bound, 4096u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].verdict), static_cast<u8>(WsVerdict::Drop));
+}
+
+TEST(frontend, analyze_rejects_websocket_non_len_guard) {
+    // Only `frame.len <cmp> N` guard conditions are supported for now; other accessors are a
+    // follow-up, so a non-frame.len guard condition is rejected.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "  guard frame.opcode == 1 else { frame.drop() }\n"
+        "  frame.forward()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    CHECK(!hir);
+}
+
 TEST(frontend, build_mir_skips_ws_terminate_route) {
     // A ws-terminate route compiles via the frame-handler JIT path in the serve loader, NOT
     // the HTTP MIR/RIR pipeline, so build_mir SKIPS it (rather than rejecting): a ws-only

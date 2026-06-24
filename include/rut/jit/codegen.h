@@ -39,15 +39,32 @@ CodegenResult codegen(const rir::Module& rir_mod);
 // Returns the output length excluding the trailing '\0'.
 u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);
 
-// Emit a constant-verdict WebSocket terminate-mode frame handler into `mod`:
-//   i8 ws_handler_<id>(i8* ctx, i8 opcode, i8* payload, i64 len) { ret i8 <verdict> }
-// matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64)). `verdict`
-// is the WsFrameAction value (Forward=0/Drop=1/Close=2). A constant verdict needs no message
-// inspection, so this bypasses the RIR/MIR HTTP pipeline. Returns false on error.
-bool emit_ws_handler(LLVMModuleRef mod, LLVMContextRef ctx, u8 verdict, u32 id);
+// A `guard frame.len <cmp> bound else { <verdict> }` check for the frame-handler codegen.
+// Mirrors HirWsHandler::WsLenGuard but stays hir-free so the serve loader can build it.
+struct WsLenGuardSpec {
+    u8 cmp;      // WsLenGuard::Cmp ordinal (Le=0,Lt=1,Ge=2,Gt=3,Eq=4,Ne=5): frame.len <cmp> bound
+    u32 bound;   // the literal frame.len is compared against
+    u8 verdict;  // WsFrameAction yielded when the guard CONDITION is false
+};
 
-// Create a fresh LLVM module holding a single constant-verdict frame handler. Mirrors codegen()
-// for the WS path; hand {mod,ctx} to JitEngine::compile and look up ws_handler_<id>.
-CodegenResult codegen_ws_handler(u8 verdict, u32 id);
+// Emit a WebSocket terminate-mode frame handler into `mod`:
+//   i8 ws_handler_<id>(i8* ctx, i8 opcode, i8* payload, i64 len)
+// matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64)). It checks
+// each guard against `len` (= frame.len) in order — the first whose condition is FALSE returns
+// that guard's verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
+// (Forward=0/Drop=1/Close=2). This bypasses the RIR/MIR HTTP pipeline. Returns false on error.
+bool emit_ws_handler(LLVMModuleRef mod,
+                     LLVMContextRef ctx,
+                     u8 default_verdict,
+                     const WsLenGuardSpec* guards,
+                     u32 guard_count,
+                     u32 id);
+
+// Create a fresh LLVM module holding a single frame handler. Mirrors codegen() for the WS path;
+// hand {mod,ctx} to JitEngine::compile and look up ws_handler_<id>.
+CodegenResult codegen_ws_handler(u8 default_verdict,
+                                 const WsLenGuardSpec* guards,
+                                 u32 guard_count,
+                                 u32 id);
 
 }  // namespace rut::jit

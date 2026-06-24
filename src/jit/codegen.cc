@@ -1667,7 +1667,12 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size) {
     return pos;
 }
 
-bool emit_ws_handler(LLVMModuleRef mod, LLVMContextRef ctx, u8 verdict, u32 id) {
+bool emit_ws_handler(LLVMModuleRef mod,
+                     LLVMContextRef ctx,
+                     u8 default_verdict,
+                     const WsLenGuardSpec* guards,
+                     u32 guard_count,
+                     u32 id) {
     if (!mod || !ctx) return false;
     LLVMTypeRef i8_ty = LLVMInt8TypeInContext(ctx);
     LLVMTypeRef i64_ty = LLVMInt64TypeInContext(ctx);
@@ -1680,21 +1685,51 @@ bool emit_ws_handler(LLVMModuleRef mod, LLVMContextRef ctx, u8 verdict, u32 id) 
     format_ws_handler_symbol(id, sym, sizeof(sym));
     LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
     if (!fn) return false;
+    LLVMValueRef len = LLVMGetParam(fn, 3);  // i64 message length == frame.len
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
     LLVMBuilderRef builder = LLVMCreateBuilderInContext(ctx);
     if (!builder) return false;
     LLVMPositionBuilderAtEnd(builder, entry);
-    // Constant verdict: ignore the message, return the compile-time WsFrameAction.
-    LLVMBuildRet(builder, LLVMConstInt(i8_ty, verdict, /*SignExtend=*/0));
+
+    // Each guard: if its condition (len <cmp> bound) holds, fall through to the next; otherwise
+    // return the guard's verdict. After all guards, return the default verdict.
+    for (u32 i = 0; i < guard_count; i++) {
+        LLVMIntPredicate pred = LLVMIntEQ;
+        switch (guards[i].cmp) {  // WsLenGuard::Cmp ordinals: 0=Lt, 1=Gt, 2=Eq
+            case 0:
+                pred = LLVMIntULT;
+                break;
+            case 1:
+                pred = LLVMIntUGT;
+                break;
+            case 2:
+                pred = LLVMIntEQ;
+                break;
+            default:
+                break;
+        }
+        LLVMValueRef cond =
+            LLVMBuildICmp(builder, pred, len, LLVMConstInt(i64_ty, guards[i].bound, 0), "g");
+        LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
+        LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
+        LLVMBuildCondBr(builder, cond, cont, els);  // cond true -> continue; false -> verdict
+        LLVMPositionBuilderAtEnd(builder, els);
+        LLVMBuildRet(builder, LLVMConstInt(i8_ty, guards[i].verdict, /*SignExtend=*/0));
+        LLVMPositionBuilderAtEnd(builder, cont);
+    }
+    LLVMBuildRet(builder, LLVMConstInt(i8_ty, default_verdict, /*SignExtend=*/0));
     LLVMDisposeBuilder(builder);
     return true;
 }
 
-CodegenResult codegen_ws_handler(u8 verdict, u32 id) {
+CodegenResult codegen_ws_handler(u8 default_verdict,
+                                 const WsLenGuardSpec* guards,
+                                 u32 guard_count,
+                                 u32 id) {
     LLVMContextRef ctx = LLVMContextCreate();
     LLVMModuleRef mod = LLVMModuleCreateWithNameInContext("rut_ws_handler", ctx);
-    if (!emit_ws_handler(mod, ctx, verdict, id)) {
+    if (!emit_ws_handler(mod, ctx, default_verdict, guards, guard_count, id)) {
         LLVMDisposeModule(mod);
         LLVMContextDispose(ctx);
         return {nullptr, nullptr, false};
