@@ -1685,7 +1685,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
     format_ws_handler_symbol(id, sym, sizeof(sym));
     LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
     if (!fn) return false;
-    LLVMValueRef len = LLVMGetParam(fn, 3);  // i64 message length == frame.len
+    LLVMValueRef len = LLVMGetParam(fn, 3);     // i64 message length == frame.len
+    LLVMValueRef opcode = LLVMGetParam(fn, 1);  // i8 WsOpcode == frame opcode
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
     LLVMBuilderRef builder = LLVMCreateBuilderInContext(ctx);
@@ -1709,8 +1710,12 @@ bool emit_ws_handler(LLVMModuleRef mod,
             default:
                 break;
         }
+        // Operand + width by accessor: 1=Opcode reads the i8 opcode param, else the i64 len.
+        const bool is_opcode = guards[i].accessor == 1;
+        LLVMValueRef operand = is_opcode ? opcode : len;
+        LLVMTypeRef bound_ty = is_opcode ? i8_ty : i64_ty;
         LLVMValueRef cond =
-            LLVMBuildICmp(builder, pred, len, LLVMConstInt(i64_ty, guards[i].bound, 0), "g");
+            LLVMBuildICmp(builder, pred, operand, LLVMConstInt(bound_ty, guards[i].bound, 0), "g");
         LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
         LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
         LLVMBuildCondBr(builder, cond, cont, els);  // cond true -> continue; false -> verdict
