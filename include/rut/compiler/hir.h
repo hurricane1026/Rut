@@ -902,17 +902,22 @@ enum class WsVerdict : u8 {
 // Slice B: forward-only, so just the default verdict + the resolved upstream.
 // One guard in a terminate handler — a condition on a frame accessor that, when FALSE for a
 // message, yields `verdict` (the else branch). Two accessors so far:
-//   Len        — `guard frame.len <cmp> N`       : the reassembled message length (len param)
-//   Opcode     — `guard frame.isText`/`isBinary` : the message opcode (== Text / == Binary)
-//   FromClient — `guard frame.fromClient`        : the message direction (== 1 on the client leg)
+//   Len        — `guard frame.len <cmp> N`            : the reassembled message length (len param)
+//   Opcode     — `guard frame.isText`/`isBinary`      : the message opcode (== Text / == Binary)
+//   FromClient — `guard frame.fromClient`             : the direction (== 1 on the client leg)
+//   TextMatch  — `guard [not] frame.text.matches(re)` : a regex scan over the message payload
 struct WsLenGuard {
-    enum class Accessor : u8 { Len, Opcode, FromClient };
+    enum class Accessor : u8 { Len, Opcode, FromClient, TextMatch };
     // Rut's comparison operators are only `<` `>` `==` (no `<=`/`>=`/`!=`), so these three
     // cover every guard condition analyze can produce. Opcode guards always use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };
     Accessor accessor = Accessor::Len;
     Cmp cmp = Cmp::Lt;
     u32 bound = 0;  // Len: the byte literal frame.len is compared to. Opcode: the WsOpcode value.
+    // TextMatch only: the regex pattern (points into source/intern memory; valid through
+    // codegen) and whether a leading `not` inverts the match.
+    Str pattern{};
+    bool negate = false;
     WsVerdict verdict = WsVerdict::Drop;  // yielded when the guard fails
 };
 

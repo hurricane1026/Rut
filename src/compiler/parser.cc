@@ -134,6 +134,10 @@ struct Parser {
     // bare frame verdict (frame.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
     FrontendResult<AstStatement> parse_ws_frame_guard(const Token& guard_tok) {
+        // A leading `not`/`!` negates the condition (e.g. `guard not frame.text.matches(re"…")`).
+        // General prefix-not isn't in the expression grammar; it's consumed here, scoped to the
+        // frame guard, and carried on cond_negated for the WsTerminate analyze path.
+        const bool negated = take(TokenType::KwNot) != nullptr || take(TokenType::Bang) != nullptr;
         auto cond = parse_expr();
         if (!cond) return core::make_unexpected(cond.error());
         auto kw_else = expect(TokenType::KwElse);
@@ -154,6 +158,7 @@ struct Parser {
         stmt.kind = AstStmtKind::Guard;
         stmt.expr = cond.value();
         stmt.else_stmt = vptr.value();
+        stmt.cond_negated = negated;
         stmt.span = Span{guard_tok.start, rbrace.value()->end, guard_tok.line, guard_tok.col};
         return stmt;
     }

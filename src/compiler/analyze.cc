@@ -5113,11 +5113,38 @@ static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, Ws
     return g;
 }
 
-// Match a guard condition for the frame handler. Direction is a bare `frame.fromClient`
-// (true on the client→upstream leg); opcode discrimination is a bare `frame.isText` /
-// `frame.isBinary` (== the WsOpcode value); otherwise it must be a `frame.len <cmp> N`
+// `frame.text.matches(re"…")` — a regex scan over the message payload. Returns the pattern
+// when the shape matches, else an empty Str (len 0 means "not a text-match condition"); a
+// genuinely empty regex isn't expressible (re"" needs at least the delimiters → never 0 here).
+static Str ws_frame_text_match_pattern(const AstExpr& cond) {
+    if (cond.kind != AstExprKind::MethodCall || cond.lhs == nullptr ||
+        !cond.name.eq({"matches", 7}) || cond.args.len != 1 || cond.args[0] == nullptr ||
+        cond.args[0]->kind != AstExprKind::RegexLit)
+        return Str{};
+    if (!ws_is_frame_field(*cond.lhs, {"text", 4})) return Str{};
+    return cond.args[0]->str_value;
+}
+
+// Match a guard condition for the frame handler. `negate` is a leading `not`/`!`, accepted
+// ONLY on a `frame.text.matches(re)` condition (the blocklist form). Otherwise: direction is a
+// bare `frame.fromClient` (true on the client→upstream leg); opcode discrimination is a bare
+// `frame.isText` / `frame.isBinary` (== the WsOpcode value); content is
+// `frame.text.matches(re"…")` (a regex over the payload); else a `frame.len <cmp> N`
 // comparison. Anything else → UnsupportedSyntax.
-static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond, WsVerdict verdict) {
+static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
+                                                           WsVerdict verdict,
+                                                           bool negate) {
+    const Str text_pattern = ws_frame_text_match_pattern(cond);
+    if (text_pattern.len != 0) {
+        WsLenGuard g{};
+        g.accessor = WsLenGuard::Accessor::TextMatch;
+        g.pattern = text_pattern;
+        g.negate = negate;
+        g.verdict = verdict;
+        return g;
+    }
+    // `not` only negates a regex content guard; on any other condition it's unsupported.
+    if (negate) return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     if (ws_is_frame_field(cond, {"fromClient", 10})) {
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::FromClient;
@@ -9401,7 +9428,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                           gs ? gs->span : body->span);
                 auto gv = analyze_bare_frame_verdict(gs->else_stmt->expr);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_frame_guard_cond(gs->expr, gv.value());
+                auto g = analyze_frame_guard_cond(gs->expr, gv.value(), gs->cond_negated);
                 if (!g) return core::make_unexpected(g.error());
                 if (!route->ws_handler.len_guards.push(g.value()))
                     return frontend_error(FrontendError::TooManyItems, gs->span);

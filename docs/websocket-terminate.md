@@ -175,7 +175,7 @@ reach it.
 | Member | Type | Meaning |
 |--------|------|---------|
 | `frame.opcode` | `WsOpcode` — **only** `.text` / `.binary` | the message opcode (control frames never reach the handler) |
-| `frame.text` | error-capable `string` | the payload as UTF-8 text; **errors if the frame is Binary** (engine already UTF-8-validates Text). Use with `guard let` |
+| `frame.text` | error-capable `string` | the payload as UTF-8 text; **errors if the frame is Binary** (engine already UTF-8-validates Text). Use with `guard let`. **Partly implemented:** the regex-match guard form `guard [not] frame.text.matches(re"…") else { … }` works today (content filtering) — it scans the message payload bytes via the existing Vectorscan `matches()` path and respects a leading `not` (the blocklist form). The `guard let text = frame.text` *binding* form is still pending. NOTE: like every `matches()`, it is **full-string** (the helper wraps `^(?:…)$`), so substring filters need `re".*X.*"`; and v1 scans the payload regardless of opcode, so pair with `guard frame.isText` for text-only. |
 | `frame.binary` | error-capable `bytes` | the payload; **errors if the frame is Text** |
 | `frame.payload` | `bytes` | raw reassembled payload (always valid) |
 | `frame.len` | integer (bytes) | payload length (`<= maxMessageSize`). **v1 is a plain integer** so `frame.len <= 4096` parses with the existing expression grammar — `4kb` is *not* a valid expression literal today (the `IntLit + kb/mb` ByteSize form is special-cased for decorator/kwarg parsing, not general expressions). Typing it `ByteSize` + allowing `4kb` in handler expressions is a Slice B dependency (deferred). |

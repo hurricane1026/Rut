@@ -1685,8 +1685,11 @@ bool emit_ws_handler(LLVMModuleRef mod,
     format_ws_handler_symbol(id, sym, sizeof(sym));
     LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
     if (!fn) return false;
+    LLVMTypeRef i32_ty = LLVMInt32TypeInContext(ctx);
+    LLVMTypeRef i1_ty = LLVMInt1TypeInContext(ctx);
     LLVMValueRef len = LLVMGetParam(fn, 3);          // i64 message length == frame.len
     LLVMValueRef opcode = LLVMGetParam(fn, 1);       // i8 WsOpcode == frame opcode
+    LLVMValueRef payload = LLVMGetParam(fn, 2);      // i8* reassembled message bytes
     LLVMValueRef from_client = LLVMGetParam(fn, 4);  // i8 bool: 1 on the client→upstream leg
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
@@ -1694,32 +1697,73 @@ bool emit_ws_handler(LLVMModuleRef mod,
     if (!builder) return false;
     LLVMPositionBuilderAtEnd(builder, entry);
 
-    // Each guard: if its condition (len <cmp> bound) holds, fall through to the next; otherwise
-    // return the guard's verdict. After all guards, return the default verdict.
+    // u8 rut_helper_str_regex_match(ptr payload, i32 len, ptr db) — shared with HTTP handlers;
+    // get-or-declare so we don't duplicate a decl the HTTP codegen already put in this module.
+    LLVMTypeRef rx_params[3] = {ptr_ty, i32_ty, ptr_ty};
+    LLVMTypeRef rx_fn_ty = LLVMFunctionType(i8_ty, rx_params, 3, 0);
+    u32 regex_seq = 0;
+
+    // Each guard: if its condition holds, fall through to the next; otherwise return the guard's
+    // verdict. After all guards, return the default verdict.
     for (u32 i = 0; i < guard_count; i++) {
-        LLVMIntPredicate pred = LLVMIntEQ;
-        switch (guards[i].cmp) {  // WsLenGuard::Cmp ordinals: 0=Lt, 1=Gt, 2=Eq
-            case 0:
-                pred = LLVMIntULT;
-                break;
-            case 1:
-                pred = LLVMIntUGT;
-                break;
-            case 2:
-                pred = LLVMIntEQ;
-                break;
-            default:
-                break;
+        LLVMValueRef cond;
+        if (guards[i].accessor == 3) {  // TextMatch: regex scan over (payload, len)
+            // Emit the pattern + db globals JIT finalization compiles & back-patches. The `ws<id>`
+            // suffix keeps these distinct from the HTTP regex globals already in this module.
+            char pat_name[96];
+            char db_name[96];
+            snprintf(pat_name, sizeof(pat_name), "__rut_regex_pattern_ws%u_%u", id, regex_seq);
+            snprintf(db_name, sizeof(db_name), "__rut_regex_db_ws%u_%u", id, regex_seq);
+            regex_seq++;
+            LLVMValueRef str_const = LLVMConstStringInContext(
+                ctx, guards[i].pattern, guards[i].pattern_len, /*DontNullTerminate=*/0);
+            LLVMValueRef pat_global = LLVMAddGlobal(mod, LLVMTypeOf(str_const), pat_name);
+            LLVMSetInitializer(pat_global, str_const);
+            LLVMSetGlobalConstant(pat_global, 1);
+            LLVMSetLinkage(pat_global, LLVMPrivateLinkage);
+            LLVMSetUnnamedAddress(pat_global, LLVMGlobalUnnamedAddr);
+            LLVMValueRef db_global = LLVMAddGlobal(mod, ptr_ty, db_name);
+            LLVMSetLinkage(db_global, LLVMExternalLinkage);
+
+            LLVMValueRef rx_fn = LLVMGetNamedFunction(mod, "rut_helper_str_regex_match");
+            if (!rx_fn) rx_fn = LLVMAddFunction(mod, "rut_helper_str_regex_match", rx_fn_ty);
+            LLVMValueRef db = LLVMBuildLoad2(builder, ptr_ty, db_global, "regex.db");
+            LLVMValueRef len32 = LLVMBuildTrunc(builder, len, i32_ty, "len32");
+            LLVMValueRef rx_args[3] = {payload, len32, db};
+            LLVMValueRef r = LLVMBuildCall2(builder, rx_fn_ty, rx_fn, rx_args, 3, "rx");
+            LLVMValueRef is_match =
+                LLVMBuildICmp(builder, LLVMIntNE, r, LLVMConstInt(i8_ty, 0, 0), "rx.m");
+            // guard semantics fire the verdict when cond is FALSE: `matches` continues on a match
+            // (drops a non-match → allowlist); `not matches` continues on a non-match (drops a
+            // match → blocklist).
+            cond = guards[i].negate
+                       ? LLVMBuildXor(builder, is_match, LLVMConstInt(i1_ty, 1, 0), "rx.neg")
+                       : is_match;
+        } else {
+            LLVMIntPredicate pred = LLVMIntEQ;
+            switch (guards[i].cmp) {  // WsLenGuard::Cmp ordinals: 0=Lt, 1=Gt, 2=Eq
+                case 0:
+                    pred = LLVMIntULT;
+                    break;
+                case 1:
+                    pred = LLVMIntUGT;
+                    break;
+                case 2:
+                    pred = LLVMIntEQ;
+                    break;
+                default:
+                    break;
+            }
+            // Operand + width by accessor: 1=Opcode reads the i8 opcode param,
+            // 2=FromClient reads the i8 from_client param, else (0=Len) the i64 len.
+            const bool is_i8 = guards[i].accessor == 1 || guards[i].accessor == 2;
+            LLVMValueRef operand = guards[i].accessor == 2   ? from_client
+                                   : guards[i].accessor == 1 ? opcode
+                                                             : len;
+            LLVMTypeRef bound_ty = is_i8 ? i8_ty : i64_ty;
+            cond = LLVMBuildICmp(
+                builder, pred, operand, LLVMConstInt(bound_ty, guards[i].bound, 0), "g");
         }
-        // Operand + width by accessor: 1=Opcode reads the i8 opcode param,
-        // 2=FromClient reads the i8 from_client param, else (0=Len) the i64 len.
-        const bool is_i8 = guards[i].accessor == 1 || guards[i].accessor == 2;
-        LLVMValueRef operand = guards[i].accessor == 2   ? from_client
-                               : guards[i].accessor == 1 ? opcode
-                                                         : len;
-        LLVMTypeRef bound_ty = is_i8 ? i8_ty : i64_ty;
-        LLVMValueRef cond =
-            LLVMBuildICmp(builder, pred, operand, LLVMConstInt(bound_ty, guards[i].bound, 0), "g");
         LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
         LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
         LLVMBuildCondBr(builder, cond, cont, els);  // cond true -> continue; false -> verdict

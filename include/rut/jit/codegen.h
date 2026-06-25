@@ -44,11 +44,17 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);
 struct WsLenGuardSpec {
     u8 accessor;  // WsLenGuard::Accessor ordinal: 0=Len (frame.len, i64 param 3),
                   //                                1=Opcode (frame opcode, i8 param 1),
-                  //                                2=FromClient (direction, i8 param 4)
+                  //                                2=FromClient (direction, i8 param 4),
+                  //                                3=TextMatch (regex over payload, params 2+3)
     u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
     u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
                   // FromClient: 1 (client→upstream leg)
     u8 verdict;   // WsFrameAction yielded when the guard CONDITION is false
+    // TextMatch only: the regex pattern to scan the payload with (NUL-terminated not required;
+    // pattern_len is authoritative) and whether a leading `not` inverts the match result.
+    const char* pattern;
+    u32 pattern_len;
+    u8 negate;
 };
 
 // Emit a WebSocket terminate-mode frame handler into `mod`:

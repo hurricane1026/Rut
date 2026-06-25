@@ -1420,6 +1420,50 @@ TEST(frontend, analyze_accepts_websocket_direction_guard) {
     CHECK_EQ(static_cast<u8>(h.default_verdict), static_cast<u8>(WsVerdict::Drop));
 }
 
+TEST(frontend, analyze_accepts_websocket_text_match_guard) {
+    // `guard not frame.text.matches(re"badword") else { frame.drop() }` then forward → one
+    // TextMatch guard (negated, pattern "badword", Drop) — a content blocklist.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "  guard not frame.text.matches(re\"badword\") else { frame.drop() }\n"
+        "  frame.forward()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& h = hir->routes[0].ws_handler;
+    REQUIRE_EQ(h.len_guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].accessor),
+             static_cast<u8>(WsLenGuard::Accessor::TextMatch));
+    CHECK(h.len_guards[0].negate);
+    CHECK(h.len_guards[0].pattern.eq(lit("badword")));
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].verdict), static_cast<u8>(WsVerdict::Drop));
+    CHECK_EQ(static_cast<u8>(h.default_verdict), static_cast<u8>(WsVerdict::Forward));
+}
+
+TEST(frontend, analyze_accepts_websocket_text_match_guard_positive) {
+    // The non-negated allowlist form: `guard frame.text.matches(re"^ok$") else { frame.drop() }`.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "  guard frame.text.matches(re\"^ok$\") else { frame.drop() }\n"
+        "  frame.forward()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& h = hir->routes[0].ws_handler;
+    REQUIRE_EQ(h.len_guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].accessor),
+             static_cast<u8>(WsLenGuard::Accessor::TextMatch));
+    CHECK(!h.len_guards[0].negate);
+}
+
 TEST(frontend, analyze_rejects_websocket_non_len_guard) {
     // Only `frame.len <cmp> N` guard conditions are supported for now; other accessors are a
     // follow-up, so a non-frame.len guard condition is rejected.

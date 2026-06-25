@@ -192,6 +192,9 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
                 guards[g].cmp = static_cast<u8>(h.len_guards[g].cmp);
                 guards[g].bound = h.len_guards[g].bound;
                 guards[g].verdict = static_cast<u8>(h.len_guards[g].verdict);
+                guards[g].pattern = h.len_guards[g].pattern.ptr;
+                guards[g].pattern_len = h.len_guards[g].pattern.len;
+                guards[g].negate = h.len_guards[g].negate ? 1u : 0u;
             }
             if (!jit::emit_ws_handler(cg.mod,
                                       cg.ctx,
