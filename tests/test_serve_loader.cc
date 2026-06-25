@@ -229,6 +229,50 @@ TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
     program.destroy();
 }
 
+TEST(serve_loader, websocket_terminate_max_message_size_kwarg_reaches_route) {
+    // `maxMessageSize: 4kb` end-to-end: the published terminate route carries 4096 as its cap
+    // (proves the kwarg threads parser → HIR → add_ws_terminate → RouteEntry). Omitting it
+    // falls back to the engine default (~16 KB), checked separately.
+    const std::string dir = "/tmp/rut_serve_loader_ws_maxmsg";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend, "
+                                        "maxMessageSize: 4kb) {\n"
+                                        "  frame.forward()\n"
+                                        "} }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    bool found = false;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (!program.config.routes[i].ws_terminate) continue;
+        found = true;
+        CHECK_EQ(program.config.routes[i].ws_max_message_size, 4096u);
+    }
+    CHECK(found);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_terminate_default_max_message_size) {
+    // No kwarg → the route gets the engine's single-slice default cap (nonzero, ~16 KB).
+    const std::string dir = "/tmp/rut_serve_loader_ws_maxmsg_default";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  frame.forward()\n"
+                                        "} }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (!program.config.routes[i].ws_terminate) continue;
+        CHECK(program.config.routes[i].ws_max_message_size > 4096u);  // ~16 KB slice default
+    }
+    program.destroy();
+}
+
 TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
     // Defense-in-depth on the C++ route surface: a close code the runtime would never put on
     // the wire (reserved/local-only or out of range) must be refused at registration, not

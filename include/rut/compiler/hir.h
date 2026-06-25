@@ -937,6 +937,9 @@ struct HirWsHandler {
     // `frame.close(code)` status code (default 1000 = normal closure). Only meaningful when
     // default_verdict == Close. Validated to RFC 6455 application close codes in analyze.
     u16 close_code = 1000;
+    // `maxMessageSize:` kwarg in bytes (0 = omitted → the loader uses the engine default). The
+    // runtime arm-time clamps this to one slice (~16 KB); a larger value is silently capped.
+    u32 max_message_size = 0;
     u32 upstream_index = 0;
     Span span{};
 };
