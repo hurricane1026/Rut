@@ -1396,6 +1396,30 @@ TEST(frontend, analyze_accepts_websocket_opcode_guard) {
     CHECK_EQ(static_cast<u8>(h.len_guards[0].verdict), static_cast<u8>(WsVerdict::Drop));
 }
 
+TEST(frontend, analyze_accepts_websocket_direction_guard) {
+    // `guard frame.fromClient else { frame.forward() }` then drop → one direction guard
+    // (FromClient, Eq, 1, Forward) plus the default Drop verdict — police only the client leg.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "  guard frame.fromClient else { frame.forward() }\n"
+        "  frame.drop()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& h = hir->routes[0].ws_handler;
+    REQUIRE_EQ(h.len_guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].accessor),
+             static_cast<u8>(WsLenGuard::Accessor::FromClient));
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].cmp), static_cast<u8>(WsLenGuard::Cmp::Eq));
+    CHECK_EQ(h.len_guards[0].bound, 1u);  // true on the client→upstream leg
+    CHECK_EQ(static_cast<u8>(h.len_guards[0].verdict), static_cast<u8>(WsVerdict::Forward));
+    CHECK_EQ(static_cast<u8>(h.default_verdict), static_cast<u8>(WsVerdict::Drop));
+}
+
 TEST(frontend, analyze_rejects_websocket_non_len_guard) {
     // Only `frame.len <cmp> N` guard conditions are supported for now; other accessors are a
     // follow-up, so a non-frame.len guard condition is rejected.

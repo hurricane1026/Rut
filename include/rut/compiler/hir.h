@@ -902,10 +902,11 @@ enum class WsVerdict : u8 {
 // Slice B: forward-only, so just the default verdict + the resolved upstream.
 // One guard in a terminate handler — a condition on a frame accessor that, when FALSE for a
 // message, yields `verdict` (the else branch). Two accessors so far:
-//   Len    — `guard frame.len <cmp> N`        : the reassembled message length (the len param)
-//   Opcode — `guard frame.isText`/`isBinary`  : the message opcode (== Text / == Binary)
+//   Len        — `guard frame.len <cmp> N`       : the reassembled message length (len param)
+//   Opcode     — `guard frame.isText`/`isBinary` : the message opcode (== Text / == Binary)
+//   FromClient — `guard frame.fromClient`        : the message direction (== 1 on the client leg)
 struct WsLenGuard {
-    enum class Accessor : u8 { Len, Opcode };
+    enum class Accessor : u8 { Len, Opcode, FromClient };
     // Rut's comparison operators are only `<` `>` `==` (no `<=`/`>=`/`!=`), so these three
     // cover every guard condition analyze can produce. Opcode guards always use Eq.
     enum class Cmp : u8 { Lt, Gt, Eq };

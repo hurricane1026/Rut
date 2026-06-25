@@ -196,7 +196,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
         }
 
         // Message complete — invoke the handler and act on its verdict.
-        const WsFrameAction action = handler(ctx, msg_op, msg_buf, total);
+        const WsFrameAction action = handler(ctx, msg_op, msg_buf, total, st.from_client);
         if (action == WsFrameAction::Forward) {
             // Re-serialize the whole message as a single (unfragmented) frame.
             if (!emit_frame(
