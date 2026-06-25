@@ -69,7 +69,8 @@ TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
         if (!r.ws_terminate) continue;
         found = true;
         REQUIRE(r.ws_frame_handler != nullptr);
-        CHECK(r.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0) == WsFrameAction::Drop);
+        CHECK(r.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, false) ==
+              WsFrameAction::Drop);
     }
     CHECK(found);
     program.destroy();
@@ -102,10 +103,12 @@ TEST(serve_loader, websocket_terminate_len_guard_branches_on_length) {
         }
     }
     REQUIRE(h != nullptr);
-    CHECK(h(nullptr, WsOpcode::Text, nullptr, 5000) == WsFrameAction::Drop);  // over cap -> drop
-    CHECK(h(nullptr, WsOpcode::Text, nullptr, 4096) == WsFrameAction::Drop);  // at cap (< is excl)
-    CHECK(h(nullptr, WsOpcode::Text, nullptr, 4095) == WsFrameAction::Forward);  // just under
-    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100) == WsFrameAction::Forward);   // under cap
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 5000, false) == WsFrameAction::Drop);  // over cap
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 4096, false) ==
+          WsFrameAction::Drop);  // at cap (excl)
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 4095, false) ==
+          WsFrameAction::Forward);                                                     // just under
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100, false) == WsFrameAction::Forward);  // under cap
     program.destroy();
 }
 
@@ -134,8 +137,41 @@ TEST(serve_loader, websocket_terminate_opcode_guard_drops_binary) {
         }
     }
     REQUIRE(h != nullptr);
-    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100) == WsFrameAction::Forward);  // text -> forward
-    CHECK(h(nullptr, WsOpcode::Binary, nullptr, 100) == WsFrameAction::Drop);   // binary -> drop
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100, false) == WsFrameAction::Forward);  // text->fwd
+    CHECK(h(nullptr, WsOpcode::Binary, nullptr, 100, false) == WsFrameAction::Drop);   // bin->drop
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
+    // Direction discrimination end-to-end: `guard frame.fromClient else { frame.forward() }`
+    // then `frame.drop()`. The handler should drop only the client→upstream leg and forward the
+    // upstream→client leg. Proves the from_client param threads through analyze -> HIR -> codegen
+    // ABI (param 4) -> serve.
+    const std::string dir = "/tmp/rut_serve_loader_ws_dir";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  guard frame.fromClient else { frame.forward() }\n"
+                                        "  frame.drop()\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    WsMessageHandlerFn h = nullptr;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (program.config.routes[i].ws_terminate) {
+            h = program.config.routes[i].ws_frame_handler;
+            break;
+        }
+    }
+    REQUIRE(h != nullptr);
+    // from_client=true  -> guard passes -> falls through to default drop
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100, true) == WsFrameAction::Drop);
+    // from_client=false -> guard fails  -> else verdict forward
+    CHECK(h(nullptr, WsOpcode::Text, nullptr, 100, false) == WsFrameAction::Forward);
     program.destroy();
 }
 #endif

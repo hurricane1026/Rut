@@ -5112,10 +5112,19 @@ static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, Ws
     return g;
 }
 
-// Match a guard condition for the frame handler. Opcode discrimination is a bare
-// `frame.isText` / `frame.isBinary` (== the WsOpcode value); otherwise it must be a
-// `frame.len <cmp> N` comparison. Anything else → UnsupportedSyntax.
+// Match a guard condition for the frame handler. Direction is a bare `frame.fromClient`
+// (true on the client→upstream leg); opcode discrimination is a bare `frame.isText` /
+// `frame.isBinary` (== the WsOpcode value); otherwise it must be a `frame.len <cmp> N`
+// comparison. Anything else → UnsupportedSyntax.
 static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond, WsVerdict verdict) {
+    if (ws_is_frame_field(cond, {"fromClient", 10})) {
+        WsLenGuard g{};
+        g.accessor = WsLenGuard::Accessor::FromClient;
+        g.cmp = WsLenGuard::Cmp::Eq;
+        g.bound = 1u;  // the bool param is 1 on the client→upstream leg, 0 otherwise
+        g.verdict = verdict;
+        return g;
+    }
     const bool is_text = ws_is_frame_field(cond, {"isText", 6});
     if (is_text || ws_is_frame_field(cond, {"isBinary", 8})) {
         WsLenGuard g{};

@@ -179,7 +179,7 @@ reach it.
 | `frame.binary` | error-capable `bytes` | the payload; **errors if the frame is Text** |
 | `frame.payload` | `bytes` | raw reassembled payload (always valid) |
 | `frame.len` | integer (bytes) | payload length (`<= maxMessageSize`). **v1 is a plain integer** so `frame.len <= 4096` parses with the existing expression grammar — `4kb` is *not* a valid expression literal today (the `IntLit + kb/mb` ByteSize form is special-cased for decorator/kwarg parsing, not general expressions). Typing it `ByteSize` + allowing `4kb` in handler expressions is a Slice B dependency (deferred). |
-| `frame.fromClient` | `bool` | direction: client→upstream (`true`) vs upstream→client (`false`) — *needs the §8 direction-ABI bump; omit from v1 if not landed* |
+| `frame.fromClient` | `bool` | direction: client→upstream (`true`) vs upstream→client (`false`) — **implemented** (the `dir` slice, §9): the handler ABI carries a `bool from_client` param the engine sets per leg. Usable as a bare guard condition: `guard frame.fromClient else { … }` |
 | `frame.json` | error-capable `Json` | payload parsed as JSON; errors on parse failure — *depends on a JSON builtin (§8)* |
 
 `frame.text` / `frame.binary` / `frame.json` are **error-capable** (not optional), so they
@@ -293,7 +293,7 @@ The inspect-only v1 (single-frame Text/Binary ≤ ~16 KB; `forward`/`drop`/bare-
 
 | Capability | Runtime work | Without it |
 |------------|--------------|------------|
-| `frame.fromClient` | `WsMessageHandlerFn` gains a `bool from_client` (or richer `ctx`); engine passes the leg | ship v1 with **no direction**; one handler, both legs identical |
+| `frame.fromClient` | ~~`WsMessageHandlerFn` gains a `bool from_client` (or richer `ctx`); engine passes the leg~~ — **DONE** (the typedef + JIT ABI gained `bool from_client`; `ws_arm_terminate` sets it `true` on `ws_c2u`, `false` on `ws_u2c`; `ws_inspect` passes `st.from_client`) | ~~ship v1 with no direction~~ |
 | `close(code)` | extend the handler return path to carry an RFC 6455 code (`WsFrameAction` → `{action, code}`, or a ctx field) **and** apply it at *both* emit sites — the `ws_inspect` forward Close and `ws_emit_close_frame` | bare `close` only: forward peer gets **1005 No Status**, echo gets **1000** |
 | Fragmented messages (within the ~16 KB cap) | a **separate per-direction output buffer** — the assembler already reassembles fragments into its message buffer, but in-place re-framing can overflow the final read, which is why `reject_fragmented` is set; an output buffer (the *same* one modify needs) lifts it | fragmented messages fail closed before the handler |
 | Messages > ~16 KB | a multi-slice reassembly buffer **and a larger/streaming input path** — `ws_inspect` waits for `avail >= header_len + payload_len` and the callers feed one slice-backed recv buffer, so a 64 KB *unfragmented* frame never becomes fully available; reassembly storage alone isn't enough (or require clients to fragment into slice-sized frames). *Independent* of the fragmentation/output-buffer work | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
@@ -316,7 +316,7 @@ output buffer lifts `reject_fragmented` without touching the size cap, and vice 
 | **C** | RIR + JIT | frame-handler ABI emission (verdict function); map `frame.opcode/payload/len`→args | M | **highest** (new handler kind through codegen) |
 | **D** | compiler→runtime | emit `add_ws_terminate` with the JIT pointer (+ required `maxMessageSize`); passthrough unchanged | S | low |
 | **E** | tests | `.rut` fixtures compiled+JIT'd+run e2e over a socket: forward / drop / bare close. **No direction** (it needs the ABI bump, which lands after E) | M | low |
-| **dir** | runtime+lang | `WsMessageHandlerFn` direction-ABI bump + `frame.fromClient` + its e2e coverage | S | low |
+| **dir** ✅ | runtime+lang | `WsMessageHandlerFn` direction-ABI bump + `frame.fromClient` + its e2e coverage — **DONE** (`from_client` param threaded through the typedef, JIT ABI param 4, and both tunnel legs; `frame.fromClient` guard in analyze/codegen; tests in test_ws_terminate / test_serve_loader / test_frontend) | S | low |
 | **code** | runtime+lang | `close(code)` — thread the code through the return path + both emit sites | S | low |
 | **4b** | runtime+lang | `frame.text =`/`frame.payload =` modify → new output slice + send-drain + re-frame from handler output | M | med (touches engine data path) |
 
@@ -335,10 +335,10 @@ runtime changes A–E deliberately avoid.
    matches "handlers must return a Response"), or default to `forward` when the block ends
    (terser, since most messages pass)? *Leaning: explicit, with `=> forward` sugar for the
    common one-liner.*
-2. **`fromClient` in v1 or deferred?** It needs the small ABI bump (§8), so to keep A–E
-   zero-runtime-change it is **deferred to the dedicated `dir` slice** (right after E) — *not*
-   in v1. Direction-awareness is still core to the real use cases (Kong's size/schema plugins
-   are per-direction), so `dir` is the very next slice; it is just not part of the no-runtime v1.
+2. **`fromClient` in v1 or deferred?** ~~Deferred to the dedicated `dir` slice~~ — **RESOLVED /
+   DONE.** The `dir` slice landed after E: the handler ABI gained a `bool from_client` param
+   (kept distinct from the inspector's `masked` flag on purpose — masking is wire-format,
+   direction is routing), and `guard frame.fromClient` is now a valid bare guard condition.
 3. **Modify (§6) in Phase 4 or 4b?** *Leaning: 4b — keep v1 verdict-only so the engine data
    path is untouched.*
 4. **Declarative sugar surface** — offer `maxMessageSize:` / `allow:` / `drop: re"..."`
