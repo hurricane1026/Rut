@@ -606,6 +606,53 @@ TEST(ws_terminate, handler_close_emits_configured_code) {
     CHECK_EQ(st.echo_close_code, 1008u);                      // echo leg will too
 }
 
+// A handler close on a message too small to hold a coded Close in the in-place out buffer
+// must NOT fail (the in-place re-frame is bounded by the consumed input). It falls back to a
+// no-status Close on the forward leg, but still reports the configured code for the echo leg.
+TEST(ws_terminate, handler_close_tiny_message_falls_back_not_errors) {
+    WsInspector st = make_state(/*masked=*/false);
+    st.close_code = 1008;
+    Recorder r;
+    r.close_now = true;
+    u8 in[16];
+    const u8 msg[] = {'x'};  // 1-byte unmasked text → 3-byte frame; coded Close needs 4
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 1);
+
+    // out_cap == consumed input (the tunnel's in-place contract): no room for a 4-byte Close.
+    u8 out[3], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Close);   // graceful close, not Error
+    CHECK_EQ(st.echo_close_code, 1008u);  // echo leg still carries the code
+    WsFrameHeader h;
+    u8 pl[8];
+    CHECK(parse_one(out, produced, false, &h, pl) == produced);
+    CHECK(h.opcode == WsOpcode::Close);
+    CHECK_EQ(h.payload_len, 0u);  // fell back to a no-status Close (no room for the 2-byte code)
+}
+
+// With room, the same tiny message keeps the coded body — the fallback is only when it won't fit.
+TEST(ws_terminate, handler_close_tiny_message_keeps_code_when_room) {
+    WsInspector st = make_state(/*masked=*/false);
+    st.close_code = 1008;
+    Recorder r;
+    r.close_now = true;
+    u8 in[16];
+    const u8 msg[] = {'x'};
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 1);
+    u8 out[16], mbuf[64];  // ample room
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Close);
+    WsFrameHeader h;
+    u8 pl[8];
+    CHECK(parse_one(out, produced, false, &h, pl) == produced);
+    CHECK_EQ(h.payload_len, 2u);
+    CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1008u);
+}
+
 // A peer-sent Close leaves the echo at 1000 (unchanged) even when the route configured a
 // different frame.close(code) — the peer's own code is relayed verbatim on the forward leg.
 TEST(ws_terminate, peer_close_echo_stays_1000) {

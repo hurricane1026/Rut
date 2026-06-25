@@ -228,6 +228,27 @@ TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
     CHECK(found);
     program.destroy();
 }
+
+TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
+    // Defense-in-depth on the C++ route surface: a close code the runtime would never put on
+    // the wire (reserved/local-only or out of range) must be refused at registration, not
+    // serialized into a Close frame later. (The .rut analyze path already rejects these; this
+    // guards direct callers of add_ws_terminate.)
+    RouteConfig cfg;
+    auto up = cfg.add_upstream("backend", 0x7F000001u, 9999);
+    REQUIRE(up.has_value());
+    const u16 uid = static_cast<u16>(up.value());
+    WsMessageHandlerFn h = [](void*, WsOpcode, const u8*, u64, bool) {
+        return WsFrameAction::Forward;
+    };
+    CHECK_FALSE(cfg.add_ws_terminate("/a", 0, uid, h, 4096, 1005));  // reserved local-only
+    CHECK_FALSE(cfg.add_ws_terminate("/b", 0, uid, h, 4096, 1006));  // reserved local-only
+    CHECK_FALSE(cfg.add_ws_terminate("/c", 0, uid, h, 4096, 999));   // below range
+    CHECK_FALSE(cfg.add_ws_terminate("/d", 0, uid, h, 4096, 5000));  // above range
+    // Valid application codes are accepted.
+    CHECK(cfg.add_ws_terminate("/e", 0, uid, h, 4096, 1000));
+    CHECK(cfg.add_ws_terminate("/f", 0, uid, h, 4096, 1008));
+}
 #endif
 
 TEST(serve_loader, missing_file_fails_at_read) {
