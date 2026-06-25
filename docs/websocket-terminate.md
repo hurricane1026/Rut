@@ -208,11 +208,19 @@ return (which has no room for a 16-bit code), the code travels as a **per-connec
 side-channel**: `frame.close(code)` is validated + stored in `HirWsHandler.close_code`,
 `serve_loader` passes it to `add_ws_terminate`, the route's `ws_close_code` seeds **both**
 `WsInspector`s' `close_code` at arm time, `ws_inspect` emits a 2-byte status body on the
-*forward* leg (no longer empty/1005) and reports `echo_close_code` for the *echo* leg, which
+*forward* leg and reports `echo_close_code` for the *echo* leg, which
 `ws_drive_close` feeds to `ws_emit_close_frame`. A **peer-sent** Close is unchanged — its own
 code is relayed verbatim on the forward leg and the echo stays 1000. This works for any Close
 verdict (guard else or default); the frontend only lets the **default** verdict carry an
 explicit code, so a guard's bare `close` uses the route's configured code (or 1000).
+
+**Tiny-message fallback (forward leg only).** The forward Close is re-framed *in place* over
+the recv buffer, whose capacity is bounded by the consumed input. A coded 2-byte Close is
+larger than a 0/1-byte data frame, so when the status body won't fit, the forward leg falls
+back to a **no-status Close** (which always fits — same header as the data frame it replaces).
+The **echo leg uses a dedicated buffer and always carries the configured code**; only the
+in-place forward leg degrades, and only for those 0/1-byte messages. Lifting this needs the
+separate per-direction output buffer that modify/fragmentation also want (§8).
 
 ---
 

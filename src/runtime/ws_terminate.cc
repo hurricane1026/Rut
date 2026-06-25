@@ -61,13 +61,6 @@ bool utf8_valid(const u8* s, u64 n) {
     return true;
 }
 
-// RFC 6455 §7.4: status codes an endpoint may put on the wire in a Close frame. Rejects
-// the unassigned (<1000, 1016-2999, >4999) and the local-only/reserved 1004/1005/1006/1015.
-bool valid_close_code(u32 code) {
-    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
-           (code >= 3000 && code <= 4999);
-}
-
 // Re-serialize one frame (header + `len`-byte cleartext payload) into out[*produced..],
 // masking the payload with a fresh key when `masked`. Returns false if it won't fit or the
 // header is refused.
@@ -154,7 +147,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             // a valid wire code) followed by a UTF-8 reason. Fail the tunnel otherwise.
             if (h.opcode == WsOpcode::Close && h.payload_len >= 2) {
                 const u32 code = (static_cast<u32>(cbuf[0]) << 8) | cbuf[1];
-                if (!valid_close_code(code)) return WsInspectStatus::Error;
+                if (!ws_valid_close_code(code)) return WsInspectStatus::Error;
                 if (!utf8_valid(cbuf + 2, h.payload_len - 2)) return WsInspectStatus::Error;
             }
 

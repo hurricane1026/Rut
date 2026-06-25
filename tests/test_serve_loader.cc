@@ -245,9 +245,11 @@ TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
     CHECK_FALSE(cfg.add_ws_terminate("/b", 0, uid, h, 4096, 1006));  // reserved local-only
     CHECK_FALSE(cfg.add_ws_terminate("/c", 0, uid, h, 4096, 999));   // below range
     CHECK_FALSE(cfg.add_ws_terminate("/d", 0, uid, h, 4096, 5000));  // above range
+    CHECK_FALSE(cfg.add_ws_terminate("/g", 0, uid, h, 4096, 2000));  // reserved 1016–2999
     // Valid application codes are accepted.
     CHECK(cfg.add_ws_terminate("/e", 0, uid, h, 4096, 1000));
     CHECK(cfg.add_ws_terminate("/f", 0, uid, h, 4096, 1008));
+    CHECK(cfg.add_ws_terminate("/h", 0, uid, h, 4096, 4000));  // private-use range
 }
 #endif
 

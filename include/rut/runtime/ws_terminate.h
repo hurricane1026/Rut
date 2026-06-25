@@ -17,6 +17,16 @@
 // slice) calls ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
 
+// RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close frame.
+// Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,
+// 1016–2999, >4999) and the local-only/reserved codes (1004/1005/1006/1015). Single source
+// of truth shared by the receive-side validator (ws_inspect), the `frame.close(code)` analyze
+// check, and the add_ws_terminate registration guard, so all three agree on what is sendable.
+constexpr bool ws_valid_close_code(u32 code) {
+    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
+           (code >= 3000 && code <= 4999);
+}
+
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
     Forward,  // re-serialize the message and send it on

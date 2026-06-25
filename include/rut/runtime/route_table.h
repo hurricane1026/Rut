@@ -464,13 +464,11 @@ struct RouteConfig {
         return false;
 #else
         if (handler == nullptr || max_message_size == 0) return false;
-        // Fail closed on a close code the runtime would refuse to put on the wire: the
-        // unassigned range (<1000, >4999) and the reserved/local-only codes (1004/1005/1006/
-        // 1015). Mirrors the .rut analyze check (RFC 6455 §7.4.1) so this C++ surface can't
-        // publish a route that serializes an invalid Close frame.
-        if (close_code < 1000 || close_code > 4999 || close_code == 1004 || close_code == 1005 ||
-            close_code == 1006 || close_code == 1015)
-            return false;
+        // Fail closed on a close code the runtime would refuse to put on the wire, using the
+        // SAME predicate as the receive-side validator (ws_inspect) and the .rut analyze check
+        // — including the reserved 1016–2999 range — so this C++ surface can't publish a route
+        // whose handler Close serializes a code the runtime itself considers invalid.
+        if (!ws_valid_close_code(close_code)) return false;
         if (!add_proxy(path, method, upstream_id)) return false;
         auto& r = routes[route_count - 1];
         r.ws_terminate = true;
