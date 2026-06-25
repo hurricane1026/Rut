@@ -253,6 +253,48 @@ TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
 }
 #endif
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(serve_loader, websocket_terminate_text_match_guard_filters_content) {
+    // Content blocklist end-to-end: `guard not frame.text.matches(re".*badword.*") else { drop }`
+    // then forward. The JIT'd handler runs the compiled regex over the payload — drop a message
+    // that matches, forward one that doesn't. Proves the regex pattern/db globals emitted by
+    // emit_ws_handler are compiled + back-patched by JIT finalization and called at runtime.
+    // matches() is full-string (the helper wraps the pattern as ^(?:…)$), so a substring filter
+    // needs the explicit `.*….*`.
+    const std::string dir = "/tmp/rut_serve_loader_ws_text_match";
+    const std::string path =
+        write_file(dir,
+                   "app.rut",
+                   "upstream backend at \"127.0.0.1:9999\"\n"
+                   "route GET \"/ws\" { return websocket(backend) {\n"
+                   "  guard not frame.text.matches(re\".*badword.*\") else { frame.drop() }\n"
+                   "  frame.forward()\n"
+                   "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    WsMessageHandlerFn h = nullptr;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (program.config.routes[i].ws_terminate) {
+            h = program.config.routes[i].ws_frame_handler;
+            break;
+        }
+    }
+    REQUIRE(h != nullptr);
+    const char* clean = "hello world";
+    const char* dirty = "you said badword again";
+    // contains badword -> matches -> `not match` false -> guard fails -> Drop
+    CHECK(h(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(dirty), strlen(dirty), true) ==
+          WsFrameAction::Drop);
+    // no match -> `not match` true -> guard passes -> default Forward
+    CHECK(h(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>(clean), strlen(clean), true) ==
+          WsFrameAction::Forward);
+    program.destroy();
+}
+#endif
+
 TEST(serve_loader, missing_file_fails_at_read) {
     LoadedProgram program;
     LoadError err;

@@ -192,6 +192,10 @@ struct AstStatement {
     Span span{};
     Str name{};
     bool bind_value = false;
+    // WebSocket frame guard only: a leading `not`/`!` negated the condition
+    // (`guard not frame.text.matches(re"…") else { … }`). Set by parse_ws_frame_guard,
+    // read by the WsTerminate analyze path; unused by every other statement kind.
+    bool cond_negated = false;
     bool is_const = false;
     bool has_type = false;
     AstTypeRef type{};

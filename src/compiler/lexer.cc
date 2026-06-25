@@ -43,6 +43,7 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"in", 2})) return TokenType::KwIn;
     if (text.eq({"and", 3})) return TokenType::KwAnd;
     if (text.eq({"or", 2})) return TokenType::KwOr;
+    if (text.eq({"not", 3})) return TokenType::KwNot;
     if (text.eq({"nil", 3})) return TokenType::KwNil;
     if (text.eq({"upstream", 8})) return TokenType::KwUpstream;
     if (text.eq({"downstream", 10})) return TokenType::KwDownstream;
