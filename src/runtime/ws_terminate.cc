@@ -61,13 +61,6 @@ bool utf8_valid(const u8* s, u64 n) {
     return true;
 }
 
-// RFC 6455 §7.4: status codes an endpoint may put on the wire in a Close frame. Rejects
-// the unassigned (<1000, 1016-2999, >4999) and the local-only/reserved 1004/1005/1006/1015.
-bool valid_close_code(u32 code) {
-    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
-           (code >= 3000 && code <= 4999);
-}
-
 // Re-serialize one frame (header + `len`-byte cleartext payload) into out[*produced..],
 // masking the payload with a fresh key when `masked`. Returns false if it won't fit or the
 // header is refused.
@@ -154,7 +147,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             // a valid wire code) followed by a UTF-8 reason. Fail the tunnel otherwise.
             if (h.opcode == WsOpcode::Close && h.payload_len >= 2) {
                 const u32 code = (static_cast<u32>(cbuf[0]) << 8) | cbuf[1];
-                if (!valid_close_code(code)) return WsInspectStatus::Error;
+                if (!ws_valid_close_code(code)) return WsInspectStatus::Error;
                 if (!utf8_valid(cbuf + 2, h.payload_len - 2)) return WsInspectStatus::Error;
             }
 
@@ -169,7 +162,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             }
             *consumed += static_cast<u32>(frame_total);
-            if (h.opcode == WsOpcode::Close) return WsInspectStatus::Close;
+            if (h.opcode == WsOpcode::Close) {
+                // Peer-initiated close: the peer's own code was relayed verbatim above; keep
+                // the echo to the other side at 1000 (unchanged behavior — see header).
+                st.echo_close_code = 1000;
+                return WsInspectStatus::Close;
+            }
             continue;
         }
 
@@ -204,11 +202,23 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             }
         } else if (action == WsFrameAction::Close) {
-            // Emit an empty Close (no body) and end the stream.
+            // Handler-initiated close. Carry the route's frame.close(code) status as a 2-byte
+            // body to the forward peer WHEN IT FITS the in-place out buffer. That buffer is
+            // bounded by the consumed input (the tunnel passes out_cap = the bytes received),
+            // and a coded Close can be larger than a tiny data frame — e.g. a 0/1-byte message
+            // whose whole frame is smaller than header+2 — so when there's no room, fall back
+            // to a no-status Close, which always fits (it has the same header as the data frame
+            // it replaces, with no body). The echo leg uses a dedicated buffer, so it carries
+            // the code regardless; only this in-place forward leg can degrade, and only for
+            // those tiny messages.
+            const u8 cc[2] = {static_cast<u8>(st.close_code >> 8), static_cast<u8>(st.close_code)};
+            const u32 hdr = 2u + (st.masked ? 4u : 0u);  // base header + optional mask key
+            const u64 body = (*produced + hdr + 2u <= out_cap) ? 2u : 0u;
             if (!emit_frame(
-                    out, out_cap, produced, WsOpcode::Close, msg_buf, 0, st.masked, st.mask_rng)) {
+                    out, out_cap, produced, WsOpcode::Close, cc, body, st.masked, st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
+            st.echo_close_code = st.close_code;
             st.message_len = 0;
             return WsInspectStatus::Close;
         }
@@ -219,10 +229,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
     return WsInspectStatus::Ok;
 }
 
-u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng) {
-    const u8 code[2] = {0x03, 0xE8};  // 1000 Normal Closure
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code) {
+    const u8 body[2] = {static_cast<u8>(code >> 8), static_cast<u8>(code)};
     u32 produced = 0;
-    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, code, 2, masked, mask_rng)) return 0;
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, body, 2, masked, mask_rng)) return 0;
     return produced;
 }
 

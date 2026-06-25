@@ -180,6 +180,8 @@ struct ConnectionBase {
     bool is_ws_terminate;           // active: 101 seen + inspection buffers acquired
     WsMessageHandlerFn ws_handler;  // per-message decision callback (route-supplied)
     u32 ws_max_message_size;        // reassembly cap; bounded to one slice (<=16KB-14)
+    u16 ws_close_code;              // route's frame.close(code) status (seeds both inspectors)
+    u16 ws_echo_close_code;         // code for the echo Close (set from the inspector on close)
     WsInspector ws_c2u;             // client->upstream inspection state (masked)
     WsInspector ws_u2c;             // upstream->client inspection state (unmasked)
     // Reassembly scratch, one per direction (pure CPU — never kernel-referenced, so freed
@@ -470,6 +472,8 @@ struct ConnectionBase {
         is_ws_terminate = false;
         ws_handler = nullptr;
         ws_max_message_size = 0;
+        ws_close_code = 1000;
+        ws_echo_close_code = 1000;
         ws_c2u.reset();
         ws_u2c.reset();
         ws_c2u.message_len = 0;

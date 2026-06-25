@@ -17,6 +17,16 @@
 // slice) calls ws_inspect at the forward boundary and sends the produced bytes.
 namespace rut {
 
+// RFC 6455 §7.4.1: the status codes an endpoint may put on the wire in a Close frame.
+// Accepts 1000–1003, 1007–1014, and 3000–4999; rejects the unassigned ranges (<1000,
+// 1016–2999, >4999) and the local-only/reserved codes (1004/1005/1006/1015). Single source
+// of truth shared by the receive-side validator (ws_inspect), the `frame.close(code)` analyze
+// check, and the add_ws_terminate registration guard, so all three agree on what is sendable.
+constexpr bool ws_valid_close_code(u32 code) {
+    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) ||
+           (code >= 3000 && code <= 4999);
+}
+
 // What the gateway should do with a fully-reassembled data message.
 enum class WsFrameAction : u8 {
     Forward,  // re-serialize the message and send it on
@@ -57,6 +67,14 @@ struct WsInspector {
                                // `masked`; the caller MUST seed it with real entropy
                                // (e.g. RAND_bytes) per RFC 6455 §5.3 unpredictability.
     u64 max_message_size = 0;  // 0 = unbounded
+    // `frame.close(code)` support. close_code (INPUT) is the RFC 6455 status the handler's
+    // Close verdict should put on the wire — set by the caller from the route config (1000 =
+    // Normal Closure default). echo_close_code (OUTPUT) is written by ws_inspect whenever it
+    // returns Close: the code the OPPOSITE leg's echo Close should carry. For a handler Close
+    // it mirrors close_code; for a peer-sent Close it stays 1000 (the echo behavior is
+    // unchanged — the peer's own code is already relayed verbatim on the forward leg).
+    u16 close_code = 1000;
+    u16 echo_close_code = 1000;
     // Reject fragmented messages (a Continuation frame, or a data frame with FIN=0) with
     // Error. The in-place tunnel integration uses this: it re-frames over the recv buffer,
     // which is only sound when a message's output fits its single frame's consumed input —
@@ -101,9 +119,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
                            u32* consumed,
                            u32* produced);
 
-// Serialize a Close frame (status 1000 Normal Closure) into out for the terminate close
+// Serialize a Close frame carrying RFC 6455 status `code` into out for the terminate close
 // handshake. `masked` true for the gateway→backend (client-role) leg, false for
 // gateway→client. Advances mask_rng when masked. Returns bytes written, 0 on overflow.
-u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng);
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code = 1000);
 
 }  // namespace rut

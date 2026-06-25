@@ -3,6 +3,7 @@
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
 #include <hs.h>
 #endif
@@ -9457,10 +9458,12 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     !const_eval_expr(code.value(), route->locals.data, route->locals.len, &cv, 0) ||
                     cv.type != HirTypeKind::I32)
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
-                // RFC 6455 §7.4.1 application close codes: 1000–4999, excluding the reserved
-                // codes a sender must never put on the wire (1004/1005/1006/1015).
+                // Sendable RFC 6455 §7.4.1 close codes — the SAME predicate the runtime uses
+                // (ws_valid_close_code): 1000–1003, 1007–1014, 3000–4999; rejects the reserved
+                // 1016–2999 range and the local-only codes too. (c<0 wraps to a huge u32 →
+                // rejected.)
                 const i32 c = cv.int_value;
-                if (c < 1000 || c > 4999 || c == 1004 || c == 1005 || c == 1006 || c == 1015)
+                if (c < 0 || !ws_valid_close_code(static_cast<u32>(c)))
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
                 route->ws_handler.close_code = static_cast<u16>(c);
             }

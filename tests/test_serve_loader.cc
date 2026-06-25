@@ -174,6 +174,83 @@ TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
     CHECK(h(nullptr, WsOpcode::Text, nullptr, 100, false) == WsFrameAction::Forward);
     program.destroy();
 }
+
+TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
+    // close(code) end-to-end: `frame.close(1008)` must publish the route with ws_close_code
+    // == 1008 (the runtime puts that on the wire), and the JIT'd handler still returns Close.
+    // Proves close_code threads analyze -> HIR -> add_ws_terminate -> RouteEntry.
+    const std::string dir = "/tmp/rut_serve_loader_ws_close_code";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  frame.close(1008)\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    bool found = false;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        const auto& r = program.config.routes[i];
+        if (!r.ws_terminate) continue;
+        found = true;
+        CHECK_EQ(r.ws_close_code, 1008u);
+        REQUIRE(r.ws_frame_handler != nullptr);
+        CHECK(r.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, false) ==
+              WsFrameAction::Close);
+    }
+    CHECK(found);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
+    // A bare frame.close() (or any non-close default) leaves ws_close_code at the 1000 default.
+    const std::string dir = "/tmp/rut_serve_loader_ws_close_default";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  frame.close()\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    bool found = false;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (!program.config.routes[i].ws_terminate) continue;
+        found = true;
+        CHECK_EQ(program.config.routes[i].ws_close_code, 1000u);
+    }
+    CHECK(found);
+    program.destroy();
+}
+
+TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
+    // Defense-in-depth on the C++ route surface: a close code the runtime would never put on
+    // the wire (reserved/local-only or out of range) must be refused at registration, not
+    // serialized into a Close frame later. (The .rut analyze path already rejects these; this
+    // guards direct callers of add_ws_terminate.)
+    RouteConfig cfg;
+    auto up = cfg.add_upstream("backend", 0x7F000001u, 9999);
+    REQUIRE(up.has_value());
+    const u16 uid = static_cast<u16>(up.value());
+    WsMessageHandlerFn h = [](void*, WsOpcode, const u8*, u64, bool) {
+        return WsFrameAction::Forward;
+    };
+    CHECK_FALSE(cfg.add_ws_terminate("/a", 0, uid, h, 4096, 1005));  // reserved local-only
+    CHECK_FALSE(cfg.add_ws_terminate("/b", 0, uid, h, 4096, 1006));  // reserved local-only
+    CHECK_FALSE(cfg.add_ws_terminate("/c", 0, uid, h, 4096, 999));   // below range
+    CHECK_FALSE(cfg.add_ws_terminate("/d", 0, uid, h, 4096, 5000));  // above range
+    CHECK_FALSE(cfg.add_ws_terminate("/g", 0, uid, h, 4096, 2000));  // reserved 1016–2999
+    // Valid application codes are accepted.
+    CHECK(cfg.add_ws_terminate("/e", 0, uid, h, 4096, 1000));
+    CHECK(cfg.add_ws_terminate("/f", 0, uid, h, 4096, 1008));
+    CHECK(cfg.add_ws_terminate("/h", 0, uid, h, 4096, 4000));  // private-use range
+}
 #endif
 
 TEST(serve_loader, missing_file_fails_at_read) {

@@ -650,6 +650,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.is_ws_terminate_route = ws_term;
     conn.ws_handler = ws_term ? route->ws_frame_handler : nullptr;
     conn.ws_max_message_size = ws_term ? route->ws_max_message_size : 0;
+    conn.ws_close_code = ws_term ? route->ws_close_code : 1000;
 #endif
 
     if (route && route->action == RouteAction::Proxy) {
@@ -2225,11 +2226,13 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
         conn.ws_c2u.masked = true;       // client->upstream is client-role on both ends → masked
         conn.ws_c2u.from_client = true;  // this leg is the client→upstream direction
         conn.ws_c2u.max_message_size = cap;
+        conn.ws_c2u.close_code = conn.ws_close_code;  // frame.close(code) status for this route
         conn.ws_c2u.reject_fragmented = true;  // in-place re-frame: single-frame messages only
         conn.ws_u2c.reset();
         conn.ws_u2c.masked = false;       // upstream->client is server-role on both ends → unmasked
         conn.ws_u2c.from_client = false;  // this leg is the upstream→client direction
         conn.ws_u2c.max_message_size = cap;
+        conn.ws_u2c.close_code = conn.ws_close_code;
         conn.ws_u2c.reject_fragmented = true;
         u64 seed = 0;
         // Fail closed on an RNG failure rather than emit predictable mask keys (§5.3).
@@ -2342,7 +2345,8 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
         const u32 n = ws_emit_close_frame(conn.ws_close_frame_client,
                                           sizeof(conn.ws_close_frame_client),
                                           /*masked=*/false,
-                                          conn.ws_u2c.mask_rng);
+                                          conn.ws_u2c.mask_rng,
+                                          conn.ws_echo_close_code);
         if (n == 0 || !client_send(loop, conn, conn.ws_close_frame_client, n)) return false;
         conn.ws_upstream_send_pending = true;
         conn.ws_close_client_need = false;
@@ -2353,7 +2357,8 @@ bool ws_drive_close(Loop* loop, Connection& conn) {
         const u32 n = ws_emit_close_frame(conn.ws_close_frame_upstream,
                                           sizeof(conn.ws_close_frame_upstream),
                                           /*masked=*/true,
-                                          conn.ws_c2u.mask_rng);
+                                          conn.ws_c2u.mask_rng,
+                                          conn.ws_echo_close_code);
         if (n == 0 || !loop->submit_send_upstream(conn, conn.ws_close_frame_upstream, n))
             return false;
         conn.ws_client_send_pending = true;
@@ -2399,10 +2404,12 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
             if (st == WsInspectStatus::Close) {
                 // The produced send carries the Close to the upstream; the client must get a
                 // Close back too (handshake). Start the upstream slot in-flight + queue the
-                // client echo, then close once both drain.
+                // client echo, then close once both drain. The echo carries the code the
+                // inspector resolved (handler frame.close(code), or 1000 for a peer close).
                 conn.ws_closing = true;
                 conn.ws_close_upstream_inflight = true;
                 conn.ws_close_client_need = true;
+                conn.ws_echo_close_code = conn.ws_c2u.echo_close_code;
             }
             if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), produced)) return false;
             conn.ws_client_send_pending = true;
@@ -2474,10 +2481,12 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
             conn.ws_u2c_consumed = consumed;
             if (st == WsInspectStatus::Close) {
                 // The produced send carries the Close to the client; the upstream must get a
-                // Close back too. Start the client slot in-flight + queue the upstream echo.
+                // Close back too. Start the client slot in-flight + queue the upstream echo,
+                // carrying the code the inspector resolved (frame.close(code), or 1000).
                 conn.ws_closing = true;
                 conn.ws_close_client_inflight = true;
                 conn.ws_close_upstream_need = true;
+                conn.ws_echo_close_code = conn.ws_u2c.echo_close_code;
             }
             if (!client_send(loop, conn, conn.upstream_recv_buf.data(), produced)) return false;
             conn.ws_upstream_send_pending = true;

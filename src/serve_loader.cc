@@ -245,7 +245,8 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
                                              route.method,
                                              static_cast<u16>(route.ws_handler.upstream_index),
                                              handler,
-                                             kWsDefaultMaxMessageSize))
+                                             kWsDefaultMaxMessageSize,
+                                             route.ws_handler.close_code))
                 return false;
             ws_n++;
         }
