@@ -102,6 +102,8 @@ struct RouteEntry {
     bool ws_terminate = false;
     WsMessageHandlerFn ws_frame_handler = nullptr;
     u32 ws_max_message_size = 0;
+    // RFC 6455 status the handler's `frame.close(code)` verdict puts on the wire (1000 default).
+    u16 ws_close_code = 1000;
 };
 
 // RouteConfig — immutable after construction, atomically swappable.
@@ -448,7 +450,8 @@ struct RouteConfig {
                           u8 method,
                           u16 upstream_id,
                           WsMessageHandlerFn handler,
-                          u32 max_message_size) {
+                          u32 max_message_size,
+                          u16 close_code = 1000) {
 #if !RUT_ENABLE_WEBSOCKET
         // The 101/tunnel path is compiled out in this build — a terminate route could
         // never enter terminate mode, so fail loud instead of publishing an unusable route.
@@ -457,6 +460,7 @@ struct RouteConfig {
         (void)upstream_id;
         (void)handler;
         (void)max_message_size;
+        (void)close_code;
         return false;
 #else
         if (handler == nullptr || max_message_size == 0) return false;
@@ -465,6 +469,7 @@ struct RouteConfig {
         r.ws_terminate = true;
         r.ws_frame_handler = handler;
         r.ws_max_message_size = max_message_size;
+        r.ws_close_code = close_code;
         return true;
 #endif
     }

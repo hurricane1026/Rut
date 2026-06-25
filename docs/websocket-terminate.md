@@ -201,17 +201,18 @@ A top-level implicit `forward` fallthrough is a possible ergonomic option (TBD �
 | `return forward` | re-serialize the message for the peer and send it on — **implemented** |
 | `return drop` | silently discard (the peer never sees it) — **implemented** |
 | `return close` | emit a Close to **both** peers, drain, tear down — the merged bidirectional Close handshake — **implemented (see status note below)** |
-| `return close(code)` | the same, with a chosen RFC 6455 status — **needs a runtime change** |
+| `return close(code)` | the same, with a chosen RFC 6455 status — **implemented** (the `code` slice) |
 
-**v1: bare `close` only — and the two legs carry different status.** `WsMessageHandlerFn`
-returns only a `WsFrameAction`, so the handler has no channel for a code. On `Close`,
-`ws_inspect` emits an **empty (no-status) Close** to the *forward* peer (that peer reads
-**1005 No Status**) while the queued **echo** to the other peer is **1000** via
-`ws_emit_close_frame`. So even bare `close` is not uniformly 1000 today. `close(code)` — with
-`.normal` (1000), `.tooBig` (1009), `.invalidData` (1007), `.policyViolation` (1008), … —
-requires threading the code through the handler return path **and** both emit sites (the
-`ws_inspect` forward Close AND `ws_emit_close_frame`), per §8. Until then, only the
-unparameterized `close` is accepted (§9 Slice B type-checks bare `close` only).
+**`close(code)` now wires the status to the wire (both legs).** Rather than widen the JIT
+return (which has no room for a 16-bit code), the code travels as a **per-connection
+side-channel**: `frame.close(code)` is validated + stored in `HirWsHandler.close_code`,
+`serve_loader` passes it to `add_ws_terminate`, the route's `ws_close_code` seeds **both**
+`WsInspector`s' `close_code` at arm time, `ws_inspect` emits a 2-byte status body on the
+*forward* leg (no longer empty/1005) and reports `echo_close_code` for the *echo* leg, which
+`ws_drive_close` feeds to `ws_emit_close_frame`. A **peer-sent** Close is unchanged — its own
+code is relayed verbatim on the forward leg and the echo stays 1000. This works for any Close
+verdict (guard else or default); the frontend only lets the **default** verdict carry an
+explicit code, so a guard's bare `close` uses the route's configured code (or 1000).
 
 ---
 
@@ -294,7 +295,7 @@ The inspect-only v1 (single-frame Text/Binary ≤ ~16 KB; `forward`/`drop`/bare-
 | Capability | Runtime work | Without it |
 |------------|--------------|------------|
 | `frame.fromClient` | ~~`WsMessageHandlerFn` gains a `bool from_client` (or richer `ctx`); engine passes the leg~~ — **DONE** (the typedef + JIT ABI gained `bool from_client`; `ws_arm_terminate` sets it `true` on `ws_c2u`, `false` on `ws_u2c`; `ws_inspect` passes `st.from_client`) | ~~ship v1 with no direction~~ |
-| `close(code)` | extend the handler return path to carry an RFC 6455 code (`WsFrameAction` → `{action, code}`, or a ctx field) **and** apply it at *both* emit sites — the `ws_inspect` forward Close and `ws_emit_close_frame` | bare `close` only: forward peer gets **1005 No Status**, echo gets **1000** |
+| `close(code)` | ~~extend the handler return path to carry an RFC 6455 code~~ — **DONE** via a per-connection side-channel (route `ws_close_code` → both `WsInspector.close_code` → `ws_inspect` forward body + `echo_close_code` → `ws_emit_close_frame`), not a return-type change | ~~bare `close` only: forward 1005, echo 1000~~ |
 | Fragmented messages (within the ~16 KB cap) | a **separate per-direction output buffer** — the assembler already reassembles fragments into its message buffer, but in-place re-framing can overflow the final read, which is why `reject_fragmented` is set; an output buffer (the *same* one modify needs) lifts it | fragmented messages fail closed before the handler |
 | Messages > ~16 KB | a multi-slice reassembly buffer **and a larger/streaming input path** — `ws_inspect` waits for `avail >= header_len + payload_len` and the callers feed one slice-backed recv buffer, so a 64 KB *unfragmented* frame never becomes fully available; reassembly storage alone isn't enough (or require clients to fragment into slice-sized frames). *Independent* of the fragmentation/output-buffer work | `maxMessageSize` clamped to ~16 KB; larger messages fail closed |
 | `frame.json` / `validate(_, Schema)` | a JSON value type + parser builtin (regex `re"…"`/Vectorscan already exists) | ship `frame.text` + regex-based validation first |
@@ -317,7 +318,7 @@ output buffer lifts `reject_fragmented` without touching the size cap, and vice 
 | **D** | compiler→runtime | emit `add_ws_terminate` with the JIT pointer (+ required `maxMessageSize`); passthrough unchanged | S | low |
 | **E** | tests | `.rut` fixtures compiled+JIT'd+run e2e over a socket: forward / drop / bare close. **No direction** (it needs the ABI bump, which lands after E) | M | low |
 | **dir** ✅ | runtime+lang | `WsMessageHandlerFn` direction-ABI bump + `frame.fromClient` + its e2e coverage — **DONE** (`from_client` param threaded through the typedef, JIT ABI param 4, and both tunnel legs; `frame.fromClient` guard in analyze/codegen; tests in test_ws_terminate / test_serve_loader / test_frontend) | S | low |
-| **code** | runtime+lang | `close(code)` — thread the code through the return path + both emit sites | S | low |
+| **code** ✅ | runtime+lang | `close(code)` — **DONE** (per-connection side-channel: route `ws_close_code` → both inspectors → forward Close body + echo; peer-Close echo unchanged at 1000; tests in test_ws_terminate / test_serve_loader) | S | low |
 | **4b** | runtime+lang | `frame.text =`/`frame.payload =` modify → new output slice + send-drain + re-frame from handler output | M | med (touches engine data path) |
 
 Recommended order: **A → B → C → D → E** is the inspect-only v1 (single-frame, no direction,

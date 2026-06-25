@@ -174,6 +174,60 @@ TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
     CHECK(h(nullptr, WsOpcode::Text, nullptr, 100, false) == WsFrameAction::Forward);
     program.destroy();
 }
+
+TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
+    // close(code) end-to-end: `frame.close(1008)` must publish the route with ws_close_code
+    // == 1008 (the runtime puts that on the wire), and the JIT'd handler still returns Close.
+    // Proves close_code threads analyze -> HIR -> add_ws_terminate -> RouteEntry.
+    const std::string dir = "/tmp/rut_serve_loader_ws_close_code";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  frame.close(1008)\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    bool found = false;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        const auto& r = program.config.routes[i];
+        if (!r.ws_terminate) continue;
+        found = true;
+        CHECK_EQ(r.ws_close_code, 1008u);
+        REQUIRE(r.ws_frame_handler != nullptr);
+        CHECK(r.ws_frame_handler(nullptr, WsOpcode::Text, nullptr, 0, false) ==
+              WsFrameAction::Close);
+    }
+    CHECK(found);
+    program.destroy();
+}
+
+TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
+    // A bare frame.close() (or any non-close default) leaves ws_close_code at the 1000 default.
+    const std::string dir = "/tmp/rut_serve_loader_ws_close_default";
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "upstream backend at \"127.0.0.1:9999\"\n"
+                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "  frame.close()\n"
+                                        "} }\n");
+
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    bool found = false;
+    for (u32 i = 0; i < program.config.route_count; i++) {
+        if (!program.config.routes[i].ws_terminate) continue;
+        found = true;
+        CHECK_EQ(program.config.routes[i].ws_close_code, 1000u);
+    }
+    CHECK(found);
+    program.destroy();
+}
 #endif
 
 TEST(serve_loader, missing_file_fails_at_read) {

@@ -273,7 +273,7 @@ TEST(ws_terminate, output_capacity_control_and_close) {
         ws_inspect(
             st, in, n, tiny, sizeof(tiny), mbuf, sizeof(mbuf), record, &r, &consumed, &produced) ==
         WsInspectStatus::Error);
-    // A handler-requested Close with no room for even the 2-byte Close frame.
+    // A handler-requested Close with no room for even the (4-byte) Close frame.
     WsInspector st2 = make_state(false);
     r.close_now = true;
     const u8 m[] = {'x'};
@@ -340,6 +340,14 @@ TEST(ws_terminate, emit_close_frame_unmasked_and_masked) {
     CHECK(mh.opcode == WsOpcode::Close);
     CHECK(mh.masked);
     CHECK(pl[0] == 0x03 && pl[1] == 0xE8);  // unmasks back to 1000
+
+    // A custom code is encoded big-endian (1008 Policy Violation = 0x03F0).
+    u8 cout[16];
+    u32 cn = ws_emit_close_frame(cout, sizeof(cout), /*masked=*/false, rng, /*code=*/1008);
+    WsFrameHeader ch;
+    CHECK(ws_parse_header(cout, cn, /*require_mask=*/false, &ch) == ParseStatus::Complete);
+    CHECK(ch.opcode == WsOpcode::Close);
+    CHECK(cout[ch.header_len] == 0x03 && cout[ch.header_len + 1] == 0xF0);  // 1008
 }
 
 // === Drop ===
@@ -562,11 +570,65 @@ TEST(ws_terminate, handler_close_emits_close_and_stops) {
         st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
     CHECK(s == WsInspectStatus::Close);
     CHECK_EQ(r.calls, 1);
-    // A Close frame was emitted.
+    // A Close frame was emitted carrying the default 1000 Normal Closure code (2-byte body),
+    // and the inspector reports 1000 for the echo to the other peer.
     WsFrameHeader h;
     u8 pl[8];
     CHECK(parse_one(out, produced, false, &h, pl) == produced);
     CHECK(h.opcode == WsOpcode::Close);
+    CHECK_EQ(h.payload_len, 2u);
+    CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1000u);
+    CHECK_EQ(st.echo_close_code, 1000u);
+}
+
+// frame.close(code): the handler's configured close_code is put on the wire — both the
+// forward Close (emitted here) and the echo code the caller reads back for the other peer.
+TEST(ws_terminate, handler_close_emits_configured_code) {
+    WsInspector st = make_state(false);
+    st.close_code = 1008;  // Policy Violation — what frame.close(1008) lowers to
+    Recorder r;
+    r.close_now = true;
+    u8 in[64];
+    const u8 msg[] = {'n', 'o'};
+    u32 in_len = build(in, WsOpcode::Text, true, false, msg, 2);
+
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Close);
+    WsFrameHeader h;
+    u8 pl[8];
+    CHECK(parse_one(out, produced, false, &h, pl) == produced);
+    CHECK(h.opcode == WsOpcode::Close);
+    CHECK_EQ(h.payload_len, 2u);
+    CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1008u);  // forward leg carries 1008
+    CHECK_EQ(st.echo_close_code, 1008u);                      // echo leg will too
+}
+
+// A peer-sent Close leaves the echo at 1000 (unchanged) even when the route configured a
+// different frame.close(code) — the peer's own code is relayed verbatim on the forward leg.
+TEST(ws_terminate, peer_close_echo_stays_1000) {
+    WsInspector st = make_state(false);
+    st.close_code = 1008;  // would only apply to a HANDLER close, not this peer close
+    Recorder r;
+    u8 in[64];
+    const u8 body[] = {0x03, 0xF1};  // 1009 Too Big, from the peer
+    u32 in_len = build(in, WsOpcode::Close, true, false, body, 2);
+
+    u8 out[64], mbuf[64];
+    u32 consumed = 0, produced = 0;
+    WsInspectStatus s = ws_inspect(
+        st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+    CHECK(s == WsInspectStatus::Close);
+    CHECK_EQ(r.calls, 0);                 // control frames never reach the handler
+    CHECK_EQ(st.echo_close_code, 1000u);  // echo unchanged by the route's close_code
+    // The peer's 1009 was forwarded verbatim.
+    WsFrameHeader h;
+    u8 pl[8];
+    CHECK(parse_one(out, produced, false, &h, pl) == produced);
+    CHECK(h.opcode == WsOpcode::Close);
+    CHECK_EQ((static_cast<u32>(pl[0]) << 8) | pl[1], 1009u);
 }
 
 // === Partial frames across chunks ===

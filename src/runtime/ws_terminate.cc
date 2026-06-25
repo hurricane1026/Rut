@@ -169,7 +169,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             }
             *consumed += static_cast<u32>(frame_total);
-            if (h.opcode == WsOpcode::Close) return WsInspectStatus::Close;
+            if (h.opcode == WsOpcode::Close) {
+                // Peer-initiated close: the peer's own code was relayed verbatim above; keep
+                // the echo to the other side at 1000 (unchanged behavior — see header).
+                st.echo_close_code = 1000;
+                return WsInspectStatus::Close;
+            }
             continue;
         }
 
@@ -204,11 +209,15 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 return WsInspectStatus::Error;
             }
         } else if (action == WsFrameAction::Close) {
-            // Emit an empty Close (no body) and end the stream.
+            // Handler-initiated close: emit a Close carrying the route's `frame.close(code)`
+            // status (2-byte big-endian body) to the forward peer, and tell the caller the
+            // same code for the echo to the other peer. Default 1000 (Normal Closure).
+            const u8 cc[2] = {static_cast<u8>(st.close_code >> 8), static_cast<u8>(st.close_code)};
             if (!emit_frame(
-                    out, out_cap, produced, WsOpcode::Close, msg_buf, 0, st.masked, st.mask_rng)) {
+                    out, out_cap, produced, WsOpcode::Close, cc, 2, st.masked, st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
+            st.echo_close_code = st.close_code;
             st.message_len = 0;
             return WsInspectStatus::Close;
         }
@@ -219,10 +228,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
     return WsInspectStatus::Ok;
 }
 
-u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng) {
-    const u8 code[2] = {0x03, 0xE8};  // 1000 Normal Closure
+u32 ws_emit_close_frame(u8* out, u32 out_cap, bool masked, u64& mask_rng, u16 code) {
+    const u8 body[2] = {static_cast<u8>(code >> 8), static_cast<u8>(code)};
     u32 produced = 0;
-    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, code, 2, masked, mask_rng)) return 0;
+    if (!emit_frame(out, out_cap, &produced, WsOpcode::Close, body, 2, masked, mask_rng)) return 0;
     return produced;
 }
 
