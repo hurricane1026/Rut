@@ -42,14 +42,18 @@ u32 format_ws_handler_symbol(u32 id, char* out, u32 out_size);
 // A `guard frame.len <cmp> bound else { <verdict> }` check for the frame-handler codegen.
 // Mirrors HirWsHandler::WsLenGuard but stays hir-free so the serve loader can build it.
 struct WsLenGuardSpec {
-    u8 cmp;      // WsLenGuard::Cmp ordinal (Le=0,Lt=1,Ge=2,Gt=3,Eq=4,Ne=5): frame.len <cmp> bound
-    u32 bound;   // the literal frame.len is compared against
-    u8 verdict;  // WsFrameAction yielded when the guard CONDITION is false
+    u8 accessor;  // WsLenGuard::Accessor ordinal: 0=Len (frame.len, i64 param 3),
+                  //                                1=Opcode (frame opcode, i8 param 1),
+                  //                                2=FromClient (direction, i8 param 4)
+    u8 cmp;       // WsLenGuard::Cmp ordinal: 0=Lt, 1=Gt, 2=Eq
+    u32 bound;    // Len: the byte literal; Opcode: the WsOpcode value (Text=1, Binary=2);
+                  // FromClient: 1 (client→upstream leg)
+    u8 verdict;   // WsFrameAction yielded when the guard CONDITION is false
 };
 
 // Emit a WebSocket terminate-mode frame handler into `mod`:
-//   i8 ws_handler_<id>(i8* ctx, i8 opcode, i8* payload, i64 len)
-// matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64)). It checks
+//   i8 ws_handler_<id>(i8* ctx, i8 opcode, i8* payload, i64 len, i8 from_client)
+// matching WsMessageHandlerFn (WsFrameAction(*)(void*, WsOpcode, const u8*, u64, bool)). It checks
 // each guard against `len` (= frame.len) in order — the first whose condition is FALSE returns
 // that guard's verdict — then returns `default_verdict`. Verdicts are WsFrameAction values
 // (Forward=0/Drop=1/Close=2). This bypasses the RIR/MIR HTTP pipeline. Returns false on error.

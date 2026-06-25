@@ -18286,7 +18286,7 @@ static WsFrameAction jit_ws_verdict(const char* src) {
     JitEngine engine;
     if (!engine.init() || !engine.compile(cg.mod, cg.ctx)) return kFail;
     auto fn = reinterpret_cast<WsMessageHandlerFn>(engine.lookup("ws_handler_0"));
-    const WsFrameAction r = fn ? fn(nullptr, WsOpcode::Text, nullptr, 0) : kFail;
+    const WsFrameAction r = fn ? fn(nullptr, WsOpcode::Text, nullptr, 0, false) : kFail;
     engine.shutdown();
     return r;
 }

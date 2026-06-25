@@ -7990,10 +7990,8 @@ struct WsFrameEchoServer {
 };
 
 // Terminate handler: close on "BYE", drop "DROP", forward everything else.
-static rut::WsFrameAction terminate_test_handler(void*,
-                                                 rut::WsOpcode op,
-                                                 const rut::u8* p,
-                                                 rut::u64 len) {
+static rut::WsFrameAction terminate_test_handler(
+    void*, rut::WsOpcode op, const rut::u8* p, rut::u64 len, bool /*from_client*/) {
     if (op == rut::WsOpcode::Text && len == 3 && memcmp(p, "BYE", 3) == 0)
         return rut::WsFrameAction::Close;
     if (op == rut::WsOpcode::Text && len == 4 && memcmp(p, "DROP", 4) == 0)

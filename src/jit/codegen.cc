@@ -1677,15 +1677,17 @@ bool emit_ws_handler(LLVMModuleRef mod,
     LLVMTypeRef i8_ty = LLVMInt8TypeInContext(ctx);
     LLVMTypeRef i64_ty = LLVMInt64TypeInContext(ctx);
     LLVMTypeRef ptr_ty = LLVMPointerTypeInContext(ctx, 0);
-    // (ctx, opcode, payload, len) -> verdict, matching WsMessageHandlerFn's C ABI.
-    LLVMTypeRef params[4] = {ptr_ty, i8_ty, ptr_ty, i64_ty};
-    LLVMTypeRef fn_ty = LLVMFunctionType(i8_ty, params, 4, 0);
+    // (ctx, opcode, payload, len, from_client) -> verdict, matching WsMessageHandlerFn's C ABI.
+    LLVMTypeRef params[5] = {ptr_ty, i8_ty, ptr_ty, i64_ty, i8_ty};
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8_ty, params, 5, 0);
 
     char sym[64];
     format_ws_handler_symbol(id, sym, sizeof(sym));
     LLVMValueRef fn = LLVMAddFunction(mod, sym, fn_ty);
     if (!fn) return false;
-    LLVMValueRef len = LLVMGetParam(fn, 3);  // i64 message length == frame.len
+    LLVMValueRef len = LLVMGetParam(fn, 3);          // i64 message length == frame.len
+    LLVMValueRef opcode = LLVMGetParam(fn, 1);       // i8 WsOpcode == frame opcode
+    LLVMValueRef from_client = LLVMGetParam(fn, 4);  // i8 bool: 1 on the client→upstream leg
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
     LLVMBuilderRef builder = LLVMCreateBuilderInContext(ctx);
@@ -1709,8 +1711,15 @@ bool emit_ws_handler(LLVMModuleRef mod,
             default:
                 break;
         }
+        // Operand + width by accessor: 1=Opcode reads the i8 opcode param,
+        // 2=FromClient reads the i8 from_client param, else (0=Len) the i64 len.
+        const bool is_i8 = guards[i].accessor == 1 || guards[i].accessor == 2;
+        LLVMValueRef operand = guards[i].accessor == 2   ? from_client
+                               : guards[i].accessor == 1 ? opcode
+                                                         : len;
+        LLVMTypeRef bound_ty = is_i8 ? i8_ty : i64_ty;
         LLVMValueRef cond =
-            LLVMBuildICmp(builder, pred, len, LLVMConstInt(i64_ty, guards[i].bound, 0), "g");
+            LLVMBuildICmp(builder, pred, operand, LLVMConstInt(bound_ty, guards[i].bound, 0), "g");
         LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(ctx, fn, "cont");
         LLVMBasicBlockRef els = LLVMAppendBasicBlockInContext(ctx, fn, "else");
         LLVMBuildCondBr(builder, cond, cont, els);  // cond true -> continue; false -> verdict

@@ -5046,11 +5046,14 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
-// `frame.len` field access — the reassembled message length, the only frame accessor in this
-// slice (frame.text/payload/opcode are follow-ups).
-static bool ws_is_frame_len(const AstExpr& e) {
+// A `frame.<field>` access (lhs ident `frame`).
+static bool ws_is_frame_field(const AstExpr& e, Str field) {
     return e.kind == AstExprKind::Field && e.lhs != nullptr && e.lhs->kind == AstExprKind::Ident &&
-           e.lhs->name.eq({"frame", 5}) && e.name.eq({"len", 3});
+           e.lhs->name.eq({"frame", 5}) && e.name.eq(field);
+}
+// `frame.len` — the reassembled message length.
+static bool ws_is_frame_len(const AstExpr& e) {
+    return ws_is_frame_field(e, {"len", 3});
 }
 
 // A bare frame verdict `frame.drop()/close()/forward()` (no args) → WsVerdict, for guard
@@ -5102,10 +5105,36 @@ static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, Ws
             return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     }
     WsLenGuard g{};
+    g.accessor = WsLenGuard::Accessor::Len;
     g.cmp = cmp;
     g.bound = static_cast<u32>(num->int_value);
     g.verdict = verdict;
     return g;
+}
+
+// Match a guard condition for the frame handler. Direction is a bare `frame.fromClient`
+// (true on the client→upstream leg); opcode discrimination is a bare `frame.isText` /
+// `frame.isBinary` (== the WsOpcode value); otherwise it must be a `frame.len <cmp> N`
+// comparison. Anything else → UnsupportedSyntax.
+static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond, WsVerdict verdict) {
+    if (ws_is_frame_field(cond, {"fromClient", 10})) {
+        WsLenGuard g{};
+        g.accessor = WsLenGuard::Accessor::FromClient;
+        g.cmp = WsLenGuard::Cmp::Eq;
+        g.bound = 1u;  // the bool param is 1 on the client→upstream leg, 0 otherwise
+        g.verdict = verdict;
+        return g;
+    }
+    const bool is_text = ws_is_frame_field(cond, {"isText", 6});
+    if (is_text || ws_is_frame_field(cond, {"isBinary", 8})) {
+        WsLenGuard g{};
+        g.accessor = WsLenGuard::Accessor::Opcode;
+        g.cmp = WsLenGuard::Cmp::Eq;
+        g.bound = is_text ? 0x1u : 0x2u;  // WsOpcode: Text=0x1, Binary=0x2
+        g.verdict = verdict;
+        return g;
+    }
+    return analyze_frame_len_cond(cond, verdict);
 }
 #endif
 
@@ -9371,7 +9400,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                           gs ? gs->span : body->span);
                 auto gv = analyze_bare_frame_verdict(gs->else_stmt->expr);
                 if (!gv) return core::make_unexpected(gv.error());
-                auto g = analyze_frame_len_cond(gs->expr, gv.value());
+                auto g = analyze_frame_guard_cond(gs->expr, gv.value());
                 if (!g) return core::make_unexpected(g.error());
                 if (!route->ws_handler.len_guards.push(g.value()))
                     return frontend_error(FrontendError::TooManyItems, gs->span);

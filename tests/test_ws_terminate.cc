@@ -20,15 +20,19 @@ struct Recorder {
     WsFrameAction verdict = WsFrameAction::Forward;
     bool drop_text = false;
     bool close_now = false;
+    bool last_from_client = false;
+    bool drop_client = false;  // drop only the client→upstream leg (exercises from_client)
 };
-WsFrameAction record(void* c, WsOpcode op, const u8* payload, u64 len) {
+WsFrameAction record(void* c, WsOpcode op, const u8* payload, u64 len, bool from_client) {
     auto* r = static_cast<Recorder*>(c);
     r->calls++;
     r->last_op = op;
     r->last_len = len;
     r->last_first = len ? payload[0] : 0;
+    r->last_from_client = from_client;
     if (r->close_now) return WsFrameAction::Close;
     if (r->drop_text && op == WsOpcode::Text) return WsFrameAction::Drop;
+    if (r->drop_client && from_client) return WsFrameAction::Drop;
     return r->verdict;
 }
 
@@ -53,6 +57,7 @@ u32 parse_one(const u8* buf, u32 len, bool masked, WsFrameHeader* h, u8* pl) {
 WsInspector make_state(bool masked) {
     WsInspector st;
     st.masked = masked;
+    st.from_client = masked;  // the masked leg is the client→upstream direction
     st.max_message_size = 1u << 20;
     st.mask_rng = 0xC0FFEEull;  // deterministic seed (real tunnels seed with entropy)
     return st;
@@ -110,6 +115,45 @@ TEST(ws_terminate, forward_masked_reframes_with_out_key) {
     CHECK(parse_one(out, produced, true, &h, pl) == produced);
     CHECK(h.masked);
     CHECK_EQ(memcmp(pl, msg, 4), 0);
+}
+
+// The engine passes the leg to the handler as `from_client`, so a handler can police one
+// direction. Same handler, same payload: dropped on the client leg, forwarded on the other.
+TEST(ws_terminate, passes_direction_to_handler) {
+    const u8 msg[] = {'h', 'i'};
+
+    // Client→upstream leg (masked): drop_client fires → no output.
+    {
+        WsInspector st = make_state(/*masked=*/true);
+        Recorder r;
+        r.drop_client = true;
+        u8 in[64];
+        u32 in_len = build(in, WsOpcode::Text, true, true, msg, 2);
+        u8 out[128], mbuf[256];
+        u32 consumed = 0, produced = 0;
+        WsInspectStatus s = ws_inspect(
+            st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+        CHECK(s == WsInspectStatus::Ok);
+        CHECK(r.last_from_client);  // engine reported the client leg
+        CHECK_EQ(produced, 0u);     // dropped → nothing forwarded
+        CHECK_EQ(consumed, in_len);
+    }
+
+    // Upstream→client leg (unmasked): drop_client does NOT fire → forwarded.
+    {
+        WsInspector st = make_state(/*masked=*/false);
+        Recorder r;
+        r.drop_client = true;
+        u8 in[64];
+        u32 in_len = build(in, WsOpcode::Text, true, false, msg, 2);
+        u8 out[128], mbuf[256];
+        u32 consumed = 0, produced = 0;
+        WsInspectStatus s = ws_inspect(
+            st, in, in_len, out, sizeof(out), mbuf, sizeof(mbuf), record, &r, &consumed, &produced);
+        CHECK(s == WsInspectStatus::Ok);
+        CHECK(!r.last_from_client);  // engine reported the upstream leg
+        CHECK(produced > 0);         // forwarded
+    }
 }
 
 // Each re-framed masked message gets a fresh mask key (RFC 6455 §5.3) — two messages in

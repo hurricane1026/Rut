@@ -26,11 +26,11 @@ enum class WsFrameAction : u8 {
 
 // Invoked once per complete data message. `opcode` is Text or Binary; `payload` is the
 // reassembled, unmasked message of `len` bytes (read-only this slice — modify/inject
-// comes later). Returns the action.
-using WsMessageHandlerFn = WsFrameAction (*)(void* ctx,
-                                             WsOpcode opcode,
-                                             const u8* payload,
-                                             u64 len);
+// comes later). `from_client` is the leg the message travels on: true for client->upstream,
+// false for upstream->client — so one handler can police a single direction (`frame.fromClient`).
+// Returns the action.
+using WsMessageHandlerFn =
+    WsFrameAction (*)(void* ctx, WsOpcode opcode, const u8* payload, u64 len, bool from_client);
 
 enum class WsInspectStatus : u8 {
     Ok,     // all complete frames in the chunk processed; *consumed/*produced set
@@ -47,7 +47,12 @@ enum class WsInspectStatus : u8 {
 // (enforced at the handshake by the tunnel-wiring slice) so client and backend never
 // negotiate one — otherwise valid compressed frames carry RSV1 and are failed here.
 struct WsInspector {
-    bool masked = false;       // this direction's frames are masked (client->upstream)
+    bool masked = false;  // this direction's frames are masked (client->upstream)
+    // The leg this inspector handles, passed to the handler as `frame.fromClient`. Kept
+    // separate from `masked` on purpose: today client->upstream is both masked AND the
+    // client leg, but masking is a wire-format property and direction is a routing one —
+    // conflating them would break the day they diverge. The caller sets it at arm time.
+    bool from_client = false;
     u64 mask_rng = 0;          // PRNG state for fresh per-frame outbound mask keys when
                                // `masked`; the caller MUST seed it with real entropy
                                // (e.g. RAND_bytes) per RFC 6455 §5.3 unpredictability.

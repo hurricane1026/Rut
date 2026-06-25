@@ -188,6 +188,7 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
             if (!ir.hir->routes[i].is_ws_terminate) continue;
             jit::WsLenGuardSpec guards[HirWsHandler::kMaxLenGuards];
             for (u32 g = 0; g < h.len_guards.len; g++) {
+                guards[g].accessor = static_cast<u8>(h.len_guards[g].accessor);
                 guards[g].cmp = static_cast<u8>(h.len_guards[g].cmp);
                 guards[g].bound = h.len_guards[g].bound;
                 guards[g].verdict = static_cast<u8>(h.len_guards[g].verdict);
