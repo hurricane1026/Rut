@@ -5136,6 +5136,16 @@ static FrontendResult<WsLenGuard> analyze_frame_guard_cond(const AstExpr& cond,
                                                            bool negate) {
     const Str text_pattern = ws_frame_text_match_pattern(cond);
     if (text_pattern.len != 0) {
+#if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
+        // Same compile-time regex check the HTTP `matches()` path runs, so an invalid pattern
+        // is a frontend diagnostic with a source span instead of a late JIT-compile failure.
+        std::string regex_error;
+        if (!validate_regex_literal(text_pattern, &regex_error)) {
+            return frontend_error(FrontendError::InvalidRegex,
+                                  cond.args[0]->span,
+                                  intern_generated_name(regex_error));
+        }
+#endif
         WsLenGuard g{};
         g.accessor = WsLenGuard::Accessor::TextMatch;
         g.pattern = text_pattern;
