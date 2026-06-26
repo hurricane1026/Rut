@@ -1773,6 +1773,14 @@ void h2_proxy_finish(Loop* loop,
                      bool is_head) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
+    // If the upstream sent more headers than HttpResponseParser can hold, a later
+    // Connection field naming an earlier (dropped) header is invisible to the
+    // hop-by-hop filter below — we can't safely strip connection-specific headers,
+    // so fail the stream. kMaxHeaders is generous, so this is rare.
+    if (resp.header_count >= kMaxHeaders) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
     hpack::Header hdrs[kMaxHeaders];
     u32 nhdrs = 0;
     for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
@@ -1802,13 +1810,17 @@ void h2_proxy_finish(Loop* loop,
     // DATA frame in pending_synth scratch — so serialize BEFORE teardown.
     const u8* body = conn.upstream_recv_buf.data() + hdr_end;
     H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
-    // A re-framed response too large for the scratch buffer must NOT close the
-    // whole connection (dropping unrelated streams); answer just this stream with
-    // 502 instead. Reserve room for the header block + frame overhead.
-    if (body_len > Http2Conn::kBodySynthCap - 1024)
+    // A re-framed response too large for the scratch buffer (large body OR large
+    // header block) must NOT close the whole connection (dropping unrelated
+    // streams), nor be reported as a generic 500. Disable the 500 fallback and, on
+    // overflow, answer just this stream with 502 Bad Gateway.
+    h2_emit_response(
+        d, kStreamId, resp.status_code, hdrs, nhdrs, body, body_len, /*allow_fallback=*/false);
+    if (d.overflow || d.resp_len == 0) {
+        d.resp_len = 0;
+        d.overflow = false;
         h2_emit_status(d, kStreamId, 502);
-    else
-        h2_emit_response(d, kStreamId, resp.status_code, hdrs, nhdrs, body, body_len);
+    }
     h2_proxy_teardown_upstream(loop, conn);
     h2_proxy_flush(loop, conn, d.resp_len);
 }
@@ -1846,10 +1858,18 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // Headers complete.
     const u32 kHdrEnd = parser.header_end;
 
-    // Discard 1xx informational responses (100 Continue, 103 Early Hints): they
-    // carry no body and precede the final response. Drop the 1xx block and re-parse
-    // the remainder (it may already be buffered), else the final response would be
-    // reframed as the body of a :status 1xx (or stall waiting on it).
+    // 101 Switching Protocols means the backend upgraded — no final HTTP response
+    // follows, and the h2 proxy can't tunnel an upgrade. Fail now (502) instead of
+    // stalling until the upstream timeout (504).
+    if (resp.status_code == 101) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    // Discard other 1xx informational responses (100 Continue, 103 Early Hints):
+    // they carry no body and precede the final response. Drop the 1xx block and
+    // re-parse the remainder (it may already be buffered), else the final response
+    // would be reframed as the body of a :status 1xx (or stall waiting on it).
+    // (101 is handled above; this range covers 100/102/103/...)
     if (resp.status_code >= 100 && resp.status_code < 200) {
         const u32 kRem = conn.upstream_recv_buf.len() - kHdrEnd;
         if (kRem > 0 && conn.upstream_recv_slice)

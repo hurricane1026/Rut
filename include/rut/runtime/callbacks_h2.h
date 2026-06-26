@@ -50,7 +50,8 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                       const hpack::Header* hdrs,
                       u32 nhdrs,
                       const u8* body,
-                      u32 body_len) {
+                      u32 body_len,
+                      bool allow_fallback = true) {
     auto enc = d.conn->h2->hpack_enc;
     const u32 kN = http2_write_response(d.resp + d.resp_len,
                                         d.resp_cap - d.resp_len,
@@ -61,28 +62,27 @@ void h2_emit_response(H2Dispatch<Loop>& d,
                                         nhdrs,
                                         body,
                                         body_len);
-    if (kN == 0 && d.resp_len != 0) {
-        d.overflow = true;
-    } else if (kN == 0 && d.resp_len == 0) {
-        enc = d.conn->h2->hpack_enc;
-        const u32 kFallback = http2_write_response(d.resp + d.resp_len,
-                                                   d.resp_cap - d.resp_len,
-                                                   enc,
-                                                   stream_id,
-                                                   500,
-                                                   nullptr,
-                                                   0,
-                                                   nullptr,
-                                                   0);
-        if (kFallback == 0)
-            d.overflow = true;
-        else {
-            d.conn->h2->hpack_enc = enc;
-            d.resp_len += kFallback;
-        }
-    } else {
+    if (kN != 0) {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
+        return;
+    }
+    // The response didn't fit. If it isn't the first frame in the batch, or the
+    // caller opted out of the generic fallback (e.g. the proxy wants its own 502),
+    // just flag overflow so the caller decides.
+    if (d.resp_len != 0 || !allow_fallback) {
+        d.overflow = true;
+        return;
+    }
+    // First frame, fallback allowed: a tiny synthetic 500 always fits.
+    enc = d.conn->h2->hpack_enc;
+    const u32 kFallback = http2_write_response(
+        d.resp + d.resp_len, d.resp_cap - d.resp_len, enc, stream_id, 500, nullptr, 0, nullptr, 0);
+    if (kFallback == 0)
+        d.overflow = true;
+    else {
+        d.conn->h2->hpack_enc = enc;
+        d.resp_len += kFallback;
     }
 }
 
@@ -124,6 +124,11 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     for (u32 i = 0; i < n; i++) {
         if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') continue;  // pseudo-headers
         if (hs[i].name.eq(Str{"cookie", 6})) continue;                 // combined below
+        // When :authority is present it already produced the Host line above; drop
+        // a regular `host` field so the synthesized request (and any upstream we
+        // proxy it to) doesn't carry two conflicting Host headers (:authority is
+        // authoritative — it's what Rut routed/authorized against). RFC 7540 §8.1.2.3.
+        if (authority.len > 0 && hs[i].name.eq(Str{"host", 4})) continue;
         if (!put(hs[i].name.ptr, hs[i].name.len) || !put(": ", 2) ||
             !put(hs[i].value.ptr, hs[i].value.len) || !put("\r\n", 2))
             return 0;
