@@ -1799,8 +1799,41 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         loop->submit_recv_upstream(conn);
         return;
     }
-    // Headers complete — is the body fully buffered?
+    // Headers complete.
     const u32 kHdrEnd = parser.header_end;
+
+    // Discard 1xx informational responses (100 Continue, 103 Early Hints): they
+    // carry no body and precede the final response. Drop the 1xx block and re-parse
+    // the remainder (it may already be buffered), else the final response would be
+    // reframed as the body of a :status 1xx (or stall waiting on it).
+    if (resp.status_code >= 100 && resp.status_code < 200) {
+        const u32 kRem = conn.upstream_recv_buf.len() - kHdrEnd;
+        if (kRem > 0 && conn.upstream_recv_slice)
+            __builtin_memmove(conn.upstream_recv_slice, conn.upstream_recv_slice + kHdrEnd, kRem);
+        conn.upstream_recv_buf.reset();
+        if (kRem > 0) {
+            conn.upstream_recv_buf.commit(kRem);
+            IoEvent synth{conn.id, static_cast<i32>(kRem), 0, 0, IoEventType::UpstreamRecv, 0};
+            h2_on_upstream_response<Loop>(lp, conn, synth);
+        } else if (!loop->submit_recv_upstream(conn)) {
+            h2_proxy_fail(loop, conn, 502);
+        }
+        return;
+    }
+
+    // No-body responses carry no body regardless of content-length: 204/205/304,
+    // and any response to a HEAD request (the synthesized request is in
+    // pending_synth, still intact here). Reframe immediately instead of waiting on
+    // a body a keep-alive upstream will never send.
+    const bool kHeadReq = conn.h2->async_synth_len >= 4 && conn.h2->pending_synth[0] == 'H' &&
+                          conn.h2->pending_synth[1] == 'E' && conn.h2->pending_synth[2] == 'A' &&
+                          conn.h2->pending_synth[3] == 'D';
+    if (resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 || kHeadReq) {
+        h2_proxy_finish(loop, conn, resp, kHdrEnd, 0);
+        return;
+    }
+
+    // Is the body fully buffered?
     const u32 kHaveBody = conn.upstream_recv_buf.len() - kHdrEnd;
     u32 body_len = 0;
     bool complete = false;
@@ -1812,24 +1845,25 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (kHaveBody >= resp.content_length) {
             body_len = resp.content_length;
             complete = true;
-        }
-    } else if (ev.result <= 0) {
-        body_len = kHaveBody;  // close-delimited body, upstream closed
-        complete = true;
-    }
-    if (!complete) {
-        // Upstream closed/errored before the declared body arrived → truncated
-        // response, fail closed instead of re-arming a recv that will never
-        // complete (same EOF check as the incomplete-header path above).
-        if (ev.result <= 0) {
-            h2_proxy_fail(loop, conn, 502);
+        } else if (ev.result <= 0) {
+            h2_proxy_fail(loop, conn, 502);  // closed/errored before the declared body → truncated
             return;
         }
+    } else if (ev.result == 0) {
+        body_len = kHaveBody;  // close-delimited body, clean EOF
+        complete = true;
+    } else if (ev.result < 0) {
+        // A reset / -ENOBUFS overflow must not be reframed as a successful partial
+        // body (only a clean EOF terminates an until-close body).
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    if (!complete) {
         if (conn.upstream_recv_buf.write_avail() == 0) {
             h2_proxy_fail(loop, conn, 502);  // response exceeds buffer
             return;
         }
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) h2_proxy_fail(loop, conn, 502);
         return;
     }
     h2_proxy_finish(loop, conn, resp, kHdrEnd, body_len);
@@ -1858,7 +1892,7 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         h2_on_upstream_response<Loop>(lp, conn, synth);
         return;
     }
-    loop->submit_recv_upstream(conn);
+    if (!loop->submit_recv_upstream(conn)) h2_proxy_fail(loop, conn, 502);
 }
 
 // Upstream TCP connect completion → send the synthesized h1 request.
@@ -1879,7 +1913,10 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<Loop>);
-    loop->submit_send_upstream(conn, h2->pending_synth, h2->async_synth_len);
+    // submit_send_upstream can fail to queue (io_uring SQE exhaustion); without a
+    // completion the stream would park forever, so fail closed like a bad connect.
+    if (!loop->submit_send_upstream(conn, h2->pending_synth, h2->async_synth_len))
+        h2_proxy_fail(loop, conn, 502);
 }
 
 // Open the upstream connection for a proxy-suspended stream (called after the
@@ -1895,6 +1932,13 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         return;
     }
     conn.upstream_abandoned = false;  // fresh proxy episode (teardown sets it true)
+    // Enter Proxying so the timer wheel uses the (shorter) upstream_timeout, not
+    // keepalive: a backend that accepts then stalls is reaped on the configured
+    // upstream deadline (the tick routes h2 conns to h2_proxy_fail(504)) instead
+    // of holding the stream + inflight slot until keepalive. proxy_resp_started
+    // stays false (h2 buffers the whole response before sending to the client).
+    conn.state = ConnState::Proxying;
+    conn.proxy_resp_started = false;
     const UpstreamTarget& target = cfg->upstreams[route->upstream_id];
     if (target.max_inflight != 0) {
         bool acquired = true;

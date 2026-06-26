@@ -7484,6 +7484,7 @@ struct ScriptedUpstreamServer {
     u16 port = 0;
     const char* response = nullptr;
     u32 response_len = 0;
+    bool keep_open = false;  // hold the connection open after replying (HTTP keep-alive)
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -7514,6 +7515,11 @@ struct ScriptedUpstreamServer {
                 if (server->response != nullptr && server->response_len > 0) {
                     (void)send_all(client, server->response, server->response_len);
                 }
+                // keep_open simulates a keep-alive upstream that does NOT close
+                // after a body-less response — the case that would hang an h2
+                // proxy waiting for EOF if no-body statuses weren't special-cased.
+                while (server->keep_open && server->running.load(std::memory_order_acquire))
+                    usleep(5000);
             }
             close(client);
         }
@@ -7772,6 +7778,113 @@ TEST(shard, serves_http2_proxy_rejects_request_body) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 503u);  // rejected pre-forward, not 502
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// Upstream sends a 1xx informational response (103 Early Hints) before its final
+// response. The h2 proxy must discard the 1xx and reframe the FINAL response —
+// not serve :status 103 with the 200 as its body.
+TEST(shard, serves_http2_proxy_skips_1xx) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 103 Early Hints\r\n"
+        "Link: </s.css>; rel=preload\r\n"
+        "\r\n"
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "hi";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    u8 body[64];
+    u32 blen = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(resp, total, 1) != 0 && blen == 2) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // final response, not 103
+    CHECK_EQ(blen, 2u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A 204 (no body, no Content-Length) from a keep-alive upstream that does NOT
+// close. The h2 proxy must reframe at headers — waiting for EOF would hang.
+TEST(shard, serves_http2_proxy_no_body_status) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] = "HTTP/1.1 204 No Content\r\n\r\n";
+    backend.keep_open = true;  // keep-alive: never closes → would hang without the fix
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);  // reframed at headers, no hang
 
     close(c);
     shard.stop();
@@ -8077,6 +8190,47 @@ TEST(proxy_e2e, upstream_timeout_returns_504) {
     CHECK(total > 0);
     CHECK(buf_contains(buf, total, "504", 3));
     close(client);
+}
+
+// Same stalled-backend timeout, but over HTTP/2: the h2 proxy stream must be
+// reframed as an h2 504 (not raw h1 504 bytes), released on the upstream
+// deadline instead of held until keepalive. Regression for the Proxying-state +
+// h2-aware-tick fix.
+TEST(proxy_e2e, serves_http2_proxy_upstream_timeout) {
+    using namespace rut;
+    StallServer stall;
+    REQUIRE(stall.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("slow", 0x7F000001, stall.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1500));
+    proxy.loop->upstream_timeout = 1;  // 1s upstream deadline (vs 60s keepalive)
+
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 6);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 12 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 5000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 504u);  // upstream-timeout, reframed as h2
+
+    close(c);
 }
 
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no

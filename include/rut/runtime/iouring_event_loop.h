@@ -890,8 +890,13 @@ public:
                             c->resume_event_result = 0;
                             resume_jit_handler<IoUringEventLoop>(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
-                            // Upstream stalled before responding → 504.
-                            respond_upstream_timeout<IoUringEventLoop>(this, *c);
+                            // Upstream stalled before responding → 504. h2 proxy
+                            // streams reframe as h2 (raw h1 504 bytes would corrupt
+                            // the stream), so route them to h2_proxy_fail.
+                            if (c->protocol == ConnProtocol::Http2)
+                                h2_proxy_fail<IoUringEventLoop>(this, *c, 504);
+                            else
+                                respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else if (c->throttle_paused) {
                             throttle_resume<IoUringEventLoop>(this, *c);
 #if RUT_ENABLE_WEBSOCKET

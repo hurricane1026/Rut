@@ -104,6 +104,12 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
 
+// Answer a suspended HTTP/2 proxy stream with a synthetic status (e.g. 504 on
+// upstream timeout from the timer tick, 502 on failure) and tear down the
+// upstream side. Defined in callbacks_impl.h.
+template <typename Loop>
+void h2_proxy_fail(Loop* loop, Connection& conn, u16 status);
+
 // Resume a throttled (@throttle) client send parked for the next byte-rate
 // window — invoked from the per-shard timer tick. Defined in callbacks_impl.h.
 template <typename Loop>
