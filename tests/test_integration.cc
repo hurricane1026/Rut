@@ -7623,6 +7623,8 @@ TEST(shard, serves_http2_proxy) {
         "Te: gzip\r\n"           // hop-by-hop — must NOT be forwarded to the h2 client
         "Connection: x-hop\r\n"  // nominates x-hop as connection-specific (hop-by-hop)
         "X-Hop: secret\r\n"      // ...so this must NOT be forwarded either
+        "Connection: x-two\r\n"  // a SECOND Connection field — its token is hop-by-hop too
+        "X-Two: also-secret\r\n"
         "\r\n"
         "hello";
     REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
@@ -7675,6 +7677,7 @@ TEST(shard, serves_http2_proxy) {
     CHECK(h2_response_has_header(resp, total, 1, "x-backend", "rut"));
     CHECK(!h2_response_has_header(resp, total, 1, "te", "gzip"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-hop", "secret"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-two", "also-secret"));  // 2nd Connection field
 
     close(c);
     shard.stop();

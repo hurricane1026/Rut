@@ -1765,29 +1765,36 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
 // The full h1 upstream response is buffered in upstream_recv_buf. Re-encode it as
 // h2 (:status + forwarded headers as HEADERS, body as DATA) for the stream.
 template <typename Loop>
-void h2_proxy_finish(
-    Loop* loop, Connection& conn, const ParsedResponse& resp, u32 hdr_end, u32 body_len) {
+void h2_proxy_finish(Loop* loop,
+                     Connection& conn,
+                     const ParsedResponse& resp,
+                     u32 hdr_end,
+                     u32 body_len,
+                     bool is_head) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
-    // Copy the body out of upstream_recv_buf before teardown resets it; pending_synth
-    // (the serialization scratch) is a different buffer, so no aliasing.
-    // Fields named by the upstream's Connection header are hop-by-hop too.
-    Str connection_tokens{nullptr, 0};
-    for (u32 i = 0; i < resp.header_count; i++) {
-        if (http_header_name_eq_ci(
-                resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10)) {
-            connection_tokens = resp.headers[i].value;
-            break;
-        }
-    }
     hpack::Header hdrs[kMaxHeaders];
     u32 nhdrs = 0;
     for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
-        if (h2_drop_response_header(resp.headers[i].name)) continue;
-        if (connection_tokens.len > 0 &&
-            h2_name_in_connection_tokens(connection_tokens, resp.headers[i].name))
+        const Str name = resp.headers[i].name;
+        // content-length is normally dropped (http2_write_response re-derives it
+        // from the DATA body), but a HEAD response carries no DATA, so keep the
+        // upstream's so the client learns the corresponding GET body size.
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
+            if (!is_head) continue;
+        } else if (h2_drop_response_header(name)) {
             continue;
-        hdrs[nhdrs].name = resp.headers[i].name;
+        }
+        // Fields named by ANY upstream Connection header are hop-by-hop (RFC 7230
+        // §6.1) — scan every Connection field, not just the first.
+        bool nominated = false;
+        for (u32 j = 0; j < resp.header_count && !nominated; j++) {
+            if (http_header_name_eq_ci(
+                    resp.headers[j].name.ptr, resp.headers[j].name.len, "connection", 10))
+                nominated = h2_name_in_connection_tokens(resp.headers[j].value, name);
+        }
+        if (nominated) continue;
+        hdrs[nhdrs].name = name;
         hdrs[nhdrs].value = resp.headers[i].value;
         nhdrs++;
     }
@@ -1795,10 +1802,15 @@ void h2_proxy_finish(
     // DATA frame in pending_synth scratch — so serialize BEFORE teardown.
     const u8* body = conn.upstream_recv_buf.data() + hdr_end;
     H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
-    h2_emit_response(d, kStreamId, resp.status_code, hdrs, nhdrs, body, body_len);
-    const u32 kRespLen = d.overflow ? 0 : d.resp_len;  // 0 → flush closes (response too large)
+    // A re-framed response too large for the scratch buffer must NOT close the
+    // whole connection (dropping unrelated streams); answer just this stream with
+    // 502 instead. Reserve room for the header block + frame overhead.
+    if (body_len > Http2Conn::kBodySynthCap - 1024)
+        h2_emit_status(d, kStreamId, 502);
+    else
+        h2_emit_response(d, kStreamId, resp.status_code, hdrs, nhdrs, body, body_len);
     h2_proxy_teardown_upstream(loop, conn);
-    h2_proxy_flush(loop, conn, kRespLen);
+    h2_proxy_flush(loop, conn, d.resp_len);
 }
 
 // Upstream response recv completion: accumulate in upstream_recv_buf until the
@@ -1861,7 +1873,7 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                           conn.h2->pending_synth[1] == 'E' && conn.h2->pending_synth[2] == 'A' &&
                           conn.h2->pending_synth[3] == 'D';
     if (resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 || kHeadReq) {
-        h2_proxy_finish(loop, conn, resp, kHdrEnd, 0);
+        h2_proxy_finish(loop, conn, resp, kHdrEnd, 0, /*is_head=*/kHeadReq);
         return;
     }
 
@@ -1898,7 +1910,7 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (!loop->submit_recv_upstream(conn)) h2_proxy_fail(loop, conn, 502);
         return;
     }
-    h2_proxy_finish(loop, conn, resp, kHdrEnd, body_len);
+    h2_proxy_finish(loop, conn, resp, kHdrEnd, body_len, /*is_head=*/false);
 }
 
 // Upstream request fully sent → start reading the response.
