@@ -1068,6 +1068,74 @@ TEST(rate_limit_dsl, decorator_compiles_to_route_limit) {
     rir.destroy();
 }
 
+// A `timer name, every: D { }` declaration compiles through the IR to a timer
+// function carrying the name + interval (register_jit_timers forwards it into
+// RouteConfig.timers[]). Slice 1: the body must be empty.
+TEST(timer_dsl, compiles_to_timer_function) {
+    using namespace rut;
+    const char* src = "timer heartbeat, every: 5s { }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(rir.module.functions[0].is_timer);
+    CHECK_EQ(rir.module.functions[0].timer_interval_ms, 5000u);  // 5s
+    CHECK(rir.module.functions[0].route_pattern.eq(Str{"heartbeat", 9}));
+    rir.destroy();
+}
+
+// A non-empty timer body is rejected for now (executing it needs the route-body
+// analysis factored out — slice 1 only schedules the no-op handler).
+TEST(timer_dsl, rejects_non_empty_body) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s { let x = 1 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    CHECK(!hir);  // analyze rejects a non-empty timer body
+}
+
+// A captureless probe used as a timer handler: the event loop should invoke it
+// each time the timer's interval elapses.
+static rut::u32 g_timer_probe_calls = 0;
+static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut::u32, void*) {
+    g_timer_probe_calls++;
+    return 0;
+}
+
+// The event loop fires a registered timer once its interval elapses, invoking the
+// compiled handler with no Connection/Request and bumping the per-timer count.
+TEST(timer, event_loop_fires_due_timer) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_probe_fn));
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    g_timer_probe_calls = 0;
+
+    loop->fire_due_timers();  // first call arms the deadline (now + 1ms)
+    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    usleep(5000);             // exceed the 1ms interval
+    loop->fire_due_timers();  // now due → fire
+    CHECK_GE(loop->timer_fire_count[0], 1u);
+    CHECK_GE(g_timer_probe_calls, 1u);
+}
+
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.
 TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     using namespace rut;

@@ -18,6 +18,7 @@ enum class AstItemKind : u8 {
     Impl,
     Chain,
     Route,
+    Timer,
 };
 
 enum class AstStmtKind : u8 {
@@ -470,6 +471,18 @@ struct AstRouteDecl {
     FixedVec<AstChainUse, kMaxChains> chains;
 };
 
+// Background periodic task: `timer name, every: <duration> { <body> }`. The body
+// compiles to a no-request/no-response state-machine handler the shard event loop
+// fires every interval. (slice 1: `shard:` selector deferred — runs every shard.)
+struct AstTimerDecl {
+    Span span{};
+    Span body_span{};
+    Str name{};
+    u32 interval_ms = 0;
+    static constexpr u32 kMaxStatements = 16;
+    FixedVec<AstStatement, kMaxStatements> statements;
+};
+
 struct AstItem {
     AstItemKind kind = AstItemKind::Upstream;
     Span span{};
@@ -484,6 +497,7 @@ struct AstItem {
     AstImplDecl impl_decl{};
     AstChainDecl chain{};
     AstRouteDecl route{};
+    AstTimerDecl timer{};
 };
 
 struct AstFile {

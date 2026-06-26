@@ -222,6 +222,33 @@ struct RouteConfig {
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
 
+    // Background periodic tasks: `timer name, every: D {...}`. Each holds the
+    // compiled handler + interval; the shard event loop fires them on schedule
+    // (they are NOT matched against requests). Slice 1: bodies are no-ops, so this
+    // exercises the scheduling/compile path only.
+    static constexpr u32 kMaxTimers = 16;
+    struct TimerEntry {
+        char name[32];
+        u32 name_len = 0;
+        jit::HandlerFn fn = nullptr;
+        u32 interval_ms = 0;
+    };
+    TimerEntry timers[kMaxTimers];
+    u32 timer_count = 0;
+
+    bool add_timer(const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn) {
+        if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
+        TimerEntry& t = timers[timer_count];
+        const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
+        for (u32 i = 0; i < kN; i++) t.name[i] = name[i];
+        t.name[kN] = '\0';
+        t.name_len = kN;
+        t.fn = fn;
+        t.interval_ms = interval_ms;
+        timer_count++;
+        return true;
+    }
+
     // Firewall rules support source IPv4 exact, CIDR, inclusive range, and
     // source-port checks. IP values are packed host-order u32:
     //   ip = (a << 24) | (b << 16) | (c << 8) | d  for a.b.c.d

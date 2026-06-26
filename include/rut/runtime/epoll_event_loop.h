@@ -206,6 +206,13 @@ public:
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
+
+    // Background timers (`timer name, every: D {...}`). Per-timer next-fire
+    // deadline + fire count, driven by the 1s keepalive tick (slice 1 effectively
+    // runs at >=1s granularity). timer_fire_count is exposed for tests.
+    u64 timer_deadline_ns[RouteConfig::kMaxTimers]{};
+    u32 timer_fire_count[RouteConfig::kMaxTimers]{};
+    bool timers_initialized = false;
     TlsServerContext* tls_server = nullptr;
 
     AccessLogRing* access_log = nullptr;
@@ -651,6 +658,35 @@ public:
         rearm_yield_timerfd();
     }
 
+    // Fire any background timer whose interval has elapsed. Called from the 1s
+    // keepalive tick, so timers run at ~1s granularity (slice 1). Timer bodies are
+    // currently no-op handlers (return a status the timer path ignores); this
+    // drives the schedule + compiled-handler invocation with no Connection/Request.
+    void fire_due_timers() {
+        const RouteConfig* cfg = config_ptr ? *config_ptr : nullptr;
+        if (cfg == nullptr || cfg->timer_count == 0) return;
+        const u64 now = epoll_yield::monotonic_ns();
+        const u32 n =
+            cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
+        if (!timers_initialized) {
+            for (u32 i = 0; i < n; i++)
+                timer_deadline_ns[i] =
+                    now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+            timers_initialized = true;
+            return;
+        }
+        for (u32 i = 0; i < n; i++) {
+            if (now < timer_deadline_ns[i]) continue;
+            jit::HandlerCtx ctx{};
+            (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
+            timer_fire_count[i]++;
+            // Reschedule from now (not the missed deadline) to avoid a catch-up
+            // burst after a long stall.
+            timer_deadline_ns[i] =
+                now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+        }
+    }
+
     // --- Dispatch ---
 
     void dispatch(const IoEvent& ev) {
@@ -697,6 +733,7 @@ public:
                         }
                     });
                 }
+                fire_due_timers();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

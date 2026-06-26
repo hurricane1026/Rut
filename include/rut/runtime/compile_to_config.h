@@ -87,15 +87,26 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         if (fn.route_pattern.len > 0 && fn.route_pattern.ptr == nullptr) return false;
         if (fn.name.len > 0 && fn.name.ptr == nullptr) return false;
 
-        char path[RouteEntry::kMaxPathLen];
-        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
-        path[fn.route_pattern.len] = '\0';
-
         char symbol[256];
         jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
         auto* addr = engine.lookup(symbol);
         if (!addr) return false;
         auto handler = reinterpret_cast<jit::HandlerFn>(addr);
+
+        // A timer compiles like a route but is fired on schedule, not matched
+        // against requests: register it into the timer table (route_pattern holds
+        // the timer name) and skip route registration.
+        if (fn.is_timer) {
+            if (!cfg.add_timer(
+                    fn.route_pattern.ptr, fn.route_pattern.len, fn.timer_interval_ms, handler))
+                return false;
+            continue;
+        }
+
+        char path[RouteEntry::kMaxPathLen];
+        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
+        path[fn.route_pattern.len] = '\0';
+
         if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
             return false;
         // @rateLimit decorators → stacked token-bucket rules, each with its own

@@ -2739,6 +2739,75 @@ struct Parser {
         return parse_route_entry(*kw.value());
     }
 
+    // Convert a DurLit token ("5s", "100ms", "1m", "1h") to milliseconds. 0 = bad
+    // unit / overflow. Unlike dur_lit_to_seconds this preserves sub-second values
+    // for forward compatibility (slice 1 fires on the 1s tick regardless).
+    static u32 dur_lit_to_ms(Str t) {
+        u64 digits = 0;
+        u32 i = 0;
+        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
+            digits = digits * 10 + static_cast<u64>(t.ptr[i] - '0');
+            if (digits > 0xffffffffull) return 0;
+        }
+        const Str kUnit{t.ptr + i, t.len - i};
+        u64 ms = 0;
+        if (kUnit.eq({"ms", 2}))
+            ms = digits;
+        else if (kUnit.eq({"s", 1}))
+            ms = digits * 1000ull;
+        else if (kUnit.eq({"m", 1}))
+            ms = digits * 60ull * 1000ull;
+        else if (kUnit.eq({"h", 1}))
+            ms = digits * 3600ull * 1000ull;
+        else
+            return 0;
+        return ms > 0xffffffffull ? 0xffffffffu : static_cast<u32>(ms);
+    }
+
+    // `timer <name>, every: <duration> { <body> }` — a background periodic task.
+    // (slice 1: the optional `shard: N` selector is not yet parsed.)
+    FrontendResult<AstItem> parse_timer() {
+        // `timer` is a contextual keyword (an Ident, not reserved). The top-level
+        // dispatch only routes here when cur() is the `timer` identifier.
+        auto kw = expect(TokenType::Ident);
+        if (!kw) return core::make_unexpected(kw.error());
+        const Token& kw_timer = *kw.value();
+        AstItem item{};
+        item.kind = AstItemKind::Timer;
+        auto name = expect(TokenType::Ident);
+        if (!name) return core::make_unexpected(name.error());
+        if (!expect(TokenType::Comma))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        auto every_kw = expect(TokenType::Ident);
+        if (!every_kw || !every_kw.value()->text.eq({"every", 5}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        if (!expect(TokenType::Colon))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        auto dur = expect(TokenType::DurLit);
+        if (!dur) return core::make_unexpected(dur.error());
+        const u32 kInterval = dur_lit_to_ms(dur.value()->text);
+        if (kInterval == 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(*dur.value()), dur.value()->text);
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+            auto stmt = parse_stmt();
+            if (!stmt) return core::make_unexpected(stmt.error());
+            if (!item.timer.statements.push(stmt.value()))
+                return frontend_error(FrontendError::TooManyItems, stmt.value().span);
+        }
+        auto rbrace = expect(TokenType::RBrace);
+        if (!rbrace) return core::make_unexpected(rbrace.error());
+        item.span = Span{kw_timer.start, rbrace.value()->end, kw_timer.line, kw_timer.col};
+        item.timer.span = item.span;
+        item.timer.body_span = Span{
+            lbrace.value()->start, rbrace.value()->end, lbrace.value()->line, lbrace.value()->col};
+        item.timer.name = name.value()->text;
+        item.timer.interval_ms = kInterval;
+        return item;
+    }
+
     // Block form: route { @binding "pattern"...  @entry-decorator method "path" { stmts } ... }
     // Pushes one AstItem::Route per entry into file->items; bindings are matched against entry
     // paths and merged into each entry's `decorators` list at parse time.
@@ -2913,6 +2982,14 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 }
                 if (p.cur().type == TokenType::Ident && p.cur().text.eq({"type", 4})) {
                     item = p.parse_type_alias();
+                    break;
+                }
+                // `timer <name>, every: ...` — contextual top-level declaration.
+                // peek == Ident (the timer name) disambiguates from a bare `timer`
+                // identifier used elsewhere.
+                if (p.cur().type == TokenType::Ident && p.cur().text.eq({"timer", 5}) &&
+                    p.peek().type == TokenType::Ident) {
+                    item = p.parse_timer();
                     break;
                 }
                 if (p.cur().type == TokenType::Ident || p.cur().type == TokenType::LParen) {

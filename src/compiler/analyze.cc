@@ -16207,6 +16207,30 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::TooManyItems, item.route.span);
     }
 
+    // Timers: `timer name, every: D { body }`. A timer compiles to a handler the
+    // shard event loop fires periodically (registered into RouteConfig.timers[],
+    // not routes[]). Slice 1 emits a no-op handler (returns 200, which the timer
+    // path ignores); executing the body needs the route-body analysis factored
+    // out, so a non-empty body is rejected for now rather than silently dropped.
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
+        if (item.kind != AstItemKind::Timer) continue;
+        if (item.timer.statements.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.timer.body_span);
+        HirRoute route{};
+        route.span = item.timer.span;
+        route.path = item.timer.name;  // timer name (not an HTTP path)
+        route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
+        route.is_timer = true;
+        route.timer_interval_ms = item.timer.interval_ms;
+        route.control.kind = HirControlKind::Direct;
+        route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+        route.control.direct_term.source_kind = HirTerminatorSourceKind::Literal;
+        route.control.direct_term.status_code = 200;
+        if (!mod.routes.push(route))
+            return frontend_error(FrontendError::TooManyItems, item.timer.span);
+    }
+
     if (source_path.len != 0 && !import_stack.empty()) import_stack.pop_back();
     return mod_ptr.release();
 }
