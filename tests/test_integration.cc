@@ -7614,6 +7614,7 @@ TEST(shard, serves_http2_proxy) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: 5\r\n"
         "X-Backend: rut\r\n"
+        "Te: gzip\r\n"  // hop-by-hop — must NOT be forwarded to the h2 client
         "\r\n"
         "hello";
     REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
@@ -7660,6 +7661,10 @@ TEST(shard, serves_http2_proxy) {
     for (u32 i = 0; i < blen && body_ok; i++)
         if (body[i] != static_cast<u8>(want[i])) body_ok = false;
     CHECK(body_ok);
+    // Header re-framing: a normal upstream header is forwarded (lowercased per
+    // RFC 7540 §8.1.2), the hop-by-hop `te` is filtered out.
+    CHECK(h2_response_has_header(resp, total, 1, "x-backend", "rut"));
+    CHECK(!h2_response_has_header(resp, total, 1, "te", "gzip"));
 
     close(c);
     shard.stop();
@@ -7713,6 +7718,60 @@ TEST(shard, serves_http2_proxy_truncated_upstream) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 502u);  // truncated → Bad Gateway
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A proxy request that carries a body (HEADERS without END_STREAM, then DATA)
+// must be rejected with 503 BEFORE any upstream contact — forwarding request
+// bodies over h2 isn't supported yet, and the no-body path would otherwise drop
+// the body. The upstream points at a dead port: a 503 (not 502) proves we never
+// tried to connect. Regression for the DATA-bearing-proxy fix.
+TEST(shard, serves_http2_proxy_rejects_request_body) {
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);  // discard port, never connected
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("body"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 503u);  // rejected pre-forward, not 502
 
     close(c);
     shard.stop();
