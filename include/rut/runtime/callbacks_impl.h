@@ -1673,12 +1673,13 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
 // h2 response headers we must NOT forward: hop-by-hop / connection-specific
 // (RFC 7540 §8.1.2.2) and content-length (http2_write_response re-derives it).
 inline bool h2_drop_response_header(Str name) {
-    const char* kName = name.ptr;
+    const char* const kName = name.ptr;
     const u32 kLen = name.len;
     return http_header_name_eq_ci(kName, kLen, "connection", 10) ||
            http_header_name_eq_ci(kName, kLen, "keep-alive", 10) ||
            http_header_name_eq_ci(kName, kLen, "proxy-connection", 16) ||
            http_header_name_eq_ci(kName, kLen, "transfer-encoding", 17) ||
+           http_header_name_eq_ci(kName, kLen, "te", 2) ||
            http_header_name_eq_ci(kName, kLen, "upgrade", 7) ||
            http_header_name_eq_ci(kName, kLen, "content-length", 14);
 }
@@ -1687,6 +1688,14 @@ inline bool h2_drop_response_header(Str name) {
 // response buffer). Shared by the success and failure paths.
 template <typename Loop>
 void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
+    // Detach the upstream slots BEFORE closing: on io_uring a multishot recv may
+    // still have an in-flight terminal CQE after close(). With on_upstream_recv
+    // null + upstream_abandoned set, the dispatch's stale-CQE guard ignores it
+    // (won't re-enter h2_on_upstream_response on the next stream, won't close the
+    // now-reused connection on a negative terminal). See EventLoopCRTP::dispatch.
+    conn.on_upstream_recv = nullptr;
+    conn.on_upstream_send = nullptr;
+    conn.upstream_abandoned = true;
     if (conn.upstream_fd >= 0) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
@@ -1704,10 +1713,15 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
 template <typename Loop>
 void h2_proxy_flush(Loop* loop, Connection& conn, u32 resp_len) {
     h2_clear_async(*conn.h2);
+    h2_async_epoch_leave(loop, conn);  // proxy episode done — release the config epoch
     if (resp_len == 0) {
         loop->close_conn(conn);
         return;
     }
+    // The proxy left the connection idle on the keepalive wheel while upstream
+    // I/O ran; refresh it so a client that stops reading the response can't strand
+    // the connection with no timer to reap it.
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
     conn.send_progress = 0;
     conn.send_buf.reset();
     conn.send_buf.write(conn.h2->pending_synth, resp_len);
@@ -1804,6 +1818,13 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         complete = true;
     }
     if (!complete) {
+        // Upstream closed/errored before the declared body arrived → truncated
+        // response, fail closed instead of re-arming a recv that will never
+        // complete (same EOF check as the incomplete-header path above).
+        if (ev.result <= 0) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
         if (conn.upstream_recv_buf.write_avail() == 0) {
             h2_proxy_fail(loop, conn, 502);  // response exceeds buffer
             return;
@@ -1823,6 +1844,20 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
+    // On epoll, EPOLLIN stayed armed while a partial request send drained, so an
+    // upstream that replied early may already have bytes in upstream_recv_buf.
+    // Process them now rather than only arming another recv (which could stall if
+    // the backend sends nothing further).
+    if (conn.upstream_recv_buf.len() > 0) {
+        IoEvent synth{conn.id,
+                      static_cast<i32>(conn.upstream_recv_buf.len()),
+                      0,
+                      0,
+                      IoEventType::UpstreamRecv,
+                      0};
+        h2_on_upstream_response<Loop>(lp, conn, synth);
+        return;
+    }
     loop->submit_recv_upstream(conn);
 }
 
@@ -1859,6 +1894,7 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
+    conn.upstream_abandoned = false;  // fresh proxy episode (teardown sets it true)
     const UpstreamTarget& target = cfg->upstreams[route->upstream_id];
     if (target.max_inflight != 0) {
         bool acquired = true;

@@ -778,6 +778,11 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
             *out_written = w.len;
             return {pos, true};
         }
+        // A serving callback parked a stream (one-at-a-time wait/proxy). Stop
+        // consuming frames and leave the rest unconsumed so they queue in the
+        // caller's recv buffer until the parked stream resumes — otherwise the
+        // next coalesced stream would be dispatched now and refused (503).
+        if (async_stream != 0) break;
     }
 
     *out_written = w.len;

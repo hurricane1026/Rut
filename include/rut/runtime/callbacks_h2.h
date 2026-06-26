@@ -319,6 +319,26 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len);
 }
 
+// An h2 stream going async (wait/proxy) must pin the RCU config epoch the same
+// way the HTTP/1 request path does — otherwise a config hot-reload during the
+// wait can free the RouteConfig/RouteEntry pinned in the async slot before the
+// stream resumes. req_start_us != 0 is the "in epoch" marker close_conn checks,
+// so the pair stays balanced even on an abnormal close. Idempotent.
+template <typename Loop>
+void h2_async_epoch_enter(Loop* loop, Connection& conn) {
+    if (conn.req_start_us == 0) {
+        loop->epoch_enter();
+        conn.req_start_us = monotonic_us();
+    }
+}
+template <typename Loop>
+void h2_async_epoch_leave(Loop* loop, Connection& conn) {
+    if (conn.req_start_us != 0) {
+        loop->epoch_leave();
+        conn.req_start_us = 0;
+    }
+}
+
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
     h2.async_stream = 0;
@@ -648,7 +668,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
         case RouteAction::Proxy:
         default:
-            if (!end_stream && req.has_content_length) {
+            // Any request body (DATA frames follow) blocks proxying: we'd forward
+            // the synthesized headers immediately and silently drop the body
+            // (it's never tied to pending_stream). Gate on end_stream, NOT just a
+            // declared content-length — an h2 POST can stream a body with no
+            // content-length. Defer to drain DATA, then 503 (forwarding request
+            // bodies over h2 is a follow-up); see h2_finish_body's Proxy branch.
+            if (!end_stream) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
@@ -664,9 +690,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 return;
             }
             // No-body proxy: park the stream and forward to the h1 upstream,
-            // re-framing its response into h2 (h2_proxy_begin, after flush). A
-            // request body would need buffering the proxy-defer path doesn't do,
-            // so body proxying still falls through to 503 above.
+            // re-framing its response into h2 (h2_proxy_begin, after flush).
             {
                 u8 synth[Http2Conn::kBodySynthCap];
                 const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
@@ -737,9 +761,12 @@ template <typename Loop>
 void h2_proxy_begin(Loop* loop, Connection& conn);
 
 // Once a suspended stream's batch has flushed, start whatever it is waiting on:
-// arm the resume timer (Timer) or open the upstream connection (Proxy).
+// arm the resume timer (Timer) or open the upstream connection (Proxy). Pins the
+// RCU config epoch first so a hot-reload during the wait can't free the config
+// pinned in the async slot (released when the stream completes).
 template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
+    h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
         h2_proxy_begin<Loop>(loop, conn);
         return;
@@ -791,6 +818,14 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     // Keep serving frames on this connection.
     conn.transition_to_reading_header(&on_h2_data<Loop>);
+    // A just-resumed stream may have left coalesced frames buffered (process()
+    // stops consuming once a stream parks). Drain them now rather than blocking
+    // on a socket read the client may never make — they were already received.
+    if (conn.h2 && conn.recv_buf.len() > 0) {
+        IoEvent synth{conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+        on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
+        return;
+    }
     loop->submit_recv(conn);
 }
 
@@ -905,6 +940,11 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
+    // schedule_yield_timer took the connection off the keepalive wheel; put it
+    // back before we re-enter Sending, so a client that stops reading the
+    // resumed response can't strand the connection with no timer to reap it
+    // (mirrors the HTTP/1 resume_jit_handler).
+    loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
@@ -934,9 +974,11 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
 
     // Clear the suspension before responding so the flush's on_h2_sent re-arms
-    // recv (async_stream == 0) rather than the timer.
+    // recv (async_stream == 0) rather than the timer. The async episode is over —
+    // release the config epoch pinned at park time.
     conn.pending_handler_fn = nullptr;
     h2_clear_async(*h2);
+    h2_async_epoch_leave(loop, conn);
 
     if (d.resp_len == 0 || d.overflow) {
         loop->close_conn(conn);
