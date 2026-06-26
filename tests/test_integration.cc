@@ -1136,6 +1136,32 @@ TEST(timer, event_loop_fires_due_timer) {
     CHECK_GE(g_timer_probe_calls, 1u);
 }
 
+// A hot reload swapping *config_ptr must re-arm timer deadlines for the new
+// config (measured from the swap), not reuse the old config's deadlines. Without
+// re-arming, the just-installed timer would fire immediately on the next tick.
+TEST(timer, rearms_on_config_swap) {
+    using namespace rut;
+    RouteConfig cfg_a{};
+    REQUIRE(cfg_a.add_timer("a", 1, /*interval_ms=*/1, &timer_probe_fn));
+    RouteConfig cfg_b{};
+    REQUIRE(cfg_b.add_timer("b", 1, /*interval_ms=*/1, &timer_probe_fn));
+
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg_a;
+    loop->config_ptr = &active;
+    loop->fire_due_timers();  // arm for config A
+
+    // Hot reload: swap the active config. The next call must re-arm (not fire at
+    // A's stale deadline), then fire only after B's interval elapses.
+    active = &cfg_b;
+    g_timer_probe_calls = 0;
+    loop->fire_due_timers();  // detects the swap → re-arm, no fire
+    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    usleep(5000);
+    loop->fire_due_timers();  // B's timer now due → fire
+    CHECK_GE(loop->timer_fire_count[0], 1u);
+}
+
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.
 TEST(rate_limit_dsl, by_clause_compiles_to_key_spec) {
     using namespace rut;
