@@ -154,14 +154,16 @@ websocket(chat, frame: => match frame.opcode { .text => forward, .binary => drop
 ```
 
 ### `maxMessageSize`
-**Required in v1.** `add_ws_terminate` rejects `max_message_size == 0` and there is no
-route/global WebSocket default for the compiler to fall back on, so omitting the kwarg would
-lower to an unusable route. Slice D must therefore either require `maxMessageSize:` on every
-terminate route or pass a fixed nonzero default (recommended: **the v1 cap, ~16 KB / one
-slice**). It bounds the reassembly buffer and is enforced by the engine **before** the handler
-runs (an over-cap message fails closed without dispatch). `frame.len` is the post-reassembly
-length, always `<= maxMessageSize`. **v1 hard cap: ~16 KB** — the runtime clamps to one slice
-(`SlicePool::kSliceSize - kWsMaxHeaderSize`); a larger value is silently clamped. Lifting the
+**Implemented (optional kwarg).** `websocket(x, maxMessageSize: 8kb) { … }` parses the
+ByteSize (`IntLit` + a `b`/`kb`/`mb`/`gb` unit Ident, mirroring `@throttle`), carries it on
+`HirWsHandler.max_message_size`, and the loader passes it to `add_ws_terminate`. **Omitting it
+is allowed** — the loader falls back to the engine's single-slice cap (~16 KB), so a terminate
+route is never unusable. It's rejected on the bare passthrough form (`websocket(x,
+maxMessageSize: …)` with no block), where it has no meaning. It bounds the reassembly buffer
+and is enforced by the engine **before** the handler runs (an over-cap message fails closed
+without dispatch). `frame.len` is the post-reassembly length, always `<= maxMessageSize`.
+**v1 hard cap: ~16 KB** — the runtime arm-time clamps to one slice
+(`SlicePool::kSliceSize - kWsMaxHeaderSize`); a larger value is silently capped. Lifting the
 cap is a runtime item (§8).
 
 ---

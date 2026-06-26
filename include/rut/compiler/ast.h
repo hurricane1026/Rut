@@ -196,6 +196,9 @@ struct AstStatement {
     // (`guard not frame.text.matches(re"…") else { … }`). Set by parse_ws_frame_guard,
     // read by the WsTerminate analyze path; unused by every other statement kind.
     bool cond_negated = false;
+    // WsTerminate only: the `maxMessageSize:` kwarg in bytes (`websocket(x, maxMessageSize: 8kb)`),
+    // 0 when omitted (the loader then uses the engine default). Carried to HirWsHandler.
+    u32 ws_max_message_size = 0;
     bool is_const = false;
     bool has_type = false;
     AstTypeRef type{};

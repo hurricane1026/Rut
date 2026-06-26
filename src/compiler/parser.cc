@@ -1028,9 +1028,51 @@ struct Parser {
                 if (!lparen) return core::make_unexpected(lparen.error());
                 auto name = expect(TokenType::Ident);
                 if (!name) return core::make_unexpected(name.error());
+                // Optional `, maxMessageSize: <IntLit><b|kb|mb|gb>` — the per-message reassembly
+                // cap for terminate mode. ByteSize lexes as IntLit + a separate unit Ident
+                // (mirrors @throttle's bandwidth parse). Only meaningful with a frame-handler
+                // block (terminate); rejected on the bare passthrough form below.
+                u32 ws_max_size = 0;
+                if (cur().type == TokenType::Comma) {
+                    pos++;  // consume `,`
+                    auto kw = expect(TokenType::Ident);
+                    if (!kw || !kw.value()->text.eq({"maxMessageSize", 14}))
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+                    if (!expect(TokenType::Colon))
+                        return frontend_error(FrontendError::UnexpectedToken, span_from(start));
+                    auto num = expect(TokenType::IntLit);
+                    if (!num) return core::make_unexpected(num.error());
+                    u64 amount = 0;
+                    for (u32 i = 0; i < num.value()->text.len; i++) {
+                        amount = amount * 10 + static_cast<u64>(num.value()->text.ptr[i] - '0');
+                        if (amount > 0xffffffffull)
+                            return frontend_error(
+                                FrontendError::InvalidInteger, span_from(start), num.value()->text);
+                    }
+                    auto unit = expect(TokenType::Ident);
+                    if (!unit) return core::make_unexpected(unit.error());
+                    const Str u = unit.value()->text;
+                    u64 mult = 0;
+                    if (u.eq({"b", 1}))
+                        mult = 1;
+                    else if (u.eq({"kb", 2}))
+                        mult = 1024;
+                    else if (u.eq({"mb", 2}))
+                        mult = 1024ull * 1024;
+                    else if (u.eq({"gb", 2}))
+                        mult = 1024ull * 1024 * 1024;
+                    else
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, span_from(start), u);
+                    const u64 bytes = amount * mult;
+                    if (bytes == 0 || bytes > 0xffffffffull)
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+                    ws_max_size = static_cast<u32>(bytes);
+                }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.name = name.value()->text;
+                stmt.ws_max_message_size = ws_max_size;
                 // A trailing `{ ... }` block makes this TERMINATE mode (the gateway
                 // parses/inspects each message); a bare `websocket(x)` stays the passthrough
                 // ForwardUpstream tunnel. The block is the per-message frame handler; its
@@ -1048,6 +1090,10 @@ struct Parser {
                     stmt.span = Span{start.start, body.value().span.end, start.line, start.col};
                     return stmt;
                 }
+                // Passthrough form (no block): maxMessageSize only governs terminate-mode
+                // reassembly, so it's meaningless here — reject rather than silently ignore it.
+                if (ws_max_size != 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                 stmt.kind = AstStmtKind::ForwardUpstream;
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
                 return stmt;

@@ -1286,6 +1286,46 @@ TEST(frontend, analyze_accepts_websocket_drop) {
              static_cast<u8>(WsVerdict::Drop));
 }
 
+TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
+    // `websocket(ws, maxMessageSize: 4kb) { ... }` → ByteSize lexes as IntLit + unit Ident;
+    // 4kb = 4096 bytes carried onto the handler.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) {\n"
+        "  frame.forward()\n"
+        "} }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].ws_handler.max_message_size, 4096u);
+}
+
+TEST(frontend, analyze_websocket_max_message_size_omitted_is_zero) {
+    // Omitting the kwarg leaves max_message_size 0 (the loader then uses the engine default).
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].ws_handler.max_message_size, 0u);
+}
+
+TEST(frontend, parse_rejects_websocket_max_message_size_without_block) {
+    // maxMessageSize only governs terminate-mode reassembly; on the bare passthrough form
+    // (no frame-handler block) it's meaningless and must be rejected, not silently dropped.
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    CHECK(!ast);  // parse error
+}
+
 TEST(frontend, analyze_accepts_websocket_close_default_code) {
     // `frame.close()` → Close verdict, default code 1000.
     const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close() } }\n";

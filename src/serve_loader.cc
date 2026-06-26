@@ -227,8 +227,8 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
 
 #if RUT_ENABLE_WEBSOCKET
     // Register each terminate route: look up its compiled verdict fn and publish a proxy +
-    // frame-handler route. max_message_size defaults to the engine's single-slice cap (the
-    // `maxMessageSize:` kwarg is a follow-up; arm-time clamps further anyway).
+    // frame-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
+    // defaults to the engine's single-slice cap. The runtime arm-time clamps either way.
     {
         constexpr u32 kWsDefaultMaxMessageSize = SlicePool::kSliceSize - kWsMaxHeaderSize;
         u32 ws_n = 0;
@@ -244,11 +244,14 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
             char path[RouteEntry::kMaxPathLen];
             for (u32 j = 0; j < route.path.len; j++) path[j] = route.path.ptr[j];
             path[route.path.len] = '\0';
+            const u32 max_msg = route.ws_handler.max_message_size != 0
+                                    ? route.ws_handler.max_message_size
+                                    : kWsDefaultMaxMessageSize;
             if (!out.config.add_ws_terminate(path,
                                              route.method,
                                              static_cast<u16>(route.ws_handler.upstream_index),
                                              handler,
-                                             kWsDefaultMaxMessageSize,
+                                             max_msg,
                                              route.ws_handler.close_code))
                 return false;
             ws_n++;

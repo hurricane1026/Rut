@@ -9419,6 +9419,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         // accessors and conditions are follow-up slices.
         route->is_ws_terminate = true;
         route->ws_handler.upstream_index = upstream_index.value();
+        route->ws_handler.max_message_size = stmt.ws_max_message_size;  // 0 = loader default
         route->ws_handler.span = stmt.span;
 
         const AstStatement* body = stmt.then_stmt;
