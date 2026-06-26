@@ -1776,13 +1776,13 @@ void h2_proxy_finish(Loop* loop,
     hpack::Header hdrs[kMaxHeaders];
     u32 nhdrs = 0;
     for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
-        const Str name = resp.headers[i].name;
+        const Str kName = resp.headers[i].name;
         // content-length is normally dropped (http2_write_response re-derives it
         // from the DATA body), but a HEAD response carries no DATA, so keep the
         // upstream's so the client learns the corresponding GET body size.
-        if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
+        if (http_header_name_eq_ci(kName.ptr, kName.len, "content-length", 14)) {
             if (!is_head) continue;
-        } else if (h2_drop_response_header(name)) {
+        } else if (h2_drop_response_header(kName)) {
             continue;
         }
         // Fields named by ANY upstream Connection header are hop-by-hop (RFC 7230
@@ -1791,10 +1791,10 @@ void h2_proxy_finish(Loop* loop,
         for (u32 j = 0; j < resp.header_count && !nominated; j++) {
             if (http_header_name_eq_ci(
                     resp.headers[j].name.ptr, resp.headers[j].name.len, "connection", 10))
-                nominated = h2_name_in_connection_tokens(resp.headers[j].value, name);
+                nominated = h2_name_in_connection_tokens(resp.headers[j].value, kName);
         }
         if (nominated) continue;
-        hdrs[nhdrs].name = name;
+        hdrs[nhdrs].name = kName;
         hdrs[nhdrs].value = resp.headers[i].value;
         nhdrs++;
     }

@@ -9080,6 +9080,71 @@ TEST(shard, serves_http2_request_body) {
     close(lfd);
 }
 
+// A body-reading stream deferred for DATA and a coalesced proxy stream both want
+// pending_synth. The proxy stream must be refused (503) while the body stream is
+// pending — not allowed to overwrite the deferred request's bytes — and the body
+// stream must still complete correctly. Regression for the pending_synth aliasing
+// fix.
+TEST(shard, serves_http2_body_defer_blocks_concurrent_async) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_echo_body_handler, /*needs_req_body=*/true));
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);  // discard port; never connected
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Coalesced: stream 1 POST body (defers for DATA), stream 3 proxy GET (would
+    // suspend → must be refused 503 while stream 1 is pending), then stream 1's
+    // DATA terminator.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header up[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, up, 5, /*end_stream=*/false);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/api", 4);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("ping"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0 && h2_status_for_stream(resp, total, 3) != 0)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1),
+             200u);  // body handler saw "ping" (not corrupted)
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 503u);  // proxy refused while body pending
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(shard, serves_http2_request_body_with_synthesized_content_length) {
     using namespace rut;
 
