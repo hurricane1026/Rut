@@ -623,4 +623,29 @@ u32 Encoder::encode(u8* out, Str name, Str value) {
     return o;
 }
 
+// React to the peer's advertised SETTINGS_HEADER_TABLE_SIZE (RFC 7541 §4.2).
+//
+// The table size we may index against is min(peer's advertised maximum, our own
+// fixed dynamic-table buffer DynamicTable::kHardCap). Using less than the peer
+// allows is always legal, so a peer offering more than kHardCap (e.g. browsers
+// advertise 64KiB) simply leaves us at our budget — a no-op, since we start
+// there. The case that *must* act is a peer advertising less than our current
+// limit: we shrink to match (evicting entries that no longer fit) and arm a §6.3
+// dynamic table size update so the next header block tells the peer's decoder the
+// new size in lockstep. Without that the two tables desync and decoding breaks.
+void Encoder::set_table_size(u32 settings_max) {
+    const u32 kNew = settings_max < DynamicTable::kHardCap ? settings_max : DynamicTable::kHardCap;
+    if (kNew == dyn.max_size) return;  // unchanged: arm no spurious size update
+    dyn_set_max_size(dyn, kNew);       // shrinking evicts entries that no longer fit
+    pending_size_update = static_cast<i32>(kNew);
+}
+
+u32 Encoder::emit_pending_size_update(u8* out) {
+    if (pending_size_update < 0) return 0;
+    // §6.3 dynamic table size update: pattern 001 (0x20) + 5-bit prefix integer.
+    const u32 kN = encode_integer(out, static_cast<u32>(pending_size_update), 5, 0x20);
+    pending_size_update = -1;
+    return kN;
+}
+
 }  // namespace rut::hpack

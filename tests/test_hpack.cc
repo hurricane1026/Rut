@@ -480,6 +480,46 @@ TEST(hpack_encoder, dynamic_indexing_roundtrip) {
     CHECK(hdr_is(out[0], "custom-key", "custom-value"));
 }
 
+// A peer that advertises a smaller SETTINGS_HEADER_TABLE_SIZE must make the
+// encoder (a) cap its dynamic table, (b) lead the next block with a §6.3 size
+// update, and (c) stay in sync with a decoder bounded to the same size.
+TEST(hpack_encoder, honors_peer_table_size_with_size_update) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    // Index a field so the table is non-empty before the shrink.
+    u8 warm[256];
+    enc.encode(warm, cstr("custom-key"), cstr("custom-value"));
+    CHECK_EQ(enc.dyn.nent, 1u);
+
+    // Peer shrinks the table to 0 → no dynamic entries may survive, and a size
+    // update must be armed.
+    enc.set_table_size(0);
+    CHECK_EQ(enc.dyn.max_size, 0u);
+    CHECK_EQ(enc.dyn.nent, 0u);  // everything evicted
+    CHECK_EQ(enc.pending_size_update, 0);
+
+    // The next header block must begin with the §6.3 size update (pattern 001),
+    // and a decoder bounded to 0 must decode it without desyncing.
+    hpack::DynamicTable dec;
+    dec.init(0);
+    u8 block[256];
+    u32 bp = enc.emit_pending_size_update(block);
+    REQUIRE(bp >= 1u);
+    CHECK_EQ(block[0] & 0xe0, 0x20);        // 001xxxxx
+    CHECK_EQ(enc.pending_size_update, -1);  // disarmed after emit
+    bp += enc.encode(block + bp, cstr(":status"), cstr("200"));
+    u8 scratch[256];
+    hpack::Header out[8];
+    u32 n = 0;
+    REQUIRE(hpack::decode_header_block(dec, block, bp, scratch, sizeof(scratch), out, 8, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(out[0], ":status", "200"));
+
+    // An unchanged advertisement arms nothing (no spurious updates per SETTINGS).
+    enc.set_table_size(0);
+    CHECK_EQ(enc.pending_size_update, -1);
+}
+
 TEST(hpack_encoder, static_exact_match_is_one_byte) {
     hpack::Encoder enc;
     enc.init(4096);

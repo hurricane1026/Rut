@@ -4150,7 +4150,9 @@ TEST(shard, serves_http2_routed) {
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);  // matched static route
     CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);  // default fallback
-    CHECK_EQ(h2_status_for_stream(resp, total, 5), 503u);  // proxy over h2 not yet supported
+    // Proxy over h2 now forwards to the upstream; 127.0.0.1:8080 isn't listening,
+    // so the connect is refused and the stream gets 502 (Bad Gateway).
+    CHECK_EQ(h2_status_for_stream(resp, total, 5), 502u);
 
     close(c);
     shard.stop();
@@ -6616,6 +6618,165 @@ TEST(route, wait_jit_handler_real_socket) {
     rir.destroy();
 }
 
+// End-to-end async-yield over HTTP/2: a JIT handler that wait(ms)s then returns
+// 200 must suspend its h2 stream and resume to emit the response. Before the h2
+// async path this answered 503 (yielding handlers unsupported); now the stream
+// parks on a real yield timer (h2_suspend_timer → schedule_yield_timer) and
+// resumes through h2_resume_jit_handler to serialize the HEADERS frame. Driven
+// over cleartext h2c on the real EpollEventLoop so the timer actually fires.
+TEST(shard, serves_http2_async_wait_jit_handler) {
+    using namespace rut;
+
+    const char* src = "route GET \"/sleep\" { wait(50) return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/sleep", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    // 200 (not 503) proves the suspend/resume round-trip completed.
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Two async-yield requests in sequence on one h2 connection: after the first
+// stream resumes and flushes, the connection must re-arm recv (async slot
+// cleared) and serve the next stream's wait→200 the same way. Exercises the
+// resume → read → next-request lifecycle in on_h2_sent that single-shot tests
+// miss.
+TEST(shard, serves_http2_async_wait_sequential) {
+    using namespace rut;
+
+    const char* src = "route GET \"/sleep\" { wait(30) return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    auto send_and_read_status = [&](u32 stream_id) -> u16 {
+        u8 out[512];
+        u32 n = 0;
+        if (stream_id == 1) n = h2_client_prologue(out);  // preface + SETTINGS once
+        n += h2_client_get(out + n, sizeof(out) - n, stream_id, "/sleep", 6);
+        if (!write_all_fd(c, out, n)) return 0;
+        u8 resp[4096];
+        u32 total = 0;
+        for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+            i32 got =
+                recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+            if (h2_status_for_stream(resp, total, stream_id) != 0) break;
+        }
+        return h2_status_for_stream(resp, total, stream_id);
+    };
+
+    CHECK_EQ(send_and_read_status(1), 200u);  // first wait→200
+    CHECK_EQ(send_and_read_status(3), 200u);  // connection served the next stream
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // wait(50) — sub-second precision verification. The legacy TimerWheel
 // would round this up to 1000ms (one full tick), so this test fails
 // immediately if the yield_timer_fd / min-heap path regresses back to
@@ -7362,6 +7523,71 @@ struct ScopedProxyLoop {
         }
     }
 };
+
+// End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
+// route; the runtime forwards a synthesized h1 request to a real upstream, buffers
+// the upstream's h1 response, and re-encodes it as h2 HEADERS+DATA. Asserts the
+// h2 client sees the re-framed :status and body (proves h2_proxy_begin →
+// h2_on_upstream_* → h2_proxy_finish, not the old 503).
+TEST(shard, serves_http2_proxy) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "X-Backend: rut\r\n"
+        "\r\n"
+        "hello";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    u8 body[64];
+    u32 blen = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(resp, total, 1) != 0 && blen == 5) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // re-framed upstream :status
+    CHECK_EQ(blen, 5u);                                    // re-framed upstream body
+    bool body_ok = blen == 5;
+    const char* want = "hello";
+    for (u32 i = 0; i < blen && body_ok; i++)
+        if (body[i] != static_cast<u8>(want[i])) body_ok = false;
+    CHECK(body_ok);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
 
 struct MalformedUpstreamCase {
     const char* name;

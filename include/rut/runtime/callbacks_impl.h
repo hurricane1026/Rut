@@ -1328,6 +1328,15 @@ void handle_jit_outcome(Loop* loop,
 
 template <typename Loop>
 void resume_jit_handler(Loop* loop, Connection& conn) {
+    // HTTP/2 streams suspend/resume through their own path: the response is
+    // serialized as frames (not an HTTP/1 byte stream) and the request bytes live
+    // in the engine's pending_synth, not recv_buf. The connection-scoped timer
+    // machinery is shared (a connection is either h1 or h2), so the drains funnel
+    // both here; branch on protocol.
+    if (conn.protocol == ConnProtocol::Http2) {
+        h2_resume_jit_handler<Loop>(loop, conn);
+        return;
+    }
     // A yielded handler can resume while still on the keepalive wheel
     // (pure event waits) or after schedule_yield_timer removed it.
     // refresh handles both without double-inserting the intrusive node.
@@ -1648,6 +1657,236 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         on_upstream_response<Loop>(lp, conn, synth);
     } else {
         loop->submit_recv_upstream(conn);
+    }
+}
+
+// === HTTP/2 reverse proxy (buffered, one stream at a time) ===
+//
+// An h2 proxy stream is parked on the engine's async slot (h2_suspend_proxy),
+// then driven here: connect upstream → send the synthesized h1 request (stashed
+// in pending_synth) → accumulate the whole h1 response in upstream_recv_buf →
+// re-encode it as h2 HEADERS+DATA on the stream. The h1 proxy streams response
+// bytes raw; an h2 client needs frames, so we must buffer + re-frame. Bounded by
+// the 16KB upstream_recv_buf (over-cap → 502). Deferred: chunked de-framing,
+// streaming/large bodies with flow control, request bodies, backend failover.
+
+// h2 response headers we must NOT forward: hop-by-hop / connection-specific
+// (RFC 7540 §8.1.2.2) and content-length (http2_write_response re-derives it).
+inline bool h2_drop_response_header(Str name) {
+    const char* kName = name.ptr;
+    const u32 kLen = name.len;
+    return http_header_name_eq_ci(kName, kLen, "connection", 10) ||
+           http_header_name_eq_ci(kName, kLen, "keep-alive", 10) ||
+           http_header_name_eq_ci(kName, kLen, "proxy-connection", 16) ||
+           http_header_name_eq_ci(kName, kLen, "transfer-encoding", 17) ||
+           http_header_name_eq_ci(kName, kLen, "upgrade", 7) ||
+           http_header_name_eq_ci(kName, kLen, "content-length", 14);
+}
+
+// Close the upstream side and release its resources (fd, concurrency slot,
+// response buffer). Shared by the success and failure paths.
+template <typename Loop>
+void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+    }
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    release_upstream_slot(loop, conn);
+    conn.upstream_recv_buf.reset();
+}
+
+// Flush a fully-serialized response (already in pending_synth scratch, length
+// resp_len) for the suspended stream, clear the async slot, and resume reading
+// frames once it drains (on_h2_sent sees async_stream == 0).
+template <typename Loop>
+void h2_proxy_flush(Loop* loop, Connection& conn, u32 resp_len) {
+    h2_clear_async(*conn.h2);
+    if (resp_len == 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress = 0;
+    conn.send_buf.reset();
+    conn.send_buf.write(conn.h2->pending_synth, resp_len);
+    conn.keep_alive = true;
+    conn.transition_to_sending(&on_h2_sent<Loop>);
+    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
+// Answer the suspended proxy stream with a synthetic status (502 upstream
+// failure, 503 inflight cap) and tear down the upstream side.
+template <typename Loop>
+void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
+    Http2Conn* h2 = conn.h2;
+    const u32 kStreamId = h2->async_stream;
+    h2_proxy_teardown_upstream(loop, conn);
+    H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
+    h2_emit_status(d, kStreamId, status);
+    h2_proxy_flush(loop, conn, d.resp_len);
+}
+
+// The full h1 upstream response is buffered in upstream_recv_buf. Re-encode it as
+// h2 (:status + forwarded headers as HEADERS, body as DATA) for the stream.
+template <typename Loop>
+void h2_proxy_finish(
+    Loop* loop, Connection& conn, const ParsedResponse& resp, u32 hdr_end, u32 body_len) {
+    Http2Conn* h2 = conn.h2;
+    const u32 kStreamId = h2->async_stream;
+    // Copy the body out of upstream_recv_buf before teardown resets it; pending_synth
+    // (the serialization scratch) is a different buffer, so no aliasing.
+    hpack::Header hdrs[kMaxHeaders];
+    u32 nhdrs = 0;
+    for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
+        if (h2_drop_response_header(resp.headers[i].name)) continue;
+        hdrs[nhdrs].name = resp.headers[i].name;
+        hdrs[nhdrs].value = resp.headers[i].value;
+        nhdrs++;
+    }
+    // body points into upstream_recv_buf, which h2_emit_response copies into the
+    // DATA frame in pending_synth scratch — so serialize BEFORE teardown.
+    const u8* body = conn.upstream_recv_buf.data() + hdr_end;
+    H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
+    h2_emit_response(d, kStreamId, resp.status_code, hdrs, nhdrs, body, body_len);
+    const u32 kRespLen = d.overflow ? 0 : d.resp_len;  // 0 → flush closes (response too large)
+    h2_proxy_teardown_upstream(loop, conn);
+    h2_proxy_flush(loop, conn, kRespLen);
+}
+
+// Upstream response recv completion: accumulate in upstream_recv_buf until the
+// full response is present (headers + content-length body, or close-delimited),
+// then re-frame. Chunked and over-buffer responses fail closed (502).
+template <typename Loop>
+void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    resp.reset();
+    parser.reset();
+    ParseStatus ps =
+        parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    if (ps == ParseStatus::Error) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    if (ps == ParseStatus::Incomplete) {
+        // Headers not complete yet: need more bytes, unless the peer closed or the
+        // buffer is full (header block larger than we will buffer).
+        if (ev.result <= 0 || conn.upstream_recv_buf.write_avail() == 0) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        loop->submit_recv_upstream(conn);
+        return;
+    }
+    // Headers complete — is the body fully buffered?
+    const u32 kHdrEnd = parser.header_end;
+    const u32 kHaveBody = conn.upstream_recv_buf.len() - kHdrEnd;
+    u32 body_len = 0;
+    bool complete = false;
+    if (resp.chunked) {
+        h2_proxy_fail(loop, conn, 502);  // chunked de-framing: follow-up
+        return;
+    }
+    if (resp.has_content_length) {
+        if (kHaveBody >= resp.content_length) {
+            body_len = resp.content_length;
+            complete = true;
+        }
+    } else if (ev.result <= 0) {
+        body_len = kHaveBody;  // close-delimited body, upstream closed
+        complete = true;
+    }
+    if (!complete) {
+        if (conn.upstream_recv_buf.write_avail() == 0) {
+            h2_proxy_fail(loop, conn, 502);  // response exceeds buffer
+            return;
+        }
+        loop->submit_recv_upstream(conn);
+        return;
+    }
+    h2_proxy_finish(loop, conn, resp, kHdrEnd, body_len);
+}
+
+// Upstream request fully sent → start reading the response.
+template <typename Loop>
+void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result < 0) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
+    loop->submit_recv_upstream(conn);
+}
+
+// Upstream TCP connect completion → send the synthesized h1 request.
+template <typename Loop>
+void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    Http2Conn* h2 = conn.h2;
+    if (ev.result < 0) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        h2_proxy_fail(loop, conn, 502);  // backend failover over h2: follow-up
+        return;
+    }
+    record_backend_result(
+        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    if (!loop->alloc_upstream_buf(conn)) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<Loop>);
+    loop->submit_send_upstream(conn, h2->pending_synth, h2->async_synth_len);
+}
+
+// Open the upstream connection for a proxy-suspended stream (called after the
+// suspending batch flushes). Acquires an inflight slot, opens a socket, and
+// connects; any failure answers the stream (502/503) instead of stalling.
+template <typename Loop>
+void h2_proxy_begin(Loop* loop, Connection& conn) {
+    Http2Conn* h2 = conn.h2;
+    const RouteConfig* cfg = h2->async_cfg;
+    const RouteEntry* route = h2->async_route;
+    if (cfg == nullptr || route == nullptr) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    const UpstreamTarget& target = cfg->upstreams[route->upstream_id];
+    if (target.max_inflight != 0) {
+        bool acquired = true;
+        if constexpr (requires { loop->upstream_acquire(route->upstream_id, 1u); }) {
+            acquired = loop->upstream_acquire(route->upstream_id, target.max_inflight);
+        }
+        if (!acquired) {
+            h2_proxy_fail(loop, conn, 503);
+            return;
+        }
+        conn.upstream_slot_held = true;
+        conn.upstream_slot_uid = route->upstream_id;
+    }
+    const i32 kFd = UpstreamPool::create_socket();
+    if (kFd < 0) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    conn.upstream_fd = kFd;
+    conn.upstream_idx = route->upstream_id;
+    conn.upstream_attempts = 1;
+    conn.upstream_start_us = monotonic_us();
+    conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
+    const u32 kBackend =
+        select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+    conn.upstream_backend_idx = static_cast<u8>(kBackend);
+    if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+        h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
     }
 }
 

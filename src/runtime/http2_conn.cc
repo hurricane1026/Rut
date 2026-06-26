@@ -49,6 +49,15 @@ void Http2Conn::init() {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         pending_route_params[i] = {};
     }
+    async_stream = 0;
+    async_kind = H2AsyncKind::None;
+    async_cfg = nullptr;
+    async_synth_len = 0;
+    async_timer_ms = 0;
+    async_fn = nullptr;
+    async_state = 0;
+    async_route = nullptr;
+    async_resp_len = 0;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
@@ -150,6 +159,9 @@ u32 http2_write_response(u8* out,
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
     u32 hb = 0;
+    // A pending dynamic table size update (from a peer SETTINGS_HEADER_TABLE_SIZE
+    // change) MUST lead the header block, before any field (RFC 7541 §4.2).
+    hb += enc.emit_pending_size_update(hblock + hb);
     char sbuf[3];
     sbuf[0] = static_cast<char>('0' + (status / 100) % 10);
     sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
@@ -463,6 +475,11 @@ static Http2Error handle_frame(Http2Conn& c,
             const i64 kOldIws = c.peer_settings.initial_window_size;
             const Http2Error kErr = parse_settings(payload, h.length, &c.peer_settings);
             if (kErr != Http2Error::NoError) return kErr;
+            // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
+            // encoder may index against. React (resize + arm a §6.3 update for the
+            // next response header block) so we never index into a table the peer
+            // shrank. No-op when the value is unchanged.
+            c.hpack_enc.set_table_size(c.peer_settings.header_table_size);
             // Adjust live stream send windows by the INITIAL_WINDOW_SIZE delta.
             const i64 kDelta = static_cast<i64>(c.peer_settings.initial_window_size) - kOldIws;
             if (kDelta != 0) {

@@ -4,12 +4,14 @@
 // per-connection Http2Conn engine: feed inbound bytes, run dispatch for each
 // completed request, serialize responses as HEADERS(+DATA), and flush.
 //
-// Serves: static (return-status) routes, the default 200, and synchronous JIT
-// handlers (those that return a status — with an optional body/headers — without
-// yielding and without reading the request body). Proxy routes, body-reading or
-// yielding JIT handlers answer 503 for now (async-over-h2 / per-stream upstream
-// are follow-ups). HTTP/1 is untouched: this path is only entered when
-// conn.protocol == Http2 (ALPN) or the cleartext h2c preface is detected.
+// Serves: static (return-status) routes, the default 200, synchronous JIT
+// handlers (status + optional body/headers + request bodies), timer-yielding JIT
+// handlers (wait(ms) — suspended on the async slot, resumed via the yield timer),
+// and no-body proxy routes (forwarded to the h1 upstream, response buffered and
+// re-framed). One suspended stream per connection (others queue). Still 503:
+// forwarding/event-yield JIT handlers, and proxy with a request body. HTTP/1 is
+// untouched: this path is only entered when conn.protocol == Http2 (ALPN) or the
+// cleartext h2c preface is detected.
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
@@ -285,9 +287,113 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     return true;
 }
 
-// Invoke a synchronous JIT handler given the assembled HTTP/1 request bytes
-// (headers, plus body for POST), then serialize its response. Yielding /
-// forwarding handlers are not supported over h2 yet → 503.
+// Serialize a handler's ReturnStatus outcome — status, plus an optional body and
+// custom header set materialized from the route config — as the stream's HTTP/2
+// response. Shared by the immediate and async-resume paths.
+template <typename Loop>
+void h2_emit_outcome(H2Dispatch<Loop>& d,
+                     u32 stream_id,
+                     const JitDispatchOutcome& o,
+                     const RouteConfig* cfg) {
+    const u8* body = nullptr;
+    u32 body_len = 0;
+    if (o.response_body_idx != 0 && cfg != nullptr &&
+        o.response_body_idx <= cfg->response_body_count) {
+        const auto& b = cfg->response_bodies[o.response_body_idx - 1];
+        body = reinterpret_cast<const u8*>(b.data);
+        body_len = b.len;
+    }
+    hpack::Header hdrs[RouteConfig::kMaxHeadersPerSet];
+    u32 nhdrs = 0;
+    if (o.response_headers_idx != 0 && cfg != nullptr &&
+        o.response_headers_idx <= cfg->response_header_set_count) {
+        const auto& ref = cfg->response_header_sets[o.response_headers_idx - 1];
+        for (u16 i = 0; i < ref.count; i++) {
+            hdrs[nhdrs].name = {cfg->header_keys[ref.offset + i].data,
+                                cfg->header_keys[ref.offset + i].len};
+            hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
+                                 cfg->header_values[ref.offset + i].len};
+            nhdrs++;
+        }
+    }
+    h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len);
+}
+
+// Release the single async-suspend slot.
+inline void h2_clear_async(Http2Conn& h2) {
+    h2.async_stream = 0;
+    h2.async_kind = H2AsyncKind::None;
+    h2.async_cfg = nullptr;
+    h2.async_synth_len = 0;
+    h2.async_timer_ms = 0;
+    h2.async_fn = nullptr;
+    h2.async_state = 0;
+    h2.async_route = nullptr;
+    h2.async_resp_len = 0;
+}
+
+// Copy a synthesized h1 request into pending_synth (the per-connection stable
+// buffer) so it survives a suspension. Clamps to the buffer; a no-op when the
+// source already is pending_synth (the deferred-body path). Returns the length.
+inline u32 h2_stash_synth(Http2Conn& h2, const u8* synth, u32 synth_len) {
+    const u32 kN = synth_len <= Http2Conn::kBodySynthCap ? synth_len : Http2Conn::kBodySynthCap;
+    if (synth != h2.pending_synth)
+        for (u32 i = 0; i < kN; i++) h2.pending_synth[i] = synth[i];
+    return kN;
+}
+
+// Park a timer-yielding handler's resume point on the connection's single async
+// slot (the request bytes are copied into pending_synth so they survive the
+// sleep). The precise yield timer is armed later by h2_arm_async_timer, after
+// this batch's queued frames flush. Returns false when a stream is already
+// suspended — one async wait at a time, mirroring pending_stream — so the caller
+// answers 503.
+template <typename Loop>
+bool h2_suspend_timer(H2Dispatch<Loop>& d,
+                      u32 stream_id,
+                      jit::HandlerFn fn,
+                      const JitDispatchOutcome& o,
+                      const RouteConfig* cfg,
+                      const u8* synth,
+                      u32 synth_len) {
+    Http2Conn* h2 = d.conn->h2;
+    if (h2->async_stream != 0) return false;
+    h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
+    h2->async_stream = stream_id;
+    h2->async_kind = H2AsyncKind::Timer;
+    h2->async_cfg = cfg;
+    h2->async_timer_ms = o.timer_ms;
+    h2->async_fn = fn;
+    h2->async_state = static_cast<u16>(o.next_state);
+    return true;
+}
+
+// Park a proxy stream on the async slot: the synthesized h1 request is stashed in
+// pending_synth to be forwarded upstream (then reused to accumulate the upstream
+// response). The upstream connect is started later by h2_proxy_begin, after this
+// batch flushes. Returns false when a stream is already suspended → caller 503s.
+template <typename Loop>
+bool h2_suspend_proxy(H2Dispatch<Loop>& d,
+                      u32 stream_id,
+                      const RouteConfig* cfg,
+                      const RouteEntry* route,
+                      const u8* synth,
+                      u32 synth_len) {
+    Http2Conn* h2 = d.conn->h2;
+    if (h2->async_stream != 0) return false;
+    h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
+    h2->async_stream = stream_id;
+    h2->async_kind = H2AsyncKind::Proxy;
+    h2->async_cfg = cfg;
+    h2->async_route = route;
+    h2->async_resp_len = 0;
+    return true;
+}
+
+// Invoke a JIT handler given the assembled HTTP/1 request bytes (headers, plus
+// body for POST), then serialize its response. A timer yield (wait(ms)) parks the
+// stream for async resume; forwarding / event-yield handlers are not supported
+// over h2 yet → 503.
 template <typename Loop>
 void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 stream_id,
@@ -306,32 +412,16 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
 
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
-    if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
-        h2_emit_status(d, stream_id, 503);  // forward/yield over h2 not wired yet
+    if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
+        if (!h2_suspend_timer(d, stream_id, route->fn, kOutcome, cfg, synth, synth_len))
+            h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         return;
     }
-    const u8* body = nullptr;
-    u32 body_len = 0;
-    if (kOutcome.response_body_idx != 0 && cfg != nullptr &&
-        kOutcome.response_body_idx <= cfg->response_body_count) {
-        const auto& b = cfg->response_bodies[kOutcome.response_body_idx - 1];
-        body = reinterpret_cast<const u8*>(b.data);
-        body_len = b.len;
+    if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
+        h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
+        return;
     }
-    hpack::Header hdrs[RouteConfig::kMaxHeadersPerSet];
-    u32 nhdrs = 0;
-    if (kOutcome.response_headers_idx != 0 && cfg != nullptr &&
-        kOutcome.response_headers_idx <= cfg->response_header_set_count) {
-        const auto& ref = cfg->response_header_sets[kOutcome.response_headers_idx - 1];
-        for (u16 i = 0; i < ref.count; i++) {
-            hdrs[nhdrs].name = {cfg->header_keys[ref.offset + i].data,
-                                cfg->header_keys[ref.offset + i].len};
-            hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
-                                 cfg->header_values[ref.offset + i].len};
-            nhdrs++;
-        }
-    }
-    h2_emit_response(d, stream_id, kOutcome.status_code, hdrs, nhdrs, body, body_len);
+    h2_emit_outcome(d, stream_id, kOutcome, cfg);
 }
 
 // A deferred stream is complete. If the matched handler reads req.body,
@@ -573,9 +663,20 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                                         200);
                 return;
             }
-            // TODO(h2): proxy over HTTP/2 needs the upstream state machine
-            // driven per stream. Until then, fail closed.
-            h2_emit_status(d, stream_id, 503);
+            // No-body proxy: park the stream and forward to the h1 upstream,
+            // re-framing its response into h2 (h2_proxy_begin, after flush). A
+            // request body would need buffering the proxy-defer path doesn't do,
+            // so body proxying still falls through to 503 above.
+            {
+                u8 synth[Http2Conn::kBodySynthCap];
+                const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
+                if (kSynthLen == 0) {
+                    h2_emit_status(d, stream_id, 400);
+                    return;
+                }
+                if (!h2_suspend_proxy(d, stream_id, config, route, synth, kSynthLen))
+                    h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+            }
             return;
     }
 }
@@ -613,6 +714,39 @@ void h2_on_data_cb(
 template <typename Loop>
 void on_h2_data(void* lp, Connection& conn, IoEvent ev);
 
+// Transfer the parked async resume point (Http2Conn async_*) onto the Connection
+// and arm the precise yield timer — atomically leaving the keepalive wheel, the
+// same sequence the HTTP/1 TimerYield path uses. Done only once the suspended
+// stream's batch has flushed, so conn.pending_handler_fn is never set while the
+// connection is still on the keepalive wheel (which would let a keepalive tick
+// resume or close it early). Returns schedule_yield_timer's verdict; false means
+// the wait couldn't be scheduled faithfully → caller fails the connection.
+template <typename Loop>
+[[nodiscard]] bool h2_arm_async_timer(Loop* loop, Connection& conn) {
+    Http2Conn* h2 = conn.h2;
+    conn.pending_handler_fn = h2->async_fn;
+    conn.handler_state = h2->async_state;
+    conn.pending_yield_kind = jit::YieldKind::Timer;
+    conn.transition_to_exec_handler_wait();
+    return loop->schedule_yield_timer(conn, h2->async_timer_ms);
+}
+
+// Defined in callbacks_impl.h (needs the upstream helpers): open the upstream
+// connection for a proxy-suspended stream and forward the request.
+template <typename Loop>
+void h2_proxy_begin(Loop* loop, Connection& conn);
+
+// Once a suspended stream's batch has flushed, start whatever it is waiting on:
+// arm the resume timer (Timer) or open the upstream connection (Proxy).
+template <typename Loop>
+void h2_begin_suspended_io(Loop* loop, Connection& conn) {
+    if (conn.h2->async_kind == H2AsyncKind::Proxy) {
+        h2_proxy_begin<Loop>(loop, conn);
+        return;
+    }
+    if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
+}
+
 // Send-completion callback for the h2 path (partial-send aware, mirrors
 // on_response_sent). On completion: close if the engine asked to, else go back
 // to reading frames.
@@ -645,6 +779,14 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.send_buf.reset();
     if (!conn.keep_alive) {  // engine signalled GOAWAY / connection error
         loop->close_conn(conn);
+        return;
+    }
+    // A stream is suspended (wait() or proxy): now that its batch has flushed,
+    // start what it waits on — arm the resume timer, or open the upstream
+    // connection — instead of reading more frames (one suspended stream at a
+    // time, others queue until it resumes).
+    if (conn.h2 && conn.h2->async_stream != 0) {
+        h2_begin_suspended_io<Loop>(loop, conn);
         return;
     }
     // Keep serving frames on this connection.
@@ -691,6 +833,25 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
 
     const bool kClose = r.close || d.overflow;
 
+    // A handler suspended on wait() during this batch. Flush whatever queued
+    // (control frames + any synchronously-completed streams' responses); the
+    // resume timer is armed afterward — in on_h2_sent if there's output to send,
+    // or right here if there isn't. Not entered on kClose: a closing connection
+    // abandons the suspended handler rather than parking it.
+    if (conn.h2->async_stream != 0 && !kClose) {
+        if (ctrl_len == 0 && d.resp_len == 0) {
+            h2_begin_suspended_io<Loop>(loop, conn);
+            return;
+        }
+        conn.send_buf.reset();
+        conn.send_buf.write(ctrl, ctrl_len);
+        conn.send_buf.write(resp, d.resp_len);
+        conn.keep_alive = true;
+        conn.transition_to_sending(&on_h2_sent<Loop>);
+        loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
+
     // No output and a partial frame that fills the whole recv buffer => the peer
     // sent a frame larger than we can buffer. Fail closed.
     if (ctrl_len == 0 && d.resp_len == 0) {
@@ -729,6 +890,64 @@ void enter_h2(Loop* loop, Connection& conn, IoEvent ev) {
     }
     conn.transition_to_reading_header(&on_h2_data<Loop>);
     on_h2_data<Loop>(static_cast<void*>(loop), conn, ev);
+}
+
+// Resume a timer-suspended HTTP/2 stream. Called from resume_jit_handler when the
+// connection is HTTP/2 (the timer drains in both backends funnel through there).
+// Re-invokes the handler from the parked request bytes; on ReturnStatus
+// serializes the stream's response and flushes (after which on_h2_sent re-arms
+// recv since the async slot is cleared); on another wait() re-arms without
+// flushing; forward / event-yield over h2 are not supported yet → 503.
+template <typename Loop>
+void h2_resume_jit_handler(Loop* loop, Connection& conn) {
+    Http2Conn* h2 = conn.h2;
+    if (h2 == nullptr || h2->async_stream == 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 kStreamId = h2->async_stream;
+    auto* ctx = conn.jit_ctx();
+    ctx->state = conn.handler_state;
+    ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
+    ctx->resume_event_result = conn.resume_event_result;
+    const JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
+                                                           static_cast<void*>(&conn),
+                                                           *ctx,
+                                                           h2->pending_synth,
+                                                           h2->async_synth_len,
+                                                           /*arena=*/nullptr);
+
+    // Another wait(): keep the stream parked and re-arm without flushing.
+    if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
+        h2->async_timer_ms = kOutcome.timer_ms;
+        h2->async_state = static_cast<u16>(kOutcome.next_state);
+        if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+
+    u8 resp[8192];
+    H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
+        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
+    } else {
+        h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
+    }
+
+    // Clear the suspension before responding so the flush's on_h2_sent re-arms
+    // recv (async_stream == 0) rather than the timer.
+    conn.pending_handler_fn = nullptr;
+    h2_clear_async(*h2);
+
+    if (d.resp_len == 0 || d.overflow) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress = 0;
+    conn.send_buf.reset();
+    conn.send_buf.write(resp, d.resp_len);
+    conn.keep_alive = true;
+    conn.transition_to_sending(&on_h2_sent<Loop>);
+    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
 }
 
 }  // namespace rut
