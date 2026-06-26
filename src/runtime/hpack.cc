@@ -635,17 +635,33 @@ u32 Encoder::encode(u8* out, Str name, Str value) {
 // new size in lockstep. Without that the two tables desync and decoding breaks.
 void Encoder::set_table_size(u32 settings_max) {
     const u32 kNew = settings_max < DynamicTable::kHardCap ? settings_max : DynamicTable::kHardCap;
-    if (kNew == dyn.max_size) return;  // unchanged: arm no spurious size update
-    dyn_set_max_size(dyn, kNew);       // shrinking evicts entries that no longer fit
+    // The size currently in effect for the peer's decoder is the final pending
+    // value if one is armed, else our live table limit. No net change → nothing
+    // to do (avoids spurious size updates on duplicate SETTINGS).
+    const i32 kCurrent =
+        pending_size_update >= 0 ? pending_size_update : static_cast<i32>(dyn.max_size);
+    if (static_cast<i32>(kNew) == kCurrent) return;
+    dyn_set_max_size(dyn, kNew);  // shrinking evicts entries that no longer fit
+    // Track the smallest size reached since the last emit. A shrink-then-grow
+    // between header blocks must signal the minimum first (§4.2), otherwise the
+    // peer decoder never evicts at the shrink and its table diverges from ours.
+    if (pending_size_update < 0 || static_cast<i32>(kNew) < pending_min_size)
+        pending_min_size = static_cast<i32>(kNew);
     pending_size_update = static_cast<i32>(kNew);
 }
 
 u32 Encoder::emit_pending_size_update(u8* out) {
     if (pending_size_update < 0) return 0;
     // §6.3 dynamic table size update: pattern 001 (0x20) + 5-bit prefix integer.
-    const u32 kN = encode_integer(out, static_cast<u32>(pending_size_update), 5, 0x20);
+    // Signal the smallest size reached first (so the decoder evicts identically),
+    // then the final size when it differs.
+    u32 n = 0;
+    if (pending_min_size >= 0 && pending_min_size != pending_size_update)
+        n += encode_integer(out + n, static_cast<u32>(pending_min_size), 5, 0x20);
+    n += encode_integer(out + n, static_cast<u32>(pending_size_update), 5, 0x20);
     pending_size_update = -1;
-    return kN;
+    pending_min_size = -1;
+    return n;
 }
 
 }  // namespace rut::hpack

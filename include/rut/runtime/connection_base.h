@@ -402,6 +402,12 @@ struct ConnectionBase {
     // Request timing (for access log)
     u64 req_start_us;
 
+    // An HTTP/2 async (wait/proxy) stream pins the RCU config epoch while parked.
+    // It uses this dedicated flag rather than req_start_us so close_conn leaves
+    // the epoch without also decrementing metrics requests_active (the h2 path
+    // doesn't call on_request_start).
+    bool epoch_held;
+
     // Outstanding I/O ops submitted to the backend. Incremented on
     // submit_recv/submit_send/etc., decremented when the final CQE
     // arrives in dispatch() (multishot CQEs with IORING_CQE_F_MORE
@@ -569,6 +575,7 @@ struct ConnectionBase {
         capture_buf = nullptr;
         capture_header_len = 0;
         req_start_us = 0;
+        epoch_held = false;
         pending_ops = 0;
         recv_slice = nullptr;
         send_slice = nullptr;

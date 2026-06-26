@@ -322,20 +322,23 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
 // An h2 stream going async (wait/proxy) must pin the RCU config epoch the same
 // way the HTTP/1 request path does — otherwise a config hot-reload during the
 // wait can free the RouteConfig/RouteEntry pinned in the async slot before the
-// stream resumes. req_start_us != 0 is the "in epoch" marker close_conn checks,
-// so the pair stays balanced even on an abnormal close. Idempotent.
+// stream resumes. epoch_held is the "in epoch" marker close_conn also checks, so
+// the pair stays balanced even on an abnormal close. A dedicated flag (not
+// req_start_us) keeps the metrics requests_active count correct — the h2 path
+// never called on_request_start, so it must not trigger the close-time
+// decrement. Idempotent.
 template <typename Loop>
 void h2_async_epoch_enter(Loop* loop, Connection& conn) {
-    if (conn.req_start_us == 0) {
+    if (!conn.epoch_held) {
         loop->epoch_enter();
-        conn.req_start_us = monotonic_us();
+        conn.epoch_held = true;
     }
 }
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
-    if (conn.req_start_us != 0) {
+    if (conn.epoch_held) {
         loop->epoch_leave();
-        conn.req_start_us = 0;
+        conn.epoch_held = false;
     }
 }
 
@@ -378,6 +381,9 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       u32 synth_len) {
     Http2Conn* h2 = d.conn->h2;
     if (h2->async_stream != 0) return false;
+    // Pin the config epoch BEFORE storing cfg/route — a backpressured flush of the
+    // suspending batch could otherwise let a hot reload reclaim them while parked.
+    h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     h2->async_stream = stream_id;
     h2->async_kind = H2AsyncKind::Timer;
@@ -401,6 +407,8 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       u32 synth_len) {
     Http2Conn* h2 = d.conn->h2;
     if (h2->async_stream != 0) return false;
+    // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
+    h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     h2->async_stream = stream_id;
     h2->async_kind = H2AsyncKind::Proxy;

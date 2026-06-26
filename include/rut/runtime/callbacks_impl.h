@@ -1684,6 +1684,26 @@ inline bool h2_drop_response_header(Str name) {
            http_header_name_eq_ci(kName, kLen, "content-length", 14);
 }
 
+// Is `name` listed as a token in an upstream `Connection: a, b, c` header value?
+// Such fields are connection-specific (hop-by-hop) and must not be forwarded to
+// the HTTP/2 client (RFC 7230 §6.1 / RFC 7540 §8.1.2.2). Tokens are comma
+// separated, case-insensitive, with optional surrounding whitespace.
+inline bool h2_name_in_connection_tokens(Str connection_value, Str name) {
+    const char* const kV = connection_value.ptr;
+    const u32 kN = connection_value.len;
+    u32 i = 0;
+    while (i < kN) {
+        while (i < kN && (kV[i] == ' ' || kV[i] == '\t' || kV[i] == ',')) i++;
+        const u32 kStart = i;
+        while (i < kN && kV[i] != ',') i++;
+        u32 end = i;  // trim trailing whitespace
+        while (end > kStart && (kV[end - 1] == ' ' || kV[end - 1] == '\t')) end--;
+        if (end > kStart && http_header_name_eq_ci(kV + kStart, end - kStart, name.ptr, name.len))
+            return true;
+    }
+    return false;
+}
+
 // Close the upstream side and release its resources (fd, concurrency slot,
 // response buffer). Shared by the success and failure paths.
 template <typename Loop>
@@ -1751,10 +1771,22 @@ void h2_proxy_finish(
     const u32 kStreamId = h2->async_stream;
     // Copy the body out of upstream_recv_buf before teardown resets it; pending_synth
     // (the serialization scratch) is a different buffer, so no aliasing.
+    // Fields named by the upstream's Connection header are hop-by-hop too.
+    Str connection_tokens{nullptr, 0};
+    for (u32 i = 0; i < resp.header_count; i++) {
+        if (http_header_name_eq_ci(
+                resp.headers[i].name.ptr, resp.headers[i].name.len, "connection", 10)) {
+            connection_tokens = resp.headers[i].value;
+            break;
+        }
+    }
     hpack::Header hdrs[kMaxHeaders];
     u32 nhdrs = 0;
     for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
         if (h2_drop_response_header(resp.headers[i].name)) continue;
+        if (connection_tokens.len > 0 &&
+            h2_name_in_connection_tokens(connection_tokens, resp.headers[i].name))
+            continue;
         hdrs[nhdrs].name = resp.headers[i].name;
         hdrs[nhdrs].value = resp.headers[i].value;
         nhdrs++;
@@ -1796,7 +1828,7 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             h2_proxy_fail(loop, conn, 502);
             return;
         }
-        loop->submit_recv_upstream(conn);
+        if (!loop->submit_recv_upstream(conn)) h2_proxy_fail(loop, conn, 502);
         return;
     }
     // Headers complete.
@@ -1912,6 +1944,12 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
+    // Start the response buffer clean. A previous proxy on this connection may
+    // have left stale bytes from a positive multishot recv CQE that landed after
+    // its teardown reset; without this, the early-response path below would parse
+    // them as this upstream's response. The old fd is long closed, so its CQEs
+    // have drained by the time this fresh connect completes.
+    conn.upstream_recv_buf.reset();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<Loop>);
     // submit_send_upstream can fail to queue (io_uring SQE exhaustion); without a
     // completion the stream would park forever, so fail closed like a bad connect.
@@ -1939,6 +1977,12 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     // stays false (h2 buffers the whole response before sending to the client).
     conn.state = ConnState::Proxying;
     conn.proxy_resp_started = false;
+    // Refresh the wheel now so a CONNECT that hangs (never producing an
+    // UpstreamConnect event to refresh it) is still reaped on upstream_timeout
+    // rather than the much longer keepalive deadline it was last scheduled at.
+    if constexpr (requires { loop->upstream_timeout; }) {
+        loop->timer.refresh(&conn, loop->upstream_timeout);
+    }
     const UpstreamTarget& target = cfg->upstreams[route->upstream_id];
     if (target.max_inflight != 0) {
         bool acquired = true;

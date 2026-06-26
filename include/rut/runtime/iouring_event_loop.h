@@ -691,7 +691,10 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
-        if (c.req_start_us != 0) epoch_leave();
+        // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
+        // the config epoch without an h1-style req_start_us (see event_loop.h).
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
         // prior release at completion a no-op).
         if (c.upstream_slot_held) {

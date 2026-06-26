@@ -7620,7 +7620,9 @@ TEST(shard, serves_http2_proxy) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: 5\r\n"
         "X-Backend: rut\r\n"
-        "Te: gzip\r\n"  // hop-by-hop — must NOT be forwarded to the h2 client
+        "Te: gzip\r\n"           // hop-by-hop — must NOT be forwarded to the h2 client
+        "Connection: x-hop\r\n"  // nominates x-hop as connection-specific (hop-by-hop)
+        "X-Hop: secret\r\n"      // ...so this must NOT be forwarded either
         "\r\n"
         "hello";
     REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
@@ -7668,9 +7670,11 @@ TEST(shard, serves_http2_proxy) {
         if (body[i] != static_cast<u8>(want[i])) body_ok = false;
     CHECK(body_ok);
     // Header re-framing: a normal upstream header is forwarded (lowercased per
-    // RFC 7540 §8.1.2), the hop-by-hop `te` is filtered out.
+    // RFC 7540 §8.1.2); the hop-by-hop `te` and the field nominated by the
+    // upstream `Connection` header (`x-hop`) are filtered out.
     CHECK(h2_response_has_header(resp, total, 1, "x-backend", "rut"));
     CHECK(!h2_response_has_header(resp, total, 1, "te", "gzip"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-hop", "secret"));
 
     close(c);
     shard.stop();

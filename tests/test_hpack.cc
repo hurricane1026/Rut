@@ -480,6 +480,46 @@ TEST(hpack_encoder, dynamic_indexing_roundtrip) {
     CHECK(hdr_is(out[0], "custom-key", "custom-value"));
 }
 
+// A shrink-then-grow between header blocks (e.g. peer SETTINGS 0 then 4096) must
+// signal the SMALLEST size first (RFC 7541 §4.2), so the decoder evicts in
+// lockstep — signalling only the final size would leave the decoder's entries in
+// place while the encoder evicted, desyncing the tables.
+TEST(hpack_encoder, shrink_then_grow_signals_minimum_size) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    hpack::DynamicTable dec;
+    dec.init(4096);
+    u8 block[256];
+    u8 scratch[256];
+    hpack::Header out[8];
+    u32 n = 0;
+
+    // Round-trip a field so BOTH tables hold one dynamic entry.
+    u32 b = enc.encode(block, cstr("custom-key"), cstr("custom-value"));
+    REQUIRE(hpack::decode_header_block(dec, block, b, scratch, sizeof(scratch), out, 8, &n));
+    CHECK_EQ(enc.dyn.nent, 1u);
+    CHECK_EQ(dec.nent, 1u);
+
+    // Peer shrinks the table to 0 then back to 4096 before the next block.
+    enc.set_table_size(0);
+    CHECK_EQ(enc.dyn.nent, 0u);  // encoder evicted at the shrink
+    enc.set_table_size(4096);
+
+    // The next block leads with the size updates. A correct encoder signals 0
+    // first (decoder evicts its entry) then 4096; signalling only 4096 would
+    // leave dec.nent == 1 and desync.
+    u32 bp = enc.emit_pending_size_update(block);
+    REQUIRE(bp >= 2u);                // two §6.3 updates: 0 then 4096
+    CHECK_EQ(block[0] & 0xe0, 0x20);  // first instruction is a size update
+    bp += enc.encode(block + bp, cstr(":status"), cstr("200"));
+    n = 0;
+    REQUIRE(hpack::decode_header_block(dec, block, bp, scratch, sizeof(scratch), out, 8, &n));
+    CHECK_EQ(n, 1u);
+    CHECK(hdr_is(out[0], ":status", "200"));
+    CHECK_EQ(dec.nent, 0u);         // decoder evicted at the signalled shrink
+    CHECK_EQ(dec.max_size, 4096u);  // ...then grew back
+}
+
 // A peer that advertises a smaller SETTINGS_HEADER_TABLE_SIZE must make the
 // encoder (a) cap its dynamic table, (b) lead the next block with a §6.3 size
 // update, and (c) stay in sync with a decoder bounded to the same size.
