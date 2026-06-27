@@ -249,6 +249,9 @@ struct MirTerminator {
     // Request-path rewrite for forward(set_path:) — carried verbatim from HIR.
     // ptr != nullptr → lower_rir emits ReqSetPath before RetForward.
     Str forward_set_path{};
+    // Request-header overrides for forward(set_header:) — carried verbatim from
+    // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
+    FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
 };
 
 struct MirBlock {

@@ -686,6 +686,9 @@ struct HirTerminator {
     // != nullptr means a path override is present; lowering emits ReqSetPath
     // before the RetForward terminator.
     Str forward_set_path{};
+    // Request-header overrides for `forward(name, set_header: {...})`. len == 0
+    // means none; lowering emits one ReqSetHeader per entry before RetForward.
+    FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
 };
 
 struct HirGuardBody {

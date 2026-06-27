@@ -290,6 +290,17 @@ struct Ctx {
         return fn_req_set_path;
     }
 
+    // void rut_helper_req_set_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
+    LLVMValueRef fn_req_set_header = nullptr;
+    LLVMValueRef get_req_set_header() {
+        if (!fn_req_set_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_req_set_header = LLVMAddFunction(llvm_mod, "rut_helper_req_set_header", ft);
+        }
+        return fn_req_set_header;
+    }
+
     // void rut_helper_req_cookie(ptr, i32, ptr, i32, ptr, ptr, ptr)
     LLVMValueRef get_req_cookie() {
         if (!fn_req_cookie) {
@@ -873,6 +884,25 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            c.get_req_set_path(),
                            args,
                            3,
+                           "");
+            break;
+        }
+        case rir::Opcode::ReqSetHeader: {
+            // imm.str_val is the header name (a literal); operands[0] is the value
+            // (a Str register). Record both on the connection; the proxy injects or
+            // replaces the line in the outbound request before forwarding.
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "setheader.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "setheader.vptr");
+            LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "setheader.vlen");
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_header()),
+                           c.get_req_set_header(),
+                           args,
+                           5,
                            "");
             break;
         }

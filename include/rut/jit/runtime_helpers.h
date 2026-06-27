@@ -154,4 +154,10 @@ void rut_helper_str_trim_prefix(const char* s,
 // constant), since the proxy reads it later when rewriting the request line.
 void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 
+// Record a forward(set_header:) override. `name`/`val` must point at stable
+// memory (JIT string constants); the proxy injects/replaces the header line in
+// the outbound request later. Bounded per connection.
+void rut_helper_req_set_header(
+    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+
 }  // extern "C"

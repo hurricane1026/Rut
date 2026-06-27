@@ -997,6 +997,59 @@ struct Parser {
                         if (!val) return core::make_unexpected(val.error());
                         stmt.forward_set_path = val.value()->text;
                         stmt.has_forward_set_path = true;
+                    } else if (kw_text.eq({"set_header", 10})) {
+                        // set_header: { "Name": "Value", ... } — request-header
+                        // overrides applied to the outbound proxied request. Same
+                        // dict grammar + validation as response(headers:).
+                        if (stmt.forward_set_headers.len != 0)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto lbrace = expect(TokenType::LBrace);
+                        if (!lbrace) return core::make_unexpected(lbrace.error());
+                        if (cur().type == TokenType::RBrace)  // empty dict → omit the kwarg
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(cur()));
+                        while (true) {
+                            auto key_tok = expect(TokenType::StringLit);
+                            if (!key_tok) return core::make_unexpected(key_tok.error());
+                            auto kcolon = expect(TokenType::Colon);
+                            if (!kcolon) return core::make_unexpected(kcolon.error());
+                            auto val_tok = expect(TokenType::StringLit);
+                            if (!val_tok) return core::make_unexpected(val_tok.error());
+                            AstHeaderKV pair{key_tok.value()->text, val_tok.value()->text};
+                            // Reuse the shared validator: tchar key, control-free
+                            // value, and the framing names (Content-Length /
+                            // Transfer-Encoding / Connection) reserved — those are
+                            // runtime-managed for requests too.
+                            const auto vr = validate_response_header(
+                                pair.key.ptr, pair.key.len, pair.value.ptr, pair.value.len);
+                            if (vr != HttpHeaderValidation::Ok) {
+                                const bool is_value_err =
+                                    vr == HttpHeaderValidation::InvalidValueChar;
+                                const Token& where =
+                                    is_value_err ? *val_tok.value() : *key_tok.value();
+                                const Str detail = is_value_err ? pair.value : pair.key;
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax, span_from(where), detail);
+                            }
+                            for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
+                                if (http_header_name_eq_ci(stmt.forward_set_headers[i].key.ptr,
+                                                           stmt.forward_set_headers[i].key.len,
+                                                           pair.key.ptr,
+                                                           pair.key.len)) {
+                                    return frontend_error(FrontendError::UnexpectedToken,
+                                                          span_from(*key_tok.value()),
+                                                          pair.key);
+                                }
+                            }
+                            if (!stmt.forward_set_headers.push(pair))
+                                return frontend_error(FrontendError::TooManyItems,
+                                                      span_from(*key_tok.value()));
+                            if (!take(TokenType::Comma)) break;
+                            if (cur().type == TokenType::RBrace) break;  // trailing comma
+                        }
+                        auto rbrace = expect(TokenType::RBrace);
+                        if (!rbrace) return core::make_unexpected(rbrace.error());
                     } else {
                         return frontend_error(
                             FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);

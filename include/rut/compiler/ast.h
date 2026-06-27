@@ -227,6 +227,12 @@ struct AstStatement {
     // proxy rewrites the outbound request line.
     Str forward_set_path{};
     bool has_forward_set_path = false;
+    // Request-header overrides from `forward(name, set_header: { "K": "V", ... })`.
+    // Inline-stored like response_headers; lowered to ReqSetHeader ops before the
+    // forward terminator so the proxy injects/replaces the lines outbound.
+    // `forward_set_headers.len == 0` means "no kwarg" (empty dict is rejected).
+    static constexpr u32 kMaxForwardSetHeaders = 16;
+    FixedVec<AstHeaderKV, kMaxForwardSetHeaders> forward_set_headers;
     AstStatement* then_stmt = nullptr;
     AstStatement* else_stmt = nullptr;
     static constexpr u32 kMaxBlockStatements = 8;

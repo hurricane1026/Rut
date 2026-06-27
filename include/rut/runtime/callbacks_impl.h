@@ -523,6 +523,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // exactly once per complete request, before route matching / handler dispatch.
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
     if (loop->capture_ring) capture_stage_headers(conn);
@@ -1465,6 +1466,89 @@ inline void rewrite_request_line_path(Connection& conn) {
     }
 }
 
+// Apply forward(set_header:) overrides to the buffered request before forwarding.
+// For each (name, value): replace the existing header line (case-insensitive) in
+// place, or insert "Name: Value\r\n" just before the blank-line terminator. Same
+// in-place mechanics as rewrite_request_line_path — every byte past the edit point
+// shifts by the length delta, and recv_buf's length, req_header_end, and
+// req_initial_send_len are adjusted so the injected bytes are forwarded and a
+// streaming body stays correctly framed. No-op unless overrides were recorded.
+inline void apply_request_header_overrides(Connection& conn) {
+    if (conn.req_header_override_count == 0) return;
+    u8* buf = conn.recv_slice;
+    if (buf == nullptr) return;
+    for (u32 oi = 0; oi < conn.req_header_override_count; oi++) {
+        const Str name = conn.req_header_overrides[oi].name;
+        const Str val = conn.req_header_overrides[oi].value;
+        if (name.len == 0) continue;
+        // Build "Name: Value\r\n" into a bounded scratch (skip pathological sizes).
+        const u32 kLineLen = name.len + 2 + val.len + 2;  // ": " + CRLF
+        u8 line[2048];
+        if (kLineLen > sizeof(line)) continue;
+        u32 lp = 0;
+        for (u32 i = 0; i < name.len; i++) line[lp++] = static_cast<u8>(name.ptr[i]);
+        line[lp++] = ':';
+        line[lp++] = ' ';
+        for (u32 i = 0; i < val.len; i++) line[lp++] = static_cast<u8>(val.ptr[i]);
+        line[lp++] = '\r';
+        line[lp++] = '\n';
+
+        const u32 total = conn.recv_buf.len();
+        const u32 kHEnd = conn.req_header_end;
+        // Need a valid header block (past CRLFCRLF) to locate the terminator.
+        if (kHEnd < 4 || kHEnd > total) continue;
+        // Header lines begin after the request line (first LF). The trailing blank
+        // line is [kHEnd-2, kHEnd); header fields occupy [kHStart, kHBody).
+        u32 kHStart = 0;
+        while (kHStart < kHEnd && buf[kHStart] != '\n') kHStart++;
+        if (kHStart >= kHEnd) continue;
+        kHStart++;
+        const u32 kHBody = kHEnd - 2;
+        if (kHBody < kHStart) continue;
+
+        // Find an existing field with this name (case-insensitive).
+        u32 found_start = 0, found_end = 0;
+        bool found = false;
+        for (u32 i = kHStart; i < kHBody;) {
+            const u32 ls = i;
+            u32 colon = ls;
+            while (colon < kHBody && buf[colon] != ':' && buf[colon] != '\n') colon++;
+            u32 le = ls;
+            while (le < kHBody && buf[le] != '\n') le++;
+            le = le < kHBody ? le + 1 : kHBody;  // include LF
+            if (colon < kHBody && buf[colon] == ':' &&
+                http_header_name_eq_ci(
+                    reinterpret_cast<const char*>(buf + ls), colon - ls, name.ptr, name.len)) {
+                found = true;
+                found_start = ls;
+                found_end = le;
+                break;
+            }
+            i = le;
+        }
+
+        const u32 pos = found ? found_start : kHBody;  // insert before the blank line
+        const u32 old_span = found ? found_end - found_start : 0;
+        const i64 delta = static_cast<i64>(kLineLen) - static_cast<i64>(old_span);
+        if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) continue;
+        const u32 tail_src = pos + old_span;
+        if (delta != 0)
+            __builtin_memmove(buf + (static_cast<i64>(tail_src) + delta),
+                              buf + tail_src,
+                              static_cast<size_t>(total - tail_src));
+        __builtin_memcpy(buf + pos, line, kLineLen);
+        conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(total) + delta));
+        if (delta != 0) {
+            const i64 he = static_cast<i64>(conn.req_header_end) + delta;
+            conn.req_header_end = he > 0 ? static_cast<u32>(he) : 0;
+            if (conn.req_initial_send_len > pos) {
+                const i64 adj = static_cast<i64>(conn.req_initial_send_len) + delta;
+                conn.req_initial_send_len = adj > 0 ? static_cast<u32>(adj) : 0;
+            }
+        }
+    }
+}
+
 #if RUT_ENABLE_WEBSOCKET
 // Remove the `Sec-WebSocket-Extensions` request header (in place) before forwarding a
 // terminate-route upgrade, so client and backend can't negotiate a per-message extension
@@ -1562,6 +1646,10 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // forward(set_path:) — rewrite the request line before forwarding (no-op
     // unless a path override was recorded by the JIT handler).
     rewrite_request_line_path(conn);
+    // forward(set_header:) — inject/replace request header lines (no-op unless
+    // overrides were recorded). After the path rewrite so it reads the updated
+    // req_header_end.
+    apply_request_header_overrides(conn);
 #if RUT_ENABLE_WEBSOCKET
     // Terminate routes must not let the backend negotiate a per-message extension.
     if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);

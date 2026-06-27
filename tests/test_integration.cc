@@ -11647,6 +11647,203 @@ TEST(route, forward_invalid_kwargs_rejected) {
     auto l2 = lex(Str{dup, static_cast<u32>(strlen(dup))});
     REQUIRE(l2);
     CHECK(!parse_file(l2.value()));
+
+    // set_header: reserved framing name (Content-Length) is rejected.
+    const char* reserved =
+        "upstream b at \"127.0.0.1:80\"\n"
+        "route GET \"/a\" { return forward(b, set_header: { \"Content-Length\": \"9\" }) }\n";
+    auto l3 = lex(Str{reserved, static_cast<u32>(strlen(reserved))});
+    REQUIRE(l3);
+    CHECK(!parse_file(l3.value()));
+
+    // set_header: empty dict is rejected (omit the kwarg instead).
+    const char* empty =
+        "upstream b at \"127.0.0.1:80\"\n"
+        "route GET \"/a\" { return forward(b, set_header: {}) }\n";
+    auto l4 = lex(Str{empty, static_cast<u32>(strlen(empty))});
+    REQUIRE(l4);
+    CHECK(!parse_file(l4.value()));
+
+    // set_header: duplicate (case-insensitive) keys are rejected.
+    const char* dupkey =
+        "upstream b at \"127.0.0.1:80\"\n"
+        "route GET \"/a\" { return forward(b, set_header: { \"X-A\": \"1\", \"x-a\": \"2\" }) }\n";
+    auto l5 = lex(Str{dupkey, static_cast<u32>(strlen(dupkey))});
+    REQUIRE(l5);
+    CHECK(!parse_file(l5.value()));
+}
+
+// Upstream that echoes a chosen request header's value back in the response body
+// (or "ABSENT" if the header isn't present), so a test can assert what the proxy
+// actually forwarded. One connection per request (gateway opens a fresh upstream).
+struct EchoHeaderServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    const char* echo_header = "x-inject";  // lowercase; matched case-insensitively
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~EchoHeaderServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<EchoHeaderServer*>(arg);
+        const u32 hlen = static_cast<u32>(strlen(s->echo_header));
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[2048];
+            i32 n = recv_timeout(client, req, sizeof(req), 1000);
+            if (n > 0) {
+                const auto len = static_cast<u32>(n);
+                // Scan header lines for `<echo_header>:` (case-insensitive).
+                char value[256];
+                u32 vlen = 0;
+                bool found = false;
+                u32 i = 0;
+                while (i < len) {
+                    u32 ls = i;
+                    while (i < len && req[i] != '\n') i++;
+                    u32 le = i;  // points at '\n' (or len)
+                    if (i < len) i++;
+                    // line [ls, le), maybe ending with '\r'
+                    u32 colon = ls;
+                    while (colon < le && req[colon] != ':') colon++;
+                    if (colon < le && colon - ls == hlen) {
+                        bool match = true;
+                        for (u32 j = 0; j < hlen; j++) {
+                            char c = req[ls + j];
+                            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                            if (c != s->echo_header[j]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            u32 vs = colon + 1;
+                            while (vs < le && (req[vs] == ' ' || req[vs] == '\t')) vs++;
+                            u32 ve = le;
+                            while (ve > vs && (req[ve - 1] == '\r' || req[ve - 1] == ' ')) ve--;
+                            vlen = ve > vs ? ve - vs : 0;
+                            if (vlen >= sizeof(value)) vlen = sizeof(value) - 1;
+                            memcpy(value, req + vs, vlen);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                const char* body = found ? value : "ABSENT";
+                const u32 blen = found ? vlen : 6;
+                char resp[512];
+                int rn = snprintf(resp,
+                                  sizeof(resp),
+                                  "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n%.*s",
+                                  blen,
+                                  static_cast<int>(blen),
+                                  body);
+                if (rn > 0) (void)send_all(client, resp, static_cast<u32>(rn));
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Compile `forward(backend, set_header: <dict>)`, drive one GET /api through the
+// proxy, and return true iff the upstream's echo of `echo_header` contained
+// `expect`. Plain bool result (no REQUIRE/CHECK) so it can run as a free helper.
+static bool run_set_header_case(const char* echo_header,
+                                const char* set_header_dict,
+                                const char* expect) {
+    using namespace rut;
+    EchoHeaderServer echo;
+    echo.echo_header = echo_header;
+    if (!echo.setup()) return false;
+    char src_buf[320];
+    const int src_len = snprintf(src_buf,
+                                 sizeof(src_buf),
+                                 "upstream backend at \"127.0.0.1:%u\"\n"
+                                 "route GET \"/api\" { return forward(backend, set_header: %s) }\n",
+                                 echo.port,
+                                 set_header_dict);
+    if (src_len <= 0 || src_len >= static_cast<int>(sizeof(src_buf))) return false;
+    auto lexed = lex(Str{src_buf, static_cast<u32>(src_len)});
+    if (!lexed) return false;
+    auto ast = parse_file(lexed.value());
+    if (!ast) return false;
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    if (!hir) return false;
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    if (!mir) return false;
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    if (!lowered) return false;
+    auto cg = jit::codegen(rir.module);
+    if (!cg.ok) return false;
+    jit::JitEngine engine;
+    if (!engine.init() || !engine.compile(cg.mod, cg.ctx)) {
+        rir.destroy();
+        return false;
+    }
+    RouteConfig cfg{};
+    bool ok = false;
+    if (populate_route_config(cfg, rir.module) && register_jit_routes(cfg, rir.module, engine)) {
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        if (proxy.setup(&active, 500)) {
+            char buf[1024];
+            const u32 total = proxy_get_api(proxy.port, buf, sizeof(buf));
+            ok = total > 0 && buf_contains(buf, total, expect, static_cast<u32>(strlen(expect)));
+        }
+    }
+    engine.shutdown();
+    rir.destroy();
+    return ok;
+}
+
+// End-to-end: the proxy applies forward(set_header:) overrides to the outbound
+// request — an INJECTED header the client never sent (X-Inject) reaches the
+// upstream, and an existing header (Host, sent by proxy_get_api) is REPLACED.
+TEST(route, forward_set_header_rewrites_upstream_request) {
+    CHECK(run_set_header_case("x-inject", "{ \"X-Inject\": \"yes\" }", "yes"));
+    CHECK(run_set_header_case("host", "{ \"Host\": \"replaced\" }", "replaced"));
 }
 
 TEST(route, req_query_string_any_non_short_circuit_eager_rhs_is_observed_real_socket) {

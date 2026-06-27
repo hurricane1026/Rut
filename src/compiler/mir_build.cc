@@ -958,6 +958,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 // silently shipping a truncated header set.
                 if (!ok) __builtin_trap();
             }
+            // forward(set_header:) overrides — same cap on both sides (the
+            // static_assert above covers kMaxHeaders), straight copy.
+            out->forward_set_headers.len = 0;
+            for (u32 i = 0; i < term.forward_set_headers.len; i++) {
+                const auto& p = term.forward_set_headers[i];
+                if (!out->forward_set_headers.push({p.key, p.value})) __builtin_trap();
+            }
         };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;

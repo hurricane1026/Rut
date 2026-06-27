@@ -8063,6 +8063,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
+    // Carry forward(set_header:) overrides verbatim (parser validated + deduped).
+    for (u32 i = 0; i < stmt.forward_set_headers.len; i++) {
+        const auto& p = stmt.forward_set_headers[i];
+        if (!term.forward_set_headers.push({p.key, p.value}))
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+    }
     return term;
 }
 
