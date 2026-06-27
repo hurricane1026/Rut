@@ -640,6 +640,10 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
                 headers[hdr_count].value = {reinterpret_cast<const char*>(buf + value_start),
                                             value_end - value_start};
                 hdr_count++;
+            } else {
+                // Beyond capacity: keep parsing (semantic headers still apply
+                // below) but record that headers[] is now truncated.
+                resp->headers_truncated = true;
             }
 
             // Semantic header detection (always runs, even if header not stored)

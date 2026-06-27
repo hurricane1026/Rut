@@ -1773,11 +1773,13 @@ void h2_proxy_finish(Loop* loop,
                      bool is_head) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
-    // If the upstream sent more headers than HttpResponseParser can hold, a later
+    // If the upstream sent MORE headers than HttpResponseParser can hold, a later
     // Connection field naming an earlier (dropped) header is invisible to the
     // hop-by-hop filter below — we can't safely strip connection-specific headers,
-    // so fail the stream. kMaxHeaders is generous, so this is rare.
-    if (resp.header_count >= kMaxHeaders) {
+    // so fail the stream. Keyed off headers_truncated (not header_count, which
+    // saturates at kMaxHeaders): an exactly-full 64-header response is fully stored
+    // and forwarded normally. kMaxHeaders is generous, so truncation is rare.
+    if (resp.headers_truncated) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }

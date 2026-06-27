@@ -870,6 +870,13 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
     conn.h2->on_reset = nullptr;
+    // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
+    // hot reload (poll_command runs once per loop iteration, after this dispatch
+    // batch) can't reclaim a RouteConfig/RouteEntry that a stream parks on —
+    // whether it suspends on wait/proxy or defers its body to a later DATA batch.
+    // Released at the bottom of this batch when nothing stays parked; held across
+    // batches otherwise (and dropped on resume or close_conn).
+    h2_async_epoch_enter(loop, conn);
     conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
 
     u32 ctrl_len = 0;
@@ -905,6 +912,14 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
         return;
     }
+
+    // Past the suspend path: no wait/proxy stream parked this batch. Release the
+    // config epoch pinned at the top — unless a body-defer still holds cfg/route
+    // for a later DATA batch (keep it then), or a parked stream rides a close
+    // (close_conn releases it). The leave is idempotent, so a later close_conn is
+    // a harmless no-op.
+    if (conn.h2->async_stream == 0 && conn.h2->pending_stream == 0)
+        h2_async_epoch_leave(loop, conn);
 
     // No output and a partial frame that fills the whole recv buffer => the peer
     // sent a frame larger than we can buffer. Fail closed.
