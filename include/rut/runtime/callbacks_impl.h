@@ -1727,11 +1727,12 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
     conn.upstream_recv_buf.reset();
 }
 
-// Flush a fully-serialized response (already in pending_synth scratch, length
-// resp_len) for the suspended stream, clear the async slot, and resume reading
-// frames once it drains (on_h2_sent sees async_stream == 0).
+// Flush a fully-serialized response (in `src`, length resp_len) for the suspended
+// stream, clear the async slot, and resume reading frames once it drains
+// (on_h2_sent sees async_stream == 0). `src` is copied into send_buf synchronously,
+// so a caller-owned stack buffer is fine.
 template <typename Loop>
-void h2_proxy_flush(Loop* loop, Connection& conn, u32 resp_len) {
+void h2_proxy_flush(Loop* loop, Connection& conn, const u8* src, u32 resp_len) {
     h2_clear_async(*conn.h2);
     h2_async_epoch_leave(loop, conn);  // proxy episode done — release the config epoch
     if (resp_len == 0) {
@@ -1744,7 +1745,7 @@ void h2_proxy_flush(Loop* loop, Connection& conn, u32 resp_len) {
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     conn.send_progress = 0;
     conn.send_buf.reset();
-    conn.send_buf.write(conn.h2->pending_synth, resp_len);
+    conn.send_buf.write(src, resp_len);
     conn.keep_alive = true;
     conn.transition_to_sending(&on_h2_sent<Loop>);
     loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
@@ -1757,9 +1758,15 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
     h2_proxy_teardown_upstream(loop, conn);
-    H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
+    // Serialize the status-only response into a local scratch, NOT pending_synth:
+    // on io_uring a timeout can fire while the upstream request send is still in
+    // flight, and that SQE still sources pending_synth — overwriting it here would
+    // corrupt the bytes the backend is reading. A status-only HEADERS frame is
+    // tiny, so a small stack buffer is ample.
+    u8 scratch[256];
+    H2Dispatch<Loop> d{loop, &conn, scratch, sizeof(scratch), 0, false};
     h2_emit_status(d, kStreamId, status);
-    h2_proxy_flush(loop, conn, d.resp_len);
+    h2_proxy_flush(loop, conn, scratch, d.resp_len);
 }
 
 // The full h1 upstream response is buffered in upstream_recv_buf. Re-encode it as
@@ -1824,7 +1831,9 @@ void h2_proxy_finish(Loop* loop,
         h2_emit_status(d, kStreamId, 502);
     }
     h2_proxy_teardown_upstream(loop, conn);
-    h2_proxy_flush(loop, conn, d.resp_len);
+    // Success path: the full upstream response already arrived, so the request
+    // send long completed and pending_synth (d's buffer) is free to source from.
+    h2_proxy_flush(loop, conn, h2->pending_synth, d.resp_len);
 }
 
 // Upstream response recv completion: accumulate in upstream_recv_buf until the
@@ -1984,6 +1993,10 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // them as this upstream's response. The old fd is long closed, so its CQEs
     // have drained by the time this fresh connect completes.
     conn.upstream_recv_buf.reset();
+    // Same drain guarantee lets us drop the stale-CQE guard now: from here on, a
+    // negative UpstreamRecv terminal belongs to THIS upstream and should fail the
+    // stream rather than be ignored. (h2_proxy_begin deliberately left it set.)
+    conn.upstream_abandoned = false;
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<Loop>);
     // submit_send_upstream can fail to queue (io_uring SQE exhaustion); without a
     // completion the stream would park forever, so fail closed like a bad connect.
@@ -2003,7 +2016,14 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
-    conn.upstream_abandoned = false;  // fresh proxy episode (teardown sets it true)
+    // NOTE: upstream_abandoned stays true (set by the prior episode's teardown)
+    // through the connect window — cleared only once the fresh upstream connects
+    // (h2_on_upstream_connected). On io_uring a late negative terminal CQE from the
+    // PREVIOUS upstream's multishot recv can still be in flight here; with the guard
+    // up, the dispatch ignores it instead of spuriously closing this connection
+    // before the new upstream has even connected. By the time the fresh connect
+    // completes, the old fd's CQEs have drained (same reasoning as the recv-buf
+    // reset in h2_on_upstream_connected).
     // Enter Proxying so the timer wheel uses the (shorter) upstream_timeout, not
     // keepalive: a backend that accepts then stalls is reaped on the configured
     // upstream deadline (the tick routes h2 conns to h2_proxy_fail(504)) instead

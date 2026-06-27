@@ -167,9 +167,20 @@ u32 http2_write_response(u8* out,
     sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
     sbuf[2] = static_cast<char>('0' + status % 10);
     hb += enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
+    // Worst-case HPACK literal overhead beyond the raw name+value bytes: one field-
+    // line prefix octet plus a length-prefix integer for each of name and value (up
+    // to 5 bytes each for 32-bit lengths). The peer (or an upstream we proxy) can
+    // supply arbitrary header sizes, so this must bound the write exactly — a header
+    // just under the buffer would otherwise encode past hblock instead of returning
+    // 0 (→ the caller answers 502).
+    static constexpr u32 kHpackFieldOverhead = 11;  // 1 prefix + 5 + 5 length octets
+    // Room the trailing content-length line needs when there's a body, reserved
+    // during the loop so the loop can't fill hblock and then overflow on the CL.
+    const u32 kClReserve = body_len > 0 ? 14 + 10 + kHpackFieldOverhead : 0;
     for (u32 i = 0; i < nhdrs; i++) {
-        // Worst case per header ~ name+value+few prefix octets; bail if tight.
-        if (hb + hdrs[i].name.len + hdrs[i].value.len + 8 > sizeof(hblock)) return 0;
+        if (hb + hdrs[i].name.len + hdrs[i].value.len + kHpackFieldOverhead + kClReserve >
+            sizeof(hblock))
+            return 0;
         // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
         // config may hold mixed case (HTTP/1 tolerates it). Lowercase into a
         // small buffer before encoding.
@@ -187,6 +198,7 @@ u32 http2_write_response(u8* out,
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
+        if (hb + 14 + kClLen + kHpackFieldOverhead > sizeof(hblock)) return 0;  // (reserved above)
         hb += enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
     }
 

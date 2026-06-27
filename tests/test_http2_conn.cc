@@ -944,6 +944,32 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     CHECK((df.flags & http2_flag::kEndStream) != 0);
 }
 
+// http2_write_response must refuse (return 0) rather than overflow its fixed 8 KiB
+// HPACK scratch when the (untrusted, upstream-forwarded) header block is too large.
+// The bound is on raw name+value lengths, so it rejects conservatively regardless
+// of Huffman — the proxy turns a 0 return into a 502 instead of smashing the stack.
+TEST(http2_conn, write_response_rejects_oversized_headers) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    static char val[600];
+    for (char& c : val) c = 'a';
+    constexpr u32 kN = 40;  // 40 * 600 = 24 KiB raw; even best-case (~5-bit) Huffman
+                            // exceeds the 8 KiB hblock, so the bound must trip.
+    char names[kN][5];
+    hpack::Header hdrs[kN];
+    for (u32 i = 0; i < kN; i++) {
+        names[i][0] = 'x';
+        names[i][1] = '-';
+        names[i][2] = static_cast<char>('a' + i / 10);
+        names[i][3] = static_cast<char>('a' + i % 10);
+        hdrs[i].name = Str{names[i], 4};
+        hdrs[i].value = Str{val, sizeof(val)};
+    }
+    u8 out[32768];
+    u32 n = http2_write_response(out, sizeof(out), enc, 1, 200, hdrs, kN, nullptr, 0);
+    CHECK_EQ(n, 0u);  // refused, not overflowed
+}
+
 // Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
 // more frames. Helper to reduce boilerplate in the branch tests below.
 namespace {
