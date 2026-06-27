@@ -999,6 +999,24 @@ TEST(http2_conn, write_response_rejects_long_uppercase_name) {
     }
 }
 
+// The h2 response path must drop connection-specific (hop-by-hop) header names a
+// route can still carry from response(headers:) — validate_response_header only
+// blocks Connection/Transfer-Encoding/Content-Length, so keep-alive / upgrade /
+// proxy-connection / te would otherwise emit an h2-illegal field.
+TEST(http2_conn, prohibited_response_header_filter) {
+    using namespace rut;
+    CHECK(h2_is_prohibited_response_header("connection", 10));
+    CHECK(h2_is_prohibited_response_header("Keep-Alive", 10));  // case-insensitive
+    CHECK(h2_is_prohibited_response_header("proxy-connection", 16));
+    CHECK(h2_is_prohibited_response_header("transfer-encoding", 17));
+    CHECK(h2_is_prohibited_response_header("Upgrade", 7));
+    CHECK(h2_is_prohibited_response_header("te", 2));
+    // Ordinary headers pass through.
+    CHECK(!h2_is_prohibited_response_header("content-type", 12));
+    CHECK(!h2_is_prohibited_response_header("x-custom", 8));
+    CHECK(!h2_is_prohibited_response_header("cache-control", 13));
+}
+
 // Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
 // more frames. Helper to reduce boilerplate in the branch tests below.
 namespace {

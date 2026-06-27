@@ -4253,6 +4253,56 @@ TEST(shard, serves_http2_sequential_requests) {
     close(lfd);
 }
 
+// A keep-alive h2 connection that issues MORE than kMaxStreams sequential requests
+// must keep getting responses: each completed stream is marked Closed so
+// alloc_stream can reuse its slot. Without the close, the live stream table fills
+// after kMaxStreams ids have ever been used and further requests get
+// REFUSED_STREAM (RST_STREAM, no :status), even with no active streams.
+TEST(shard, serves_http2_many_sequential_streams_reuse_slots) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 pre[64];
+    u32 pn = h2_client_prologue(pre);
+    REQUIRE(write_all_fd(c, pre, pn));
+
+    // Comfortably past Http2Conn::kMaxStreams (64), one stream at a time.
+    const u32 kRequests = 80;
+    for (u32 r = 0; r < kRequests; r++) {
+        const u32 sid = 1 + r * 2;  // client-initiated odd stream ids
+        u8 out[256];
+        u32 n = h2_client_get(out, sizeof(out), sid, "/", 1);
+        REQUIRE(write_all_fd(c, out, n));
+        u8 resp[4096];
+        u32 total = 0;
+        for (int a = 0; a < 6 && total < sizeof(resp); a++) {
+            i32 got =
+                recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+            if (h2_status_for_stream(resp, total, sid) != 0) break;
+        }
+        // Every request — including those past the 64th distinct stream id — gets a
+        // real 200, not a slot-exhaustion refusal.
+        CHECK_EQ(h2_status_for_stream(resp, total, sid), 200u);
+    }
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(shard, rejects_malformed_http2_request) {
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);

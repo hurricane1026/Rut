@@ -43,6 +43,32 @@ struct H2Dispatch {
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
 // the connection's dynamic-indexing encoder. `hdrs[0..nhdrs)` are extra
 // response headers (after :status, before content-length).
+
+// Mark a stream Closed once its final (END_STREAM) response has been serialized.
+// http2_write_response always sets END_STREAM on the last frame, so every emitted
+// response completes the stream from our side. Without this the Http2Stream stays
+// in the live table forever (the serving layer writes frames directly, bypassing
+// the engine's stream state), and after kMaxStreams slots have ever been used
+// alloc_stream — which only reuses Closed slots — starts refusing new streams on a
+// long-lived keep-alive connection even though none are active.
+inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
+    if (Http2Stream* s = h2->find_stream(stream_id)) s->state = Http2StreamState::Closed;
+}
+
+// Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
+// response (RFC 7540 §8.1.2.2). validate_response_header already blocks Connection
+// / Transfer-Encoding / Content-Length, but a route's response(headers:) set can
+// still carry keep-alive / proxy-connection / upgrade / te — drop those on the h2
+// path so a compliant client doesn't reject the response as malformed.
+inline bool h2_is_prohibited_response_header(const char* name, u32 len) {
+    return http_header_name_eq_ci(name, len, "connection", 10) ||
+           http_header_name_eq_ci(name, len, "keep-alive", 10) ||
+           http_header_name_eq_ci(name, len, "proxy-connection", 16) ||
+           http_header_name_eq_ci(name, len, "transfer-encoding", 17) ||
+           http_header_name_eq_ci(name, len, "upgrade", 7) ||
+           http_header_name_eq_ci(name, len, "te", 2);
+}
+
 template <typename Loop>
 void h2_emit_response(H2Dispatch<Loop>& d,
                       u32 stream_id,
@@ -65,6 +91,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     if (kN != 0) {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kN;
+        h2_close_stream(d.conn->h2, stream_id);
         return;
     }
     // The response didn't fit. If it isn't the first frame in the batch, or the
@@ -83,6 +110,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     else {
         d.conn->h2->hpack_enc = enc;
         d.resp_len += kFallback;
+        h2_close_stream(d.conn->h2, stream_id);
     }
 }
 
@@ -318,8 +346,15 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         o.response_headers_idx <= cfg->response_header_set_count) {
         const auto& ref = cfg->response_header_sets[o.response_headers_idx - 1];
         for (u16 i = 0; i < ref.count; i++) {
-            hdrs[nhdrs].name = {cfg->header_keys[ref.offset + i].data,
-                                cfg->header_keys[ref.offset + i].len};
+            const char* kn = cfg->header_keys[ref.offset + i].data;
+            const u32 kl = cfg->header_keys[ref.offset + i].len;
+            // Connection-specific fields are prohibited in HTTP/2 (RFC 7540
+            // §8.1.2.2) and make compliant clients treat the response as malformed.
+            // validate_response_header only reserves Connection/Transfer-Encoding/
+            // Content-Length, so keep-alive/proxy-connection/upgrade/te can still
+            // reach here from a route's response(headers:) set — drop them.
+            if (h2_is_prohibited_response_header(kn, kl)) continue;
+            hdrs[nhdrs].name = {kn, kl};
             hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
                                  cfg->header_values[ref.offset + i].len};
             nhdrs++;

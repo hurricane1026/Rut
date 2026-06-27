@@ -996,8 +996,15 @@ public:
                         conn.upstream_recv_cancel_inflight = false;
                         conn.upstream_recv_terminal_stale = false;
                         // A torn-down h2-proxy episode's recv terminal has now drained,
-                        // so the next episode may safely arm its own recv.
-                        conn.h2_proxy_recv_draining = false;
+                        // so the next episode may safely arm its own recv — but first
+                        // discard any stale positive bytes wait() copied into the buffer
+                        // before this terminal, or the next stream would parse them as its
+                        // own response. Gated on the flag so the normal recv path (which
+                        // delivers the real bytes below) is untouched.
+                        if (conn.h2_proxy_recv_draining) {
+                            conn.h2_proxy_recv_draining = false;
+                            conn.upstream_recv_buf.reset();
+                        }
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (conn.fd < 0) {
                             // Closed conn (e.g. the close-path cancel of an armed upstream
@@ -1059,8 +1066,16 @@ public:
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
                             conn.upstream_recv_terminal_stale = false;
-                            // A torn-down h2-proxy episode's recv terminal has now drained.
-                            conn.h2_proxy_recv_draining = false;
+                            // A torn-down h2-proxy episode's recv terminal has now drained;
+                            // discard any stale positive bytes it left so the next stream
+                            // can't parse them as its response. Gated on the flag so the
+                            // normal recv (delivered via dispatch_event below) is untouched
+                            // — for the draining case on_upstream_recv is null, so the
+                            // fall-through delivery is suppressed by the abandoned guard.
+                            if (conn.h2_proxy_recv_draining) {
+                                conn.h2_proxy_recv_draining = false;
+                                conn.upstream_recv_buf.reset();
+                            }
                             if (conn.fd < 0) {
                                 // Closed conn: reclaim if this was the last op (the break
                                 // below skips the generic pending_ops==0 reclaim).
