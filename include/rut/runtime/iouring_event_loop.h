@@ -995,6 +995,9 @@ public:
                         conn.upstream_recv_armed = false;
                         conn.upstream_recv_cancel_inflight = false;
                         conn.upstream_recv_terminal_stale = false;
+                        // A torn-down h2-proxy episode's recv terminal has now drained,
+                        // so the next episode may safely arm its own recv.
+                        conn.h2_proxy_recv_draining = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (conn.fd < 0) {
                             // Closed conn (e.g. the close-path cancel of an armed upstream
@@ -1041,7 +1044,12 @@ public:
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
-                        if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                        if (ev.type == IoEventType::UpstreamSend) {
+                            conn.upstream_send_armed = false;
+                            // A torn-down h2-proxy episode's request send has now drained, so
+                            // pending_synth is free again — lift the reuse quarantine.
+                            conn.h2_proxy_synth_quarantined = false;
+                        }
                         if (ev.type == IoEventType::UpstreamRecv) {
                             // Recv ended normally and is NOT stale (the stale case is handled
                             // and dropped above). If a pause cancel lost the race its own CQE
@@ -1051,6 +1059,8 @@ public:
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
                             conn.upstream_recv_terminal_stale = false;
+                            // A torn-down h2-proxy episode's recv terminal has now drained.
+                            conn.h2_proxy_recv_draining = false;
                             if (conn.fd < 0) {
                                 // Closed conn: reclaim if this was the last op (the break
                                 // below skips the generic pending_ops==0 reclaim).

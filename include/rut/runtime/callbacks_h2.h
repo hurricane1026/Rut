@@ -227,7 +227,9 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     Http2Conn* h2 = d.conn->h2;
     // One deferred request at a time, AND none while a wait/proxy stream is
     // suspended: both reuse pending_synth, so a second would corrupt the first.
-    if (h2->pending_stream != 0 || h2->async_stream != 0) {
+    // Also refuse while pending_synth is quarantined (a torn-down proxy episode's
+    // io_uring upstream send still sources it until its CQE drains).
+    if (h2->pending_stream != 0 || h2->async_stream != 0 || d.conn->h2_proxy_synth_quarantined) {
         h2_emit_status(d, stream_id, 503);
         return false;
     }
@@ -388,8 +390,10 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       u32 synth_len) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
-    // — both reuse pending_synth, so a second would corrupt the first's bytes.
-    if (h2->async_stream != 0 || h2->pending_stream != 0) return false;
+    // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
+    // while pending_synth is quarantined behind a draining io_uring upstream send.
+    if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
+        return false;
     // Pin the config epoch BEFORE storing cfg/route — a backpressured flush of the
     // suspending batch could otherwise let a hot reload reclaim them while parked.
     h2_async_epoch_enter(d.loop, *d.conn);
@@ -416,8 +420,10 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       u32 synth_len) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse while another stream is suspended OR a body-reading request is
-    // deferred — both reuse pending_synth (see h2_suspend_timer).
-    if (h2->async_stream != 0 || h2->pending_stream != 0) return false;
+    // deferred — both reuse pending_synth (see h2_suspend_timer) — OR while
+    // pending_synth is quarantined behind a draining io_uring upstream send.
+    if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
+        return false;
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);

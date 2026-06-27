@@ -1716,6 +1716,14 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
     conn.on_upstream_recv = nullptr;
     conn.on_upstream_send = nullptr;
     conn.upstream_abandoned = true;
+    // Record which in-flight upstream SQEs still reference connection state, so the
+    // NEXT episode waits for their CQEs to drain before reusing that state. The
+    // multishot recv shares the (conn_id, UpstreamRecv) user_data with the next
+    // episode's recv; the in-flight send still sources pending_synth. (Both are
+    // io_uring-only: epoll's recv/send complete synchronously, so neither flag is
+    // ever armed there.) close() doesn't cancel these SQEs — their CQEs still come.
+    if (conn.upstream_recv_armed) conn.h2_proxy_recv_draining = true;
+    if (conn.upstream_send_armed) conn.h2_proxy_synth_quarantined = true;
     if (conn.upstream_fd >= 0) {
         ::close(conn.upstream_fd);
         conn.upstream_fd = -1;
@@ -1966,6 +1974,16 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             h2_proxy_fail(loop, conn, 502);
         return;
     }
+    // Don't arm this episode's recv while a previous torn-down episode's multishot
+    // recv terminal is still in flight: it shares the (conn_id, UpstreamRecv)
+    // user_data, so installing on_upstream_response now would let that stale CQE be
+    // delivered to this stream. The terminal almost always drained during the
+    // connect+send above (it's accounted in dispatch, which clears the flag); if it
+    // somehow hasn't, fail this stream rather than risk misrouting (502, very rare).
+    if (conn.h2_proxy_recv_draining) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
     conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
     // On epoll, EPOLLIN stayed armed while a partial request send drained, so an
     // upstream that replied early may already have bytes in upstream_recv_buf.
@@ -2007,10 +2025,12 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // them as this upstream's response. The old fd is long closed, so its CQEs
     // have drained by the time this fresh connect completes.
     conn.upstream_recv_buf.reset();
-    // Same drain guarantee lets us drop the stale-CQE guard now: from here on, a
-    // negative UpstreamRecv terminal belongs to THIS upstream and should fail the
-    // stream rather than be ignored. (h2_proxy_begin deliberately left it set.)
-    conn.upstream_abandoned = false;
+    // upstream_abandoned stays set: the new episode's recv carries its own handler,
+    // so its CQEs are delivered regardless of the flag — the flag only suppresses
+    // NULL-handler (stale) terminals, which is always what we want for an h2 proxy.
+    // The h2_proxy_recv_draining guard (checked before arming the new recv in
+    // h2_on_upstream_request_sent) is what prevents a stale terminal from being
+    // misrouted to the new stream once its handler is installed.
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<Loop>);
     h2->async_synth_sent = 0;  // track partial sends (h2_on_upstream_request_sent)
     // submit_send_upstream can fail to queue (io_uring SQE exhaustion); without a
