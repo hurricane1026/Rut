@@ -16220,7 +16220,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Timer) continue;
-        if (item.timer.statements.len != 0)
+        if (item.timer.statement_count != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.timer.body_span);
         // Bound the timer count in the frontend (deterministic DSL capacity error)
         // rather than letting RouteConfig::add_timer reject the surplus at load time

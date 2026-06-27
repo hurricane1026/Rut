@@ -71,21 +71,31 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
 
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
-    if (mod.func_count > RouteConfig::kMaxRoutes) return false;
     if (mod.func_count > 0 && mod.functions == nullptr) return false;
 
+    // Count only HTTP routes — timer functions are fired on a schedule, not matched
+    // against request paths. Including them would (a) overflow the kMaxRoutes-sized
+    // paths[] when func_count exceeds kMaxRoutes (routes + timers can reach
+    // kMaxRoutes + kMaxTimers), and (b) let a timer name influence trie selection.
     Str paths[RouteConfig::kMaxRoutes];
+    u32 route_count = 0;
     for (u32 i = 0; i < mod.func_count; i++) {
-        paths[i] = mod.functions[i].route_pattern;
-        if (paths[i].len > 0 && paths[i].ptr == nullptr) return false;
+        if (mod.functions[i].is_timer) continue;
+        if (route_count >= RouteConfig::kMaxRoutes) return false;
+        paths[route_count] = mod.functions[i].route_pattern;
+        if (paths[route_count].len > 0 && paths[route_count].ptr == nullptr) return false;
+        route_count++;
     }
 
-    if (needs_segment_aware(paths, mod.func_count)) return cfg.use_segment_trie();
+    if (needs_segment_aware(paths, route_count)) return cfg.use_segment_trie();
     return cfg.use_art();
 }
 
 inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine) {
-    if (cfg.route_count != 0) return false;
+    // Guard on BOTH tables: a timer-only module never bumps route_count, so a
+    // route_count-only precondition would let a second call re-append the same
+    // timers (firing them twice per interval).
+    if (cfg.route_count != 0 || cfg.timer_count != 0) return false;
     if (!configure_route_dispatch(cfg, mod)) return false;
 
     for (u32 i = 0; i < mod.func_count; i++) {

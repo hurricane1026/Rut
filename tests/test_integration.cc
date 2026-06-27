@@ -1095,6 +1095,45 @@ TEST(timer_dsl, compiles_to_timer_function) {
     rir.destroy();
 }
 
+// register_jit_routes must (a) keep a timer out of the route table / dispatch (a
+// timer function is fired on schedule, not matched against request paths) and
+// (b) refuse a second registration even for a timer-only config. A timer-only
+// module never bumps route_count, so the precondition gates on timer_count too —
+// otherwise the same timer is appended twice and fires doubly per interval.
+TEST(timer_dsl, registration_idempotent_for_timer_only) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s { }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    RouteConfig cfg{};
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    CHECK_EQ(cfg.route_count, 0u);  // a timer is NOT registered as a route
+    CHECK_EQ(cfg.timer_count, 1u);
+    // A second call must be refused — otherwise the timer is appended again.
+    CHECK(!register_jit_routes(cfg, rir.module, engine));
+    CHECK_EQ(cfg.timer_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 // A non-empty timer body is rejected for now (executing it needs the route-body
 // analysis factored out — slice 1 only schedules the no-op handler).
 TEST(timer_dsl, rejects_non_empty_body) {

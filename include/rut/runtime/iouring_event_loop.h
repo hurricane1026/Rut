@@ -215,6 +215,8 @@ public:
             reclaim_pending();
             retry_deferred_accepts();
             poll_command();
+            // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
+            this->fire_due_timers();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 u64 start = drain_start_.load(std::memory_order_relaxed);

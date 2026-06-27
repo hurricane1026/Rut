@@ -306,6 +306,12 @@ public:
                 dispatch(events[i]);
             }
             poll_command();
+            // poll_command may have installed a new config (hot reload); re-arm
+            // timers now so a freshly activated `every: D` measures from the reload
+            // rather than waiting for the next 1s tick to notice (and then another
+            // interval before it actually fires). Cheap no-op when the config is
+            // unchanged (fire_due_timers compares the armed config pointer).
+            this->fire_due_timers();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 u64 start = drain_start_.load(std::memory_order_relaxed);

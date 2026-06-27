@@ -479,8 +479,13 @@ struct AstTimerDecl {
     Span body_span{};
     Str name{};
     u32 interval_ms = 0;
-    static constexpr u32 kMaxStatements = 16;
-    FixedVec<AstStatement, kMaxStatements> statements;
+    // Slice 1 rejects any non-empty timer body (no execution yet), so the parser
+    // only needs to know whether the body had statements — it does NOT store them.
+    // Storing a FixedVec<AstStatement, N> here (AstStatement is large, and AstItem
+    // inlines every decl kind) bloated the parser's per-item stack frame enough to
+    // overflow on the recursive-import path under clang Debug / ASan. When body
+    // execution lands, lift the statements into an out-of-line pool, not inline.
+    u32 statement_count = 0;
 };
 
 struct AstItem {
