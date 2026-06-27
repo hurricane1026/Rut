@@ -432,7 +432,11 @@ struct MirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxStructs = 64;
     static constexpr u32 kMaxVariants = 32;
-    static constexpr u32 kMaxFunctions = 96;
+    // One MirFunction per HIR route, INCLUDING synthesized timer routes, so this
+    // must cover HirModule::kMaxRoutes + kMaxTimers (kept in sync by a static_assert
+    // in mir_build.cc). Otherwise a config near the route cap plus timers analyzes
+    // but fails MIR lowering with TooManyItems.
+    static constexpr u32 kMaxFunctions = 112;  // 96 routes + 16 timers
     static constexpr u32 kMaxTypeShapes = 256;
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;

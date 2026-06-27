@@ -4,6 +4,13 @@
 
 namespace rut {
 
+// build_mir lowers one MirFunction per HIR route, including synthesized timer
+// routes (analyze.cc reserves kMaxRoutes + kMaxTimers HIR route slots). The MIR
+// function table must hold all of them, or a config near the route cap plus timers
+// would lower into TooManyItems after passing analysis.
+static_assert(MirModule::kMaxFunctions >= HirModule::kMaxRoutes + HirModule::kMaxTimers,
+              "MIR function capacity must cover all HIR routes plus timers");
+
 namespace {
 
 static Str entry_label() {
