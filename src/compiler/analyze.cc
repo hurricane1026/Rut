@@ -16203,6 +16203,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
 
+        // Cap HTTP routes at kMaxRoutes even though the routes vector reserves extra
+        // slots for synthesized timers — a timer must never consume HTTP capacity.
+        if (mod.routes.len >= HirModule::kMaxRoutes)
+            return frontend_error(FrontendError::TooManyItems, item.route.span);
         if (!mod.routes.push(route))
             return frontend_error(FrontendError::TooManyItems, item.route.span);
     }
@@ -16212,11 +16216,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
     // not routes[]). Slice 1 emits a no-op handler (returns 200, which the timer
     // path ignores); executing the body needs the route-body analysis factored
     // out, so a non-empty body is rejected for now rather than silently dropped.
+    u32 timer_count = 0;
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Timer) continue;
         if (item.timer.statements.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, item.timer.body_span);
+        // Bound the timer count in the frontend (deterministic DSL capacity error)
+        // rather than letting RouteConfig::add_timer reject the surplus at load time
+        // (a generic runtime failure). kMaxTimers mirrors RouteConfig::kMaxTimers.
+        if (timer_count >= HirModule::kMaxTimers)
+            return frontend_error(FrontendError::TooManyItems, item.timer.span);
+        timer_count++;
         HirRoute route{};
         route.span = item.timer.span;
         route.path = item.timer.name;  // timer name (not an HTTP path)

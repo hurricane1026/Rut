@@ -1205,6 +1205,13 @@ struct HirModule {
     static constexpr u32 kMaxConformances = 64;
     static constexpr u32 kMaxImpls = 64;
     static constexpr u32 kMaxRoutes = 96;
+    // Timers compile to routes (is_timer flag) to reuse route→MIR→codegen, but are
+    // registered into RouteConfig.timers[] (a separate kMaxTimers table) at load,
+    // so they must NOT consume HTTP-route capacity. The routes vector is sized to
+    // hold both; analyze.cc caps HTTP routes at kMaxRoutes and timers at kMaxTimers
+    // independently. kMaxTimers must match RouteConfig::kMaxTimers (static_assert in
+    // compile_to_config.h).
+    static constexpr u32 kMaxTimers = 16;
     static constexpr u32 kMaxGuardMatchArms = 64;
     static constexpr u32 kMaxTypeShapes = 512;
 
@@ -1220,7 +1227,8 @@ struct HirModule {
     FixedVec<HirConformance, kMaxConformances> conformances;
     FixedVec<HirImpl, kMaxImpls> impls;
     FixedVec<HirGuardMatchArm, kMaxGuardMatchArms> guard_match_arms;
-    FixedVec<HirRoute, kMaxRoutes> routes;
+    // Holds HTTP routes (≤kMaxRoutes) plus synthesized timer routes (≤kMaxTimers).
+    FixedVec<HirRoute, kMaxRoutes + kMaxTimers> routes;
     FixedVec<HirTypeShape, kMaxTypeShapes> type_shapes;
     std::deque<std::string> owned_strings;
     bool has_package_decl = false;

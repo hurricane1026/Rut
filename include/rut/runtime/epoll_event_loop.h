@@ -207,15 +207,9 @@ public:
     u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
 
-    // Background timers (`timer name, every: D {...}`). Per-timer next-fire
-    // deadline + fire count, driven by the 1s keepalive tick (slice 1 effectively
-    // runs at >=1s granularity). timer_fire_count is exposed for tests.
-    u64 timer_deadline_ns[RouteConfig::kMaxTimers]{};
-    u32 timer_fire_count[RouteConfig::kMaxTimers]{};
-    // The config whose timer deadlines are currently armed. Re-armed whenever the
-    // active config changes (incl. a hot reload swapping *config_ptr), so a new
-    // timer set measures `every: D` from activation, not from stale deadlines.
-    const RouteConfig* timer_armed_config = nullptr;
+    // Background timers (`timer name, every: D`) are scheduled by the shared
+    // EventLoopCRTP base (fire_due_timers + timer_deadline_ns/timer_fire_count),
+    // so both backends drive them.
     TlsServerContext* tls_server = nullptr;
 
     AccessLogRing* access_log = nullptr;
@@ -303,7 +297,7 @@ public:
         backend.add_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
-        fire_due_timers();
+        this->fire_due_timers();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
@@ -664,42 +658,7 @@ public:
         rearm_yield_timerfd();
     }
 
-    // Fire any background timer whose interval has elapsed. Called from the 1s
-    // keepalive tick, so timers run at ~1s granularity (slice 1). Timer bodies are
-    // currently no-op handlers (return a status the timer path ignores); this
-    // drives the schedule + compiled-handler invocation with no Connection/Request.
-    void fire_due_timers() {
-        const RouteConfig* cfg = config_ptr ? *config_ptr : nullptr;
-        const u64 now = epoll_yield::monotonic_ns();
-        // (Re)arm deadlines whenever the active config changes — first install or a
-        // hot reload — so each timer's interval is measured from activation rather
-        // than reusing the old config's deadlines (or a zero deadline for a newly
-        // added slot, which would fire on the next tick instead of after `every`).
-        if (cfg != timer_armed_config) {
-            timer_armed_config = cfg;
-            if (cfg != nullptr) {
-                const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
-                                                                         : RouteConfig::kMaxTimers;
-                for (u32 i = 0; i < m; i++)
-                    timer_deadline_ns[i] =
-                        now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
-            }
-            return;
-        }
-        if (cfg == nullptr || cfg->timer_count == 0) return;
-        const u32 n =
-            cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
-        for (u32 i = 0; i < n; i++) {
-            if (now < timer_deadline_ns[i]) continue;
-            jit::HandlerCtx ctx{};
-            (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
-            timer_fire_count[i]++;
-            // Reschedule from now (not the missed deadline) to avoid a catch-up
-            // burst after a long stall.
-            timer_deadline_ns[i] =
-                now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
-        }
-    }
+    // fire_due_timers() is provided by the shared EventLoopCRTP base.
 
     // --- Dispatch ---
 
@@ -747,7 +706,7 @@ public:
                         }
                     });
                 }
-                fire_due_timers();
+                this->fire_due_timers();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

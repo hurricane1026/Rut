@@ -43,12 +43,19 @@
 // `cfg` may have been partially populated, so callers should discard
 // it rather than try to reuse it.
 
+#include "rut/compiler/hir.h"  // HirModule::kMaxTimers (frontend timer cap)
 #include "rut/compiler/rir.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
+
+// The frontend (analyze.cc) caps declared timers at HirModule::kMaxTimers so a
+// surplus is a deterministic DSL error; that cap must fit the runtime table, or
+// RouteConfig::add_timer would still reject the overflow at load time.
+static_assert(HirModule::kMaxTimers <= RouteConfig::kMaxTimers,
+              "frontend timer cap must not exceed the runtime timer table");
 
 inline bool rir_function_needs_req_body(const rir::Function& fn) {
     if (fn.blocks == nullptr) return false;

@@ -1109,6 +1109,37 @@ TEST(timer_dsl, rejects_non_empty_body) {
     CHECK(!hir);  // analyze rejects a non-empty timer body
 }
 
+// Timers don't consume HTTP-route capacity: the routes vector is sized
+// kMaxRoutes + kMaxTimers, and analyze.cc caps HTTP routes at kMaxRoutes
+// independently of timers. A full-route-table boundary test isn't expressible in
+// source (96 brace-routes exceed the 512-token lexer cap), so this asserts the
+// structural headroom that makes the independence hold.
+TEST(timer_dsl, timers_have_dedicated_route_headroom) {
+    using namespace rut;
+    auto mod = std::make_unique<HirModule>();  // HirModule is too large for the stack
+    const u32 cap = sizeof(mod->routes.data) / sizeof(mod->routes.data[0]);
+    CHECK_EQ(cap, HirModule::kMaxRoutes + HirModule::kMaxTimers);
+}
+
+// Declaring more than kMaxTimers timers is a deterministic frontend error, not a
+// generic runtime load failure in RouteConfig::add_timer.
+TEST(timer_dsl, rejects_more_than_max_timers) {
+    using namespace rut;
+    std::string src;
+    for (u32 i = 0; i < HirModule::kMaxTimers + 1; i++) {
+        src += "timer t";
+        src += std::to_string(i);
+        src += ", every: 1s { }\n";
+    }
+    auto lexed = lex(Str{src.c_str(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    CHECK(!hir);  // >kMaxTimers rejected in the frontend, before JIT/config
+}
+
 // A captureless probe used as a timer handler: the event loop should invoke it
 // each time the timer's interval elapses.
 static rut::u32 g_timer_probe_calls = 0;
@@ -1131,6 +1162,28 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->fire_due_timers();  // first call arms the deadline (now + 1ms)
     CHECK_EQ(loop->timer_fire_count[0], 0u);
     usleep(5000);             // exceed the 1ms interval
+    loop->fire_due_timers();  // now due → fire
+    CHECK_GE(loop->timer_fire_count[0], 1u);
+    CHECK_GE(g_timer_probe_calls, 1u);
+}
+
+// The same scheduler must drive timers on the io_uring backend: main.cc prefers
+// io_uring when available, so a timer wired only into epoll would never fire on
+// the default host. fire_due_timers() lives in the shared CRTP base; this checks
+// the io_uring loop inherits it. (No io_uring init needed — the method is pure
+// scheduling over config_ptr.)
+TEST(timer, io_uring_loop_fires_due_timer) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_probe_fn));
+    auto loop = std::make_unique<IoUringEventLoop>();
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    g_timer_probe_calls = 0;
+
+    loop->fire_due_timers();  // arm
+    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    usleep(5000);
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
