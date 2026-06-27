@@ -1100,6 +1100,8 @@ TEST(timer_dsl, compiles_to_timer_function) {
 // (b) refuse a second registration even for a timer-only config. A timer-only
 // module never bumps route_count, so the precondition gates on timer_count too —
 // otherwise the same timer is appended twice and fires doubly per interval.
+// Uses the JIT engine, so it's gated like the other compile→JIT→register tests.
+#if RUT_ENABLE_JIT_TESTS
 TEST(timer_dsl, registration_idempotent_for_timer_only) {
     using namespace rut;
     const char* src = "timer t, every: 1s { }\n";
@@ -1133,6 +1135,7 @@ TEST(timer_dsl, registration_idempotent_for_timer_only) {
     engine.shutdown();
     rir.destroy();
 }
+#endif  // RUT_ENABLE_JIT_TESTS
 
 // A non-empty timer body is rejected for now (executing it needs the route-body
 // analysis factored out — slice 1 only schedules the no-op handler).
