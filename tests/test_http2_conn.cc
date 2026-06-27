@@ -970,6 +970,35 @@ TEST(http2_conn, write_response_rejects_oversized_headers) {
     CHECK_EQ(n, 0u);  // refused, not overflowed
 }
 
+// A header name too long to lowercase in http2_write_response's stack buffer must
+// be rejected (return 0 → the proxy answers 502) if it contains uppercase, rather
+// than forwarding an invalid uppercase HTTP/2 name. An all-lowercase long name is
+// still forwarded.
+TEST(http2_conn, write_response_rejects_long_uppercase_name) {
+    static char longname[300];
+    for (char& c : longname) c = 'x';
+    const char val[] = "v";
+    // All-lowercase long name: accepted (non-zero).
+    {
+        hpack::Encoder enc;
+        enc.init(4096);
+        const hpack::Header hdrs[] = {{{longname, sizeof(longname)}, {val, 1}}};
+        u8 out[1024];
+        u32 n = http2_write_response(out, sizeof(out), enc, 1, 200, hdrs, 1, nullptr, 0);
+        CHECK(n != 0u);
+    }
+    // One uppercase byte in the over-long name: rejected (0).
+    {
+        longname[100] = 'X';
+        hpack::Encoder enc;
+        enc.init(4096);
+        const hpack::Header hdrs[] = {{{longname, sizeof(longname)}, {val, 1}}};
+        u8 out[1024];
+        u32 n = http2_write_response(out, sizeof(out), enc, 1, 200, hdrs, 1, nullptr, 0);
+        CHECK_EQ(n, 0u);
+    }
+}
+
 // Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
 // more frames. Helper to reduce boilerplate in the branch tests below.
 namespace {

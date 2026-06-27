@@ -1952,6 +1952,20 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
+    // io_uring sends can complete short (full socket send buffer, large synthesized
+    // header block). Treating a prefix as the whole request makes the backend stall
+    // or parse a truncated request → the stream times out. Resubmit the remainder
+    // until the full request is written, then read the response.
+    Http2Conn* h2 = conn.h2;
+    h2->async_synth_sent += static_cast<u32>(ev.result);
+    if (h2->async_synth_sent < h2->async_synth_len) {
+        // Slot is still h2_on_upstream_request_sent, so the next send CQE re-enters.
+        if (!loop->submit_send_upstream(conn,
+                                        h2->pending_synth + h2->async_synth_sent,
+                                        h2->async_synth_len - h2->async_synth_sent))
+            h2_proxy_fail(loop, conn, 502);
+        return;
+    }
     conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
     // On epoll, EPOLLIN stayed armed while a partial request send drained, so an
     // upstream that replied early may already have bytes in upstream_recv_buf.
@@ -1998,6 +2012,7 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // stream rather than be ignored. (h2_proxy_begin deliberately left it set.)
     conn.upstream_abandoned = false;
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_request_sent<Loop>);
+    h2->async_synth_sent = 0;  // track partial sends (h2_on_upstream_request_sent)
     // submit_send_upstream can fail to queue (io_uring SQE exhaustion); without a
     // completion the stream would park forever, so fail closed like a bad connect.
     if (!loop->submit_send_upstream(conn, h2->pending_synth, h2->async_synth_len))

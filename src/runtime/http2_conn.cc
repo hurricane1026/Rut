@@ -53,6 +53,7 @@ void Http2Conn::init() {
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;
     async_synth_len = 0;
+    async_synth_sent = 0;
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;
@@ -182,8 +183,8 @@ u32 http2_write_response(u8* out,
             sizeof(hblock))
             return 0;
         // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
-        // config may hold mixed case (HTTP/1 tolerates it). Lowercase into a
-        // small buffer before encoding.
+        // config (or a proxied upstream) may hold mixed case (HTTP/1 tolerates it).
+        // Lowercase into a small buffer before encoding.
         char lname[256];
         Str name = hdrs[i].name;
         if (name.len <= sizeof(lname)) {
@@ -192,6 +193,15 @@ u32 http2_write_response(u8* out,
                 lname[j] = (kC >= 'A' && kC <= 'Z') ? static_cast<char>(kC - 'A' + 'a') : kC;
             }
             name = Str{lname, name.len};
+        } else {
+            // Too long to lowercase in our buffer. Forwarding it verbatim would emit
+            // an uppercase (invalid) HTTP/2 name, so reject the response (→ 502)
+            // unless it's already all-lowercase. A >256-byte field name is
+            // pathological regardless.
+            for (u32 j = 0; j < name.len; j++) {
+                const char kC = name.ptr[j];
+                if (kC >= 'A' && kC <= 'Z') return 0;
+            }
         }
         hb += enc.encode(hblock + hb, name, hdrs[i].value);
     }
