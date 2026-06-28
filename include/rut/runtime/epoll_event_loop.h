@@ -21,6 +21,7 @@
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls.h"
 #include "rut/runtime/upstream_concurrency.h"
+#include "rut/runtime/upstream_pool.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -246,6 +247,9 @@ public:
     // aggregate across shards. Null → endpoint disabled (the default).
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
+    // Per-shard idle upstream connection pool (HTTP/1 keep-alive reuse). Wired by
+    // the shard; null in tests/mocks that don't exercise reuse.
+    UpstreamPool* upstream = nullptr;
 
     const RouteConfig** config_ptr = nullptr;
     ShardControlBlock* control = nullptr;
@@ -385,6 +389,39 @@ public:
     // Clear upstream fd mapping (call when upstream_fd is closed on keep-alive).
     void clear_upstream_fd(u32 conn_id) {
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
+    }
+
+    // --- HTTP/1 idle upstream connection reuse (per-shard pool) ---
+
+    // Borrow a live, connected upstream socket to `endpoint` (upstream_id,
+    // backend_idx) from the idle pool, skipping the TCP connect. On a hit, install
+    // it as conn.upstream_fd and route this conn's upstream completions to it.
+    // Returns false (no live idle socket) → caller connects fresh. epoll is
+    // synchronous, so detach/reattach is a plain EPOLL_CTL_DEL/ADD pair.
+    bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
+        if (!upstream) return false;
+        const i32 fd = upstream->take_idle(upstream_id, backend_idx);
+        if (fd < 0) return false;
+        c.upstream_fd = fd;
+        if (c.id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[c.id] = fd;
+        return true;
+    }
+
+    // Return conn.upstream_fd to the idle pool for a later request to the same
+    // endpoint instead of closing it. Fully detaches the fd from epoll first
+    // (EPOLL_CTL_DEL + clear send state + clear the fd↔conn map) so no stale event
+    // can fire on it while it's parked. Closes the fd if the pool is full. The
+    // caller has verified both sides are keep-alive and the response framed cleanly.
+    void return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
+        const i32 fd = c.upstream_fd;
+        if (fd < 0 || !upstream) return;                // no pool wired → caller closes the fd
+        backend.clear_send_state(c.id);                 // ensure no pending send
+        backend.quiesce_recv(c.id, /*upstream=*/true);  // EPOLL_CTL_DEL, keep the fd
+        clear_upstream_fd(c.id);                        // drop fd↔conn routing
+        c.upstream_fd = -1;
+        c.upstream_recv_armed = false;
+        c.upstream_send_armed = false;
+        if (!upstream->put_idle(fd, upstream_id, backend_idx)) ::close(fd);
     }
 
     // Drop any partial/EAGAIN upstream request send still buffered for this

@@ -374,6 +374,32 @@ void release_upstream_slot(Loop* loop, Connection& conn) {
     }
 }
 
+// Release conn.upstream_fd at proxy completion: hand it to the per-shard idle pool
+// for reuse when the upstream connection is keep-alive + self-framed (and wasn't
+// abandoned on timeout), otherwise close it. Either way conn.upstream_fd ends as -1
+// and the fd↔conn routing / armed flags are cleared. The loop's return_idle_upstream
+// (epoll today; io_uring via the deferred-drain path) detaches the fd from the I/O
+// backend before parking it; loops without that method just close (no reuse).
+template <typename Loop>
+void release_upstream_conn(Loop* loop, Connection& conn) {
+    if (conn.upstream_fd >= 0 && conn.upstream_keep_alive && !conn.upstream_abandoned) {
+        if constexpr (requires {
+                          loop->return_idle_upstream(
+                              conn, conn.upstream_idx, conn.upstream_backend_idx);
+                      }) {
+            loop->return_idle_upstream(conn, conn.upstream_idx, conn.upstream_backend_idx);
+            if (conn.upstream_fd < 0) return;  // parked (or closed) + cleared by the loop
+        }
+    }
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    loop->clear_upstream_fd(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+}
+
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
@@ -527,6 +553,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_override_overflow = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
+    conn.upstream_keep_alive = false;
+    conn.upstream_reused = false;
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
@@ -684,6 +712,33 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_name[target.name_len] = '\0';
         else
             conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+        conn.upstream_idx = route->upstream_id;
+        // (terminate-mode config is set unconditionally above, for every request)
+        conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
+        conn.upstream_start_us = monotonic_us();
+        const u32 kBackend =
+            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+        conn.upstream_backend_idx = static_cast<u8>(kBackend);
+
+        // Idle reuse: borrow a live keep-alive socket to this endpoint from the
+        // per-shard pool and skip the TCP connect, driving the post-connect path
+        // directly with a synthetic success. On a miss, fall through to a fresh
+        // connect. `upstream_reused` lets a send/recv failure before any response
+        // byte fall back to a fresh connect (idempotent methods only).
+        if constexpr (requires {
+                          loop->reuse_idle_upstream(
+                              conn, route->upstream_id, static_cast<u8>(kBackend));
+                      }) {
+            if (loop->reuse_idle_upstream(conn, route->upstream_id, static_cast<u8>(kBackend))) {
+                conn.upstream_reused = true;
+                on_upstream_connected<Loop>(
+                    static_cast<void*>(loop),
+                    conn,
+                    IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+                return;
+            }
+        }
+
         const i32 kUpstreamFd = UpstreamPool::create_socket();
         if (kUpstreamFd < 0) {
             conn.resp_status = kStatusBadGateway;
@@ -694,14 +749,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.upstream_fd = kUpstreamFd;
-        conn.upstream_idx = route->upstream_id;
-        // (terminate-mode config is set unconditionally above, for every request)
-        conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
-        conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-        const u32 kBackend =
-            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
-        conn.upstream_backend_idx = static_cast<u8>(kBackend);
         if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
@@ -2541,13 +2589,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
+    release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
     if (!conn.keep_alive || loop->is_draining()) {
         loop->close_conn(conn);
@@ -3713,6 +3755,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_body_remaining = 0;
     }
 
+    // Decide upstream idle-reuse eligibility now, while the parsed response is in
+    // hand: reusable iff the upstream wants keep-alive and the body is self-framed
+    // (None / Content-Length / chunked). A close-delimited (UntilClose) body ends
+    // by the upstream closing the socket, so its fd is never reusable. The
+    // completion path reads this flag to pool the fd vs. close it.
+    conn.upstream_keep_alive =
+        resp.keep_alive && !resp.connection_close && conn.resp_body_mode != BodyMode::UntilClose;
+
     const u32 kHeaderLen = resp_parser.header_end;
     const u32 kTotalLen = conn.upstream_recv_buf.len();
     const u32 kInitialBodyLen = (kTotalLen > kHeaderLen) ? kTotalLen - kHeaderLen : 0;
@@ -3888,13 +3938,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.upstream_recv_buf.reset();
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
+    release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;

@@ -22,6 +22,7 @@
 #include "rut/runtime/tls.h"
 #include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
+#include "rut/runtime/upstream_pool.h"
 #include <atomic>
 
 #include <netinet/in.h>
@@ -150,6 +151,9 @@ public:
     // aggregate across shards. Null → endpoint disabled (the default).
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
+    // Per-shard idle upstream connection pool (HTTP/1 keep-alive reuse). Wired by
+    // the shard; null in tests/mocks that don't exercise reuse.
+    UpstreamPool* upstream = nullptr;
 
     const RouteConfig** config_ptr = nullptr;
     ShardControlBlock* control = nullptr;

@@ -123,6 +123,14 @@ struct ConnectionBase {
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    // HTTP/1 idle upstream reuse: `upstream_keep_alive` is set when the upstream
+    // response is parsed iff its connection may be reused (keep-alive, not
+    // close-delimited) — the completion path then returns the fd to the per-shard
+    // idle pool instead of closing it. `upstream_reused` marks a request whose
+    // upstream socket came from that pool, so a send/recv failure before any
+    // response byte can fall back to a fresh connect (idempotent methods only).
+    bool upstream_keep_alive;
+    bool upstream_reused;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -486,6 +494,8 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
+        upstream_keep_alive = false;
+        upstream_reused = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
