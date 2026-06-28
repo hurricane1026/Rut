@@ -1962,6 +1962,18 @@ template <typename Loop>
 void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result < 0) {
+        // On epoll the backend can reply early (e.g. an error response) and close
+        // before our request finishes draining, so the send completes negative even
+        // though a complete response is already buffered. Reframe it — as the HTTP/1
+        // proxy does — rather than masking it with a synthetic 502. An EOF-signalling
+        // event (result 0) makes h2_on_upstream_response serve a complete response or
+        // 502 a truncated one; it never re-arms a recv on the now-dead fd.
+        if (conn.upstream_recv_buf.len() > 0) {
+            conn.set_slots(nullptr, nullptr, &h2_on_upstream_response<Loop>, nullptr);
+            IoEvent eof{conn.id, 0, 0, 0, IoEventType::UpstreamRecv, 0};
+            h2_on_upstream_response<Loop>(lp, conn, eof);
+            return;
+        }
         h2_proxy_fail(loop, conn, 502);
         return;
     }

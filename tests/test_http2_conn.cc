@@ -669,6 +669,43 @@ TEST(h2_request, unknown_pseudo_header_rejected) {
     CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
 }
 
+TEST(h2_proxy_forwardable, accepts_well_formed_request) {
+    hpack::Header ok[] = {{{":method", 7}, {"GET", 3}},
+                          {{":scheme", 7}, {"http", 4}},
+                          {{":path", 5}, {"/", 1}},
+                          {{":authority", 10}, {"x", 1}}};
+    CHECK(h2_proxy_request_forwardable(ok, 4));
+}
+
+TEST(h2_proxy_forwardable, rejects_missing_scheme) {
+    // :method + :path + :authority but no :scheme — fine for a local handler,
+    // malformed to forward upstream.
+    hpack::Header no_scheme[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{":authority", 10}, {"x", 1}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(no_scheme, 3));
+}
+
+TEST(h2_proxy_forwardable, rejects_ambiguous_host_without_authority) {
+    // No :authority and two regular host fields would synthesize duplicate Host
+    // headers upstream.
+    hpack::Header dup_host[] = {{{":method", 7}, {"GET", 3}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/", 1}},
+                                {{"host", 4}, {"a", 1}},
+                                {{"host", 4}, {"b", 1}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(dup_host, 5));
+    // A single host field (no authority) is unambiguous.
+    CHECK(h2_proxy_request_forwardable(dup_host, 4));
+    // With :authority, regular host fields are dropped by synth → not ambiguous.
+    hpack::Header auth_plus_host[] = {{{":method", 7}, {"GET", 3}},
+                                      {{":scheme", 7}, {"http", 4}},
+                                      {{":path", 5}, {"/", 1}},
+                                      {{":authority", 10}, {"x", 1}},
+                                      {{"host", 4}, {"a", 1}},
+                                      {{"host", 4}, {"b", 1}}};
+    CHECK(h2_proxy_request_forwardable(auth_plus_host, 6));
+}
+
 // Write a raw frame (header + payload) into out; return bytes written.
 namespace {
 u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 plen) {

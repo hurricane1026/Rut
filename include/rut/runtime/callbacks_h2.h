@@ -190,6 +190,35 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     return o;
 }
 
+// Extra validation for an h2 request about to be forwarded upstream as HTTP/1.1.
+// h2_headers_to_request already enforced the core pseudo-header rules, but two
+// hazards are harmless for a local handler yet corrupt a *forwarded* HTTP/1.1
+// request, so gate them only on the proxy path:
+//   1. Missing :scheme — RFC 7540 §8.1.2.3 makes it mandatory for non-CONNECT
+//      requests; h2_headers_to_request tracks but doesn't require it (CONNECT and
+//      synthetic local requests legitimately omit it), so a scheme-less proxy
+//      request would otherwise reach the upstream.
+//   2. Ambiguous Host — with no :authority, two regular `host` fields would
+//      synthesize duplicate Host headers upstream. (When :authority is present
+//      h2_synth_h1_request drops every regular host, so that case is already safe.)
+// Returns false to reject (→ 400) before opening the upstream.
+inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
+    bool have_scheme = false;
+    bool have_authority = false;
+    u32 host_fields = 0;
+    for (u32 i = 0; i < n; i++) {
+        if (hs[i].name.eq(Str{":scheme", 7}))
+            have_scheme = true;
+        else if (hs[i].name.eq(Str{":authority", 10}))
+            have_authority = true;
+        else if (hs[i].name.len > 0 && hs[i].name.ptr[0] != ':' && hs[i].name.eq(Str{"host", 4}))
+            host_fields++;
+    }
+    if (!have_scheme) return false;
+    if (!have_authority && host_fields > 1) return false;
+    return true;
+}
+
 inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_stream = 0;
     h2.pending_body_start = 0;
@@ -771,6 +800,12 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // No-body proxy: park the stream and forward to the h1 upstream,
             // re-framing its response into h2 (h2_proxy_begin, after flush).
             {
+                // Reject requests that would forward a malformed/ambiguous HTTP/1.1
+                // request upstream (missing :scheme, duplicate Host) before opening it.
+                if (!h2_proxy_request_forwardable(headers, nheaders)) {
+                    h2_emit_status(d, stream_id, 400);
+                    return;
+                }
                 u8 synth[Http2Conn::kBodySynthCap];
                 const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
                 if (kSynthLen == 0) {
