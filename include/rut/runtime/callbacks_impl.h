@@ -1480,7 +1480,7 @@ inline void rewrite_request_line_path(Connection& conn) {
 inline bool apply_request_header_overrides(Connection& conn) {
     if (conn.req_header_override_count == 0) return true;
     u8* buf = conn.recv_slice;
-    if (buf == nullptr) return true;
+    if (buf == nullptr) return false;  // overrides recorded but no buffer → fail closed
 
     // In-place splice: replace buf[pos, pos+old_span) with "Name: Value\r\n"
     // (write_line) or with nothing (deletion of a duplicate). Adjusts the buffer
@@ -1548,13 +1548,40 @@ inline bool apply_request_header_overrides(Connection& conn) {
         return false;
     };
 
+    // Bytes that lie inside recv_buf's storage. A recorded value (or name) pointing
+    // here — e.g. a request-derived value recorded straight through RIR — would be
+    // shifted/overwritten by the in-place rewrite below before it's serialized, so
+    // we can't apply it safely and must fail closed rather than forward a corrupted
+    // header. (DSL set_header values are string literals in stable JIT constant
+    // memory, so they never alias recv_buf and this never trips for compiled .rut.)
+    const uintptr_t kBufLo = reinterpret_cast<uintptr_t>(buf);
+    const uintptr_t kBufHi = kBufLo + conn.recv_buf.capacity();
+    auto aliases_recv_buf = [&](const Str& s) {
+        if (s.ptr == nullptr) return false;
+        const uintptr_t p = reinterpret_cast<uintptr_t>(s.ptr);
+        return p < kBufHi && p + s.len > kBufLo;
+    };
+
     for (u32 oi = 0; oi < conn.req_header_override_count; oi++) {
         const Str name = conn.req_header_overrides[oi].name;
         const Str val = conn.req_header_overrides[oi].value;
-        if (name.len == 0) continue;
+        // Validate at the choke point before any byte reaches the wire. The DSL
+        // parser already validates literals at compile time, but overrides recorded
+        // directly through RIR are otherwise unchecked — an empty/non-tchar name, a
+        // value carrying CR/LF or other control bytes (header injection), or a
+        // reserved framing name (Content-Length/Transfer-Encoding/Connection) must
+        // fail the request closed, never be forwarded.
+        if (validate_response_header(name.ptr, name.len, val.ptr, val.len) !=
+            HttpHeaderValidation::Ok)
+            return false;
+        if (aliases_recv_buf(name) || aliases_recv_buf(val)) return false;
+
         const u32 total = conn.recv_buf.len();
         const u32 hend = conn.req_header_end;
-        if (hend < 4 || hend > total) continue;  // no usable header block to edit
+        // A configured override must be applied; if the request has no usable parsed
+        // header block (e.g. a lenient request line that set no req_header_end) we
+        // can't place it, so fail closed instead of forwarding without it.
+        if (hend < 4 || hend > total) return false;
 
         const u32 line_len = name.len + 2 + val.len + 2;
         u32 fs = 0, fe = 0, search_from = 0;

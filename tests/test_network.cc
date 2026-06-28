@@ -165,6 +165,65 @@ TEST(set_header, fails_closed_when_override_cannot_fit) {
     CHECK_EQ(c->req_header_end, kLen);
 }
 
+// Defense-in-depth for overrides recorded directly via RIR (the DSL parser
+// validates literals at compile time): a value carrying CRLF would inject extra
+// outbound headers, so it must fail the request closed rather than be written.
+TEST(set_header, rejects_crlf_injection_value) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_header_overrides[0].name = Str{"X-Evil", 6};
+    c->req_header_overrides[0].value = Str{"a\r\nInjected: yes", 16};
+    c->req_header_override_count = 1;
+    CHECK(!rut::apply_request_header_overrides(*c));
+    CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+    CHECK(!buf_has(c->recv_buf.data(), c->recv_buf.len(), "Injected"));
+}
+
+// A value that aliases recv_buf (e.g. a request-derived value recorded via RIR)
+// would be shifted/overwritten by the in-place rewrite, so it fails closed.
+TEST(set_header, fails_closed_on_recv_buf_aliasing_value) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    // Point the value at the "client" token inside recv_buf (the Host value).
+    c->req_header_overrides[0].name = Str{"X-Alias", 7};
+    c->req_header_overrides[0].value =
+        Str{reinterpret_cast<const char*>(c->recv_buf.data()) + 22, 6};  // "client"
+    c->req_header_override_count = 1;
+    CHECK(!rut::apply_request_header_overrides(*c));
+    CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+}
+
+// An override with no usable parsed header block (req_header_end unset) fails
+// closed rather than forwarding the request without the configured mutation.
+TEST(set_header, fails_closed_without_header_block) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = 0;  // parser set no header block
+    c->req_header_overrides[0].name = Str{"X-Inject", 8};
+    c->req_header_overrides[0].value = Str{"v", 1};
+    c->req_header_override_count = 1;
+    CHECK(!rut::apply_request_header_overrides(*c));
+}
+
 // === Recv ===
 
 TEST(recv, then_send) {
