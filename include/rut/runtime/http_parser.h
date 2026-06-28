@@ -117,6 +117,13 @@ struct ParsedResponse {
     bool chunked;
     bool keep_alive;        // HTTP/1.1 default true, HTTP/1.0 default false
     bool connection_close;  // explicit Connection: close
+    // True if the response carried more than kMaxHeaders header fields, so
+    // headers[] holds only the first kMaxHeaders. Semantic headers are still
+    // applied for all of them, but a consumer that scans the stored array (e.g.
+    // the h2 proxy's hop-by-hop filter) can't see the dropped tail and should
+    // treat the response as untrustworthy. header_count alone can't signal this:
+    // it saturates at kMaxHeaders, so exactly-full and truncated look identical.
+    bool headers_truncated;
 
     void reset() {
         status_code = 0;
@@ -126,6 +133,7 @@ struct ParsedResponse {
         chunked = false;
         keep_alive = true;  // HTTP/1.1 default
         connection_close = false;
+        headers_truncated = false;
     }
 };
 

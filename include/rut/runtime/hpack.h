@@ -116,8 +116,30 @@ u32 encode_header(u8* out, Str name, Str value);
 // Usage: init(max_size) once per connection, then encode() per header field.
 struct Encoder {
     DynamicTable dyn;
+    // Armed when the peer's SETTINGS_HEADER_TABLE_SIZE changes: the next header
+    // block must begin with a §6.3 dynamic table size update (RFC 7541 §4.2).
+    // pending_size_update is the FINAL size to signal; pending_min_size is the
+    // smallest size reached since the last emit (could be < final if the peer
+    // shrank then grew between blocks — §4.2 requires signalling the minimum
+    // first so the decoder evicts in lockstep). -1 = nothing pending.
+    i32 pending_size_update;
+    i32 pending_min_size;
 
-    void init(u32 max_size) { dyn.init(max_size); }
+    void init(u32 max_size) {
+        dyn.init(max_size);
+        pending_size_update = -1;
+        pending_min_size = -1;
+    }
+
+    // React to the peer's advertised SETTINGS_HEADER_TABLE_SIZE. Adjusts the
+    // dynamic table limit (evicting entries that no longer fit) and arms a size
+    // update for the next header block. See hpack.cc for the policy.
+    void set_table_size(u32 settings_max);
+
+    // If a size update is armed, write the §6.3 instruction into out and disarm.
+    // Returns octets written (0 if none pending). MUST be called at the very
+    // start of each header block, before any field is encoded.
+    u32 emit_pending_size_update(u8* out);
 
     // Encode one header field into out, possibly emitting an index and growing
     // the dynamic table. Returns octets written. name/value must not alias

@@ -3985,6 +3985,57 @@ TEST(PathCanon, non_origin_form_leaves_canon_null) {
     CHECK_EQ(req.path_canon.len, 0u);
 }
 
+// A response with exactly kMaxHeaders fields is fully stored and NOT flagged
+// truncated; one more field saturates header_count at kMaxHeaders and sets the
+// headers_truncated flag. The h2 proxy keys its hop-by-hop-safety 502 off this
+// flag, so the exactly-full boundary must not be mistaken for truncation.
+TEST(response_parser, headers_truncated_flag) {
+    // Build "HTTP/1.1 200 OK\r\n" + n distinct "x-hN: v\r\n" headers + CRLF.
+    auto build = [](char* out, u32 n) -> u32 {
+        u32 o = 0;
+        for (const char* p = "HTTP/1.1 200 OK\r\n"; *p != '\0'; p++) out[o++] = *p;
+        for (u32 i = 0; i < n; i++) {
+            out[o++] = 'x';
+            out[o++] = '-';
+            out[o++] = 'h';
+            if (i >= 10) out[o++] = static_cast<char>('0' + i / 10);
+            out[o++] = static_cast<char>('0' + i % 10);
+            out[o++] = ':';
+            out[o++] = ' ';
+            out[o++] = 'v';
+            out[o++] = '\r';
+            out[o++] = '\n';
+        }
+        out[o++] = '\r';
+        out[o++] = '\n';
+        return o;
+    };
+    {
+        HttpResponseParser parser;
+        parser.reset();
+        ParsedResponse resp;
+        resp.reset();
+        char raw[2048];
+        u32 len = build(raw, kMaxHeaders);  // exactly full
+        auto s = parser.parse(reinterpret_cast<const u8*>(raw), len, &resp);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+        CHECK_EQ(resp.header_count, kMaxHeaders);
+        CHECK(!resp.headers_truncated);  // all stored — a valid response
+    }
+    {
+        HttpResponseParser parser;
+        parser.reset();
+        ParsedResponse resp;
+        resp.reset();
+        char raw[2048];
+        u32 len = build(raw, kMaxHeaders + 1);  // one over capacity
+        auto s = parser.parse(reinterpret_cast<const u8*>(raw), len, &resp);
+        CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+        CHECK_EQ(resp.header_count, kMaxHeaders);  // saturates
+        CHECK(resp.headers_truncated);             // tail dropped from headers[]
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

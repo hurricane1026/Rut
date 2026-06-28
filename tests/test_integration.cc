@@ -4150,7 +4150,61 @@ TEST(shard, serves_http2_routed) {
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);  // matched static route
     CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);  // default fallback
-    CHECK_EQ(h2_status_for_stream(resp, total, 5), 503u);  // proxy over h2 not yet supported
+    // Proxy over h2 now forwards to the upstream; 127.0.0.1:8080 isn't listening,
+    // so the connect is refused and the stream gets 502 (Bad Gateway).
+    CHECK_EQ(h2_status_for_stream(resp, total, 5), 502u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_firewall_denies) {
+    // A deny rule for the loopback peer must 403 every h2 request — including the
+    // proxy route — before any upstream is opened, mirroring the HTTP/1 firewall
+    // gate. Without the gate the proxy route would have opened the upstream (502).
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 204);
+    cfg.add_upstream("api", 0x7F000001, 8080);
+    cfg.add_proxy("/api/", 0, 0);
+    REQUIRE(cfg.add_firewall_deny_ip(0x7f000001));  // 127.0.0.1
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // A single proxy request: the firewall gate must answer 403 BEFORE the proxy
+    // action opens the upstream. Without the gate this route reaches the (dead)
+    // upstream and returns 502, so 403 specifically proves the peer is rejected
+    // ahead of route dispatch. (One request keeps the assertion independent of the
+    // response encoder's dynamic HPACK indexing, which the simple test-side decoder
+    // can't follow across streams.)
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api/x", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 403u);  // denied before reaching upstream
 
     close(c);
     shard.stop();
@@ -4243,6 +4297,56 @@ TEST(shard, serves_http2_sequential_requests) {
         if (h2_status_for_stream(resp2, total2, 3) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp2, total2, 3), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A keep-alive h2 connection that issues MORE than kMaxStreams sequential requests
+// must keep getting responses: each completed stream is marked Closed so
+// alloc_stream can reuse its slot. Without the close, the live stream table fills
+// after kMaxStreams ids have ever been used and further requests get
+// REFUSED_STREAM (RST_STREAM, no :status), even with no active streams.
+TEST(shard, serves_http2_many_sequential_streams_reuse_slots) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 pre[64];
+    u32 pn = h2_client_prologue(pre);
+    REQUIRE(write_all_fd(c, pre, pn));
+
+    // Comfortably past Http2Conn::kMaxStreams (64), one stream at a time.
+    const u32 kRequests = 80;
+    for (u32 r = 0; r < kRequests; r++) {
+        const u32 sid = 1 + r * 2;  // client-initiated odd stream ids
+        u8 out[256];
+        u32 n = h2_client_get(out, sizeof(out), sid, "/", 1);
+        REQUIRE(write_all_fd(c, out, n));
+        u8 resp[4096];
+        u32 total = 0;
+        for (int a = 0; a < 6 && total < sizeof(resp); a++) {
+            i32 got =
+                recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+            if (h2_status_for_stream(resp, total, sid) != 0) break;
+        }
+        // Every request — including those past the 64th distinct stream id — gets a
+        // real 200, not a slot-exhaustion refusal.
+        CHECK_EQ(h2_status_for_stream(resp, total, sid), 200u);
+    }
 
     close(c);
     shard.stop();
@@ -6616,6 +6720,244 @@ TEST(route, wait_jit_handler_real_socket) {
     rir.destroy();
 }
 
+// End-to-end async-yield over HTTP/2: a JIT handler that wait(ms)s then returns
+// 200 must suspend its h2 stream and resume to emit the response. Before the h2
+// async path this answered 503 (yielding handlers unsupported); now the stream
+// parks on a real yield timer (h2_suspend_timer → schedule_yield_timer) and
+// resumes through h2_resume_jit_handler to serialize the HEADERS frame. Driven
+// over cleartext h2c on the real EpollEventLoop so the timer actually fires.
+TEST(shard, serves_http2_async_wait_jit_handler) {
+    using namespace rut;
+
+    const char* src = "route GET \"/sleep\" { wait(50) return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/sleep", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    // 200 (not 503) proves the suspend/resume round-trip completed.
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Two async-yield requests in sequence on one h2 connection: after the first
+// stream resumes and flushes, the connection must re-arm recv (async slot
+// cleared) and serve the next stream's wait→200 the same way. Exercises the
+// resume → read → next-request lifecycle in on_h2_sent that single-shot tests
+// miss.
+TEST(shard, serves_http2_async_wait_sequential) {
+    using namespace rut;
+
+    const char* src = "route GET \"/sleep\" { wait(30) return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 200};
+    lt.start();
+    usleep(10000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    auto send_and_read_status = [&](u32 stream_id) -> u16 {
+        u8 out[512];
+        u32 n = 0;
+        if (stream_id == 1) n = h2_client_prologue(out);  // preface + SETTINGS once
+        n += h2_client_get(out + n, sizeof(out) - n, stream_id, "/sleep", 6);
+        if (!write_all_fd(c, out, n)) return 0;
+        u8 resp[4096];
+        u32 total = 0;
+        for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+            i32 got =
+                recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+            if (h2_status_for_stream(resp, total, stream_id) != 0) break;
+        }
+        return h2_status_for_stream(resp, total, stream_id);
+    };
+
+    CHECK_EQ(send_and_read_status(1), 200u);  // first wait→200
+    CHECK_EQ(send_and_read_status(3), 200u);  // connection served the next stream
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
+// Two async-yield streams coalesced into one TCP read. The first parks; the
+// engine must STOP processing and leave the second's HEADERS buffered (rather
+// than dispatch it while a stream is already suspended → 503). After the first
+// resumes, the buffered second stream is drained and also served. Regression for
+// the one-at-a-time queuing fix (process() stop-after-park + on_h2_sent drain).
+TEST(shard, serves_http2_async_wait_coalesced) {
+    using namespace rut;
+
+    const char* src = "route GET \"/sleep\" { wait(30) return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 300};
+    lt.start();
+    usleep(10000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Both streams in ONE write so they arrive coalesced in a single read.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/sleep", 6);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/sleep", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 12 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 3) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // first parked stream
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);  // queued, not 503
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // wait(50) — sub-second precision verification. The legacy TimerWheel
 // would round this up to 1000ms (one full tick), so this test fails
 // immediately if the yield_timer_fd / min-heap path regresses back to
@@ -7244,6 +7586,7 @@ struct ScriptedUpstreamServer {
     u16 port = 0;
     const char* response = nullptr;
     u32 response_len = 0;
+    bool keep_open = false;  // hold the connection open after replying (HTTP keep-alive)
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -7274,6 +7617,11 @@ struct ScriptedUpstreamServer {
                 if (server->response != nullptr && server->response_len > 0) {
                     (void)send_all(client, server->response, server->response_len);
                 }
+                // keep_open simulates a keep-alive upstream that does NOT close
+                // after a body-less response — the case that would hang an h2
+                // proxy waiting for EOF if no-body statuses weren't special-cased.
+                while (server->keep_open && server->running.load(std::memory_order_acquire))
+                    usleep(5000);
             }
             close(client);
         }
@@ -7362,6 +7710,346 @@ struct ScopedProxyLoop {
         }
     }
 };
+
+// End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
+// route; the runtime forwards a synthesized h1 request to a real upstream, buffers
+// the upstream's h1 response, and re-encodes it as h2 HEADERS+DATA. Asserts the
+// h2 client sees the re-framed :status and body (proves h2_proxy_begin →
+// h2_on_upstream_* → h2_proxy_finish, not the old 503).
+TEST(shard, serves_http2_proxy) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "X-Backend: rut\r\n"
+        "Te: gzip\r\n"           // hop-by-hop — must NOT be forwarded to the h2 client
+        "Connection: x-hop\r\n"  // nominates x-hop as connection-specific (hop-by-hop)
+        "X-Hop: secret\r\n"      // ...so this must NOT be forwarded either
+        "Connection: x-two\r\n"  // a SECOND Connection field — its token is hop-by-hop too
+        "X-Two: also-secret\r\n"
+        "\r\n"
+        "hello";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    u8 body[64];
+    u32 blen = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(resp, total, 1) != 0 && blen == 5) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // re-framed upstream :status
+    CHECK_EQ(blen, 5u);                                    // re-framed upstream body
+    bool body_ok = blen == 5;
+    const char* want = "hello";
+    for (u32 i = 0; i < blen && body_ok; i++)
+        if (body[i] != static_cast<u8>(want[i])) body_ok = false;
+    CHECK(body_ok);
+    // Header re-framing: a normal upstream header is forwarded (lowercased per
+    // RFC 7540 §8.1.2); the hop-by-hop `te` and the field nominated by the
+    // upstream `Connection` header (`x-hop`) are filtered out.
+    CHECK(h2_response_has_header(resp, total, 1, "x-backend", "rut"));
+    CHECK(!h2_response_has_header(resp, total, 1, "te", "gzip"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-hop", "secret"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-two", "also-secret"));  // 2nd Connection field
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// Upstream declares Content-Length: 100 but sends a 2-byte body then closes.
+// The h2 proxy must fail the stream with 502 (truncated) rather than re-arm a
+// recv that never completes. Regression for the truncated-CL fix.
+TEST(shard, serves_http2_proxy_truncated_upstream) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 100\r\n"
+        "\r\n"
+        "hi";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 502u);  // truncated → Bad Gateway
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A proxy request that carries a body (HEADERS without END_STREAM, then DATA)
+// must be rejected with 503 BEFORE any upstream contact — forwarding request
+// bodies over h2 isn't supported yet, and the no-body path would otherwise drop
+// the body. The upstream points at a dead port: a 503 (not 502) proves we never
+// tried to connect. Regression for the DATA-bearing-proxy fix.
+TEST(shard, serves_http2_proxy_rejects_request_body) {
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);  // discard port, never connected
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("body"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 503u);  // rejected pre-forward, not 502
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// Upstream sends a 1xx informational response (103 Early Hints) before its final
+// response. The h2 proxy must discard the 1xx and reframe the FINAL response —
+// not serve :status 103 with the 200 as its body.
+TEST(shard, serves_http2_proxy_skips_1xx) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 103 Early Hints\r\n"
+        "Link: </s.css>; rel=preload\r\n"
+        "\r\n"
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "hi";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    u8 body[64];
+    u32 blen = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(resp, total, 1) != 0 && blen == 2) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // final response, not 103
+    CHECK_EQ(blen, 2u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// An upstream 101 Switching Protocols (an upgrade the h2 proxy can't tunnel) must
+// fail the stream with 502 immediately, not be treated as informational and
+// stalled until the upstream timeout (504). Regression for the 101 fix.
+TEST(shard, serves_http2_proxy_upstream_101) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+    backend.keep_open = true;  // after a 101 the backend would hold the connection open
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 502u);  // fail-fast, not a 504 stall
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A 204 (no body, no Content-Length) from a keep-alive upstream that does NOT
+// close. The h2 proxy must reframe at headers — waiting for EOF would hang.
+TEST(shard, serves_http2_proxy_no_body_status) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] = "HTTP/1.1 204 No Content\r\n\r\n";
+    backend.keep_open = true;  // keep-alive: never closes → would hang without the fix
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);  // reframed at headers, no hang
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
 
 struct MalformedUpstreamCase {
     const char* name;
@@ -7660,6 +8348,47 @@ TEST(proxy_e2e, upstream_timeout_returns_504) {
     CHECK(total > 0);
     CHECK(buf_contains(buf, total, "504", 3));
     close(client);
+}
+
+// Same stalled-backend timeout, but over HTTP/2: the h2 proxy stream must be
+// reframed as an h2 504 (not raw h1 504 bytes), released on the upstream
+// deadline instead of held until keepalive. Regression for the Proxying-state +
+// h2-aware-tick fix.
+TEST(proxy_e2e, serves_http2_proxy_upstream_timeout) {
+    using namespace rut;
+    StallServer stall;
+    REQUIRE(stall.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("slow", 0x7F000001, stall.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1500));
+    proxy.loop->upstream_timeout = 1;  // 1s upstream deadline (vs 60s keepalive)
+
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 6);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 12 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 5000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 504u);  // upstream-timeout, reframed as h2
+
+    close(c);
 }
 
 // Handler returns ReturnStatus with an out-of-range body_idx (e.g. no
@@ -8494,6 +9223,71 @@ TEST(shard, serves_http2_request_body) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);  // handler saw "ping"
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A body-reading stream deferred for DATA and a coalesced proxy stream both want
+// pending_synth. The proxy stream must be refused (503) while the body stream is
+// pending — not allowed to overwrite the deferred request's bytes — and the body
+// stream must still complete correctly. Regression for the pending_synth aliasing
+// fix.
+TEST(shard, serves_http2_body_defer_blocks_concurrent_async) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_echo_body_handler, /*needs_req_body=*/true));
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);  // discard port; never connected
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, id.value()));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // Coalesced: stream 1 POST body (defers for DATA), stream 3 proxy GET (would
+    // suspend → must be refused 503 while stream 1 is pending), then stream 1's
+    // DATA terminator.
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header up[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, up, 5, /*end_stream=*/false);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/api", 4);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("ping"), 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0 && h2_status_for_stream(resp, total, 3) != 0)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1),
+             200u);  // body handler saw "ping" (not corrupted)
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 503u);  // proxy refused while body pending
 
     close(c);
     shard.stop();

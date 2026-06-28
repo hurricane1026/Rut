@@ -657,7 +657,10 @@ public:
         // If a request was in flight (epoch_enter called), leave the epoch
         // before closing. This covers timer wheel timeouts, force_close_all
         // during drain, and any other path that bypasses normal callbacks.
-        if (c.req_start_us != 0) epoch_leave();
+        // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream, which
+        // pins the epoch without an h1-style req_start_us.
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; idempotent via
         // the held flag).
         if (c.upstream_slot_held) {

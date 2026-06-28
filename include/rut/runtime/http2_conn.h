@@ -19,9 +19,15 @@ namespace rut {
 enum class Http2StreamState : u8 {
     Idle,
     Open,
+    HalfClosedLocal,   // we sent END_STREAM; peer may still send DATA we discard
     HalfClosedRemote,  // peer sent END_STREAM; we may still respond
     Closed,
 };
+
+// What a suspended stream is waiting on. None = no stream suspended. Timer = a
+// JIT handler yielded on wait(ms) (resumed by the yield timer). Proxy = the
+// stream is being forwarded to an h1 upstream (resumed by upstream I/O).
+enum class H2AsyncKind : u8 { None, Timer, Proxy };
 
 struct Http2Stream {
     u32 id;
@@ -126,6 +132,36 @@ struct Http2Conn {
     H2RouteParam pending_route_params[kMaxRouteParams];
     u32 pending_route_param_count;
     u8 pending_synth[kBodySynthCap];
+
+    // One suspended async (wait/timer) stream at a time, mirroring the
+    // pending_stream body constraint. When a JIT handler yields on a timer the
+    // serving layer parks it here: the resume point lives on the Connection
+    // (pending_handler_fn / handler_state / jit_ctx — a connection is either h1
+    // or h2, never both, so reusing those is safe), and the request bytes stay in
+    // pending_synth[0..async_synth_len). async_stream == 0 means no suspension.
+    // The connection stops pulling new frames while a stream sleeps; others queue
+    // and resume after — the same one-at-a-time tradeoff as pending_stream.
+    // The resume point (fn + state) is parked here, not on the Connection, until
+    // the yield timer is actually armed: setting conn.pending_handler_fn before
+    // the connection leaves the keepalive wheel would let a keepalive tick during
+    // the response flush resume (or close) the stream early. h2_arm_async_timer
+    // transfers these to the Connection atomically with schedule_yield_timer.
+    u32 async_stream;
+    H2AsyncKind async_kind;
+    const RouteConfig* async_cfg;
+    u32 async_synth_len;
+    // Bytes of the synthesized request already written to the upstream. io_uring
+    // sends can complete short (full socket buffer, large header block), so the
+    // proxy resubmits the remainder until async_synth_sent == async_synth_len.
+    u32 async_synth_sent;
+    u32 async_timer_ms;
+    jit::HandlerFn async_fn;
+    u16 async_state;
+    // Proxy suspension only: the matched route (for upstream_id + inflight cap)
+    // and the running count of upstream h1 response bytes accumulated back into
+    // pending_synth (reused as the response buffer once the request is sent).
+    const RouteEntry* async_route;
+    u32 async_resp_len;
 
     // Set callbacks (any may be null) then call init().
     void init();

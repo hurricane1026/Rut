@@ -374,6 +374,21 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Drop any partial/EAGAIN upstream request send still buffered for this
+    // connection. epoll retains such a send in upstream_send_state with `src`
+    // pointing at pending_synth; when an h2 proxy is torn down (its upstream fd is
+    // closed) that send can never legitimately complete, yet the stale entry would
+    // make a later EPOLLOUT on a reused upstream fd ship pending_synth's (by then
+    // overwritten) bytes to the next backend. Reset it so the handle_epollout guard
+    // (remaining==0 / !src / fd<0) skips it. io_uring has no equivalent: its
+    // in-flight send is an SQE that pins pending_synth via h2_proxy_synth_quarantined
+    // until the CQE drains, so this method is epoll-only (reached via requires-guard).
+    void discard_upstream_send(Connection& c) {
+        if (c.id < EpollBackend::kMaxFdMap)
+            backend.upstream_send_state[c.id] = {
+                nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+    }
+
     // Stop polling the upstream fd without closing it (close_conn still ::closes
     // it). epoll is level-triggered and delivers EPOLLHUP/EPOLLERR even with the
     // interest mask zeroed, so a backend that closes during the pre-tunnel 101
@@ -490,7 +505,10 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
-        if (c.req_start_us != 0) epoch_leave();
+        // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
+        // the config epoch without an h1-style req_start_us (see event_loop.h).
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all for failure /
         // non-keep-alive completion; the held flag makes a prior release a no-op).
         if (c.upstream_slot_held) {
@@ -682,8 +700,15 @@ public:
                             c->resume_event_result = 0;
                             resume_jit_handler<EpollEventLoop>(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
-                            // Upstream stalled before responding → 504.
-                            respond_upstream_timeout<EpollEventLoop>(this, *c);
+                            // Upstream stalled before responding → 504. A genuine
+                            // in-flight h2 proxy stream reframes as h2 (raw h1 504
+                            // bytes would corrupt the stream); anything else uses
+                            // the HTTP/1 path.
+                            if (c->protocol == ConnProtocol::Http2 && c->h2 != nullptr &&
+                                c->h2->async_stream != 0)
+                                h2_proxy_fail<EpollEventLoop>(this, *c, 504);
+                            else
+                                respond_upstream_timeout<EpollEventLoop>(this, *c);
                         } else if (c->throttle_paused) {
                             // @throttle: a new byte-rate window has opened — resume
                             // the parked client send.

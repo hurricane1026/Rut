@@ -123,6 +123,18 @@ struct ConnectionBase {
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
+    // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
+    // episode may still deliver a terminal CQE; the next episode must not arm its
+    // own recv (which shares the conn_id/type user_data) until that terminal drains,
+    // or the stale CQE would be misrouted to the new stream. Cleared when the
+    // terminal is accounted in dispatch.
+    bool h2_proxy_recv_draining;
+    // h2_proxy_synth_quarantined: an upstream request send was still in flight when
+    // an h2 proxy episode was torn down (timeout). The send SQE still sources
+    // pending_synth, so a subsequent request must not overwrite it until that send
+    // CQE drains. Cleared when the stale UpstreamSend terminal is accounted.
+    bool h2_proxy_synth_quarantined;
     // forward(set_path:) request mutation: a JIT handler may rewrite the request
     // path before proxying. The runtime helper records the new path (a view into
     // stable JIT constant memory); on_upstream_connected rewrites the request
@@ -402,6 +414,12 @@ struct ConnectionBase {
     // Request timing (for access log)
     u64 req_start_us;
 
+    // An HTTP/2 async (wait/proxy) stream pins the RCU config epoch while parked.
+    // It uses this dedicated flag rather than req_start_us so close_conn leaves
+    // the epoch without also decrementing metrics requests_active (the h2 path
+    // doesn't call on_request_start).
+    bool epoch_held;
+
     // Outstanding I/O ops submitted to the backend. Incremented on
     // submit_recv/submit_send/etc., decremented when the final CQE
     // arrives in dispatch() (multishot CQEs with IORING_CQE_F_MORE
@@ -451,6 +469,8 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
+        h2_proxy_recv_draining = false;
+        h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
         upstream_slot_held = false;
@@ -569,6 +589,7 @@ struct ConnectionBase {
         capture_buf = nullptr;
         capture_header_len = 0;
         req_start_us = 0;
+        epoch_held = false;
         pending_ops = 0;
         recv_slice = nullptr;
         send_slice = nullptr;

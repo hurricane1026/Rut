@@ -691,7 +691,10 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
-        if (c.req_start_us != 0) epoch_leave();
+        // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
+        // the config epoch without an h1-style req_start_us (see event_loop.h).
+        if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
+        c.epoch_held = false;
         // Release any held upstream concurrency slot (catch-all; held flag makes a
         // prior release at completion a no-op).
         if (c.upstream_slot_held) {
@@ -890,8 +893,15 @@ public:
                             c->resume_event_result = 0;
                             resume_jit_handler<IoUringEventLoop>(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
-                            // Upstream stalled before responding → 504.
-                            respond_upstream_timeout<IoUringEventLoop>(this, *c);
+                            // Upstream stalled before responding → 504. A genuine
+                            // in-flight h2 proxy stream reframes as h2 (raw h1 504
+                            // bytes would corrupt the stream); anything else uses
+                            // the HTTP/1 path.
+                            if (c->protocol == ConnProtocol::Http2 && c->h2 != nullptr &&
+                                c->h2->async_stream != 0)
+                                h2_proxy_fail<IoUringEventLoop>(this, *c, 504);
+                            else
+                                respond_upstream_timeout<IoUringEventLoop>(this, *c);
                         } else if (c->throttle_paused) {
                             throttle_resume<IoUringEventLoop>(this, *c);
 #if RUT_ENABLE_WEBSOCKET
@@ -985,6 +995,16 @@ public:
                         conn.upstream_recv_armed = false;
                         conn.upstream_recv_cancel_inflight = false;
                         conn.upstream_recv_terminal_stale = false;
+                        // A torn-down h2-proxy episode's recv terminal has now drained,
+                        // so the next episode may safely arm its own recv — but first
+                        // discard any stale positive bytes wait() copied into the buffer
+                        // before this terminal, or the next stream would parse them as its
+                        // own response. Gated on the flag so the normal recv path (which
+                        // delivers the real bytes below) is untouched.
+                        if (conn.h2_proxy_recv_draining) {
+                            conn.h2_proxy_recv_draining = false;
+                            conn.upstream_recv_buf.reset();
+                        }
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (conn.fd < 0) {
                             // Closed conn (e.g. the close-path cancel of an armed upstream
@@ -1031,7 +1051,12 @@ public:
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         if (ev.type == IoEventType::Recv) conn.recv_armed = false;
                         if (ev.type == IoEventType::Send) conn.send_armed = false;
-                        if (ev.type == IoEventType::UpstreamSend) conn.upstream_send_armed = false;
+                        if (ev.type == IoEventType::UpstreamSend) {
+                            conn.upstream_send_armed = false;
+                            // A torn-down h2-proxy episode's request send has now drained, so
+                            // pending_synth is free again — lift the reuse quarantine.
+                            conn.h2_proxy_synth_quarantined = false;
+                        }
                         if (ev.type == IoEventType::UpstreamRecv) {
                             // Recv ended normally and is NOT stale (the stale case is handled
                             // and dropped above). If a pause cancel lost the race its own CQE
@@ -1041,6 +1066,16 @@ public:
                             conn.upstream_recv_armed = false;
                             conn.upstream_recv_cancel_inflight = false;
                             conn.upstream_recv_terminal_stale = false;
+                            // A torn-down h2-proxy episode's recv terminal has now drained;
+                            // discard any stale positive bytes it left so the next stream
+                            // can't parse them as its response. Gated on the flag so the
+                            // normal recv (delivered via dispatch_event below) is untouched
+                            // — for the draining case on_upstream_recv is null, so the
+                            // fall-through delivery is suppressed by the abandoned guard.
+                            if (conn.h2_proxy_recv_draining) {
+                                conn.h2_proxy_recv_draining = false;
+                                conn.upstream_recv_buf.reset();
+                            }
                             if (conn.fd < 0) {
                                 // Closed conn: reclaim if this was the last op (the break
                                 // below skips the generic pending_ops==0 reclaim).

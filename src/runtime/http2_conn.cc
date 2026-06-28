@@ -49,6 +49,16 @@ void Http2Conn::init() {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         pending_route_params[i] = {};
     }
+    async_stream = 0;
+    async_kind = H2AsyncKind::None;
+    async_cfg = nullptr;
+    async_synth_len = 0;
+    async_synth_sent = 0;
+    async_timer_ms = 0;
+    async_fn = nullptr;
+    async_state = 0;
+    async_route = nullptr;
+    async_resp_len = 0;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {
@@ -150,17 +160,31 @@ u32 http2_write_response(u8* out,
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
     u32 hb = 0;
+    // A pending dynamic table size update (from a peer SETTINGS_HEADER_TABLE_SIZE
+    // change) MUST lead the header block, before any field (RFC 7541 §4.2).
+    hb += enc.emit_pending_size_update(hblock + hb);
     char sbuf[3];
     sbuf[0] = static_cast<char>('0' + (status / 100) % 10);
     sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
     sbuf[2] = static_cast<char>('0' + status % 10);
     hb += enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
+    // Worst-case HPACK literal overhead beyond the raw name+value bytes: one field-
+    // line prefix octet plus a length-prefix integer for each of name and value (up
+    // to 5 bytes each for 32-bit lengths). The peer (or an upstream we proxy) can
+    // supply arbitrary header sizes, so this must bound the write exactly — a header
+    // just under the buffer would otherwise encode past hblock instead of returning
+    // 0 (→ the caller answers 502).
+    static constexpr u32 kHpackFieldOverhead = 11;  // 1 prefix + 5 + 5 length octets
+    // Room the trailing content-length line needs when there's a body, reserved
+    // during the loop so the loop can't fill hblock and then overflow on the CL.
+    const u32 kClReserve = body_len > 0 ? 14 + 10 + kHpackFieldOverhead : 0;
     for (u32 i = 0; i < nhdrs; i++) {
-        // Worst case per header ~ name+value+few prefix octets; bail if tight.
-        if (hb + hdrs[i].name.len + hdrs[i].value.len + 8 > sizeof(hblock)) return 0;
+        if (hb + hdrs[i].name.len + hdrs[i].value.len + kHpackFieldOverhead + kClReserve >
+            sizeof(hblock))
+            return 0;
         // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
-        // config may hold mixed case (HTTP/1 tolerates it). Lowercase into a
-        // small buffer before encoding.
+        // config (or a proxied upstream) may hold mixed case (HTTP/1 tolerates it).
+        // Lowercase into a small buffer before encoding.
         char lname[256];
         Str name = hdrs[i].name;
         if (name.len <= sizeof(lname)) {
@@ -169,12 +193,22 @@ u32 http2_write_response(u8* out,
                 lname[j] = (kC >= 'A' && kC <= 'Z') ? static_cast<char>(kC - 'A' + 'a') : kC;
             }
             name = Str{lname, name.len};
+        } else {
+            // Too long to lowercase in our buffer. Forwarding it verbatim would emit
+            // an uppercase (invalid) HTTP/2 name, so reject the response (→ 502)
+            // unless it's already all-lowercase. A >256-byte field name is
+            // pathological regardless.
+            for (u32 j = 0; j < name.len; j++) {
+                const char kC = name.ptr[j];
+                if (kC >= 'A' && kC <= 'Z') return 0;
+            }
         }
         hb += enc.encode(hblock + hb, name, hdrs[i].value);
     }
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
+        if (hb + 14 + kClLen + kHpackFieldOverhead > sizeof(hblock)) return 0;  // (reserved above)
         hb += enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
     }
 
@@ -463,6 +497,11 @@ static Http2Error handle_frame(Http2Conn& c,
             const i64 kOldIws = c.peer_settings.initial_window_size;
             const Http2Error kErr = parse_settings(payload, h.length, &c.peer_settings);
             if (kErr != Http2Error::NoError) return kErr;
+            // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
+            // encoder may index against. React (resize + arm a §6.3 update for the
+            // next response header block) so we never index into a table the peer
+            // shrank. No-op when the value is unchanged.
+            c.hpack_enc.set_table_size(c.peer_settings.header_table_size);
             // Adjust live stream send windows by the INITIAL_WINDOW_SIZE delta.
             const i64 kDelta = static_cast<i64>(c.peer_settings.initial_window_size) - kOldIws;
             if (kDelta != 0) {
@@ -523,8 +562,14 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (kDe != Http2Error::NoError) return kDe;
                     // Valid request trailers: END_STREAM, no pseudo-headers, on a
                     // stream still receiving its body.
-                    if (kEndStream && !has_pseudo && s->state == Http2StreamState::Open) {
-                        s->state = Http2StreamState::HalfClosedRemote;
+                    if (kEndStream && !has_pseudo &&
+                        (s->state == Http2StreamState::Open ||
+                         s->state == Http2StreamState::HalfClosedLocal)) {
+                        // Valid request trailers end the peer's side: close fully if
+                        // we already responded (HalfClosedLocal), else half-close remote.
+                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
+                                       ? Http2StreamState::Closed
+                                       : Http2StreamState::HalfClosedRemote;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -567,8 +612,12 @@ static Http2Error handle_frame(Http2Conn& c,
                     bool has_pseudo = false;
                     const Http2Error kDe = discard_headers(c, &has_pseudo);
                     if (kDe != Http2Error::NoError) return kDe;
-                    if (kTrailerEnd && !has_pseudo && s && s->state == Http2StreamState::Open) {
-                        s->state = Http2StreamState::HalfClosedRemote;
+                    if (kTrailerEnd && !has_pseudo && s &&
+                        (s->state == Http2StreamState::Open ||
+                         s->state == Http2StreamState::HalfClosedLocal)) {
+                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
+                                       ? Http2StreamState::Closed
+                                       : Http2StreamState::HalfClosedRemote;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -627,7 +676,13 @@ static Http2Error handle_frame(Http2Conn& c,
 
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
             if (c.on_data) c.on_data(c.cb_ctx, c, h.stream_id, p, n, kEndStream);
-            if (kEndStream) s->state = Http2StreamState::HalfClosedRemote;
+            // DATA on a HalfClosedLocal stream (we already responded; on_data above
+            // discards it) completes the stream once the peer ends it — close fully
+            // so the slot frees. An Open stream only half-closes its remote side.
+            if (kEndStream)
+                s->state = (s->state == Http2StreamState::HalfClosedLocal)
+                               ? Http2StreamState::Closed
+                               : Http2StreamState::HalfClosedRemote;
 
             // Auto-replenish: keep the peer's send windows open.
             c.conn_recv_window += static_cast<i64>(h.length);
@@ -751,6 +806,22 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
             return {pos, true};
         }
         if (len - pos < kFrameHeaderSize + h.length) break;  // wait for full payload
+
+        // A serving callback parked a stream (one-at-a-time wait/proxy). We still
+        // drain control frames already coalesced in this buffer — above all a
+        // RST_STREAM that cancels the parked stream (the client sent HEADERS +
+        // RST_STREAM in one packet): processing it now fires on_reset, which frees
+        // the async slot so we never arm a timer / open an upstream and later reply
+        // on a cancelled stream. Request frames (HEADERS / CONTINUATION / DATA /
+        // PUSH_PROMISE) start new work and are HPACK-order-dependent, so stop at the
+        // first one and leave it buffered until the parked stream resumes — else the
+        // next coalesced stream would be dispatched now and refused (503).
+        if (async_stream != 0) {
+            const auto kT = static_cast<Http2FrameType>(h.type);
+            if (kT == Http2FrameType::Headers || kT == Http2FrameType::Continuation ||
+                kT == Http2FrameType::Data || kT == Http2FrameType::PushPromise)
+                break;
+        }
 
         const Http2Error kErr = handle_frame(*this, h, in + pos + kFrameHeaderSize, w);
         pos += kFrameHeaderSize + h.length;

@@ -288,6 +288,115 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     CHECK(c.find_stream(1) == nullptr);  // closed streams are not findable
 }
 
+// Regression: a stream we've already responded to (END_STREAM sent) while the
+// peer is still sending must go half-closed(local), so the peer's trailing DATA
+// is accepted & discarded — NOT answered with a spurious RST_STREAM (which used
+// to happen because h2_close_stream marked the stream fully Closed too early).
+TEST(http2_conn, data_after_local_response_discarded_not_reset) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // Client opens a stream WITHOUT END_STREAM (a request body follows).
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/x", 2}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/false);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    Http2Stream* s = c.find_stream(1);
+    REQUIRE(s != nullptr);
+    CHECK(s->state == Http2StreamState::Open);
+    // Serving layer emits an END_STREAM response before the body arrives.
+    h2_close_stream(&c, 1);
+    CHECK(s->state == Http2StreamState::HalfClosedLocal);
+    // Trailing DATA (with END_STREAM) is accepted, not RST'd, and closes the stream.
+    u8 df[64];
+    u32 dn = http2_write_data(df, 1, reinterpret_cast<const u8*>("body"), 4, /*end_stream=*/true);
+    ow = 0;
+    c.process(df, dn, out, sizeof(out), &ow);
+    CHECK(!has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK(c.find_stream(1) == nullptr);  // HalfClosedLocal + peer END_STREAM → Closed
+}
+
+// A fully-completed request (peer sent END_STREAM) closes the slot outright when
+// we respond, so a long keep-alive connection can keep reusing stream slots.
+TEST(http2_conn, complete_request_closes_slot_on_response) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    Http2Stream* s = c.find_stream(1);
+    REQUIRE(s != nullptr);
+    CHECK(s->state == Http2StreamState::HalfClosedRemote);
+    h2_close_stream(&c, 1);
+    CHECK(c.find_stream(1) == nullptr);  // both sides done → Closed, slot reusable
+}
+
+// Regression: a RST_STREAM coalesced behind the request that parked the async
+// slot (wait/proxy) must still be processed in the same batch and cancel the
+// parked work — otherwise we'd open an upstream / arm a timer and later respond
+// for a stream the client already cancelled.
+TEST(http2_conn, coalesced_rst_cancels_parked_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.on_reset = &h2_on_reset_cb;  // serving-layer handler clears the async slot
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    // Serving layer parks stream 1 on the single async slot.
+    c.async_stream = 1;
+    c.async_kind = H2AsyncKind::Proxy;
+    u8 rf[kFrameHeaderSize + 4];
+    u32 rn = write_rst_stream(rf, 1, Http2Error::Cancel);
+    ow = 0;
+    Http2Result r = c.process(rf, rn, out, sizeof(out), &ow);
+    CHECK_EQ(r.consumed, rn);  // control frame drained past the park, not buffered
+    CHECK_EQ(c.async_stream, 0u);
+    CHECK(c.async_kind == H2AsyncKind::None);
+}
+
+// Complement: a NEW request's HEADERS coalesced behind a parked stream stays
+// buffered (HPACK-order-dependent, starts new work) until the parked stream
+// resumes — only control frames are drained past the park.
+TEST(http2_conn, parked_stream_buffers_new_request_headers) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    c.async_stream = 1;
+    c.async_kind = H2AsyncKind::Proxy;
+    cap.headers_calls = 0;
+    hpack::Header hs2[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/y", 2}}};
+    u8 hf2[256];
+    u32 hn2 = http2_write_headers(hf2, sizeof(hf2), 3, hs2, 2, /*end_stream=*/true);
+    ow = 0;
+    Http2Result r = c.process(hf2, hn2, out, sizeof(out), &ow);
+    CHECK_EQ(r.consumed, 0u);         // left buffered for resume
+    CHECK_EQ(cap.headers_calls, 0u);  // not dispatched while parked
+}
+
 TEST(http2_conn, partial_frame_left_unconsumed) {
     Http2Conn c;
     Capture cap;
@@ -558,6 +667,43 @@ TEST(h2_request, unknown_pseudo_header_rejected) {
         {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{":status", 7}, {"200", 3}}};
     ParsedRequest req;
     CHECK_FALSE(h2_headers_to_request(bad, 3, &req));
+}
+
+TEST(h2_proxy_forwardable, accepts_well_formed_request) {
+    hpack::Header ok[] = {{{":method", 7}, {"GET", 3}},
+                          {{":scheme", 7}, {"http", 4}},
+                          {{":path", 5}, {"/", 1}},
+                          {{":authority", 10}, {"x", 1}}};
+    CHECK(h2_proxy_request_forwardable(ok, 4));
+}
+
+TEST(h2_proxy_forwardable, rejects_missing_scheme) {
+    // :method + :path + :authority but no :scheme — fine for a local handler,
+    // malformed to forward upstream.
+    hpack::Header no_scheme[] = {
+        {{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}, {{":authority", 10}, {"x", 1}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(no_scheme, 3));
+}
+
+TEST(h2_proxy_forwardable, rejects_ambiguous_host_without_authority) {
+    // No :authority and two regular host fields would synthesize duplicate Host
+    // headers upstream.
+    hpack::Header dup_host[] = {{{":method", 7}, {"GET", 3}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/", 1}},
+                                {{"host", 4}, {"a", 1}},
+                                {{"host", 4}, {"b", 1}}};
+    CHECK_FALSE(h2_proxy_request_forwardable(dup_host, 5));
+    // A single host field (no authority) is unambiguous.
+    CHECK(h2_proxy_request_forwardable(dup_host, 4));
+    // With :authority, regular host fields are dropped by synth → not ambiguous.
+    hpack::Header auth_plus_host[] = {{{":method", 7}, {"GET", 3}},
+                                      {{":scheme", 7}, {"http", 4}},
+                                      {{":path", 5}, {"/", 1}},
+                                      {{":authority", 10}, {"x", 1}},
+                                      {{"host", 4}, {"a", 1}},
+                                      {{"host", 4}, {"b", 1}}};
+    CHECK(h2_proxy_request_forwardable(auth_plus_host, 6));
 }
 
 // Write a raw frame (header + payload) into out; return bytes written.
@@ -942,6 +1088,79 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     parse_frame_header(out + kFrameHeaderSize + h.length, n - kFrameHeaderSize - h.length, &df);
     CHECK_EQ(df.type, static_cast<u8>(Http2FrameType::Data));
     CHECK((df.flags & http2_flag::kEndStream) != 0);
+}
+
+// http2_write_response must refuse (return 0) rather than overflow its fixed 8 KiB
+// HPACK scratch when the (untrusted, upstream-forwarded) header block is too large.
+// The bound is on raw name+value lengths, so it rejects conservatively regardless
+// of Huffman — the proxy turns a 0 return into a 502 instead of smashing the stack.
+TEST(http2_conn, write_response_rejects_oversized_headers) {
+    hpack::Encoder enc;
+    enc.init(4096);
+    static char val[600];
+    for (char& c : val) c = 'a';
+    constexpr u32 kN = 40;  // 40 * 600 = 24 KiB raw; even best-case (~5-bit) Huffman
+                            // exceeds the 8 KiB hblock, so the bound must trip.
+    char names[kN][5];
+    hpack::Header hdrs[kN];
+    for (u32 i = 0; i < kN; i++) {
+        names[i][0] = 'x';
+        names[i][1] = '-';
+        names[i][2] = static_cast<char>('a' + i / 10);
+        names[i][3] = static_cast<char>('a' + i % 10);
+        hdrs[i].name = Str{names[i], 4};
+        hdrs[i].value = Str{val, sizeof(val)};
+    }
+    u8 out[32768];
+    u32 n = http2_write_response(out, sizeof(out), enc, 1, 200, hdrs, kN, nullptr, 0);
+    CHECK_EQ(n, 0u);  // refused, not overflowed
+}
+
+// A header name too long to lowercase in http2_write_response's stack buffer must
+// be rejected (return 0 → the proxy answers 502) if it contains uppercase, rather
+// than forwarding an invalid uppercase HTTP/2 name. An all-lowercase long name is
+// still forwarded.
+TEST(http2_conn, write_response_rejects_long_uppercase_name) {
+    static char longname[300];
+    for (char& c : longname) c = 'x';
+    const char val[] = "v";
+    // All-lowercase long name: accepted (non-zero).
+    {
+        hpack::Encoder enc;
+        enc.init(4096);
+        const hpack::Header hdrs[] = {{{longname, sizeof(longname)}, {val, 1}}};
+        u8 out[1024];
+        u32 n = http2_write_response(out, sizeof(out), enc, 1, 200, hdrs, 1, nullptr, 0);
+        CHECK(n != 0u);
+    }
+    // One uppercase byte in the over-long name: rejected (0).
+    {
+        longname[100] = 'X';
+        hpack::Encoder enc;
+        enc.init(4096);
+        const hpack::Header hdrs[] = {{{longname, sizeof(longname)}, {val, 1}}};
+        u8 out[1024];
+        u32 n = http2_write_response(out, sizeof(out), enc, 1, 200, hdrs, 1, nullptr, 0);
+        CHECK_EQ(n, 0u);
+    }
+}
+
+// The h2 response path must drop connection-specific (hop-by-hop) header names a
+// route can still carry from response(headers:) — validate_response_header only
+// blocks Connection/Transfer-Encoding/Content-Length, so keep-alive / upgrade /
+// proxy-connection / te would otherwise emit an h2-illegal field.
+TEST(http2_conn, prohibited_response_header_filter) {
+    using namespace rut;
+    CHECK(h2_is_prohibited_response_header("connection", 10));
+    CHECK(h2_is_prohibited_response_header("Keep-Alive", 10));  // case-insensitive
+    CHECK(h2_is_prohibited_response_header("proxy-connection", 16));
+    CHECK(h2_is_prohibited_response_header("transfer-encoding", 17));
+    CHECK(h2_is_prohibited_response_header("Upgrade", 7));
+    CHECK(h2_is_prohibited_response_header("te", 2));
+    // Ordinary headers pass through.
+    CHECK(!h2_is_prohibited_response_header("content-type", 12));
+    CHECK(!h2_is_prohibited_response_header("x-custom", 8));
+    CHECK(!h2_is_prohibited_response_header("cache-control", 13));
 }
 
 // Open stream 1 (HEADERS without END_STREAM) and return the conn/cap ready for
