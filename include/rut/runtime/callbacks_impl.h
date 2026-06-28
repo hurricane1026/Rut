@@ -381,8 +381,33 @@ void release_upstream_slot(Loop* loop, Connection& conn) {
 // (epoll today; io_uring via the deferred-drain path) detaches the fd from the I/O
 // backend before parking it; loops without that method just close (no reuse).
 template <typename Loop>
+bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
+    // The upstream must have signalled keep-alive + a self-framed body, and the
+    // episode must not have been abandoned on timeout.
+    if (!conn.upstream_keep_alive || conn.upstream_abandoned) return false;
+    // The client→upstream request upload must have finished. An early upstream
+    // response (e.g. a 413 before the POST body drained) stops forwarding the body,
+    // leaving the backend still reading the previous request — a pooled fd would
+    // then have the next request's bytes parsed as that leftover body.
+    if ((conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state != ChunkedParser::State::Complete))
+        return false;
+    // The request must have run on the still-current config. A hot reload can
+    // repoint this (upstream_idx, backend_idx) to a different backend while the
+    // request is in flight; poll_command's drain only flushes sockets idle at the
+    // swap instant, so an in-flight old-config request completing afterward must not
+    // park its fd under the now-reused numeric key.
+    if constexpr (requires { loop->config_ptr; }) {
+        const RouteConfig* kCur = loop->config_ptr ? *loop->config_ptr : nullptr;
+        if (conn.request_config != kCur) return false;
+    }
+    return true;
+}
+
+template <typename Loop>
 void release_upstream_conn(Loop* loop, Connection& conn) {
-    if (conn.upstream_fd >= 0 && conn.upstream_keep_alive && !conn.upstream_abandoned) {
+    if (conn.upstream_fd >= 0 && proxy_upstream_reusable(loop, conn)) {
         if constexpr (requires {
                           loop->return_idle_upstream(
                               conn, conn.upstream_idx, conn.upstream_backend_idx);
@@ -411,6 +436,9 @@ template <typename Loop>
 bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (!conn.upstream_reused) return false;
     conn.upstream_reused = false;
+    // An upgrade request (WebSocket/HTTP Upgrade) is a GET but can open backend
+    // session state, so replaying it could create a duplicate session — never retry.
+    if (conn.req_wants_upgrade) return false;
     const u8 m = conn.req_method;
     const bool kIdempotent =
         m == static_cast<u8>(LogHttpMethod::Get) || m == static_cast<u8>(LogHttpMethod::Head) ||

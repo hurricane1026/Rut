@@ -3666,6 +3666,82 @@ TEST(upstream_reuse, send_error_with_buffered_response_serves_not_retries) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 }
 
+// proxy_upstream_reusable: a clean keep-alive, fully-uploaded request on the
+// current config is poolable.
+TEST(upstream_reuse, reusable_true_for_clean_keepalive) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->upstream_abandoned = false;
+    c->req_body_mode = BodyMode::None;
+    c->req_body_remaining = 0;
+    CHECK(rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// A request that ran on a now-replaced config must not be pooled (hot reload may
+// have repointed the (upstream_idx, backend_idx) endpoint to a different backend).
+TEST(upstream_reuse, reusable_rejects_stale_config) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cur{};
+    RouteConfig old{};
+    const RouteConfig* active = &cur;
+    loop.config_ptr = &active;
+    c->request_config = &old;  // ran on a since-swapped config
+    c->upstream_keep_alive = true;
+    c->req_body_mode = BodyMode::None;
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// An incomplete request upload (early upstream response cut the body short) leaves
+// the backend mid-read → not poolable.
+TEST(upstream_reuse, reusable_rejects_incomplete_upload) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 10;  // body not fully forwarded
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// An upgrade (WebSocket) request is a GET but must never be replayed on a reused-
+// socket failure — replaying could open a duplicate backend session.
+TEST(upstream_reuse, fallback_skips_upgrade_request) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_wants_upgrade = true;  // WebSocket/Upgrade GET
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+    CHECK(!rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // === RouteTable validation ===
 
 TEST(route, add_proxy_invalid_upstream_id) {
