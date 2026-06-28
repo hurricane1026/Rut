@@ -400,6 +400,52 @@ void release_upstream_conn(Loop* loop, Connection& conn) {
     conn.upstream_send_armed = false;
 }
 
+// A reused (pooled) upstream socket failed before any response byte — the backend
+// closed it between take_idle's liveness probe and our request. Fall back to a
+// fresh connect + resend, but ONLY for idempotent methods: a non-idempotent
+// request could have been received by the backend before the reset, so resending
+// risks executing it twice. Returns true (a fresh connect was started → caller
+// returns) or false (caller runs its normal failure handling, e.g. 502/close).
+// One-shot: clears upstream_reused so a fresh-connect failure isn't retried again.
+template <typename Loop>
+bool retry_reused_upstream(Loop* loop, Connection& conn) {
+    if (!conn.upstream_reused) return false;
+    conn.upstream_reused = false;
+    const u8 m = conn.req_method;
+    const bool kIdempotent =
+        m == static_cast<u8>(LogHttpMethod::Get) || m == static_cast<u8>(LogHttpMethod::Head) ||
+        m == static_cast<u8>(LogHttpMethod::Put) || m == static_cast<u8>(LogHttpMethod::Delete) ||
+        m == static_cast<u8>(LogHttpMethod::Options) || m == static_cast<u8>(LogHttpMethod::Trace);
+    if (!kIdempotent) return false;
+    const RouteConfig* cfg = conn.request_config;
+    if (!cfg) return false;
+    const auto& target = cfg->upstreams[conn.upstream_idx];
+    if (conn.upstream_backend_idx >= target.addr_count) return false;
+
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    loop->clear_upstream_fd(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    conn.upstream_recv_buf.reset();
+    const i32 fd = UpstreamPool::create_socket();
+    if (fd < 0) return false;
+    conn.upstream_fd = fd;
+    conn.upstream_start_us = monotonic_us();
+    conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    if (!loop->submit_connect(conn,
+                              &target.addrs[conn.upstream_backend_idx],
+                              sizeof(target.addrs[conn.upstream_backend_idx]))) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        return false;
+    }
+    return true;
+}
+
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
@@ -1806,6 +1852,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result < 0) {
+        // A reused pooled socket the backend reset: the request never landed, so a
+        // fresh connect + resend is safe for idempotent methods.
+        if (retry_reused_upstream(loop, conn)) return;
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -3613,6 +3662,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        // Reused pooled socket closed by the backend before responding: retry on a
+        // fresh connect for idempotent methods, else fail (close).
+        if (retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
