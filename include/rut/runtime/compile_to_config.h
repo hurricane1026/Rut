@@ -216,6 +216,16 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             for (u32 b = 0; b < up.extra_count; b++) {
                 if (!cfg.add_upstream_backend(i, up.extra_ips[b], up.extra_ports[b])) return false;
             }
+            // Attach active health-check config (data only; the frontend already
+            // validated path/interval). Fails only on an over-long path.
+            if (up.hc_enabled) {
+                if (!cfg.set_upstream_health_check(i,
+                                                   up.hc_path.ptr,
+                                                   up.hc_path.len,
+                                                   up.hc_interval_ms,
+                                                   up.hc_expected_status))
+                    return false;
+            }
         }
     } else {
         // Pre-bound mode: verify the caller added upstreams in DSL

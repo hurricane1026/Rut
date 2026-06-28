@@ -1604,12 +1604,95 @@ struct Parser {
                     }
                     auto rbrk = expect(TokenType::RBracket);
                     if (!rbrk) return core::make_unexpected(rbrk.error());
+                } else if (field_name.eq({"health_check", 12})) {
+                    // `health_check: { path: "...", interval: <dur>, status: N }`
+                    // — active-health config (data only this slice). path and
+                    // interval are required; status defaults to 200. Mirrors the
+                    // dict-field error style above (dup/unknown/missing).
+                    if (item.upstream.hc_enabled)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto hc_lbrace = expect(TokenType::LBrace);
+                    if (!hc_lbrace) return core::make_unexpected(hc_lbrace.error());
+                    bool seen_path = false;
+                    bool seen_interval = false;
+                    bool seen_status = false;
+                    while (true) {
+                        auto hc_field = expect(TokenType::Ident);
+                        if (!hc_field) return core::make_unexpected(hc_field.error());
+                        const Str hc_key = hc_field.value()->text;
+                        auto hc_colon = expect(TokenType::Colon);
+                        if (!hc_colon) return core::make_unexpected(hc_colon.error());
+                        if (hc_key.eq({"path", 4})) {
+                            if (seen_path)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto lit = expect(TokenType::StringLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            item.upstream.hc_path_lit = lit.value()->text;
+                            seen_path = true;
+                        } else if (hc_key.eq({"interval", 8})) {
+                            if (seen_interval)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto dur = expect(TokenType::DurLit);
+                            if (!dur) return core::make_unexpected(dur.error());
+                            const u32 kIntervalMs = dur_lit_to_ms(dur.value()->text);
+                            if (kIntervalMs == 0)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*dur.value()),
+                                                      dur.value()->text);
+                            item.upstream.hc_interval_ms = kIntervalMs;
+                            seen_interval = true;
+                        } else if (hc_key.eq({"status", 6})) {
+                            if (seen_status)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto lit = expect(TokenType::IntLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            u32 sv = 0;
+                            for (u32 i = 0; i < lit.value()->text.len; i++) {
+                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[i] - '0');
+                                sv = sv * 10 + digit;
+                                if (sv > 0xffffu)
+                                    return frontend_error(FrontendError::InvalidInteger,
+                                                          span_from(*lit.value()),
+                                                          lit.value()->text);
+                            }
+                            item.upstream.hc_expected_status = static_cast<u16>(sv);
+                            seen_status = true;
+                        } else {
+                            return frontend_error(FrontendError::UnexpectedToken,
+                                                  span_from(*hc_field.value()),
+                                                  hc_key);
+                        }
+                        if (!take(TokenType::Comma)) break;
+                        if (cur().type == TokenType::RBrace) break;  // trailing comma
+                    }
+                    auto hc_rbrace = expect(TokenType::RBrace);
+                    if (!hc_rbrace) return core::make_unexpected(hc_rbrace.error());
+                    if (!seen_path || !seen_interval) {
+                        // path before interval in the dict order; name the first
+                        // missing required field so the user knows what to add.
+                        const Str detail = !seen_path ? Str{"path", 4} : Str{"interval", 8};
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, span_from(*field.value()), detail);
+                    }
+                    item.upstream.hc_enabled = true;
                 } else {
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
                 }
-                if (!take(TokenType::Comma)) break;
-                if (cur().type == TokenType::RBrace) break;  // trailing comma
+                // Field separator is optional: the DSL accepts both comma-
+                // separated (`{ host: "x", port: N }`) and newline-laid-out
+                // (`{ backends: [...]\n health_check: {...} }`) blocks. The
+                // lexer drops newlines, so we stop only at the closing brace
+                // and let the next iteration parse the following `field:`.
+                (void)take(TokenType::Comma);
+                if (cur().type == TokenType::RBrace) break;
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());

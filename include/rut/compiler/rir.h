@@ -454,6 +454,13 @@ struct Module {
         u32 extra_count = 0;
         u32 extra_ips[kMaxExtraBackends] = {};
         u16 extra_ports[kMaxExtraBackends] = {};
+        // Active health-check config carried verbatim from MIR (data only; the
+        // compile→config helper feeds it to set_upstream_health_check). hc_path
+        // is a Str copied into UpstreamTarget::hc_path there.
+        bool hc_enabled = false;
+        Str hc_path;
+        u32 hc_interval_ms = 0;
+        u16 hc_expected_status = 200;
     };
     static constexpr u32 kMaxUpstreams = 32;
     Upstream upstreams[kMaxUpstreams];

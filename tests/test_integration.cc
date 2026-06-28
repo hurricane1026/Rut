@@ -10683,6 +10683,107 @@ TEST(route, upstream_backends_list_compiles) {
     rir.destroy();
 }
 
+// `health_check: { path, interval, status }` threads through every IR layer
+// into UpstreamTarget (config data only; no runtime probing in this slice).
+TEST(route, upstream_health_check_compiles) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { path: \"/healthz\", interval: 5s, status: 200 }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(rir.module.upstreams[0].hc_enabled);
+    CHECK_EQ(rir.module.upstreams[0].hc_interval_ms, 5000u);
+    CHECK_EQ(rir.module.upstreams[0].hc_expected_status, 200u);
+    REQUIRE_EQ(rir.module.upstreams[0].hc_path.len, 8u);
+    CHECK((rir.module.upstreams[0].hc_path.eq({"/healthz", 8})));
+    // populate_route_config copies the config into UpstreamTarget.
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    CHECK(cfg.upstreams[0].hc_enabled);
+    CHECK_EQ(cfg.upstreams[0].hc_path_len, 8u);
+    CHECK((Str{cfg.upstreams[0].hc_path, cfg.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
+    CHECK_EQ(cfg.upstreams[0].hc_interval_ms, 5000u);
+    CHECK_EQ(cfg.upstreams[0].hc_expected_status, 200u);
+    rir.destroy();
+}
+
+// `status:` is optional and defaults to 200.
+TEST(route, upstream_health_check_status_defaults_to_200) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { path: \"/up\", interval: 10s }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    CHECK(rir.module.upstreams[0].hc_enabled);
+    CHECK_EQ(rir.module.upstreams[0].hc_interval_ms, 10000u);
+    CHECK_EQ(rir.module.upstreams[0].hc_expected_status, 200u);
+    rir.destroy();
+}
+
+// `health_check` missing the required `path` key is rejected at parse time.
+TEST(route, upstream_health_check_missing_path_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { interval: 5s }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // parser rejects: required `path` missing
+}
+
+// `health_check` missing the required `interval` key is rejected at parse time.
+TEST(route, upstream_health_check_missing_interval_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { path: \"/healthz\" }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // parser rejects: required `interval` missing
+}
+
 // Mixing `backends:` with `host`/`port` in one upstream dict is rejected.
 TEST(route, upstream_backends_mixed_with_host_rejected) {
     using namespace rut;

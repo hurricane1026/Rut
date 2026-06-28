@@ -429,6 +429,11 @@ struct MirUpstream {
     u32 extra_count = 0;
     u32 extra_ips[kMaxExtraBackends] = {};
     u16 extra_ports[kMaxExtraBackends] = {};
+    // Active health-check config copied from HIR (data only; no probing yet).
+    bool hc_enabled = false;
+    Str hc_path{};
+    u32 hc_interval_ms = 0;
+    u16 hc_expected_status = 200;
 };
 
 struct MirModule {

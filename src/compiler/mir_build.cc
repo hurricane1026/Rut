@@ -731,6 +731,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             up.extra_ips[b] = module.upstreams[i].extra_ips[b];
             up.extra_ports[b] = module.upstreams[i].extra_ports[b];
         }
+        up.hc_enabled = module.upstreams[i].hc_enabled;
+        up.hc_path = module.upstreams[i].hc_path;
+        up.hc_interval_ms = module.upstreams[i].hc_interval_ms;
+        up.hc_expected_status = module.upstreams[i].hc_expected_status;
         if (!mir->upstreams.push(up)) return frontend_error(FrontendError::TooManyItems, up.span);
     }
 
