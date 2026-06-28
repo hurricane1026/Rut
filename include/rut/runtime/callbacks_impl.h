@@ -3766,13 +3766,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // at completion, so pooling the socket would mask the protocol violation and
     // risk desync. (On-wire leftover the backend sends later is separately caught by
     // take_idle's MSG_PEEK probe before any request goes out.)
-    if (conn.upstream_keep_alive) {
-        if (conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > resp.content_length)
-            conn.upstream_keep_alive = false;
-        else if (conn.resp_body_mode == BodyMode::Chunked && chunked_done &&
-                 chunked_consumed < kInitialBodyLen)
-            conn.upstream_keep_alive = false;
-    }
+    const bool kContentLenOverlong =
+        conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > resp.content_length;
+    const bool kChunkedOverlong = conn.resp_body_mode == BodyMode::Chunked && chunked_done &&
+                                  chunked_consumed < kInitialBodyLen;
+    if (conn.upstream_keep_alive && (kContentLenOverlong || kChunkedOverlong))
+        conn.upstream_keep_alive = false;
 
     if (loop->is_draining()) {
         u8* d = const_cast<u8*>(conn.upstream_recv_buf.data());
