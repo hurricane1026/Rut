@@ -1684,9 +1684,6 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result < 0) {
-        // A reused pooled socket the backend reset: the request never landed, so a
-        // fresh connect + resend is safe for idempotent methods.
-        if (retry_reused_upstream(loop, conn)) return;
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -1723,6 +1720,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                 }
             }
         }
+        // No early upstream response was buffered or recoverable. A reused pooled
+        // socket the backend reset before responding can retry on a fresh connect
+        // (idempotent only) — checked here, after every early-response path, so a
+        // buffered/in-flight response is never dropped in favor of a retry.
+        if (retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
