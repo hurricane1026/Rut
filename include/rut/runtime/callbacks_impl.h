@@ -777,6 +777,13 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                       }) {
             if (loop->reuse_idle_upstream(conn, route->upstream_id, static_cast<u8>(kBackend))) {
                 conn.upstream_reused = true;
+                // Driving on_upstream_connected inline skips the UpstreamConnect
+                // dispatch that refreshes the wheel to upstream_timeout, so refresh
+                // here — else a reused send that parks (EPOLLOUT) or a stalled
+                // backend would wait the longer keepalive deadline.
+                if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); }) {
+                    loop->timer.refresh(&conn, loop->upstream_timeout);
+                }
                 on_upstream_connected<Loop>(
                     static_cast<void*>(loop),
                     conn,
@@ -3664,9 +3671,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
-        // Reused pooled socket closed by the backend before responding: retry on a
-        // fresh connect for idempotent methods, else fail (close).
-        if (retry_reused_upstream(loop, conn)) return;
+        // Reused-socket dead-on-arrival is recovered on the SEND-error path only
+        // (on_upstream_request_sent), where recv_buf still holds the request to
+        // replay. Here the request send already succeeded and reset recv_buf, so a
+        // retry can't resend — fail closed. (The MSG_PEEK probe in take_idle catches
+        // the common backend-closed-idle case before the send; this is the rarer
+        // probe-then-FIN race, which we don't replay.)
         loop->close_conn(conn);
         return;
     }

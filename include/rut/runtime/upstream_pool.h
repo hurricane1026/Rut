@@ -79,6 +79,21 @@ struct UpstreamPool {
         return -1;
     }
 
+    // Close every parked socket and return to the empty (but usable) state. Called
+    // on config reload: a hot reload can repoint an upstream endpoint while keeping
+    // the same (upstream_id, backend_idx), so idle sockets parked under the old
+    // config must not be handed out for the new endpoint. No-op when already empty.
+    void drain() {
+        if (idle_count == 0) return;
+        for (u32 i = 0; i < kMaxConns; i++) {
+            if (conns[i].fd >= 0) ::close(conns[i].fd);
+            conns[i] = UpstreamConn{};
+        }
+        free_top = kMaxConns;
+        idle_count = 0;
+        for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
+    }
+
     // Close every parked socket and reset to the initial all-free state.
     void shutdown() {
         for (u32 i = 0; i < kMaxConns; i++) {

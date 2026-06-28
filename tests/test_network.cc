@@ -3008,6 +3008,23 @@ TEST(upstream_pool, shutdown_closes_idle_fds) {
     CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
 }
 
+// drain() closes every parked socket (config reload → stale endpoint), leaving the
+// pool empty but usable — guards against reusing a keep-alive fd to an old backend.
+TEST(upstream_pool, drain_closes_idle_sockets) {
+    UpstreamPool pool;
+    pool.init();
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 3, 0));
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.drain();
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(pool.take_idle(3, 0), -1);  // nothing reusable after a drain
+    CHECK(close(sv[0]) < 0);             // drain closed the parked fd
+    close(sv[1]);
+}
+
 // === SlicePool ===
 
 TEST(slice_pool, init_destroy) {
