@@ -52,7 +52,18 @@ struct H2Dispatch {
 // alloc_stream — which only reuses Closed slots — starts refusing new streams on a
 // long-lived keep-alive connection even though none are active.
 inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
-    if (Http2Stream* s = h2->find_stream(stream_id)) s->state = Http2StreamState::Closed;
+    if (Http2Stream* s = h2->find_stream(stream_id)) {
+        // We've serialized our END_STREAM response. If the peer already finished
+        // its side (HalfClosedRemote), the stream is fully closed and its slot is
+        // reusable. If the peer is still sending (Open) — e.g. a request without
+        // END_STREAM to a route that ignores the body — move to half-closed(local):
+        // keep the slot live so the engine accepts and discards the peer's trailing
+        // DATA instead of mistaking the still-open remote side for a closed stream
+        // and replying with a spurious RST_STREAM.
+        s->state = (s->state == Http2StreamState::HalfClosedRemote)
+                       ? Http2StreamState::Closed
+                       : Http2StreamState::HalfClosedLocal;
+    }
 }
 
 // Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
@@ -590,6 +601,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     }
 
     const RouteConfig* config = d.conn->request_config;
+    // Firewall gate — mirrors the HTTP/1 path (callbacks_impl.h checks
+    // firewall_allows_peer before route matching and 403s). Without this an h2
+    // client bypasses a deny/default-deny rule and can reach a protected upstream
+    // via the proxy route; enforce it here for every h2 route, before dispatch.
+    if (config && !config->firewall_allows_peer(d.conn->peer_addr, d.conn->peer_port)) {
+        h2_emit_status(d, stream_id, 403);
+        return;
+    }
     if (!config) {
         if (!end_stream && req.has_content_length) {
             h2_defer_until_data_end(d,
@@ -794,6 +813,17 @@ void h2_on_data_cb(
     if (end_stream) h2_finish_body(*d, stream_id);
 }
 
+// A peer RST_STREAM. If it cancels the stream currently parked on the async slot
+// (a wait/proxy that the client coalesced HEADERS + RST_STREAM for in one packet),
+// abandon the parked work: clear the slot so this batch neither arms the yield
+// timer nor opens the upstream nor sends a response for a stream the client already
+// cancelled. The timer/upstream are armed only AFTER process() returns, so at RST
+// time there is no in-flight I/O to undo; the config epoch pinned for the suspend
+// is released by the post-process path once async_stream is clear.
+inline void h2_on_reset_cb(void* /*ctx*/, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
+    if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+}
+
 // Forward declaration: defined below; on_h2_data re-arms via this on send done.
 template <typename Loop>
 void on_h2_data(void* lp, Connection& conn, IoEvent ev);
@@ -910,7 +940,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.h2->cb_ctx = &d;
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
-    conn.h2->on_reset = nullptr;
+    conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
     // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
     // hot reload (poll_command runs once per loop iteration, after this dispatch
     // batch) can't reclaim a RouteConfig/RouteEntry that a stream parks on —

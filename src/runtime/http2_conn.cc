@@ -562,8 +562,14 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (kDe != Http2Error::NoError) return kDe;
                     // Valid request trailers: END_STREAM, no pseudo-headers, on a
                     // stream still receiving its body.
-                    if (kEndStream && !has_pseudo && s->state == Http2StreamState::Open) {
-                        s->state = Http2StreamState::HalfClosedRemote;
+                    if (kEndStream && !has_pseudo &&
+                        (s->state == Http2StreamState::Open ||
+                         s->state == Http2StreamState::HalfClosedLocal)) {
+                        // Valid request trailers end the peer's side: close fully if
+                        // we already responded (HalfClosedLocal), else half-close remote.
+                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
+                                       ? Http2StreamState::Closed
+                                       : Http2StreamState::HalfClosedRemote;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -606,8 +612,12 @@ static Http2Error handle_frame(Http2Conn& c,
                     bool has_pseudo = false;
                     const Http2Error kDe = discard_headers(c, &has_pseudo);
                     if (kDe != Http2Error::NoError) return kDe;
-                    if (kTrailerEnd && !has_pseudo && s && s->state == Http2StreamState::Open) {
-                        s->state = Http2StreamState::HalfClosedRemote;
+                    if (kTrailerEnd && !has_pseudo && s &&
+                        (s->state == Http2StreamState::Open ||
+                         s->state == Http2StreamState::HalfClosedLocal)) {
+                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
+                                       ? Http2StreamState::Closed
+                                       : Http2StreamState::HalfClosedRemote;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -666,7 +676,13 @@ static Http2Error handle_frame(Http2Conn& c,
 
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
             if (c.on_data) c.on_data(c.cb_ctx, c, h.stream_id, p, n, kEndStream);
-            if (kEndStream) s->state = Http2StreamState::HalfClosedRemote;
+            // DATA on a HalfClosedLocal stream (we already responded; on_data above
+            // discards it) completes the stream once the peer ends it — close fully
+            // so the slot frees. An Open stream only half-closes its remote side.
+            if (kEndStream)
+                s->state = (s->state == Http2StreamState::HalfClosedLocal)
+                               ? Http2StreamState::Closed
+                               : Http2StreamState::HalfClosedRemote;
 
             // Auto-replenish: keep the peer's send windows open.
             c.conn_recv_window += static_cast<i64>(h.length);
@@ -791,6 +807,22 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
         }
         if (len - pos < kFrameHeaderSize + h.length) break;  // wait for full payload
 
+        // A serving callback parked a stream (one-at-a-time wait/proxy). We still
+        // drain control frames already coalesced in this buffer — above all a
+        // RST_STREAM that cancels the parked stream (the client sent HEADERS +
+        // RST_STREAM in one packet): processing it now fires on_reset, which frees
+        // the async slot so we never arm a timer / open an upstream and later reply
+        // on a cancelled stream. Request frames (HEADERS / CONTINUATION / DATA /
+        // PUSH_PROMISE) start new work and are HPACK-order-dependent, so stop at the
+        // first one and leave it buffered until the parked stream resumes — else the
+        // next coalesced stream would be dispatched now and refused (503).
+        if (async_stream != 0) {
+            const auto kT = static_cast<Http2FrameType>(h.type);
+            if (kT == Http2FrameType::Headers || kT == Http2FrameType::Continuation ||
+                kT == Http2FrameType::Data || kT == Http2FrameType::PushPromise)
+                break;
+        }
+
         const Http2Error kErr = handle_frame(*this, h, in + pos + kFrameHeaderSize, w);
         pos += kFrameHeaderSize + h.length;
         if (kErr != Http2Error::NoError) {
@@ -800,11 +832,6 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
             *out_written = w.len;
             return {pos, true};
         }
-        // A serving callback parked a stream (one-at-a-time wait/proxy). Stop
-        // consuming frames and leave the rest unconsumed so they queue in the
-        // caller's recv buffer until the parked stream resumes — otherwise the
-        // next coalesced stream would be dispatched now and refused (503).
-        if (async_stream != 0) break;
     }
 
     *out_written = w.len;

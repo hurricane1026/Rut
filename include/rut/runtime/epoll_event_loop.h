@@ -374,6 +374,21 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Drop any partial/EAGAIN upstream request send still buffered for this
+    // connection. epoll retains such a send in upstream_send_state with `src`
+    // pointing at pending_synth; when an h2 proxy is torn down (its upstream fd is
+    // closed) that send can never legitimately complete, yet the stale entry would
+    // make a later EPOLLOUT on a reused upstream fd ship pending_synth's (by then
+    // overwritten) bytes to the next backend. Reset it so the handle_epollout guard
+    // (remaining==0 / !src / fd<0) skips it. io_uring has no equivalent: its
+    // in-flight send is an SQE that pins pending_synth via h2_proxy_synth_quarantined
+    // until the CQE drains, so this method is epoll-only (reached via requires-guard).
+    void discard_upstream_send(Connection& c) {
+        if (c.id < EpollBackend::kMaxFdMap)
+            backend.upstream_send_state[c.id] = {
+                nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
+    }
+
     // Stop polling the upstream fd without closing it (close_conn still ::closes
     // it). epoll is level-triggered and delivers EPOLLHUP/EPOLLERR even with the
     // interest mask zeroed, so a backend that closes during the pre-tunnel 101

@@ -19,6 +19,7 @@ namespace rut {
 enum class Http2StreamState : u8 {
     Idle,
     Open,
+    HalfClosedLocal,   // we sent END_STREAM; peer may still send DATA we discard
     HalfClosedRemote,  // peer sent END_STREAM; we may still respond
     Closed,
 };

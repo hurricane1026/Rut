@@ -288,6 +288,115 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     CHECK(c.find_stream(1) == nullptr);  // closed streams are not findable
 }
 
+// Regression: a stream we've already responded to (END_STREAM sent) while the
+// peer is still sending must go half-closed(local), so the peer's trailing DATA
+// is accepted & discarded — NOT answered with a spurious RST_STREAM (which used
+// to happen because h2_close_stream marked the stream fully Closed too early).
+TEST(http2_conn, data_after_local_response_discarded_not_reset) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    // Client opens a stream WITHOUT END_STREAM (a request body follows).
+    hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/x", 2}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/false);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    Http2Stream* s = c.find_stream(1);
+    REQUIRE(s != nullptr);
+    CHECK(s->state == Http2StreamState::Open);
+    // Serving layer emits an END_STREAM response before the body arrives.
+    h2_close_stream(&c, 1);
+    CHECK(s->state == Http2StreamState::HalfClosedLocal);
+    // Trailing DATA (with END_STREAM) is accepted, not RST'd, and closes the stream.
+    u8 df[64];
+    u32 dn = http2_write_data(df, 1, reinterpret_cast<const u8*>("body"), 4, /*end_stream=*/true);
+    ow = 0;
+    c.process(df, dn, out, sizeof(out), &ow);
+    CHECK(!has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
+    CHECK(c.find_stream(1) == nullptr);  // HalfClosedLocal + peer END_STREAM → Closed
+}
+
+// A fully-completed request (peer sent END_STREAM) closes the slot outright when
+// we respond, so a long keep-alive connection can keep reusing stream slots.
+TEST(http2_conn, complete_request_closes_slot_on_response) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    Http2Stream* s = c.find_stream(1);
+    REQUIRE(s != nullptr);
+    CHECK(s->state == Http2StreamState::HalfClosedRemote);
+    h2_close_stream(&c, 1);
+    CHECK(c.find_stream(1) == nullptr);  // both sides done → Closed, slot reusable
+}
+
+// Regression: a RST_STREAM coalesced behind the request that parked the async
+// slot (wait/proxy) must still be processed in the same batch and cancel the
+// parked work — otherwise we'd open an upstream / arm a timer and later respond
+// for a stream the client already cancelled.
+TEST(http2_conn, coalesced_rst_cancels_parked_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.on_reset = &h2_on_reset_cb;  // serving-layer handler clears the async slot
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    // Serving layer parks stream 1 on the single async slot.
+    c.async_stream = 1;
+    c.async_kind = H2AsyncKind::Proxy;
+    u8 rf[kFrameHeaderSize + 4];
+    u32 rn = write_rst_stream(rf, 1, Http2Error::Cancel);
+    ow = 0;
+    Http2Result r = c.process(rf, rn, out, sizeof(out), &ow);
+    CHECK_EQ(r.consumed, rn);  // control frame drained past the park, not buffered
+    CHECK_EQ(c.async_stream, 0u);
+    CHECK(c.async_kind == H2AsyncKind::None);
+}
+
+// Complement: a NEW request's HEADERS coalesced behind a parked stream stays
+// buffered (HPACK-order-dependent, starts new work) until the parked stream
+// resumes — only control frames are drained past the park.
+TEST(http2_conn, parked_stream_buffers_new_request_headers) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 hf[256];
+    u32 hn = http2_write_headers(hf, sizeof(hf), 1, hs, 2, /*end_stream=*/true);
+    u8 in[384];
+    u32 inlen = with_preface(in, hf, hn);
+    u8 out[256];
+    u32 ow = 0;
+    c.process(in, inlen, out, sizeof(out), &ow);
+    c.async_stream = 1;
+    c.async_kind = H2AsyncKind::Proxy;
+    cap.headers_calls = 0;
+    hpack::Header hs2[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/y", 2}}};
+    u8 hf2[256];
+    u32 hn2 = http2_write_headers(hf2, sizeof(hf2), 3, hs2, 2, /*end_stream=*/true);
+    ow = 0;
+    Http2Result r = c.process(hf2, hn2, out, sizeof(out), &ow);
+    CHECK_EQ(r.consumed, 0u);         // left buffered for resume
+    CHECK_EQ(cap.headers_calls, 0u);  // not dispatched while parked
+}
+
 TEST(http2_conn, partial_frame_left_unconsumed) {
     Http2Conn c;
     Capture cap;

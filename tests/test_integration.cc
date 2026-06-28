@@ -4161,6 +4161,58 @@ TEST(shard, serves_http2_routed) {
     close(lfd);
 }
 
+TEST(shard, serves_http2_firewall_denies) {
+    // A deny rule for the loopback peer must 403 every h2 request — including the
+    // proxy route — before any upstream is opened, mirroring the HTTP/1 firewall
+    // gate. Without the gate the proxy route would have opened the upstream (502).
+    RouteConfig cfg;
+    cfg.add_static("/health", 0, 204);
+    cfg.add_upstream("api", 0x7F000001, 8080);
+    cfg.add_proxy("/api/", 0, 0);
+    REQUIRE(cfg.add_firewall_deny_ip(0x7f000001));  // 127.0.0.1
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    // A single proxy request: the firewall gate must answer 403 BEFORE the proxy
+    // action opens the upstream. Without the gate this route reaches the (dead)
+    // upstream and returns 502, so 403 specifically proves the peer is rejected
+    // ahead of route dispatch. (One request keeps the assertion independent of the
+    // response encoder's dynamic HPACK indexing, which the simple test-side decoder
+    // can't follow across streams.)
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api/x", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 403u);  // denied before reaching upstream
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(shard, serves_http2_concurrent_streams) {
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);

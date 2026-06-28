@@ -1729,6 +1729,11 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
         conn.upstream_fd = -1;
         loop->clear_upstream_fd(conn.id);
     }
+    // epoll-only: drop any partial upstream send still referencing pending_synth so
+    // a later EPOLLOUT on a reused upstream fd can't ship overwritten bytes to the
+    // next backend (io_uring uses the h2_proxy_synth_quarantined SQE-drain path).
+    if constexpr (requires { loop->discard_upstream_send(conn); })
+        loop->discard_upstream_send(conn);
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
     release_upstream_slot(loop, conn);
