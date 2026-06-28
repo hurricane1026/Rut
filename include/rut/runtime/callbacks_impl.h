@@ -2695,6 +2695,13 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     const bool kWasThrottled = conn.throttle_paused;
     conn.throttle_paused = false;
     conn.throttle_pending_len = 0;
+    // Surplus upstream bytes after the self-framed body — left in the buffer by the
+    // body pump (already consumed from the socket, so take_idle's MSG_PEEK can't see
+    // them) — mean a desynced/overlong backend; don't pool such a connection. (A
+    // TLS-proxied stream parks its tail in this buffer legitimately, so skip the
+    // check there to avoid needlessly dropping a reusable connection.)
+    if (!conn.tls_proxy_stream && conn.upstream_recv_buf.len() > 0)
+        conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 
@@ -2793,6 +2800,13 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight) {
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        // EOF/error before any response, possibly before the request send even
+        // completed (epoll can deliver a reused socket's FIN/RST while the send is
+        // still parked on EPOLLOUT). The request is still in recv_buf, so retry on a
+        // fresh connect for idempotent reused requests. Gated on !upstream_send_armed
+        // so we never abandon an in-flight io_uring send SQE (its later CQE would be
+        // misrouted to the retried connection).
+        if (!conn.upstream_send_armed && retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
@@ -3938,7 +3952,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > resp.content_length;
     const bool kChunkedOverlong = conn.resp_body_mode == BodyMode::Chunked && chunked_done &&
                                   chunked_consumed < kInitialBodyLen;
-    if (conn.upstream_keep_alive && (kContentLenOverlong || kChunkedOverlong))
+    // No-body responses (HEAD / 204 / 205 / 304) must have nothing after the
+    // headers; any trailing bytes mean a desynced/malformed keep-alive backend.
+    const bool kNoBodyOverlong = conn.resp_body_mode == BodyMode::None && kInitialBodyLen > 0;
+    if (conn.upstream_keep_alive && (kContentLenOverlong || kChunkedOverlong || kNoBodyOverlong))
         conn.upstream_keep_alive = false;
 
     if (loop->is_draining()) {

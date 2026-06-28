@@ -3781,6 +3781,27 @@ TEST(upstream_reuse, overlong_response_not_reusable) {
     CHECK(!c->upstream_keep_alive);  // overlong body → not reusable
 }
 
+// A no-body response (204/304/HEAD) with any bytes after the headers means a
+// desynced keep-alive backend — not reusable.
+TEST(upstream_reuse, no_body_response_with_surplus_not_reusable) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // 204 No Content carries no body, but the backend appended a stray byte.
+    static const char kResp[] = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\nX";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(!c->upstream_keep_alive);  // surplus after no-body headers → not reusable
+}
+
 // === RouteTable validation ===
 
 TEST(route, add_proxy_invalid_upstream_id) {
