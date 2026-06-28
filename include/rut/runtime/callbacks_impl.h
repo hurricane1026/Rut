@@ -94,6 +94,199 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     return idx;
 }
 
+// --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
+//
+// A probe is a Connection with fd == -1 (no downstream client) whose upstream_fd
+// is a fresh socket to ONE backend of an hc_enabled upstream. The 1s sweep
+// (EventLoopCRTP::sweep_health_probes) calls start_health_probe per backend; the
+// probe connects, sends `GET <hc_path> HTTP/1.1`, parses the response status, and
+// feeds the result into the SAME per-shard BackendHealth used by passive
+// ejection (record_backend_result), so select_backend honors both signals — no
+// parallel health state. Teardown goes through free_probe_conn (never the full
+// close_conn, which moves per-request metrics/epoch/access-log counters).
+//
+// Bounded recv attempts before a probe gives up (counts as a failed probe).
+inline constexpr u32 kMaxProbeReads = 4;
+
+// Format "<ipv4>:<port>" (network-order sockaddr_in) for the probe Host header.
+// out must hold >= 22 bytes ("255.255.255.255:65535"). Returns bytes written.
+inline u32 format_probe_host(char* out, const struct sockaddr_in& addr) {
+    u32 w = 0;
+    const auto* bytes = reinterpret_cast<const u8*>(&addr.sin_addr.s_addr);
+    for (u32 i = 0; i < 4; i++) {
+        if (i > 0) out[w++] = '.';
+        const u8 kOctet = bytes[i];
+        if (kOctet >= 100) out[w++] = static_cast<char>('0' + kOctet / 100);
+        if (kOctet >= 10) out[w++] = static_cast<char>('0' + (kOctet / 10) % 10);
+        out[w++] = static_cast<char>('0' + kOctet % 10);
+    }
+    out[w++] = ':';
+    u16 port = ntohs(addr.sin_port);
+    char tmp[5];
+    u32 t = 0;
+    if (port == 0) tmp[t++] = '0';
+    while (port > 0) {
+        tmp[t++] = static_cast<char>('0' + port % 10);
+        port = static_cast<u16>(port / 10);
+    }
+    for (u32 i = 0; i < t; i++) out[w++] = tmp[t - 1 - i];
+    return w;
+}
+
+// Build `GET <hc_path> HTTP/1.1\r\nHost: <ip:port>\r\nConnection: close\r\n
+// User-Agent: rut-healthcheck\r\n\r\n` into the connection-owned recv_buf (a
+// probe never receives client bytes, so recv_buf is free for the request).
+inline void build_probe_request(Connection& conn, const UpstreamTarget& target, u32 backend_idx) {
+    Buffer& buf = conn.recv_buf;
+    static const char kGet[] = "GET ";
+    buf.write(reinterpret_cast<const u8*>(kGet), 4);
+    if (target.hc_path_len > 0)
+        buf.write(reinterpret_cast<const u8*>(target.hc_path), target.hc_path_len);
+    else
+        buf.write(reinterpret_cast<const u8*>("/"), 1);
+    static const char kProto[] = " HTTP/1.1\r\nHost: ";
+    buf.write(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
+    char host[24];
+    const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
+    buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+    static const char kTail[] = "\r\nConnection: close\r\nUser-Agent: rut-healthcheck\r\n\r\n";
+    buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
+}
+
+template <typename Loop>
+void free_probe_conn(Loop* loop, Connection& conn) {
+    // Minimal teardown — close the probe socket (EPOLL_CTL_DEL first) and return
+    // the slot. Never touches metrics/epoch/access-log/keepalive (the probe is
+    // not a real request). free_health_probe is epoll-only; probes never run on
+    // io_uring this slice, so this is only instantiated for the epoll loop.
+    loop->free_health_probe(conn);
+}
+
+template <typename Loop>
+void on_probe_response(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_probe_sent(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_probe_connected(void* lp, Connection& conn, IoEvent ev);
+
+template <typename Loop>
+void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
+    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (config == nullptr || upstream_idx >= config->upstream_count) return;
+    const UpstreamTarget& target = config->upstreams[upstream_idx];
+    if (backend_idx >= target.addr_count) return;
+
+    Connection* cptr = loop->alloc_conn();
+    if (cptr == nullptr) return;  // slot exhaustion: never starve real traffic
+    Connection& conn = *cptr;
+    conn.is_health_probe = true;
+    conn.fd = -1;
+    conn.upstream_idx = upstream_idx;
+    conn.upstream_backend_idx = static_cast<u8>(backend_idx);
+
+    const u64 kNowUs = monotonic_us();
+    const i32 kProbeFd = UpstreamPool::create_socket();
+    if (kProbeFd < 0) {
+        // Nothing registered yet — record the failure and free the raw slot.
+        record_backend_result(upstream_idx, backend_idx, /*success=*/false, kNowUs);
+        loop->free_conn(conn);
+        return;
+    }
+    conn.upstream_fd = kProbeFd;
+    // The response lands in upstream_recv_buf (recv_buf holds the request).
+    if (!loop->alloc_upstream_buf(conn)) {
+        record_backend_result(upstream_idx, backend_idx, /*success=*/false, kNowUs);
+        free_probe_conn(loop, conn);
+        return;
+    }
+
+    conn.recv_buf.reset();
+    build_probe_request(conn, target, backend_idx);
+
+    conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
+    if (!loop->submit_connect(
+            conn, &target.addrs[backend_idx], sizeof(target.addrs[backend_idx]))) {
+        record_backend_result(upstream_idx, backend_idx, /*success=*/false, kNowUs);
+        free_probe_conn(loop, conn);
+    }
+}
+
+template <typename Loop>
+void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result < 0) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    conn.set_slots(nullptr, nullptr, nullptr, &on_probe_sent<Loop>);
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len())) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+    }
+}
+
+template <typename Loop>
+void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result < 0) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    conn.upstream_recv_buf.reset();
+    conn.upstream_attempts = 0;  // reuse as the bounded recv-attempt counter
+    conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
+    if (!loop->submit_recv_upstream(conn)) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+    }
+}
+
+template <typename Loop>
+void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const u64 kNowUs = monotonic_us();
+    if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, kNowUs);
+        free_probe_conn(loop, conn);
+        return;
+    }
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    resp.reset();
+    parser.reset();
+    const ParseStatus kStatus =
+        parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    // Headers split across packets: read again (bounded) if more can still arrive.
+    if (kStatus == ParseStatus::Incomplete && ev.result > 0 &&
+        conn.upstream_attempts < kMaxProbeReads && conn.upstream_recv_buf.write_avail() > 0) {
+        conn.upstream_attempts++;
+        if (!loop->submit_recv_upstream(conn)) {
+            record_backend_result(
+                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, kNowUs);
+            free_probe_conn(loop, conn);
+        }
+        return;
+    }
+    // Complete + expected status → healthy; anything else (Error, Incomplete with
+    // no more data, unexpected status) → failure. A config swap that dropped the
+    // upstream also fails the probe (treated as unhealthy, harmless).
+    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    bool healthy = false;
+    if (kStatus == ParseStatus::Complete && config != nullptr &&
+        conn.upstream_idx < config->upstream_count) {
+        healthy = (resp.status_code == config->upstreams[conn.upstream_idx].hc_expected_status);
+    }
+    record_backend_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, kNowUs);
+    free_probe_conn(loop, conn);
+}
+
 u8 map_log_method(HttpMethod method);
 u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
 void capture_request_metadata(Connection& conn);

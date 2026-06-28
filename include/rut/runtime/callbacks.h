@@ -116,6 +116,15 @@ void h2_proxy_fail(Loop* loop, Connection& conn, u16 status);
 template <typename Loop>
 void throttle_resume(Loop* loop, Connection& conn);
 
+// Start one built-in active health-check probe to (upstream_idx, backend_idx):
+// connect a fresh socket, GET <hc_path>, parse the status, and feed the result
+// into the shared BackendHealth via record_backend_result. Invoked from the
+// per-shard 1s sweep (EventLoopCRTP::sweep_health_probes). Defined in
+// callbacks_impl.h; EPOLL ONLY this slice. No-op if the slot pool is exhausted
+// (never starve real traffic with probes).
+template <typename Loop>
+void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
+
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);
 

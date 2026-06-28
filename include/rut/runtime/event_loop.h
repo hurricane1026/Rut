@@ -209,6 +209,56 @@ public:
                 now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
         }
     }
+
+    // --- Active health-check probes (`health_check { ... }`) — EPOLL ONLY ---
+    // Per-upstream probe deadlines, mirroring timer_deadline_ns. Re-armed (from
+    // activation) whenever the active config changes — same generation guard as
+    // fire_due_timers — so an upstream's `interval` measures from config install,
+    // not from a stale deadline. Lives in the CRTP base so the re-arm bookkeeping
+    // runs on BOTH backends; the actual probe issue is gated to epoll this slice
+    // (Derived::kSupportsHealthProbe), since only the epoll loop can synchronously
+    // tear a probe Connection down. io_uring probing is a deliberate follow-up.
+    u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
+    const RouteConfig* health_armed_config = nullptr;
+
+    void sweep_health_probes() {
+        const RouteConfig** cfg_ptr = self().config_ptr;
+        const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
+        const u64 now = monotonic_ns();
+        if (cfg != health_armed_config) {
+            health_armed_config = cfg;
+            if (cfg != nullptr) {
+                const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
+                                  ? cfg->upstream_count
+                                  : RouteConfig::kMaxUpstreams;
+                for (u32 u = 0; u < m; u++)
+                    health_probe_deadline_ns[u] =
+                        now + static_cast<u64>(cfg->upstreams[u].hc_interval_ms) * 1'000'000ull;
+            }
+            return;
+        }
+        if (cfg == nullptr || cfg->upstream_count == 0) return;
+        // Deadline re-arm above runs everywhere; the probe issue below is epoll
+        // only. On io_uring this returns here (a safe no-op for the sweep).
+        if constexpr (!Derived::kSupportsHealthProbe) {
+            return;
+        } else {
+            const u32 n = cfg->upstream_count < RouteConfig::kMaxUpstreams
+                              ? cfg->upstream_count
+                              : RouteConfig::kMaxUpstreams;
+            for (u32 u = 0; u < n; u++) {
+                const UpstreamTarget& up = cfg->upstreams[u];
+                if (!up.hc_enabled) continue;
+                if (now < health_probe_deadline_ns[u]) continue;
+                // Re-arm from now (not the missed deadline) to avoid a catch-up
+                // burst after a stall, mirroring fire_due_timers.
+                health_probe_deadline_ns[u] =
+                    now + static_cast<u64>(up.hc_interval_ms) * 1'000'000ull;
+                for (u32 b = 0; b < up.addr_count; b++)
+                    start_health_probe(&self(), static_cast<u16>(u), b);
+            }
+        }
+    }
 };
 
 template <typename Backend>

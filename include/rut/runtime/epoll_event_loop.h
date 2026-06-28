@@ -194,6 +194,11 @@ public:
     // so this rarely matters). Idle keep-alive uses keepalive_timeout — a
     // separate knob. TODO: a dedicated connect-timeout if hung connects matter.
     static constexpr u32 kDefaultUpstreamTimeout = 30;
+    // The epoll loop can synchronously tear down a health-probe Connection
+    // (close upstream_fd, EPOLL_CTL_DEL, free the slot), so it issues active
+    // health-check probes from EventLoopCRTP::sweep_health_probes. io_uring sets
+    // this false — its sweep only re-arms deadlines (probing is a follow-up).
+    static constexpr bool kSupportsHealthProbe = true;
     SlicePool pool;
     // Per-shard HTTP/2 engine pool — lazily handed out when a connection
     // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
@@ -517,7 +522,36 @@ public:
         backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
     }
 
+    // Minimal teardown for a health-probe Connection (fd == -1, no downstream).
+    // Deliberately does NOT touch metrics / epoch / access-log / keepalive — a
+    // probe never ran a real request, so none of close_conn's per-request
+    // side-effects apply. Removes the probe socket from epoll, closes it, drops
+    // the fd-map + send-state bookkeeping, and returns the slot to the free list.
+    void free_health_probe(Connection& c) {
+        if (c.upstream_fd >= 0) {
+            backend.cancel(c.upstream_fd, c.id);  // EPOLL_CTL_DEL
+            ::close(c.upstream_fd);
+            c.upstream_fd = -1;
+        }
+        c.upstream_recv_armed = false;
+        c.upstream_send_armed = false;
+        if (c.id < EpollBackend::kMaxFdMap) {
+            backend.upstream_fd_map[c.id] = -1;
+            backend.downstream_fd_map[c.id] = -1;
+        }
+        backend.clear_send_state(c.id);
+        this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
+    }
+
     void close_conn_impl(Connection& c) {
+        // A health probe never ran a real request: route it through the minimal
+        // teardown so no metrics/epoch/access-log counters move (covers the rare
+        // keepalive-timeout / drain / force-close path that reaches a stalled
+        // probe; the normal probe lifecycle frees via free_probe_conn).
+        if (c.is_health_probe) {
+            free_health_probe(c);
+            return;
+        }
         // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
         // the config epoch without an h1-style req_start_us (see event_loop.h).
         if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
@@ -738,6 +772,7 @@ public:
                     });
                 }
                 this->fire_due_timers();
+                this->sweep_health_probes();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

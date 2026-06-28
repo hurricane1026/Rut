@@ -1959,6 +1959,144 @@ TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
     destroy_real_loop(loop);
 }
 
+// A tiny backend whose HTTP status for the health path is switchable at runtime
+// (atomic), so one server can model a failing-then-recovering backend. Each probe
+// uses Connection: close, so every probe is a fresh accepted connection.
+struct HealthProbeServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<u16> status{200};
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~HealthProbeServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<HealthProbeServer*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[1024];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            const u16 code = s->status.load(std::memory_order_acquire);
+            char resp[128];
+            const char* reason = (code == 200) ? "OK" : "Service Unavailable";
+            int n = snprintf(resp,
+                             sizeof(resp),
+                             "HTTP/1.1 %u %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                             static_cast<unsigned>(code),
+                             reason);
+            if (n > 0) (void)send_all(client, resp, static_cast<u32>(n));
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Active health checks (slice 2, epoll): the built-in probe sweep connects to an
+// hc_enabled backend, GETs the health path, and feeds the result into the SHARED
+// BackendHealth via record_backend_result. A backend that answers the probe with
+// 503 (!= hc_expected_status) is ejected once it crosses the consecutive-failure
+// threshold; a recovered 200 clears the ejection. Driven deterministically in the
+// test thread — sweep + a manual event pump — so probes share the thread_local
+// health table we assert against (no multi-second sleeps).
+TEST(active_health_e2e, probe_ejects_failing_backend_then_recovers) {
+    using namespace rut;
+    HealthProbeServer backend;
+    REQUIRE(backend.setup());
+    backend.status.store(503, std::memory_order_release);  // unhealthy first
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/1, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    // Start from a clean health record (thread_local may carry state across tests
+    // that ran a proxy on this same thread).
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    // Pump events on THIS thread until the in-flight probe frees its slot. Probe
+    // I/O is local + responsive, so wait() only blocks until the next probe step.
+    auto pump = [&]() {
+        IoEvent events[64];
+        for (int it = 0; it < 200 && loop->active_count() > 0; it++) {
+            u32 n = loop->backend.wait(events, 64, loop->conns, RealLoop::kMaxConns);
+            for (u32 i = 0; i < n; i++) loop->dispatch(events[i]);
+        }
+    };
+
+    // First sweep detects the config install → arms deadlines, issues nothing.
+    loop->sweep_health_probes();
+
+    // Three failing probes (== kBackendFailThreshold) eject the backend.
+    for (u32 round = 0; round < 3; round++) {
+        loop->health_probe_deadline_ns[uid] = 0;  // force "due"
+        loop->sweep_health_probes();              // issues one probe
+        pump();                                   // run it to completion
+    }
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    // Backend recovers: a single successful probe clears the ejection.
+    backend.status.store(200, std::memory_order_release);
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    pump();
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+    backend.teardown();
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

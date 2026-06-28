@@ -65,6 +65,10 @@ private:
 
 public:
     static constexpr u32 kMaxConns = 16384;
+    // Active health-check probing requires synchronous probe teardown; the
+    // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
+    // deadlines here and issues no connects (epoll-only this slice).
+    static constexpr bool kSupportsHealthProbe = false;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
     // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
@@ -919,6 +923,9 @@ public:
                     });
                 }
                 this->fire_due_timers();
+                // io_uring: sweep re-arms health-probe deadlines but issues no
+                // probes (kSupportsHealthProbe == false). EPOLL-only this slice.
+                this->sweep_health_probes();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

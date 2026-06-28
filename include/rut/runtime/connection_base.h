@@ -123,6 +123,11 @@ struct ConnectionBase {
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    // Active health-check probe (slice 2, epoll only): this Connection is not a
+    // real client request but a built-in periodic HTTP probe to one upstream
+    // backend (fd == -1, no downstream; upstream_fd is the probe socket). Gates
+    // close_conn to the minimal probe teardown (no metrics/epoch/access-log).
+    bool is_health_probe;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -486,6 +491,7 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
+        is_health_probe = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;

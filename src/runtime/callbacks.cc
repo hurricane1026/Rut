@@ -741,6 +741,10 @@ template void resume_jit_handler<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void respond_upstream_timeout<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void h2_proxy_fail<EpollEventLoop>(EpollEventLoop*, Connection&, u16);
 template void throttle_resume<EpollEventLoop>(EpollEventLoop*, Connection&);
+// Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
+// re-arms deadlines but issues no probes), so only the epoll instantiation is
+// emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
+template void start_health_probe<EpollEventLoop>(EpollEventLoop*, u16, u32);
 
 template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
