@@ -3622,6 +3622,33 @@ TEST(upstream_reuse, fallback_noop_when_not_reused) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 }
 
+// Regression: a reused-socket send error must NOT retry when an early upstream
+// response is already buffered (the backend replied while our send was in flight).
+// on_upstream_request_sent serves the buffered response instead of reconnecting.
+TEST(upstream_reuse, send_error_with_buffered_response_serves_not_retries) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);  // idempotent → retry IS eligible
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    // Backend already replied (early response buffered) before our send errored.
+    static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, -1));
+
+    // The buffered response is served (no fresh connect / dropped response).
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
 // === RouteTable validation ===
 
 TEST(route, add_proxy_invalid_upstream_id) {
