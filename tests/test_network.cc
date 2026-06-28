@@ -3371,6 +3371,73 @@ TEST(upstream_pool, put_idle_full_rejects) {
     close(fd);
 }
 
+// === Idle-reuse dead-socket fallback (retry_reused_upstream) ===
+
+// A reused upstream that died before any response retries on a fresh connect for
+// an idempotent method: a new connect is submitted and upstream_reused is cleared
+// (one-shot, so a fresh-connect failure isn't retried again).
+TEST(upstream_reuse, fallback_retries_idempotent_method) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);  // idempotent
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);  // fresh connect submitted
+    CHECK(!c->upstream_reused);                             // one-shot
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A non-idempotent reused request is NOT resent (the backend may have received it
+// before the reset → double-execution risk); the caller falls through to 502.
+TEST(upstream_reuse, fallback_skips_non_idempotent_method) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);  // NOT idempotent
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(!rut::retry_reused_upstream(&loop, *c));          // no retry
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);  // no fresh connect
+    CHECK(!c->upstream_reused);                             // still cleared (one-shot)
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A non-reused (freshly-connected) failure never triggers the fallback.
+TEST(upstream_reuse, fallback_noop_when_not_reused) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->upstream_reused = false;
+    loop.backend.clear_ops();
+    CHECK(!rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
 // === RouteTable validation ===
 
 TEST(route, add_proxy_invalid_upstream_id) {
