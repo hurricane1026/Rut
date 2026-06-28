@@ -427,7 +427,7 @@ public:
         c.upstream_fd = -1;
         c.upstream_recv_armed = false;
         c.upstream_send_armed = false;
-        if (!upstream->put_idle(fd, upstream_id, backend_idx)) ::close(fd);
+        if (!upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs())) ::close(fd);
     }
 
     // Drop any partial/EAGAIN upstream request send still buffered for this
@@ -781,6 +781,11 @@ public:
                     });
                 }
                 this->fire_due_timers();
+                // Evict idle pooled upstream sockets past the keepalive deadline
+                // (1s-granular) — bounds dead-socket accumulation for endpoints that
+                // never get another request to trigger take_idle's probe.
+                if (upstream)
+                    upstream->sweep(static_cast<u32>(monotonic_secs()), keepalive_timeout);
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
