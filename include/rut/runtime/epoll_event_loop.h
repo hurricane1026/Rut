@@ -206,6 +206,10 @@ public:
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
+
+    // Background timers (`timer name, every: D`) are scheduled by the shared
+    // EventLoopCRTP base (fire_due_timers + timer_deadline_ns/timer_fire_count),
+    // so both backends drive them.
     TlsServerContext* tls_server = nullptr;
 
     AccessLogRing* access_log = nullptr;
@@ -291,6 +295,9 @@ public:
 
     void run() {
         backend.add_accept();
+        // Arm timer deadlines from activation (config is installed before run()),
+        // so `every: D` measures from here rather than from the first 1s tick.
+        this->fire_due_timers();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
@@ -299,6 +306,12 @@ public:
                 dispatch(events[i]);
             }
             poll_command();
+            // poll_command may have installed a new config (hot reload); re-arm
+            // timers now so a freshly activated `every: D` measures from the reload
+            // rather than waiting for the next 1s tick to notice (and then another
+            // interval before it actually fires). Cheap no-op when the config is
+            // unchanged (fire_due_timers compares the armed config pointer).
+            this->fire_due_timers();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
@@ -669,6 +682,8 @@ public:
         rearm_yield_timerfd();
     }
 
+    // fire_due_timers() is provided by the shared EventLoopCRTP base.
+
     // --- Dispatch ---
 
     void dispatch(const IoEvent& ev) {
@@ -722,6 +737,7 @@ public:
                         }
                     });
                 }
+                this->fire_due_timers();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

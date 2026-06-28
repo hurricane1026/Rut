@@ -43,12 +43,19 @@
 // `cfg` may have been partially populated, so callers should discard
 // it rather than try to reuse it.
 
+#include "rut/compiler/hir.h"  // HirModule::kMaxTimers (frontend timer cap)
 #include "rut/compiler/rir.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
+
+// The frontend (analyze.cc) caps declared timers at HirModule::kMaxTimers so a
+// surplus is a deterministic DSL error; that cap must fit the runtime table, or
+// RouteConfig::add_timer would still reject the overflow at load time.
+static_assert(HirModule::kMaxTimers <= RouteConfig::kMaxTimers,
+              "frontend timer cap must not exceed the runtime timer table");
 
 inline bool rir_function_needs_req_body(const rir::Function& fn) {
     if (fn.blocks == nullptr) return false;
@@ -64,21 +71,31 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
 
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
-    if (mod.func_count > RouteConfig::kMaxRoutes) return false;
     if (mod.func_count > 0 && mod.functions == nullptr) return false;
 
+    // Count only HTTP routes — timer functions are fired on a schedule, not matched
+    // against request paths. Including them would (a) overflow the kMaxRoutes-sized
+    // paths[] when func_count exceeds kMaxRoutes (routes + timers can reach
+    // kMaxRoutes + kMaxTimers), and (b) let a timer name influence trie selection.
     Str paths[RouteConfig::kMaxRoutes];
+    u32 route_count = 0;
     for (u32 i = 0; i < mod.func_count; i++) {
-        paths[i] = mod.functions[i].route_pattern;
-        if (paths[i].len > 0 && paths[i].ptr == nullptr) return false;
+        if (mod.functions[i].is_timer) continue;
+        if (route_count >= RouteConfig::kMaxRoutes) return false;
+        paths[route_count] = mod.functions[i].route_pattern;
+        if (paths[route_count].len > 0 && paths[route_count].ptr == nullptr) return false;
+        route_count++;
     }
 
-    if (needs_segment_aware(paths, mod.func_count)) return cfg.use_segment_trie();
+    if (needs_segment_aware(paths, route_count)) return cfg.use_segment_trie();
     return cfg.use_art();
 }
 
 inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::JitEngine& engine) {
-    if (cfg.route_count != 0) return false;
+    // Guard on BOTH tables: a timer-only module never bumps route_count, so a
+    // route_count-only precondition would let a second call re-append the same
+    // timers (firing them twice per interval).
+    if (cfg.route_count != 0 || cfg.timer_count != 0) return false;
     if (!configure_route_dispatch(cfg, mod)) return false;
 
     for (u32 i = 0; i < mod.func_count; i++) {
@@ -87,15 +104,26 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         if (fn.route_pattern.len > 0 && fn.route_pattern.ptr == nullptr) return false;
         if (fn.name.len > 0 && fn.name.ptr == nullptr) return false;
 
-        char path[RouteEntry::kMaxPathLen];
-        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
-        path[fn.route_pattern.len] = '\0';
-
         char symbol[256];
         jit::format_handler_symbol(fn.name, symbol, sizeof(symbol));
         auto* addr = engine.lookup(symbol);
         if (!addr) return false;
         auto handler = reinterpret_cast<jit::HandlerFn>(addr);
+
+        // A timer compiles like a route but is fired on schedule, not matched
+        // against requests: register it into the timer table (route_pattern holds
+        // the timer name) and skip route registration.
+        if (fn.is_timer) {
+            if (!cfg.add_timer(
+                    fn.route_pattern.ptr, fn.route_pattern.len, fn.timer_interval_ms, handler))
+                return false;
+            continue;
+        }
+
+        char path[RouteEntry::kMaxPathLen];
+        for (u32 j = 0; j < fn.route_pattern.len; j++) path[j] = fn.route_pattern.ptr[j];
+        path[fn.route_pattern.len] = '\0';
+
         if (!cfg.add_jit_handler(path, fn.http_method, handler, rir_function_needs_req_body(fn)))
             return false;
         // @rateLimit decorators → stacked token-bucket rules, each with its own

@@ -286,6 +286,11 @@ struct MirFunction {
     RateLimitRuleSet rate_limit{};
     // @throttle client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    // Timer function: a `timer name, every: D {...}` periodic task (path holds the
+    // name). Carried to the RIR Function so config registers it into the timer
+    // table instead of the route table.
+    bool is_timer = false;
+    u32 timer_interval_ms = 0;
 
     MirFunction() = default;
     MirFunction(const MirFunction& other)
@@ -302,7 +307,9 @@ struct MirFunction {
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
-          throttle_down_bps(other.throttle_down_bps) {
+          throttle_down_bps(other.throttle_down_bps),
+          is_timer(other.is_timer),
+          timer_interval_ms(other.timer_interval_ms) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -323,6 +330,8 @@ struct MirFunction {
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        is_timer = other.is_timer;
+        timer_interval_ms = other.timer_interval_ms;
         rebase_from(other);
         return *this;
     }
@@ -340,7 +349,9 @@ struct MirFunction {
           has_explicit_resume_blocks(other.has_explicit_resume_blocks),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
-          throttle_down_bps(other.throttle_down_bps) {
+          throttle_down_bps(other.throttle_down_bps),
+          is_timer(other.is_timer),
+          timer_interval_ms(other.timer_interval_ms) {
         for (u32 i = 0; i < kMaxWaits + 1; i++) resume_blocks[i] = other.resume_blocks[i];
         rebase_from(other);
     }
@@ -361,6 +372,8 @@ struct MirFunction {
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        is_timer = other.is_timer;
+        timer_interval_ms = other.timer_interval_ms;
         rebase_from(other);
         return *this;
     }
@@ -419,7 +432,11 @@ struct MirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxStructs = 64;
     static constexpr u32 kMaxVariants = 32;
-    static constexpr u32 kMaxFunctions = 96;
+    // One MirFunction per HIR route, INCLUDING synthesized timer routes, so this
+    // must cover HirModule::kMaxRoutes + kMaxTimers (kept in sync by a static_assert
+    // in mir_build.cc). Otherwise a config near the route cap plus timers analyzes
+    // but fails MIR lowering with TooManyItems.
+    static constexpr u32 kMaxFunctions = 112;  // 96 routes + 16 timers
     static constexpr u32 kMaxTypeShapes = 256;
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;

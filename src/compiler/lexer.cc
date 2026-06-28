@@ -54,6 +54,9 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"route", 5})) return TokenType::KwRoute;
     if (text.eq({"return", 6})) return TokenType::KwReturn;
     if (text.eq({"forward", 7})) return TokenType::KwForward;
+    // `timer` is recognized CONTEXTUALLY at top level (a `timer name, every: ...`
+    // declaration), NOT reserved — otherwise `wait any(recv, timer)` and any
+    // identifier named `timer` would stop parsing. Mirrors `websocket`/`response`.
     // `websocket` is recognized CONTEXTUALLY in the parser (only `websocket(` in
     // return position is the builder), NOT reserved as a keyword — otherwise the
     // `.websocket` variant literal (e.g. `req.upgrade == .websocket`) and any

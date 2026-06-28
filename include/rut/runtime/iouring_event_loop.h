@@ -202,6 +202,9 @@ public:
 
     void run() {
         backend.add_accept();
+        // Arm timer deadlines from activation (config is installed before run()),
+        // so `every: D` measures from here rather than from the first 1s tick.
+        this->fire_due_timers();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
@@ -212,6 +215,8 @@ public:
             reclaim_pending();
             retry_deferred_accepts();
             poll_command();
+            // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
+            this->fire_due_timers();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
@@ -913,6 +918,7 @@ public:
                         }
                     });
                 }
+                this->fire_due_timers();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

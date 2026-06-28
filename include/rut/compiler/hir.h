@@ -992,6 +992,12 @@ struct HirRoute {
     // until the JIT path lands.)
     bool is_ws_terminate = false;
     HirWsHandler ws_handler{};
+    // Timer route: the body is a `timer name, every: D {...}` background periodic
+    // task, not an HTTP route. `path` holds the timer name; `timer_interval_ms`
+    // the period. Registered into RouteConfig.timers[] (not routes[]) and fired by
+    // the shard event loop instead of matched against requests.
+    bool is_timer = false;
+    u32 timer_interval_ms = 0;
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -1010,7 +1016,9 @@ struct HirRoute {
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_ws_terminate(other.is_ws_terminate),
-          ws_handler(other.ws_handler) {
+          ws_handler(other.ws_handler),
+          is_timer(other.is_timer),
+          timer_interval_ms(other.timer_interval_ms) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -1031,6 +1039,8 @@ struct HirRoute {
         throttle_down_bps = other.throttle_down_bps;
         is_ws_terminate = other.is_ws_terminate;
         ws_handler = other.ws_handler;
+        is_timer = other.is_timer;
+        timer_interval_ms = other.timer_interval_ms;
         rebase_from(other);
         return *this;
     }
@@ -1050,7 +1060,9 @@ struct HirRoute {
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
           is_ws_terminate(other.is_ws_terminate),
-          ws_handler(other.ws_handler) {
+          ws_handler(other.ws_handler),
+          is_timer(other.is_timer),
+          timer_interval_ms(other.timer_interval_ms) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -1071,6 +1083,8 @@ struct HirRoute {
         throttle_down_bps = other.throttle_down_bps;
         is_ws_terminate = other.is_ws_terminate;
         ws_handler = other.ws_handler;
+        is_timer = other.is_timer;
+        timer_interval_ms = other.timer_interval_ms;
         rebase_from(other);
         return *this;
     }
@@ -1194,6 +1208,13 @@ struct HirModule {
     static constexpr u32 kMaxConformances = 64;
     static constexpr u32 kMaxImpls = 64;
     static constexpr u32 kMaxRoutes = 96;
+    // Timers compile to routes (is_timer flag) to reuse route→MIR→codegen, but are
+    // registered into RouteConfig.timers[] (a separate kMaxTimers table) at load,
+    // so they must NOT consume HTTP-route capacity. The routes vector is sized to
+    // hold both; analyze.cc caps HTTP routes at kMaxRoutes and timers at kMaxTimers
+    // independently. kMaxTimers must match RouteConfig::kMaxTimers (static_assert in
+    // compile_to_config.h).
+    static constexpr u32 kMaxTimers = 16;
     static constexpr u32 kMaxGuardMatchArms = 64;
     static constexpr u32 kMaxTypeShapes = 512;
 
@@ -1209,7 +1230,8 @@ struct HirModule {
     FixedVec<HirConformance, kMaxConformances> conformances;
     FixedVec<HirImpl, kMaxImpls> impls;
     FixedVec<HirGuardMatchArm, kMaxGuardMatchArms> guard_match_arms;
-    FixedVec<HirRoute, kMaxRoutes> routes;
+    // Holds HTTP routes (≤kMaxRoutes) plus synthesized timer routes (≤kMaxTimers).
+    FixedVec<HirRoute, kMaxRoutes + kMaxTimers> routes;
     FixedVec<HirTypeShape, kMaxTypeShapes> type_shapes;
     std::deque<std::string> owned_strings;
     bool has_package_decl = false;

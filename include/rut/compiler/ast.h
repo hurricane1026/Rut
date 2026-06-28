@@ -18,6 +18,7 @@ enum class AstItemKind : u8 {
     Impl,
     Chain,
     Route,
+    Timer,
 };
 
 enum class AstStmtKind : u8 {
@@ -473,6 +474,23 @@ struct AstRouteDecl {
     FixedVec<AstChainUse, kMaxChains> chains;
 };
 
+// Background periodic task: `timer name, every: <duration> { <body> }`. The body
+// compiles to a no-request/no-response state-machine handler the shard event loop
+// fires every interval. (slice 1: `shard:` selector deferred — runs every shard.)
+struct AstTimerDecl {
+    Span span{};
+    Span body_span{};
+    Str name{};
+    u32 interval_ms = 0;
+    // Slice 1 rejects any non-empty timer body (no execution yet), so the parser
+    // only needs to know whether the body had statements — it does NOT store them.
+    // Storing a FixedVec<AstStatement, N> here (AstStatement is large, and AstItem
+    // inlines every decl kind) bloated the parser's per-item stack frame enough to
+    // overflow on the recursive-import path under clang Debug / ASan. When body
+    // execution lands, lift the statements into an out-of-line pool, not inline.
+    u32 statement_count = 0;
+};
+
 struct AstItem {
     AstItemKind kind = AstItemKind::Upstream;
     Span span{};
@@ -487,6 +505,7 @@ struct AstItem {
     AstImplDecl impl_decl{};
     AstChainDecl chain{};
     AstRouteDecl route{};
+    AstTimerDecl timer{};
 };
 
 struct AstFile {

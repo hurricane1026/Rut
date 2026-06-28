@@ -353,6 +353,11 @@ struct Function {
     RateLimitRuleSet rate_limit{};
     // @throttle client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    // Timer function: a `timer name, every: D {...}` periodic task (route_pattern
+    // holds the name). register_jit_timers registers it into RouteConfig.timers[]
+    // and the shard event loop fires it every timer_interval_ms.
+    bool is_timer = false;
+    u32 timer_interval_ms = 0;
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;

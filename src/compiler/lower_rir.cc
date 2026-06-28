@@ -3347,6 +3347,8 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         }
         fn.value()->rate_limit = mir.functions[i].rate_limit;
         fn.value()->throttle_down_bps = mir.functions[i].throttle_down_bps;
+        fn.value()->is_timer = mir.functions[i].is_timer;
+        fn.value()->timer_interval_ms = mir.functions[i].timer_interval_ms;
         if (mir.functions[i].waits.len > 0) {
             u32 ms_list[MirFunction::kMaxWaits]{};
             u8 kind_list[MirFunction::kMaxWaits]{};
