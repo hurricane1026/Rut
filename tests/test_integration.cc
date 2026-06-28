@@ -8023,6 +8023,53 @@ TEST(proxy_reuse, reuses_idle_upstream_across_keepalive_requests) {
     proxy.teardown();
 }
 
+// io_uring variant of the reuse e2e (Shard wires the pool for both backends). Unlike
+// epoll's synchronous detach, io_uring defers the pool-return until the cancelled
+// multishot recv drains, so a short usleep between requests lets the fd re-enter the
+// pool before the next request borrows it. Skips where io_uring is unavailable.
+TEST(proxy_reuse, reuses_idle_upstream_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    for (int i = 0; i < 3; i++) {
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+        usleep(20000);  // let the deferred recv-cancel drain so the fd re-enters the pool
+    }
+    close(c);
+    usleep(50000);
+
+    CHECK_EQ(backend.accept_count.load(), 1);  // one upstream connection, reused 3×
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
 // the upstream's h1 response, and re-encodes it as h2 HEADERS+DATA. Asserts the

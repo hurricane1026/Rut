@@ -300,6 +300,51 @@ public:
     // No-op for io_uring (no fd_map to clear).
     void clear_upstream_fd(u32 /*conn_id*/) {}
 
+    // --- HTTP/1 idle upstream connection reuse (per-shard pool) ---
+
+    // Borrow a live idle socket to (upstream_id, backend_idx) from the pool,
+    // skipping the TCP connect. io_uring routes upstream completions by conn_id
+    // user_data (no fd map), so installing the fd is all that's needed; the next
+    // submit_send_upstream arms a send SQE tagged with this conn. Returns false
+    // (no live idle socket) → caller connects fresh.
+    bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
+        if (!upstream) return false;
+        const i32 fd = upstream->take_idle(upstream_id, backend_idx);
+        if (fd < 0) return false;
+        c.upstream_fd = fd;
+        return true;
+    }
+
+    // Return conn.upstream_fd to the idle pool at proxy completion. Unlike epoll's
+    // synchronous detach, the multishot upstream recv (IORING_RECV_MULTISHOT) is
+    // still armed here, so the fd can't be handed out until that recv stops — a new
+    // borrower's recv would otherwise race the old one on the same socket. We cancel
+    // the recv and DEFER the pool-return (idle_return_fd) until its terminal CQE
+    // drains; try_deferred_upstream_rearm parks it then. If no recv is armed we park
+    // immediately. The fd is detached from the conn (upstream_fd = -1) either way,
+    // so release_upstream_conn's close is skipped; close_conn closes idle_return_fd
+    // if the conn tears down before the drain.
+    void return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
+        if (c.upstream_fd < 0 || !upstream) return;  // caller closes
+        const bool kRecvPending = c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
+                                  c.upstream_recv_pause_cancel_pending;
+        if (!kRecvPending) {
+            const i32 fd = c.upstream_fd;
+            c.upstream_fd = -1;
+            c.upstream_send_armed = false;
+            if (!upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs())) ::close(fd);
+            return;
+        }
+        // Cancel the armed multishot recv; if the cancel SQE can't be queued, leave
+        // upstream_fd set so the caller closes (can't safely park an armed socket).
+        if (c.upstream_recv_armed && !pause_upstream_recv_impl(c)) return;
+        c.idle_return_fd = c.upstream_fd;
+        c.idle_return_uid = upstream_id;
+        c.idle_return_bidx = backend_idx;
+        c.upstream_fd = -1;
+        c.upstream_send_armed = false;
+    }
+
     // never pay the cost. Returns false if SlicePool is exhausted.
     bool alloc_upstream_buf(ConnectionBase& c) {
         if (c.upstream_recv_slice) return true;  // already allocated
@@ -678,6 +723,20 @@ public:
     // fires from whichever lands second. No-op unless a re-arm was actually deferred.
     // Returns false only if the re-arm failed under SQ pressure (caller must close).
     bool try_deferred_upstream_rearm(Connection& c) {
+        // Deferred idle-pool return (return_idle_upstream): the cancelled multishot
+        // recv has now fully drained (both the cancel and the recv terminal cleared
+        // their flags), so the fd parked in idle_return_fd is safe to hand to the
+        // pool — no recv can fire on it anymore. Runs at every recv-terminal drain
+        // site (all call this) so whichever CQE lands last triggers it. Closes the
+        // fd if the pool is full / gone.
+        if (c.idle_return_fd >= 0 && !c.upstream_recv_pause_cancel_pending &&
+            !c.upstream_recv_cancel_inflight && !c.upstream_recv_armed) {
+            const i32 fd = c.idle_return_fd;
+            c.idle_return_fd = -1;
+            if (!upstream ||
+                !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
+                ::close(fd);
+        }
         if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight ||
             c.upstream_recv_armed || !c.upstream_recv_pause_rearm_pending ||
             c.upstream_recv_paused_for_send || c.upstream_fd < 0) {
@@ -735,6 +794,13 @@ public:
         if (c.upstream_fd >= 0) {
             ::close(c.upstream_fd);
             c.upstream_fd = -1;
+        }
+        // A deferred idle-pool return that never drained (conn torn down mid-drain):
+        // close the parked fd so it isn't leaked. Its cancelled recv terminal still
+        // drains harmlessly against pending_ops (on_upstream_recv is null by now).
+        if (c.idle_return_fd >= 0) {
+            ::close(c.idle_return_fd);
+            c.idle_return_fd = -1;
         }
         if (metrics) {
             if (c.req_start_us != 0) {
@@ -929,6 +995,11 @@ public:
                     });
                 }
                 this->fire_due_timers();
+                // Evict idle pooled upstream sockets past the keepalive deadline
+                // (1s-granular) — bounds dead-socket accumulation for endpoints that
+                // never get another request to trigger take_idle's probe.
+                if (upstream)
+                    upstream->sweep(static_cast<u32>(monotonic_secs()), keepalive_timeout);
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);

@@ -140,6 +140,14 @@ struct ConnectionBase {
     // desynced must never be reused (the next request would be parsed as leftover
     // body). Reset at the per-request boundary like the other reuse flags.
     bool upstream_request_incomplete;
+    // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
+    // once its cancelled multishot recv terminal drains (handing the fd out while a
+    // recv is still draining on it would let two recvs race the same socket). -1 =
+    // none. epoll detaches synchronously and never uses this. See
+    // IoUringEventLoop::return_idle_upstream / try_deferred_upstream_rearm.
+    i32 idle_return_fd;
+    u16 idle_return_uid;
+    u8 idle_return_bidx;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -531,6 +539,9 @@ struct ConnectionBase {
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;
+        idle_return_fd = -1;
+        idle_return_uid = 0;
+        idle_return_bidx = 0;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
