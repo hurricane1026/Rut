@@ -242,7 +242,13 @@ public:
     void poll_command() {
         if (!control) return;
         auto* cfg = control->pending_config.exchange(nullptr, std::memory_order_acq_rel);
-        if (cfg && config_ptr) *config_ptr = cfg;
+        if (cfg && config_ptr) {
+            *config_ptr = cfg;
+            // A reload may repoint an upstream endpoint under the same
+            // (upstream_id, backend_idx); drop idle sockets parked under the old
+            // config so post-reload requests don't reuse a stale connection.
+            if (upstream) upstream->drain();
+        }
         auto* jit = control->pending_jit.exchange(nullptr, std::memory_order_acq_rel);
         if (jit && jit_code_ptr) *jit_code_ptr = jit;
         auto* cap = control->pending_capture.exchange(nullptr, std::memory_order_acq_rel);
