@@ -224,6 +224,29 @@ TEST(set_header, fails_closed_without_header_block) {
     CHECK(!rut::apply_request_header_overrides(*c));
 }
 
+// Recording more overrides than the table holds (reachable only via direct RIR —
+// the DSL caps + dedupes) sets the overflow flag (rut_helper_req_set_header), and
+// the apply path fails closed so a dropped override is never forwarded as a silent
+// no-op. Drive the apply-side contract directly via the flag.
+TEST(set_header, fails_closed_on_record_overflow) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    // A valid recorded override plus the overflow signal: still fail closed.
+    c->req_header_overrides[0].name = Str{"X-H", 3};
+    c->req_header_overrides[0].value = Str{"v", 1};
+    c->req_header_override_count = 1;
+    c->req_header_override_overflow = true;
+    CHECK(!rut::apply_request_header_overrides(*c));
+    CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+}
+
 // === Recv ===
 
 TEST(recv, then_send) {

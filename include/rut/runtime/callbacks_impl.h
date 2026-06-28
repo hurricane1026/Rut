@@ -524,6 +524,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
+    conn.req_header_override_overflow = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
     if (loop->capture_ring) capture_stage_headers(conn);
@@ -1478,7 +1479,10 @@ inline void rewrite_request_line_path(Connection& conn) {
 // forwarding it with a security-sensitive override silently dropped); true on a
 // no-op or full success.
 inline bool apply_request_header_overrides(Connection& conn) {
-    if (conn.req_header_override_count == 0) return true;
+    if (conn.req_header_override_count == 0 && !conn.req_header_override_overflow) return true;
+    // More overrides were requested than the table holds (direct-RIR only): a
+    // dropped override must not be forwarded as a silent no-op — fail closed.
+    if (conn.req_header_override_overflow) return false;
     u8* buf = conn.recv_slice;
     if (buf == nullptr) return false;  // overrides recorded but no buffer → fail closed
 
@@ -1702,6 +1706,16 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // (oversized / no headroom) rather than forwarding the request with a
     // security-sensitive header silently dropped.
     if (!apply_request_header_overrides(conn)) {
+        // The upstream connected but no request will be sent. Release it now so a
+        // client that stalls reading the 500 can't pin an idle upstream fd /
+        // concurrency slot until keepalive/timeout (close_conn would otherwise only
+        // reap it once the downstream connection finally goes away).
+        if (conn.upstream_fd >= 0) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+            loop->clear_upstream_fd(conn.id);
+        }
+        release_upstream_slot(loop, conn);
         static const char k500[] =
             "HTTP/1.1 500 Internal Server Error\r\n"
             "Content-Length: 21\r\n"
