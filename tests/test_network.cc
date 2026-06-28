@@ -2758,7 +2758,7 @@ TEST(upstream_pool, put_take_roundtrip) {
     pool.init();
     i32 sv[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-    REQUIRE(pool.put_idle(sv[0], 5, 0));
+    REQUIRE(pool.put_idle(sv[0], 5, 0, 0));
     CHECK_EQ(pool.idle_count, 1u);
     CHECK_EQ(pool.take_idle(5, 0), sv[0]);  // healthy idle socket handed back
     CHECK_EQ(pool.idle_count, 0u);
@@ -2772,7 +2772,7 @@ TEST(upstream_pool, take_idle_keyed_by_endpoint) {
     pool.init();
     i32 sv[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-    REQUIRE(pool.put_idle(sv[0], 7, 2));
+    REQUIRE(pool.put_idle(sv[0], 7, 2, 0));
     CHECK_EQ(pool.take_idle(7, 0), -1);     // wrong backend index
     CHECK_EQ(pool.take_idle(9, 2), -1);     // wrong upstream id
     CHECK_EQ(pool.take_idle(7, 2), sv[0]);  // exact endpoint match
@@ -2786,7 +2786,7 @@ TEST(upstream_pool, take_idle_evicts_dead_socket) {
     i32 sv[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
     close(sv[1]);  // peer closed → the probe reads EOF on sv[0]
-    REQUIRE(pool.put_idle(sv[0], 5, 0));
+    REQUIRE(pool.put_idle(sv[0], 5, 0, 0));
     CHECK_EQ(pool.take_idle(5, 0), -1);  // MSG_PEEK sees EOF → evict + close
     CHECK_EQ(pool.idle_count, 0u);
     CHECK(close(sv[0]) < 0);  // take_idle already closed it
@@ -2796,7 +2796,7 @@ TEST(upstream_pool, take_idle_empty_and_bad_fd) {
     UpstreamPool pool;
     pool.init();
     CHECK_EQ(pool.take_idle(0, 0), -1);  // cold pool, no scan
-    CHECK(!pool.put_idle(-1, 0, 0));     // bad fd rejected
+    CHECK(!pool.put_idle(-1, 0, 0, 0));  // bad fd rejected
     CHECK_EQ(pool.idle_count, 0u);
 }
 
@@ -2815,7 +2815,7 @@ TEST(upstream_pool, shutdown_closes_idle_fds) {
     pool.init();
     i32 fd = dup(2);
     REQUIRE(fd >= 0);
-    REQUIRE(pool.put_idle(fd, 1, 0));
+    REQUIRE(pool.put_idle(fd, 1, 0, 0));
     pool.shutdown();
     CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
     CHECK_EQ(pool.idle_count, 0u);
@@ -2831,13 +2831,30 @@ TEST(upstream_pool, drain_closes_idle_sockets) {
     pool.init();
     i32 sv[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-    REQUIRE(pool.put_idle(sv[0], 3, 0));
+    REQUIRE(pool.put_idle(sv[0], 3, 0, 0));
     CHECK_EQ(pool.idle_count, 1u);
     pool.drain();
     CHECK_EQ(pool.idle_count, 0u);
     CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
     CHECK_EQ(pool.take_idle(3, 0), -1);  // nothing reusable after a drain
     CHECK(close(sv[0]) < 0);             // drain closed the parked fd
+    close(sv[1]);
+}
+
+// sweep() closes sockets parked at least max_idle_sec ago — bounds dead-socket
+// accumulation for endpoints that never get another request to trigger the probe.
+TEST(upstream_pool, sweep_evicts_expired_idle) {
+    UpstreamPool pool;
+    pool.init();
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 4, 0, /*now_sec=*/100));
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.sweep(/*now_sec=*/150, /*max_idle_sec=*/60);  // idle 50s < 60 → kept
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.sweep(/*now_sec=*/161, /*max_idle_sec=*/60);  // idle 61s ≥ 60 → evicted
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(sv[0]) < 0);  // sweep closed the parked fd
     close(sv[1]);
 }
 
@@ -3383,7 +3400,7 @@ TEST(upstream_pool, put_idle_full_rejects) {
     pool.free_top = 0;  // simulate a full pool
     i32 fd = dup(2);
     REQUIRE(fd >= 0);
-    CHECK(!pool.put_idle(fd, 1, 0));  // no slot → caller keeps ownership
+    CHECK(!pool.put_idle(fd, 1, 0, 0));  // no slot → caller keeps ownership
     CHECK_EQ(pool.idle_count, 0u);
     close(fd);
 }
@@ -3556,6 +3573,28 @@ TEST(upstream_reuse, fallback_skips_upgrade_request) {
     CHECK(!rut::retry_reused_upstream(&loop, *c));
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// An upstream that sends bytes beyond its declared Content-Length is desynced —
+// on_upstream_response must clear upstream_keep_alive so the fd isn't pooled.
+TEST(upstream_reuse, overlong_response_not_reusable) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // Declares Content-Length: 2 but the buffer carries 3 body bytes ("hiX").
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhiX";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(!c->upstream_keep_alive);  // overlong body → not reusable
 }
 
 // === RouteTable validation ===

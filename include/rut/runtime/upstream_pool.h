@@ -26,6 +26,7 @@ struct UpstreamConn {
     u8 backend_idx = 0;      // which backend endpoint of the upstream this connects to
     bool idle = false;       // true = parked, available for reuse
     bool allocated = false;  // true = slot in use
+    u32 parked_sec = 0;      // monotonic seconds when parked (idle-timeout sweep)
 };
 
 struct UpstreamPool {
@@ -48,12 +49,28 @@ struct UpstreamPool {
     // Park a connected, idle upstream fd for reuse by a later request to the same
     // (upstream_id, backend_idx) endpoint. Returns false if the pool is full (the
     // caller must close the fd itself). The fd must have no I/O armed on it.
-    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx) {
+    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
         if (fd < 0 || free_top == 0) return false;
         const u32 idx = free_stack[--free_top];
-        conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true};
+        conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
         idle_count++;
         return true;
+    }
+
+    // Close parked sockets idle for at least max_idle_sec — bounds resource use for
+    // sockets a backend silently closes while parked (no event watches an idle fd;
+    // take_idle's probe only fires for endpoints that receive another request, so a
+    // low-traffic or removed endpoint could otherwise hold dead fds until reload).
+    // Driven by the per-shard 1s timer tick. No-op when the pool is empty.
+    void sweep(u32 now_sec, u32 max_idle_sec) {
+        if (idle_count == 0) return;
+        for (u32 i = 0; i < kMaxConns; i++) {
+            UpstreamConn& c = conns[i];
+            if (!c.idle || !c.allocated || c.fd < 0) continue;
+            if (now_sec - c.parked_sec < max_idle_sec) continue;
+            ::close(c.fd);
+            release_slot(i);
+        }
     }
 
     // Borrow a reusable idle fd for the given endpoint, or -1 if none is live.

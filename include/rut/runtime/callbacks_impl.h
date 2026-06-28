@@ -1421,6 +1421,38 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_recv_armed = false;
                 conn.upstream_send_armed = false;
             }
+            conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
+            conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
+            conn.upstream_start_us = monotonic_us();
+            const u32 kBackend = select_backend(
+                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
+            conn.upstream_backend_idx = static_cast<u8>(kBackend);
+
+            // Idle reuse (mirrors the direct RouteAction::Proxy path): borrow a live
+            // pooled socket to this endpoint and skip the connect. Without this take
+            // path, JIT forward(...) completions would deposit idle fds the pool never
+            // hands back. On a miss, connect fresh.
+            if constexpr (requires {
+                              loop->reuse_idle_upstream(conn,
+                                                        static_cast<u16>(outcome.upstream_id),
+                                                        static_cast<u8>(kBackend));
+                          }) {
+                if (loop->reuse_idle_upstream(
+                        conn, static_cast<u16>(outcome.upstream_id), static_cast<u8>(kBackend))) {
+                    conn.upstream_reused = true;
+                    if constexpr (requires {
+                                      loop->timer.refresh(&conn, loop->upstream_timeout);
+                                  }) {
+                        loop->timer.refresh(&conn, loop->upstream_timeout);
+                    }
+                    on_upstream_connected<Loop>(
+                        static_cast<void*>(loop),
+                        conn,
+                        IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+                    return;
+                }
+            }
+
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
                 conn.resp_status = kStatusBadGateway;
@@ -1431,13 +1463,7 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             conn.upstream_fd = kUpstreamFd;
-            conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
-            conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
-            conn.upstream_start_us = monotonic_us();
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            const u32 kBackend = select_backend(
-                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
-            conn.upstream_backend_idx = static_cast<u8>(kBackend);
             loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
             return;
         }
@@ -3733,6 +3759,19 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             if (kChunkStatus == ChunkStatus::NeedMore) break;
         }
         chunked_consumed = pos;
+    }
+
+    // Refuse reuse if the upstream sent bytes beyond its self-framed body in this
+    // initial buffer — an overlong/malformed response. We discard those extra bytes
+    // at completion, so pooling the socket would mask the protocol violation and
+    // risk desync. (On-wire leftover the backend sends later is separately caught by
+    // take_idle's MSG_PEEK probe before any request goes out.)
+    if (conn.upstream_keep_alive) {
+        if (conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > resp.content_length)
+            conn.upstream_keep_alive = false;
+        else if (conn.resp_body_mode == BodyMode::Chunked && chunked_done &&
+                 chunked_consumed < kInitialBodyLen)
+            conn.upstream_keep_alive = false;
     }
 
     if (loop->is_draining()) {
