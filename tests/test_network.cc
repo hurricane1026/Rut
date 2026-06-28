@@ -63,6 +63,190 @@ TEST(event_loop, default_alloc_h2_refuses) {
     CHECK(c->h2 == nullptr);
 }
 
+// === forward(set_header:) request mutation ===
+
+namespace {
+// Count non-overlapping occurrences of `needle` in buf[0..len).
+u32 count_occurrences(const u8* buf, u32 len, const char* needle) {
+    const u32 nlen = static_cast<u32>(strlen(needle));
+    if (nlen == 0 || len < nlen) return 0;
+    u32 count = 0;
+    for (u32 i = 0; i + nlen <= len;) {
+        if (__builtin_memcmp(buf + i, needle, nlen) == 0) {
+            count++;
+            i += nlen;
+        } else {
+            i++;
+        }
+    }
+    return count;
+}
+bool buf_has(const u8* buf, u32 len, const char* needle) {
+    return count_occurrences(buf, len, needle) > 0;
+}
+}  // namespace
+
+// Replacing a header the client sent twice must replace the first AND drop the
+// rest, so the client's value can't survive past the override.
+TEST(set_header, replaces_all_duplicate_client_fields) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\nX-Dup: a\r\nX-Dup: b\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_header_overrides[0].name = Str{"X-Dup", 5};
+    c->req_header_overrides[0].value = Str{"override", 8};
+    c->req_header_override_count = 1;
+
+    CHECK(rut::apply_request_header_overrides(*c));
+    const u8* d = c->recv_buf.data();
+    const u32 n = c->recv_buf.len();
+    CHECK_EQ(count_occurrences(d, n, "X-Dup:"), 1u);
+    CHECK(buf_has(d, n, "X-Dup: override\r\n"));
+    CHECK(!buf_has(d, n, "X-Dup: a"));
+    CHECK(!buf_has(d, n, "X-Dup: b"));
+    CHECK(buf_has(d, n, "Host: client\r\n"));  // unrelated header untouched
+    // req_header_end stays consistent with the rewritten block (ends in CRLFCRLF).
+    REQUIRE(c->req_header_end >= 4 && c->req_header_end <= n);
+    CHECK(__builtin_memcmp(d + c->req_header_end - 4, "\r\n\r\n", 4) == 0);
+}
+
+// Injecting a header absent from the request appends one line before the blank
+// line; a large value is serialized verbatim (no fixed scratch limit).
+TEST(set_header, injects_large_value_without_scratch_limit) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    // A value longer than the old 2048-byte scratch buffer (and still fits 4096).
+    static char big[3000];
+    for (u32 i = 0; i < sizeof(big); i++) big[i] = 'x';
+    c->req_header_overrides[0].name = Str{"X-Big", 5};
+    c->req_header_overrides[0].value = Str{big, sizeof(big)};
+    c->req_header_override_count = 1;
+
+    CHECK(rut::apply_request_header_overrides(*c));
+    const u8* d = c->recv_buf.data();
+    const u32 n = c->recv_buf.len();
+    CHECK(buf_has(d, n, "X-Big: "));
+    CHECK_EQ(n, kLen + 5 + 2 + static_cast<u32>(sizeof(big)) + 2);  // "X-Big" + ": " + val + CRLF
+}
+
+// When an override can't fit recv_buf, the function fails closed (returns false)
+// so the caller can reject rather than forward without the configured header.
+TEST(set_header, fails_closed_when_override_cannot_fit) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    // Leave no spare capacity, so inserting any new header line must fail.
+    c->recv_buf.commit(c->recv_buf.write_avail());
+    const u32 full = c->recv_buf.len();
+    c->req_header_overrides[0].name = Str{"X-Inject", 8};
+    c->req_header_overrides[0].value = Str{"v", 1};
+    c->req_header_override_count = 1;
+
+    CHECK(!rut::apply_request_header_overrides(*c));  // fail closed
+    CHECK_EQ(c->recv_buf.len(), full);                // buffer left untouched
+    CHECK_EQ(c->req_header_end, kLen);
+}
+
+// Defense-in-depth for overrides recorded directly via RIR (the DSL parser
+// validates literals at compile time): a value carrying CRLF would inject extra
+// outbound headers, so it must fail the request closed rather than be written.
+TEST(set_header, rejects_crlf_injection_value) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_header_overrides[0].name = Str{"X-Evil", 6};
+    c->req_header_overrides[0].value = Str{"a\r\nInjected: yes", 16};
+    c->req_header_override_count = 1;
+    CHECK(!rut::apply_request_header_overrides(*c));
+    CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+    CHECK(!buf_has(c->recv_buf.data(), c->recv_buf.len(), "Injected"));
+}
+
+// A value that aliases recv_buf (e.g. a request-derived value recorded via RIR)
+// would be shifted/overwritten by the in-place rewrite, so it fails closed.
+TEST(set_header, fails_closed_on_recv_buf_aliasing_value) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    // Point the value at the "client" token inside recv_buf (the Host value).
+    c->req_header_overrides[0].name = Str{"X-Alias", 7};
+    c->req_header_overrides[0].value =
+        Str{reinterpret_cast<const char*>(c->recv_buf.data()) + 22, 6};  // "client"
+    c->req_header_override_count = 1;
+    CHECK(!rut::apply_request_header_overrides(*c));
+    CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+}
+
+// An override with no usable parsed header block (req_header_end unset) fails
+// closed rather than forwarding the request without the configured mutation.
+TEST(set_header, fails_closed_without_header_block) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = 0;  // parser set no header block
+    c->req_header_overrides[0].name = Str{"X-Inject", 8};
+    c->req_header_overrides[0].value = Str{"v", 1};
+    c->req_header_override_count = 1;
+    CHECK(!rut::apply_request_header_overrides(*c));
+}
+
+// Recording more overrides than the table holds (reachable only via direct RIR —
+// the DSL caps + dedupes) sets the overflow flag (rut_helper_req_set_header), and
+// the apply path fails closed so a dropped override is never forwarded as a silent
+// no-op. Drive the apply-side contract directly via the flag.
+TEST(set_header, fails_closed_on_record_overflow) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    // A valid recorded override plus the overflow signal: still fail closed.
+    c->req_header_overrides[0].name = Str{"X-H", 3};
+    c->req_header_overrides[0].value = Str{"v", 1};
+    c->req_header_override_count = 1;
+    c->req_header_override_overflow = true;
+    CHECK(!rut::apply_request_header_overrides(*c));
+    CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+}
+
 // === Recv ===
 
 TEST(recv, then_send) {

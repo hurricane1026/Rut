@@ -523,6 +523,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // exactly once per complete request, before route matching / handler dispatch.
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
+    conn.req_header_override_overflow = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
     if (loop->capture_ring) capture_stage_headers(conn);
@@ -1474,6 +1476,142 @@ inline void rewrite_request_line_path(Connection& conn) {
     }
 }
 
+// Apply forward(set_header:) overrides to the buffered request before forwarding.
+// For each (name, value): replace the FIRST existing header line (case-insensitive)
+// in place — or insert "Name: Value\r\n" before the blank-line terminator — then
+// delete every further field with the same name, so a client that sent the header
+// more than once can't smuggle its own value past the override. The header line is
+// written directly into recv_buf (no fixed scratch limit), and recv_buf's length,
+// req_header_end, and req_initial_send_len are adjusted by each edit's delta — the
+// same in-place mechanics as rewrite_request_line_path. Returns false if any
+// override can't fit recv_buf (so the caller fails the request closed rather than
+// forwarding it with a security-sensitive override silently dropped); true on a
+// no-op or full success.
+inline bool apply_request_header_overrides(Connection& conn) {
+    if (conn.req_header_override_count == 0 && !conn.req_header_override_overflow) return true;
+    // More overrides were requested than the table holds (direct-RIR only): a
+    // dropped override must not be forwarded as a silent no-op — fail closed.
+    if (conn.req_header_override_overflow) return false;
+    u8* buf = conn.recv_slice;
+    if (buf == nullptr) return false;  // overrides recorded but no buffer → fail closed
+
+    // In-place splice: replace buf[pos, pos+old_span) with "Name: Value\r\n"
+    // (write_line) or with nothing (deletion of a duplicate). Adjusts the buffer
+    // length, req_header_end and req_initial_send_len by the delta. Returns false
+    // — leaving the buffer untouched — only when a grow would exceed capacity.
+    auto splice =
+        [&](u32 pos, u32 old_span, const Str& name, const Str& val, bool write_line) -> bool {
+        const u32 total = conn.recv_buf.len();
+        const u32 ins_len = write_line ? name.len + 2 + val.len + 2 : 0;  // ": " + CRLF
+        const i64 delta = static_cast<i64>(ins_len) - static_cast<i64>(old_span);
+        if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) return false;
+        const u32 tail_src = pos + old_span;
+        if (delta != 0)
+            __builtin_memmove(buf + (static_cast<i64>(tail_src) + delta),
+                              buf + tail_src,
+                              static_cast<size_t>(total - tail_src));
+        if (write_line) {
+            u32 p = pos;
+            for (u32 i = 0; i < name.len; i++) buf[p++] = static_cast<u8>(name.ptr[i]);
+            buf[p++] = ':';
+            buf[p++] = ' ';
+            for (u32 i = 0; i < val.len; i++) buf[p++] = static_cast<u8>(val.ptr[i]);
+            buf[p++] = '\r';
+            buf[p++] = '\n';
+        }
+        conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(total) + delta));
+        if (delta != 0) {
+            const i64 he = static_cast<i64>(conn.req_header_end) + delta;
+            conn.req_header_end = he > 0 ? static_cast<u32>(he) : 0;
+            if (conn.req_initial_send_len > pos) {
+                const i64 adj = static_cast<i64>(conn.req_initial_send_len) + delta;
+                conn.req_initial_send_len = adj > 0 ? static_cast<u32>(adj) : 0;
+            }
+        }
+        return true;
+    };
+
+    // Find the first header field named `name` (case-insensitive) at or after `from`
+    // within the live header block; on success sets [*fs,*fe) (fe just past its LF).
+    auto find_field = [&](const Str& name, u32 from, u32* fs, u32* fe) -> bool {
+        const u32 total = conn.recv_buf.len();
+        const u32 hend = conn.req_header_end;
+        if (hend < 4 || hend > total) return false;
+        u32 hstart = 0;
+        while (hstart < hend && buf[hstart] != '\n') hstart++;  // past the request line
+        if (hstart >= hend) return false;
+        hstart++;
+        const u32 hbody = hend - 2;  // header fields occupy [hstart, hbody)
+        for (u32 i = from < hstart ? hstart : from; i < hbody;) {
+            const u32 ls = i;
+            u32 colon = ls;
+            while (colon < hbody && buf[colon] != ':' && buf[colon] != '\n') colon++;
+            u32 le = ls;
+            while (le < hbody && buf[le] != '\n') le++;
+            le = le < hbody ? le + 1 : hbody;  // include LF
+            if (colon < hbody && buf[colon] == ':' &&
+                http_header_name_eq_ci(
+                    reinterpret_cast<const char*>(buf + ls), colon - ls, name.ptr, name.len)) {
+                *fs = ls;
+                *fe = le;
+                return true;
+            }
+            i = le;
+        }
+        return false;
+    };
+
+    // Bytes that lie inside recv_buf's storage. A recorded value (or name) pointing
+    // here — e.g. a request-derived value recorded straight through RIR — would be
+    // shifted/overwritten by the in-place rewrite below before it's serialized, so
+    // we can't apply it safely and must fail closed rather than forward a corrupted
+    // header. (DSL set_header values are string literals in stable JIT constant
+    // memory, so they never alias recv_buf and this never trips for compiled .rut.)
+    const uintptr_t kBufLo = reinterpret_cast<uintptr_t>(buf);
+    const uintptr_t kBufHi = kBufLo + conn.recv_buf.capacity();
+    auto aliases_recv_buf = [&](const Str& s) {
+        if (s.ptr == nullptr) return false;
+        const uintptr_t p = reinterpret_cast<uintptr_t>(s.ptr);
+        return p < kBufHi && p + s.len > kBufLo;
+    };
+
+    for (u32 oi = 0; oi < conn.req_header_override_count; oi++) {
+        const Str name = conn.req_header_overrides[oi].name;
+        const Str val = conn.req_header_overrides[oi].value;
+        // Validate at the choke point before any byte reaches the wire. The DSL
+        // parser already validates literals at compile time, but overrides recorded
+        // directly through RIR are otherwise unchecked — an empty/non-tchar name, a
+        // value carrying CR/LF or other control bytes (header injection), or a
+        // reserved framing name (Content-Length/Transfer-Encoding/Connection) must
+        // fail the request closed, never be forwarded.
+        if (validate_response_header(name.ptr, name.len, val.ptr, val.len) !=
+            HttpHeaderValidation::Ok)
+            return false;
+        if (aliases_recv_buf(name) || aliases_recv_buf(val)) return false;
+
+        const u32 total = conn.recv_buf.len();
+        const u32 hend = conn.req_header_end;
+        // A configured override must be applied; if the request has no usable parsed
+        // header block (e.g. a lenient request line that set no req_header_end) we
+        // can't place it, so fail closed instead of forwarding without it.
+        if (hend < 4 || hend > total) return false;
+
+        const u32 line_len = name.len + 2 + val.len + 2;
+        u32 fs = 0, fe = 0, search_from = 0;
+        if (find_field(name, 0, &fs, &fe)) {
+            if (!splice(fs, fe - fs, name, val, /*write_line=*/true)) return false;
+            search_from = fs + line_len;  // skip the line we just wrote
+        } else {
+            const u32 hbody = conn.req_header_end - 2;  // insert before the blank line
+            if (!splice(hbody, 0, name, val, /*write_line=*/true)) return false;
+            search_from = hbody + line_len;
+        }
+        // Drop any remaining same-named fields (deletion never grows → never fails).
+        while (find_field(name, search_from, &fs, &fe)) splice(fs, fe - fs, name, val, false);
+    }
+    return true;
+}
+
 #if RUT_ENABLE_WEBSOCKET
 // Remove the `Sec-WebSocket-Extensions` request header (in place) before forwarding a
 // terminate-route upgrade, so client and backend can't negotiate a per-message extension
@@ -1571,6 +1709,36 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // forward(set_path:) — rewrite the request line before forwarding (no-op
     // unless a path override was recorded by the JIT handler).
     rewrite_request_line_path(conn);
+    // forward(set_header:) — inject/replace request header lines (no-op unless
+    // overrides were recorded). After the path rewrite so it reads the updated
+    // req_header_end. Fail closed (500) if a configured override can't be applied
+    // (oversized / no headroom) rather than forwarding the request with a
+    // security-sensitive header silently dropped.
+    if (!apply_request_header_overrides(conn)) {
+        // The upstream connected but no request will be sent. Release it now so a
+        // client that stalls reading the 500 can't pin an idle upstream fd /
+        // concurrency slot until keepalive/timeout (close_conn would otherwise only
+        // reap it once the downstream connection finally goes away).
+        if (conn.upstream_fd >= 0) {
+            ::close(conn.upstream_fd);
+            conn.upstream_fd = -1;
+            loop->clear_upstream_fd(conn.id);
+        }
+        release_upstream_slot(loop, conn);
+        static const char k500[] =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Length: 21\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Internal Server Error";
+        conn.send_buf.reset();
+        conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+        conn.keep_alive = false;
+        conn.resp_status = kStatusInternalServerError;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
 #if RUT_ENABLE_WEBSOCKET
     // Terminate routes must not let the backend negotiate a per-message extension.
     if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);

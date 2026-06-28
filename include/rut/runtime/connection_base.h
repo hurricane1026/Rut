@@ -141,6 +141,23 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // forward(set_header:) request mutation: rut_helper_req_set_header records
+    // (name, value) overrides (views into stable JIT constant memory);
+    // on_upstream_connected injects/replaces those header lines in recv_buf before
+    // forwarding. Bounded; reset per request. No default member initializers, so
+    // the struct stays trivially constructible for the SlabPool.
+    static constexpr u32 kMaxReqHeaderOverrides = 16;
+    struct ReqHeaderOverride {
+        Str name;
+        Str value;
+    };
+    ReqHeaderOverride req_header_overrides[kMaxReqHeaderOverrides];
+    u8 req_header_override_count;
+    // Set when rut_helper_req_set_header is called past kMaxReqHeaderOverrides
+    // (reachable only via direct RIR — the DSL caps + dedupes entries). The apply
+    // path fails the request closed so a dropped override can't be forwarded as a
+    // silent no-op. Reset per request alongside the count.
+    bool req_header_override_overflow;
     // Upstream concurrency slot: set true between try_acquire and release so the
     // slot is freed exactly once, on whatever exit path runs (completion, failure,
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
@@ -473,6 +490,8 @@ struct ConnectionBase {
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        req_header_override_count = 0;
+        req_header_override_overflow = false;
         upstream_slot_held = false;
         upstream_slot_uid = 0;
         throttle_down_bps = 0;

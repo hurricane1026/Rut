@@ -2798,6 +2798,15 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!path || !b.emit_req_set_path(path.value(), {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
         }
+        // forward(set_header: {...}): one ReqSetHeader(name, const-str value) per
+        // entry before the terminator (name is the op immediate, value a register).
+        for (u32 i = 0; i < term.forward_set_headers.len; i++) {
+            const auto& kv = term.forward_set_headers[i];
+            auto val = b.emit_const_str(kv.value, {term.span.line, term.span.col});
+            if (!val ||
+                !b.emit_req_set_header(kv.key, val.value(), {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+        }
         const u16 upstream_id = mir.upstreams[term.upstream_index].id;
         auto upstream =
             b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});

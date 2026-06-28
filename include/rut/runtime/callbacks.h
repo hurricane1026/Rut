@@ -19,6 +19,7 @@ static_assert(CaptureEntry::kMaxHeaderLen == 8192,
 
 // HTTP status codes used in callbacks.
 static constexpr u16 kStatusOK = 200;
+static constexpr u16 kStatusInternalServerError = 500;
 static constexpr u16 kStatusBadGateway = 502;
 
 // Minimum bytes for a valid HTTP response status line ("HTTP/1.x NNN").

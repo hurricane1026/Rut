@@ -246,6 +246,21 @@ void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
     c->req_path_override = Str{path, len};
 }
 
+void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    auto* c = static_cast<ConnectionBase*>(conn);
+    // Bounded record. The DSL frontend caps + dedupes entries so overflow is
+    // unreachable from compiled .rut, but a direct-RIR route can emit more than the
+    // table holds — flag it so apply_request_header_overrides fails the request
+    // closed rather than silently dropping (and forwarding without) the override.
+    if (c->req_header_override_count >= ConnectionBase::kMaxReqHeaderOverrides) {
+        c->req_header_override_overflow = true;
+        return;
+    }
+    auto& o = c->req_header_overrides[c->req_header_override_count++];
+    o.name = Str{name, nlen};
+    o.value = Str{val, vlen};
+}
+
 static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
     if (h.len != name_len) return false;
     for (u32 j = 0; j < name_len; j++) {
