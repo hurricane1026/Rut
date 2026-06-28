@@ -2753,37 +2753,51 @@ TEST(route, upstream_backend_list_full) {
 
 // === UpstreamPool ===
 
-TEST(upstream_pool, alloc_free) {
+TEST(upstream_pool, put_take_roundtrip) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    CHECK_EQ(c->fd, -1);
-    CHECK(!c->idle);
-    pool.free(c);
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 5, 0));
+    CHECK_EQ(pool.idle_count, 1u);
+    CHECK_EQ(pool.take_idle(5, 0), sv[0]);  // healthy idle socket handed back
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK_EQ(pool.take_idle(5, 0), -1);  // pool now empty
+    close(sv[0]);
+    close(sv[1]);
 }
 
-TEST(upstream_pool, find_idle) {
+TEST(upstream_pool, take_idle_keyed_by_endpoint) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->fd = 42;
-    c->upstream_id = 5;
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 7, 2));
+    CHECK_EQ(pool.take_idle(7, 0), -1);     // wrong backend index
+    CHECK_EQ(pool.take_idle(9, 2), -1);     // wrong upstream id
+    CHECK_EQ(pool.take_idle(7, 2), sv[0]);  // exact endpoint match
+    close(sv[0]);
+    close(sv[1]);
+}
 
-    CHECK(pool.find_idle(5) == nullptr);
-    pool.return_idle(c);
-    CHECK(c->idle);
+TEST(upstream_pool, take_idle_evicts_dead_socket) {
+    UpstreamPool pool;
+    pool.init();
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);  // peer closed → the probe reads EOF on sv[0]
+    REQUIRE(pool.put_idle(sv[0], 5, 0));
+    CHECK_EQ(pool.take_idle(5, 0), -1);  // MSG_PEEK sees EOF → evict + close
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(sv[0]) < 0);  // take_idle already closed it
+}
 
-    auto* found = pool.find_idle(5);
-    CHECK_EQ(found, c);
-    CHECK(!found->idle);
-
-    pool.return_idle(c);
-    CHECK(pool.find_idle(99) == nullptr);
-
-    c->fd = -1;
-    pool.free(c);
+TEST(upstream_pool, take_idle_empty_and_bad_fd) {
+    UpstreamPool pool;
+    pool.init();
+    CHECK_EQ(pool.take_idle(0, 0), -1);  // cold pool, no scan
+    CHECK(!pool.put_idle(-1, 0, 0));     // bad fd rejected
+    CHECK_EQ(pool.idle_count, 0u);
 }
 
 TEST(upstream_pool, create_socket) {
@@ -2796,16 +2810,18 @@ TEST(upstream_pool, create_socket) {
     if (fd >= 0) close(fd);
 }
 
-TEST(upstream_pool, shutdown_closes_fds) {
+TEST(upstream_pool, shutdown_closes_idle_fds) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->fd = dup(2);
-    REQUIRE(c->fd >= 0);
-    i32 saved_fd = c->fd;
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    REQUIRE(pool.put_idle(fd, 1, 0));
     pool.shutdown();
-    CHECK(close(saved_fd) < 0);
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(fd) < 0);  // closed by shutdown
+    pool.shutdown();       // idempotent
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
 }
 
 // === SlicePool ===
@@ -3344,63 +3360,15 @@ TEST(slab_pool, init_map_mmap_failure) {
     CHECK_EQ(pool.free_top, 0u);
 }
 
-TEST(upstream_pool, double_free_rejected) {
+TEST(upstream_pool, put_idle_full_rejects) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    u32 before = pool.free_top;
-    c->fd = -1;  // no real fd to close
-    pool.free(c);
-    CHECK_EQ(pool.free_top, before + 1);
-    pool.free(c);                         // double-free: allocated=false now
-    CHECK_EQ(pool.free_top, before + 1);  // unchanged
-}
-
-// === UpstreamPool validation ===
-
-TEST(upstream_pool, return_idle_null_safe) {
-    UpstreamPool pool;
-    pool.init();
-    pool.return_idle(nullptr);  // should not crash
-}
-
-TEST(upstream_pool, return_idle_requires_allocated) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->fd = -1;
-    pool.free(c);
-    // c is now free — return_idle should reject
-    pool.return_idle(c);
-    CHECK(!c->idle);  // not marked idle (allocated=false)
-}
-
-TEST(upstream_pool, shutdown_is_idempotent) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->fd = UpstreamPool::create_socket();
-    pool.shutdown();
-    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
-    pool.shutdown();  // second shutdown
-    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
-}
-
-TEST(upstream_pool, alloc_resets_upstream_id) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->upstream_id = 42;
-    c->fd = -1;
-    pool.free(c);
-    auto* c2 = pool.alloc();
-    CHECK_EQ(c2->upstream_id, 0u);  // reset on alloc
-    c2->fd = -1;
-    pool.free(c2);
+    pool.free_top = 0;  // simulate a full pool
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    CHECK(!pool.put_idle(fd, 1, 0));  // no slot → caller keeps ownership
+    CHECK_EQ(pool.idle_count, 0u);
+    close(fd);
 }
 
 // === RouteTable validation ===
@@ -9584,22 +9552,6 @@ TEST(early_response, consume_upstream_sent_normal) {
     u32 remaining = consume_upstream_sent(*c);
     CHECK_EQ(remaining, 0u);
     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
-}
-
-// === Coverage: upstream pool free with open fd ===
-
-TEST(upstream_pool, free_closes_fd) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    // Give it a real fd (dup of stderr so close doesn't fail)
-    c->fd = dup(2);
-    REQUIRE(c->fd >= 0);
-    pool.free(c);
-    CHECK_EQ(c->fd, -1);
-    CHECK_EQ(c->allocated, false);
-    pool.shutdown();
 }
 
 // === Coverage: legacy EventLoop<Backend> alloc_upstream_buf ===

@@ -135,6 +135,7 @@ struct Shard {
         }
         upstream = new (up_mem) UpstreamPool();
         upstream->init();
+        loop->upstream = upstream;  // wire idle-reuse pool into the proxy data path
 
         // Access log ring is allocated lazily via init_access_log(),
         // only when --access-log is specified. No ring = no per-request overhead.
