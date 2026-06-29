@@ -731,6 +731,23 @@ public:
                 drain_yield_heap();
                 break;
             case IoEventType::Timeout: {
+                // Issue health probes BEFORE the timer wheel reaps (F4 / #161). A
+                // stalled probe is freed by the reap below — its slot returns to
+                // the free list and its upstream fd is EPOLL_CTL_DEL'd (so no NEW
+                // events), but stale UpstreamConnect/UpstreamRecv events for that
+                // fd already collected in THIS epoll_wait batch still trail behind.
+                // Running the sweep first guarantees the just-freed slot is NOT
+                // re-allocated to a replacement probe within this same batch, so
+                // those stale events (keyed only by conn_id) cannot misroute into a
+                // new probe sharing the reused conn_id; they instead land on a
+                // now-free slot whose callbacks free_conn nulled, and are ignored.
+                // A backend whose probe is reaped this tick is re-probed on a later
+                // tick (the sweep we just ran skips it — its probe_in_flight guard
+                // is still set until the reap clears it), which is the intended
+                // deferral. The sweep arms new probes upstream_timeout (~30) slots
+                // ahead on the wheel, so a normal 1-tick reap below never touches
+                // them.
+                this->sweep_health_probes();
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
@@ -788,7 +805,6 @@ public:
                     });
                 }
                 this->fire_due_timers();
-                this->sweep_health_probes();
                 if (draining_.load(std::memory_order_acquire)) {
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
@@ -816,10 +832,21 @@ public:
                         // don't let stray events (e.g. a stale -ENOBUFS on the
                         // upstream fd) bump it back to the keepalive timeout, which
                         // would strand the parked pump until keepalive expiry.
+                        // A health probe is functionally an upstream request but
+                        // stays in the default (Idle) state, so the Proxying check
+                        // alone would refresh its deadline to keepalive_timeout
+                        // (60s) on every connect/send event — overwriting the
+                        // upstream_timeout (30s) bound start_health_probe armed and
+                        // delaying the stalled-probe reap. Special-case it here
+                        // (least blast radius: no ConnState semantics touched, so
+                        // the proxy-timeout 504 / traffic-capture paths that key off
+                        // Proxying stay untouched for a probe with fd == -1).
                         if (!conn.throttle_paused)
-                            timer.refresh(&conn,
-                                          conn.state == ConnState::Proxying ? upstream_timeout
-                                                                            : keepalive_timeout);
+                            timer.refresh(
+                                &conn,
+                                (conn.is_health_probe || conn.state == ConnState::Proxying)
+                                    ? upstream_timeout
+                                    : keepalive_timeout);
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
@@ -892,9 +919,21 @@ private:
         }
     }
 
+public:
     void force_close_all() {
         for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].fd >= 0) {
+            // A health probe deliberately has fd == -1 with upstream_fd >= 0 (no
+            // downstream socket), so the fd >= 0 guard alone would leak its
+            // upstream socket + slot when graceful drain hits its deadline mid-
+            // probe. Route it through free_probe_conn (clears probe_in_flight,
+            // then free_health_probe closes upstream_fd + EPOLL_CTL_DEL + returns
+            // the slot). free_health_probe touches only the still-live loop/backend
+            // (epoll set, fd maps, slice pool), all valid here — force_close_all
+            // runs inside run() before running_ is cleared. Mirrors the io_uring
+            // deferred-idle fd-leak fix (PR #160).
+            if (conns[i].is_health_probe) {
+                free_probe_conn(this, conns[i]);
+            } else if (conns[i].fd >= 0) {
                 this->close_conn(conns[i]);
             }
         }

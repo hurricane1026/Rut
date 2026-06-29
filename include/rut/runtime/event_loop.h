@@ -255,16 +255,49 @@ public:
             const u32 n = cfg->upstream_count < RouteConfig::kMaxUpstreams
                               ? cfg->upstream_count
                               : RouteConfig::kMaxUpstreams;
+            // Bound probes issued this sweep. A full fan-out (kMaxUpstreams ×
+            // kMaxBackendsPerUpstream) far exceeds the epoll backend's FIXED
+            // pending-completion ring (kPendingCap): each probe's synchronous
+            // connect can queue one immediate completion, and the ring silently
+            // drops anything past kPendingCap. A dropped completion strands a
+            // healthy probe as probe_in_flight until the timer reaps it as a
+            // FAILURE — wrongly marking a live backend down. So cap probes per
+            // sweep AND reserve ring headroom for real traffic's immediate sends
+            // (which share this same ring across the whole dispatch batch).
+            // Upstreams we cannot fully cover keep their (already-due) deadline,
+            // so the NEXT 1s tick retries them; probe_in_flight makes the retry
+            // idempotent for backends already launched. No health coverage is
+            // dropped — only deferred by a tick under heavy fan-out. Deterministic
+            // (iterates upstreams in index order).
+            static constexpr u32 kMaxProbesPerSweep = 32;
+            static constexpr u32 kProbePendingReserve = 16;
+            const u32 ring = self().backend.kPendingCap;
+            const u32 pend = self().backend.pending_count;
+            const u32 avail =
+                (pend + kProbePendingReserve < ring) ? (ring - kProbePendingReserve - pend) : 0;
+            u32 budget = avail < kMaxProbesPerSweep ? avail : kMaxProbesPerSweep;
             for (u32 u = 0; u < n; u++) {
                 const UpstreamTarget& up = cfg->upstreams[u];
                 if (!up.hc_enabled) continue;
                 if (now < health_probe_deadline_ns[u]) continue;
+                if (budget == 0) break;  // out of budget — defer remaining upstreams
+                bool all_issued = true;
+                for (u32 b = 0; b < up.addr_count; b++) {
+                    if (budget == 0) {
+                        all_issued = false;
+                        break;
+                    }
+                    // Only a launched probe consumes a ring slot; an in-flight skip
+                    // / local failure returns false and costs no budget.
+                    if (start_health_probe(&self(), static_cast<u16>(u), b)) budget--;
+                }
                 // Re-arm from now (not the missed deadline) to avoid a catch-up
-                // burst after a stall, mirroring fire_due_timers.
-                health_probe_deadline_ns[u] =
-                    now + static_cast<u64>(up.hc_interval_ms) * 1'000'000ull;
-                for (u32 b = 0; b < up.addr_count; b++)
-                    start_health_probe(&self(), static_cast<u16>(u), b);
+                // burst after a stall, mirroring fire_due_timers — but only once
+                // this upstream is fully covered. If budget ran out mid-upstream,
+                // leave the (past) deadline so the next tick re-probes the rest.
+                if (all_issued)
+                    health_probe_deadline_ns[u] =
+                        now + static_cast<u64>(up.hc_interval_ms) * 1'000'000ull;
             }
         }
     }

@@ -42,8 +42,12 @@ struct EpollBackend {
     i32 downstream_fd_map[kMaxFdMap];  // downstream (client) fd per conn_id
     i32 upstream_fd_map[kMaxFdMap];    // upstream (origin) fd per conn_id
 
-    // Pending synthetic completion events (from immediate sends)
-    IoEvent pending_completions[64];
+    // Pending synthetic completion events (from immediate sends). FIXED ring:
+    // queue_pending_completion drops past kPendingCap, so producers (incl. the
+    // health-probe sweep) must bound how many synchronous completions they emit
+    // per dispatch — see EventLoopCRTP::sweep_health_probes.
+    static constexpr u32 kPendingCap = 64;
+    IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;
 
     // Outstanding partial-send state per connection.

@@ -2206,6 +2206,279 @@ TEST(active_health, stalled_probe_reaped_then_reprobed) {
     destroy_real_loop(loop);
 }
 
+// F2 (#161): a probe's stalled-recv reap must fire at upstream_timeout, not the
+// (longer) keepalive_timeout. A probe stays in the default (Idle) state, so the
+// dispatch timer-refresh — `state == Proxying ? upstream_timeout : keepalive` —
+// would bump the probe's deadline to keepalive on its connect/send events,
+// delaying the reap. The fix special-cases is_health_probe in that refresh. Here
+// we drive a connect event through dispatch (which runs the refresh), then prove
+// the probe is reaped after only upstream_timeout+1 wheel ticks (far below
+// keepalive): if the refresh had used keepalive, those ticks would not reach it.
+TEST(active_health, probe_deadline_stays_upstream_timeout) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    // Large interval so the sweep that runs inside dispatch(Timeout) does not
+    // re-issue a probe and perturb the assertions.
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    // upstream_timeout deliberately far below keepalive_timeout (default 60).
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();  // launch one probe (connect via backlog)
+    REQUIRE(probe_in_flight(uid, 0));
+    REQUIRE_EQ(loop->active_count(), 1u);
+
+    // Locate the probe slot to address a synthetic connect-completion at it.
+    u32 cid = RealLoop::kMaxConns;
+    for (u32 i = 0; i < RealLoop::kMaxConns; i++)
+        if (loop->conns[i].is_health_probe) {
+            cid = i;
+            break;
+        }
+    REQUIRE(cid < RealLoop::kMaxConns);
+
+    // Drive the connect completion through dispatch — this is the path that
+    // refreshes the probe's wheel deadline (the line the fix touches). With the
+    // fix it refreshes to upstream_timeout; the pre-fix code used keepalive.
+    IoEvent connected{};
+    connected.type = IoEventType::UpstreamConnect;
+    connected.conn_id = cid;
+    connected.result = 0;
+    loop->dispatch(connected);
+    REQUIRE_EQ(loop->active_count(), 1u);  // probe still parked (submit_send ok)
+
+    // Advance the wheel by upstream_timeout+1 ticks. Reaped → the refresh used
+    // upstream_timeout. (Pre-fix: deadline would be keepalive (60), unreached.)
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+// F1 (#161): a single sweep can have far more due backend probes than the epoll
+// backend's fixed pending-completion ring (kPendingCap) can hold; each probe's
+// synchronous connect may queue one completion, so an unbounded sweep would
+// overflow the ring and silently drop healthy probe results. The sweep caps
+// probes per tick and reserves ring headroom for real traffic. Here 5 upstreams ×
+// 8 backends = 40 due probes exceed kMaxProbesPerSweep (32); the sweep must launch
+// exactly the cap, never overflow the ring, and keep the un-covered upstreams
+// "due" so a later tick picks them up (no dropped health coverage).
+TEST(active_health, sweep_caps_probes_per_tick) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    const u32 kUps = 5;  // 5 × 8 = 40 due probes > kMaxProbesPerSweep (32)
+    u16 uids[kUps];
+    const char kPath[] = "/healthz";
+    for (u32 u = 0; u < kUps; u++) {
+        auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+        REQUIRE(id.has_value());
+        uids[u] = static_cast<u16>(id.value());
+        for (u32 b = 1; b < 8; b++)  // add_upstream gave backend 0; add 7 more → 8
+            REQUIRE(cfg.add_upstream_backend(uids[u], 0x7F000001, backend_port));
+        REQUIRE(cfg.set_upstream_health_check(
+            uids[u], kPath, sizeof(kPath) - 1, /*interval_ms=*/1, /*status=*/200));
+    }
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    // Clean slate for every (upstream, backend) this test touches.
+    for (u32 u = 0; u < kUps; u++)
+        for (u32 b = 0; b < 8; b++) set_probe_in_flight(uids[u], b, false);
+
+    loop->sweep_health_probes();  // config install → arms, issues nothing
+    CHECK_EQ(loop->active_count(), 0u);
+
+    for (u32 u = 0; u < kUps; u++) loop->health_probe_deadline_ns[uids[u]] = 0;  // all due
+    loop->sweep_health_probes();
+
+    // Exactly the per-sweep cap launched (pending starts empty: budget =
+    // min(kPendingCap - reserve, kMaxProbesPerSweep) = 32), and the ring never
+    // overflowed.
+    CHECK_EQ(loop->active_count(), 32u);
+    CHECK_LE(loop->backend.pending_count, EpollBackend::kPendingCap);
+    // The last upstream couldn't be covered this sweep → its deadline stays in the
+    // past, so the next tick re-probes it (coverage deferred, not dropped).
+    CHECK_EQ(loop->health_probe_deadline_ns[uids[kUps - 1]], 0u);
+
+    // Tear down the in-flight probes (clears probe_in_flight via free_probe_conn).
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    for (u32 u = 0; u < kUps; u++)
+        for (u32 b = 0; b < 8; b++) CHECK(!probe_in_flight(uids[u], b));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+// F3 (#161): graceful-drain force-close must tear down an in-flight probe. A probe
+// has fd == -1 (no downstream) with upstream_fd >= 0, so force_close_all()'s
+// `fd >= 0` guard alone would leak its upstream socket + slot at the drain
+// deadline. force_close_all must route probes through free_probe_conn (close the
+// upstream fd, return the slot, clear probe_in_flight).
+TEST(active_health, force_close_tears_down_inflight_probe) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();  // launch one probe
+    REQUIRE(probe_in_flight(uid, 0));
+    REQUIRE_EQ(loop->active_count(), 1u);
+
+    // Capture the probe's upstream fd so we can verify force-close closed it.
+    i32 probe_fd = -1;
+    for (u32 i = 0; i < RealLoop::kMaxConns; i++)
+        if (loop->conns[i].is_health_probe) {
+            probe_fd = loop->conns[i].upstream_fd;
+            break;
+        }
+    REQUIRE(probe_fd >= 0);
+
+    loop->force_close_all();
+
+    CHECK_EQ(loop->active_count(), 0u);        // slot returned
+    CHECK(!probe_in_flight(uid, 0));           // in-flight guard cleared
+    CHECK_EQ(::fcntl(probe_fd, F_GETFD), -1);  // upstream fd closed (no leak)
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+// F4 (#161): the same-batch stale-event race (a reaped probe's slot reused by a
+// replacement probe within the same epoll_wait batch, letting stale events for the
+// old conn_id misroute) is not directly reproducible at unit level. Instead pin
+// the ORDERING that prevents it: dispatch(Timeout) runs sweep_health_probes BEFORE
+// the timer-wheel reap. Consequence — when a stalled probe is reaped on a tick
+// where its upstream is also due, the (earlier) sweep sees probe_in_flight still
+// set and skips it, so no replacement probe is allocated into the slot the reap is
+// about to free in this same dispatch. We assert active_count() == 0 afterward;
+// under the old (reap-then-sweep) order the reap would clear the guard and the
+// due sweep would immediately re-allocate the freed slot (active_count() == 1).
+TEST(active_health, timeout_sweep_runs_before_reap) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/1, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();  // launch the probe that will stall + be reaped
+    REQUIRE(probe_in_flight(uid, 0));
+    REQUIRE_EQ(loop->active_count(), 1u);
+
+    // Force the upstream "due" for the sweep that runs INSIDE the Timeout dispatch.
+    loop->health_probe_deadline_ns[uid] = 0;
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    loop->dispatch(tick);
+
+    // Sweep ran first (saw the probe in-flight → no re-probe), THEN the reap freed
+    // the slot. No replacement probe was allocated into the freed slot this batch.
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

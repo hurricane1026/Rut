@@ -263,25 +263,30 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_probe_connected(void* lp, Connection& conn, IoEvent ev);
 
+// Returns true iff a probe socket was actually submitted (a connect that may
+// queue one synchronous completion into the epoll pending ring). Returns false
+// when the probe was skipped (already in-flight) or aborted before submit
+// (invalid index / local resource failure) — i.e. when no pending-ring slot was
+// consumed. sweep_health_probes uses this to budget probes against the ring.
 template <typename Loop>
-void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
+bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (config == nullptr || upstream_idx >= config->upstream_count) return;
+    if (config == nullptr || upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[upstream_idx];
-    if (backend_idx >= target.addr_count) return;
+    if (backend_idx >= target.addr_count) return false;
 
     // At most one outstanding probe per backend (see probe_in_flight). A backend
     // that accepts but never responds otherwise accumulates a probe Connection per
     // due sweep until each times out. Mark BEFORE alloc_conn and clear on EVERY
     // exit-after-mark path below (alloc/create-socket failure here, every other
     // path through free_probe_conn).
-    if (probe_in_flight(upstream_idx, backend_idx)) return;
+    if (probe_in_flight(upstream_idx, backend_idx)) return false;
     set_probe_in_flight(upstream_idx, backend_idx, true);
 
     Connection* cptr = loop->alloc_conn();
     if (cptr == nullptr) {  // slot exhaustion: never starve real traffic
         set_probe_in_flight(upstream_idx, backend_idx, false);
-        return;
+        return false;
     }
     Connection& conn = *cptr;
     conn.is_health_probe = true;
@@ -304,13 +309,13 @@ void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
         // in-flight guard inline.
         set_probe_in_flight(upstream_idx, backend_idx, false);
         loop->free_conn(conn);
-        return;
+        return false;
     }
     conn.upstream_fd = kProbeFd;
     // The response lands in upstream_recv_buf (recv_buf holds the request).
     if (!loop->alloc_upstream_buf(conn)) {
         free_probe_conn(loop, conn);
-        return;
+        return false;
     }
 
     conn.recv_buf.reset();
@@ -320,7 +325,7 @@ void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     if (!loop->submit_connect(
             conn, &target.addrs[backend_idx], sizeof(target.addrs[backend_idx]))) {
         free_probe_conn(loop, conn);
-        return;
+        return false;
     }
     // Bound the probe's lifetime. A probe Connection is not a client accept, so
     // nothing else puts it on the keepalive wheel; a backend that completes the
@@ -335,6 +340,7 @@ void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // free_health_probe -> free_conn, which removes the wheel entry, so a completed
     // probe can never leave a stale entry to fire later against a reused slot.
     loop->timer.add(&conn, loop->upstream_timeout);
+    return true;
 }
 
 template <typename Loop>

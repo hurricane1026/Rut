@@ -122,8 +122,11 @@ void throttle_resume(Loop* loop, Connection& conn);
 // per-shard 1s sweep (EventLoopCRTP::sweep_health_probes). Defined in
 // callbacks_impl.h; EPOLL ONLY this slice. No-op if the slot pool is exhausted
 // (never starve real traffic with probes).
+// Returns true iff a probe socket was submitted (may consume one epoll
+// pending-ring slot); false if skipped/aborted before submit. sweep_health_probes
+// budgets probes against the fixed ring using this.
 template <typename Loop>
-void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
+bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 
 // Minimal teardown for a health-probe Connection: clears the in-flight guard for
 // the probe's (upstream, backend) then routes through Loop::free_health_probe.

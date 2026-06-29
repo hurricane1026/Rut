@@ -744,7 +744,7 @@ template void throttle_resume<EpollEventLoop>(EpollEventLoop*, Connection&);
 // Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
 // re-arms deadlines but issues no probes), so only the epoll instantiation is
 // emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
-template void start_health_probe<EpollEventLoop>(EpollEventLoop*, u16, u32);
+template bool start_health_probe<EpollEventLoop>(EpollEventLoop*, u16, u32);
 
 // Out-of-line definition (declared in callbacks.h, documented in callbacks_impl.h)
 // — odr-used from sweep_health_probes in multiple TUs, so a single strong symbol
