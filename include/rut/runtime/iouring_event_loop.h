@@ -1406,6 +1406,14 @@ private:
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0) {
                 this->close_conn(conns[i]);
+            } else if (conns[i].idle_return_fd >= 0) {
+                // Deferred-close conn (close_conn ran on a Connection: close client
+                // while its deferred idle-pool return was still draining): fd is
+                // already closed, but a reusable upstream fd is parked in
+                // idle_return_fd awaiting a recv-cancel drain that this forced
+                // shutdown will never deliver. Close it directly so it can't leak.
+                ::close(conns[i].idle_return_fd);
+                conns[i].idle_return_fd = -1;
             }
         }
     }
