@@ -464,13 +464,15 @@ inline bool request_resendable_from_recv_buf(const Connection& conn) {
 //      request-sent (after recv_buf was reset). This is the post-send dead-socket
 //      site (on_upstream_response); recv_buf may now hold a pipelined next request,
 //      which is preserved while the snapshot is replayed from send_buf.
-//   2. recv_buf still byte-for-byte holds the request — the pre-reset sites (failed
+//   2. recv_buf still has the request as its prefix — the pre-reset sites (failed
 //      send / EOF before the send completed), where no snapshot was taken yet.
+//      Any surplus bytes are pipelined next-request data and are preserved by the
+//      normal stash path after the retry send succeeds.
 // Used to gate BOTH reused-socket retry sites so they cannot drift.
 inline bool request_fully_resendable(const Connection& conn) {
     if (!request_body_replayable(conn)) return false;
     if (conn.retry_req_send_len > 0) return true;
-    return conn.req_initial_send_len > 0 && conn.recv_buf.len() == conn.req_initial_send_len;
+    return conn.req_initial_send_len > 0 && conn.recv_buf.len() >= conn.req_initial_send_len;
 }
 
 // A reused (pooled) upstream socket failed before any response byte — the backend
@@ -2087,9 +2089,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     //
     // RETRY path (retry_req_send_len > 0): the request was just replayed from the
     // send_buf snapshot, so recv_buf did NOT hold it — recv_buf was empty when the
-    // retry began (request_fully_resendable gates the retry on recv_buf.len()==0). Any
-    // bytes in recv_buf now are the next request(s) the client PIPELINED during the
-    // in-flight fresh connect/send, sitting at offset 0 (a clean request boundary).
+    // retry began. Any bytes in recv_buf now are the next request(s) the client
+    // PIPELINED during the in-flight fresh connect/send, sitting at offset 0 (a clean
+    // request boundary).
     // Running pipeline_stash here would mis-slice them at req_initial_send_len (the
     // ORIGINAL request's length, not a boundary in this buffer), and recv_buf.reset()
     // would drop them. So on the retry path we do NEITHER and preserve recv_buf intact:
@@ -3915,6 +3917,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         if (retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
+    }
+
+    // A reused pooled socket proved healthy once it returned response bytes; record
+    // success here rather than at synthetic connect time.
+    if (conn.upstream_reused) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        conn.upstream_reused = false;
     }
 
     // A response byte is now in hand, so the request will not be replayed: drop the

@@ -3873,10 +3873,10 @@ TEST(upstream_reuse, retry_replays_request_from_snapshot) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
-// The snapshot-based retry is refused when the client pipelined another request into
-// recv_buf during the upstream wait: replaying would strand those buffered bytes, so
-// fail closed (mirrors the original strict-equality clobber guard).
-TEST(upstream_reuse, retry_refused_when_pipelined_bytes_buffered) {
+// The snapshot-based retry remains valid when the client pipelined another request
+// into recv_buf during the upstream wait: replay comes from send_buf, while recv_buf
+// is preserved for the next dispatch.
+TEST(upstream_reuse, retry_allowed_when_pipelined_bytes_buffered) {
     SmallLoop loop;
     loop.setup();
     auto* c = loop.alloc_conn();
@@ -3893,7 +3893,28 @@ TEST(upstream_reuse, retry_refused_when_pipelined_bytes_buffered) {
     c->recv_buf.reset();
     c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), sizeof(pipelined) - 1);
 
-    CHECK(!rut::request_fully_resendable(*c));  // refused: recv_buf not empty
+    CHECK(rut::request_fully_resendable(*c));  // replayable from the snapshot
+}
+
+// Before the initial reused-fd send completes, recv_buf can still contain the original
+// request followed by pipelined bytes. The retry can replay only the request prefix;
+// the normal successful-send path stashes the surplus for the next dispatch.
+TEST(upstream_reuse, pre_send_retry_allows_pipelined_suffix) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char pipelined[] = "GET /next HTTP/1.1\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), sizeof(pipelined) - 1);
+    c->req_initial_send_len = len;
+    c->retry_req_send_len = 0;
+
+    CHECK(rut::request_fully_resendable(*c));
 }
 
 // Finding (F3): on the snapshot-retry path the request was replayed from send_buf, so
