@@ -131,6 +131,15 @@ struct ConnectionBase {
     // response byte can fall back to a fresh connect (idempotent methods only).
     bool upstream_keep_alive;
     bool upstream_reused;
+    // Set when a request-body write to the upstream FAILS (initial forward or a
+    // streamed chunk) so the upload was not fully delivered. The body counters
+    // (req_body_remaining / req_chunk_parser) are advanced before the send is
+    // submitted, so they can read "complete" even though those bytes never landed;
+    // this flag is the authoritative "upload finished cleanly" signal that
+    // proxy_upstream_reusable consults before pooling — a socket whose upload
+    // desynced must never be reused (the next request would be parsed as leftover
+    // body). Reset at the per-request boundary like the other reuse flags.
+    bool upstream_request_incomplete;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -348,6 +357,11 @@ struct ConnectionBase {
     BodyMode req_body_mode;
     u32 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
+    // True once any request-body byte has started streaming upstream (recv_buf is
+    // reset + refilled with body chunks, so the original headers+body are gone).
+    // Once set, the request can no longer be replayed from recv_buf, so the
+    // reused-socket retry predicate refuses it. Reset at the per-request boundary.
+    bool req_body_streamed;
     BodyMode resp_body_mode;
     u32 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
@@ -479,6 +493,7 @@ struct ConnectionBase {
         upstream_abandoned = false;
         upstream_keep_alive = false;
         upstream_reused = false;
+        upstream_request_incomplete = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
@@ -567,6 +582,7 @@ struct ConnectionBase {
         req_body_mode = BodyMode::None;
         req_body_remaining = 0;
         req_chunk_parser.reset();
+        req_body_streamed = false;
         resp_body_mode = BodyMode::None;
         resp_body_remaining = 0;
         resp_chunk_parser.reset();
