@@ -736,6 +736,22 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+                        // A stalled active health probe: it accepted the connect
+                        // (or stayed pending) but never produced a parseable
+                        // response within upstream_timeout. Record a health FAILURE
+                        // for its backend (an unresponsive backend is unhealthy)
+                        // and tear the probe down. MUST come first: a probe has
+                        // fd == -1, so falling through to respond_upstream_timeout
+                        // would client_send to fd -1. record_probe_if_current pins
+                        // the launching config, so a timeout straddling a hot
+                        // reload frees without recording against the wrong
+                        // upstream; free_probe_conn clears probe_in_flight so the
+                        // next sweep re-probes.
+                        if (c->is_health_probe) {
+                            record_probe_if_current(this, *c, /*healthy=*/false, monotonic_us());
+                            free_probe_conn(this, *c);
+                            return;
+                        }
                         // A timer can now expire for two reasons:
                         //   (1) keepalive — close the connection (existing).
                         //   (2) a JIT handler yielded with wait(ms), or wait-any

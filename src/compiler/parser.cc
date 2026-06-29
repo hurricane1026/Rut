@@ -1662,6 +1662,16 @@ struct Parser {
                                                           span_from(*lit.value()),
                                                           lit.value()->text);
                             }
+                            // The probe path parses the upstream reply with
+                            // HttpResponseParser, which rejects any response
+                            // outside 100..599 BEFORE the equality check — so an
+                            // out-of-range expected status (e.g. 0, 99, 600) can
+                            // never match and the backend could never be marked
+                            // healthy. Reject it here.
+                            if (sv < 100 || sv > 599)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*lit.value()),
+                                                      lit.value()->text);
                             item.upstream.hc_expected_status = static_cast<u16>(sv);
                             seen_status = true;
                         } else {

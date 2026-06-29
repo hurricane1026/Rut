@@ -1670,6 +1670,46 @@ TEST(frontend, parse_upstream_dict_form) {
     }
 }
 
+TEST(frontend, parse_upstream_health_check_valid_status) {
+    // A health_check.status inside the HTTP response range (100..599) parses and
+    // is stored. 200 and the boundary 599 both pass.
+    for (unsigned code : {100u, 200u, 599u}) {
+        char src[160];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { path: \"/h\", "
+                 "interval: 1s, status: %u } }\nroute GET \"/u\" { return 200 }\n",
+                 code);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        const auto& up = ast->items[0].upstream;
+        CHECK(up.hc_enabled);
+        CHECK_EQ(static_cast<unsigned>(up.hc_expected_status), code);
+    }
+}
+
+TEST(frontend, parse_upstream_health_check_rejects_out_of_range_status) {
+    // A health_check.status outside 100..599 can never match (the probe parses the
+    // reply with HttpResponseParser, which rejects responses outside that range
+    // before the equality check), so the backend could never be marked healthy.
+    // Reject it at parse time. 0xffff still trips the existing overflow guard.
+    for (const char* code : {"0", "99", "600", "1000"}) {
+        char src[160];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { path: \"/h\", "
+                 "interval: 1s, status: %s } }\nroute GET \"/u\" { return 200 }\n",
+                 code);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+    }
+}
+
 TEST(frontend, parse_upstream_no_address_still_works) {
     // Backwards-compat: `upstream NAME` (no address) stays legal.
     // HirUpstream.has_address == false means the runtime must bind

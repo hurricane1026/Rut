@@ -128,6 +128,27 @@ inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
     if (s != nullptr) *s = v;
 }
 
+// Clear ALL per-(upstream, backend) health verdicts. Called from
+// sweep_health_probes on a config change (hot reload). The BackendHealth table is
+// thread_local and keyed only by NUMERIC (upstream_idx, backend_idx) — it carries
+// no config pin and active_down has no timed expiry — so after a reload a verdict
+// recorded under the OLD config would wrongly suppress (or pass) a DIFFERENT
+// endpoint that now occupies the same numeric slot, and if the new config
+// disables health checks there is no future probe to clear it. Reset all three
+// fields (active_down + the passive fails/eject, since indices may now mean a
+// different backend). O(kMaxUpstreams * kMaxBackends); runs only on reload.
+//
+// probe_in_flight is deliberately NOT reset. A probe launched under the old config
+// may still be in flight via a live Connection that owns its slot's flag; every
+// probe now carries a bounded timer (see start_health_probe), so the flag always
+// self-clears within upstream_timeout on the probe's teardown. Clearing it here
+// would let the next sweep launch a SECOND probe for the same backend while the
+// old one is still live, defeating the in-flight overlap guard.
+//
+// Defined out-of-line in callbacks.cc (not inline here): it is odr-used from
+// sweep_health_probes — instantiated in main.cc and the test TUs — and a single
+// strong symbol avoids multiple-definition across TUs that include this header.
+
 // Pick the next backend index for `upstream_id` via round-robin, skipping
 // ejected backends. If every backend is ejected, falls back to plain
 // round-robin (serving through a possibly-down backend beats refusing). A
@@ -299,7 +320,21 @@ void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     if (!loop->submit_connect(
             conn, &target.addrs[backend_idx], sizeof(target.addrs[backend_idx]))) {
         free_probe_conn(loop, conn);
+        return;
     }
+    // Bound the probe's lifetime. A probe Connection is not a client accept, so
+    // nothing else puts it on the keepalive wheel; a backend that completes the
+    // connect but never responds (or a connect that stays pending) would otherwise
+    // keep this Connection alive forever with upstream I/O armed and
+    // probe_in_flight set — permanently suppressing all future probes for the
+    // backend and leaking the slot. Arm it on the 1s timer wheel with the same
+    // bound a real proxied upstream response gets (upstream_timeout, default 30s,
+    // already < TimerWheel::kSlots): the Timeout tick reaps a stalled probe as a
+    // health FAILURE and frees it (clearing probe_in_flight so the next sweep
+    // re-probes). Every fast completion path frees via free_probe_conn ->
+    // free_health_probe -> free_conn, which removes the wheel entry, so a completed
+    // probe can never leave a stale entry to fire later against a reused slot.
+    loop->timer.add(&conn, loop->upstream_timeout);
 }
 
 template <typename Loop>

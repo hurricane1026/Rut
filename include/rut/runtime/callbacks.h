@@ -125,6 +125,24 @@ void throttle_resume(Loop* loop, Connection& conn);
 template <typename Loop>
 void start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 
+// Minimal teardown for a health-probe Connection: clears the in-flight guard for
+// the probe's (upstream, backend) then routes through Loop::free_health_probe.
+// Invoked from the per-shard timer tick to reap a stalled probe. Defined in
+// callbacks_impl.h.
+template <typename Loop>
+void free_probe_conn(Loop* loop, Connection& conn);
+
+// Record an active-probe outcome, but only if the config that LAUNCHED the probe
+// is still current (config-pin guard against a hot reload repointing the numeric
+// upstream index). Invoked from the per-shard timer tick. Defined in
+// callbacks_impl.h.
+template <typename Loop>
+void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us);
+
+// Clear ALL per-(upstream, backend) active/passive health verdicts. Called from
+// sweep_health_probes on a config change (hot reload). Defined in callbacks_impl.h.
+void reset_backend_health();
+
 template <typename Loop>
 void on_early_upstream_recvd_send_inflight(void* lp, Connection& conn, IoEvent ev);
 

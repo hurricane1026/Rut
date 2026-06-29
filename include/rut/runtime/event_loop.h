@@ -227,6 +227,15 @@ public:
         const u64 now = monotonic_ns();
         if (cfg != health_armed_config) {
             health_armed_config = cfg;
+            // BackendHealth is thread_local and keyed only by NUMERIC
+            // (upstream_idx, backend_idx) with no config pin; active_down has no
+            // timed expiry. After a hot reload the same numeric slot can mean a
+            // different endpoint, so a stale verdict (or a passive eject) would
+            // wrongly suppress the new backend — and if the new config disables
+            // health checks there is no future probe to clear it. Reset all
+            // verdicts here so the new config starts clean. (probe_in_flight is
+            // intentionally NOT reset — see reset_backend_health.)
+            reset_backend_health();
             if (cfg != nullptr) {
                 const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
                                   ? cfg->upstream_count

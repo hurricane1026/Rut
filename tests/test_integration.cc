@@ -2123,6 +2123,89 @@ TEST(active_health, failed_probe_keeps_backend_down_until_success) {
     CHECK(!backend_ejected(uid, bidx, now + 60'000'000));
 }
 
+// A probe to a backend that accepts the TCP connect but never sends a response
+// parks the probe Connection on its upstream recv. Without a bounded probe
+// timeout it would stay alive forever with probe_in_flight set — permanently
+// blocking future probes for the backend and leaking the slot. start_health_probe
+// arms the probe on the 1s timer wheel (upstream_timeout); the Timeout tick must
+// reap it as a health FAILURE, clear probe_in_flight, and free the slot, so the
+// next sweep re-probes. Driven deterministically: we issue the probe but never
+// pump its I/O (it stays parked), then advance the wheel by hand.
+TEST(active_health, stalled_probe_reaped_then_reprobed) {
+    using namespace rut;
+    // A bare listening socket: the kernel completes the handshake via the backlog,
+    // so connect succeeds, but nothing ever accept()s or replies → the probe
+    // stalls. We never pump the loop, so the connect/recv completions are never
+    // delivered; the probe simply sits on the wheel until the tick reaps it.
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    // Large interval so the sweep that runs inside dispatch(Timeout) does not
+    // re-issue a probe and perturb the assertions.
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    // Short probe deadline so a handful of wheel ticks reaps it deterministically.
+    loop->upstream_timeout = 3;
+
+    // First sweep: config install → arms deadlines + clears the health table.
+    loop->sweep_health_probes();
+    // Defensive clean slate (the thread_local tables may carry state across tests
+    // that ran on this same thread).
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    // Force one probe. It connects to a backend that never responds; we
+    // deliberately do NOT pump the I/O, so it stays parked on the timer wheel.
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK(probe_in_flight(uid, 0));                   // probe launched, in flight
+    CHECK_EQ(loop->active_count(), 1u);               // one probe Connection taken
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));  // not failed yet
+
+    // Advance the wheel past the probe deadline (upstream_timeout=3) → reap.
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    loop->dispatch(tick);
+
+    // Reaped: backend recorded down, in-flight guard cleared, slot freed.
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+
+    // The cleared guard re-enables probing: a later sweep issues a fresh probe.
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK(probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 1u);
+
+    // Reap the second probe so no Connection dangles past teardown.
+    loop->dispatch(tick);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {
