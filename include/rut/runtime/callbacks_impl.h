@@ -385,6 +385,13 @@ bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
     // The upstream must have signalled keep-alive + a self-framed body, and the
     // episode must not have been abandoned on timeout.
     if (!conn.upstream_keep_alive || conn.upstream_abandoned) return false;
+    // The client→upstream upload must have been fully DELIVERED. A failed body
+    // write (initial forward or a streamed chunk) leaves the backend mid-read of a
+    // truncated request even though the body counters below may read "complete"
+    // (they advance before the send is submitted) — pooling such a socket would let
+    // the next request's bytes be parsed as the unfinished body. See
+    // upstream_request_incomplete.
+    if (conn.upstream_request_incomplete) return false;
     // The client→upstream request upload must have finished. An early upstream
     // response (e.g. a 413 before the POST body drained) stops forwarding the body,
     // leaving the backend still reading the previous request — a pooled fd would
@@ -425,6 +432,27 @@ void release_upstream_conn(Loop* loop, Connection& conn) {
     conn.upstream_send_armed = false;
 }
 
+// True iff the COMPLETE original request is still byte-for-byte replayable from
+// recv_buf. A reused-socket retry reconnects and re-sends the request straight out
+// of recv_buf, so it is only safe when (a) no request-body byte has begun streaming
+// upstream (once it has, recv_buf was reset and refilled with body chunks, so the
+// original headers+body are gone), (b) the whole body is buffered (nothing left to
+// stream), and (c) recv_buf holds EXACTLY the request bytes — not more. The strict
+// equality is load-bearing for the post-send retry site (on_upstream_response):
+// while we wait for the response the downstream fd stays EPOLLIN-armed, so a client
+// that PIPELINES another request has its bytes appended into recv_buf. If that
+// happened, recv_buf no longer holds just the original request, so we must NOT
+// replay it (we fall back to close, same as a non-reused failure). Used to gate
+// BOTH reused-socket retry sites so the two sites cannot drift.
+inline bool request_fully_resendable(const Connection& conn) {
+    if (conn.req_body_streamed) return false;
+    if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) return false;
+    if (conn.req_body_mode == BodyMode::Chunked &&
+        conn.req_chunk_parser.state != ChunkedParser::State::Complete)
+        return false;
+    return conn.req_initial_send_len > 0 && conn.recv_buf.len() == conn.req_initial_send_len;
+}
+
 // A reused (pooled) upstream socket failed before any response byte — the backend
 // closed it between take_idle's liveness probe and our request. Fall back to a
 // fresh connect + resend, but ONLY for idempotent methods: a non-idempotent
@@ -445,6 +473,15 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
         m == static_cast<u8>(LogHttpMethod::Put) || m == static_cast<u8>(LogHttpMethod::Delete) ||
         m == static_cast<u8>(LogHttpMethod::Options) || m == static_cast<u8>(LogHttpMethod::Trace);
     if (!kIdempotent) return false;
+    // The full request must still be resendable from recv_buf: a body upload that
+    // began streaming has already overwritten recv_buf with body chunks, so
+    // reconnecting would resend a truncated/garbage request (bodyless idempotent
+    // methods and fully-buffered-unsent bodies stay retryable). This same gate runs
+    // at every retry site, so a partially-or-fully-streamed body is never replayed.
+    if (!request_fully_resendable(conn)) return false;
+    // A retry re-sends the request from scratch, so any prior failed-send marker
+    // from this episode is stale; the fresh attempt decides delivery anew.
+    conn.upstream_request_incomplete = false;
     const RouteConfig* cfg = conn.request_config;
     if (!cfg) return false;
     const auto& target = cfg->upstreams[conn.upstream_idx];
@@ -636,6 +673,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_abandoned = false;
     conn.upstream_keep_alive = false;
     conn.upstream_reused = false;
+    conn.upstream_request_incomplete = false;
+    conn.req_body_streamed = false;
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
@@ -1920,6 +1959,12 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result < 0) {
+        // The request forward failed mid-write: the backend never received the
+        // complete request. If an early response was buffered (below) and the
+        // socket gets considered for pooling, this marks the upload as not
+        // delivered so proxy_upstream_reusable refuses it. A successful retry
+        // clears it again (the fresh attempt re-sends from scratch).
+        conn.upstream_request_incomplete = true;
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -1970,6 +2015,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (kMoreReqBody) {
+        // Body streaming begins here: recv_buf is reset and refilled with body
+        // chunks, so the original headers+body are no longer replayable. Mark it so
+        // request_fully_resendable refuses any later reused-socket retry.
+        conn.req_body_streamed = true;
         conn.recv_buf.reset();
         conn.set_slots(
             &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
@@ -1979,7 +2028,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     pipeline_stash(conn);
-    conn.recv_buf.reset();
+    // Keep recv_buf for a reused pooled socket so the rare post-send dead-socket
+    // case (origin FIN landing just after take_idle's MSG_PEEK probe) can replay
+    // the request in on_upstream_response; that path resets recv_buf once a response
+    // byte is in hand. A fresh connect has nothing to retry, so release it now.
+    if (!conn.upstream_reused) conn.recv_buf.reset();
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
     if (conn.upstream_recv_buf.len() > 0) {
@@ -2880,6 +2933,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        // A streamed body chunk failed to send: the upload is now truncated even
+        // though req_body_remaining / the chunk parser were advanced (before this
+        // submit) and may read "complete". Mark the upload incomplete so that if an
+        // early response was buffered and the socket reaches release_upstream_conn,
+        // proxy_upstream_reusable refuses to pool this desynced stream.
+        conn.upstream_request_incomplete = true;
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -3746,15 +3805,22 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
-        // Reused-socket dead-on-arrival is recovered on the SEND-error path only
-        // (on_upstream_request_sent), where recv_buf still holds the request to
-        // replay. Here the request send already succeeded and reset recv_buf, so a
-        // retry can't resend — fail closed. (The MSG_PEEK probe in take_idle catches
-        // the common backend-closed-idle case before the send; this is the rarer
-        // probe-then-FIN race, which we don't replay.)
+        // Post-send first-recv EOF/RST with no response byte. For a reused pooled
+        // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
+        // the request write completed locally and the dead socket only surfaces
+        // here. on_upstream_request_sent kept recv_buf for the reused case, so an
+        // idempotent request whose full bytes are still buffered can fall back to a
+        // fresh connect (request_fully_resendable inside the helper enforces this, so
+        // a streamed body upload is never replayed). Otherwise fail closed.
+        if (retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
+
+    // A response byte is now in hand, so the request will not be replayed: release
+    // the recv_buf bytes kept for the retry above (reused sockets only — fresh
+    // connects already reset it) before they are mistaken for a pipelined request.
+    conn.recv_buf.reset();
 
     HttpResponseParser resp_parser;
     ParsedResponse resp;

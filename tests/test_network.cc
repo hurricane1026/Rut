@@ -3608,6 +3608,12 @@ TEST(upstream_reuse, fallback_retries_idempotent_method) {
     c->upstream_backend_idx = 0;
     c->req_method = static_cast<u8>(LogHttpMethod::Get);  // idempotent
     c->upstream_reused = true;
+    // The bodyless request must still be replayable from recv_buf (the retry
+    // re-sends straight out of it).
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), sizeof(get_req) - 1);
+    c->req_initial_send_len = sizeof(get_req) - 1;
     c->upstream_fd = dup(2);
     REQUIRE(c->upstream_fd >= 0);
     loop.backend.clear_ops();
@@ -3615,6 +3621,73 @@ TEST(upstream_reuse, fallback_retries_idempotent_method) {
     CHECK(rut::retry_reused_upstream(&loop, *c));
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);  // fresh connect submitted
     CHECK(!c->upstream_reused);                             // one-shot
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A reused idempotent request whose body already began streaming upstream must NOT
+// retry: recv_buf was reset + refilled with body chunks, so the original request is
+// gone and a replay would send a truncated/garbage request. (Finding 1 regression —
+// e.g. a PUT mid-upload after a dead pooled socket.)
+TEST(upstream_reuse, fallback_refuses_streamed_body_upload) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Put);  // idempotent method...
+    c->upstream_reused = true;
+    // ...but a body chunk has already been streamed: recv_buf holds only that chunk,
+    // not the headers/body, and req_body_streamed records the loss.
+    c->req_body_streamed = true;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;  // counters can read "complete" yet upload isn't replayable
+    static const char chunk[] = "trailing-body-bytes";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(chunk), sizeof(chunk) - 1);
+    c->req_initial_send_len = sizeof(chunk) - 1;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(!rut::retry_reused_upstream(&loop, *c));          // refused
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);  // no fresh connect
+    CHECK(!c->upstream_reused);                             // still cleared (one-shot)
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A bodyless DELETE (no buffered body) stays retryable — request_fully_resendable
+// allows it since recv_buf still holds the complete request.
+TEST(upstream_reuse, fallback_retries_bodyless_delete) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Delete);
+    c->upstream_reused = true;
+    c->req_body_mode = BodyMode::None;
+    static const char del_req[] = "DELETE /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(del_req), sizeof(del_req) - 1);
+    c->req_initial_send_len = sizeof(del_req) - 1;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
@@ -3732,6 +3805,30 @@ TEST(upstream_reuse, reusable_rejects_incomplete_upload) {
     c->upstream_keep_alive = true;
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = 10;  // body not fully forwarded
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// Finding 3: a body send that FAILED leaves the upload truncated even though the
+// body counters (advanced before the send) read "complete". upstream_request_incomplete
+// is the authoritative signal, so proxy_upstream_reusable must refuse to pool —
+// otherwise the next request on the socket would be parsed as the leftover body.
+TEST(upstream_reuse, reusable_rejects_failed_body_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->upstream_abandoned = false;
+    // Counters look complete (advanced before the failed submit_send_upstream)...
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;
+    CHECK(rut::proxy_upstream_reusable(&loop, *c));  // sanity: complete counters alone pool
+    // ...but the send actually failed, so the upload never landed.
+    c->upstream_request_incomplete = true;
     CHECK(!rut::proxy_upstream_reusable(&loop, *c));
 }
 
