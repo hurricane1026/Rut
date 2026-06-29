@@ -379,6 +379,13 @@ public:
         drain_period_.store(period_secs, std::memory_order_relaxed);
         drain_start_.store(monotonic_secs(), std::memory_order_relaxed);
         draining_.store(true, std::memory_order_release);
+        // Close any parked idle upstream sockets at drain start. active_count()
+        // doesn't include idle-pool entries, so a shard whose only remaining work is
+        // pooled fds (or one that finishes its clients before the pool sweep) could
+        // otherwise let the run loop exit with backend sockets still open. Completions
+        // during drain already close instead of pool (proxy_stream_complete /
+        // on_proxy_response_sent), so draining the pool here leaves it empty.
+        if (upstream) upstream->drain();
         if (backend.timer_fd >= 0) {
             struct itimerspec wake = {};
             wake.it_value.tv_nsec = 1;
