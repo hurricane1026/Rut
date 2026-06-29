@@ -729,13 +729,26 @@ public:
         // pool — no recv can fire on it anymore. Runs at every recv-terminal drain
         // site (all call this) so whichever CQE lands last triggers it. Closes the
         // fd if the pool is full / gone.
-        if (c.idle_return_fd >= 0 && !c.upstream_recv_pause_cancel_pending &&
-            !c.upstream_recv_cancel_inflight && !c.upstream_recv_armed) {
+        const bool kUpstreamRecvDrained = !c.upstream_recv_pause_cancel_pending &&
+                                          !c.upstream_recv_cancel_inflight &&
+                                          !c.upstream_recv_armed;
+        if (c.idle_return_fd >= 0 && kUpstreamRecvDrained) {
             const i32 fd = c.idle_return_fd;
             c.idle_return_fd = -1;
             if (!upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
+        }
+        // Deferred close: close_conn_impl tore the conn down (e.g. Connection: close)
+        // while the deferred pool-return was still draining, leaving the slot allocated
+        // so these recv-terminal CQEs would route here. The fd is now pooled (above) and
+        // the recv has fully drained, so finish the slot-free that close_conn skipped.
+        // free_conn defers reclamation itself if client-side cancel CQEs are still in
+        // flight (parks the conn in pending_free until pending_ops hits 0).
+        if (c.close_after_idle_return && kUpstreamRecvDrained) {
+            c.close_after_idle_return = false;
+            this->free_conn(c);
+            return true;
         }
         if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight ||
             c.upstream_recv_armed || !c.upstream_recv_pause_rearm_pending ||
@@ -795,18 +808,45 @@ public:
             ::close(c.upstream_fd);
             c.upstream_fd = -1;
         }
-        // A deferred idle-pool return that never drained (conn torn down mid-drain):
-        // close the parked fd so it isn't leaked. Its cancelled recv terminal still
-        // drains harmlessly against pending_ops (on_upstream_recv is null by now).
-        if (c.idle_return_fd >= 0) {
-            ::close(c.idle_return_fd);
-            c.idle_return_fd = -1;
-        }
         if (metrics) {
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
             }
             metrics->on_close();
+        }
+        // A deferred idle-pool return (return_idle_upstream parked a still-reusable
+        // upstream fd in idle_return_fd) whose cancelled multishot recv has NOT yet
+        // drained. Don't discard the reusable fd or free the slot: keep the conn
+        // allocated so the in-flight cancel + recv-terminal CQEs still route here by
+        // conn_id. try_deferred_upstream_rearm then pools the fd AND performs this
+        // deferred free once the recv drains. Quiesce the client side (timer + I/O
+        // callbacks) so a stray client terminal CQE can't dispatch on the now-closed
+        // connection; the upstream-recv terminal branches key off the recv flags (left
+        // intact here), not these callbacks, so the drain still completes. epoch / slot
+        // / metrics above have already run exactly once — the deferred free_conn does
+        // none of them, so there is no double release.
+        if (c.idle_return_fd >= 0 && (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
+                                      c.upstream_recv_pause_cancel_pending)) {
+            c.close_after_idle_return = true;
+            timer.remove(&c);
+            c.on_recv = nullptr;
+            c.on_send = nullptr;
+            c.on_upstream_recv = nullptr;
+            c.on_upstream_send = nullptr;
+            c.pending_handler_fn = nullptr;
+            return;
+        }
+        // idle_return_fd set but already drained (no recv still racing it): the fd is
+        // reusable, so pool it rather than discard. In practice the synchronous close
+        // right after return_idle_upstream always leaves the cancel in flight, so this
+        // pools only if the recv happened to drain before close_conn ran — either way a
+        // reusable fd must not be leaked/closed.
+        if (c.idle_return_fd >= 0) {
+            const i32 fd = c.idle_return_fd;
+            c.idle_return_fd = -1;
+            if (!upstream ||
+                !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
+                ::close(fd);
         }
         this->free_conn(c);
     }
@@ -1066,8 +1106,14 @@ public:
                             // Connection already closed — this is a stale/close-path cancel
                             // completion. The early break below skips the generic
                             // pending_ops==0 reclaim, so reclaim here if it was the last op,
-                            // or the slot leaks and proxy churn exhausts the table.
-                            if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                            // or the slot leaks and proxy churn exhausts the table. A deferred
+                            // close (close_after_idle_return) routes through the rearm helper
+                            // instead: it pools idle_return_fd once the recv fully drains and
+                            // then performs the slot-free close_conn postponed.
+                            if (conn.close_after_idle_return)
+                                this->try_deferred_upstream_rearm(conn);
+                            else if (conn.pending_ops == 0)
+                                this->reclaim_slot(conn.id);
                             break;
                         }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
@@ -1096,8 +1142,13 @@ public:
                         if (conn.fd < 0) {
                             // Closed conn (e.g. the close-path cancel of an armed upstream
                             // recv): reclaim the slot if this drained the last op, since the
-                            // break skips the generic reclaim below.
-                            if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                            // break skips the generic reclaim below. A deferred close pools
+                            // idle_return_fd + performs its postponed slot-free via the rearm
+                            // helper once the recv has fully drained.
+                            if (conn.close_after_idle_return)
+                                this->try_deferred_upstream_rearm(conn);
+                            else if (conn.pending_ops == 0)
+                                this->reclaim_slot(conn.id);
                             break;
                         }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
@@ -1126,7 +1177,13 @@ public:
                             conn.upstream_recv_terminal_stale = false;
                             if (conn.pending_ops > 0) conn.pending_ops--;
                             if (conn.fd < 0) {
-                                if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                                // A deferred close pools idle_return_fd + performs its
+                                // postponed slot-free via the rearm helper once the recv has
+                                // fully drained; otherwise reclaim if this was the last op.
+                                if (conn.close_after_idle_return)
+                                    this->try_deferred_upstream_rearm(conn);
+                                else if (conn.pending_ops == 0)
+                                    this->reclaim_slot(conn.id);
                                 break;
                             }
                             if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
@@ -1165,8 +1222,13 @@ public:
                             }
                             if (conn.fd < 0) {
                                 // Closed conn: reclaim if this was the last op (the break
-                                // below skips the generic pending_ops==0 reclaim).
-                                if (conn.pending_ops == 0) this->reclaim_slot(conn.id);
+                                // below skips the generic pending_ops==0 reclaim). A deferred
+                                // close pools idle_return_fd + performs its postponed slot-free
+                                // via the rearm helper once the recv has fully drained.
+                                if (conn.close_after_idle_return)
+                                    this->try_deferred_upstream_rearm(conn);
+                                else if (conn.pending_ops == 0)
+                                    this->reclaim_slot(conn.id);
                                 break;
                             }
                             if (!this->try_deferred_upstream_rearm(conn)) {

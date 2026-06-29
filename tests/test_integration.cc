@@ -8070,6 +8070,62 @@ TEST(proxy_reuse, reuses_idle_upstream_iouring) {
     close(lfd);
 }
 
+// io_uring deferred-close reuse: a downstream that does NOT stay keep-alive
+// (Connection: close) still pools its reusable upstream socket. On io_uring the pool-
+// return is deferred behind the multishot recv cancel, and close_conn fires immediately
+// for a Connection: close client — so without the deferred-close path the still-reusable
+// upstream fd would be discarded (close_conn closes idle_return_fd + frees the slot).
+// Here each request arrives on a FRESH downstream connection that closes after the
+// response; a subsequent request to the same backend must still borrow the pooled fd, so
+// the backend accepts exactly ONE TCP connection (not one per downstream). Skips where
+// io_uring is unavailable.
+TEST(proxy_reuse, reuses_idle_upstream_iouring_downstream_close) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    // Three requests, each on its own downstream connection that asks the gateway to
+    // close after the response (Connection: close → proxy_stream_complete tears the
+    // conn down while the deferred upstream pool-return is mid-drain).
+    for (int i = 0; i < 3; i++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        set_socket_timeouts(c, 2);
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+        close(c);
+        usleep(20000);  // let the deferred recv-cancel drain so the fd re-enters the pool
+    }
+    usleep(50000);
+
+    // One upstream connection, reused across all three downstream-close requests. Without
+    // the deferred-close fix this would be 3 (each Connection: close discards the fd).
+    CHECK_EQ(backend.accept_count.load(), 1);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
 // the upstream's h1 response, and re-encodes it as h2 HEADERS+DATA. Asserts the

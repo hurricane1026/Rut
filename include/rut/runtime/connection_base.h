@@ -148,6 +148,13 @@ struct ConnectionBase {
     i32 idle_return_fd;
     u16 idle_return_uid;
     u8 idle_return_bidx;
+    // io_uring-only deferred close: close_conn was called on a conn whose deferred
+    // idle-pool return (idle_return_fd) had not yet drained its cancelled recv. Rather
+    // than discard the still-reusable upstream fd (and free the slot), the conn is kept
+    // allocated with this set; once the recv drains, try_deferred_upstream_rearm parks
+    // the fd in the pool AND performs the slot-free close_conn deferred. See
+    // IoUringEventLoop::close_conn_impl / try_deferred_upstream_rearm.
+    bool close_after_idle_return;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -542,6 +549,7 @@ struct ConnectionBase {
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;
+        close_after_idle_return = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
