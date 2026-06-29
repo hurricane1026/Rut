@@ -223,6 +223,11 @@ public:
             this->fire_due_timers();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
+                // Drain the idle upstream pool on the shard thread (NOT in drain(),
+                // which runs on the control thread and would race pool access here).
+                // Idempotent (no-op once empty); drain-time completions close-not-pool,
+                // so the pool stays empty and the shard exits with no open pooled fds.
+                if (upstream) upstream->drain();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
                 u32 period = drain_period_.load(std::memory_order_relaxed);
                 if (active_count() == 0) {
@@ -285,13 +290,10 @@ public:
         drain_period_.store(period_secs, std::memory_order_relaxed);
         drain_start_.store(monotonic_secs(), std::memory_order_relaxed);
         draining_.store(true, std::memory_order_release);
-        // Close parked idle upstream sockets at drain start (mirrors EpollEventLoop).
-        // active_count() doesn't include idle-pool entries, so a shard whose only
-        // remaining work is pooled fds could otherwise exit the run loop with backend
-        // sockets open. Completions during drain close instead of pool, and an
-        // in-flight deferred return whose config/recv hasn't drained is handled by
-        // force_close_all at the deadline, so the pool stays empty after.
-        if (upstream) upstream->drain();
+        // NOTE: do NOT drain the share-nothing UpstreamPool here — drain() runs on the
+        // control thread (Shard::drain) while the shard's event-loop thread may be in
+        // take_idle/put_idle/sweep. The pool is drained on the shard thread instead,
+        // the first time run() observes draining_ (the timerfd kick below wakes it).
         if (backend.timer_fd >= 0) {
             struct itimerspec wake = {};
             wake.it_value.tv_nsec = 1;
