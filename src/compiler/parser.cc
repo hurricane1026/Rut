@@ -1527,7 +1527,10 @@ struct Parser {
         } else if (cur().type == TokenType::LBrace) {
             auto lbrace = expect(TokenType::LBrace);
             if (!lbrace) return core::make_unexpected(lbrace.error());
-            item.upstream.has_address = true;
+            // has_address is set at the end of the block once we know whether
+            // host/port (or backends) were actually present: a block carrying
+            // only `health_check` is a name-only upstream with no address
+            // (pre-bound by the host application at runtime).
             // Span the whole `{ ... }` block so analyze-time
             // diagnostics (bad host, missing field, out-of-range port)
             // highlight the address site rather than the bare name.
@@ -1630,7 +1633,21 @@ struct Parser {
                                                       hc_key);
                             auto lit = expect(TokenType::StringLit);
                             if (!lit) return core::make_unexpected(lit.error());
-                            item.upstream.hc_path_lit = lit.value()->text;
+                            // The probe writes this verbatim into
+                            // `GET <path> HTTP/1.1`, so it must be an
+                            // origin-form target (leading '/'). A bare
+                            // "healthz" would emit a malformed request line
+                            // that origins reject — marking an otherwise
+                            // healthy backend down. Reject at parse time
+                            // (consistent with the other health_check
+                            // validations) rather than silently truncating
+                            // at runtime.
+                            const Str path_text = lit.value()->text;
+                            if (path_text.len == 0 || path_text.ptr[0] != '/')
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*lit.value()),
+                                                      path_text);
+                            item.upstream.hc_path_lit = path_text;
                             seen_path = true;
                         } else if (hc_key.eq({"interval", 8})) {
                             if (seen_interval)
@@ -1653,14 +1670,20 @@ struct Parser {
                                                       hc_key);
                             auto lit = expect(TokenType::IntLit);
                             if (!lit) return core::make_unexpected(lit.error());
-                            u32 sv = 0;
+                            // Accumulate in u64 with a pre-multiply overflow
+                            // guard (mirrors the port literal above). A status
+                            // literal that overflows u32 and wraps back into
+                            // the valid HTTP range — e.g. 4294967496 -> 200 —
+                            // must be rejected, not silently narrowed past the
+                            // range check below.
+                            u64 sv = 0;
                             for (u32 i = 0; i < lit.value()->text.len; i++) {
-                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[i] - '0');
-                                sv = sv * 10 + digit;
-                                if (sv > 0xffffu)
+                                const u64 digit = static_cast<u64>(lit.value()->text.ptr[i] - '0');
+                                if (sv > (0xffffu - digit) / 10u)
                                     return frontend_error(FrontendError::InvalidInteger,
                                                           span_from(*lit.value()),
                                                           lit.value()->text);
+                                sv = sv * 10 + digit;
                             }
                             // The probe path parses the upstream reply with
                             // HttpResponseParser, which rejects any response
@@ -1712,6 +1735,12 @@ struct Parser {
                 if (seen_host || seen_port)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span);
+            } else if (!seen_host && !seen_port && item.upstream.hc_enabled) {
+                // Health-check-only, name-only upstream
+                // (`upstream api { health_check: {...} }`). The host
+                // application binds the address at runtime (pre-bound slot);
+                // populate_route_config copies the health-check metadata onto
+                // it. No address is required here.
             } else if (!seen_host || !seen_port) {
                 // Name the specific missing field in the detail so the
                 // diagnostic tells the user what to add. Point the
@@ -1728,6 +1757,10 @@ struct Parser {
             // Stretch the addr_span to cover the full `{ ... }` block
             // so analyze diagnostics point at the whole address site.
             item.upstream.addr_span.end = rbrace.value()->end;
+            // An address is present iff host+port or a backends list was given;
+            // a health-check-only block leaves this false (name-only upstream).
+            item.upstream.has_address =
+                (item.upstream.backend_count > 0) || (seen_host && seen_port);
         }
         item.span = Span{kw.value()->start, end_off, kw.value()->line, kw.value()->col};
         item.upstream.span = item.span;

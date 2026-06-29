@@ -221,34 +221,57 @@ public:
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
     const RouteConfig* health_armed_config = nullptr;
 
+    // Detect a config swap (first install or hot reload) and, if so, reset the
+    // per-shard health verdicts and re-arm the per-upstream probe deadlines from
+    // now. Returns true iff a swap was just handled.
+    //
+    // BackendHealth is thread_local and keyed only by NUMERIC (upstream_idx,
+    // backend_idx) with no config pin; active_down has no timed expiry. After a
+    // hot reload the same numeric slot can mean a different endpoint, so a stale
+    // verdict (or a passive eject) would wrongly suppress the new backend — and
+    // if the new config disables health checks there is no future probe to clear
+    // it. Resetting here gives the new config a clean slate. (probe_in_flight is
+    // intentionally NOT reset — see reset_backend_health.)
+    //
+    // The run loop calls this on startup and immediately after every
+    // poll_command() so the reset happens the instant a config is installed, not
+    // a tick later when the 1 Hz sweep first runs — otherwise requests accepted
+    // in that window would route off stale numeric-slot verdicts. It advances
+    // health_armed_config, so the subsequent sweep on the Timeout path sees no
+    // change and does NOT double-reset (reset happens exactly once per swap).
+    // Runs on BOTH backends (probe issue below stays epoll-only).
+    bool arm_health_on_config_change() {
+        const RouteConfig** cfg_ptr = self().config_ptr;
+        const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
+        if (cfg == health_armed_config) return false;
+        health_armed_config = cfg;
+        reset_backend_health();
+        if (cfg != nullptr) {
+            const u64 now = monotonic_ns();
+            const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
+                              ? cfg->upstream_count
+                              : RouteConfig::kMaxUpstreams;
+            for (u32 u = 0; u < m; u++)
+                health_probe_deadline_ns[u] =
+                    now + static_cast<u64>(cfg->upstreams[u].hc_interval_ms) * 1'000'000ull;
+        }
+        return true;
+    }
+
     void sweep_health_probes() {
+        // A swap detected here just reset + re-armed deadlines; probes wait for
+        // the next tick. In the run loop the swap is normally already absorbed by
+        // arm_health_on_config_change() right after poll_command(), so this is a
+        // no-op there — but tests drive sweep_health_probes() directly, where this
+        // is the install path.
+        if (arm_health_on_config_change()) return;
         const RouteConfig** cfg_ptr = self().config_ptr;
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
         const u64 now = monotonic_ns();
-        if (cfg != health_armed_config) {
-            health_armed_config = cfg;
-            // BackendHealth is thread_local and keyed only by NUMERIC
-            // (upstream_idx, backend_idx) with no config pin; active_down has no
-            // timed expiry. After a hot reload the same numeric slot can mean a
-            // different endpoint, so a stale verdict (or a passive eject) would
-            // wrongly suppress the new backend — and if the new config disables
-            // health checks there is no future probe to clear it. Reset all
-            // verdicts here so the new config starts clean. (probe_in_flight is
-            // intentionally NOT reset — see reset_backend_health.)
-            reset_backend_health();
-            if (cfg != nullptr) {
-                const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
-                                  ? cfg->upstream_count
-                                  : RouteConfig::kMaxUpstreams;
-                for (u32 u = 0; u < m; u++)
-                    health_probe_deadline_ns[u] =
-                        now + static_cast<u64>(cfg->upstreams[u].hc_interval_ms) * 1'000'000ull;
-            }
-            return;
-        }
         if (cfg == nullptr || cfg->upstream_count == 0) return;
-        // Deadline re-arm above runs everywhere; the probe issue below is epoll
-        // only. On io_uring this returns here (a safe no-op for the sweep).
+        // The config-change re-arm (arm_health_on_config_change) runs on both
+        // backends; the probe issue below is epoll only. On io_uring this
+        // returns here (a safe no-op for the sweep).
         if constexpr (!Derived::kSupportsHealthProbe) {
             return;
         } else {
@@ -654,6 +677,10 @@ public:
     // Includes pending_free slots: they're closed but still waiting for
     // CQEs, so drain must keep running until they're reclaimed too.
     u32 active_count() const { return kMaxConns - free_top; }
+
+    // Allocatable Connection slots remaining (free_stack depth). Used by
+    // start_health_probe to keep a reserve for real client accepts.
+    u32 free_conn_slots() const { return free_top; }
 
     // --- CRTP implementations ---
 

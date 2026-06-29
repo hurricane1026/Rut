@@ -303,6 +303,10 @@ public:
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
+        // Likewise reset/arm active-health state at activation so requests
+        // accepted before the first 1s sweep don't route off stale numeric-slot
+        // verdicts (#161 F4). Probe issue still waits for the Timeout sweep.
+        this->arm_health_on_config_change();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
@@ -317,6 +321,11 @@ public:
             // interval before it actually fires). Cheap no-op when the config is
             // unchanged (fire_due_timers compares the armed config pointer).
             this->fire_due_timers();
+            // Reset/arm active-health state the instant a hot reload installs a
+            // new config, so it doesn't route off stale numeric-slot verdicts
+            // until the next 1s sweep (#161 F4). No-op when unchanged; advances
+            // health_armed_config so the later sweep doesn't double-reset.
+            this->arm_health_on_config_change();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
@@ -383,6 +392,11 @@ public:
     }
 
     u32 active_count() const { return kMaxConns - free_top; }
+
+    // Allocatable Connection slots remaining. Used by start_health_probe to
+    // keep a reserve for real client accepts (epoll frees slots synchronously,
+    // so this is exact — no pending_free deferral as on io_uring).
+    u32 free_conn_slots() const { return free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
     // Only called when a connection starts proxying — non-proxy connections

@@ -275,6 +275,20 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const UpstreamTarget& target = config->upstreams[upstream_idx];
     if (backend_idx >= target.addr_count) return false;
 
+    // Reserve a margin of Connection slots for real client traffic. Near
+    // kMaxConns a due sweep can launch up to kMaxProbesPerSweep (32) probes,
+    // and a stalled health endpoint pins each probe slot until upstream_timeout
+    // (~30s). Without a floor those probes could consume the last free slots
+    // and real accepts would be refused for that whole window. Refuse to
+    // allocate a probe when free slots are below the reserve; the deferred
+    // probe simply retries on the next sweep (probe_in_flight is left unset, so
+    // the retry is idempotent). The reserve (64) comfortably exceeds a full
+    // 32-probe sweep burst yet is negligible against kMaxConns (16384), so it
+    // never meaningfully reduces real-traffic capacity. Checked before
+    // set_probe_in_flight so a deferral leaves no guard to clear.
+    static constexpr u32 kHealthProbeSlotReserve = 64;
+    if (loop->free_conn_slots() < kHealthProbeSlotReserve) return false;
+
     // At most one outstanding probe per backend (see probe_in_flight). A backend
     // that accepts but never responds otherwise accumulates a probe Connection per
     // due sweep until each times out. Mark BEFORE alloc_conn and clear on EVERY

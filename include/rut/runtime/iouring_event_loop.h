@@ -209,6 +209,10 @@ public:
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
+        // Reset/arm active-health state at activation (#161 F4). io_uring issues
+        // no probes this slice, but the reset still clears stale numeric-slot
+        // verdicts that routing reads.
+        this->arm_health_on_config_change();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
@@ -221,6 +225,10 @@ public:
             poll_command();
             // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
             this->fire_due_timers();
+            // Reset/arm active-health state on hot reload (#161 F4). No-op when
+            // unchanged; advances health_armed_config so the later sweep doesn't
+            // double-reset.
+            this->arm_health_on_config_change();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 u64 start = drain_start_.load(std::memory_order_relaxed);

@@ -1695,7 +1695,10 @@ TEST(frontend, parse_upstream_health_check_rejects_out_of_range_status) {
     // reply with HttpResponseParser, which rejects responses outside that range
     // before the equality check), so the backend could never be marked healthy.
     // Reject it at parse time. 0xffff still trips the existing overflow guard.
-    for (const char* code : {"0", "99", "600", "1000"}) {
+    // 4294967496 overflows a u32 and wraps back to 200 — the u64 accumulator
+    // with a pre-multiply guard must reject it rather than silently narrowing.
+    for (const char* code :
+         {"0", "99", "600", "1000", "65536", "4294967496", "99999999999999999999"}) {
         char src[160];
         snprintf(src,
                  sizeof(src),
@@ -1708,6 +1711,51 @@ TEST(frontend, parse_upstream_health_check_rejects_out_of_range_status) {
         REQUIRE(!ast);
         CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
     }
+}
+
+TEST(frontend, parse_upstream_health_check_rejects_non_origin_path) {
+    // The probe writes the path verbatim into `GET <path> HTTP/1.1`, so a path
+    // without a leading '/' (e.g. "healthz") would emit a malformed request line
+    // that origins reject — marking a healthy backend down. Reject at parse time.
+    for (const char* path : {"healthz", "", "http://x/y"}) {
+        char src[200];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { path: \"%s\", "
+                 "interval: 1s } }\nroute GET \"/u\" { return 200 }\n",
+                 path);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, parse_upstream_health_check_only_name_only) {
+    // A health-check-only block (`upstream api { health_check: {...} }`) is a
+    // valid name-only upstream: it carries health metadata but no address (the
+    // host application binds the address at runtime / pre-bound slot).
+    const char* src =
+        "upstream api { health_check: { path: \"/healthz\", interval: 2s, status: 204 } }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& up = ast->items[0].upstream;
+    CHECK(!up.has_address);
+    CHECK(up.hc_enabled);
+    CHECK_EQ(up.hc_interval_ms, 2000u);
+    CHECK_EQ(static_cast<unsigned>(up.hc_expected_status), 204u);
+    REQUIRE_EQ(up.hc_path_lit.len, 8u);
+    CHECK((up.hc_path_lit.eq({"/healthz", 8})));
+    // analyze accepts it too, leaving has_address false for runtime binding.
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(!hir->upstreams[0].has_address);
+    CHECK(hir->upstreams[0].hc_enabled);
 }
 
 TEST(frontend, parse_upstream_no_address_still_works) {
