@@ -364,9 +364,22 @@ struct ConnectionBase {
     u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
 
     // Body streaming state (proxy large body support)
-    u32 req_header_end;              // offset past request headers (\r\n\r\n)
-    u32 req_content_length;          // original Content-Length value (for send capping)
-    u32 req_initial_send_len;        // max bytes to send in initial upstream forward
+    u32 req_header_end;        // offset past request headers (\r\n\r\n)
+    u32 req_content_length;    // original Content-Length value (for send capping)
+    u32 req_initial_send_len;  // max bytes to send in initial upstream forward
+    // Idle-reuse retry snapshot length. When a request is forwarded to a REUSED
+    // pooled upstream socket, recv_buf is reset at request-sent (so pipelined
+    // downstream bytes read during the wait flow through pipeline_recover, and the
+    // just-sent request can't leak into the next request). To still allow the rare
+    // post-send dead-socket fallback (origin FIN landing just after take_idle's
+    // MSG_PEEK probe), the exact request bytes are snapshotted into send_buf —
+    // which is provably free for a resendable request (no pipelined surplus ⇒
+    // pipeline_stash wrote nothing). This records that snapshot's length; >0 means
+    // "a replayable copy lives in send_buf" and on_upstream_connected replays from
+    // it instead of recv_buf. Reset at the per-request boundary like the reuse
+    // flags. Only set for resendable (bodyless / fully-buffered, idempotent-checked
+    // at the retry site) requests, so it is bounded by recv_buf/send_buf capacity.
+    u32 retry_req_send_len;
     bool req_malformed;              // true if request body is malformed (reject)
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
@@ -594,6 +607,7 @@ struct ConnectionBase {
         req_header_end = 0;
         req_content_length = 0;
         req_initial_send_len = 0;
+        retry_req_send_len = 0;
         req_malformed = false;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
