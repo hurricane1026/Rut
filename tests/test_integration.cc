@@ -2097,6 +2097,32 @@ TEST(active_health_e2e, probe_ejects_failing_backend_then_recovers) {
     backend.teardown();
 }
 
+// An active-probe failure must keep the backend OUT of rotation until a probe
+// SUCCEEDS — not merely until the passive 5s cooldown expires. Otherwise, with a
+// health-check interval longer than the cooldown, select_backend would resume
+// routing to a still-dead backend in the gap between probes. Drives the shared
+// per-shard BackendHealth directly (same thread_local table the probe path feeds).
+TEST(active_health, failed_probe_keeps_backend_down_until_success) {
+    using namespace rut;
+    const u16 uid = 40;  // distinct index — avoid colliding with other tests' state
+    const u32 bidx = 0;
+    const u64 now = monotonic_us();
+
+    // Clean slate, then a fresh active failure suppresses the backend immediately.
+    record_active_probe_result(uid, bidx, /*healthy=*/true, now);
+    CHECK(!backend_ejected(uid, bidx, now));
+    record_active_probe_result(uid, bidx, /*healthy=*/false, now);
+    CHECK(backend_ejected(uid, bidx, now));
+
+    // Still down well past the passive 5s cooldown — only a success can clear it.
+    CHECK(backend_ejected(uid, bidx, now + kBackendEjectCooldownUs + 1));
+    CHECK(backend_ejected(uid, bidx, now + 60'000'000));
+
+    // A later successful probe restores the backend to rotation.
+    record_active_probe_result(uid, bidx, /*healthy=*/true, now + 60'000'000);
+    CHECK(!backend_ejected(uid, bidx, now + 60'000'000));
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

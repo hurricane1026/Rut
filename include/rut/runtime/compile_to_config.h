@@ -251,6 +251,21 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
                 if (cfg.upstreams[i].name[j] != up.name.ptr[j]) return false;
             }
         }
+        // Attach active health-check config onto the pre-bound upstreams too —
+        // the caller bound only addresses, so without this the hc fields stay at
+        // their defaults (hc_enabled == false) and no probes ever run. Mirrors the
+        // empty-upstreams branch above. Fails only on an over-long path.
+        for (u32 i = 0; i < mod.upstream_count; i++) {
+            const auto& up = mod.upstreams[i];
+            if (up.hc_enabled) {
+                if (!cfg.set_upstream_health_check(i,
+                                                   up.hc_path.ptr,
+                                                   up.hc_path.len,
+                                                   up.hc_interval_ms,
+                                                   up.hc_expected_status))
+                    return false;
+            }
+        }
     }
 
     // Response bodies (1-based index preserved). Empty bodies don't
