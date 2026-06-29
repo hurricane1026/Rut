@@ -4046,8 +4046,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // (None / Content-Length / chunked). A close-delimited (UntilClose) body ends
     // by the upstream closing the socket, so its fd is never reusable. The
     // completion path reads this flag to pool the fd vs. close it.
-    conn.upstream_keep_alive =
-        resp.keep_alive && !resp.connection_close && conn.resp_body_mode != BodyMode::UntilClose;
+    // conn.keep_alive guards the REQUEST side: the proxy forwards the client's
+    // request bytes (incl. its Connection header) verbatim upstream, so a client
+    // Connection: close told the origin it may close after responding — even if the
+    // response itself is self-framed HTTP/1.1 keep-alive. Pooling such an fd would
+    // race the origin's close, so refuse it.
+    conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
+                               conn.resp_body_mode != BodyMode::UntilClose && conn.keep_alive;
 
     const u32 kHeaderLen = resp_parser.header_end;
     const u32 kTotalLen = conn.upstream_recv_buf.len();
