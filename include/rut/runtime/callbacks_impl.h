@@ -1944,38 +1944,41 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.state = ConnState::Proxying;
-    // forward(set_path:) — rewrite the request line before forwarding (no-op
-    // unless a path override was recorded by the JIT handler).
-    rewrite_request_line_path(conn);
-    // forward(set_header:) — inject/replace request header lines (no-op unless
-    // overrides were recorded). After the path rewrite so it reads the updated
-    // req_header_end. Fail closed (500) if a configured override can't be applied
-    // (oversized / no headroom) rather than forwarding the request with a
-    // security-sensitive header silently dropped.
-    if (!apply_request_header_overrides(conn)) {
-        // The upstream connected but no request will be sent. Release it now so a
-        // client that stalls reading the 500 can't pin an idle upstream fd /
-        // concurrency slot until keepalive/timeout (close_conn would otherwise only
-        // reap it once the downstream connection finally goes away).
-        if (conn.upstream_fd >= 0) {
-            ::close(conn.upstream_fd);
-            conn.upstream_fd = -1;
-            loop->clear_upstream_fd(conn.id);
+    // forward(set_path:) and forward(set_header:) mutate recv_buf in place. On
+    // retry replay the request bytes live in send_buf, while recv_buf may already
+    // hold the next pipelined request, so only rewrite the initial forward buffer.
+    if (conn.retry_req_send_len == 0) {
+        rewrite_request_line_path(conn);
+        // forward(set_header:) — inject/replace request header lines (no-op unless
+        // overrides were recorded). After the path rewrite so it reads the updated
+        // req_header_end. Fail closed (500) if a configured override can't be applied
+        // (oversized / no headroom) rather than forwarding the request with a
+        // security-sensitive header silently dropped.
+        if (!apply_request_header_overrides(conn)) {
+            // The upstream connected but no request will be sent. Release it now so a
+            // client that stalls reading the 500 can't pin an idle upstream fd /
+            // concurrency slot until keepalive/timeout (close_conn would otherwise only
+            // reap it once the downstream connection finally goes away).
+            if (conn.upstream_fd >= 0) {
+                ::close(conn.upstream_fd);
+                conn.upstream_fd = -1;
+                loop->clear_upstream_fd(conn.id);
+            }
+            release_upstream_slot(loop, conn);
+            static const char k500[] =
+                "HTTP/1.1 500 Internal Server Error\r\n"
+                "Content-Length: 21\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Internal Server Error";
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+            conn.keep_alive = false;
+            conn.resp_status = kStatusInternalServerError;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
         }
-        release_upstream_slot(loop, conn);
-        static const char k500[] =
-            "HTTP/1.1 500 Internal Server Error\r\n"
-            "Content-Length: 21\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Internal Server Error";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
-        conn.keep_alive = false;
-        conn.resp_status = kStatusInternalServerError;
-        conn.transition_to_sending(&on_response_sent<Loop>);
-        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
-        return;
     }
 #if RUT_ENABLE_WEBSOCKET
     // Terminate routes must not let the backend negotiate a per-message extension.
