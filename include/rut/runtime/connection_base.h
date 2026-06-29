@@ -363,7 +363,15 @@ struct ConnectionBase {
     // flags. Only set for resendable (bodyless / fully-buffered, idempotent-checked
     // at the retry site) requests, so it is bounded by recv_buf/send_buf capacity.
     u32 retry_req_send_len;
-    bool req_malformed;              // true if request body is malformed (reject)
+    bool req_malformed;  // true if request body is malformed (reject)
+    // Request-side keep-alive intent of the CURRENT request, as parsed from its
+    // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
+    // false, "Connection: close" → false). The proxy forwards the client's
+    // request bytes (incl. its Connection header / version) verbatim upstream, so
+    // this is what told the origin whether it may close after responding. Gate
+    // upstream idle-pooling on THIS, not on conn.keep_alive (which is derived from
+    // drain state, not the request). Recorded by capture_request_metadata.
+    bool req_keep_alive;
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
@@ -590,6 +598,7 @@ struct ConnectionBase {
         req_initial_send_len = 0;
         retry_req_send_len = 0;
         req_malformed = false;
+        req_keep_alive = false;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
         resp_upgrade_is_websocket = false;

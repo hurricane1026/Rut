@@ -715,6 +715,35 @@ TEST_F(ShardF, reload_before_spawn_drains_idle_pool) {
     CHECK_EQ(self.shard.upstream->idle_count, 0u);  // drained (fd closed by drain())
 }
 
+// === Graceful-drain pool teardown stays on the shard thread (F2) ===
+//
+// EpollEventLoop::drain(period) runs on the CONTROL/caller thread (Shard::drain).
+// It must NOT mutate the share-nothing UpstreamPool: the shard's event-loop thread
+// may concurrently be in take_idle/put_idle/sweep, and touching the pool here would
+// race fd reuse and corrupt idle_count/free_stack. The pool is instead emptied on the
+// shard thread, in run()'s drain block (which calls upstream->drain()). This verifies
+// the control-thread drain() leaves the pool intact and only flips draining_; the
+// shard-thread step (modeled by the explicit upstream->drain() below) is what closes
+// the parked fds — guaranteeing a draining shard ends with no open pooled fds.
+TEST_F(ShardF, drain_defers_idle_pool_teardown_to_shard_thread) {
+    REQUIRE(self.ok);
+    REQUIRE(self.shard.upstream != nullptr);
+    REQUIRE(self.shard.loop != nullptr);
+    const i32 fd = UpstreamPool::create_socket();
+    REQUIRE(fd >= 0);
+    REQUIRE(self.shard.upstream->put_idle(fd, /*upstream_id=*/1, /*backend_idx=*/0, /*now_sec=*/0));
+    CHECK_EQ(self.shard.upstream->idle_count, 1u);
+
+    self.shard.loop->drain(0);  // control-thread method (Shard::drain → loop->drain)
+    CHECK(self.shard.loop->is_draining());
+    CHECK_EQ(self.shard.upstream->idle_count, 1u);  // pool untouched — no cross-thread race
+
+    // What run()'s drain block does on the shard thread, the first time it observes
+    // draining_: empty the pool. Closes the parked fd; idle_count → 0.
+    self.shard.upstream->drain();
+    CHECK_EQ(self.shard.upstream->idle_count, 0u);
+}
+
 TEST(shard_control, reload_after_join_drains_idle_pool) {
     // spawn → stop → join → reload: direct-apply path (thread_spawned=false).
     auto lfd_result = create_listen_socket(0);

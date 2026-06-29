@@ -318,6 +318,13 @@ public:
             this->fire_due_timers();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
+                // Empty the idle upstream pool on the SHARD thread (here), not in
+                // drain() (control thread) — see drain()'s note. active_count()
+                // excludes pooled fds, so a shard whose only remaining work is parked
+                // idle sockets must close them here or run() could exit (active_count
+                // == 0 below) with backend fds still open. Idempotent: drain() no-ops
+                // once the pool is empty, and drain-time completions never re-pool.
+                if (upstream) upstream->drain();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
                 u32 period = drain_period_.load(std::memory_order_relaxed);
                 if (active_count() == 0) {
@@ -379,13 +386,15 @@ public:
         drain_period_.store(period_secs, std::memory_order_relaxed);
         drain_start_.store(monotonic_secs(), std::memory_order_relaxed);
         draining_.store(true, std::memory_order_release);
-        // Close any parked idle upstream sockets at drain start. active_count()
-        // doesn't include idle-pool entries, so a shard whose only remaining work is
-        // pooled fds (or one that finishes its clients before the pool sweep) could
-        // otherwise let the run loop exit with backend sockets still open. Completions
-        // during drain already close instead of pool (proxy_stream_complete /
-        // on_proxy_response_sent), so draining the pool here leaves it empty.
-        if (upstream) upstream->drain();
+        // NOTE: do NOT touch the idle pool here. drain() runs on the CONTROL thread
+        // (Shard::drain) while the shard's event-loop thread may be mid take_idle /
+        // put_idle / sweep on the share-nothing, unsynchronized UpstreamPool —
+        // mutating/closing entries here would race fd reuse and corrupt
+        // idle_count/free_stack. The pool is emptied on the SHARD thread instead, in
+        // run()'s drain block, the first time it observes draining_. The timerfd kick
+        // below wakes that thread promptly. Completions during drain close instead of
+        // pool (proxy_stream_complete / on_proxy_response_sent gate on is_draining),
+        // so once drained the pool stays empty.
         if (backend.timer_fd >= 0) {
             struct itimerspec wake = {};
             wake.it_value.tv_nsec = 1;
