@@ -462,15 +462,14 @@ inline bool request_resendable_from_recv_buf(const Connection& conn) {
 // are two replay sources, checked in order:
 //   1. retry_req_send_len > 0 — the request was snapshotted into send_buf at
 //      request-sent (after recv_buf was reset). This is the post-send dead-socket
-//      site (on_upstream_response). Refuse if the client pipelined another request
-//      into recv_buf during the wait: replaying would strand/garble those buffered
-//      bytes, so fall back to close (matches the original clobber guard).
+//      site (on_upstream_response); recv_buf may now hold a pipelined next request,
+//      which is preserved while the snapshot is replayed from send_buf.
 //   2. recv_buf still byte-for-byte holds the request — the pre-reset sites (failed
 //      send / EOF before the send completed), where no snapshot was taken yet.
 // Used to gate BOTH reused-socket retry sites so they cannot drift.
 inline bool request_fully_resendable(const Connection& conn) {
     if (!request_body_replayable(conn)) return false;
-    if (conn.retry_req_send_len > 0) return conn.recv_buf.len() == 0;
+    if (conn.retry_req_send_len > 0) return true;
     return conn.req_initial_send_len > 0 && conn.recv_buf.len() == conn.req_initial_send_len;
 }
 
@@ -1929,9 +1928,12 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Connect succeeded — clear this backend's passive-health record.
-    record_backend_result(
-        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    // A fresh TCP connect succeeded — clear this backend's passive-health record.
+    // Reused pooled sockets only prove health once they return a response.
+    if (!conn.upstream_reused) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    }
 
     if (conn.req_malformed) {
         loop->close_conn(conn);
