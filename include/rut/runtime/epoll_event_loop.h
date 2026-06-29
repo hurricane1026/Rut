@@ -397,6 +397,14 @@ public:
         if (conn_id < EpollBackend::kMaxFdMap) backend.upstream_fd_map[conn_id] = -1;
     }
 
+    // Drop any partial upstream-send bookkeeping for conn_id. Called before a
+    // reused-fd retry re-connects on a fresh socket: a request send that parked
+    // on EPOLLOUT leaves upstream_send_state[conn_id].remaining > 0, and the fresh
+    // connect's EPOLLOUT would otherwise resume that stale send (or a late
+    // UpstreamSend completion would be misread as the connect result). epoll only;
+    // io_uring gates the same retry on conn.upstream_send_armed instead.
+    void clear_upstream_send_state(u32 conn_id) { backend.clear_send_state(conn_id); }
+
     // --- HTTP/1 idle upstream connection reuse (per-shard pool) ---
 
     // Borrow a live, connected upstream socket to `endpoint` (upstream_id,
