@@ -455,6 +455,13 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
         conn.upstream_fd = -1;
     }
     loop->clear_upstream_fd(conn.id);
+    // Clear any epoll partial-send bookkeeping for the dead fd before reconnecting:
+    // a request send parked on EPOLLOUT leaves upstream_send_state set, which the
+    // fresh connect's EPOLLOUT would otherwise resume / misread as the connect
+    // result (the swapped on_upstream_connected slot). io_uring has no such state
+    // — its retry is gated on upstream_send_armed instead.
+    if constexpr (requires { loop->clear_upstream_send_state(conn.id); })
+        loop->clear_upstream_send_state(conn.id);
     conn.upstream_recv_armed = false;
     conn.upstream_send_armed = false;
     conn.upstream_recv_buf.reset();
@@ -3915,6 +3922,15 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    // Surplus upstream bytes beyond the one-shot response we sent
+    // (upstream_send_len) mean a desynced stream — refuse reuse, mirroring
+    // proxy_stream_complete. This covers bytes the backend wrote past its
+    // self-framed body that wait() appended to upstream_recv_buf while the
+    // downstream send was still draining (on_upstream_recv is null on this path,
+    // so they'd otherwise be silently discarded by the reset below and the fd
+    // pooled as reusable). A TLS proxy tail legitimately parks in this buffer.
+    if (conn.upstream_recv_buf.len() > conn.upstream_send_len && !conn.tls_proxy_stream)
+        conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
 
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
