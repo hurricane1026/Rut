@@ -3572,6 +3572,201 @@ TEST(upstream_reuse, send_error_with_buffered_response_serves_not_retries) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 }
 
+// Findings 1+2: when a request is forwarded to a REUSED pooled socket, the
+// request-sent path snapshots the resendable request into send_buf and then
+// RELEASES recv_buf unconditionally (so the just-sent request can't leak into the
+// next request, and pipelined downstream bytes flow through pipeline_recover).
+TEST(upstream_reuse, request_sent_reused_snapshots_into_send_buf) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->req_initial_send_len = len;
+    c->upstream_recv_buf.reset();  // no early response buffered
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+
+    CHECK_EQ(c->retry_req_send_len, len);  // snapshot length recorded
+    CHECK_EQ(c->recv_buf.len(), 0u);       // recv_buf released for ALL conns
+    CHECK_EQ(c->send_buf.len(), len);      // request bytes copied into send_buf
+    CHECK(__builtin_memcmp(c->send_buf.data(), get_req, len) == 0);
+    CHECK(rut::request_fully_resendable(*c));  // replayable from the snapshot
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A fresh (non-reused) connection takes NO snapshot — there is nothing to retry —
+// and recv_buf is still released at request-sent (unchanged original lifecycle).
+TEST(upstream_reuse, request_sent_fresh_takes_no_snapshot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;  // fresh connect
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->req_initial_send_len = len;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+
+    CHECK_EQ(c->retry_req_send_len, 0u);  // no snapshot for a fresh connect
+    CHECK_EQ(c->recv_buf.len(), 0u);      // recv_buf released
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Finding 1 (post-send dead socket): after recv_buf was reset at request-sent, the
+// EOF-before-any-response path retries and on_upstream_connected replays the request
+// from the send_buf snapshot (not recv_buf, which is now empty).
+TEST(upstream_reuse, retry_replays_request_from_snapshot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    c->upstream_reused = true;
+    // Post request-sent state: recv_buf empty, snapshot held in send_buf.
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();  // released at request-sent
+    c->send_buf.reset();
+    c->send_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->retry_req_send_len = len;
+    c->upstream_recv_buf.reset();  // no response byte → EOF
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(rut::request_fully_resendable(*c));  // replayable via the snapshot
+
+    // EOF before any response → fresh connect submitted, reuse cleared (one-shot).
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK(!c->upstream_reused);
+    CHECK_EQ(c->retry_req_send_len, len);  // snapshot retained for the replay
+
+    // Drive the fresh connect to completion: the request is re-sent from send_buf.
+    loop.backend.clear_ops();
+    rut::on_upstream_connected<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    const MockOp* op = loop.backend.last_op(MockOp::Send);  // upstream send
+    REQUIRE(op != nullptr);
+    CHECK(op->send_buf == c->send_buf.data());  // replayed from the snapshot, not recv_buf
+    CHECK_EQ(op->send_len, len);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// The snapshot-based retry is refused when the client pipelined another request into
+// recv_buf during the upstream wait: replaying would strand those buffered bytes, so
+// fail closed (mirrors the original strict-equality clobber guard).
+TEST(upstream_reuse, retry_refused_when_pipelined_bytes_buffered) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->send_buf.reset();
+    c->send_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->retry_req_send_len = len;
+    // A pipelined next request raced into recv_buf during the wait.
+    static const char pipelined[] = "GET /next HTTP/1.1\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), sizeof(pipelined) - 1);
+
+    CHECK(!rut::request_fully_resendable(*c));  // refused: recv_buf not empty
+}
+
+// Finding 3: a final body chunk send that FAILS on the early-response path
+// (on_body_send_with_early_response, which otherwise ignores ev.result) must mark
+// the upload incomplete so the desynced socket is never pooled.
+TEST(upstream_reuse, early_response_failed_body_send_marks_incomplete) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    // An early keep-alive response is buffered while the body upload was still going.
+    static const char kResp[] =
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+    CHECK(!c->upstream_request_incomplete);  // precondition
+
+    rut::on_body_send_with_early_response<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, -1));
+
+    CHECK(c->upstream_request_incomplete);  // failed chunk send → not poolable
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Finding 4: a stale same-batch UpstreamSend dispatched into the on_upstream_connected
+// slot (after a retry swapped the slot) must be ignored — it is the old fd's send
+// completion, not a connect result. on_upstream_connected only ever handles connect
+// events, so any UpstreamSend reaching it is dropped (no premature request send on
+// the not-yet-connected fresh fd, no teardown).
+TEST(upstream_reuse, stale_upstream_send_ignored_in_connected_slot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    // A positive byte count would otherwise look like a successful connect result.
+    rut::on_upstream_connected<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, 128));
+
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);     // no request send issued
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);  // no reconnect issued
+    CHECK(c->fd >= 0);                                      // connection untouched
+    if (c->fd >= 0) close(c->fd);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // proxy_upstream_reusable: a clean keep-alive, fully-uploaded request on the
 // current config is poolable.
 TEST(upstream_reuse, reusable_true_for_clean_keepalive) {

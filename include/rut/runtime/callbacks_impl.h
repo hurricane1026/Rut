@@ -432,24 +432,45 @@ void release_upstream_conn(Loop* loop, Connection& conn) {
     conn.upstream_send_armed = false;
 }
 
-// True iff the COMPLETE original request is still byte-for-byte replayable from
-// recv_buf. A reused-socket retry reconnects and re-sends the request straight out
-// of recv_buf, so it is only safe when (a) no request-body byte has begun streaming
-// upstream (once it has, recv_buf was reset and refilled with body chunks, so the
-// original headers+body are gone), (b) the whole body is buffered (nothing left to
-// stream), and (c) recv_buf holds EXACTLY the request bytes — not more. The strict
-// equality is load-bearing for the post-send retry site (on_upstream_response):
-// while we wait for the response the downstream fd stays EPOLLIN-armed, so a client
-// that PIPELINES another request has its bytes appended into recv_buf. If that
-// happened, recv_buf no longer holds just the original request, so we must NOT
-// replay it (we fall back to close, same as a non-reused failure). Used to gate
-// BOTH reused-socket retry sites so the two sites cannot drift.
-inline bool request_fully_resendable(const Connection& conn) {
+// Body-state half of resendability: the request body must be fully delivered and
+// nothing may have begun streaming (once a body byte streams, recv_buf is reset +
+// refilled with chunks, so the original headers+body are gone). Shared by both
+// resendability predicates below.
+inline bool request_body_replayable(const Connection& conn) {
     if (conn.req_body_streamed) return false;
     if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) return false;
     if (conn.req_body_mode == BodyMode::Chunked &&
         conn.req_chunk_parser.state != ChunkedParser::State::Complete)
         return false;
+    return true;
+}
+
+// True iff the COMPLETE original request is still byte-for-byte in recv_buf — i.e.
+// recv_buf holds EXACTLY the request bytes, not more. The strict equality is
+// load-bearing: while we wait for the upstream response the downstream fd stays
+// EPOLLIN-armed, so a client that PIPELINES another request has its bytes appended
+// into recv_buf; if that happened, recv_buf no longer holds just the original
+// request. Used (a) by request_fully_resendable's pre-reset retry sites (failed
+// send / EOF before the send completed, where recv_buf is still intact) and (b) to
+// decide whether to snapshot the request into send_buf at request-sent.
+inline bool request_resendable_from_recv_buf(const Connection& conn) {
+    if (!request_body_replayable(conn)) return false;
+    return conn.req_initial_send_len > 0 && conn.recv_buf.len() == conn.req_initial_send_len;
+}
+
+// True iff a reused-socket retry can re-send the COMPLETE original request. There
+// are two replay sources, checked in order:
+//   1. retry_req_send_len > 0 — the request was snapshotted into send_buf at
+//      request-sent (after recv_buf was reset). This is the post-send dead-socket
+//      site (on_upstream_response). Refuse if the client pipelined another request
+//      into recv_buf during the wait: replaying would strand/garble those buffered
+//      bytes, so fall back to close (matches the original clobber guard).
+//   2. recv_buf still byte-for-byte holds the request — the pre-reset sites (failed
+//      send / EOF before the send completed), where no snapshot was taken yet.
+// Used to gate BOTH reused-socket retry sites so they cannot drift.
+inline bool request_fully_resendable(const Connection& conn) {
+    if (!request_body_replayable(conn)) return false;
+    if (conn.retry_req_send_len > 0) return conn.recv_buf.len() == 0;
     return conn.req_initial_send_len > 0 && conn.recv_buf.len() == conn.req_initial_send_len;
 }
 
@@ -672,6 +693,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_keep_alive = false;
     conn.upstream_reused = false;
     conn.upstream_request_incomplete = false;
+    conn.retry_req_send_len = 0;
     conn.req_body_streamed = false;
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
@@ -1731,6 +1753,21 @@ template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
+    // Stale same-batch UpstreamSend guard (epoll). A dead reused upstream fd with a
+    // partial send parked on EPOLLOUT can surface BOTH an UpstreamRecv EOF and an
+    // UpstreamSend completion in ONE EpollBackend::wait() batch. The EOF dispatches
+    // first and runs retry_reused_upstream, which closes the fd, clears
+    // upstream_send_state, and swaps this slot to on_upstream_connected — but the
+    // UpstreamSend was already emitted into that batch and dispatches AFTER, landing
+    // in this (now-swapped) slot (UpstreamSend + UpstreamConnect share on_upstream_send).
+    // on_upstream_connected only ever handles connect results — a request send is
+    // submitted only AFTER the slot moves on to on_upstream_request_sent — so any
+    // UpstreamSend reaching here is that stale pre-retry completion for the old fd.
+    // Drop it. The real connect for the fresh fd arrives as an UpstreamConnect in a
+    // later batch (EINPROGRESS) or via pending_completions (immediate connect), so a
+    // genuine connect result is never swallowed.
+    if (ev.type == IoEventType::UpstreamSend) return;
+
     if (ev.result < 0) {
         // Connect failed (e.g. ECONNREFUSED). Record the failure against this
         // backend (passive health → ejection past the threshold), then try the
@@ -1776,14 +1813,26 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // Terminate routes must not let the backend negotiate a per-message extension.
     if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);
 #endif
-    u32 req_send_len =
-        conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
-    if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
+    // Pick the request source. A retried fresh connect (after a reused socket died
+    // post-send) has retry_req_send_len > 0: recv_buf was reset at request-sent, so
+    // replay the snapshot stashed in send_buf. Otherwise this is the initial connect
+    // and recv_buf still holds the request.
+    const u8* req_src;
+    u32 req_send_len;
+    if (conn.retry_req_send_len > 0) {
+        req_src = conn.send_buf.data();
+        req_send_len = conn.retry_req_send_len;
+    } else {
+        req_src = conn.recv_buf.data();
+        req_send_len =
+            conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
+        if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
+    }
     conn.set_slots(nullptr,
                    nullptr,
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_upstream_request_sent<Loop>);
-    loop->submit_send_upstream(conn, conn.recv_buf.data(), req_send_len);
+    loop->submit_send_upstream(conn, req_src, req_send_len);
 }
 
 template <typename Loop>
@@ -1860,11 +1909,25 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     pipeline_stash(conn);
-    // Keep recv_buf for a reused pooled socket so the rare post-send dead-socket
-    // case (origin FIN landing just after take_idle's MSG_PEEK probe) can replay
-    // the request in on_upstream_response; that path resets recv_buf once a response
-    // byte is in hand. A fresh connect has nothing to retry, so release it now.
-    if (!conn.upstream_reused) conn.recv_buf.reset();
+    // Snapshot the request for a reused pooled socket so the rare post-send dead-
+    // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
+    // replay it on a fresh connect even after recv_buf is reset below. Only a
+    // resendable request with no pipelined surplus is eligible — pipeline_stash above
+    // wrote nothing in that case (leftover == 0), so send_buf is free to hold the
+    // copy. recv_buf still holds exactly the request here (reset is just below).
+    // retry_req_send_len == 0 ⇒ no replay (fall back to close, always safe). Guarded
+    // on upstream_reused so the retried fresh connect (reused cleared) doesn't re-copy.
+    if (conn.upstream_reused && conn.retry_req_send_len == 0 &&
+        request_resendable_from_recv_buf(conn) && conn.recv_buf.len() <= conn.send_buf.capacity()) {
+        conn.send_buf.reset();
+        conn.send_buf.write(conn.recv_buf.data(), conn.recv_buf.len());
+        conn.retry_req_send_len = conn.recv_buf.len();
+    }
+    // recv_buf is released for ALL connections (fresh and reused): pipelined
+    // downstream bytes read during the upstream wait then land at offset 0 and flow
+    // through pipeline_recover, and the just-sent request can never leak into the
+    // next request's parse.
+    conn.recv_buf.reset();
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
     if (conn.upstream_recv_buf.len() > 0) {
@@ -2742,7 +2805,12 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
-    (void)ev;
+    // The body upload is still draining while an early upstream response is buffered;
+    // this slot completes the final body chunk send. If that send FAILED the upload
+    // is truncated even though the body counters (advanced before submit) may read
+    // "complete" — mark it so proxy_upstream_reusable refuses to pool a socket whose
+    // request desynced (otherwise the next request would be parsed as leftover body).
+    if (ev.result < 0) conn.upstream_request_incomplete = true;
 
     prepare_early_response_state(conn);
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -3649,10 +3717,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // A response byte is now in hand, so the request will not be replayed: release
-    // the recv_buf bytes kept for the retry above (reused sockets only — fresh
-    // connects already reset it) before they are mistaken for a pipelined request.
-    conn.recv_buf.reset();
+    // A response byte is now in hand, so the request will not be replayed: drop the
+    // send_buf snapshot marker (the bytes themselves are reused for response framing).
+    // recv_buf is NOT touched here — it was already reset at request-sent, so any
+    // bytes in it now are a genuine pipelined downstream request that must survive to
+    // flow through pipeline_recover / pipeline_dispatch on the completion path.
+    conn.retry_req_send_len = 0;
 
     HttpResponseParser resp_parser;
     ParsedResponse resp;
