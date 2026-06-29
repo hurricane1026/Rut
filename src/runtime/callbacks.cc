@@ -110,6 +110,10 @@ void capture_request_metadata(Connection& conn) {
     conn.req_body_remaining = 0;
     conn.req_chunk_parser.reset();
     conn.req_malformed = false;
+    // Default to "request asked the origin to close": only a cleanly parsed
+    // keep-alive request flips this true. A request we can't strictly parse
+    // (fallback path below) must never qualify its upstream fd for pooling.
+    conn.req_keep_alive = false;
     conn.req_wants_upgrade = false;
     conn.req_upgrade_is_websocket = false;
     conn.req_header_end = 0;
@@ -129,6 +133,10 @@ void capture_request_metadata(Connection& conn) {
         // hop-by-hop, so the token alone is not a valid client upgrade request.
         conn.req_wants_upgrade = req.upgrade && req.has_upgrade_header;
         conn.req_upgrade_is_websocket = req.upgrade_is_websocket;
+        // req.keep_alive already folds in the HTTP version default and a
+        // "Connection: close" token (close → false). This is the verbatim-
+        // forwarded request's keep-alive intent toward the origin.
+        conn.req_keep_alive = req.keep_alive && !req.connection_close;
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;

@@ -2076,26 +2076,42 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    pipeline_stash(conn);
-    // Snapshot the request for a reused pooled socket so the rare post-send dead-
-    // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
-    // replay it on a fresh connect even after recv_buf is reset below. Only a
-    // resendable request with no pipelined surplus is eligible — pipeline_stash above
-    // wrote nothing in that case (leftover == 0), so send_buf is free to hold the
-    // copy. recv_buf still holds exactly the request here (reset is just below).
-    // retry_req_send_len == 0 ⇒ no replay (fall back to close, always safe). Guarded
-    // on upstream_reused so the retried fresh connect (reused cleared) doesn't re-copy.
-    if (conn.upstream_reused && conn.retry_req_send_len == 0 &&
-        request_resendable_from_recv_buf(conn) && conn.recv_buf.len() <= conn.send_buf.capacity()) {
-        conn.send_buf.reset();
-        conn.send_buf.write(conn.recv_buf.data(), conn.recv_buf.len());
-        conn.retry_req_send_len = conn.recv_buf.len();
+    // FRESH (non-retry) send path: recv_buf still holds exactly the just-sent request
+    // (plus any pipelined surplus after it). Stash that surplus, optionally snapshot
+    // the request for a reused-socket retry, then release recv_buf.
+    //
+    // RETRY path (retry_req_send_len > 0): the request was just replayed from the
+    // send_buf snapshot, so recv_buf did NOT hold it — recv_buf was empty when the
+    // retry began (request_fully_resendable gates the retry on recv_buf.len()==0). Any
+    // bytes in recv_buf now are the next request(s) the client PIPELINED during the
+    // in-flight fresh connect/send, sitting at offset 0 (a clean request boundary).
+    // Running pipeline_stash here would mis-slice them at req_initial_send_len (the
+    // ORIGINAL request's length, not a boundary in this buffer), and recv_buf.reset()
+    // would drop them. So on the retry path we do NEITHER and preserve recv_buf intact:
+    // pipeline_stash_len is already 0 (a snapshot is taken only when the original send
+    // had no pipelined surplus), so the completion path dispatches recv_buf as the next
+    // request (Case C: stash_len==0 && recv_buf.len()>0). This matches on_upstream_-
+    // response's "recv_buf is NOT touched here" handling once a response byte arrives.
+    if (conn.retry_req_send_len == 0) {
+        pipeline_stash(conn);
+        // Snapshot the request for a reused pooled socket so the rare post-send dead-
+        // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
+        // replay it on a fresh connect even after recv_buf is reset below. Only a
+        // resendable request with no pipelined surplus is eligible — pipeline_stash
+        // above wrote nothing in that case (leftover == 0), so send_buf is free to hold
+        // the copy. recv_buf still holds exactly the request here (reset is just below).
+        // Guarded on upstream_reused so a fresh non-reused connect doesn't re-copy.
+        if (conn.upstream_reused && request_resendable_from_recv_buf(conn) &&
+            conn.recv_buf.len() <= conn.send_buf.capacity()) {
+            conn.send_buf.reset();
+            conn.send_buf.write(conn.recv_buf.data(), conn.recv_buf.len());
+            conn.retry_req_send_len = conn.recv_buf.len();
+        }
+        // recv_buf is released: pipelined downstream bytes read during the upstream wait
+        // then land at offset 0 and flow through pipeline_recover, and the just-sent
+        // request can never leak into the next request's parse.
+        conn.recv_buf.reset();
     }
-    // recv_buf is released for ALL connections (fresh and reused): pipelined
-    // downstream bytes read during the upstream wait then land at offset 0 and flow
-    // through pipeline_recover, and the just-sent request can never leak into the
-    // next request's parse.
-    conn.recv_buf.reset();
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
     if (conn.upstream_recv_buf.len() > 0) {
@@ -4046,13 +4062,16 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // (None / Content-Length / chunked). A close-delimited (UntilClose) body ends
     // by the upstream closing the socket, so its fd is never reusable. The
     // completion path reads this flag to pool the fd vs. close it.
-    // conn.keep_alive guards the REQUEST side: the proxy forwards the client's
-    // request bytes (incl. its Connection header) verbatim upstream, so a client
-    // Connection: close told the origin it may close after responding — even if the
-    // response itself is self-framed HTTP/1.1 keep-alive. Pooling such an fd would
-    // race the origin's close, so refuse it.
+    // conn.req_keep_alive guards the REQUEST side: the proxy forwards the client's
+    // request bytes (incl. its Connection header / HTTP version) verbatim upstream,
+    // so a client Connection: close (or an HTTP/1.0 request) told the origin it may
+    // close after responding — even if the response itself is self-framed HTTP/1.1
+    // keep-alive. Pooling such an fd would race the origin's close, so refuse it.
+    // NOTE: this must NOT be conn.keep_alive — that is derived from drain state
+    // (set to !is_draining() in on_header_received), not the parsed request, so a
+    // Connection: close request on a live shard still has conn.keep_alive == true.
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
-                               conn.resp_body_mode != BodyMode::UntilClose && conn.keep_alive;
+                               conn.resp_body_mode != BodyMode::UntilClose && conn.req_keep_alive;
 
     const u32 kHeaderLen = resp_parser.header_end;
     const u32 kTotalLen = conn.upstream_recv_buf.len();

@@ -3896,6 +3896,49 @@ TEST(upstream_reuse, retry_refused_when_pipelined_bytes_buffered) {
     CHECK(!rut::request_fully_resendable(*c));  // refused: recv_buf not empty
 }
 
+// Finding (F3): on the snapshot-retry path the request was replayed from send_buf, so
+// recv_buf holds NO original request. If the client pipelines another request into
+// recv_buf while the fresh connect/send is in flight, the retry's on_upstream_request_-
+// sent must NOT run pipeline_stash (which would mis-slice at the ORIGINAL request's
+// req_initial_send_len) nor reset recv_buf (which would drop those bytes). It must
+// preserve recv_buf so the completion path dispatches it as the next request.
+TEST(upstream_reuse, retry_preserves_pipelined_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    // On the retry path: the original request lives in send_buf (replayed already),
+    // and retry_req_send_len marks it. req_initial_send_len is the ORIGINAL length.
+    static const char orig[] = "GET /orig HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 orig_len = sizeof(orig) - 1;
+    c->send_buf.reset();
+    c->send_buf.write(reinterpret_cast<const u8*>(orig), orig_len);
+    c->retry_req_send_len = orig_len;
+    c->req_initial_send_len = orig_len;
+    c->pipeline_stash_len = 0;  // a snapshot is only taken with no pipelined surplus
+    // The client pipelined a DIFFERENT-length next request during the in-flight retry;
+    // it sits at offset 0 of recv_buf (a clean request boundary).
+    static const char pipelined[] = "GET /next HTTP/1.1\r\nHost: x\r\nX: y\r\n\r\n";
+    const u32 pl_len = sizeof(pipelined) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), pl_len);
+    c->upstream_recv_buf.reset();  // no early response yet
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(orig_len)));
+
+    // recv_buf preserved byte-for-byte; nothing stashed (no mis-slice, no drop).
+    CHECK_EQ(c->recv_buf.len(), pl_len);
+    CHECK_EQ(c->pipeline_stash_len, 0);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data(), pipelined, pl_len), 0);
+}
+
 // Finding 3: a final body chunk send that FAILS on the early-response path
 // (on_body_send_with_early_response, which otherwise ignores ev.result) must mark
 // the upload incomplete so the desynced socket is never pooled.
@@ -4092,6 +4135,88 @@ TEST(upstream_reuse, no_body_response_with_surplus_not_reusable) {
         *c,
         make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
     CHECK(!c->upstream_keep_alive);  // surplus after no-body headers → not reusable
+}
+
+// A clean, self-framed keep-alive response to a keep-alive request marks the
+// upstream fd reusable (upstream_keep_alive = true → it gets pooled).
+TEST(upstream_reuse, keepalive_request_pools_clean_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // The forwarded request asked the origin to keep the connection alive.
+    c->req_keep_alive = true;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(c->upstream_keep_alive);  // request + response both keep-alive → reusable
+}
+
+// Finding (F1) regression: a request that carried Connection: close (req_keep_alive
+// false) forwards that close intent to the origin verbatim, so even a self-framed
+// HTTP/1.1 keep-alive RESPONSE must NOT be pooled — the origin may close right after.
+// Gating on the parsed-request keep-alive (not conn.keep_alive, which is drain-derived)
+// is what catches this on a live (non-draining) shard.
+TEST(upstream_reuse, connection_close_request_not_pooled) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // Live shard: conn.keep_alive stays true (it tracks drain state, not the request).
+    c->keep_alive = true;
+    // ...but the client's request carried Connection: close, forwarded to the origin.
+    c->req_keep_alive = false;
+    // The response itself is a perfectly self-framed keep-alive reply.
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(!c->upstream_keep_alive);  // request asked origin to close → never pooled
+}
+
+// capture_request_metadata records the parsed request's keep-alive intent on the
+// Connection so the upstream-pool gate reads it (not the drain-derived conn.keep_alive).
+TEST(upstream_reuse, capture_records_request_keep_alive) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+
+    // HTTP/1.1 with no Connection header → keep-alive request.
+    static const char ka[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(ka), sizeof(ka) - 1);
+    rut::capture_request_metadata(*c);
+    CHECK(c->req_keep_alive);
+
+    // HTTP/1.1 with Connection: close → not keep-alive.
+    static const char close_req[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(close_req), sizeof(close_req) - 1);
+    rut::capture_request_metadata(*c);
+    CHECK(!c->req_keep_alive);
+
+    // HTTP/1.0 default is close.
+    static const char http10[] = "GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(http10), sizeof(http10) - 1);
+    rut::capture_request_metadata(*c);
+    CHECK(!c->req_keep_alive);
 }
 
 // === RouteTable validation ===
