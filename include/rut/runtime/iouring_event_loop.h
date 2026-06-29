@@ -341,6 +341,10 @@ public:
         c.idle_return_fd = c.upstream_fd;
         c.idle_return_uid = upstream_id;
         c.idle_return_bidx = backend_idx;
+        // Pin the config this fd is parked under. If a reload swaps it before the
+        // recv drains, the deferred put_idle would slip a stale-config socket past
+        // poll_command's pool drain — try_deferred_upstream_rearm closes on mismatch.
+        c.idle_return_config = config_ptr ? *config_ptr : nullptr;
         c.upstream_fd = -1;
         c.upstream_send_armed = false;
     }
@@ -735,7 +739,17 @@ public:
         if (c.idle_return_fd >= 0 && kUpstreamRecvDrained) {
             const i32 fd = c.idle_return_fd;
             c.idle_return_fd = -1;
-            if (!upstream ||
+            // A reload landed while the cancel drained: the pinned config no longer
+            // matches the live one, so poll_command's pool drain already ran and this
+            // fd's (uid, bidx) may now map to a different backend — close, don't pool.
+            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            // Stale bytes the backend wrote after the framed response were copied into
+            // upstream_recv_buf while the cancel drained (on_upstream_recv was cleared,
+            // so they were silently consumed off the socket). take_idle's MSG_PEEK can't
+            // see them anymore, so the next reuse would parse them as an early response —
+            // close rather than pool a desynced socket.
+            const bool kStaleBytes = c.upstream_recv_buf.len() != 0;
+            if (kConfigStale || kStaleBytes || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
         }
@@ -844,7 +858,12 @@ public:
         if (c.idle_return_fd >= 0) {
             const i32 fd = c.idle_return_fd;
             c.idle_return_fd = -1;
-            if (!upstream ||
+            // Same refusals as the deferred drain in try_deferred_upstream_rearm: a
+            // config swap (poll_command drained the pool) or surplus bytes copied into
+            // upstream_recv_buf both desync reuse — close rather than pool.
+            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kStaleBytes = c.upstream_recv_buf.len() != 0;
+            if (kConfigStale || kStaleBytes || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
         }
@@ -1314,6 +1333,31 @@ public:
         }
     }
 
+    // Forced drain-deadline shutdown: close every live client, then close any
+    // upstream fd still parked for a deferred idle-pool return. Public so the
+    // deferred-fd close path is unit-testable. Called only from run().
+    void force_close_all() {
+        for (u32 i = 0; i < kMaxConns; i++) {
+            if (conns[i].fd >= 0) {
+                // A LIVE keep-alive client can also hold a parked idle_return_fd while
+                // its upstream recv cancel drains. close_conn takes the deferred path
+                // here (keeps the conn allocated, leaves idle_return_fd for a future
+                // CQE) — so the fd survives below and is closed there.
+                this->close_conn(conns[i]);
+            }
+            // A reusable upstream fd is parked in idle_return_fd awaiting a recv-cancel
+            // drain that this forced shutdown will never deliver — close it directly so
+            // it can't leak. Covers both a slot whose client fd was already closed
+            // (deferred-close) and a live client just torn down above whose close_conn
+            // took the deferred path. close_conn's synchronous path already pooled/closed
+            // and set idle_return_fd = -1, so the guard prevents a double-close.
+            if (conns[i].idle_return_fd >= 0) {
+                ::close(conns[i].idle_return_fd);
+                conns[i].idle_return_fd = -1;
+            }
+        }
+    }
+
 private:
     using Self = IoUringEventLoop;
 
@@ -1399,22 +1443,6 @@ private:
             backend.cancel_accept();
             ::close(listen_fd);
             listen_fd = -1;
-        }
-    }
-
-    void force_close_all() {
-        for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].fd >= 0) {
-                this->close_conn(conns[i]);
-            } else if (conns[i].idle_return_fd >= 0) {
-                // Deferred-close conn (close_conn ran on a Connection: close client
-                // while its deferred idle-pool return was still draining): fd is
-                // already closed, but a reusable upstream fd is parked in
-                // idle_return_fd awaiting a recv-cancel drain that this forced
-                // shutdown will never deliver. Close it directly so it can't leak.
-                ::close(conns[i].idle_return_fd);
-                conns[i].idle_return_fd = -1;
-            }
         }
     }
 };

@@ -8126,6 +8126,144 @@ TEST(proxy_reuse, reuses_idle_upstream_iouring_downstream_close) {
     close(lfd);
 }
 
+// Unit-level coverage for the io_uring deferred idle-pool return guards. These
+// drive try_deferred_upstream_rearm directly (the recv-drain terminal site) on a
+// non-spawned shard, so they run without live io_uring async completions: only
+// the shard's io_uring queue init must succeed (skipped otherwise). The end-to-end
+// reuse paths above still cover the wired data path on CI/real Linux.
+//
+// F1 (config recheck): a hot reload between parking idle_return_fd and the recv
+//   drain must close the parked fd rather than pool a stale-config socket.
+// F2 (stale bytes): surplus upstream bytes copied into upstream_recv_buf while the
+//   cancel drained desync reuse, so the fd must be closed, not pooled.
+TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg_a{};
+    RouteConfig cfg_b{};
+
+    // Match + empty buffer → pooled and reusable.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[0];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 5;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);            // parked fd consumed
+        CHECK_EQ(shard.upstream->idle_count, 1u);  // pooled, not closed
+        CHECK_EQ(shard.upstream->take_idle(5, 0), sv[0]);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    // Config swapped under the parked fd → closed, never pooled.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[1];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 6;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_b;  // parked under a now-superseded config
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: not pooled
+        CHECK(::close(sv[0]) < 0);                 // try_deferred already closed it
+        close(sv[1]);
+    }
+    // Config matches but stale bytes were copied into upstream_recv_buf → closed.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[2];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        u8 slice[64];
+        c.upstream_recv_buf.bind(slice, sizeof(slice));
+        const u8 junk[3] = {'a', 'b', 'c'};
+        c.upstream_recv_buf.write(junk, 3);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 7;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: desynced socket
+        CHECK(::close(sv[0]) < 0);                 // closed, not pooled
+        c.upstream_recv_buf.bind(nullptr, 0);
+        close(sv[1]);
+    }
+
+    shard.shutdown();
+    close(lfd);
+}
+
+// F3: forced drain-deadline shutdown must close a parked idle_return_fd whose recv
+// cancel will never drain — for BOTH a live keep-alive client (fd >= 0, close_conn
+// takes the deferred path and leaves the fd parked) and an already-deferred-closed
+// slot (fd < 0). No leak, no double-close. Drives force_close_all directly.
+TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    // Live client (fd >= 0) with a parked upstream fd whose recv is still draining.
+    auto& live = shard.loop->conns[0];
+    live.reset();
+    i32 cli[2];
+    i32 up0[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, up0), 0);
+    live.fd = cli[0];
+    live.pending_ops = 0;
+    live.upstream_recv_cancel_inflight = true;  // recv draining → close_conn defers
+    live.idle_return_fd = up0[0];
+    live.idle_return_uid = 9;
+    live.idle_return_bidx = 0;
+    live.idle_return_config = &cfg;
+
+    // Already-deferred-closed slot (client fd already gone).
+    auto& deferred = shard.loop->conns[1];
+    deferred.reset();
+    i32 up1[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, up1), 0);
+    deferred.fd = -1;
+    deferred.idle_return_fd = up1[0];
+    deferred.idle_return_uid = 11;
+    deferred.idle_return_bidx = 0;
+
+    shard.loop->force_close_all();
+
+    CHECK_EQ(live.idle_return_fd, -1);
+    CHECK_EQ(deferred.idle_return_fd, -1);
+    CHECK(::close(cli[0]) < 0);  // client fd closed by close_conn
+    CHECK(::close(up0[0]) < 0);  // parked upstream fd closed (live-client case)
+    CHECK(::close(up1[0]) < 0);  // parked upstream fd closed (deferred-close case)
+    close(cli[1]);
+    close(up0[1]);
+    close(up1[1]);
+
+    shard.shutdown();
+    close(lfd);
+}
+
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
 // the upstream's h1 response, and re-encodes it as h2 HEADERS+DATA. Asserts the

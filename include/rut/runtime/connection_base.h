@@ -148,6 +148,14 @@ struct ConnectionBase {
     i32 idle_return_fd;
     u16 idle_return_uid;
     u8 idle_return_bidx;
+    // Active RouteConfig pinned when idle_return_fd was parked (return_idle_upstream).
+    // A hot reload can land while the cancelled recv is still draining; poll_command
+    // only drains sockets ALREADY in the pool, so the deferred fd would escape that
+    // drain and later be put_idle'd into the freshly-drained pool under a now-stale
+    // (upstream_id, backend_idx). try_deferred_upstream_rearm compares this against the
+    // live config and CLOSES instead of pooling on mismatch. request_config can't be
+    // reused: the keep-alive client repoints it on its next request while this drains.
+    const RouteConfig* idle_return_config;
     // io_uring-only deferred close: close_conn was called on a conn whose deferred
     // idle-pool return (idle_return_fd) had not yet drained its cancelled recv. Rather
     // than discard the still-reusable upstream fd (and free the slot), the conn is kept
@@ -549,6 +557,7 @@ struct ConnectionBase {
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;
+        idle_return_config = nullptr;
         close_after_idle_return = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
