@@ -2831,9 +2831,20 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();
 
+    // Mirror on_proxy_response_sent: during graceful drain, close the upstream
+    // (close_conn closes upstream_fd) rather than parking it in the idle pool.
+    // No further request should reuse a draining shard's backend sockets, and a
+    // pooled fd would otherwise survive until sweep/shutdown. This is-draining
+    // check therefore precedes release_upstream_conn (which would pool a
+    // reusable fd). A normal (non-draining) completion still pools as before.
+    if (loop->is_draining()) {
+        loop->close_conn(conn);
+        return;
+    }
+
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
-    if (!conn.keep_alive || loop->is_draining()) {
+    if (!conn.keep_alive) {
         loop->close_conn(conn);
         return;
     }
