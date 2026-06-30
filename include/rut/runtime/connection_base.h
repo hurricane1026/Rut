@@ -372,13 +372,12 @@ struct ConnectionBase {
     // downstream bytes read during the wait flow through pipeline_recover, and the
     // just-sent request can't leak into the next request). To still allow the rare
     // post-send dead-socket fallback (origin FIN landing just after take_idle's
-    // MSG_PEEK probe), the exact request bytes are snapshotted into send_buf —
-    // which is provably free for a resendable request (no pipelined surplus ⇒
-    // pipeline_stash wrote nothing). This records that snapshot's length; >0 means
-    // "a replayable copy lives in send_buf" and on_upstream_connected replays from
-    // it instead of recv_buf. Reset at the per-request boundary like the reuse
-    // flags. Only set for resendable (bodyless / fully-buffered, idempotent-checked
-    // at the retry site) requests, so it is bounded by recv_buf/send_buf capacity.
+    // MSG_PEEK probe), the exact request bytes are snapshotted into the front of
+    // send_buf. If the same client read also carried pipelined surplus, pipeline_stash
+    // appends that suffix after this snapshot; pipeline_stash_len describes the suffix.
+    // >0 means "a replayable copy lives in send_buf" and on_upstream_connected replays
+    // [0, retry_req_send_len) instead of recv_buf. Reset at the per-request boundary
+    // like the reuse flags.
     u32 retry_req_send_len;
     bool req_malformed;  // true if request body is malformed (reject)
     // Request-side keep-alive intent of the CURRENT request, as parsed from its

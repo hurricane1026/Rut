@@ -445,17 +445,13 @@ inline bool request_body_replayable(const Connection& conn) {
     return true;
 }
 
-// True iff the COMPLETE original request is still byte-for-byte in recv_buf — i.e.
-// recv_buf holds EXACTLY the request bytes, not more. The strict equality is
-// load-bearing: while we wait for the upstream response the downstream fd stays
-// EPOLLIN-armed, so a client that PIPELINES another request has its bytes appended
-// into recv_buf; if that happened, recv_buf no longer holds just the original
-// request. Used (a) by request_fully_resendable's pre-reset retry sites (failed
-// send / EOF before the send completed, where recv_buf is still intact) and (b) to
-// decide whether to snapshot the request into send_buf at request-sent.
+// True iff the COMPLETE original request is still byte-for-byte at the front of
+// recv_buf. recv_buf may also contain pipelined surplus after that prefix; the
+// retry snapshot copies only the first req_initial_send_len bytes, while
+// pipeline_stash keeps the surplus separately in send_buf after the snapshot.
 inline bool request_resendable_from_recv_buf(const Connection& conn) {
     if (!request_body_replayable(conn)) return false;
-    return conn.req_initial_send_len > 0 && conn.recv_buf.len() == conn.req_initial_send_len;
+    return conn.req_initial_send_len > 0 && conn.recv_buf.len() >= conn.req_initial_send_len;
 }
 
 // True iff a reused-socket retry can re-send the COMPLETE original request. There
@@ -2100,20 +2096,21 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // request (Case C: stash_len==0 && recv_buf.len()>0). This matches on_upstream_-
     // response's "recv_buf is NOT touched here" handling once a response byte arrives.
     if (conn.retry_req_send_len == 0) {
-        pipeline_stash(conn);
         // Snapshot the request for a reused pooled socket so the rare post-send dead-
         // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
-        // replay it on a fresh connect even after recv_buf is reset below. Only a
-        // resendable request with no pipelined surplus is eligible — pipeline_stash
-        // above wrote nothing in that case (leftover == 0), so send_buf is free to hold
-        // the copy. recv_buf still holds exactly the request here (reset is just below).
+        // replay it on a fresh connect even after recv_buf is reset below. Do this
+        // BEFORE pipeline_stash: when the client sent GET1+GET2 in the same read,
+        // pipeline_stash needs send_buf for GET2, so send_buf is laid out as:
+        //   [0, retry_req_send_len)                         retry copy of GET1
+        //   [retry_req_send_len, + pipeline_stash_len)       pipelined suffix
         // Guarded on upstream_reused so a fresh non-reused connect doesn't re-copy.
         if (conn.upstream_reused && request_resendable_from_recv_buf(conn) &&
             conn.recv_buf.len() <= conn.send_buf.capacity()) {
             conn.send_buf.reset();
-            conn.send_buf.write(conn.recv_buf.data(), conn.recv_buf.len());
-            conn.retry_req_send_len = conn.recv_buf.len();
+            conn.send_buf.write(conn.recv_buf.data(), conn.req_initial_send_len);
+            conn.retry_req_send_len = conn.req_initial_send_len;
         }
+        pipeline_stash(conn);
         // recv_buf is released: pipelined downstream bytes read during the upstream wait
         // then land at offset 0 and flow through pipeline_recover, and the just-sent
         // request can never leak into the next request's parse.
@@ -2897,7 +2894,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
-        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
@@ -4302,7 +4299,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
-        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();

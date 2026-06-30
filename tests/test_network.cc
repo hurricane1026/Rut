@@ -3792,6 +3792,49 @@ TEST(upstream_reuse, request_sent_reused_snapshots_into_send_buf) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// Regression: when GET1 and pipelined GET2 arrive in the same read, the reused-fd
+// send-success path must keep a retry copy of GET1 while also stashing GET2.
+TEST(upstream_reuse, request_sent_reused_snapshots_before_pipeline_stash) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get1[] = "GET /one HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char get2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(get1) - 1;
+    const u32 len2 = sizeof(get2) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(get2), len2);
+    c->req_initial_send_len = len1;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+
+    CHECK_EQ(c->retry_req_send_len, len1);
+    CHECK_EQ(c->pipeline_stash_len, len2);
+    CHECK_EQ(c->send_buf.len(), len1 + len2);
+    CHECK(__builtin_memcmp(c->send_buf.data(), get1, len1) == 0);
+    CHECK(__builtin_memcmp(c->send_buf.data() + len1, get2, len2) == 0);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+
+    CHECK(rut::request_fully_resendable(*c));
+    REQUIRE(rut::pipeline_recover(*c));
+    CHECK_EQ(c->recv_buf.len(), len2);
+    CHECK(__builtin_memcmp(c->recv_buf.data(), get2, len2) == 0);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // A fresh (non-reused) connection takes NO snapshot — there is nothing to retry —
 // and recv_buf is still released at request-sent (unchanged original lifecycle).
 TEST(upstream_reuse, request_sent_fresh_takes_no_snapshot) {
