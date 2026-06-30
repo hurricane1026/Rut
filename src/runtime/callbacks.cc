@@ -283,7 +283,8 @@ void pipeline_stash(Connection& conn) {
         conn.pipeline_stash_len = 0;
         return;
     }
-    conn.send_buf.reset();
+    const u32 kStashOff = conn.retry_req_send_len;
+    if (kStashOff == 0) conn.send_buf.reset();
     if (kLeftover > conn.send_buf.write_avail()) {
         conn.pipeline_stash_len = 0;
         return;
@@ -297,7 +298,7 @@ bool pipeline_recover(Connection& conn) {
     const u16 kStashLen = conn.pipeline_stash_len;
     conn.pipeline_stash_len = 0;
     if (kStashLen == 0) return false;
-    const u8* src = conn.send_buf.data();
+    const u8* src = conn.send_buf.data() + conn.retry_req_send_len;
     const u32 kExisting = conn.recv_buf.len();
     if (kExisting == 0) {
         // HTTP/1 pipeline path (and the common WS case): recv_buf is empty, just
