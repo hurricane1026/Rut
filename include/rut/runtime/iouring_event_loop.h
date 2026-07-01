@@ -276,6 +276,7 @@ public:
     }
 
     void shutdown() {
+        close_deferred_idle_return_fds();
         reclaim_pending();
         backend.shutdown();
         h2_pool.destroy();
@@ -344,9 +345,20 @@ public:
             if (!upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs())) ::close(fd);
             return;
         }
+        // The recv being drained belongs to the just-completed upstream fd, not to
+        // any pipelined/follow-up request that may reuse this Connection slot. Any
+        // terminal or positive CQE from it must be quarantined and dropped.
+        c.upstream_recv_terminal_stale = true;
         // Cancel the armed multishot recv; if the cancel SQE can't be queued, leave
-        // upstream_fd set so the caller closes (can't safely park an armed socket).
-        if (c.upstream_recv_armed && !pause_upstream_recv_impl(c)) return;
+        // the fd closed/detached but keep the old recv as an in-flight stale terminal
+        // barrier; otherwise a later CQE can be delivered to the next request.
+        if (c.upstream_recv_armed && !pause_upstream_recv_impl(c)) {
+            ::close(c.upstream_fd);
+            c.upstream_fd = -1;
+            c.upstream_send_armed = false;
+            c.upstream_recv_cancel_inflight = true;
+            return;
+        }
         c.idle_return_fd = c.upstream_fd;
         c.idle_return_uid = upstream_id;
         c.idle_return_bidx = backend_idx;
@@ -705,7 +717,8 @@ public:
             // with resp_fully_buffered set — upgrade the stale marker so the in-flight
             // recv's terminal/data is still treated as stale post-body data. The early
             // return must not leave terminal_stale at its mid-body value of false.
-            if (c.resp_fully_buffered) c.upstream_recv_terminal_stale = true;
+            c.upstream_recv_terminal_stale =
+                c.upstream_recv_terminal_stale || c.resp_fully_buffered;
             return true;
         }
         // Cancel the multishot recv by user_data — recv-only, so a concurrent upstream
@@ -723,7 +736,7 @@ public:
         // Capture whether the body was already complete: if so, the cancelled recv's
         // terminal is stale post-body data to suppress. Captured now because
         // proxy_stream_complete clears resp_fully_buffered before that terminal drains.
-        c.upstream_recv_terminal_stale = c.resp_fully_buffered;
+        c.upstream_recv_terminal_stale = c.upstream_recv_terminal_stale || c.resp_fully_buffered;
         c.pending_ops++;
         return true;
     }
@@ -758,7 +771,9 @@ public:
             // see them anymore, so the next reuse would parse them as an early response —
             // close rather than pool a desynced socket.
             const bool kStaleBytes = c.upstream_recv_buf.len() != 0;
-            if (kConfigStale || kStaleBytes || !upstream ||
+            const bool kDraining = is_draining();
+            if (kStaleBytes) c.upstream_recv_buf.reset();
+            if (kConfigStale || kStaleBytes || kDraining || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
         }
@@ -872,7 +887,9 @@ public:
             // upstream_recv_buf both desync reuse — close rather than pool.
             const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
             const bool kStaleBytes = c.upstream_recv_buf.len() != 0;
-            if (kConfigStale || kStaleBytes || !upstream ||
+            const bool kDraining = is_draining();
+            if (kStaleBytes) c.upstream_recv_buf.reset();
+            if (kConfigStale || kStaleBytes || kDraining || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
         }
@@ -1346,6 +1363,14 @@ public:
     // upstream fd still parked for a deferred idle-pool return. Public so the
     // deferred-fd close path is unit-testable. Called only from run().
     void force_close_all() {
+        close_live_clients();
+        close_deferred_idle_return_fds();
+    }
+
+private:
+    using Self = IoUringEventLoop;
+
+    void close_live_clients() {
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0) {
                 // A LIVE keep-alive client can also hold a parked idle_return_fd while
@@ -1354,6 +1379,11 @@ public:
                 // CQE) — so the fd survives below and is closed there.
                 this->close_conn(conns[i]);
             }
+        }
+    }
+
+    void close_deferred_idle_return_fds() {
+        for (u32 i = 0; i < kMaxConns; i++) {
             // A reusable upstream fd is parked in idle_return_fd awaiting a recv-cancel
             // drain that this forced shutdown will never deliver — close it directly so
             // it can't leak. Covers both a slot whose client fd was already closed
@@ -1366,9 +1396,6 @@ public:
             }
         }
     }
-
-private:
-    using Self = IoUringEventLoop;
 
     void on_accept(const IoEvent& ev) {
         if (ev.result < 0) return;

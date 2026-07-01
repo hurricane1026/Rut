@@ -7985,6 +7985,15 @@ struct KeepAliveCountingUpstream {
     }
 };
 
+template <typename ShardT>
+bool wait_for_idle_pool_count(ShardT& shard, u32 expected, u32 timeout_ms = 1000) {
+    for (u32 waited = 0; waited < timeout_ms; waited++) {
+        if (shard.upstream && shard.upstream->idle_count >= expected) return true;
+        usleep(1000);
+    }
+    return shard.upstream && shard.upstream->idle_count >= expected;
+}
+
 // End-to-end: three sequential keep-alive requests on ONE client connection to a
 // proxy route must share a SINGLE upstream connection — the gateway returns the
 // upstream fd to the per-shard idle pool after each response and borrows it back
@@ -8025,8 +8034,8 @@ TEST(proxy_reuse, reuses_idle_upstream_across_keepalive_requests) {
 
 // io_uring variant of the reuse e2e (Shard wires the pool for both backends). Unlike
 // epoll's synchronous detach, io_uring defers the pool-return until the cancelled
-// multishot recv drains, so a short usleep between requests lets the fd re-enter the
-// pool before the next request borrows it. Skips where io_uring is unavailable.
+// multishot recv drains, so the test waits until the fd actually re-enters the pool
+// before the next request borrows it. Skips where io_uring is unavailable.
 TEST(proxy_reuse, reuses_idle_upstream_iouring) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     KeepAliveCountingUpstream backend;
@@ -8057,7 +8066,7 @@ TEST(proxy_reuse, reuses_idle_upstream_iouring) {
         i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
         REQUIRE_GT(n, 0);
         CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
-        usleep(20000);  // let the deferred recv-cancel drain so the fd re-enters the pool
+        REQUIRE(wait_for_idle_pool_count(shard, 1));  // deferred recv-cancel drained
     }
     close(c);
     usleep(50000);
@@ -8070,16 +8079,10 @@ TEST(proxy_reuse, reuses_idle_upstream_iouring) {
     close(lfd);
 }
 
-// io_uring deferred-close reuse: a downstream that does NOT stay keep-alive
-// (Connection: close) still pools its reusable upstream socket. On io_uring the pool-
-// return is deferred behind the multishot recv cancel, and close_conn fires immediately
-// for a Connection: close client — so without the deferred-close path the still-reusable
-// upstream fd would be discarded (close_conn closes idle_return_fd + frees the slot).
-// Here each request arrives on a FRESH downstream connection that closes after the
-// response; a subsequent request to the same backend must still borrow the pooled fd, so
-// the backend accepts exactly ONE TCP connection (not one per downstream). Skips where
-// io_uring is unavailable.
-TEST(proxy_reuse, reuses_idle_upstream_iouring_downstream_close) {
+// A request carrying Connection: close is forwarded to the origin as such, so the
+// upstream fd must not be pooled: the origin is allowed to close it after the response.
+// This mirrors the parsed-request keep-alive gate in the epoll path.
+TEST(proxy_reuse, iouring_connection_close_request_not_pooled) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     KeepAliveCountingUpstream backend;
     REQUIRE(backend.setup());
@@ -8112,13 +8115,11 @@ TEST(proxy_reuse, reuses_idle_upstream_iouring_downstream_close) {
         REQUIRE_GT(n, 0);
         CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
         close(c);
-        usleep(20000);  // let the deferred recv-cancel drain so the fd re-enters the pool
     }
     usleep(50000);
 
-    // One upstream connection, reused across all three downstream-close requests. Without
-    // the deferred-close fix this would be 3 (each Connection: close discards the fd).
-    CHECK_EQ(backend.accept_count.load(), 1);
+    CHECK_EQ(backend.accept_count.load(), 3);
+    CHECK_EQ(shard.upstream->idle_count, 0u);
 
     shard.stop();
     shard.join();
@@ -8182,7 +8183,8 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         CHECK(::close(sv[0]) < 0);                 // try_deferred already closed it
         close(sv[1]);
     }
-    // Config matches but stale bytes were copied into upstream_recv_buf → closed.
+    // Config matches but stale bytes were copied into upstream_recv_buf → closed and
+    // the stale buffer is dropped so a later request cannot parse it as a response.
     {
         shard.active_config = &cfg_a;
         auto& c = shard.loop->conns[2];
@@ -8200,8 +8202,31 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         shard.loop->try_deferred_upstream_rearm(c);
         CHECK_EQ(c.idle_return_fd, -1);
         CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: desynced socket
-        CHECK(::close(sv[0]) < 0);                 // closed, not pooled
+        CHECK_EQ(c.upstream_recv_buf.len(), 0u);
+        CHECK(::close(sv[0]) < 0);  // closed, not pooled
         c.upstream_recv_buf.bind(nullptr, 0);
+        close(sv[1]);
+    }
+
+    // Idle-return cancellation marks the old recv terminal/data stale even when
+    // resp_fully_buffered was already cleared by proxy completion.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[3];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.id = 3;
+        c.upstream_fd = sv[0];
+        c.upstream_recv_armed = true;
+        c.resp_fully_buffered = false;
+        c.upstream_recv_terminal_stale = false;
+        shard.loop->return_idle_upstream(c, 8, 0);
+        CHECK(c.upstream_recv_terminal_stale);
+        if (c.idle_return_fd >= 0) {
+            close(c.idle_return_fd);
+            c.idle_return_fd = -1;
+        }
         close(sv[1]);
     }
 
@@ -8209,10 +8234,8 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
     close(lfd);
 }
 
-// F3: forced drain-deadline shutdown must close a parked idle_return_fd whose recv
-// cancel will never drain — for BOTH a live keep-alive client (fd >= 0, close_conn
-// takes the deferred path and leaves the fd parked) and an already-deferred-closed
-// slot (fd < 0). No leak, no double-close. Drives force_close_all directly.
+// F3: forced drain-deadline shutdown and normal shard shutdown must close a parked
+// idle_return_fd whose recv cancel may never drain. No leak, no double-close.
 TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     Shard<IoUringEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
@@ -8260,7 +8283,17 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     close(up0[1]);
     close(up1[1]);
 
+    // Normal shutdown has no drain-deadline force_close_all call, but must still
+    // scan per-connection parked fds before destroying the loop.
+    auto& normal = shard.loop->conns[2];
+    normal.reset();
+    i32 up2[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, up2), 0);
+    normal.idle_return_fd = up2[0];
+
     shard.shutdown();
+    CHECK(::close(up2[0]) < 0);
+    close(up2[1]);
     close(lfd);
 }
 
