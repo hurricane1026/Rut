@@ -691,6 +691,121 @@ TEST(shard_control, join_clears_stale_pending_without_overwrite) {
     close(lfd);
 }
 
+// === Idle upstream pool drained on stopped-shard reload paths ===
+//
+// poll_command() drains the idle pool on every config adopt, but that only runs
+// on the shard thread. A reload applied while the shard is NOT running (direct
+// apply in reload_config, or pending-apply in join) must drain too — otherwise
+// idle fds parked under the OLD config survive into the new config and could be
+// handed out for a now-different (upstream_id, backend_idx). These exercise the
+// real EpollEventLoop + real UpstreamPool wired by Shard::init().
+
+TEST_F(ShardF, reload_before_spawn_drains_idle_pool) {
+    REQUIRE(self.ok);
+    REQUIRE(self.shard.upstream != nullptr);
+    // Park a live fd as though a prior config had pooled it.
+    const i32 fd = UpstreamPool::create_socket();
+    REQUIRE(fd >= 0);
+    REQUIRE(self.shard.upstream->put_idle(fd, /*upstream_id=*/1, /*backend_idx=*/0, /*now_sec=*/0));
+    CHECK_EQ(self.shard.upstream->idle_count, 1u);
+
+    RouteConfig cfg;
+    self.shard.reload_config(&cfg);  // not-running direct-apply path
+    CHECK_EQ(self.shard.active_config, &cfg);
+    CHECK_EQ(self.shard.upstream->idle_count, 0u);  // drained (fd closed by drain())
+}
+
+// === Graceful-drain pool teardown stays on the shard thread (F2) ===
+//
+// EpollEventLoop::drain(period) runs on the CONTROL/caller thread (Shard::drain).
+// It must NOT mutate the share-nothing UpstreamPool: the shard's event-loop thread
+// may concurrently be in take_idle/put_idle/sweep, and touching the pool here would
+// race fd reuse and corrupt idle_count/free_stack. The pool is instead emptied on the
+// shard thread, in run()'s drain block (which calls upstream->drain()). This verifies
+// the control-thread drain() leaves the pool intact and only flips draining_; the
+// shard-thread step (modeled by the explicit upstream->drain() below) is what closes
+// the parked fds — guaranteeing a draining shard ends with no open pooled fds.
+TEST_F(ShardF, drain_defers_idle_pool_teardown_to_shard_thread) {
+    REQUIRE(self.ok);
+    REQUIRE(self.shard.upstream != nullptr);
+    REQUIRE(self.shard.loop != nullptr);
+    const i32 fd = UpstreamPool::create_socket();
+    REQUIRE(fd >= 0);
+    REQUIRE(self.shard.upstream->put_idle(fd, /*upstream_id=*/1, /*backend_idx=*/0, /*now_sec=*/0));
+    CHECK_EQ(self.shard.upstream->idle_count, 1u);
+
+    self.shard.loop->drain(0);  // control-thread method (Shard::drain → loop->drain)
+    CHECK(self.shard.loop->is_draining());
+    CHECK_EQ(self.shard.upstream->idle_count, 1u);  // pool untouched — no cross-thread race
+
+    // What run()'s drain block does on the shard thread, the first time it observes
+    // draining_: empty the pool. Closes the parked fd; idle_count → 0.
+    self.shard.upstream->drain();
+    CHECK_EQ(self.shard.upstream->idle_count, 0u);
+}
+
+TEST(shard_control, reload_after_join_drains_idle_pool) {
+    // spawn → stop → join → reload: direct-apply path (thread_spawned=false).
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+
+    Shard<EpollEventLoop> s;
+    REQUIRE(s.init(0, lfd).has_value());
+    REQUIRE(s.spawn(false).has_value());
+    s.stop();
+    s.join();  // thread gone — no race touching the pool from the main thread
+
+    REQUIRE(s.upstream != nullptr);
+    const i32 fd = UpstreamPool::create_socket();
+    REQUIRE(fd >= 0);
+    REQUIRE(s.upstream->put_idle(fd, /*upstream_id=*/2, /*backend_idx=*/1, /*now_sec=*/0));
+    CHECK_EQ(s.upstream->idle_count, 1u);
+
+    RouteConfig cfg;
+    cfg.route_count = 7;
+    s.reload_config(&cfg);  // direct apply (not running)
+    CHECK_EQ(s.active_config, &cfg);
+    CHECK_EQ(s.upstream->idle_count, 0u);  // drained
+
+    s.shutdown();
+    close(lfd);
+}
+
+TEST(shard_control, join_applies_pending_reload_drains_idle_pool) {
+    // spawn → stop → (let thread exit) → reload (queues to pending) → join applies
+    // + drains. Exercises the join() pending-apply branch's drain.
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+
+    Shard<EpollEventLoop> s;
+    REQUIRE(s.init(0, lfd).has_value());
+    REQUIRE(s.spawn(false).has_value());
+    s.stop();
+    // Let the thread fully exit so its final poll_command() can't consume the
+    // reload — forcing the join() pending-apply path to be the one that drains.
+    struct timespec ts = {0, 100000000L};  // 100ms
+    nanosleep(&ts, nullptr);
+
+    REQUIRE(s.upstream != nullptr);
+    const i32 fd = UpstreamPool::create_socket();
+    REQUIRE(fd >= 0);
+    REQUIRE(s.upstream->put_idle(fd, /*upstream_id=*/3, /*backend_idx=*/0, /*now_sec=*/0));
+    CHECK_EQ(s.upstream->idle_count, 1u);
+
+    RouteConfig new_cfg;
+    new_cfg.route_count = 99;
+    s.reload_config(&new_cfg);  // thread_spawned still true → queues to pending_config
+
+    s.join();  // applies new_cfg AND drains the pool
+    CHECK_EQ(s.active_config, &new_cfg);
+    CHECK_EQ(s.upstream->idle_count, 0u);  // drained on the pending-apply path
+
+    s.shutdown();
+    close(lfd);
+}
+
 // === Epoch via timer close ===
 
 TEST_F(EpochLoopF, leave_on_timer_close) {

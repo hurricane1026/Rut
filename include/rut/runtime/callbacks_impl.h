@@ -374,6 +374,168 @@ void release_upstream_slot(Loop* loop, Connection& conn) {
     }
 }
 
+// Release conn.upstream_fd at proxy completion: hand it to the per-shard idle pool
+// for reuse when the upstream connection is keep-alive + self-framed (and wasn't
+// abandoned on timeout), otherwise close it. Either way conn.upstream_fd ends as -1
+// and the fd↔conn routing / armed flags are cleared. The loop's return_idle_upstream
+// (epoll today; io_uring via the deferred-drain path) detaches the fd from the I/O
+// backend before parking it; loops without that method just close (no reuse).
+template <typename Loop>
+bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
+    // The upstream must have signalled keep-alive + a self-framed body, and the
+    // episode must not have been abandoned on timeout.
+    if (!conn.upstream_keep_alive || conn.upstream_abandoned) return false;
+    // The client→upstream upload must have been fully DELIVERED. A failed body
+    // write (initial forward or a streamed chunk) leaves the backend mid-read of a
+    // truncated request even though the body counters below may read "complete"
+    // (they advance before the send is submitted) — pooling such a socket would let
+    // the next request's bytes be parsed as the unfinished body. See
+    // upstream_request_incomplete.
+    if (conn.upstream_request_incomplete) return false;
+    // The client→upstream request upload must have finished. An early upstream
+    // response (e.g. a 413 before the POST body drained) stops forwarding the body,
+    // leaving the backend still reading the previous request — a pooled fd would
+    // then have the next request's bytes parsed as that leftover body.
+    if ((conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state != ChunkedParser::State::Complete))
+        return false;
+    // The request must have run on the still-current config. A hot reload can
+    // repoint this (upstream_idx, backend_idx) to a different backend while the
+    // request is in flight; poll_command's drain only flushes sockets idle at the
+    // swap instant, so an in-flight old-config request completing afterward must not
+    // park its fd under the now-reused numeric key.
+    if constexpr (requires { loop->config_ptr; }) {
+        const RouteConfig* kCur = loop->config_ptr ? *loop->config_ptr : nullptr;
+        if (conn.request_config != kCur) return false;
+    }
+    return true;
+}
+
+template <typename Loop>
+void release_upstream_conn(Loop* loop, Connection& conn) {
+    if (conn.upstream_fd >= 0 && proxy_upstream_reusable(loop, conn)) {
+        if constexpr (requires {
+                          loop->return_idle_upstream(
+                              conn, conn.upstream_idx, conn.upstream_backend_idx);
+                      }) {
+            loop->return_idle_upstream(conn, conn.upstream_idx, conn.upstream_backend_idx);
+            if (conn.upstream_fd < 0) return;  // parked (or closed) + cleared by the loop
+        }
+    }
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    loop->clear_upstream_fd(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+}
+
+// Body-state half of resendability: the request body must be fully delivered and
+// nothing may have begun streaming (once a body byte streams, recv_buf is reset +
+// refilled with chunks, so the original headers+body are gone). Shared by both
+// resendability predicates below.
+inline bool request_body_replayable(const Connection& conn) {
+    if (conn.req_body_streamed) return false;
+    if (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) return false;
+    if (conn.req_body_mode == BodyMode::Chunked &&
+        conn.req_chunk_parser.state != ChunkedParser::State::Complete)
+        return false;
+    return true;
+}
+
+// True iff the COMPLETE original request is still byte-for-byte at the front of
+// recv_buf. recv_buf may also contain pipelined surplus after that prefix; the
+// retry snapshot copies only the first req_initial_send_len bytes, while
+// pipeline_stash keeps the surplus separately in send_buf after the snapshot.
+inline bool request_resendable_from_recv_buf(const Connection& conn) {
+    if (!request_body_replayable(conn)) return false;
+    return conn.req_initial_send_len > 0 && conn.recv_buf.len() >= conn.req_initial_send_len;
+}
+
+// True iff a reused-socket retry can re-send the COMPLETE original request. There
+// are two replay sources, checked in order:
+//   1. retry_req_send_len > 0 — the request was snapshotted into send_buf at
+//      request-sent (after recv_buf was reset). This is the post-send dead-socket
+//      site (on_upstream_response); recv_buf may now hold a pipelined next request,
+//      which is preserved while the snapshot is replayed from send_buf.
+//   2. recv_buf still has the request as its prefix — the pre-reset sites (failed
+//      send / EOF before the send completed), where no snapshot was taken yet.
+//      Any surplus bytes are pipelined next-request data and are preserved by the
+//      normal stash path after the retry send succeeds.
+// Used to gate BOTH reused-socket retry sites so they cannot drift.
+inline bool request_fully_resendable(const Connection& conn) {
+    if (!request_body_replayable(conn)) return false;
+    if (conn.retry_req_send_len > 0) return true;
+    return conn.req_initial_send_len > 0 && conn.recv_buf.len() >= conn.req_initial_send_len;
+}
+
+// A reused (pooled) upstream socket failed before any response byte — the backend
+// closed it between take_idle's liveness probe and our request. Fall back to a
+// fresh connect + resend, but ONLY for idempotent methods: a non-idempotent
+// request could have been received by the backend before the reset, so resending
+// risks executing it twice. Returns true (a fresh connect was started → caller
+// returns) or false (caller runs its normal failure handling, e.g. 502/close).
+// One-shot: clears upstream_reused so a fresh-connect failure isn't retried again.
+template <typename Loop>
+bool retry_reused_upstream(Loop* loop, Connection& conn) {
+    if (!conn.upstream_reused) return false;
+    conn.upstream_reused = false;
+    // An upgrade request (WebSocket/HTTP Upgrade) is a GET but can open backend
+    // session state, so replaying it could create a duplicate session — never retry.
+    if (conn.req_wants_upgrade) return false;
+    const u8 m = conn.req_method;
+    const bool kIdempotent =
+        m == static_cast<u8>(LogHttpMethod::Get) || m == static_cast<u8>(LogHttpMethod::Head) ||
+        m == static_cast<u8>(LogHttpMethod::Put) || m == static_cast<u8>(LogHttpMethod::Delete) ||
+        m == static_cast<u8>(LogHttpMethod::Options) || m == static_cast<u8>(LogHttpMethod::Trace);
+    if (!kIdempotent) return false;
+    // The full request must still be resendable from recv_buf: a body upload that
+    // began streaming has already overwritten recv_buf with body chunks, so
+    // reconnecting would resend a truncated/garbage request (bodyless idempotent
+    // methods and fully-buffered-unsent bodies stay retryable). This same gate runs
+    // at every retry site, so a partially-or-fully-streamed body is never replayed.
+    if (!request_fully_resendable(conn)) return false;
+    // A retry re-sends the request from scratch, so any prior failed-send marker
+    // from this episode is stale; the fresh attempt decides delivery anew.
+    conn.upstream_request_incomplete = false;
+    const RouteConfig* cfg = conn.request_config;
+    if (!cfg) return false;
+    const auto& target = cfg->upstreams[conn.upstream_idx];
+    if (conn.upstream_backend_idx >= target.addr_count) return false;
+
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+    loop->clear_upstream_fd(conn.id);
+    // Clear any epoll partial-send bookkeeping for the dead fd before reconnecting:
+    // a request send parked on EPOLLOUT leaves upstream_send_state set, which the
+    // fresh connect's EPOLLOUT would otherwise resume / misread as the connect
+    // result (the swapped on_upstream_connected slot). io_uring has no such state
+    // — its retry is gated on upstream_send_armed instead.
+    if constexpr (requires { loop->clear_upstream_send_state(conn.id); })
+        loop->clear_upstream_send_state(conn.id);
+    conn.upstream_recv_armed = false;
+    conn.upstream_send_armed = false;
+    conn.upstream_recv_buf.reset();
+    const i32 fd = UpstreamPool::create_socket();
+    if (fd < 0) return false;
+    conn.upstream_fd = fd;
+    conn.upstream_start_us = monotonic_us();
+    conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    if (!loop->submit_connect(conn,
+                              &target.addrs[conn.upstream_backend_idx],
+                              sizeof(target.addrs[conn.upstream_backend_idx]))) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        return false;
+    }
+    return true;
+}
+
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
@@ -527,6 +689,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_override_overflow = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
+    conn.upstream_keep_alive = false;
+    conn.upstream_reused = false;
+    conn.upstream_request_incomplete = false;
+    conn.retry_req_send_len = 0;
+    conn.req_body_streamed = false;
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
@@ -684,6 +851,40 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.upstream_name[target.name_len] = '\0';
         else
             conn.upstream_name[sizeof(conn.upstream_name) - 1] = '\0';
+        conn.upstream_idx = route->upstream_id;
+        // (terminate-mode config is set unconditionally above, for every request)
+        conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
+        conn.upstream_start_us = monotonic_us();
+        const u32 kBackend =
+            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+        conn.upstream_backend_idx = static_cast<u8>(kBackend);
+
+        // Idle reuse: borrow a live keep-alive socket to this endpoint from the
+        // per-shard pool and skip the TCP connect, driving the post-connect path
+        // directly with a synthetic success. On a miss, fall through to a fresh
+        // connect. `upstream_reused` lets a send/recv failure before any response
+        // byte fall back to a fresh connect (idempotent methods only).
+        if constexpr (requires {
+                          loop->reuse_idle_upstream(
+                              conn, route->upstream_id, static_cast<u8>(kBackend));
+                      }) {
+            if (loop->reuse_idle_upstream(conn, route->upstream_id, static_cast<u8>(kBackend))) {
+                conn.upstream_reused = true;
+                // Driving on_upstream_connected inline skips the UpstreamConnect
+                // dispatch that refreshes the wheel to upstream_timeout, so refresh
+                // here — else a reused send that parks (EPOLLOUT) or a stalled
+                // backend would wait the longer keepalive deadline.
+                if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); }) {
+                    loop->timer.refresh(&conn, loop->upstream_timeout);
+                }
+                on_upstream_connected<Loop>(
+                    static_cast<void*>(loop),
+                    conn,
+                    IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+                return;
+            }
+        }
+
         const i32 kUpstreamFd = UpstreamPool::create_socket();
         if (kUpstreamFd < 0) {
             conn.resp_status = kStatusBadGateway;
@@ -694,14 +895,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.upstream_fd = kUpstreamFd;
-        conn.upstream_idx = route->upstream_id;
-        // (terminate-mode config is set unconditionally above, for every request)
-        conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
-        conn.upstream_start_us = monotonic_us();
         conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-        const u32 kBackend =
-            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
-        conn.upstream_backend_idx = static_cast<u8>(kBackend);
         if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
             ::close(conn.upstream_fd);
             conn.upstream_fd = -1;
@@ -1294,6 +1488,38 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_recv_armed = false;
                 conn.upstream_send_armed = false;
             }
+            conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
+            conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
+            conn.upstream_start_us = monotonic_us();
+            const u32 kBackend = select_backend(
+                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
+            conn.upstream_backend_idx = static_cast<u8>(kBackend);
+
+            // Idle reuse (mirrors the direct RouteAction::Proxy path): borrow a live
+            // pooled socket to this endpoint and skip the connect. Without this take
+            // path, JIT forward(...) completions would deposit idle fds the pool never
+            // hands back. On a miss, connect fresh.
+            if constexpr (requires {
+                              loop->reuse_idle_upstream(conn,
+                                                        static_cast<u16>(outcome.upstream_id),
+                                                        static_cast<u8>(kBackend));
+                          }) {
+                if (loop->reuse_idle_upstream(
+                        conn, static_cast<u16>(outcome.upstream_id), static_cast<u8>(kBackend))) {
+                    conn.upstream_reused = true;
+                    if constexpr (requires {
+                                      loop->timer.refresh(&conn, loop->upstream_timeout);
+                                  }) {
+                        loop->timer.refresh(&conn, loop->upstream_timeout);
+                    }
+                    on_upstream_connected<Loop>(
+                        static_cast<void*>(loop),
+                        conn,
+                        IoEvent{conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+                    return;
+                }
+            }
+
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
                 conn.resp_status = kStatusBadGateway;
@@ -1304,13 +1530,7 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             conn.upstream_fd = kUpstreamFd;
-            conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
-            conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
-            conn.upstream_start_us = monotonic_us();
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            const u32 kBackend = select_backend(
-                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
-            conn.upstream_backend_idx = static_cast<u8>(kBackend);
             loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
             return;
         }
@@ -1668,6 +1888,21 @@ template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
+    // Stale same-batch UpstreamSend guard (epoll). A dead reused upstream fd with a
+    // partial send parked on EPOLLOUT can surface BOTH an UpstreamRecv EOF and an
+    // UpstreamSend completion in ONE EpollBackend::wait() batch. The EOF dispatches
+    // first and runs retry_reused_upstream, which closes the fd, clears
+    // upstream_send_state, and swaps this slot to on_upstream_connected — but the
+    // UpstreamSend was already emitted into that batch and dispatches AFTER, landing
+    // in this (now-swapped) slot (UpstreamSend + UpstreamConnect share on_upstream_send).
+    // on_upstream_connected only ever handles connect results — a request send is
+    // submitted only AFTER the slot moves on to on_upstream_request_sent — so any
+    // UpstreamSend reaching here is that stale pre-retry completion for the old fd.
+    // Drop it. The real connect for the fresh fd arrives as an UpstreamConnect in a
+    // later batch (EINPROGRESS) or via pending_completions (immediate connect), so a
+    // genuine connect result is never swallowed.
+    if (ev.type == IoEventType::UpstreamSend) return;
+
     if (ev.result < 0) {
         // Connect failed (e.g. ECONNREFUSED). Record the failure against this
         // backend (passive health → ejection past the threshold), then try the
@@ -1691,9 +1926,12 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Connect succeeded — clear this backend's passive-health record.
-    record_backend_result(
-        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    // A fresh TCP connect succeeded — clear this backend's passive-health record.
+    // Reused pooled sockets only prove health once they return a response.
+    if (!conn.upstream_reused) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    }
 
     if (conn.req_malformed) {
         loop->close_conn(conn);
@@ -1706,51 +1944,66 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     }
 
     conn.state = ConnState::Proxying;
-    // forward(set_path:) — rewrite the request line before forwarding (no-op
-    // unless a path override was recorded by the JIT handler).
-    rewrite_request_line_path(conn);
-    // forward(set_header:) — inject/replace request header lines (no-op unless
-    // overrides were recorded). After the path rewrite so it reads the updated
-    // req_header_end. Fail closed (500) if a configured override can't be applied
-    // (oversized / no headroom) rather than forwarding the request with a
-    // security-sensitive header silently dropped.
-    if (!apply_request_header_overrides(conn)) {
-        // The upstream connected but no request will be sent. Release it now so a
-        // client that stalls reading the 500 can't pin an idle upstream fd /
-        // concurrency slot until keepalive/timeout (close_conn would otherwise only
-        // reap it once the downstream connection finally goes away).
-        if (conn.upstream_fd >= 0) {
-            ::close(conn.upstream_fd);
-            conn.upstream_fd = -1;
-            loop->clear_upstream_fd(conn.id);
+    // forward(set_path:) and forward(set_header:) mutate recv_buf in place. On
+    // retry replay the request bytes live in send_buf, while recv_buf may already
+    // hold the next pipelined request, so only rewrite the initial forward buffer.
+    if (conn.retry_req_send_len == 0) {
+        rewrite_request_line_path(conn);
+        // forward(set_header:) — inject/replace request header lines (no-op unless
+        // overrides were recorded). After the path rewrite so it reads the updated
+        // req_header_end. Fail closed (500) if a configured override can't be applied
+        // (oversized / no headroom) rather than forwarding the request with a
+        // security-sensitive header silently dropped.
+        if (!apply_request_header_overrides(conn)) {
+            // The upstream connected but no request will be sent. Release it now so a
+            // client that stalls reading the 500 can't pin an idle upstream fd /
+            // concurrency slot until keepalive/timeout (close_conn would otherwise only
+            // reap it once the downstream connection finally goes away).
+            if (conn.upstream_fd >= 0) {
+                ::close(conn.upstream_fd);
+                conn.upstream_fd = -1;
+                loop->clear_upstream_fd(conn.id);
+            }
+            release_upstream_slot(loop, conn);
+            static const char k500[] =
+                "HTTP/1.1 500 Internal Server Error\r\n"
+                "Content-Length: 21\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Internal Server Error";
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+            conn.keep_alive = false;
+            conn.resp_status = kStatusInternalServerError;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
         }
-        release_upstream_slot(loop, conn);
-        static const char k500[] =
-            "HTTP/1.1 500 Internal Server Error\r\n"
-            "Content-Length: 21\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Internal Server Error";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
-        conn.keep_alive = false;
-        conn.resp_status = kStatusInternalServerError;
-        conn.transition_to_sending(&on_response_sent<Loop>);
-        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
-        return;
     }
 #if RUT_ENABLE_WEBSOCKET
     // Terminate routes must not let the backend negotiate a per-message extension.
     if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);
 #endif
-    u32 req_send_len =
-        conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
-    if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
+    // Pick the request source. A retried fresh connect (after a reused socket died
+    // post-send) has retry_req_send_len > 0: recv_buf was reset at request-sent, so
+    // replay the snapshot stashed in send_buf. Otherwise this is the initial connect
+    // and recv_buf still holds the request.
+    const u8* req_src;
+    u32 req_send_len;
+    if (conn.retry_req_send_len > 0) {
+        req_src = conn.send_buf.data();
+        req_send_len = conn.retry_req_send_len;
+    } else {
+        req_src = conn.recv_buf.data();
+        req_send_len =
+            conn.req_initial_send_len > 0 ? conn.req_initial_send_len : conn.recv_buf.len();
+        if (req_send_len > conn.recv_buf.len()) req_send_len = conn.recv_buf.len();
+    }
     conn.set_slots(nullptr,
                    nullptr,
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_upstream_request_sent<Loop>);
-    loop->submit_send_upstream(conn, conn.recv_buf.data(), req_send_len);
+    loop->submit_send_upstream(conn, req_src, req_send_len);
 }
 
 template <typename Loop>
@@ -1758,6 +2011,12 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result < 0) {
+        // The request forward failed mid-write: the backend never received the
+        // complete request. If an early response was buffered (below) and the
+        // socket gets considered for pooling, this marks the upload as not
+        // delivered so proxy_upstream_reusable refuses it. A successful retry
+        // clears it again (the fresh attempt re-sends from scratch).
+        conn.upstream_request_incomplete = true;
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -1794,6 +2053,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                 }
             }
         }
+        // No early upstream response was buffered or recoverable. A reused pooled
+        // socket the backend reset before responding can retry on a fresh connect
+        // (idempotent only) — checked here, after every early-response path, so a
+        // buffered/in-flight response is never dropped in favor of a retry.
+        if (retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
@@ -1803,6 +2067,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (kMoreReqBody) {
+        // Body streaming begins here: recv_buf is reset and refilled with body
+        // chunks, so the original headers+body are no longer replayable. Mark it so
+        // request_fully_resendable refuses any later reused-socket retry.
+        conn.req_body_streamed = true;
         conn.recv_buf.reset();
         conn.set_slots(
             &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
@@ -1811,8 +2079,43 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    pipeline_stash(conn);
-    conn.recv_buf.reset();
+    // FRESH (non-retry) send path: recv_buf still holds exactly the just-sent request
+    // (plus any pipelined surplus after it). Stash that surplus, optionally snapshot
+    // the request for a reused-socket retry, then release recv_buf.
+    //
+    // RETRY path (retry_req_send_len > 0): the request was just replayed from the
+    // send_buf snapshot, so recv_buf did NOT hold it — recv_buf was empty when the
+    // retry began. Any bytes in recv_buf now are the next request(s) the client
+    // PIPELINED during the in-flight fresh connect/send, sitting at offset 0 (a clean
+    // request boundary).
+    // Running pipeline_stash here would mis-slice them at req_initial_send_len (the
+    // ORIGINAL request's length, not a boundary in this buffer), and recv_buf.reset()
+    // would drop them. So on the retry path we do NEITHER and preserve recv_buf intact:
+    // pipeline_stash_len is already 0 (a snapshot is taken only when the original send
+    // had no pipelined surplus), so the completion path dispatches recv_buf as the next
+    // request (Case C: stash_len==0 && recv_buf.len()>0). This matches on_upstream_-
+    // response's "recv_buf is NOT touched here" handling once a response byte arrives.
+    if (conn.retry_req_send_len == 0) {
+        // Snapshot the request for a reused pooled socket so the rare post-send dead-
+        // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
+        // replay it on a fresh connect even after recv_buf is reset below. Do this
+        // BEFORE pipeline_stash: when the client sent GET1+GET2 in the same read,
+        // pipeline_stash needs send_buf for GET2, so send_buf is laid out as:
+        //   [0, retry_req_send_len)                         retry copy of GET1
+        //   [retry_req_send_len, + pipeline_stash_len)       pipelined suffix
+        // Guarded on upstream_reused so a fresh non-reused connect doesn't re-copy.
+        if (conn.upstream_reused && request_resendable_from_recv_buf(conn) &&
+            conn.recv_buf.len() <= conn.send_buf.capacity()) {
+            conn.send_buf.reset();
+            conn.send_buf.write(conn.recv_buf.data(), conn.req_initial_send_len);
+            conn.retry_req_send_len = conn.req_initial_send_len;
+        }
+        pipeline_stash(conn);
+        // recv_buf is released: pipelined downstream bytes read during the upstream wait
+        // then land at offset 0 and flow through pipeline_recover, and the just-sent
+        // request can never leak into the next request's parse.
+        conn.recv_buf.reset();
+    }
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
     if (conn.upstream_recv_buf.len() > 0) {
@@ -2535,21 +2838,33 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     const bool kWasThrottled = conn.throttle_paused;
     conn.throttle_paused = false;
     conn.throttle_pending_len = 0;
+    // Surplus upstream bytes after the self-framed body — left in the buffer by the
+    // body pump (already consumed from the socket, so take_idle's MSG_PEEK can't see
+    // them) — mean a desynced/overlong backend; don't pool such a connection. (A
+    // TLS-proxied stream parks its tail in this buffer legitimately, so skip the
+    // check there to avoid needlessly dropping a reusable connection.)
+    if (!conn.tls_proxy_stream && conn.upstream_recv_buf.len() > 0)
+        conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
+    // Mirror on_proxy_response_sent: during graceful drain, close the upstream
+    // (close_conn closes upstream_fd) rather than parking it in the idle pool.
+    // No further request should reuse a draining shard's backend sockets, and a
+    // pooled fd would otherwise survive until sweep/shutdown. This is-draining
+    // check therefore precedes release_upstream_conn (which would pool a
+    // reusable fd). A normal (non-draining) completion still pools as before.
+    if (loop->is_draining()) {
+        loop->close_conn(conn);
+        return;
     }
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
 
-    if (!conn.keep_alive || loop->is_draining()) {
+    release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
+
+    if (!conn.keep_alive) {
         loop->close_conn(conn);
         return;
     }
@@ -2579,7 +2894,8 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
-        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
@@ -2639,6 +2955,13 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight) {
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        // EOF/error before any response, possibly before the request send even
+        // completed (epoll can deliver a reused socket's FIN/RST while the send is
+        // still parked on EPOLLOUT). The request is still in recv_buf, so retry on a
+        // fresh connect for idempotent reused requests. Gated on !upstream_send_armed
+        // so we never abandon an in-flight io_uring send SQE (its later CQE would be
+        // misrouted to the retried connection).
+        if (!conn.upstream_send_armed && retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
@@ -2682,7 +3005,12 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
-    (void)ev;
+    // The body upload is still draining while an early upstream response is buffered;
+    // this slot completes the final body chunk send. If that send FAILED the upload
+    // is truncated even though the body counters (advanced before submit) may read
+    // "complete" — mark it so proxy_upstream_reusable refuses to pool a socket whose
+    // request desynced (otherwise the next request would be parsed as leftover body).
+    if (ev.result < 0) conn.upstream_request_incomplete = true;
 
     prepare_early_response_state(conn);
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -2705,6 +3033,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        // A streamed body chunk failed to send: the upload is now truncated even
+        // though req_body_remaining / the chunk parser were advanced (before this
+        // submit) and may read "complete". Mark the upload incomplete so that if an
+        // early response was buffered and the socket reaches release_upstream_conn,
+        // proxy_upstream_reusable refuses to pool this desynced stream.
+        conn.upstream_request_incomplete = true;
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -3571,9 +3905,34 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        // Post-send first-recv EOF/RST with no response byte. For a reused pooled
+        // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
+        // the request write completed locally and the dead socket only surfaces
+        // here. on_upstream_request_sent kept recv_buf for the reused case, so an
+        // idempotent request whose full bytes are still buffered can fall back to a
+        // fresh connect (request_fully_resendable inside the helper enforces this, so
+        // a streamed body upload is never replayed). Otherwise fail closed.
+        if (retry_reused_upstream(loop, conn)) return;
         loop->close_conn(conn);
         return;
     }
+
+    // A reused pooled socket proved healthy once it returned response bytes; record
+    // success here rather than at synthetic connect time.
+    if (conn.upstream_reused) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        conn.upstream_reused = false;
+    }
+
+    // A response byte is now in hand, so the request will not be replayed. Drop the
+    // snapshot marker only when it is not also the offset to a stashed pipelined
+    // suffix; pipeline_recover / the merged stash+late path clear it after copying
+    // from that offset.
+    // recv_buf is NOT touched here — it was already reset at request-sent, so any
+    // bytes in it now are a genuine pipelined downstream request that must survive to
+    // flow through pipeline_recover / pipeline_dispatch on the completion path.
+    if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
 
     HttpResponseParser resp_parser;
     ParsedResponse resp;
@@ -3713,6 +4072,22 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_body_remaining = 0;
     }
 
+    // Decide upstream idle-reuse eligibility now, while the parsed response is in
+    // hand: reusable iff the upstream wants keep-alive and the body is self-framed
+    // (None / Content-Length / chunked). A close-delimited (UntilClose) body ends
+    // by the upstream closing the socket, so its fd is never reusable. The
+    // completion path reads this flag to pool the fd vs. close it.
+    // conn.req_keep_alive guards the REQUEST side: the proxy forwards the client's
+    // request bytes (incl. its Connection header / HTTP version) verbatim upstream,
+    // so a client Connection: close (or an HTTP/1.0 request) told the origin it may
+    // close after responding — even if the response itself is self-framed HTTP/1.1
+    // keep-alive. Pooling such an fd would race the origin's close, so refuse it.
+    // NOTE: this must NOT be conn.keep_alive — that is derived from drain state
+    // (set to !is_draining() in on_header_received), not the parsed request, so a
+    // Connection: close request on a live shard still has conn.keep_alive == true.
+    conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
+                               conn.resp_body_mode != BodyMode::UntilClose && conn.req_keep_alive;
+
     const u32 kHeaderLen = resp_parser.header_end;
     const u32 kTotalLen = conn.upstream_recv_buf.len();
     const u32 kInitialBodyLen = (kTotalLen > kHeaderLen) ? kTotalLen - kHeaderLen : 0;
@@ -3760,6 +4135,21 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         chunked_consumed = pos;
     }
+
+    // Refuse reuse if the upstream sent bytes beyond its self-framed body in this
+    // initial buffer — an overlong/malformed response. We discard those extra bytes
+    // at completion, so pooling the socket would mask the protocol violation and
+    // risk desync. (On-wire leftover the backend sends later is separately caught by
+    // take_idle's MSG_PEEK probe before any request goes out.)
+    const bool kContentLenOverlong =
+        conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > resp.content_length;
+    const bool kChunkedOverlong = conn.resp_body_mode == BodyMode::Chunked && chunked_done &&
+                                  chunked_consumed < kInitialBodyLen;
+    // No-body responses (HEAD / 204 / 205 / 304) must have nothing after the
+    // headers; any trailing bytes mean a desynced/malformed keep-alive backend.
+    const bool kNoBodyOverlong = conn.resp_body_mode == BodyMode::None && kInitialBodyLen > 0;
+    if (conn.upstream_keep_alive && (kContentLenOverlong || kChunkedOverlong || kNoBodyOverlong))
+        conn.upstream_keep_alive = false;
 
     if (loop->is_draining()) {
         u8* d = const_cast<u8*>(conn.upstream_recv_buf.data());
@@ -3886,15 +4276,18 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    // Surplus upstream bytes beyond the one-shot response we sent
+    // (upstream_send_len) mean a desynced stream — refuse reuse, mirroring
+    // proxy_stream_complete. This covers bytes the backend wrote past its
+    // self-framed body that wait() appended to upstream_recv_buf while the
+    // downstream send was still draining (on_upstream_recv is null on this path,
+    // so they'd otherwise be silently discarded by the reset below and the fd
+    // pooled as reusable). A TLS proxy tail legitimately parks in this buffer.
+    if (conn.upstream_recv_buf.len() > conn.upstream_send_len && !conn.tls_proxy_stream)
+        conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
 
-    if (conn.upstream_fd >= 0) {
-        ::close(conn.upstream_fd);
-        conn.upstream_fd = -1;
-    }
-    loop->clear_upstream_fd(conn.id);
-    conn.upstream_recv_armed = false;
-    conn.upstream_send_armed = false;
+    release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;
@@ -3909,7 +4302,8 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
-        conn.recv_buf.write(conn.send_buf.data(), kStashLen);
+        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();

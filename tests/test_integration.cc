@@ -5469,10 +5469,9 @@ TEST(shard, upstream_pool_initialized) {
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
     CHECK(shard.upstream != nullptr);
-    // Pool should be fresh (all free)
-    auto* c = shard.upstream->alloc();
-    CHECK(c != nullptr);
-    shard.upstream->free(c);
+    // Pool should be fresh (no idle connections parked yet).
+    CHECK_EQ(shard.upstream->idle_count, 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
     shard.shutdown();
     close(lfd);
 }
@@ -7854,10 +7853,11 @@ struct ScopedProxyLoop {
     u16 port = 0;
     LoopThread lt{};
     bool loop_started = false;
+    UpstreamPool* pool = nullptr;  // wired only when enable_reuse=true (idle reuse)
 
     ~ScopedProxyLoop() { teardown(); }
 
-    bool setup(const RouteConfig** active, i32 iters) {
+    bool setup(const RouteConfig** active, i32 iters, bool enable_reuse = false) {
         loop = create_real_loop();
         if (loop == nullptr) return false;
         auto lfd_result = create_listen_socket(0);
@@ -7872,6 +7872,11 @@ struct ScopedProxyLoop {
             return false;
         }
         loop->config_ptr = active;
+        if (enable_reuse) {
+            pool = new UpstreamPool();
+            pool->init();
+            loop->upstream = pool;  // enable HTTP/1 idle upstream connection reuse
+        }
         lt.loop = loop;
         lt.thread = {};
         lt.max_iters = iters;
@@ -7897,8 +7902,126 @@ struct ScopedProxyLoop {
             destroy_real_loop(loop);
             loop = nullptr;
         }
+        if (pool != nullptr) {
+            pool->shutdown();
+            delete pool;
+            pool = nullptr;
+        }
     }
 };
+
+// Upstream that serves many keep-alive requests per TCP connection and counts how
+// many distinct connections it accepted — so a test can prove the gateway reused a
+// single upstream socket across several proxied requests. Each request ends at the
+// CRLFCRLF header terminator (GETs have no body); each gets a fixed keep-alive 200.
+struct KeepAliveCountingUpstream {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<int> accept_count{0};
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~KeepAliveCountingUpstream() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<KeepAliveCountingUpstream*>(arg);
+        static const char kResp[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 c = accept(s->listen_fd, nullptr, nullptr);
+            if (c < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            s->accept_count.fetch_add(1, std::memory_order_relaxed);
+            char buf[4096];
+            u32 have = 0;
+            while (s->running.load(std::memory_order_acquire)) {
+                i32 n = recv_timeout(c, buf + have, sizeof(buf) - have, 1000);
+                if (n <= 0) break;  // peer closed / idle timeout → end this connection
+                have += static_cast<u32>(n);
+                u32 scan = 0;
+                for (u32 i = scan; i + 4 <= have; i++) {
+                    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+                        buf[i + 3] == '\n') {
+                        (void)send_all(c, kResp, sizeof(kResp) - 1);
+                        scan = i + 4;
+                    }
+                }
+                if (scan > 0) {
+                    __builtin_memmove(buf, buf + scan, have - scan);
+                    have -= scan;
+                }
+            }
+            close(c);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        started = (pthread_create(&thread, nullptr, &run, this) == 0);
+        return started;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// End-to-end: three sequential keep-alive requests on ONE client connection to a
+// proxy route must share a SINGLE upstream connection — the gateway returns the
+// upstream fd to the per-shard idle pool after each response and borrows it back
+// for the next request, so the backend accepts exactly one TCP connection.
+TEST(proxy_reuse, reuses_idle_upstream_across_keepalive_requests) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true));
+
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    for (int i = 0; i < 3; i++) {
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+    }
+    close(c);
+    usleep(50000);
+
+    CHECK_EQ(backend.accept_count.load(), 1);  // one upstream connection, reused 3×
+    CHECK_EQ(proxy.pool->idle_count, 1u);      // parked for the next request
+
+    proxy.teardown();
+}
 
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
