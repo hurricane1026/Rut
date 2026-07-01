@@ -2895,6 +2895,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
         conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
@@ -3924,12 +3925,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_reused = false;
     }
 
-    // A response byte is now in hand, so the request will not be replayed: drop the
-    // send_buf snapshot marker (the bytes themselves are reused for response framing).
+    // A response byte is now in hand, so the request will not be replayed. Drop the
+    // snapshot marker only when it is not also the offset to a stashed pipelined
+    // suffix; pipeline_recover / the merged stash+late path clear it after copying
+    // from that offset.
     // recv_buf is NOT touched here — it was already reset at request-sent, so any
     // bytes in it now are a genuine pipelined downstream request that must survive to
     // flow through pipeline_recover / pipeline_dispatch on the completion path.
-    conn.retry_req_send_len = 0;
+    if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
 
     HttpResponseParser resp_parser;
     ParsedResponse resp;
@@ -4300,6 +4303,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.recv_buf.reset();
         conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
