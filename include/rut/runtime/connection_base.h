@@ -458,6 +458,10 @@ struct ConnectionBase {
     // proxy_stream_complete clears resp_fully_buffered before that terminal drains, so
     // the live flag is unreliable. Cleared with upstream_recv_cancel_inflight.
     bool upstream_recv_terminal_stale;
+    // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
+    // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
+    // needs this separate marker to close rather than reuse a desynced fd.
+    bool upstream_recv_idle_stale_bytes;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -669,6 +673,7 @@ struct ConnectionBase {
         upstream_recv_pause_rearm_pending = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
+        upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;

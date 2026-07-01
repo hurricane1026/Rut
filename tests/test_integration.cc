@@ -3238,6 +3238,9 @@ TEST(uring, upstream_recv_stale_data_cqe_discarded_and_rolled_back) {
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_terminal_stale = true;  // body-done pause
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    conn.idle_return_fd = sv[0];
 
     // Simulate wait() having appended 100 stale bytes to the upstream recv buffer.
     static u8 backing[4096];
@@ -3250,7 +3253,11 @@ TEST(uring, upstream_recv_stale_data_cqe_discarded_and_rolled_back) {
     loop->dispatch(make_ev_more(conn.id, IoEventType::UpstreamRecv, 100, /*more=*/1));
     CHECK(!g_upstream_recv_delivered);           // not delivered to the (repointed) slot
     CHECK_EQ(conn.upstream_recv_buf.len(), 0u);  // stale bytes rolled back
+    CHECK(conn.upstream_recv_idle_stale_bytes);  // rollback still leaves a no-pool marker
     CHECK(conn.upstream_recv_cancel_inflight);   // still draining (F_MORE is not terminal)
+    close(conn.idle_return_fd);
+    conn.idle_return_fd = -1;
+    close(sv[1]);
     loop->shutdown();
 }
 
@@ -7988,10 +7995,12 @@ struct KeepAliveCountingUpstream {
 template <typename ShardT>
 bool wait_for_idle_pool_count(ShardT& shard, u32 expected, u32 timeout_ms = 1000) {
     for (u32 waited = 0; waited < timeout_ms; waited++) {
-        if (shard.upstream && shard.upstream->idle_count >= expected) return true;
+        if (shard.upstream &&
+            shard.upstream->idle_count.load(std::memory_order_acquire) >= expected)
+            return true;
         usleep(1000);
     }
-    return shard.upstream && shard.upstream->idle_count >= expected;
+    return shard.upstream && shard.upstream->idle_count.load(std::memory_order_acquire) >= expected;
 }
 
 // End-to-end: three sequential keep-alive requests on ONE client connection to a
@@ -8119,7 +8128,7 @@ TEST(proxy_reuse, iouring_connection_close_request_not_pooled) {
     usleep(50000);
 
     CHECK_EQ(backend.accept_count.load(), 3);
-    CHECK_EQ(shard.upstream->idle_count, 0u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
 
     shard.stop();
     shard.join();
@@ -8205,6 +8214,27 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         CHECK_EQ(c.upstream_recv_buf.len(), 0u);
         CHECK(::close(sv[0]) < 0);  // closed, not pooled
         c.upstream_recv_buf.bind(nullptr, 0);
+        close(sv[1]);
+    }
+
+    // A positive stale idle-return CQE rolls bytes back out of upstream_recv_buf before
+    // the deferred drain runs; the separate marker must still make the fd non-reusable.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[4];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.upstream_recv_idle_stale_bytes = true;
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 9;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK(!c.upstream_recv_idle_stale_bytes);
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+        CHECK(::close(sv[0]) < 0);
         close(sv[1]);
     }
 

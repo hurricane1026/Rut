@@ -349,6 +349,7 @@ public:
         // any pipelined/follow-up request that may reuse this Connection slot. Any
         // terminal or positive CQE from it must be quarantined and dropped.
         c.upstream_recv_terminal_stale = true;
+        c.upstream_recv_idle_stale_bytes = false;
         // Cancel the armed multishot recv; if the cancel SQE can't be queued, leave
         // the fd closed/detached but keep the old recv as an in-flight stale terminal
         // barrier; otherwise a later CQE can be delivered to the next request.
@@ -770,9 +771,11 @@ public:
             // so they were silently consumed off the socket). take_idle's MSG_PEEK can't
             // see them anymore, so the next reuse would parse them as an early response —
             // close rather than pool a desynced socket.
-            const bool kStaleBytes = c.upstream_recv_buf.len() != 0;
+            const bool kStaleBytes =
+                c.upstream_recv_buf.len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();
             if (kStaleBytes) c.upstream_recv_buf.reset();
+            c.upstream_recv_idle_stale_bytes = false;
             if (kConfigStale || kStaleBytes || kDraining || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
@@ -886,9 +889,11 @@ public:
             // config swap (poll_command drained the pool) or surplus bytes copied into
             // upstream_recv_buf both desync reuse — close rather than pool.
             const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
-            const bool kStaleBytes = c.upstream_recv_buf.len() != 0;
+            const bool kStaleBytes =
+                c.upstream_recv_buf.len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();
             if (kStaleBytes) c.upstream_recv_buf.reset();
+            c.upstream_recv_idle_stale_bytes = false;
             if (kConfigStale || kStaleBytes || kDraining || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
@@ -1211,6 +1216,8 @@ public:
                     if (ev.type == IoEventType::UpstreamRecv &&
                         conn.upstream_recv_cancel_inflight && conn.upstream_recv_terminal_stale) {
                         if (ev.result > 0) {
+                            if (conn.idle_return_fd >= 0)
+                                conn.upstream_recv_idle_stale_bytes = true;
                             const u32 stale = static_cast<u32>(ev.result);
                             if (conn.upstream_recv_buf.len() >= stale)
                                 conn.upstream_recv_buf.set_len(conn.upstream_recv_buf.len() -

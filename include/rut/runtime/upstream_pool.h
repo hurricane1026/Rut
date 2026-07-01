@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include <atomic>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -11,9 +12,10 @@ namespace rut {
 // Per-shard idle upstream connection pool (HTTP/1 keep-alive reuse).
 //
 // Holds connected, currently-unused upstream sockets so a later proxy request to
-// the same endpoint can skip the TCP connect. Each shard owns one UpstreamPool —
-// no cross-shard sharing, so no atomics. An idle entry is keyed by the endpoint it
-// connects to: (upstream_id, backend_idx) — multi-backend upstreams keep a
+// the same endpoint can skip the TCP connect. Each shard owns one UpstreamPool;
+// fd slots remain shard-local, while idle_count is atomic so tests/metrics can
+// observe progress without racing the owner thread. An idle entry is keyed by the
+// endpoint it connects to: (upstream_id, backend_idx) — multi-backend upstreams keep a
 // separate reusable socket per backend address.
 //
 // Lifecycle: the proxy completion path calls put_idle() to hand a live fd over
@@ -35,11 +37,13 @@ struct UpstreamPool {
     UpstreamConn conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top = 0;
-    u32 idle_count = 0;  // live idle entries — lets take_idle() skip the scan when cold
+    // live idle entries — lets take_idle() skip the scan when cold. Atomic only for
+    // cross-thread observation; pool slot ownership remains single-threaded.
+    std::atomic<u32> idle_count{0};
 
     void init() {
         free_top = kMaxConns;
-        idle_count = 0;
+        idle_count.store(0, std::memory_order_relaxed);
         for (u32 i = 0; i < kMaxConns; i++) {
             conns[i] = UpstreamConn{};
             free_stack[i] = i;
@@ -53,7 +57,7 @@ struct UpstreamPool {
         if (fd < 0 || free_top == 0) return false;
         const u32 idx = free_stack[--free_top];
         conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
-        idle_count++;
+        idle_count.fetch_add(1, std::memory_order_release);
         return true;
     }
 
@@ -63,7 +67,7 @@ struct UpstreamPool {
     // low-traffic or removed endpoint could otherwise hold dead fds until reload).
     // Driven by the per-shard 1s timer tick. No-op when the pool is empty.
     void sweep(u32 now_sec, u32 max_idle_sec) {
-        if (idle_count == 0) return;
+        if (idle_count.load(std::memory_order_acquire) == 0) return;
         for (u32 i = 0; i < kMaxConns; i++) {
             UpstreamConn& c = conns[i];
             if (!c.idle || !c.allocated || c.fd < 0) continue;
@@ -81,7 +85,7 @@ struct UpstreamPool {
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
     i32 take_idle(u16 upstream_id, u8 backend_idx) {
-        if (idle_count == 0) return -1;
+        if (idle_count.load(std::memory_order_acquire) == 0) return -1;
         for (u32 i = 0; i < kMaxConns; i++) {
             UpstreamConn& c = conns[i];
             if (!c.idle || !c.allocated || c.fd < 0) continue;
@@ -101,13 +105,13 @@ struct UpstreamPool {
     // the same (upstream_id, backend_idx), so idle sockets parked under the old
     // config must not be handed out for the new endpoint. No-op when already empty.
     void drain() {
-        if (idle_count == 0) return;
+        if (idle_count.load(std::memory_order_acquire) == 0) return;
         for (u32 i = 0; i < kMaxConns; i++) {
             if (conns[i].fd >= 0) ::close(conns[i].fd);
             conns[i] = UpstreamConn{};
         }
         free_top = kMaxConns;
-        idle_count = 0;
+        idle_count.store(0, std::memory_order_release);
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
@@ -118,7 +122,7 @@ struct UpstreamPool {
             conns[i] = UpstreamConn{};
         }
         free_top = kMaxConns;
-        idle_count = 0;
+        idle_count.store(0, std::memory_order_release);
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
@@ -131,7 +135,11 @@ private:
     void release_slot(u32 i) {
         conns[i] = UpstreamConn{};
         if (free_top < kMaxConns) free_stack[free_top++] = i;
-        if (idle_count > 0) idle_count--;
+        u32 count = idle_count.load(std::memory_order_relaxed);
+        while (count > 0 &&
+               !idle_count.compare_exchange_weak(
+                   count, count - 1, std::memory_order_release, std::memory_order_relaxed)) {
+        }
     }
 };
 
