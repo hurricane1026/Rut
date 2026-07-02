@@ -140,6 +140,29 @@ struct ConnectionBase {
     // desynced must never be reused (the next request would be parsed as leftover
     // body). Reset at the per-request boundary like the other reuse flags.
     bool upstream_request_incomplete;
+    // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
+    // once its cancelled multishot recv terminal drains (handing the fd out while a
+    // recv is still draining on it would let two recvs race the same socket). -1 =
+    // none. epoll detaches synchronously and never uses this. See
+    // IoUringEventLoop::return_idle_upstream / try_deferred_upstream_rearm.
+    i32 idle_return_fd;
+    u16 idle_return_uid;
+    u8 idle_return_bidx;
+    // Active RouteConfig pinned when idle_return_fd was parked (return_idle_upstream).
+    // A hot reload can land while the cancelled recv is still draining; poll_command
+    // only drains sockets ALREADY in the pool, so the deferred fd would escape that
+    // drain and later be put_idle'd into the freshly-drained pool under a now-stale
+    // (upstream_id, backend_idx). try_deferred_upstream_rearm compares this against the
+    // live config and CLOSES instead of pooling on mismatch. request_config can't be
+    // reused: the keep-alive client repoints it on its next request while this drains.
+    const RouteConfig* idle_return_config;
+    // io_uring-only deferred close: close_conn was called on a conn whose deferred
+    // idle-pool return (idle_return_fd) had not yet drained its cancelled recv. Rather
+    // than discard the still-reusable upstream fd (and free the slot), the conn is kept
+    // allocated with this set; once the recv drains, try_deferred_upstream_rearm parks
+    // the fd in the pool AND performs the slot-free close_conn deferred. See
+    // IoUringEventLoop::close_conn_impl / try_deferred_upstream_rearm.
+    bool close_after_idle_return;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -435,6 +458,10 @@ struct ConnectionBase {
     // proxy_stream_complete clears resp_fully_buffered before that terminal drains, so
     // the live flag is unreliable. Cleared with upstream_recv_cancel_inflight.
     bool upstream_recv_terminal_stale;
+    // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
+    // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
+    // needs this separate marker to close rather than reuse a desynced fd.
+    bool upstream_recv_idle_stale_bytes;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -531,6 +558,11 @@ struct ConnectionBase {
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;
+        idle_return_fd = -1;
+        idle_return_uid = 0;
+        idle_return_bidx = 0;
+        idle_return_config = nullptr;
+        close_after_idle_return = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
@@ -641,6 +673,7 @@ struct ConnectionBase {
         upstream_recv_pause_rearm_pending = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
+        upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;
