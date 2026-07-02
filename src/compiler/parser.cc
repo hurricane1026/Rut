@@ -176,17 +176,31 @@ struct Parser {
         AstStatement stmt{};
         stmt.kind = AstStmtKind::Guard;
         const bool is_match_guard = take(TokenType::KwMatch) != nullptr;
+        bool cond_done = false;
         if (!is_match_guard && take(TokenType::KwLet)) {
             auto name = expect(TokenType::Ident);
             if (!name) return core::make_unexpected(name.error());
-            auto eq = expect(TokenType::Eq);
-            if (!eq) return core::make_unexpected(eq.error());
             stmt.name = name.value()->text;
             stmt.bind_value = true;
+            if (cur().type == TokenType::KwElse) {
+                // Swift 5.7 shorthand: `guard let x else { ... }` rebinds an
+                // existing optional name — sugar for `guard let x = x else`.
+                AstExpr self_ref{};
+                self_ref.kind = AstExprKind::Ident;
+                self_ref.name = stmt.name;
+                self_ref.span = span_from(*name.value());
+                stmt.expr = self_ref;
+                cond_done = true;
+            } else {
+                auto eq = expect(TokenType::Eq);
+                if (!eq) return core::make_unexpected(eq.error());
+            }
         }
-        auto cond = parse_expr();
-        if (!cond) return core::make_unexpected(cond.error());
-        stmt.expr = cond.value();
+        if (!cond_done) {
+            auto cond = parse_expr();
+            if (!cond) return core::make_unexpected(cond.error());
+            stmt.expr = cond.value();
+        }
         auto kw_else = expect(TokenType::KwElse);
         if (!kw_else) return core::make_unexpected(kw_else.error());
         auto lbrace = expect(TokenType::LBrace);
@@ -956,16 +970,30 @@ struct Parser {
             const bool is_match_guard = take(TokenType::KwMatch) != nullptr;
             Str bind_name{};
             bool bind_value = false;
+            AstExpr cond_expr{};
+            bool cond_done = false;
             if (!is_match_guard && take(TokenType::KwLet)) {
                 auto name = expect(TokenType::Ident);
                 if (!name) return core::make_unexpected(name.error());
-                auto eq = expect(TokenType::Eq);
-                if (!eq) return core::make_unexpected(eq.error());
                 bind_name = name.value()->text;
                 bind_value = true;
+                if (cur().type == TokenType::KwElse) {
+                    // Swift 5.7 shorthand: `guard let x else { ... }` rebinds
+                    // an existing optional name — sugar for `guard let x = x`.
+                    cond_expr.kind = AstExprKind::Ident;
+                    cond_expr.name = bind_name;
+                    cond_expr.span = span_from(*name.value());
+                    cond_done = true;
+                } else {
+                    auto eq = expect(TokenType::Eq);
+                    if (!eq) return core::make_unexpected(eq.error());
+                }
             }
-            auto cond = parse_expr();
-            if (!cond) return core::make_unexpected(cond.error());
+            if (!cond_done) {
+                auto cond = parse_expr();
+                if (!cond) return core::make_unexpected(cond.error());
+                cond_expr = cond.value();
+            }
             auto kw_else = expect(TokenType::KwElse);
             if (!kw_else) return core::make_unexpected(kw_else.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -974,7 +1002,7 @@ struct Parser {
             stmt.kind = AstStmtKind::Guard;
             stmt.name = bind_name;
             stmt.bind_value = bind_value;
-            stmt.expr = cond.value();
+            stmt.expr = cond_expr;
             if (is_match_guard) {
                 while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
                     if (cur().type == TokenType::KwCase)

@@ -27400,6 +27400,27 @@ route GET "/users" {
     REQUIRE(hir);
 }
 
+TEST(frontend, guard_let_shorthand_rebinds_same_name) {
+    // Swift 5.7 shorthand: `guard let x else { ... }` == `guard let x = x else`.
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "route GET \"/users\" { let picked = maybeBox(true) guard let picked else { return 401 } "
+        "if picked.value == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[2].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Guard));
+    CHECK(route.statements[1].bind_value);
+    CHECK(route.statements[1].name.eq(lit("picked")));
+    CHECK_EQ(static_cast<u8>(route.statements[1].expr.kind), static_cast<u8>(AstExprKind::Ident));
+    CHECK(route.statements[1].expr.name.eq(lit("picked")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
