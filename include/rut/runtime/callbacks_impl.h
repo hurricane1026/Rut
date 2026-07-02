@@ -374,8 +374,17 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
         free_probe_conn(loop, conn);
         return;
     }
-    conn.upstream_recv_buf.reset();
     conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
+    if (conn.upstream_recv_buf.len() > 0) {
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(conn.upstream_recv_buf.len()),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0};
+        on_probe_response<Loop>(lp, conn, synth);
+        return;
+    }
     // submit failure is local (kernel submission), not a backend signal — skip.
     if (!loop->submit_recv_upstream(conn)) {
         free_probe_conn(loop, conn);
@@ -402,7 +411,6 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     if (kStatus == ParseStatus::Incomplete && ev.result > 0 &&
         conn.upstream_recv_buf.write_avail() > 0) {
         if (!loop->submit_recv_upstream(conn)) {
-            record_probe_if_current(loop, conn, /*healthy=*/false, kNowUs);
             free_probe_conn(loop, conn);
         }
         return;
@@ -2348,7 +2356,10 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                    nullptr,
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_upstream_request_sent<Loop>);
-    loop->submit_send_upstream(conn, req_src, req_send_len);
+    if (!loop->submit_send_upstream(conn, req_src, req_send_len)) {
+        IoEvent synth = {conn.id, -EIO, 0, 0, IoEventType::UpstreamSend, 0};
+        on_upstream_request_sent<Loop>(lp, conn, synth);
+    }
 }
 
 template <typename Loop>

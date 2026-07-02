@@ -824,6 +824,25 @@ TEST(proxy, connect_fail_502) {
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed, not looped back
 }
 
+TEST(proxy, upstream_initial_send_submit_failure_closes_immediately) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+
+    const u32 cid = conn->id;
+    loop.backend.fail_upstream_send = true;
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
 // Upstream send fails → close
 TEST(proxy, upstream_send_error) {
     SmallLoop loop;

@@ -387,7 +387,10 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
             }
         }
     }
-    set_fd_interest(epoll_fd, fd, conn_id, type, events);
+    if (set_fd_interest(epoll_fd, fd, conn_id, type, events) < 0) {
+        if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+        return false;
+    }
     return true;
 }
 

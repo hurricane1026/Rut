@@ -2867,6 +2867,101 @@ TEST(active_health, send_registration_failure_defers_without_downing_backend) {
     destroy_real_loop(loop);
 }
 
+TEST(active_health, recv_registration_failure_defers_without_downing_backend) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    close(loop->backend.epoll_fd);
+    loop->backend.epoll_fd = -1;  // force add_recv_upstream's epoll registration to fail
+    on_probe_sent<EpollEventLoop>(loop, *c, IoEvent{c->id, 18, 0, 0, IoEventType::UpstreamSend, 0});
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, probe_sent_preserves_preread_response) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1),
+               sizeof(kResp) - 1);
+    set_probe_in_flight(uid, 0, true);
+    record_active_probe_result(uid, 0, /*healthy=*/false, monotonic_us());
+    REQUIRE(backend_ejected(uid, 0, monotonic_us()));
+
+    on_probe_sent<EpollEventLoop>(loop, *c, IoEvent{c->id, 18, 0, 0, IoEventType::UpstreamSend, 0});
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {
