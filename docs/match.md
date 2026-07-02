@@ -8,9 +8,9 @@ Rut supports `match` in routes and source functions.
 route GET "/status" {
     let code = 200
     match code {
-    case 200:
+    200 =>
         return 200
-    case _:
+    _ =>
         return 404
     }
 }
@@ -23,9 +23,9 @@ matches need a wildcard arm.
 route GET "/path" {
     let path = "/users"
     match path {
-    case "/users":
+    "/users" =>
         return 200
-    case _:
+    _ =>
         return 404
     }
 }
@@ -37,9 +37,9 @@ Boolean matches are exhaustive when both `true` and `false` are present.
 route GET "/enabled" {
     let enabled = true
     match enabled {
-    case true:
+    true =>
         return 200
-    case false:
+    false =>
         return 503
     }
 }
@@ -56,9 +56,9 @@ variant Auth { ok, denied }
 route GET "/auth" {
     let auth = Auth.ok
     match auth {
-    case .ok:
+    .ok =>
         return 200
-    case .denied:
+    .denied =>
         return 403
     }
 }
@@ -72,9 +72,9 @@ variant Result { ok(i32), err }
 route GET "/result" {
     let result = Result.ok(200)
     match result {
-    case .ok(code) if code == 200:
+    .ok(code) if code == 200 =>
         return 200
-    case _:
+    _ =>
         return 500
     }
 }
@@ -89,9 +89,9 @@ control falls through to the next arm.
 route GET "/guarded" {
     let code = 200
     match code {
-    case 200 if false:
+    200 if false =>
         return 500
-    case _:
+    _ =>
         return 404
     }
 }
@@ -109,9 +109,9 @@ known.
 route GET "/const" {
     let path = "/users"
     match const path {
-    case "/users":
+    "/users" =>
         return 200
-    case _:
+    _ =>
         return 404
     }
 }
@@ -131,14 +131,14 @@ route GET "/nested" {
     let auth = Auth.ok
     let path = "/users"
     match auth {
-    case .ok:
+    .ok =>
         match path {
-        case "/users":
+        "/users" =>
             return 200
-        case _:
+        _ =>
             return 404
         }
-    case .denied:
+    .denied =>
         return 403
     }
 }
@@ -155,8 +155,8 @@ Source functions use `=>` arms and return expressions.
 ```rut
 func status(path: str) -> i32 {
     match path {
-    case "/users" => 200
-    case _ => 404
+    "/users" => 200
+    _ => 404
     }
 }
 ```
@@ -168,8 +168,8 @@ variant Result { ok(i32), err }
 
 func pick(result: Result) -> i32 {
     match result {
-    case .ok(code) if code == 200 => code
-    case _ => 404
+    .ok(code) if code == 200 => code
+    _ => 404
     }
 }
 ```

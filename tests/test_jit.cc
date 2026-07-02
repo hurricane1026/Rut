@@ -1835,7 +1835,7 @@ TEST(jit, frontend_import_relative_file_merges_imported_variant_symbol) {
     }
     const auto src = R"rut(
 import "types.rut"
-route GET "/users" { let state = AuthState.ok match state { case .ok: return 200 case _: return 500 } }
+route GET "/users" { let state = AuthState.ok match state { .ok => return 200 _ => return 500 } }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -2819,7 +2819,7 @@ TEST(
 import "proto.rut"
 func run<T: MaybeCode>(x: T) -> i32 {
     let failed = x.code(false)
-    guard match failed else { case .timeout => 401 case _ => 500 }
+    guard match failed else { .timeout => 401 _ => 500 }
     200
 }
 route GET "/users" { if run(Box(value: 1)) == 401 { return 200 } else { return 500 } }
@@ -3075,7 +3075,7 @@ TEST(jit, frontend_import_namespace_generic_type_ref) {
     const auto src = R"rut(
 import "proto.rut"
 func wrap(x: proto.Result<i32>) -> proto.Result<i32> => x
-route GET "/users" { let state = wrap(proto.Result<i32>.ok(1)) match state { case .ok(v): return 200 case .err: return 500 } }
+route GET "/users" { let state = wrap(proto.Result<i32>.ok(1)) match state { .ok(v) => return 200 .err => return 500 } }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3117,7 +3117,7 @@ TEST(jit, frontend_import_namespace_nested_generic_payload_lowering_path) {
     const auto src = R"rut(
 import * as proto from "proto.rut"
 func wrap(x: proto.Result<proto.Box<proto.Result<i32>>>) -> proto.Result<proto.Box<proto.Result<i32>>> => x
-route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { case .ok(v): return 200 case .err: return 500 } }
+route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { .ok(v) => return 200 .err => return 500 } }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3198,8 +3198,8 @@ TEST(jit, frontend_import_namespace_variant_constructor) {
 import "proto.rut"
 route GET "/users" {
     match proto.Result.ok(200) {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -3242,8 +3242,8 @@ TEST(jit, frontend_import_namespace_payloadless_variant_case) {
 import "proto.rut"
 route GET "/users" {
     match proto.Token.ready {
-    case .ready: return 200
-    case .pending: return 500
+    .ready => return 200
+    .pending => return 500
     }
 }
 )rut";
@@ -3535,8 +3535,8 @@ TEST(jit, frontend_req_header_alias_any_fallback) {
 TEST(jit, frontend_variant_match) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
-        "200 case _: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { .timeout => return "
+        "200 _ => return 403 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3575,8 +3575,8 @@ TEST(jit, frontend_variant_match) {
 
 TEST(jit, frontend_string_match_returns_matching_status_and_fallback) {
     const char* src =
-        "route GET \"/users\" { let path = req.path match path { case \"/api/users\": return 200 "
-        "case _: return 404 } }\n";
+        "route GET \"/users\" { let path = req.path match path { \"/api/users\" => return 200 "
+        "_ => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3623,8 +3623,8 @@ TEST(jit, frontend_string_match_returns_matching_status_and_fallback) {
 
 TEST(jit, frontend_route_match_arm_guard_false_falls_through) {
     const char* src =
-        "route GET \"/users\" { let code = 200 match code { case 200 if req.method == POST: "
-        "return 500 case _: return 404 } }\n";
+        "route GET \"/users\" { let code = 200 match code { 200 if req.method == POST => "
+        "return 500 _ => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3665,8 +3665,8 @@ TEST(jit, frontend_source_function_match_arm_guard_false_executes_fallback) {
     const auto src = R"(
 func pick(x: i32) -> i32 {
     match x {
-        case 200 if false => 201
-        case _ => 404
+        200 if false => 201
+        _ => 404
     }
 }
 route GET "/users" {
@@ -3715,8 +3715,8 @@ TEST(jit, frontend_source_function_match_arm_guard_payload_binding_executes_matc
 variant Result { ok(i32), err }
 func pick(result: Result) -> i32 {
     match result {
-        case .ok(code) if code == 200 => code
-        case _ => 404
+        .ok(code) if code == 200 => code
+        _ => 404
     }
 }
 route GET "/users" {
@@ -3764,8 +3764,8 @@ TEST(jit, frontend_source_function_match_arm_guard_seeds_named_error_case) {
     const auto src = R"(
 func pick(x: i32) -> i32 {
     match x {
-        case 200 if error(.timeout, "timed out").code == 0 => 200
-        case _ => 500
+        200 if error(.timeout, "timed out").code == 0 => 200
+        _ => 500
     }
 }
 route GET "/users" {
@@ -3817,12 +3817,12 @@ route GET "/users" {
     let auth = Auth.ok
     let result = Result.ok(200)
     match auth {
-    case .ok:
+    .ok =>
         match result {
-        case .ok: return 200
-        case _: return 404
+        .ok => return 200
+        _ => return 404
         }
-    case .denied:
+    .denied =>
         return 403
     }
 }
@@ -3866,8 +3866,8 @@ route GET "/users" {
 TEST(jit, frontend_variant_single_payload_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 "
-        "case .err: return 500 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => return 200 "
+        ".err => return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3907,8 +3907,8 @@ TEST(jit, frontend_variant_single_payload_match) {
 TEST(jit, frontend_variant_payload_binding_match_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 "
-        "{ return 200 } else { return 500 } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => if x == 200 "
+        "{ return 200 } else { return 500 } .err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3948,8 +3948,8 @@ TEST(jit, frontend_variant_payload_binding_match_if) {
 TEST(jit, frontend_variant_payload_binding_match_block) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x "
-        "if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let y = x "
+        "if y == 200 { return 200 } else { return 500 } } .err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3989,9 +3989,9 @@ TEST(jit, frontend_variant_payload_binding_match_block) {
 TEST(jit, frontend_variant_payload_binding_match_block_with_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let failed "
         "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
-        "} } case .err: return 404 } }\n";
+        "} } .err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4031,9 +4031,9 @@ TEST(jit, frontend_variant_payload_binding_match_block_with_guard) {
 TEST(jit, frontend_variant_payload_binding_match_block_with_guard_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
-        "= error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 "
-        "} if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let failed "
+        "= error(.timeout) guard match failed else { .timeout => return 401 _ => return 402 "
+        "} if x == 200 { return 200 } else { return 500 } } .err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4111,8 +4111,8 @@ TEST(jit, frontend_if_const) {
 TEST(jit, frontend_match_const_variant) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x "
-        "== 200 { return 200 } else { return 500 } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match const state { .ok(x) => if x "
+        "== 200 { return 200 } else { return 500 } .err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4152,9 +4152,9 @@ TEST(jit, frontend_match_const_variant) {
 TEST(jit, frontend_variant_mixed_payload_match) {
     const char* src =
         "variant Mixed { count(i32), ready(bool), label(str), none }\n"
-        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return "
-        "200 case .ready(flag): if flag == true { return 201 } else { return 202 } case "
-        ".label(name): return 203 case .none: return 204 } }\n";
+        "route GET \"/users\" { let state = Mixed.ready(true) match state { .count(x) => return "
+        "200 .ready(flag) => if flag == true { return 201 } else { return 202 } "
+        ".label(name) => return 203 .none => return 204 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4195,9 +4195,9 @@ TEST(jit, frontend_variant_tuple_payload_match_pipe_multi_slot) {
     const char* src =
         "variant Result { ok((i32, i32)), err }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { "
-        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case "
-        ".err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { .ok(pair) => { "
+        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } "
+        ".err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4240,8 +4240,8 @@ variant Result<T> { ok(T), err }
 route GET "/users" {
     let state = Result<i32>.ok(200)
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -4279,10 +4279,10 @@ struct Box<T> { value: T }
 variant Wrap<T> { some(T), none }
 route GET "/users" {
     match Wrap<Box<i32>>.some(Box<i32>(value: 200)) {
-    case .some(v): {
+    .some(v) => {
         if v.value == 200 { return 200 } else { return 500 }
     }
-    case .none: return 500
+    .none => return 500
     }
 }
 )rut";
@@ -4321,11 +4321,11 @@ variant Result { ok((Box, i32)), err }
 func boxCode(x: Box) -> i32 => x.value
 route GET "/users" {
     match Result.ok((Box(value: 200), 7)) {
-    case .ok(v): {
+    .ok(v) => {
         let code = v | boxCode(_1)
         if code == 200 { return 200 } else { return 500 }
     }
-    case .err: return 500
+    .err => return 500
     }
 }
 )rut";
@@ -4365,11 +4365,11 @@ variant Result { ok(Outer), err }
 route GET "/users" {
     let state = Result.ok(Outer(inner: Box(value: 200)))
     match state {
-    case .ok(v): {
+    .ok(v) => {
         let code = v.inner.value
         if code == 200 { return 200 } else { return 500 }
     }
-    case .err: return 404
+    .err => return 404
     }
 }
 )rut";
@@ -4408,11 +4408,11 @@ variant Result<T> { ok(T), err }
 func itemCode(x: Item) -> i32 => x.value
 route GET "/users" {
     match Result.ok((Item(value: 200), 7)) {
-    case .ok(v): {
+    .ok(v) => {
         let code = v | itemCode(_1)
         if code == 200 { return 200 } else { return 500 }
     }
-    case .err: return 500
+    .err => return 500
     }
 }
 )rut";
@@ -4450,8 +4450,8 @@ variant Result<T> { ok(T), err }
 route GET "/users" {
     let state = Result.ok(200)
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -4485,8 +4485,8 @@ route GET "/users" {
 
 TEST(jit, frontend_known_named_error_match) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return "
-        "503 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { .timeout => return "
+        "503 _ => return 200 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4529,8 +4529,8 @@ route GET "/users" {
     let failed = error(.timeout)
     let allow = req.path == "/api/users"
     match failed {
-    case .timeout if allow: return 503
-    case _: return 200
+    .timeout if allow => return 503
+    _ => return 200
     }
 }
 )";
@@ -4577,8 +4577,8 @@ route GET "/users" {
     let failed = error(.timeout)
     let allow = req.path == "/missing"
     match failed {
-    case .timeout if allow: return 503
-    case _: return 200
+    .timeout if allow => return 503
+    _ => return 200
     }
 }
 )";
@@ -4622,8 +4622,8 @@ route GET "/users" {
 TEST(jit, frontend_explicit_error_variant_match) {
     const char* src =
         "variant AuthError { timeout, forbidden }\n"
-        "route GET \"/users\" { let failed = error(AuthError.forbidden) match failed { case "
-        ".forbidden: return 403 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError.forbidden) match failed { "
+        ".forbidden => return 403 _ => return 200 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4664,7 +4664,7 @@ TEST(jit, frontend_custom_error_struct_guard_match) {
     const char* src =
         "struct AuthError { err: Error }\n"
         "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\") guard match "
-        "failed else { case .timeout: return 503 case _: return 500 } return 200 }\n";
+        "failed else { .timeout => return 503 _ => return 500 } return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4705,7 +4705,7 @@ TEST(jit, frontend_custom_error_struct_with_extra_fields_guard_match) {
     const char* src =
         "struct AuthError { err: Error, token: str, retry: i32 }\n"
         "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", token: "
-        "\"abc\", retry: 3) guard match failed else { case .timeout: return 503 case _: return 500 "
+        "\"abc\", retry: 3) guard match failed else { .timeout => return 503 _ => return 500 "
         "} return 200 }\n";
 
     auto lexed = lex(lit(src));
@@ -4747,7 +4747,7 @@ TEST(jit, frontend_custom_error_struct_with_tuple_field_guard_match) {
     const char* src =
         "struct AuthError { err: Error, pair: (i32, i32) }\n"
         "route GET \"/users\" { let failed = error(AuthError, .timeout, \"timed out\", pair: (200, "
-        "500)) guard match failed else { case .timeout: return 503 case _: return 500 } return 200 "
+        "500)) guard match failed else { .timeout => return 503 _ => return 500 } return 200 "
         "}\n";
 
     auto lexed = lex(lit(src));
@@ -4910,8 +4910,8 @@ TEST(jit, frontend_generic_struct_constructor_infers_type_argument_from_field_sh
 TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_let_types) {
     const char* src =
         "variant Result<T> { ok(T), err }\n"
-        "route GET \"/users\" { let state: Result<i32> = Result.ok(200) match state { case .ok(v): "
-        "return 200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let state: Result<i32> = Result.ok(200) match state { .ok(v) => "
+        "return 200 .err => return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -4952,8 +4952,8 @@ TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_function_signatur
     const char* src =
         "variant Result<T> { ok(T), err }\n"
         "func wrap(x: Result<i32>) -> Result<i32> => x\n"
-        "route GET \"/users\" { let state = wrap(Result.ok(200)) match state { case .ok(v): return "
-        "200 case .err: return 500 } }\n";
+        "route GET \"/users\" { let state = wrap(Result.ok(200)) match state { .ok(v) => return "
+        "200 .err => return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5038,7 +5038,7 @@ TEST(jit, frontend_concrete_generic_type_refs_are_supported_in_struct_fields) {
         "variant Result<T> { ok(T), err }\n"
         "struct Holder { state: Result<i32> }\n"
         "route GET \"/users\" { let holder = Holder(state: Result.ok(200)) match holder.state { "
-        "case .ok(v): return 200 case .err: return 500 } }\n";
+        ".ok(v) => return 200 .err => return 500 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5359,11 +5359,11 @@ variant Outer { wrap(Result<i32>), bad }
 route GET "/users" {
     let state = Outer.wrap(Result.ok(200))
     match state {
-    case .wrap(inner): {
+    .wrap(inner) => {
         let copied = inner
         return 200
     }
-    case .bad:
+    .bad =>
         return 404
     }
 }
@@ -5407,9 +5407,9 @@ TEST(jit, frontend_concrete_generic_struct_type_refs_are_supported_in_variant_pa
         "struct Box<T> { value: T }\n"
         "variant Outer { wrap(Box<i32>), bad }\n"
         "func is200(x: Box<i32>) -> bool => x.value == 200\n"
-        "route GET \"/users\" { let state = Outer.wrap(Box(value: 200)) match state { case "
-        ".wrap(inner): { let ok = is200(inner) if ok { return 200 } else { return 500 } } case "
-        ".bad: return 404 } }\n";
+        "route GET \"/users\" { let state = Outer.wrap(Box(value: 200)) match state { "
+        ".wrap(inner) => { let ok = is200(inner) if ok { return 200 } else { return 500 } } "
+        ".bad => return 404 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5567,8 +5567,8 @@ TEST(jit, frontend_guard_else_block_with_let) {
 TEST(jit, frontend_guard_match_routes_fail_and_success_paths) {
     {
         const char* src =
-            "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-            ".timeout: return 503 case _: return 500 } return 200 }\n";
+            "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+            ".timeout => return 503 _ => return 500 } return 200 }\n";
 
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
@@ -5608,8 +5608,8 @@ TEST(jit, frontend_guard_match_routes_fail_and_success_paths) {
     {
         const char* src =
             "func maybefail(ok: bool) -> i32 { if ok { 200 } else { error(.timeout) } }\n"
-            "route GET \"/users\" { let ok = maybefail(true) guard match ok else { case .timeout: "
-            "return 503 case _: return 500 } return 200 }\n";
+            "route GET \"/users\" { let ok = maybefail(true) guard match ok else { .timeout => "
+            "return 503 _ => return 500 } return 200 }\n";
 
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
@@ -8173,8 +8173,8 @@ TEST(jit, frontend_plain_struct_variant_field_projection_match) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
         "struct Foo { state: AuthState }\n"
-        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case "
-        ".timeout: return 200 case _: return 403 } }\n";
+        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { "
+        ".timeout => return 200 _ => return 403 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -8534,8 +8534,8 @@ struct Holder<T> { state: Result<T> }
 route GET "/users" {
     let holder = Holder<i32>(state: Result.ok(200))
     match holder.state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8574,10 +8574,10 @@ variant Wrap<T> { some(Box<T>), none }
 route GET "/users" {
     let state = Wrap<i32>.some(Box(value: 200))
     match state {
-    case .some(box): {
+    .some(box) => {
         if box.value == 200 { return 200 } else { return 500 }
     }
-    case .none:
+    .none =>
         return 404
     }
 }
@@ -8617,7 +8617,7 @@ i32 impl Hashable { func hash(self: i32) -> i32 => self }
 variant Wrap<T> { some(T) }
 func run<T: Hashable>(state: Wrap<T>) -> i32 {
     match state {
-    case .some(v) => v.hash()
+    .some(v) => v.hash()
     }
 }
 route GET "/users" {
@@ -8700,8 +8700,8 @@ func unwrap(x: Holder<i32>) -> Result<i32> => x.state
 route GET "/users" {
     let state = unwrap(Holder<i32>(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8916,8 +8916,8 @@ TEST(jit, frontend_imported_function_body_match) {
         out << "variant Result { ok, err }\n";
         out << "func pick(x: Result) -> i32 {\n";
         out << "    match x {\n";
-        out << "        case .ok => 200\n";
-        out << "        case .err => 500\n";
+        out << "        .ok => 200\n";
+        out << "        .err => 500\n";
         out << "    }\n";
         out << "}\n";
     }
@@ -8964,8 +8964,8 @@ func unwrap(x: Holder<Result<i32>>) -> Result<i32> => x.state
 route GET "/users" {
     let state = unwrap(Holder<Result<i32>>(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9004,8 +9004,8 @@ struct Holder<T> { state: T }
 route GET "/users" {
     let holder = Holder<Result<i32>>(state: Result<i32>.ok(200))
     match holder.state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9045,10 +9045,10 @@ func make() -> Wrap<i32> => Wrap<i32>.some(Box(value: 200))
 route GET "/users" {
     let x = make()
     match x {
-    case .some(box): {
+    .some(box) => {
         if box.value == 200 { return 200 } else { return 500 }
     }
-    case .none:
+    .none =>
         return 404
     }
 }
@@ -9254,8 +9254,8 @@ func unwrap<T>(x: Holder<T>) -> Result<T> => x.state
 route GET "/users" {
     let state = unwrap(Holder(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -10905,7 +10905,7 @@ TEST(jit, frontend_custom_protocol_default_method_supports_guard_match_prefix) {
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
         let y = maybefail(ok)
-        guard match y else { case .timeout => 401 case _ => 500 }
+        guard match y else { .timeout => 401 _ => 500 }
         200
     }
 }
@@ -14499,8 +14499,8 @@ variant AuthState { ok, err }
 func success() -> AuthState => AuthState.ok
 route GET "/users" {
     match success() {
-    case .ok: return 200
-    case _: return 500
+    .ok => return 200
+    _ => return 500
     }
 }
 )";
@@ -14538,8 +14538,8 @@ variant AuthState { ok, err }
 func success() => AuthState.ok
 route GET "/users" {
     match success() {
-    case .ok: return 200
-    case _: return 500
+    .ok => return 200
+    _ => return 500
     }
 }
 )";
@@ -15115,7 +15115,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard match y else { case .timeout => 401 case _ => 500 }
+    guard match y else { .timeout => 401 _ => 500 }
     200
 }
 route GET "/users" {
@@ -15196,8 +15196,8 @@ variant Result { ok, err }
 func pick(x: Result) -> i32 {
     let y = x
     match y {
-        case .ok => 200
-        case .err => 500
+        .ok => 200
+        .err => 500
     }
 }
 route GET "/users" {
@@ -15238,8 +15238,8 @@ TEST(jit, frontend_function_match_arm_block_with_let_inlines) {
 variant Result { ok, err }
 func pick(x: Result) -> i32 {
     match x {
-        case .ok => { let y = 200 y }
-        case .err => { let z = 500 z }
+        .ok => { let y = 200 y }
+        .err => { let z = 500 z }
     }
 }
 route GET "/users" {
@@ -15280,8 +15280,8 @@ TEST(jit, frontend_function_infers_optional_return_from_match_without_annotation
 variant Result { ok, err }
 func pick(x: Result) {
     match x {
-        case .ok => 200
-        case .err => nil
+        .ok => 200
+        .err => nil
     }
 }
 route GET "/users" {
@@ -15322,8 +15322,8 @@ TEST(jit, frontend_function_infers_error_return_from_match_without_annotation) {
 variant Result { ok, err }
 func pick(x: Result) {
     match x {
-        case .ok => 200
-        case .err => error(.timeout)
+        .ok => 200
+        .err => error(.timeout)
     }
 }
 route GET "/users" {
@@ -15364,8 +15364,8 @@ TEST(jit, frontend_function_allows_pure_error_match_with_explicit_return_type) {
 variant Result { ok, err }
 func pick(x: Result) -> i32 {
     match x {
-        case .ok => error(.timeout)
-        case .err => error(.timeout)
+        .ok => error(.timeout)
+        .err => error(.timeout)
     }
 }
 route GET "/users" {
