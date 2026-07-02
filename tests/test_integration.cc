@@ -3324,6 +3324,49 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
     loop->shutdown();
 }
 
+// Codex P1 (PR #160): if close_conn runs while idle_return_fd is waiting for the
+// previous upstream recv/cancel drain, do not submit a second close-path
+// UpstreamRecv cancel for a newer upstream_fd on the same conn_id. The original
+// parked recv owns upstream_recv_* until try_deferred_upstream_rearm drains it.
+TEST(uring, close_with_idle_return_drain_skips_second_upstream_recv_cancel) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.reset();
+    conn.id = 0;
+    i32 cli[2];
+    i32 upstream[2];
+    i32 parked[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, upstream), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, parked), 0);
+
+    conn.fd = cli[0];
+    conn.upstream_fd = upstream[0];   // newer upstream already opened
+    conn.idle_return_fd = parked[0];  // old reusable upstream parked
+    conn.pending_ops = 1;             // old recv terminal still in flight
+    conn.upstream_recv_armed = true;  // owned by the old parked recv drain
+    conn.upstream_recv_cancel_inflight = true;
+
+    loop->close_conn_impl(conn);
+
+    CHECK(conn.close_after_idle_return);
+    CHECK(conn.upstream_recv_armed);
+    CHECK(conn.upstream_recv_cancel_inflight);
+    CHECK_EQ(conn.pending_ops, 2u);  // old recv + UpstreamConnect cancel only; no 2nd recv cancel
+    CHECK(::close(cli[0]) < 0);
+    CHECK(::close(upstream[0]) < 0);
+
+    close(cli[1]);
+    close(upstream[1]);
+    close(parked[1]);
+    loop->shutdown();  // closes parked[0]
+}
+
 // Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
 // pending, and re-arms once the late cancel CQE arrives after the handler has
 // already asked to keep reading.

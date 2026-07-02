@@ -829,13 +829,21 @@ public:
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
         }
+        const bool idle_return_recv_draining =
+            c.idle_return_fd >= 0 && (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
+                                      c.upstream_recv_pause_cancel_pending);
         // Only cancel when ops are in flight.
         if (c.pending_ops > 0) {
+            // If an idle upstream fd is parked waiting for its old multishot recv to
+            // drain, do not submit another close-path UpstreamRecv cancel for a newer
+            // upstream_fd on the same conn_id. The parked recv/cancel pair owns these
+            // flags until try_deferred_upstream_rearm observes both CQEs.
+            const bool cancel_upstream_recv = c.upstream_recv_armed && !idle_return_recv_draining;
             c.pending_ops += backend.cancel(c.fd,
                                             c.id,
                                             c.recv_armed,
                                             c.send_armed,
-                                            c.upstream_recv_armed,
+                                            cancel_upstream_recv,
                                             c.upstream_send_armed,
                                             c.upstream_fd >= 0,
                                             c.yield_timeout_armed,
@@ -866,8 +874,7 @@ public:
         // intact here), not these callbacks, so the drain still completes. epoch / slot
         // / metrics above have already run exactly once — the deferred free_conn does
         // none of them, so there is no double release.
-        if (c.idle_return_fd >= 0 && (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
-                                      c.upstream_recv_pause_cancel_pending)) {
+        if (idle_return_recv_draining) {
             c.close_after_idle_return = true;
             timer.remove(&c);
             c.on_recv = nullptr;
