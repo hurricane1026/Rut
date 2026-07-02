@@ -523,10 +523,10 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
     if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = fd;
     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
     if (rc == 0) {
-        struct epoll_event reg_ev;
-        reg_ev.events = EPOLLIN;
-        reg_ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv);
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &reg_ev);
+        if (set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamRecv, EPOLLIN) < 0) {
+            if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+            return false;
+        }
         if (pending_count < 64) {
             pending_completions[pending_count].conn_id = conn_id;
             pending_completions[pending_count].type = IoEventType::UpstreamConnect;
@@ -540,10 +540,10 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
     }
 
     if (errno == EINPROGRESS) {
-        struct epoll_event ev;
-        ev.events = EPOLLOUT;
-        ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamConnect);
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+        if (set_fd_interest(epoll_fd, fd, conn_id, IoEventType::UpstreamConnect, EPOLLOUT) < 0) {
+            if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+            return false;
+        }
         return true;
     }
 

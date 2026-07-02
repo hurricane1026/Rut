@@ -2621,6 +2621,78 @@ TEST(active_health, draining_timeout_skips_probe_sweep) {
     destroy_real_loop(loop);
 }
 
+TEST(active_health, generic_probe_close_clears_inflight) {
+    using namespace rut;
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1).has_value());
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u16 uid = 3;
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    set_probe_in_flight(uid, 0, true);
+
+    loop->close_conn(*c);
+
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, connect_registration_failure_defers_without_downing_backend) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install + health reset
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    close(loop->backend.epoll_fd);
+    loop->backend.epoll_fd = -1;  // force add_connect's epoll registration to fail
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

@@ -630,7 +630,7 @@ public:
         // keepalive-timeout / drain / force-close path that reaches a stalled
         // probe; the normal probe lifecycle frees via free_probe_conn).
         if (c.is_health_probe) {
-            free_health_probe(c);
+            free_probe_conn(this, c);
             return;
         }
         // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
