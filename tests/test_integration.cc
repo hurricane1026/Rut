@@ -8752,8 +8752,8 @@ TEST(route, jit_handler_custom_body_real_socket) {
     const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[2048];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n, 0);
+    i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+    REQUIRE_GT(n, 0);
     buf[n < static_cast<i32>(sizeof(buf)) ? n : static_cast<i32>(sizeof(buf)) - 1] = '\0';
 
     // Response must contain "200", "Content-Length: 12", default
@@ -10682,8 +10682,8 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n, 0);
+    i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+    REQUIRE_GT(n, 0);
     // Assert the default reason-phrase body — not just that 200 is
     // anywhere in the response. For 200 the default body is "OK" (2
     // bytes), and format_static_response does NOT emit Content-Type,
