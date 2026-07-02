@@ -220,7 +220,7 @@ jobs:
         # silently dropped whenever grep matches a line.
         run: |
           set -o pipefail
-          RUT_BENCH=1 ./build/tests/test_integration 2>&1 | grep -E '\[bench\]|keepalive_latency_bench'
+          RUT_BENCH=1 ./build/tests/test_integration --filter=proxy_tls_iouring.keepalive_latency_bench 2>&1 | grep -E '\[bench\]|keepalive_latency_bench'
 
   bench-simd-x86:
     name: SIMD scan_uri bench (x86)
