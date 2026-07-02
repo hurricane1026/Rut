@@ -10,6 +10,7 @@
 #include "rut/jit/jit_engine.h"
 #endif
 #include "rut/runtime/callbacks_h2.h"
+#include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/hpack.h"
@@ -2351,6 +2352,80 @@ TEST(active_health, sweep_caps_probes_per_tick) {
     for (u32 u = 0; u < kUps; u++)
         for (u32 b = 0; b < 8; b++) CHECK(!probe_in_flight(uids[u], b));
 
+    // The next sweep must resume at the upstream deferred by the first sweep. With
+    // a fixed upstream-0 start, completing low-index probes each tick can consume
+    // the whole budget again and starve the last upstream indefinitely.
+    for (u32 u = 0; u < kUps; u++) loop->health_probe_deadline_ns[uids[u]] = 0;
+    loop->sweep_health_probes();
+    for (u32 b = 0; b < 8; b++) CHECK(probe_in_flight(uids[kUps - 1], b));
+    CHECK_GT(loop->health_probe_deadline_ns[uids[kUps - 1]], 0u);
+
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    for (u32 u = 0; u < kUps; u++)
+        for (u32 b = 0; b < 8; b++) CHECK(!probe_in_flight(uids[u], b));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, fragmented_probe_headers_rearm_until_timeout) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    static const char kPartial[] = "HTTP/1.1 ";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1),
+        sizeof(kPartial) - 1);
+
+    for (u32 i = 0; i < 8; i++) {
+        on_probe_response<EpollEventLoop>(
+            loop, *c, IoEvent{c->id, 1, 0, 0, IoEventType::UpstreamRecv, 0});
+        REQUIRE_EQ(loop->active_count(), 1u);
+        CHECK(probe_in_flight(uid, 0));
+        CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    }
+
+    free_probe_conn(loop, *c);
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    close(fds[1]);
     loop->shutdown();
     close(listen_fd);
     close(backend_fd);

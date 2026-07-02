@@ -176,9 +176,6 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
 // parallel health state. Teardown goes through free_probe_conn (never the full
 // close_conn, which moves per-request metrics/epoch/access-log counters).
 //
-// Bounded recv attempts before a probe gives up (counts as a failed probe).
-inline constexpr u32 kMaxProbeReads = 4;
-
 // Format "<ipv4>:<port>" (network-order sockaddr_in) for the probe Host header.
 // out must hold >= 22 bytes ("255.255.255.255:65535"). Returns bytes written.
 inline u32 format_probe_host(char* out, const struct sockaddr_in& addr) {
@@ -378,7 +375,6 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     conn.upstream_recv_buf.reset();
-    conn.upstream_attempts = 0;  // reuse as the bounded recv-attempt counter
     conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
     // submit failure is local (kernel submission), not a backend signal — skip.
     if (!loop->submit_recv_upstream(conn)) {
@@ -401,10 +397,10 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     parser.reset();
     const ParseStatus kStatus =
         parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
-    // Headers split across packets: read again (bounded) if more can still arrive.
+    // Headers split across packets: keep reading while bytes arrive and buffer space
+    // remains. The probe's upstream_timeout bounds stalled/trickling responses.
     if (kStatus == ParseStatus::Incomplete && ev.result > 0 &&
-        conn.upstream_attempts < kMaxProbeReads && conn.upstream_recv_buf.write_avail() > 0) {
-        conn.upstream_attempts++;
+        conn.upstream_recv_buf.write_avail() > 0) {
         if (!loop->submit_recv_upstream(conn)) {
             record_probe_if_current(loop, conn, /*healthy=*/false, kNowUs);
             free_probe_conn(loop, conn);

@@ -220,6 +220,7 @@ public:
     // tear a probe Connection down. io_uring probing is a deliberate follow-up.
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
     const RouteConfig* health_armed_config = nullptr;
+    u32 health_probe_sweep_cursor = 0;
 
     // Detect a config swap (first install or hot reload) and, if so, reset the
     // per-shard health verdicts and re-arm the per-upstream probe deadlines from
@@ -245,6 +246,7 @@ public:
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
         if (cfg == health_armed_config) return false;
         health_armed_config = cfg;
+        health_probe_sweep_cursor = 0;
         reset_backend_health();
         if (cfg != nullptr) {
             const u64 now = monotonic_ns();
@@ -290,8 +292,9 @@ public:
             // Upstreams we cannot fully cover keep their (already-due) deadline,
             // so the NEXT 1s tick retries them; probe_in_flight makes the retry
             // idempotent for backends already launched. No health coverage is
-            // dropped — only deferred by a tick under heavy fan-out. Deterministic
-            // (iterates upstreams in index order).
+            // dropped — only deferred by a tick under heavy fan-out. A rotating
+            // cursor resumes at the first deferred upstream, so low-index upstreams
+            // that complete quickly cannot consume the whole budget every tick.
             static constexpr u32 kMaxProbesPerSweep = 32;
             static constexpr u32 kProbePendingReserve = 16;
             const u32 ring = self().backend.kPendingCap;
@@ -299,11 +302,18 @@ public:
             const u32 avail =
                 (pend + kProbePendingReserve < ring) ? (ring - kProbePendingReserve - pend) : 0;
             u32 budget = avail < kMaxProbesPerSweep ? avail : kMaxProbesPerSweep;
-            for (u32 u = 0; u < n; u++) {
+            const u32 start = (n == 0) ? 0 : (health_probe_sweep_cursor % n);
+            u32 next_cursor = start;
+            bool cursor_advanced = false;
+            for (u32 scanned = 0; scanned < n; scanned++) {
+                const u32 u = (start + scanned) % n;
                 const UpstreamTarget& up = cfg->upstreams[u];
                 if (!up.hc_enabled) continue;
                 if (now < health_probe_deadline_ns[u]) continue;
-                if (budget == 0) break;  // out of budget — defer remaining upstreams
+                if (budget == 0) {
+                    health_probe_sweep_cursor = u;  // out of budget — resume here next tick
+                    return;
+                }
                 bool all_issued = true;
                 for (u32 b = 0; b < up.addr_count; b++) {
                     if (probe_in_flight(static_cast<u16>(u), b)) continue;
@@ -324,7 +334,15 @@ public:
                 if (all_issued)
                     health_probe_deadline_ns[u] =
                         now + static_cast<u64>(up.hc_interval_ms) * 1'000'000ull;
+                if (all_issued) {
+                    next_cursor = (u + 1) % n;
+                    cursor_advanced = true;
+                } else if (budget == 0) {
+                    health_probe_sweep_cursor = u;
+                    return;
+                }
             }
+            if (cursor_advanced) health_probe_sweep_cursor = next_cursor;
         }
     }
 };
