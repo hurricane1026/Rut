@@ -812,26 +812,26 @@ public:
                 drain_yield_heap();
                 break;
             case IoEventType::Timeout: {
-                // Issue health probes BEFORE the timer wheel reaps (F4 / #161). A
-                // stalled probe is freed by the reap below — its slot returns to
-                // the free list and its upstream fd is EPOLL_CTL_DEL'd (so no NEW
-                // events), but stale UpstreamConnect/UpstreamRecv events for that
-                // fd already collected in THIS epoll_wait batch still trail behind.
-                // Running the sweep first guarantees the just-freed slot is NOT
-                // re-allocated to a replacement probe within this same batch, so
-                // those stale events (keyed only by conn_id) cannot misroute into a
-                // new probe sharing the reused conn_id; they instead land on a
-                // now-free slot whose callbacks free_conn nulled, and are ignored.
-                // A backend whose probe is reaped this tick is re-probed on a later
-                // tick (the sweep we just ran skips it — its probe_in_flight guard
-                // is still set until the reap clears it), which is the intended
-                // deferral. The sweep arms new probes upstream_timeout (~30) slots
-                // ahead on the wheel, so a normal 1-tick reap below never touches
-                // them.
-                if (!is_draining()) this->sweep_health_probes();
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
+                const bool catchup_reaches_probe_timeout =
+                    ticks >= static_cast<i32>(upstream_timeout);
+                // For normal 1s ticks, issue health probes BEFORE the timer wheel
+                // reaps (F4 / #161). A stalled probe is freed by the reap below —
+                // its slot returns to the free list and its upstream fd is
+                // EPOLL_CTL_DEL'd (so no NEW events), but stale
+                // UpstreamConnect/UpstreamRecv events for that fd already collected
+                // in THIS epoll_wait batch can still trail behind. Running the
+                // sweep first guarantees the just-freed slot is NOT re-allocated to
+                // a replacement probe within this same batch.
+                //
+                // If timerfd coalesced enough ticks to cross upstream_timeout, do
+                // not launch fresh probes before replaying those ticks: the same
+                // catch-up pass would immediately reap the new probes as stalled
+                // before their I/O can run. Skip this sweep; the next timer event
+                // retries due probe deadlines after the catch-up batch is gone.
+                if (!catchup_reaches_probe_timeout && !is_draining()) this->sweep_health_probes();
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
                         // A stalled active health probe: it accepted the connect

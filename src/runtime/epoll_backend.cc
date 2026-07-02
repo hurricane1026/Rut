@@ -360,18 +360,10 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
         rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
     if (rc < 0) {
-        i32 err = errno;
         if (conn_id < kMaxFdMap) {
             upstream_send_state[conn_id] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0};
         }
-        if (pending_count >= 64) pending_count = 63;
-        pending_completions[pending_count].conn_id = conn_id;
-        pending_completions[pending_count].type = IoEventType::UpstreamSend;
-        pending_completions[pending_count].result = -err;
-        pending_completions[pending_count].buf_id = 0;
-        pending_completions[pending_count].has_buf = 0;
-        pending_completions[pending_count].more = 0;
-        pending_count++;
+        return false;
     }
     return true;
 }

@@ -1758,6 +1758,30 @@ TEST(frontend, parse_upstream_health_check_only_name_only) {
     CHECK(hir->upstreams[0].hc_enabled);
 }
 
+TEST(frontend, parse_upstream_health_check_accepts_optional_commas) {
+    const char* src =
+        "upstream api {\n"
+        "  host: \"127.0.0.1\"\n"
+        "  port: 8080\n"
+        "  health_check: {\n"
+        "    path: \"/healthz\"\n"
+        "    interval: 2s\n"
+        "    status: 204\n"
+        "  }\n"
+        "}\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& up = ast->items[0].upstream;
+    CHECK(up.hc_enabled);
+    CHECK_EQ(up.hc_interval_ms, 2000u);
+    CHECK_EQ(static_cast<unsigned>(up.hc_expected_status), 204u);
+    REQUIRE_EQ(up.hc_path_lit.len, 8u);
+    CHECK((up.hc_path_lit.eq({"/healthz", 8})));
+}
+
 TEST(frontend, parse_upstream_no_address_still_works) {
     // Backwards-compat: `upstream NAME` (no address) stays legal.
     // HirUpstream.has_address == false means the runtime must bind

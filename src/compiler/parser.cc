@@ -1711,7 +1711,7 @@ struct Parser {
                                                   span_from(*hc_field.value()),
                                                   hc_key);
                         }
-                        if (!take(TokenType::Comma)) break;
+                        (void)take(TokenType::Comma);
                         if (cur().type == TokenType::RBrace) break;  // trailing comma
                     }
                     auto hc_rbrace = expect(TokenType::RBrace);
