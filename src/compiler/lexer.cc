@@ -41,6 +41,9 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"else", 4})) return TokenType::KwElse;
     if (text.eq({"for", 3})) return TokenType::KwFor;
     if (text.eq({"in", 2})) return TokenType::KwIn;
+    // `and` / `or` / `not` are NOT keywords — boolean operators are the
+    // Swift-identical `&&` / `||` / `!`. The words stay reserved purely so
+    // lex() can reject them with a fix-it (see kAndDetail etc. below).
     if (text.eq({"and", 3})) return TokenType::KwAnd;
     if (text.eq({"or", 2})) return TokenType::KwOr;
     if (text.eq({"not", 3})) return TokenType::KwNot;
@@ -77,6 +80,15 @@ static TokenType keyword_type(Str text) {
 static Span token_span(const Token& tok) {
     return Span{tok.start, tok.end, tok.line, tok.col};
 }
+
+// Fix-it details for removed / reserved surface forms (DESIGN.md §3.6).
+constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
+constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
+constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
+constexpr Str kBitwiseDetail =
+    lit_str("bitwise operators are functions: bitwise.and/or/xor/flip/shiftLeft/shiftRight");
+constexpr Str kQuestionDetail =
+    lit_str("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)");
 
 }  // namespace
 
@@ -168,6 +180,15 @@ LexResult lex(Str source) {
             tok.text = source.slice(tok.start, tok.end);
             tok.type = tok.text.len == 1 && tok.text.ptr[0] == '_' ? TokenType::Underscore
                                                                    : keyword_type(tok.text);
+            // Removed word operators — reserved solely for the fix-it.
+            if (tok.type == TokenType::KwAnd)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kAndDetail);
+            if (tok.type == TokenType::KwOr)
+                return frontend_error(FrontendError::UnsupportedSyntax, token_span(tok), kOrDetail);
+            if (tok.type == TokenType::KwNot)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kNotDetail);
             if (!out.tokens.push(tok))
                 return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
@@ -291,6 +312,26 @@ LexResult lex(Str source) {
                 return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
+        // Two-char operators (Swift-identical boolean/comparison set).
+        {
+            const char next = pos < source.len ? source.ptr[pos] : '\0';
+            TokenType two = TokenType::Error;
+            if (c == '&' && next == '&') two = TokenType::AmpAmp;
+            if (c == '|' && next == '|') two = TokenType::PipePipe;
+            if (c == '!' && next == '=') two = TokenType::BangEq;
+            if (c == '<' && next == '=') two = TokenType::LtEq;
+            if (c == '>' && next == '=') two = TokenType::GtEq;
+            if (two != TokenType::Error) {
+                pos++;
+                col++;
+                tok.end = pos;
+                tok.text = source.slice(tok.start, tok.end);
+                tok.type = two;
+                if (!out.tokens.push(tok))
+                    return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+                continue;
+            }
+        }
         switch (c) {
             case '{':
                 tok.type = TokenType::LBrace;
@@ -337,6 +378,18 @@ LexResult lex(Str source) {
             case '@':
                 tok.type = TokenType::At;
                 break;
+            case '!':
+                tok.type = TokenType::Bang;
+                break;
+            // Removed / reserved symbols get targeted fix-its (DESIGN.md §3.6).
+            case '&':
+            case '^':
+            case '~':
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kBitwiseDetail);
+            case '?':
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kQuestionDetail);
             default:
                 return frontend_error(FrontendError::UnexpectedChar, token_span(tok), tok.text);
         }

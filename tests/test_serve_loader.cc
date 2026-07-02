@@ -299,7 +299,7 @@ TEST(serve_loader, add_ws_terminate_rejects_invalid_close_code) {
 
 #if RUT_ENABLE_WEBSOCKET
 TEST(serve_loader, websocket_terminate_text_match_guard_filters_content) {
-    // Content blocklist end-to-end: `guard not frame.text.matches(re".*badword.*") else { drop }`
+    // Content blocklist end-to-end: `guard !frame.text.matches(re".*badword.*") else { drop }`
     // then forward. The JIT'd handler runs the compiled regex over the payload — drop a message
     // that matches, forward one that doesn't. Proves the regex pattern/db globals emitted by
     // emit_ws_handler are compiled + back-patched by JIT finalization and called at runtime.
@@ -311,7 +311,7 @@ TEST(serve_loader, websocket_terminate_text_match_guard_filters_content) {
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
                    "route GET \"/ws\" { return websocket(backend) {\n"
-                   "  guard not frame.text.matches(re\".*badword.*\") else { frame.drop() }\n"
+                   "  guard !frame.text.matches(re\".*badword.*\") else { frame.drop() }\n"
                    "  frame.forward()\n"
                    "} }\n");
 

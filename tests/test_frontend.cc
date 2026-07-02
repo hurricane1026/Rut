@@ -551,31 +551,110 @@ TEST(frontend, lex_regex_literal_reports_trailing_escape_at_literal_start) {
     CHECK_EQ(lexed.error().span.col, 1u);
 }
 
-TEST(frontend, lex_recognizes_and_or_keywords) {
-    const char* src = "a and b or c";
+TEST(frontend, lex_recognizes_logical_operator_tokens) {
+    const char* src = "a && b || c";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
-    REQUIRE_EQ(lexed->tokens.len, 6u);  // a, and, b, or, c, EOF
-    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::KwAnd));
-    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::KwOr));
+    REQUIRE_EQ(lexed->tokens.len, 6u);  // a, &&, b, ||, c, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::AmpAmp));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::PipePipe));
 }
 
-TEST(frontend, lex_rejects_non_core_optional_symbols) {
+TEST(frontend, lex_recognizes_comparison_operator_tokens) {
+    const char* src = "a != b <= c >= d";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 8u);  // a, !=, b, <=, c, >=, d, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::BangEq));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::LtEq));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[5].type), static_cast<u8>(TokenType::GtEq));
+}
+
+TEST(frontend, lex_rejects_reserved_optional_symbols_with_fixit) {
     const char* sources[] = {
         "route GET \"/x\" { let name = req.query(\"name\") ?? \"anonymous\" return 200 }\n",
         "route GET \"/x\" { let ok = req.authorization?.hasPrefix(\"Bearer\") return 200 }\n",
-        "route GET \"/x\" { guard !req.path.contains(\"/../\") else { return 403 } return 200 "
-        "}\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
         REQUIRE(!lexed);
-        CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(
+            lit("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)")));
     }
 }
 
+TEST(frontend, lex_rejects_word_boolean_operators_with_fixit) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {"route GET \"/x\" { let x = true and false return 200 }\n",
+         "`and` is not Rut syntax; use `&&`"},
+        {"route GET \"/x\" { let x = true or false return 200 }\n",
+         "`or` is not Rut syntax; use `||`"},
+        {"route GET \"/x\" { guard not x else { return 403 } return 200 }\n",
+         "`not` is not Rut syntax; use `!`"},
+    };
+    for (const Case& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(!lexed);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(lit(c.detail)));
+    }
+}
+
+TEST(frontend, lex_rejects_bitwise_symbols_with_fixit) {
+    const char* sources[] = {
+        "route GET \"/x\" { let x = 1 & 2 return 200 }\n",
+        "route GET \"/x\" { let x = 1 ^ 2 return 200 }\n",
+        "route GET \"/x\" { let x = ~1 return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(!lexed);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(
+            lit("bitwise operators are functions: bitwise.and/or/xor/flip/shiftLeft/shiftRight")));
+    }
+}
+
+TEST(frontend, parse_supports_prefix_bang_negation_in_guard) {
+    // Parse-level only: `contains` is not an analyze-supported method yet.
+    const char* src =
+        "route GET \"/x\" { guard !req.path.contains(\"/../\") else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+}
+
+TEST(frontend, analyze_supports_bang_negation_of_bool_condition) {
+    // `!` desugars to `== false`; the whole chain must survive analyze.
+    const char* src = "route GET \"/x\" { guard !(1 == 2) else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_supports_negated_comparison_operators) {
+    const char* src =
+        "route GET \"/x\" { guard 1 != 2 else { return 403 } guard 1 <= 2 else { return 403 } "
+        "guard 2 >= 1 else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_supports_infix_or_expression) {
-    const char* src = "route GET \"/x\" { let x = true or false return 200 }\n";
+    const char* src = "route GET \"/x\" { let x = true || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -589,7 +668,7 @@ TEST(frontend, parse_supports_infix_or_expression) {
 }
 
 TEST(frontend, parse_supports_infix_and_expression) {
-    const char* src = "route GET \"/x\" { let x = true and false return 200 }\n";
+    const char* src = "route GET \"/x\" { let x = true && false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -635,7 +714,7 @@ TEST(frontend, parse_supports_any_function_call_form) {
 }
 
 TEST(frontend, parse_infix_and_or_is_left_associative) {
-    const char* src = "route GET \"/x\" { let x = true and false or false return 200 }\n";
+    const char* src = "route GET \"/x\" { let x = true && false || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -650,29 +729,47 @@ TEST(frontend, parse_infix_and_or_is_left_associative) {
     CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
 }
 
-TEST(frontend, parse_rejects_double_ampersand_operator) {
-    const char* src = "route GET \"/x\" { let x = true && false return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
-}
-
-TEST(frontend, parse_rejects_double_pipe_operator) {
-    const char* src = "route GET \"/x\" { let x = true || false return 200 }\n";
+TEST(frontend, parse_and_binds_tighter_than_or) {
+    // Swift/C precedence: a || b && c parses as a || (b && c).
+    const char* src = "route GET \"/x\" { let x = true || false && false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    auto& expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
+    CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::BoolLit));
+    CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::And));
+}
+
+TEST(frontend, parse_desugars_negated_comparisons) {
+    // a != b → (a == b) == false; likewise <= / >= via > / <.
+    const char* src =
+        "route GET \"/x\" { let x = 1 != 2 let y = 1 <= 2 let z = 1 >= 2 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 4u);
+    auto check_desugar = [&](const AstExpr& e, AstExprKind inner) {
+        CHECK_EQ(static_cast<u8>(e.kind), static_cast<u8>(AstExprKind::Eq));
+        CHECK_EQ(static_cast<u8>(e.lhs->kind), static_cast<u8>(inner));
+        CHECK_EQ(static_cast<u8>(e.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
+        CHECK_EQ(e.rhs->bool_value, false);
+    };
+    check_desugar(route.statements[0].expr, AstExprKind::Eq);  // !=
+    check_desugar(route.statements[1].expr, AstExprKind::Gt);  // <=
+    check_desugar(route.statements[2].expr, AstExprKind::Lt);  // >=
 }
 
 TEST(frontend, parse_rejects_or_function_call_form) {
     const char* src = "route GET \"/x\" { let x = or(maybe(), 200) return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_or_function_call_form_with_header) {
@@ -680,10 +777,9 @@ TEST(frontend, parse_rejects_or_function_call_form_with_header) {
         "route GET \"/x\" { let host = req.header(\"Host\") let x = or(host, \"fallback\") return "
         "200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
@@ -691,19 +787,17 @@ TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
         "route GET \"/x\" { let sid = req.cookie(\"sid\") let x = or(sid, \"fallback\") return 200 "
         "}\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form) {
     const char* src = "route GET \"/x\" { let x = and(maybe(), 200) return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form_with_header) {
@@ -711,10 +805,9 @@ TEST(frontend, parse_rejects_and_function_call_form_with_header) {
         "route GET \"/x\" { let host = req.header(\"Host\") let x = and(host, \"fallback\") return "
         "200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
@@ -722,16 +815,15 @@ TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
         "route GET \"/x\" { let sid = req.cookie(\"sid\") let x = and(sid, \"fallback\") return "
         "200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(!lexed);
+    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_pipe_with_bool_operator_rhs) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true | pass_bool(_) or false return 200 }\n";
+        "route GET \"/x\" { let x = true | pass_bool(_) || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -742,7 +834,7 @@ TEST(frontend, parse_rejects_pipe_with_bool_operator_rhs) {
 TEST(frontend, parse_allows_parenthesized_pipe_with_or) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = (true | pass_bool(_)) or false return 200 }\n";
+        "route GET \"/x\" { let x = (true | pass_bool(_)) || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -761,7 +853,7 @@ TEST(frontend, parse_allows_parenthesized_pipe_with_or) {
 TEST(frontend, parse_supports_and_expr_before_pipe) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true and false | pass_bool(_) return 200 }\n";
+        "route GET \"/x\" { let x = true && false | pass_bool(_) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -779,7 +871,7 @@ TEST(frontend, parse_supports_and_expr_before_pipe) {
 TEST(frontend, parse_supports_or_expr_before_pipe) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true or false | pass_bool(_) return 200 }\n";
+        "route GET \"/x\" { let x = true || false | pass_bool(_) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -827,7 +919,7 @@ route GET "/users" {
 TEST(frontend, parse_rejects_pipe_with_unclear_and_operand) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true | pass_bool(_) and false return 200 }\n";
+        "route GET \"/x\" { let x = true | pass_bool(_) && false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -836,7 +928,7 @@ TEST(frontend, parse_rejects_pipe_with_unclear_and_operand) {
 }
 
 TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
-    const char* lhs_mismatch = "route GET \"/users\" { let code = 200 and true return 200 }\n";
+    const char* lhs_mismatch = "route GET \"/users\" { let code = 200 && true return 200 }\n";
     auto lexed = lex(lit(lhs_mismatch));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -846,7 +938,7 @@ TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
     CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 
     const char* rhs_mismatch =
-        "route GET \"/users\" { let code = true and \"fallback\" return 200 }\n";
+        "route GET \"/users\" { let code = true && \"fallback\" return 200 }\n";
     lexed = lex(lit(rhs_mismatch));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -857,7 +949,7 @@ TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
 }
 
 TEST(frontend, analyze_rejects_and_with_fallible_operands) {
-    const char* lhs_fallible = "route GET \"/users\" { let code = error(7) and true return 200 }\n";
+    const char* lhs_fallible = "route GET \"/users\" { let code = error(7) && true return 200 }\n";
     auto lexed = lex(lit(lhs_fallible));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -866,7 +958,7 @@ TEST(frontend, analyze_rejects_and_with_fallible_operands) {
     REQUIRE_FALSE(lhs);
     CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 
-    const char* rhs_fallible = "route GET \"/users\" { let code = true and error(7) return 200 }\n";
+    const char* rhs_fallible = "route GET \"/users\" { let code = true && error(7) return 200 }\n";
     lexed = lex(lit(rhs_fallible));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -877,7 +969,7 @@ TEST(frontend, analyze_rejects_and_with_fallible_operands) {
 }
 
 TEST(frontend, analyze_rejects_and_with_nil_operands) {
-    const char* lhs_optional = "route GET \"/users\" { let code = nil and true return 200 }\n";
+    const char* lhs_optional = "route GET \"/users\" { let code = nil && true return 200 }\n";
     auto lexed = lex(lit(lhs_optional));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -887,7 +979,7 @@ TEST(frontend, analyze_rejects_and_with_nil_operands) {
     CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 
     const char* rhs_optional =
-        "route GET \"/users\" { let maybe = nil let code = true and maybe return 200 }\n";
+        "route GET \"/users\" { let maybe = nil let code = true && maybe return 200 }\n";
     lexed = lex(lit(rhs_optional));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -899,7 +991,7 @@ TEST(frontend, analyze_rejects_and_with_nil_operands) {
 
 TEST(frontend, analyze_constant_folds_and_with_false) {
     const char* src =
-        "route GET \"/users\" { let code = false and false if code { return 200 } else { return "
+        "route GET \"/users\" { let code = false && false if code { return 200 } else { return "
         "401 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -917,7 +1009,7 @@ TEST(frontend, analyze_constant_folds_and_with_false) {
 
 TEST(frontend, analyze_constant_folds_and_with_true_to_rhs) {
     const char* src =
-        "route GET \"/users\" { let code = true and true if code { return 200 } else { return 401 "
+        "route GET \"/users\" { let code = true && true if code { return 200 } else { return 401 "
         "} "
         "}\n";
     auto lexed = lex(lit(src));
@@ -936,7 +1028,7 @@ TEST(frontend, analyze_constant_folds_and_with_true_to_rhs) {
 
 TEST(frontend, analyze_preserves_non_constant_and_as_if_else) {
     const char* src =
-        "func gate(left: bool, right: bool) -> bool => left and right\n"
+        "func gate(left: bool, right: bool) -> bool => left && right\n"
         "route GET \"/users\" { return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -954,7 +1046,7 @@ TEST(frontend, analyze_preserves_non_constant_and_as_if_else) {
 
 TEST(frontend, analyze_constant_folds_or_with_true) {
     const char* src =
-        "route GET \"/users\" { let code = false or true if code { return 200 } else { return 401 "
+        "route GET \"/users\" { let code = false || true if code { return 200 } else { return 401 "
         "} "
         "}\n";
     auto lexed = lex(lit(src));
@@ -973,7 +1065,7 @@ TEST(frontend, analyze_constant_folds_or_with_true) {
 
 TEST(frontend, analyze_constant_folds_or_with_false) {
     const char* src =
-        "route GET \"/users\" { let code = false or false if code { return 200 } else { return "
+        "route GET \"/users\" { let code = false || false if code { return 200 } else { return "
         "401 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1062,7 +1154,7 @@ TEST(frontend, analyze_preserves_optional_all_as_if_else) {
 
 TEST(frontend, analyze_preserves_non_constant_or_as_if_else) {
     const char* src =
-        "func gate(left: bool, right: bool) -> bool => left or right\n"
+        "func gate(left: bool, right: bool) -> bool => left || right\n"
         "route GET \"/users\" { return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1461,11 +1553,11 @@ TEST(frontend, analyze_accepts_websocket_direction_guard) {
 }
 
 TEST(frontend, analyze_accepts_websocket_text_match_guard) {
-    // `guard not frame.text.matches(re"badword") else { frame.drop() }` then forward → one
+    // `guard !frame.text.matches(re"badword") else { frame.drop() }` then forward → one
     // TextMatch guard (negated, pattern "badword", Drop) — a content blocklist.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
-        "  guard not frame.text.matches(re\"badword\") else { frame.drop() }\n"
+        "  guard !frame.text.matches(re\"badword\") else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
@@ -9554,7 +9646,7 @@ TEST(frontend, if_const_selects_then_without_checking_else) {
 
 TEST(frontend, if_const_folds_constant_local_boolean_or) {
     const char* src =
-        "route GET \"/users\" { let flag = true if const flag or false { return 200 } else { "
+        "route GET \"/users\" { let flag = true if const flag || false { return 200 } else { "
         "return forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9570,7 +9662,7 @@ TEST(frontend, if_const_folds_constant_local_boolean_or) {
 
 TEST(frontend, if_const_folds_constant_local_boolean_and) {
     const char* src =
-        "route GET \"/users\" { let flag = false if const flag and true { return forward(missing) "
+        "route GET \"/users\" { let flag = false if const flag && true { return forward(missing) "
         "} else { return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9586,7 +9678,7 @@ TEST(frontend, if_const_folds_constant_local_boolean_and) {
 
 TEST(frontend, if_const_folds_const_comparison_boolean_or) {
     const char* src =
-        "route GET \"/users\" { if const (POST == GET) or true { return 200 } else { return "
+        "route GET \"/users\" { if const (POST == GET) || true { return 200 } else { return "
         "forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9602,7 +9694,7 @@ TEST(frontend, if_const_folds_const_comparison_boolean_or) {
 
 TEST(frontend, if_const_folds_const_comparison_boolean_and) {
     const char* src =
-        "route GET \"/users\" { if const (POST == GET) and true { return forward(missing) } else { "
+        "route GET \"/users\" { if const (POST == GET) && true { return forward(missing) } else { "
         "return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);

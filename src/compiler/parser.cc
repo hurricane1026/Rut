@@ -134,10 +134,10 @@ struct Parser {
     // bare frame verdict (frame.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
     FrontendResult<AstStatement> parse_ws_frame_guard(const Token& guard_tok) {
-        // A leading `not`/`!` negates the condition (e.g. `guard not frame.text.matches(re"…")`).
-        // General prefix-not isn't in the expression grammar; it's consumed here, scoped to the
-        // frame guard, and carried on cond_negated for the WsTerminate analyze path.
-        const bool negated = take(TokenType::KwNot) != nullptr || take(TokenType::Bang) != nullptr;
+        // A leading `!` negates the condition (e.g. `guard !frame.text.matches(re"…")`).
+        // It's consumed here, scoped to the frame guard, and carried on cond_negated for
+        // the WsTerminate analyze path (which pattern-matches the bare condition shape).
+        const bool negated = take(TokenType::Bang) != nullptr;
         auto cond = parse_expr();
         if (!cond) return core::make_unexpected(cond.error());
         auto kw_else = expect(TokenType::KwElse);
@@ -746,44 +746,89 @@ struct Parser {
         return expr;
     }
 
+    // Wrap `operand` as `operand == false` — the parse-time desugar shared by
+    // prefix `!` and the negated comparisons (`!=`, `<=`, `>=`). No new
+    // AST/HIR/MIR node kinds are needed; Bool equality lowers like any Eq.
+    FrontendResult<AstExpr> make_eq_false(AstExpr operand) {
+        AstExpr false_lit{};
+        false_lit.kind = AstExprKind::BoolLit;
+        false_lit.bool_value = false;
+        false_lit.span = operand.span;
+        auto lhs_ptr = alloc_expr(operand);
+        if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+        auto rhs_ptr = alloc_expr(false_lit);
+        if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+        AstExpr expr{};
+        expr.kind = AstExprKind::Eq;
+        expr.lhs = lhs_ptr.value();
+        expr.rhs = rhs_ptr.value();
+        expr.span = operand.span;
+        return expr;
+    }
+
+    // Prefix `!` — Swift-identical logical not, binds tighter than comparisons.
+    FrontendResult<AstExpr> parse_unary_expr() {
+        const Token* bang = take(TokenType::Bang);
+        if (!bang) return parse_primary_expr();
+        auto operand = parse_unary_expr();
+        if (!operand) return core::make_unexpected(operand.error());
+        auto expr = make_eq_false(operand.value());
+        if (!expr) return core::make_unexpected(expr.error());
+        AstExpr out = expr.value();
+        out.span = Span{bang->start, operand->span.end, bang->line, bang->col};
+        return out;
+    }
+
     FrontendResult<AstExpr> parse_eq_expr() {
-        auto lhs = parse_primary_expr();
+        auto lhs = parse_unary_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         TokenType op = TokenType::Error;
         if (take(TokenType::EqEq))
             op = TokenType::EqEq;
+        else if (take(TokenType::BangEq))
+            op = TokenType::BangEq;
+        else if (take(TokenType::LtEq))
+            op = TokenType::LtEq;
+        else if (take(TokenType::GtEq))
+            op = TokenType::GtEq;
         else if (take(TokenType::Lt))
             op = TokenType::Lt;
         else if (take(TokenType::Gt))
             op = TokenType::Gt;
         else
             return lhs.value();
-        auto rhs = parse_primary_expr();
+        auto rhs = parse_unary_expr();
         if (!rhs) return core::make_unexpected(rhs.error());
         auto lhs_ptr = alloc_expr(lhs.value());
         if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
         auto rhs_ptr = alloc_expr(rhs.value());
         if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
         AstExpr expr{};
-        expr.kind = op == TokenType::EqEq
-                        ? AstExprKind::Eq
-                        : (op == TokenType::Lt ? AstExprKind::Lt : AstExprKind::Gt);
+        // `!=` → `(a == b) == false`, `<=` → `(a > b) == false`,
+        // `>=` → `(a < b) == false` — parse-time desugar, see make_eq_false.
+        const bool negate =
+            op == TokenType::BangEq || op == TokenType::LtEq || op == TokenType::GtEq;
+        if (op == TokenType::EqEq || op == TokenType::BangEq)
+            expr.kind = AstExprKind::Eq;
+        else if (op == TokenType::Lt || op == TokenType::GtEq)
+            expr.kind = AstExprKind::Lt;
+        else
+            expr.kind = AstExprKind::Gt;
         expr.lhs = lhs_ptr.value();
         expr.rhs = rhs_ptr.value();
         expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
-        return expr;
+        if (!negate) return expr;
+        auto negated = make_eq_false(expr);
+        if (!negated) return core::make_unexpected(negated.error());
+        AstExpr out = negated.value();
+        out.span = expr.span;
+        return out;
     }
 
-    FrontendResult<AstExpr> parse_or_expr() {
+    FrontendResult<AstExpr> parse_and_expr() {
         auto lhs = parse_eq_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
-        while (true) {
-            const auto op = [&]() -> TokenType {
-                if (take(TokenType::KwAnd)) return TokenType::KwAnd;
-                if (take(TokenType::KwOr)) return TokenType::KwOr;
-                return TokenType::Error;
-            }();
-            if (op == TokenType::Error) break;
+        while (take(TokenType::AmpAmp)) {
             auto rhs = parse_eq_expr();
             if (!rhs) return core::make_unexpected(rhs.error());
             auto lhs_ptr = alloc_expr(lhs.value());
@@ -791,7 +836,28 @@ struct Parser {
             auto rhs_ptr = alloc_expr(rhs.value());
             if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
             AstExpr expr{};
-            expr.kind = op == TokenType::KwAnd ? AstExprKind::And : AstExprKind::Or;
+            expr.kind = AstExprKind::And;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
+    }
+
+    // `&&` binds tighter than `||` (Swift/C precedence).
+    FrontendResult<AstExpr> parse_or_expr() {
+        auto lhs = parse_and_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (take(TokenType::PipePipe)) {
+            auto rhs = parse_and_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = AstExprKind::Or;
             expr.lhs = lhs_ptr.value();
             expr.rhs = rhs_ptr.value();
             expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};

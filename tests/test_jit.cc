@@ -1081,7 +1081,7 @@ TEST(jit, frontend_req_cookie_any_non_short_circuit_eager_rhs_is_observed_with_p
 
 TEST(jit, frontend_req_query_and_requires_both_operands) {
     const char* src =
-        "route GET \"/users\" { if req.pathOnly == \"/users\" and any(req.queryString, \"\") == "
+        "route GET \"/users\" { if req.pathOnly == \"/users\" && any(req.queryString, \"\") == "
         "\"\" { return "
         "204 } else { return 401 } }\n";
 
@@ -1126,7 +1126,7 @@ TEST(jit, frontend_req_query_and_requires_both_operands) {
 
 TEST(jit, frontend_req_query_or_requires_either_operand) {
     const char* src =
-        "route GET \"/users\" { if req.pathOnly == \"/admin\" or req.queryString == \"q=1\" { "
+        "route GET \"/users\" { if req.pathOnly == \"/admin\" || req.queryString == \"q=1\" { "
         "return "
         "204 } else { return 401 } }\n";
 
@@ -1178,7 +1178,7 @@ TEST(jit, frontend_req_query_or_requires_either_operand) {
 TEST(jit, frontend_req_query_all_requires_expected_alternative) {
     const char* src =
         "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, \"rut\") if value == "
-        "\"rut\" or req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
+        "\"rut\" || req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1238,10 +1238,10 @@ TEST(jit, frontend_rejects_or_function_call_form) {
         "route GET \"/users\" { let token = req.header(\"Authorization\") let x = or(token, \"\") "
         "return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast);
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnexpectedToken));
+    REQUIRE_FALSE(lexed);
+    CHECK_EQ(static_cast<u8>(lexed.error().code),
+             static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(jit, frontend_rejects_and_function_call_form) {
@@ -1249,26 +1249,30 @@ TEST(jit, frontend_rejects_and_function_call_form) {
         "route GET \"/users\" { let query = req.query(\"x\") let x = and(query, \"\") return 200 "
         "}\n";
     auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast);
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnexpectedToken));
+    REQUIRE_FALSE(lexed);
+    CHECK_EQ(static_cast<u8>(lexed.error().code),
+             static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
-TEST(jit, frontend_rejects_double_ampersand_operator) {
+TEST(jit, frontend_accepts_double_ampersand_operator) {
     const char* src = "route GET \"/users\" { let value = true && false return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(static_cast<u8>(lexed.error().code), static_cast<u8>(FrontendError::UnexpectedChar));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
 }
 
-TEST(jit, frontend_rejects_double_pipe_operator) {
+TEST(jit, frontend_accepts_double_pipe_operator) {
     const char* src = "route GET \"/users\" { let value = true || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast);
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnexpectedToken));
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
 }
 
 TEST(jit, frontend_req_path_only_ignores_query_and_fragment) {
