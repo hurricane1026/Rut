@@ -2,6 +2,38 @@
 
 Outstanding work items, prioritized for the next implementation passes.
 
+## P0: Front-End Migration to the Revised Syntax Spec (branch design_syntax)
+
+**Goal**: Migrate lexer/parser/checker to the 2026-07 DESIGN.md §3 revision
+("Swift-exact or absent"). `docs/language-card.md` is the target surface;
+each item should land with fix-it diagnostics matching DESIGN.md §3.6.
+
+**Work** (roughly in dependency order):
+- Lexer: drop `and`/`or`/`not` keywords → `&&` `||` `!`; drop bitwise operator
+  tokens (`&` binary, `^`, `~`, `<<`, `>>`); keep `|` (pipeline-only in
+  expressions); add keywords `respond`, `break`, `continue`, `package`
+  (variant/protocol/impl/type already parsed).
+- Parser: `if let` / `guard let x` shorthand; `guard` condition must be bool
+  (reject bare-value truthiness with fix-it); remove postfix `?` nil-check;
+  `break`/`continue` statements; `respond status[, body] | resp` statement;
+  websocket trailing block takes explicit `{ frame in }`; object literal only
+  in call-argument position; pipeline RHS must contain `_`/`_N` placeholder.
+- Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;
+  `req.header/set/add/getAll` + `resp.set/remove/add/header` (remove hyphenated
+  header property paths); `req.params.*` capture namespace (flat `req.<capture>`
+  becomes an error with fix-it); `req.queryAll`; `respond` legality (middleware
+  only) vs status-`return` (handler only); `stats()/metrics()/reload()/
+  upstream.mark()` declarations.
+- Diagnostics: implement the §3.6 fix-it rows for `?.`, `??`, postfix `!`,
+  truthiness guard, bitwise symbols, placeholder-less pipeline, `case`,
+  middleware/handler return-respond confusion.
+- Tests/examples: migrate `examples/*.rut`, test fixtures, and docs/ topic
+  pages (match.md, pipe.md, decorators.md, for-loops.md, ...) to the new
+  surface once the front-end accepts it.
+
+**Acceptance**: language-card examples all parse and type-check; old forms
+produce the documented fix-its; `./dev.sh test` green.
+
 ## Recently Completed
 
 - [x] epoll partial-send proactor semantics and recv-buffer integration.

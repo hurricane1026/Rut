@@ -162,7 +162,7 @@ status matrix above.
   another explicit async boundary. The compiler lowers these points into state
   machines; ordinary helper functions should not hide new yield points.
 - **Strong typing with domain types**: Duration, ByteSize, StatusCode, IP, CIDR, MediaType with compile-time validation
-- **Middleware = ordinary functions**: return a status code to reject, return nothing to pass through
+- **Middleware = ordinary functions**: `respond <status>` short-circuits the request; falling through (or plain `return`) passes through. `return` keeps a single meaning everywhere — produce the function's value
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
 - **Replay and simulation are first-class**: route semantics should be
   deterministic enough that captured traffic can be replayed through the same
@@ -173,7 +173,11 @@ status matrix above.
   Features that cannot be represented in that graph should be rejected, bounded,
   or isolated behind explicit escape hatches.
 - **Three-layer model**: `listen` (downstream/client) → .rut file (gateway logic) → `upstream` (backend). No `gateway` or `downstream` keyword — the .rut file IS the gateway, `listen` IS the downstream config
-- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `route`, `match`, `if`, `else`, `for`, `in`, `return`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `and`, `or`, `not`, `nil`, `true`, `false`
+- **Minimal keyword set**: `func`, `let`, `var`, `const`, `guard`, `struct`, `variant`, `protocol`, `impl`, `type`, `route`, `match`, `if`, `else`, `for`, `in`, `break`, `continue`, `return`, `respond`, `defer`, `upstream`, `listen`, `tls`, `defaults`, `forward`, `websocket`, `fire`, `submit`, `wait`, `timer`, `init`, `shutdown`, `firewall`, `throttle`, `per`, `notify`, `import`, `using`, `as`, `package`, `nil`, `true`, `false`
+- **Swift-exact or absent**: any surface form that looks like Swift must behave
+  exactly like Swift. Near-miss variants (Swift-looking syntax with different
+  semantics) are removed rather than documented, because they are the primary
+  source of LLM-generated errors.
 
 ### 3.2 File Extension
 
@@ -192,6 +196,10 @@ status matrix above.
 
 // Regex literals — re prefix
 re"^/api/v\d+/"
+
+// Anonymous object literal — ONLY as a call argument (typically json()).
+// Never a statement, never a response/header map, never a bare expression.
+json({ users: [], total: 0 })
 
 // Number literals
 42                              // i32
@@ -216,36 +224,50 @@ let result = (
 true   false   nil
 
 // Operators
-and   or   not                  // boolean (keywords)
-&   |   ^   ~   <<   >>        // bitwise (symbols)
+&&   ||   !                     // boolean (identical to Swift)
+|                               // pipeline (shell intuition) — RHS must be a
+                                // call with a _ placeholder
 +   -   *   /   %              // arithmetic
 ==  !=  <  >  <=  >=           // comparison
 =                               // assignment
-?                               // nil check postfix (x?)
 @                               // decorator prefix
 =>                              // single-expression body / branch result
 ->                              // function return type
+
+// Bitwise — the built-in `bitwise` namespace, not symbols (same style as
+// log.info / trace.span). Bit twiddling is rare in gateway code; naming it
+// frees | to mean pipeline only and removes an entire class of operator
+// ambiguity.
+bitwise.and(a, b)    bitwise.or(a, b)    bitwise.xor(a, b)    bitwise.flip(a)
+bitwise.shiftLeft(a, n)    bitwise.shiftRight(a, n)
 ```
 
-Rut Core intentionally avoids symbolic optional chaining and null-coalescing as
-the primary surface. Use named fallback and explicit binding instead:
+Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
+force-unwrap. Use named fallback and explicit binding instead:
 
 - `value.or(default)` for "usable value or fallback"
+- `if let x = expr { ... }` to branch on and bind a usable value
 - `guard let x = expr else { ... }` when absence/failure must stop the route
+- `x == nil` / `x != nil` for a bare presence test
 - `match` when the reason for absence/failure matters
 
-The symbolic forms `?.`, `??`, and `!` remain non-core/reserved until there is
-evidence that they reduce ambiguity for humans, diagnostics, and LLM-generated
-code.
+The symbolic forms `?.`, `??`, and postfix `!` remain reserved — rejected with a
+fix-it pointing at the named forms above. There is deliberately no other postfix
+`?` operator: a construct that looks like Swift must either behave exactly like
+Swift or not exist.
 
 ### 3.2.2 Core Control-Flow Surface
 
 Rut keeps a small set of branching constructs with clear roles:
 
 - `if` — the lightweight boolean branch
-- `guard` — fail-fast branch for error handling
+- `if let` — branch on "a usable value exists", binding it (Swift-identical)
+- `guard` / `guard let` — fail-fast branch: the condition must be a bool, or
+  `guard let` binds a usable value; `else` must terminate (Swift-identical)
 - `match` — the general multi-branch construct
-- `for` — bounded iteration over finite collections
+- `for` — bounded iteration over finite collections; `break` / `continue` are
+  allowed (Swift-identical — they only shorten iteration, so the compile-time
+  execution bound is preserved)
 
 `switch` is not a language keyword. Where a traditional switch would normally be
 used, Rut uses `match`.
@@ -257,7 +279,7 @@ Examples:
 
 - `func id(x: i32) -> i32 => x`
 - `get /health => 200`
-- `case .ok(v) => v`
+- `.ok(v) => v` (match arm — Rut has no `case` keyword)
 
 Where a construct uses `=>`, the right-hand side is interpreted as a single
 expression body with implicit result/return semantics appropriate to that
@@ -286,8 +308,8 @@ C++ builtin structs — compile-time validated literals, zero-overhead access.
 
 ```swift
 let ip = req.remoteAddr              // IP
-ip.v4?                               // bool — is IPv4
-ip.v6?                               // bool — is IPv6
+ip.isV4                              // bool — is IPv4
+ip.isV6                              // bool — is IPv6
 ip.isPrivate                         // bool — RFC1918 (10.x, 172.16.x, 192.168.x)
 ip.isLoopback                        // bool — 127.0.0.0/8 or ::1
 ip.in(10.0.0.0/8)                    // bool — CIDR containment
@@ -399,6 +421,45 @@ struct OrderItem {
 }
 ```
 
+**variant** — closed sum type; `match` dispatches on cases and must be
+exhaustive (all cases or a `_ =>` fallback):
+
+```swift
+variant NetError {
+    timeout
+    refused
+    dns(string)          // case with payload
+}
+
+let e = NetError.dns("no such host")
+match e {
+    .timeout   => log.warn("timeout")
+    .dns(host) => log.warn("dns failure", host: host)
+    _          => log.warn("net error")
+}
+```
+
+Case references are `.case` (short form) or `Type.case` (qualified); bare case
+names are not accepted. Payload binding is single-layer.
+
+**protocol / impl** — explicit interface conformance:
+
+```swift
+protocol Hashable {
+    func hash() -> u64
+}
+
+impl User: Hashable {
+    func hash() -> u64 => fnv64(self.id)
+}
+```
+
+Conformance is always explicit via `impl Type: Protocol` — never structural or
+inferred. Duplicate `impl` for the same Type + Protocol pair is a compile
+error. Generics, associated types, and the type-level `match` alias facility
+are specified compiler-side in §11.1.4–§11.1.9; this section is only the
+surface summary.
+
 #### 3.3.3 Tuple
 
 Ordered, fixed-size, heterogeneous collection. Compile-time known layout.
@@ -436,24 +497,27 @@ req.origin              // string?
 req.ifModifiedSince     // Time?
 req.accept              // MediaType?
 
-// Custom headers — accessed as properties using their name
-req.X-Request-ID        // string?
-req.X-User-ID           // string?
-req.X-Timestamp         // string?
+// Custom headers — explicit function access. (A hyphen inside a property
+// name would parse as subtraction in a Swift-shaped grammar, so raw header
+// names never appear as identifiers.)
+req.header("X-Request-ID")   // string?
+req.header("X-User-ID")      // string?
+req.header("X-Timestamp")    // string?
 
-// Setting headers — direct assignment
-req.X-User-ID = "123"
-req.X-Request-ID = uuid()
+// Setting headers
+req.set("X-User-ID", "123")
+req.set("X-Request-ID", uuid())
 
-// Route parameters — path captures become req properties
+// Route parameters — path captures live in the req.params namespace,
+// so a capture can never shadow a built-in property (req.path, req.host, ...)
 // Route: get /users/:id/posts/:postId
-req.id                  // string (from :id)
-req.postId              // string (from :postId)
+req.params.id           // string (from :id)
+req.params.postId       // string (from :postId)
 
 // Query string
 req.queryString         // string? — raw query string: "page=1&limit=20"
-req.query("page")       // string? — single query parameter
-req.query("tags")       // [string]? — multi-value parameter (?tags=a&tags=b)
+req.query("page")       // string? — first value of the parameter
+req.queryAll("tags")    // [string] — all values (?tags=a&tags=b), like getAll for headers
 
 // Body
 req.body(User)          // parse body as User struct, error-capable
@@ -495,17 +559,17 @@ return 200, json(data)               // with JSON body
 
 // With headers — build response object, no { } ambiguity
 let resp = response(429)
-resp.Retry-After = "60"
+resp.set("Retry-After", "60")
 return resp
 
 let resp = response(200)
-resp.Content-Type = "application/json"
+resp.set("Content-Type", "application/json")
 resp.body = json(stats())
 return resp
 
 // Redirect
 let resp = response(301)
-resp.Location = "https://example.com\(req.path)"
+resp.set("Location", "https://example.com\(req.path)")
 return resp
 
 // Multi-value headers on response
@@ -513,11 +577,13 @@ resp.add("Set-Cookie", "a=1; Path=/")
 resp.add("Set-Cookie", "b=2; Path=/")
 
 // Delete header
-resp.Server = nil
+resp.remove("Server")
 ```
 
 `response(status)` is a built-in function that creates a Response object.
-`{ }` is only used for code blocks — never for response construction.
+A `{ }` after a status is never a header map — braces in statement position are
+always code blocks. Anonymous object literals `{ key: value }` exist only as
+call arguments (see §3.2.1), not as response construction.
 
 #### 3.3.6 State Types
 
@@ -552,9 +618,9 @@ Same pattern as nginx `proxy_cache_lock`.
 let cache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 
 get /users/:id {
-    let key = "/users/\(req.id)"
-    let cached = cache.get(key)      // miss + in-flight → auto wait for first request
-    if cached? { return 200, cached }
+    let key = "/users/\(req.params.id)"
+    // miss + in-flight → auto wait for first request
+    if let cached = cache.get(key) { return 200, cached }
     let resp = forward(userService, buffered: true)
     cache.set(key, resp.body)        // stores result + wakes all waiting connections
     return resp
@@ -653,8 +719,7 @@ notify(key) expr                   // hash(key) → owner shard — targeted
 let blacklist = Set<IP>(capacity: 100000)
 
 post /admin/ban {
-    let ip = req.body(IP)
-    guard ip else { return 400 }
+    guard let ip = req.body(IP) else { return 400 }
     blacklist.add(ip)              // local shard — immediate
     notify all blacklist.add(ip)   // all other shards — next event loop tick
     return 200
@@ -795,10 +860,11 @@ with `guard` (and later possibly `match`).
 
 | Syntax | Meaning |
 |--------|---------|
-| `x?` | nil check on the usable value channel |
 | `x.or(default)` | provide a fallback when no usable value exists |
+| `if let x = expr { ... }` | branch on and bind a usable value |
 | `guard let x = expr else { ... }` | bind usable value or terminate |
-| `a | f(_, ...)` | pipeline over the usable value channel |
+| `x == nil` / `x != nil` | bare presence test |
+| `a \| f(_, ...)` | pipeline over the usable value channel |
 
 These operators intentionally optimize for the common case: keep the normal logic
 flowing without forcing local `if/else`, `match`, or `guard` at every step.
@@ -813,13 +879,31 @@ let user = findUser(id).or(GuestUser)
 let userName = user.profileName.or("guest")
 ```
 
+Pipeline and UFCS have distinct blessed roles — they are not two spellings of
+the same thing:
+
+- **UFCS chaining** (`a.f().g()`) when the value flows into the **first**
+  parameter of each step
+- **`|` pipeline** when the value lands in a **non-first** position (explicit
+  `_` placeholder makes the position visible) or when value-channel
+  short-circuiting across stages matters
+
+`|` follows the shell-pipe intuition, and in expression position it means
+**pipeline only** — bitwise operations live in the built-in `bitwise` namespace
+(`bitwise.or(a, b)` etc., §3.2.1), so there is no second reading to confuse it
+with. (`get|post` in route
+position is a method union — a different syntactic context that never overlaps
+with expressions.) The right-hand side must be a call containing a `_` / `_N`
+placeholder; anything else is a compile error with a fix-it. The mandatory
+placeholder means a pipeline stage always shows where the value lands.
+
 When a caller needs to care about the failure reason rather than just the absence
 of a usable value, they should switch to explicit handling:
 
 ```swift
 guard let user = req.body(User) else {
     log.warn("bad body")
-    return .badRequest
+    return 400              // in a handler; inside middleware: respond 400
 }
 ```
 
@@ -829,23 +913,26 @@ the explicit failure-handling world.
 Tuple values remain ordinary values. Numbered placeholders such as `_1` and `_2`
 only project tuple slots; they do not introduce a separate error model.
 
-**`guard` scope and role**
+**`if let` / `guard let` — the only binding forms (Swift-identical)**
 
-Rut `guard` is intentionally narrower than Swift-style optional unwrapping:
+Rut keeps the binding surface exactly as Swift users expect:
 
-- `guard` handles **error**, not `nil`
-- `nil` remains part of the normal value channel and is handled by `?`,
-  `.or(...)`, `guard let`, or `match`
-- `guard ... else { ... }` must terminate control flow in the `else` block
-- `guard let x = expr else { ... }` binds the success value of `expr`, but does not implicitly unwrap optional payloads inside that success value
+- `guard <expr> else { ... }` requires a **bool** condition. A non-bool
+  expression in guard position is a compile error — there is no implicit
+  truthiness and no implicit narrowing of a bare value.
+- `guard let x = expr else { ... }` binds the usable value of `expr` (whether
+  `expr` is optional or error-capable) or runs `else`, which must terminate
+  control flow (`return`, `respond`, `continue`, or `break`).
+- `guard let x else { ... }` is the Swift 5.7 shorthand for
+  `guard let x = x else { ... }` — rebinding an already-bound optional name.
+- `if let x = expr { ... }` (and the `if let x { ... }` shorthand) is the
+  branching form of the same rule.
+- Neither form implicitly unwraps optional payloads *inside* the bound value.
 
-This means:
-
-- use `guard` when the caller needs to stop and explicitly handle failure
-- use value-flow operators when the caller only cares whether a usable value exists
-
-When a caller needs to distinguish *which* error occurred, they should use `match`
-rather than trying to overload `guard` with pattern semantics.
+Both forms treat "failed with `error(...)`" and "`nil`" uniformly as "no usable
+value" — one binding idiom covers both channels. When a caller needs to
+distinguish *which* error occurred, they should use `match` rather than trying
+to overload `guard` with pattern semantics.
 
 **`or(...)`**
 
@@ -904,9 +991,10 @@ at compile time. This prevents a buggy handler from stalling a shard.
 - **`var`** — mutable binding, **handler-local only**. Not allowed at top level.
   Protects share-nothing: no global mutable state, no cross-shard mutation.
 - **`for ... in` only** — iterates finite collections (arrays, struct fields). No `while`, no `loop`.
-- **No `break` / `continue`** — every iteration runs to completion.
+- **`break` / `continue` allowed** — Swift-identical loop control. They only
+  shorten iteration, so the compile-time execution bound is unaffected.
 - **No recursion** — all functions inline at compile time. A function calling itself is a compile error.
-- **No closures** — no first-class functions, no callbacks. Keyword-specific trailing blocks (e.g., `websocket { }` with implicit `frame`) are compile-time constructs, not closures.
+- **No closures** — no first-class functions, no callbacks. Keyword-specific trailing blocks (e.g., `websocket { frame in }`) borrow Swift's trailing-closure surface but are compile-time constructs, not runtime closures.
 
 ```swift
 // var — handler-local mutable variable
@@ -952,7 +1040,7 @@ get /api/data {
     let start = now()
     defer log.info("done", duration: now() - start)  // runs after decr (LIFO)
 
-    guard req.authorization? else { return 401 }      // defer still runs
+    guard req.authorization != nil else { return 401 }   // defer still runs
     guard req.contentLength <= 1mb else { return 413 } // defer still runs
     return forward(userService)                        // defer still runs
 }
@@ -1113,7 +1201,7 @@ All standard algorithms are built-in. The runtime tracks per-target state
 | Random | `balance: .random` | Uniform random selection |
 | Power of Two (P2C) | `balance: .powerOfTwo` | Random 2 targets, pick the one with fewer connections |
 | IP Hash | `balance: .ipHash` | Consistent hash on client IP (session affinity) |
-| Consistent Hash | `balance: .hash(expr)` | Consistent hash on arbitrary field (e.g., `req.X-User-ID`) |
+| Consistent Hash | `balance: .hash(expr)` | Consistent hash on arbitrary field (e.g., `req.header("X-User-ID")`) |
 | EWMA | `balance: .ewma` | Lowest exponential weighted moving average latency |
 
 **Custom load balancing:**
@@ -1125,7 +1213,7 @@ select a target manually using `upstream.servers` and `forward` to a specific ad
 // Custom: route to the target whose name matches a header
 func selectByHeader(_ req: Request, up: Upstream) -> Server {
     for server in up.servers {
-        if server.addr == req.X-Target-Server {
+        if server.addr == req.header("X-Target-Server") {
             return server
         }
     }
@@ -1141,6 +1229,9 @@ get /custom {
 `upstream.servers` exposes the target list as `[Server]`. `Server` has fields:
 `addr` (string), `weight` (i32), `healthy` (bool), `activeConns` (i32),
 `latencyEwma` (Duration). The user can read these to implement any selection logic.
+
+`upstream.mark(server, healthy: bool)` manually overrides a target's health —
+used by custom health checks running in `timer` blocks.
 
 **Health check modes:**
 
@@ -1252,119 +1343,131 @@ let userService = upstream {
 
 All functions are inlined at compile time. No runtime function call overhead.
 
+**`respond` — the only way to short-circuit.** Inside a function, `respond`
+terminates the whole request immediately with a response:
+
+- `respond 401` / `respond 401, "expired"` — status (+ optional body)
+- `respond resp` — a built `Response` object (e.g. a CORS preflight `204`)
+
+`return` keeps its single ordinary meaning: produce the function's value (or
+nothing) and continue normal flow. A function's declared return type describes
+only its normal value — `respond` is a separate exit channel and never
+participates in the return type. Inside a route handler, the handler's value
+*is* the response, so handlers use `return`; `respond` in a handler is a
+compile error with a fix-it (and vice versa for status-`return` in middleware).
+
 Two types of middleware, distinguished by whether the signature contains `Response`:
-- **Request middleware**: signature has no `Response` parameter — runs before handler. Return status code to reject, return nothing to pass through. E.g., `func auth(_ req: Request, role: string)`.
+- **Request middleware**: signature has no `Response` parameter — runs before handler. `respond <status>` to short-circuit, fall through to pass. E.g., `func auth(_ req: Request, role: string)`.
 - **Response middleware**: signature contains a `Response` parameter — runs after handler, before sending to client. Can modify response headers, body, status. Valid signatures: `func f(_ resp: Response)` or `func f(_ req: Request, _ resp: Response)`.
 
-`guard` is the idiomatic way to express "check or reject".
+`guard ... else { respond ... }` is the idiomatic way to express "check or reject".
 
 ```swift
 func auth(_ req: Request, role: string) -> User {
     let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { return 401 }
+    guard token.hasPrefix("Bearer ") else { respond 401 }
 
     let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard claims else { return 401 }
-    guard claims.exp >= now() else { return 401, "token expired" }
-    guard claims.role == role else { return 403 }
+    guard let claims else { respond 401 }
+    guard claims.exp >= now() else { respond 401, "token expired" }
+    guard claims.role == role else { respond 403 }
 
-    req.X-User-ID = claims.sub
-    req.X-User-Role = claims.role
+    req.set("X-User-ID", claims.sub)
+    req.set("X-User-Role", claims.role)
     return User(id: claims.sub, role: claims.role)
 }
 
 func rateLimit(_ req: Request, limits: Counter<IP>, max: i32) {
     let count = limits.incr(req.remoteAddr)
-    guard count <= max else { return 429 }
+    guard count <= max else { respond 429 }
 }
 
 func requestId(_ req: Request) {
-    if req.X-Request-ID.isEmpty {
-        req.X-Request-ID = uuid()
+    if req.header("X-Request-ID") == nil {
+        req.set("X-Request-ID", uuid())
     }
 }
 
 func cors(_ req: Request, origins: [string]) {
-    let origin = req.origin
+    guard let origin = req.origin else { return }
     guard origins.contains(origin) else {
-        if req.method == .OPTIONS { return 403 }
+        if req.method == .OPTIONS { respond 403 }
         return
     }
 
     if req.method == .OPTIONS {
         let resp = response(204)
-        resp.Access-Control-Allow-Origin = origin
-        resp.Access-Control-Allow-Methods = "GET, POST, PUT, DELETE"
-        resp.Access-Control-Allow-Headers = "Content-Type, Authorization"
-        resp.Access-Control-Max-Age = "86400"
-        return resp
+        resp.set("Access-Control-Allow-Origin", origin)
+        resp.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+        resp.set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        resp.set("Access-Control-Max-Age", "86400")
+        respond resp                       // short-circuit with a full response
     }
 
-    req.Access-Control-Allow-Origin = origin
-    req.Vary = "Origin"
+    req.set("Access-Control-Allow-Origin", origin)
+    req.set("Vary", "Origin")
 }
 
 func verifySig(_ req: Request, secret: string) {
-    let ts = req.X-Timestamp.or("")
-    guard ts.isEmpty == false else { return 401 }
-    guard now() - time(ts) <= 5m else { return 401, "expired" }
+    guard let ts = req.header("X-Timestamp") else { respond 401 }
+    guard now() - time(ts) <= 5m else { respond 401, "expired" }
 
     let payload = "\(req.method)\n\(req.path)\n\(ts)"
-    guard hmacSha256(secret, payload).hex == req.X-Signature else {
-        return 401, "bad signature"
+    guard hmacSha256(secret, payload).hex == req.header("X-Signature") else {
+        respond 401, "bad signature"
     }
 }
 
 func ipAllow(_ req: Request, cidrs: [CIDR]) {
     guard cidrs.contains(req.remoteAddr) else {
-        return 403
+        respond 403
     }
 }
 
 func maxBody(_ req: Request, limit: ByteSize) {
-    guard req.contentLength <= limit else { return 413 }
+    guard req.contentLength <= limit else { respond 413 }
 }
 
 func concurrencyLimit(_ req: Request, active: Counter<IP>, limit: i32) {
-    guard active.get(req.remoteAddr) < limit else { return 503, "overloaded" }
+    guard active.get(req.remoteAddr) < limit else { respond 503, "overloaded" }
 }
 
 // --- Response middleware (takes both Request and Response) ---
 
 func securityHeaders(_ req: Request, _ resp: Response) {
-    resp.Strict-Transport-Security = "max-age=31536000; includeSubDomains"
-    resp.X-Content-Type-Options = "nosniff"
-    resp.X-Frame-Options = "DENY"
-    resp.X-XSS-Protection = "1; mode=block"
-    resp.Referrer-Policy = "strict-origin-when-cross-origin"
-    resp.Server = nil          // strip server info
+    resp.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    resp.set("X-Content-Type-Options", "nosniff")
+    resp.set("X-Frame-Options", "DENY")
+    resp.set("X-XSS-Protection", "1; mode=block")
+    resp.set("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.remove("Server")      // strip server info
 }
 
 // --- Security middleware examples ---
 
 func antiFlood(_ req: Request, perIP: Counter<IP>, global: Counter<string>) {
-    guard perIP.incr(req.remoteAddr) <= 50 else { return 429 }
-    guard global.incr("total") <= 10000 else { return 503 }
+    guard perIP.incr(req.remoteAddr) <= 50 else { respond 429 }
+    guard global.incr("total") <= 10000 else { respond 503 }
 }
 
 func waf(_ req: Request) {
     let path = req.path
-    guard !path.contains("/../") else { return 403, "path traversal" }
-    guard !urlDecode(path).contains("/../") else { return 403, "encoded traversal" }
+    guard !path.contains("/../") else { respond 403, "path traversal" }
+    guard !urlDecode(path).contains("/../") else { respond 403, "encoded traversal" }
 
     let input = "\(path) \(req.queryString.or(""))"
     guard !input.matches(re"(?i)UNION\s+SELECT|DROP\s+TABLE|<script|javascript:") else {
-        log.warn("waf blocked", { addr: req.remoteAddr })
-        return 403
+        log.warn("waf blocked", addr: req.remoteAddr)
+        respond 403
     }
 }
 
 func blockBots(_ req: Request) {
     let ua = req.userAgent.lower()
-    guard !ua.isEmpty else { return 403 }
+    guard !ua.isEmpty else { respond 403 }
     let blocked = ["bot", "spider", "crawler", "scraper"]
     for word in blocked {
-        guard !ua.contains(word) else { return 403 }
+        guard !ua.contains(word) else { respond 403 }
     }
 }
 ```
@@ -1442,8 +1545,8 @@ func requestId(_ req: Request) { ... }
 
 // Post — signature contains Response
 func addSecurityHeaders(_ resp: Response) {
-    resp.Server = nil
-    resp.X-Content-Type-Options = "nosniff"
+    resp.remove("Server")
+    resp.set("X-Content-Type-Options", "nosniff")
 }
 
 // Post — also contains Response (req available too)
@@ -1506,12 +1609,12 @@ route {
 //   :name(uuid)    — captures only if segment is a valid UUID
 //   *rest          — captures remaining path segments as string (must be last)
 
-get /users/:id(i64) {         // req.id is i64, returns 404 if not numeric
+get /users/:id(i64) {         // req.params.id is i64, returns 404 if not numeric
     return forward(userService)
 }
 
-get /files/*path {            // req.path captures "docs/2024/readme.md"
-    return read(root: "/var/www")
+get /files/*rest {            // req.params.rest captures "docs/2024/readme.md"
+    return read(root: "/var/www")  // req.path is still the full "/files/docs/…"
 }
 ```
 
@@ -1534,7 +1637,7 @@ route {
     *.example.com {
         get|post /** {
             let resp = response(301)
-            resp.Location = "https://www.example.com\(req.path)"
+            resp.set("Location", "https://www.example.com\(req.path)")
             return resp
         }
     }
@@ -1567,8 +1670,7 @@ route {
         get /users/:id(i64) => forward(userService)
 
         post /orders {
-            let order = req.body(Order)
-            guard order else { return 400 }
+            guard let order = req.body(Order) else { return 400 }
             for item in order.items {
                 guard item.qty > 0 else { return 400, "invalid quantity" }
             }
@@ -1669,8 +1771,8 @@ get /users/:id => forward(userService)
 // Buffered — modify headers
 get /users/:id {
     let resp = forward(userService, buffered: true)
-    resp.Server = nil
-    resp.X-Request-ID = req.X-Request-ID
+    resp.remove("Server")
+    resp.set("X-Request-ID", req.header("X-Request-ID").or(""))
     return resp
 }
 
@@ -1678,7 +1780,7 @@ get /users/:id {
 get /users/:id {
     let resp = forward(userService, buffered: true)
     if resp.status >= 500 {
-        log.error("upstream error", { status: resp.status, path: req.path })
+        log.error("upstream error", status: resp.status, path: req.path)
     }
     if resp.status == 404 {
         resp.status = 200
@@ -1700,7 +1802,9 @@ The compiler detects which mode to use:
 let resp = forward(userService, buffered: true)
 resp.status                   // StatusCode — read/write
 resp.body                     // string — read/write
-resp.Server                   // string? — header read/write
+resp.header("Server")         // string? — header read
+resp.set("Server", val)       // header write (replace)
+resp.remove("Server")         // header delete
 resp.add("Set-Cookie", val)   // append multi-value header
 resp.getAll("Set-Cookie")     // [string] — all values
 resp.cookie("session")        // string? — read a Set-Cookie value by name
@@ -1714,17 +1818,14 @@ let sessionMap = Hash<string, string>(capacity: 100000, ttl: 1h)
 
 get /api/*path {
     // Sticky session — route to previously learned upstream
-    let sid = req.cookie("session")
-    if sid? {
-        let target = sessionMap.get(sid)
-        if target? {
+    if let sid = req.cookie("session") {
+        if let target = sessionMap.get(sid) {
             return forward(target)
         }
     }
     // First request — forward normally, learn the session
     let resp = forward(userService, buffered: true)
-    let newSid = resp.cookie("session")
-    if newSid? {
+    if let newSid = resp.cookie("session") {
         sessionMap.set(newSid, resp.upstream)
     }
     return resp
@@ -1748,9 +1849,8 @@ For custom caching logic, use `LRU` state type + `forward(buffered: true)`:
 let responseCache = LRU<string, string>(capacity: 10000, ttl: 5m)
 
 get /users/:id {
-    let key = "/users/\(req.id)"
-    let cached = responseCache.get(key)
-    if cached? {
+    let key = "/users/\(req.params.id)"
+    if let cached = responseCache.get(key) {
         return 200, cached
     }
     let resp = forward(userService, buffered: true)
@@ -1765,7 +1865,7 @@ get /users/:id {
 
 ```swift
 func mirror(_ req: Request, to: string) {
-    fire post http://{to}{req.path} {
+    fire post http://\(to)\(req.path) {
         Headers: req.headers
         Body: req.bodyRaw
         Timeout: 5s           // timeout for the fire, won't block caller
@@ -1809,12 +1909,14 @@ get /ws/graphql {
 
 **Frame inspection and modification:**
 
-Trailing block runs per frame. `frame` is the implicit variable.
+The trailing block runs per frame and declares its parameter explicitly,
+Swift-trailing-closure style: `{ frame in ... }`. It is compiled into the
+route's state machine — not a runtime closure.
 
 ```swift
 get /ws/events {
     guard req.upgrade == .websocket else { return 400 }
-    websocket(eventService, maxMessageSize: 64kb) {
+    websocket(eventService, maxMessageSize: 64kb) { frame in
         // --- frame properties ---
         // frame.isText       bool
         // frame.isBinary     bool
@@ -1833,14 +1935,14 @@ get /ws/events {
         // return .inject("extra message")   forward original + inject extra frame
 
         // Example: filter profanity from client messages
-        if frame.direction == .client and frame.isText {
-            guard not frame.text.matches(re"(?i)badword|profanity") else {
+        if frame.direction == .client && frame.isText {
+            guard !frame.text.matches(re"(?i)badword|profanity") else {
                 return .drop
             }
         }
 
         // Example: inject metadata into upstream messages
-        if frame.direction == .upstream and frame.isText {
+        if frame.direction == .upstream && frame.isText {
             return .send("\(frame.text)\n<!-- gateway: \(now()) -->")
         }
 
@@ -2055,18 +2157,17 @@ get /stream => read(path: "/tmp/data_pipe")
 
 // Buffered — read into memory for modification
 get /index.html {
-    let content = read(path: "/var/www/index.html")
-    guard content else { return 404 }
-    let html = content.or("").replace("{{VERSION}}", env("APP_VERSION"))
+    guard let content = read(path: "/var/www/index.html") else { return 404 }
+    let html = content.replace("{{VERSION}}", env("APP_VERSION"))
     let resp = response(200)
-    resp.Content-Type = "text/html"
+    resp.set("Content-Type", "text/html")
     resp.body = html
     return resp
 }
 ```
 
 Parameters:
-- `read(root:)` — directory mode: joins `root + *path` capture
+- `read(root:)` — directory mode: joins `root` + the route's `*` catch-all capture (whatever its name)
 - `read(path:)` — specific file/pipe/device
 - `fallback:` — file served when target not found (SPA)
 - `index:` — default `"index.html"` for directory requests
@@ -2088,18 +2189,17 @@ Same async safety model — compiler generates yield points, io_uring/epoll back
 **TCP — connection-oriented, stream:**
 
 ```swift
-let conn = tcp("redis:6379")           // error-capable TcpConn, compiler yields
-guard conn else { return 502 }
+// error-capable TcpConn, compiler yields
+guard let conn = tcp("redis:6379") else { return 502 }
 defer conn.close()
 
 conn.send("PING\r\n")                  // send data
-let data = conn.recv(maxSize: 4kb)     // error-capable string, compiler yields
-guard data else { return 502 }
+// error-capable string, compiler yields
+guard let data = conn.recv(maxSize: 4kb) else { return 502 }
 
 // With timeout
 let h = submit conn.recv(maxSize: 4kb)
-let data = any(wait(h, 1s))
-guard data else { return 504 }
+guard let data = any(wait(h, 1s)) else { return 504 }
 ```
 
 `TcpConn` members:
@@ -2112,16 +2212,14 @@ guard data else { return 504 }
 **UDP — connectionless, datagrams:**
 
 ```swift
-let sock = udp()
-guard sock else { return 500 }
+guard let sock = udp() else { return 500 }
 defer sock.close()
 
 // Send (fire-and-forget, typical for metrics/logging)
 sock.sendTo("10.0.0.1:8125", "myapp.requests:1|c")
 
-// Receive
-let data = sock.recvFrom(maxSize: 4kb)   // error-capable `(string, IP)`
-guard data else { return 502 }
+// Receive — error-capable `(string, IP)`
+guard let data = sock.recvFrom(maxSize: 4kb) else { return 502 }
 let (payload, sender) = data
 ```
 
@@ -2134,12 +2232,10 @@ via `defer`. No `while` loops prevent unbounded read loops.
 ```swift
 // stdlib/redis.rut
 func redisGet(_ req: Request, addr: string, key: string) -> string? {
-    let conn = tcp(addr)
-    guard conn else { return nil }
+    guard let conn = tcp(addr) else { return nil }
     defer conn.close()
     conn.send("GET \(key)\r\n")
-    let resp = conn.recv(maxSize: 16kb)
-    guard resp else { return nil }
+    guard let resp = conn.recv(maxSize: 16kb) else { return nil }
     return parseRedisReply(resp)
 }
 ```
@@ -2151,13 +2247,16 @@ reports an error if it finds code after a terminal statement.
 
 | Statement | Effect |
 |-----------|--------|
-| `return N` | Send HTTP response with status code N |
-| `return forward(upstream)` | Forward request to upstream (zero-copy) |
-| `return read(root:)` | Serve static file/pipe (zero-copy) |
-| `return websocket(upstream)` | Upgrade to WebSocket and proxy |
+| `return N` | (handler) Send HTTP response with status code N |
+| `return forward(upstream)` | (handler) Forward request to upstream (zero-copy) |
+| `return read(root:)` | (handler) Serve static file/pipe (zero-copy) |
+| `return websocket(upstream)` | (handler) Upgrade to WebSocket and proxy |
+| `respond N` / `respond N, body` / `respond resp` | (middleware) Short-circuit the request with a response |
 
-All terminal statements use `return`. `forward`, `read`, `websocket` without
-`return` (assigned to `let`) are non-terminal buffered operations.
+In handlers all terminal statements use `return` — the handler's value is its
+response. In middleware, `respond` is the terminal statement. `forward`, `read`,
+`websocket` without `return` (assigned to `let`) are non-terminal buffered
+operations.
 
 ```swift
 get /users/:id {
@@ -2180,21 +2279,19 @@ let stable  = upstream { "10.0.0.4:8080" }
 
 // By header
 get /api/users/:id {
-    let target = match req.X-API-Version {
+    let target = match req.header("X-API-Version") {
         "v2" => usersV2
         _    => usersV1
     }
     return forward(target)
 }
 
-// Canary release: percentage-based
+// Canary release: percentage-based — a two-way bool branch uses if, not match
 get /api/** {
-    let hash = fnv32(req.remoteAddr)
-    let target = match hash % 100 < 10 {
-        true => canary
-        _    => stable
+    if fnv32(req.remoteAddr) % 100 < 10 {
+        return forward(canary)
     }
-    return forward(target)
+    return forward(stable)
 }
 
 // Blue-green via environment variable
@@ -2224,9 +2321,10 @@ let res = post http://order-service/create {
     Timeout: 10s
 }
 
-// Using the response
+// Using the response — the call itself is error-capable, unwrap first
+guard let res else { return 502 }
 guard res.status == 200 else { return 502 }
-let user = res.body(User)
+guard let user = res.body(User) else { return 502 }
 
 // Fire-and-forget (non-blocking, don't wait for response)
 // On failure (connect refused, DNS error, timeout): auto log.warn, never affects caller.
@@ -2247,8 +2345,7 @@ database for one-pass scanning.
 guard req.path.matches(re"^/api/v\d+/") else { return 404 }
 
 // Capture groups — error-capable match extraction
-let m = req.path.match(re"^/api/v(\d+)/(.*)")
-guard m else { return 404 }
+guard let m = req.path.match(re"^/api/v(\d+)/(.*)") else { return 404 }
 let version = m[1]    // "2"
 let rest = m[2]       // "users/123"
 
@@ -2271,10 +2368,10 @@ matches all patterns simultaneously.
 // User writes N separate checks:
 func waf(_ req: Request) {
     let input = "\(req.path) \(req.queryString.or(""))"
-    guard !input.matches(re"(?i)UNION\s+SELECT") else { return 403 }
-    guard !input.matches(re"(?i)DROP\s+TABLE") else { return 403 }
-    guard !input.matches(re"<script") else { return 403 }
-    guard !input.matches(re"javascript:") else { return 403 }
+    guard !input.matches(re"(?i)UNION\s+SELECT") else { respond 403 }
+    guard !input.matches(re"(?i)DROP\s+TABLE") else { respond 403 }
+    guard !input.matches(re"<script") else { respond 403 }
+    guard !input.matches(re"javascript:") else { respond 403 }
 }
 
 // Compiler merges into one Vectorscan database, one scan → O(input_length),
@@ -2500,11 +2597,9 @@ This is the current implementation contract. A future language-level scope chapt
 
 ```swift
 // Checked numeric conversion
-let page = parseInt("42")
-guard page else { return 400 }
+guard let page = parseInt("42") else { return 400 }
 
-let weight = parseFloat("3.14")
-guard weight else { return 400 }
+guard let weight = parseFloat("3.14") else { return 400 }
 
 // With value fallback
 let limit = parseInt(req.query("limit").or("20")).or(20)
@@ -2538,7 +2633,7 @@ import { rateLimit } from "stdlib/ratelimit.rut"
 import { cors, securityHeaders } from "stdlib/security.rut"
 ```
 
-#### 3.4.19 No FFI
+#### 3.4.21 No FFI
 
 Rutlang has no `extern func` or FFI mechanism. The gateway only communicates via
 HTTP. External systems (Redis, databases, LDAP, HSM) are accessed through HTTP
@@ -2548,7 +2643,7 @@ Rationale: FFI breaks all compile-time guarantees — bounded execution, memory
 safety, share-nothing isolation. A single C++ function call could block, malloc,
 segfault, or access shared memory.
 
-#### 3.4.20 Concurrent I/O
+#### 3.4.22 Concurrent I/O
 
 `submit` starts an async I/O operation without waiting. `wait` collects results.
 Maps directly to io_uring batched submission.
@@ -2560,8 +2655,8 @@ let h2 = submit get http://order-service/orders?user=1
 
 // Wait all — single yield point, one io_uring_enter syscall
 let (r1, r2) = wait(h1, h2)           // pair of error-capable responses
-guard r1 else { return 502 }
-guard r2 else { return 502 }
+guard let r1 else { return 502 }
+guard let r2 else { return 502 }
 return 200, json({ user: r1.body, orders: r2.body })
 
 // Wait any — first response wins, cancel rest
@@ -2569,8 +2664,8 @@ let first = any(wait(h1, h2))         // first-completing error-capable response
 
 // All — wait all, fail-fast on first error (cancel rest)
 let (r1, r2) = all(h1, h2)            // both succeed or first error
-guard r1 else { return 502 }
-guard r2 else { return 502 }
+guard let r1 else { return 502 }
+guard let r2 else { return 502 }
 ```
 
 `wait` also accepts a Duration — compiler generates `IORING_OP_TIMEOUT`:
@@ -2581,13 +2676,12 @@ wait(2s)
 
 // Timeout — race I/O against deadline, cancel loser
 let h = submit get http://slow-service/data
-let result = any(wait(h, 5s))     // first to complete wins
-guard result else { return 504, "timeout" }
+// first to complete wins
+guard let result = any(wait(h, 5s)) else { return 504, "timeout" }
 
 // Custom timeout on any I/O (alternative to per-call timeout: parameter)
 let h1 = submit forward(userService, buffered: true)
-let resp = any(wait(h1, 30s))
-guard resp else { return 504 }
+guard let resp = any(wait(h1, 30s)) else { return 504 }
 return resp
 ```
 
@@ -2605,7 +2699,7 @@ for host in healthCheckHosts {
 }
 ```
 
-#### 3.4.21 Timers
+#### 3.4.23 Timers
 
 Background periodic tasks. Top-level declaration alongside `listen`, `upstream`, `route`.
 
@@ -2614,7 +2708,11 @@ Background periodic tasks. Top-level declaration alongside `listen`, `upstream`,
 timer checkHealth, every: 5s, shard: 0 {
     for server in userService.servers {
         let res = get http://\(server)/health
-        if not res? or res.status != 200 {
+        guard let res else {
+            userService.mark(server, healthy: false)
+            continue
+        }
+        if res.status != 200 {
             userService.mark(server, healthy: false)
         }
     }
@@ -2640,7 +2738,7 @@ Parameters:
 Timer body can use I/O (`get http://`, `fire`, `submit`/`wait`). The compiler
 generates a state machine per timer, scheduled by the shard's event loop.
 
-#### 3.4.22 Lifecycle Hooks
+#### 3.4.24 Lifecycle Hooks
 
 `init` runs once per shard at startup, **before** accepting connections.
 `shutdown` runs once per shard on graceful shutdown, **after** all connections drain.
@@ -2649,7 +2747,7 @@ Both can use I/O.
 ```swift
 init {
     let resp = get http://config-service/warmup
-    guard resp else {
+    guard let resp else {
         log.error("warmup failed")
         return
     }
@@ -2679,7 +2777,7 @@ process start
   → process exit
 ```
 
-#### 3.4.23 Distributed Tracing
+#### 3.4.25 Distributed Tracing
 
 Automatic runtime behavior — the compiler instruments every `forward`, `submit`,
 `get http://` call. Users write zero tracing code.
@@ -2736,7 +2834,7 @@ Everything a gateway needs, with zero external dependencies:
 // --- I/O ---
 get/post/put/delete url { }   // HTTP calls to external services
 fire post url { }             // fire-and-forget HTTP (traffic mirroring, async logging)
-forward(upstream)                // forward to upstream, with optional response callback
+forward(upstream)                // forward to upstream (zero-copy when returned)
 forward(upstream, streaming:)   // streaming proxy (large body, no buffering)
 websocket(upstream)           // WebSocket transparent proxy
 read(root:, fallback:)        // file/pipe I/O: zero-copy (return) or buffered (let)
@@ -2757,7 +2855,8 @@ upstream { breaker: ... }     // circuit breaker (consecutive failures → open 
 upstream { retry: ... }       // retry policy (on specific status codes, with backoff)
 
 // --- Request ---
-req.query("key")              // query string parameter access
+req.query("key")              // string? — first value of a query parameter
+req.queryAll("key")           // [string] — all values of a query parameter
 req.queryString               // raw query string
 req.cookie("name")            // cookie access
 
@@ -2801,6 +2900,7 @@ sha256(data)                  // string (hex)
 sha384(data)                  // string (hex)
 sha512(data)                  // string (hex)
 fnv32(data)                   // u32 (non-crypto, for load balancing)
+fnv64(data)                   // u64 (non-crypto, for hashing/sharding)
 
 // --- HMAC ---
 hmacSha256(key, data)         // string (hex)
@@ -2837,8 +2937,7 @@ req.bodyJson()                // dynamic JSON, error-capable
 req.multipart()               // multipart/form-data, error-capable
 
 // Json — dynamic JSON access (no struct required)
-let j = req.bodyJson()
-guard j else { return 400 }
+guard let j = req.bodyJson() else { return 400 }
 j.field("name")              // Json? — nested access
 j.string()                   // error-capable extract as string
 j.int()                      // error-capable extract as number
@@ -2868,12 +2967,21 @@ json(value)                   // serialize to JSON string
 upstream_status()             // string (JSON) — all upstreams: targets, health, connections
 config_dump()                 // string (JSON) — current compiled config: routes, middleware, TLS
 shard_stats()                 // string (JSON) — per-shard: requests, connections, memory, latency
+stats()                       // Stats — request/connection counters, json()-serializable
+metrics()                     // Metrics — metrics snapshot for push/export, json()-serializable
+reload()                      // trigger config hot reload (same as SIGHUP / admin endpoint)
 
 // --- Numeric ---
 i8, i16, i32, i64             // signed integers, wrapping overflow
 u8, u16, u32, u64             // unsigned integers, wrapping overflow
 f32, f64                      // floating point
-Bit operations: & | ^ << >> ~
+// Bit operations — built-in `bitwise` namespace (symbols reserved; | is the pipeline):
+bitwise.and(a, b)             // a & b
+bitwise.or(a, b)              // a | b
+bitwise.xor(a, b)             // a ^ b
+bitwise.flip(a)               // ~a
+bitwise.shiftLeft(a, n)       // a << n
+bitwise.shiftRight(a, n)      // a >> n
 ```
 
 ### 3.6 Compile-Time Checks
@@ -2881,7 +2989,8 @@ Bit operations: & | ^ << >> ~
 | Check | Example | Error |
 |-------|---------|-------|
 | Route conflict | `get /users/:id` + `get /users/:name` | "conflicting route patterns" |
-| Route param | `get /users/:id { forward(req.name) }` | "route has no param :name" |
+| Route param | `get /users/:id { ... req.params.name ... }` | "route has no param :name (declared: :id)" |
+| Flat capture access | `req.id` for route param `:id` | "route captures live in req.params; use req.params.id" |
 | Param type | `get /users/:id(i64)` with non-numeric path | returns 404 at runtime; type-checked at use site |
 | Type error | `User(id: 123)` | "id expects string, got i32" |
 | Domain value | `listen :70000` | "port range 1-65535" |
@@ -2894,14 +3003,21 @@ Bit operations: & | ^ << >> ~
 | Header spell | `req.athorization` | "warning: did you mean authorization?" |
 | Indirect call | `let f = auth; f(req)` | "functions cannot be assigned to variables" |
 | guard exhaustive | `guard expr else { ... }` with non-terminating or missing `else` | "guard must have else clause" |
-| Optional access | `req.authorization.hasPrefix("B")` | "value may be nil, use guard let, match, or .or(default)" |
+| Optional access | `req.authorization.hasPrefix("B")` | "value may be nil, use if let, guard let, or .or(default)" |
+| Optional chaining | `req.accept?.subtype` | "?. is not supported; use if let / guard let" |
+| Null coalescing | `a ?? b` | "?? is not supported; use a.or(b)" |
+| Force unwrap | `x!` | "postfix ! is not supported; use if let / guard let" |
+| Bitwise symbol | `a & b`, `a ^ b`, `~a`, `a << 2` | "bitwise operators are functions in the bitwise namespace; use bitwise.and(a, b) / bitwise.xor(a, b) / bitwise.flip(a) / bitwise.shiftLeft(a, 2)" |
+| Pipeline without placeholder | `x \| f(y)` | "right side of \| must be a call with a _ placeholder; write f(y, _) — or f(_, y) — to show where the value lands" |
+| Truthiness guard | `guard claims else { ... }` | "guard condition must be bool; to bind a value use `guard let claims = ... else`" |
+| Status return in middleware | `return 401` inside a middleware func | "middleware short-circuits with `respond 401`; `return` is only for the function's value" |
+| respond in handler | `respond 200` inside a route handler | "a handler's return value is its response; use `return 200`" |
 | Response middleware | `func f(_ resp: Response)` applied where only pre-middleware expected | "signature contains Response — this is a post-middleware, will run after handler" (info) |
 | TLS without host | `tls "x.com"` but no `x.com { }` in route | warning: "TLS cert declared but no routes for x.com" |
 | Host without TLS | `x.com { }` in route but no `tls "x.com"` and listen uses TLS | "no TLS certificate for host x.com" |
 | Duplicate TLS | two `tls "x.com"` declarations | "duplicate TLS declaration for x.com" |
 | Host pattern | `x.y.z { }` in route with invalid domain chars | "invalid host pattern" |
-| Error-capable value ignored | `let x = req.body(User)` and later code assumes a usable value without fallback/guard | "expression may fail; use guard, match, or a value fallback such as .or(default)" |
-| Error/nil confusion | treating an error-capable value as plain Optional without an explicit value-flow operation | "failure and nil are distinct; use guard/match for error handling or value-flow operators to treat failure as no value" |
+| Error-capable value ignored | `let x = req.body(User)` and later code assumes a usable value without fallback/guard | "expression may fail; use guard let, if let, match, or a value fallback such as .or(default)" |
 | Regex syntax | `re"[unclosed"` | "invalid regex: unclosed bracket" |
 | Regex capture | `m[3]` but pattern has 2 groups | "regex has 2 capture groups, index 3 out of range" |
 | Recursion | `func foo() { foo() }` | "recursive call detected: foo → foo" |
@@ -2924,16 +3040,15 @@ The language has no `async`, `await`, `future`, or `promise` keywords. User writ
 // User writes:
 func auth(_ req: Request, role: string) -> User {
     let token = req.authorization.or("")
-    guard token.isEmpty == false else { return 401 }
+    guard !token.isEmpty else { respond 401 }
     let res = get http://auth/verify {     // compiler knows: I/O point
         Authorization: token
     }
-    guard res else { return 502 }          // error-capable response
-    guard res.status == 200 else { return 401 }
-    let user = res.body(User)
-    guard user else { return 401 }         // error-capable body parse
-    guard user.role == role else { return 403 }
-    req.X-User-ID = user.id
+    guard let res else { respond 502 }     // error-capable response
+    guard res.status == 200 else { respond 401 }
+    guard let user = res.body(User) else { respond 401 }   // error-capable body parse
+    guard user.role == role else { respond 403 }
+    req.set("X-User-ID", user.id)
     return user
 }
 
@@ -2955,15 +3070,23 @@ func auth(_ req: Request, role: string) -> User {
 
 ### 3.8 Swift Syntax Features Used
 
+The rule is **Swift-exact or absent**: every construct below keeps Swift's exact
+semantics. Anything that would look like Swift but behave differently was
+removed from the language instead of documented as a variation.
+
 | Feature | Example | Why |
 |---------|---------|-----|
-| `guard ... else` | `guard jwtDecode(token, secret: key) else { return 401 }` | Perfect for middleware "reject or continue" pattern |
+| `guard let ... else` | `guard let claims = jwtDecode(token, secret: key) else { respond 401 }` | Middleware "reject or continue"; Swift-identical, incl. the `guard let x else` shorthand |
+| `if let` | `if let cached = cache.get(key) { return 200, cached }` | Swift-identical optional binding |
+| Boolean operators | `a && b`, `a \|\| b`, `!a` | Identical to Swift — no `and`/`or`/`not` near-miss |
+| `break` / `continue` | loop control inside `for ... in` | Swift-identical; only shortens iteration, bound preserved |
 | Named parameters | `auth(req, role: "user")` | Self-documenting calls, LLMs generate correct argument order |
 | `_` unlabeled param | `func auth(_ req: Request, role: string)` | First param (always req) doesn't need label |
-| Named fallback | `req.authorization.or("")` | Core optional fallback surface; symbolic chaining remains non-core/reserved |
+| Named fallback | `req.authorization.or("")` | Core optional fallback surface; `??` / `?.` / postfix `!` remain reserved (rejected with fix-its) |
 | `let` / `var` | `let x = ...` (immutable), `var x = ...` (mutable) | `var` only inside func/handler, not at top level |
 | String interpolation | `"\(req.method)\n\(req.path)"` | Cleaner than concatenation |
 | `.enumCase` | `balance: .leastConn` | Concise enum values |
+| Trailing block | `websocket(x) { frame in ... }` | Swift trailing-closure surface; compiled to a state machine, not a closure |
 | No commas in blocks | Multi-line blocks don't need commas | Cleaner, less noise |
 
 ### 3.9 Complete Example
@@ -3042,22 +3165,22 @@ let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 
 func auth(_ req: Request, role: string) {
     let token = req.authorization.or("")
-    guard token.isEmpty == false else { return 401 }
-    guard token.hasPrefix("Bearer ") else { return 401 }
+    guard !token.isEmpty else { respond 401 }
+    guard token.hasPrefix("Bearer ") else { respond 401 }
 
     let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard claims else { return 401 }
-    guard claims.exp >= now() else { return 401, "token expired" }
-    guard claims.role == role else { return 403 }
+    guard let claims else { respond 401 }
+    guard claims.exp >= now() else { respond 401, "token expired" }
+    guard claims.role == role else { respond 403 }
 
     req.ctx.userId = claims.sub
     req.ctx.userRole = claims.role
 }
 
 func addSecHeaders(_ resp: Response) {
-    resp.Strict-Transport-Security = "max-age=31536000"
-    resp.X-Content-Type-Options = "nosniff"
-    resp.Server = nil
+    resp.set("Strict-Transport-Security", "max-age=31536000")
+    resp.set("X-Content-Type-Options", "nosniff")
+    resp.remove("Server")
 }
 
 // ---------- Timers ----------
@@ -3065,7 +3188,11 @@ func addSecHeaders(_ resp: Response) {
 timer checkHealth, every: 10s, shard: 0 {
     for server in userService.servers {
         let res = get http://\(server.addr)/ping
-        if not res? or res.status != 200 {
+        guard let res else {
+            userService.mark(server, healthy: false)
+            continue
+        }
+        if res.status != 200 {
             userService.mark(server, healthy: false)
         }
     }
@@ -3094,23 +3221,21 @@ route {
     @priority(.high)
     api.example.com {
         get /users/:id(i64) {
-            guard not blacklist.contains(req.remoteAddr) else { return 403 }
+            guard !blacklist.contains(req.remoteAddr) else { return 403 }
 
-            let cached = userCache.get("/users/\(req.id)")
-            if cached? {
+            if let cached = userCache.get("/users/\(req.params.id)") {
                 return 200, cached
             }
 
             let resp = forward(userService, buffered: true)
-            resp.X-Request-ID = req.X-Request-ID
-            resp.X-Powered-By = nil
-            userCache.set("/users/\(req.id)", resp.body)
+            resp.set("X-Request-ID", req.header("X-Request-ID").or(""))
+            resp.remove("X-Powered-By")
+            userCache.set("/users/\(req.params.id)", resp.body)
             return resp
         }
 
         post /orders {
-            let order = req.body(Order)
-            guard order else { return 400 }
+            guard let order = req.body(Order) else { return 400 }
             for item in order.items {
                 guard item.qty > 0 else { return 400, "invalid quantity" }
             }
@@ -3138,8 +3263,7 @@ route {
             return 200
         }
         post /ban {
-            let ip = req.body(IP)
-            guard ip else { return 400 }
+            guard let ip = req.body(IP) else { return 400 }
             blacklist.add(ip)
             notify all blacklist.add(ip)
             return 200
@@ -5250,19 +5374,22 @@ branching rather than making failure-to-match part of overload resolution:
 
 ```rut
 type Storage<T> match {
-case T: Copy => Inline<T>
-case T: MoveOnly => Box<T>
-case _ => Ref<T>
+    T: Copy => Inline<T>
+    T: MoveOnly => Box<T>
+    _ => Ref<T>
 }
 
 func clone_or_move<T>(x: T) -> T {
-    comptime if T: Clone {
+    if const T: Clone {
         x.clone()
     } else {
         x
     }
 }
 ```
+
+Type-level `match` arms use the same `pattern => ...` spelling as value-level
+`match` — there is no `case` keyword at either level.
 
 Rules for this family of features:
 
@@ -5274,7 +5401,9 @@ Rules for this family of features:
 - implementation remains monomorphized; no trait objects or erased dispatch are implied
 
 Current implementation status: the first front-end slice supports top-level
-generic type aliases and ordered type-level `match` aliases:
+generic type aliases and ordered type-level `match` aliases (note: this slice
+still spells arms with a legacy `case` prefix; the target syntax above drops
+`case` to match value-level `match`):
 
 ```rut
 type Storage<T> match {
@@ -5319,7 +5448,7 @@ type-alias facility, not overload selection.
 
 #### 11.1.6 Pipeline Placeholder Rules
 
-Rut may support a pipeline operator for staged dataflow, but if it does, the placeholder rules should be explicit and compile-time checked.
+Rut supports the shell-style pipeline operator `|` for staged dataflow. The placeholder rules are explicit and compile-time checked.
 
 The intended placeholder model is:
 
@@ -5353,7 +5482,12 @@ This placeholder system is intentionally future-friendly:
 - multi-input pipelines can later reuse the same numbered-slot model
 - the syntax does not need to be redesigned when tuple-fed stages are introduced
 
-The pipeline operator should only trigger its special pipeline semantics when the right-hand side is a stage application using placeholders. That keeps bitwise operators and pipeline syntax distinguishable at compile time while preserving a clear path for stream-style lowering and fusion optimizations.
+In expression position `|` means pipeline only — bitwise operations are named
+functions (§3.2.1), so no contextual disambiguation is needed. The right-hand
+side of `|` must be a call expression containing at least one placeholder;
+anything else is a compile error with a fix-it suggesting a placeholder stage
+(`f(_, ...)`). This is a validation rule, not a disambiguation rule, and it
+keeps a clear path for stream-style lowering and fusion optimizations.
 
 #### 11.1.6A Recursive Tuple Type Shapes
 
@@ -5570,7 +5704,7 @@ The semantic distinction still matters:
 But the ergonomic value-flow surface intentionally works in terms of the value
 channel:
 
-- `|`, `?`, and `.or(default)` are value-oriented syntax
+- `|` and `.or(default)` are value-oriented syntax
 - they optimize for "keep going if a usable value exists"
 - in these forms, failure behaves like "no usable value", so the expression flows as `nil`
 
@@ -5670,20 +5804,21 @@ every local context.
 
 **First-stage `match` forms**
 
-Rut should support:
+Rut should support (there is no `case` keyword — arms use the uniform
+`pattern => ...` form from §3.2.2):
 
 - `match expr { ... }`
-- `case <literal>:`
-- `case .variant:`
-- `case .variant(x):`
-- `case Type.variant:`
-- `case _:` as fallback
+- `<literal> => ...`
+- `.variant => ...`
+- `.variant(x) => ...`
+- `Type.variant => ...`
+- `_ => ...` as fallback
 
 Payload binding is intentionally shallow in the first stage:
 
 - single-layer payload binding is supported
 - deep nested destructuring is not
-- OR-patterns, range patterns, and `case ... if cond` are not part of the first stage
+- OR-patterns, range patterns, and pattern guards (`pattern if cond =>`) are not part of the first stage
 
 `match` is initially a statement form. It does not need to be an expression in the
 first implementation.
@@ -5693,7 +5828,7 @@ first implementation.
 For `variant`-based matches, the compiler should require either:
 
 - all cases are covered, or
-- a `case _:` fallback is present
+- a `_ =>` fallback is present
 
 That exhaustiveness check is one of the main reasons to have `match` at all, and it
 should be part of the first-stage design.
@@ -5867,7 +6002,7 @@ Source:
 get /users/:id {
     let user = auth(req, role: "user")
     rateLimit(req, limit: 100, window: 1m)
-    req.X-User-ID = req.id
+    req.set("X-User-ID", req.params.id)
     forward(userService)
 }
 ```
@@ -6032,7 +6167,7 @@ public:
 };
 
 // No register_native / FFI — Rutlang communicates with external systems
-// via HTTP (get/post), TCP (tcp()), or UDP (udp()). See §3.4.19 No FFI.
+// via HTTP (get/post), TCP (tcp()), or UDP (udp()). See §3.4.21 No FFI.
 ```
 
 ### 11.4 LSP Server
@@ -6223,8 +6358,8 @@ let users = upstream {
 
 // Request-level timeout via any(wait()):
 let h = submit forward(userService, buffered: true)
-let resp = any(wait(h, 5s))   // 5s deadline, cancel if exceeded
-guard resp else { return 504 }
+// 5s deadline, cancel if exceeded
+guard let resp = any(wait(h, 5s)) else { return 504 }
 ```
 
 ```
@@ -6253,7 +6388,7 @@ let authService = service("http://auth-service") {
 // Use like a typed HTTP client — same syntax, but with retry + breaker:
 func auth(_ req: Request, role: string) -> User {
     let token = req.authorization.or("")
-    guard token.isEmpty == false else { return 401 }
+    guard !token.isEmpty else { respond 401 }
 
     let res = authService.get("/verify") {
         Authorization: token
@@ -6261,7 +6396,8 @@ func auth(_ req: Request, role: string) -> User {
     // If auth-service returns 502 → auto-retry up to 2 times
     // If 5 consecutive failures → circuit opens → instant 503 for 30s
 
-    guard res.status == 200 else { return 401 }
+    guard let res else { respond 503 }
+    guard res.status == 200 else { respond 401 }
     return res.body(User)
 }
 
@@ -6300,7 +6436,7 @@ let users = upstream {
 // Periodic refresh using timer:
 timer refreshUsers, every: 10s, shard: 0 {
     let res = get http://consul:8500/v1/health/service/user-service
-    guard res else { return }
+    guard let res else { return }
     // update upstream targets from Consul response
 }
 ```
@@ -6345,29 +6481,25 @@ fire (async calls)      ✅              -               -
 // Structured logging — built into the language
 func auth(_ req: Request, role: string) -> User {
     let token = req.authorization.or("")
-    guard token.isEmpty == false else {
-        log.warn("missing auth token", {
-            path: req.path
-            addr: req.remoteAddr
-        })
-        return 401
+    guard !token.isEmpty else {
+        log.warn("missing auth token", path: req.path, addr: req.remoteAddr)
+        respond 401
     }
 
     let res = get http://auth/verify {
         Authorization: token
     }
+    guard let res else { respond 502 }
 
     guard res.status == 200 else {
-        log.error("auth service rejected", {
-            status: res.status
-            path: req.path
-            upstream: "auth-service"
-        })
-        return 401
+        log.error("auth service rejected",
+            status: res.status, path: req.path, upstream: "auth-service")
+        respond 401
     }
 
-    log.debug("auth ok", { userId: claims.sub, role: claims.role })
-    return User(id: claims.sub, role: claims.role)
+    guard let user = res.body(User) else { respond 502 }
+    log.debug("auth ok", userId: user.id, role: user.role)
+    return user
 }
 
 // Log levels: debug, info, warn, error
@@ -6384,16 +6516,16 @@ func auth(_ req: Request, role: string) -> User {
 // Manual spans for fine-grained tracing:
 func processOrder(_ req: Request) {
     trace.span("validate_order") {
-        let order = req.body(Order)
-        guard order else { return 400 }
-        guard !order.items.isEmpty else { return 400 }
+        guard let order = req.body(Order) else { respond 400 }
+        guard !order.items.isEmpty else { respond 400 }
     }
 
     trace.span("check_inventory") {
         let res = post http://inventory/check {
             Body: order.items
         }
-        guard res.status == 200 else { return 503 }
+        guard let res else { respond 503 }
+        guard res.status == 200 else { respond 503 }
     }
 
     forward(orders)
@@ -6837,13 +6969,13 @@ TCP stack. Users don't need to know eBPF exists.
 // firewall — network-level rules, compiled to eBPF, runs in kernel
 firewall {
     // IP blacklist — line-rate filtering
-    guard not blacklist.contains(src.ip) else { drop }
+    guard !blacklist.contains(src.ip) else { drop }
 
     // CIDR filtering
-    guard not badNetworks.contains(src.ip) else { drop }
+    guard !badNetworks.contains(src.ip) else { drop }
 
     // Port whitelist — only allow declared listen ports
-    guard dst.port == 443 or dst.port == 80 else { drop }
+    guard dst.port == 443 || dst.port == 80 else { drop }
 
     // SYN flood protection — rate limit new connections per IP
     if src.isSYN {
@@ -6851,9 +6983,9 @@ firewall {
     }
 
     // TLS fingerprinting — block known malware/scanner clients
-    if src.tls? {
+    if src.isTLS {
         guard allowedDomains.contains(src.tls.sni) else { drop }
-        guard not badFingerprints.contains(src.tls.ja3) else { drop }
+        guard !badFingerprints.contains(src.tls.ja3) else { drop }
     }
 
     // TCP fingerprint — drop non-standard OS signatures (scanners)
@@ -6872,7 +7004,7 @@ firewall {
 | `dst.ip` | IP | Destination IP address |
 | `dst.port` | Port | Destination port |
 | `src.isSYN` | bool | TCP SYN flag |
-| `src.tls?` | bool | Is TLS ClientHello |
+| `src.isTLS` | bool | Is TLS ClientHello |
 | `src.tls.sni` | string? | TLS SNI domain name |
 | `src.tls.ja3` | string? | JA3 TLS client fingerprint |
 | `src.ttl` | i32 | IP TTL value |
@@ -6972,8 +7104,7 @@ are updated:
 
 ```swift
 post /admin/ban {
-    let ip = req.body(IP)
-    guard ip else { return 400 }
+    guard let ip = req.body(IP) else { return 400 }
     blacklist.add(ip)               // userspace Set (immediate)
     notify all blacklist.add(ip)    // all shard userspace Sets
     // compiler auto-generates: update eBPF map via Node Agent
