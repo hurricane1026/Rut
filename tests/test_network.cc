@@ -13277,6 +13277,42 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     close(new_fds[1]);
 }
 
+TEST(state_invariant, jit_forward_connect_submit_failure_sends_502) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    SmallLoop loop;
+    loop.setup();
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_EQ(c->upstream_idx, 0u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+
+    close(fds[1]);
+}
+
 // State 1: Accept → ReadingHeader {on_recv=header, rest=null}
 TEST(state_transition, accept_to_reading_header) {
     SmallLoop loop;

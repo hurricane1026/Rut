@@ -1864,7 +1864,19 @@ void handle_jit_outcome(Loop* loop,
             }
             conn.upstream_fd = kUpstreamFd;
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
+            if (!loop->submit_connect(
+                    conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+                ::close(conn.upstream_fd);
+                conn.upstream_fd = -1;
+                conn.upstream_idx = 0;
+                loop->clear_upstream_fd(conn.id);
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             return;
         }
         case JitDispatchOutcome::Kind::Error:
