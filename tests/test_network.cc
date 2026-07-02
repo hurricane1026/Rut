@@ -2937,37 +2937,51 @@ TEST(route, upstream_backend_list_full) {
 
 // === UpstreamPool ===
 
-TEST(upstream_pool, alloc_free) {
+TEST(upstream_pool, put_take_roundtrip) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    CHECK_EQ(c->fd, -1);
-    CHECK(!c->idle);
-    pool.free(c);
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 5, 0, 0));
+    CHECK_EQ(pool.idle_count, 1u);
+    CHECK_EQ(pool.take_idle(5, 0), sv[0]);  // healthy idle socket handed back
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK_EQ(pool.take_idle(5, 0), -1);  // pool now empty
+    close(sv[0]);
+    close(sv[1]);
 }
 
-TEST(upstream_pool, find_idle) {
+TEST(upstream_pool, take_idle_keyed_by_endpoint) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->fd = 42;
-    c->upstream_id = 5;
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 7, 2, 0));
+    CHECK_EQ(pool.take_idle(7, 0), -1);     // wrong backend index
+    CHECK_EQ(pool.take_idle(9, 2), -1);     // wrong upstream id
+    CHECK_EQ(pool.take_idle(7, 2), sv[0]);  // exact endpoint match
+    close(sv[0]);
+    close(sv[1]);
+}
 
-    CHECK(pool.find_idle(5) == nullptr);
-    pool.return_idle(c);
-    CHECK(c->idle);
+TEST(upstream_pool, take_idle_evicts_dead_socket) {
+    UpstreamPool pool;
+    pool.init();
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);  // peer closed → the probe reads EOF on sv[0]
+    REQUIRE(pool.put_idle(sv[0], 5, 0, 0));
+    CHECK_EQ(pool.take_idle(5, 0), -1);  // MSG_PEEK sees EOF → evict + close
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(sv[0]) < 0);  // take_idle already closed it
+}
 
-    auto* found = pool.find_idle(5);
-    CHECK_EQ(found, c);
-    CHECK(!found->idle);
-
-    pool.return_idle(c);
-    CHECK(pool.find_idle(99) == nullptr);
-
-    c->fd = -1;
-    pool.free(c);
+TEST(upstream_pool, take_idle_empty_and_bad_fd) {
+    UpstreamPool pool;
+    pool.init();
+    CHECK_EQ(pool.take_idle(0, 0), -1);  // cold pool, no scan
+    CHECK(!pool.put_idle(-1, 0, 0, 0));  // bad fd rejected
+    CHECK_EQ(pool.idle_count, 0u);
 }
 
 TEST(upstream_pool, create_socket) {
@@ -2980,16 +2994,52 @@ TEST(upstream_pool, create_socket) {
     if (fd >= 0) close(fd);
 }
 
-TEST(upstream_pool, shutdown_closes_fds) {
+TEST(upstream_pool, shutdown_closes_idle_fds) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    c->fd = dup(2);
-    REQUIRE(c->fd >= 0);
-    i32 saved_fd = c->fd;
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    REQUIRE(pool.put_idle(fd, 1, 0, 0));
     pool.shutdown();
-    CHECK(close(saved_fd) < 0);
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(fd) < 0);  // closed by shutdown
+    pool.shutdown();       // idempotent
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+}
+
+// drain() closes every parked socket (config reload → stale endpoint), leaving the
+// pool empty but usable — guards against reusing a keep-alive fd to an old backend.
+TEST(upstream_pool, drain_closes_idle_sockets) {
+    UpstreamPool pool;
+    pool.init();
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 3, 0, 0));
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.drain();
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    CHECK_EQ(pool.take_idle(3, 0), -1);  // nothing reusable after a drain
+    CHECK(close(sv[0]) < 0);             // drain closed the parked fd
+    close(sv[1]);
+}
+
+// sweep() closes sockets parked at least max_idle_sec ago — bounds dead-socket
+// accumulation for endpoints that never get another request to trigger the probe.
+TEST(upstream_pool, sweep_evicts_expired_idle) {
+    UpstreamPool pool;
+    pool.init();
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    REQUIRE(pool.put_idle(sv[0], 4, 0, /*now_sec=*/100));
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.sweep(/*now_sec=*/150, /*max_idle_sec=*/60);  // idle 50s < 60 → kept
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.sweep(/*now_sec=*/161, /*max_idle_sec=*/60);  // idle 61s ≥ 60 → evicted
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(sv[0]) < 0);  // sweep closed the parked fd
+    close(sv[1]);
 }
 
 // === SlicePool ===
@@ -3528,63 +3578,759 @@ TEST(slab_pool, init_map_mmap_failure) {
     CHECK_EQ(pool.free_top, 0u);
 }
 
-TEST(upstream_pool, double_free_rejected) {
+TEST(upstream_pool, put_idle_full_rejects) {
     UpstreamPool pool;
     pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    u32 before = pool.free_top;
-    c->fd = -1;  // no real fd to close
-    pool.free(c);
-    CHECK_EQ(pool.free_top, before + 1);
-    pool.free(c);                         // double-free: allocated=false now
-    CHECK_EQ(pool.free_top, before + 1);  // unchanged
+    pool.free_top = 0;  // simulate a full pool
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    CHECK(!pool.put_idle(fd, 1, 0, 0));  // no slot → caller keeps ownership
+    CHECK_EQ(pool.idle_count, 0u);
+    close(fd);
 }
 
-// === UpstreamPool validation ===
+// === Idle-reuse dead-socket fallback (retry_reused_upstream) ===
 
-TEST(upstream_pool, return_idle_null_safe) {
-    UpstreamPool pool;
-    pool.init();
-    pool.return_idle(nullptr);  // should not crash
+// A reused upstream that died before any response retries on a fresh connect for
+// an idempotent method: a new connect is submitted and upstream_reused is cleared
+// (one-shot, so a fresh-connect failure isn't retried again).
+TEST(upstream_reuse, fallback_retries_idempotent_method) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);  // idempotent
+    c->upstream_reused = true;
+    // The bodyless request must still be replayable from recv_buf (the retry
+    // re-sends straight out of it).
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), sizeof(get_req) - 1);
+    c->req_initial_send_len = sizeof(get_req) - 1;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);  // fresh connect submitted
+    CHECK(!c->upstream_reused);                             // one-shot
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
-TEST(upstream_pool, return_idle_requires_allocated) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
+// A reused idempotent request whose body already began streaming upstream must NOT
+// retry: recv_buf was reset + refilled with body chunks, so the original request is
+// gone and a replay would send a truncated/garbage request. (Finding 1 regression —
+// e.g. a PUT mid-upload after a dead pooled socket.)
+TEST(upstream_reuse, fallback_refuses_streamed_body_upload) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
     REQUIRE(c != nullptr);
-    c->fd = -1;
-    pool.free(c);
-    // c is now free — return_idle should reject
-    pool.return_idle(c);
-    CHECK(!c->idle);  // not marked idle (allocated=false)
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Put);  // idempotent method...
+    c->upstream_reused = true;
+    // ...but a body chunk has already been streamed: recv_buf holds only that chunk,
+    // not the headers/body, and req_body_streamed records the loss.
+    c->req_body_streamed = true;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;  // counters can read "complete" yet upload isn't replayable
+    static const char chunk[] = "trailing-body-bytes";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(chunk), sizeof(chunk) - 1);
+    c->req_initial_send_len = sizeof(chunk) - 1;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(!rut::retry_reused_upstream(&loop, *c));          // refused
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);  // no fresh connect
+    CHECK(!c->upstream_reused);                             // still cleared (one-shot)
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
-TEST(upstream_pool, shutdown_is_idempotent) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
+// A bodyless DELETE (no buffered body) stays retryable — request_fully_resendable
+// allows it since recv_buf still holds the complete request.
+TEST(upstream_reuse, fallback_retries_bodyless_delete) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
     REQUIRE(c != nullptr);
-    c->fd = UpstreamPool::create_socket();
-    pool.shutdown();
-    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
-    pool.shutdown();  // second shutdown
-    CHECK_EQ(pool.free_top, UpstreamPool::kMaxConns);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Delete);
+    c->upstream_reused = true;
+    c->req_body_mode = BodyMode::None;
+    static const char del_req[] = "DELETE /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(del_req), sizeof(del_req) - 1);
+    c->req_initial_send_len = sizeof(del_req) - 1;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
-TEST(upstream_pool, alloc_resets_upstream_id) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
+// A non-idempotent reused request is NOT resent (the backend may have received it
+// before the reset → double-execution risk); the caller falls through to 502.
+TEST(upstream_reuse, fallback_skips_non_idempotent_method) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
     REQUIRE(c != nullptr);
-    c->upstream_id = 42;
-    c->fd = -1;
-    pool.free(c);
-    auto* c2 = pool.alloc();
-    CHECK_EQ(c2->upstream_id, 0u);  // reset on alloc
-    c2->fd = -1;
-    pool.free(c2);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);  // NOT idempotent
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(!rut::retry_reused_upstream(&loop, *c));          // no retry
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);  // no fresh connect
+    CHECK(!c->upstream_reused);                             // still cleared (one-shot)
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A non-reused (freshly-connected) failure never triggers the fallback.
+TEST(upstream_reuse, fallback_noop_when_not_reused) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->upstream_reused = false;
+    loop.backend.clear_ops();
+    CHECK(!rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
+// Regression: a reused-socket send error must NOT retry when an early upstream
+// response is already buffered (the backend replied while our send was in flight).
+// on_upstream_request_sent serves the buffered response instead of reconnecting.
+TEST(upstream_reuse, send_error_with_buffered_response_serves_not_retries) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);  // idempotent → retry IS eligible
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    // Backend already replied (early response buffered) before our send errored.
+    static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, -1));
+
+    // The buffered response is served (no fresh connect / dropped response).
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
+// Findings 1+2: when a request is forwarded to a REUSED pooled socket, the
+// request-sent path snapshots the resendable request into send_buf and then
+// RELEASES recv_buf unconditionally (so the just-sent request can't leak into the
+// next request, and pipelined downstream bytes flow through pipeline_recover).
+TEST(upstream_reuse, request_sent_reused_snapshots_into_send_buf) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->req_initial_send_len = len;
+    c->upstream_recv_buf.reset();  // no early response buffered
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+
+    CHECK_EQ(c->retry_req_send_len, len);  // snapshot length recorded
+    CHECK_EQ(c->recv_buf.len(), 0u);       // recv_buf released for ALL conns
+    CHECK_EQ(c->send_buf.len(), len);      // request bytes copied into send_buf
+    CHECK(__builtin_memcmp(c->send_buf.data(), get_req, len) == 0);
+    CHECK(rut::request_fully_resendable(*c));  // replayable from the snapshot
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Regression: when GET1 and pipelined GET2 arrive in the same read, the reused-fd
+// send-success path must keep a retry copy of GET1 while also stashing GET2.
+TEST(upstream_reuse, request_sent_reused_snapshots_before_pipeline_stash) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get1[] = "GET /one HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char get2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(get1) - 1;
+    const u32 len2 = sizeof(get2) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(get2), len2);
+    c->req_initial_send_len = len1;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+
+    CHECK_EQ(c->retry_req_send_len, len1);
+    CHECK_EQ(c->pipeline_stash_len, len2);
+    CHECK_EQ(c->send_buf.len(), len1 + len2);
+    CHECK(__builtin_memcmp(c->send_buf.data(), get1, len1) == 0);
+    CHECK(__builtin_memcmp(c->send_buf.data() + len1, get2, len2) == 0);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+
+    CHECK(rut::request_fully_resendable(*c));
+    REQUIRE(rut::pipeline_recover(*c));
+    CHECK_EQ(c->recv_buf.len(), len2);
+    CHECK(__builtin_memcmp(c->recv_buf.data(), get2, len2) == 0);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Regression: retry_req_send_len is also the offset to the stashed pipelined
+// suffix. Receiving response bytes proves GET1 will not be retried, but the
+// marker must survive until pipeline_recover copies GET2 from after GET1.
+TEST(upstream_reuse, response_preserves_stash_offset_until_pipeline_recover) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get1[] = "GET /one HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char get2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(get1) - 1;
+    const u32 len2 = sizeof(get2) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(get2), len2);
+    c->req_initial_send_len = len1;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->pipeline_stash_len, len2);
+    REQUIRE_EQ(c->send_buf.len(), len1 + len2);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+
+    CHECK_EQ(c->retry_req_send_len, len1);
+    REQUIRE(rut::pipeline_recover(*c));
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->recv_buf.len(), len2);
+    CHECK(__builtin_memcmp(c->recv_buf.data(), get2, len2) == 0);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A fresh (non-reused) connection takes NO snapshot — there is nothing to retry —
+// and recv_buf is still released at request-sent (unchanged original lifecycle).
+TEST(upstream_reuse, request_sent_fresh_takes_no_snapshot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;  // fresh connect
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->req_initial_send_len = len;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+
+    CHECK_EQ(c->retry_req_send_len, 0u);  // no snapshot for a fresh connect
+    CHECK_EQ(c->recv_buf.len(), 0u);      // recv_buf released
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Finding 1 (post-send dead socket): after recv_buf was reset at request-sent, the
+// EOF-before-any-response path retries and on_upstream_connected replays the request
+// from the send_buf snapshot (not recv_buf, which is now empty).
+TEST(upstream_reuse, retry_replays_request_from_snapshot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    c->upstream_reused = true;
+    // Post request-sent state: recv_buf empty, snapshot held in send_buf.
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();  // released at request-sent
+    c->send_buf.reset();
+    c->send_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->retry_req_send_len = len;
+    c->upstream_recv_buf.reset();  // no response byte → EOF
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    CHECK(rut::request_fully_resendable(*c));  // replayable via the snapshot
+
+    // EOF before any response → fresh connect submitted, reuse cleared (one-shot).
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK(!c->upstream_reused);
+    CHECK_EQ(c->retry_req_send_len, len);  // snapshot retained for the replay
+
+    // Drive the fresh connect to completion: the request is re-sent from send_buf.
+    loop.backend.clear_ops();
+    rut::on_upstream_connected<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    const MockOp* op = loop.backend.last_op(MockOp::Send);  // upstream send
+    REQUIRE(op != nullptr);
+    CHECK(op->send_buf == c->send_buf.data());  // replayed from the snapshot, not recv_buf
+    CHECK_EQ(op->send_len, len);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// The snapshot-based retry remains valid when the client pipelined another request
+// into recv_buf during the upstream wait: replay comes from send_buf, while recv_buf
+// is preserved for the next dispatch.
+TEST(upstream_reuse, retry_allowed_when_pipelined_bytes_buffered) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->send_buf.reset();
+    c->send_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->retry_req_send_len = len;
+    // A pipelined next request raced into recv_buf during the wait.
+    static const char pipelined[] = "GET /next HTTP/1.1\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), sizeof(pipelined) - 1);
+
+    CHECK(rut::request_fully_resendable(*c));  // replayable from the snapshot
+}
+
+// Before the initial reused-fd send completes, recv_buf can still contain the original
+// request followed by pipelined bytes. The retry can replay only the request prefix;
+// the normal successful-send path stashes the surplus for the next dispatch.
+TEST(upstream_reuse, pre_send_retry_allows_pipelined_suffix) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char pipelined[] = "GET /next HTTP/1.1\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), sizeof(pipelined) - 1);
+    c->req_initial_send_len = len;
+    c->retry_req_send_len = 0;
+
+    CHECK(rut::request_fully_resendable(*c));
+}
+
+// Finding (F3): on the snapshot-retry path the request was replayed from send_buf, so
+// recv_buf holds NO original request. If the client pipelines another request into
+// recv_buf while the fresh connect/send is in flight, the retry's on_upstream_request_-
+// sent must NOT run pipeline_stash (which would mis-slice at the ORIGINAL request's
+// req_initial_send_len) nor reset recv_buf (which would drop those bytes). It must
+// preserve recv_buf so the completion path dispatches it as the next request.
+TEST(upstream_reuse, retry_preserves_pipelined_bytes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    // On the retry path: the original request lives in send_buf (replayed already),
+    // and retry_req_send_len marks it. req_initial_send_len is the ORIGINAL length.
+    static const char orig[] = "GET /orig HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 orig_len = sizeof(orig) - 1;
+    c->send_buf.reset();
+    c->send_buf.write(reinterpret_cast<const u8*>(orig), orig_len);
+    c->retry_req_send_len = orig_len;
+    c->req_initial_send_len = orig_len;
+    c->pipeline_stash_len = 0;  // a snapshot is only taken with no pipelined surplus
+    // The client pipelined a DIFFERENT-length next request during the in-flight retry;
+    // it sits at offset 0 of recv_buf (a clean request boundary).
+    static const char pipelined[] = "GET /next HTTP/1.1\r\nHost: x\r\nX: y\r\n\r\n";
+    const u32 pl_len = sizeof(pipelined) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(pipelined), pl_len);
+    c->upstream_recv_buf.reset();  // no early response yet
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(orig_len)));
+
+    // recv_buf preserved byte-for-byte; nothing stashed (no mis-slice, no drop).
+    CHECK_EQ(c->recv_buf.len(), pl_len);
+    CHECK_EQ(c->pipeline_stash_len, 0);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data(), pipelined, pl_len), 0);
+}
+
+// Finding 3: a final body chunk send that FAILS on the early-response path
+// (on_body_send_with_early_response, which otherwise ignores ev.result) must mark
+// the upload incomplete so the desynced socket is never pooled.
+TEST(upstream_reuse, early_response_failed_body_send_marks_incomplete) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    // An early keep-alive response is buffered while the body upload was still going.
+    static const char kResp[] =
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+    CHECK(!c->upstream_request_incomplete);  // precondition
+
+    rut::on_body_send_with_early_response<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, -1));
+
+    CHECK(c->upstream_request_incomplete);  // failed chunk send → not poolable
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Finding 4: a stale same-batch UpstreamSend dispatched into the on_upstream_connected
+// slot (after a retry swapped the slot) must be ignored — it is the old fd's send
+// completion, not a connect result. on_upstream_connected only ever handles connect
+// events, so any UpstreamSend reaching it is dropped (no premature request send on
+// the not-yet-connected fresh fd, no teardown).
+TEST(upstream_reuse, stale_upstream_send_ignored_in_connected_slot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(2);
+    REQUIRE(c->fd >= 0);
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+
+    // A positive byte count would otherwise look like a successful connect result.
+    rut::on_upstream_connected<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, 128));
+
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);     // no request send issued
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);  // no reconnect issued
+    CHECK(c->fd >= 0);                                      // connection untouched
+    if (c->fd >= 0) close(c->fd);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// proxy_upstream_reusable: a clean keep-alive, fully-uploaded request on the
+// current config is poolable.
+TEST(upstream_reuse, reusable_true_for_clean_keepalive) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->upstream_abandoned = false;
+    c->req_body_mode = BodyMode::None;
+    c->req_body_remaining = 0;
+    CHECK(rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// A request that ran on a now-replaced config must not be pooled (hot reload may
+// have repointed the (upstream_idx, backend_idx) endpoint to a different backend).
+TEST(upstream_reuse, reusable_rejects_stale_config) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cur{};
+    RouteConfig old{};
+    const RouteConfig* active = &cur;
+    loop.config_ptr = &active;
+    c->request_config = &old;  // ran on a since-swapped config
+    c->upstream_keep_alive = true;
+    c->req_body_mode = BodyMode::None;
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// An incomplete request upload (early upstream response cut the body short) leaves
+// the backend mid-read → not poolable.
+TEST(upstream_reuse, reusable_rejects_incomplete_upload) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 10;  // body not fully forwarded
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// Finding 3: a body send that FAILED leaves the upload truncated even though the
+// body counters (advanced before the send) read "complete". upstream_request_incomplete
+// is the authoritative signal, so proxy_upstream_reusable must refuse to pool —
+// otherwise the next request on the socket would be parsed as the leftover body.
+TEST(upstream_reuse, reusable_rejects_failed_body_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    loop.config_ptr = &active;
+    c->request_config = &cfg;
+    c->upstream_keep_alive = true;
+    c->upstream_abandoned = false;
+    // Counters look complete (advanced before the failed submit_send_upstream)...
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;
+    CHECK(rut::proxy_upstream_reusable(&loop, *c));  // sanity: complete counters alone pool
+    // ...but the send actually failed, so the upload never landed.
+    c->upstream_request_incomplete = true;
+    CHECK(!rut::proxy_upstream_reusable(&loop, *c));
+}
+
+// An upgrade (WebSocket) request is a GET but must never be replayed on a reused-
+// socket failure — replaying could open a duplicate backend session.
+TEST(upstream_reuse, fallback_skips_upgrade_request) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_wants_upgrade = true;  // WebSocket/Upgrade GET
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+    CHECK(!rut::retry_reused_upstream(&loop, *c));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// An upstream that sends bytes beyond its declared Content-Length is desynced —
+// on_upstream_response must clear upstream_keep_alive so the fd isn't pooled.
+TEST(upstream_reuse, overlong_response_not_reusable) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // Declares Content-Length: 2 but the buffer carries 3 body bytes ("hiX").
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhiX";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(!c->upstream_keep_alive);  // overlong body → not reusable
+}
+
+// A no-body response (204/304/HEAD) with any bytes after the headers means a
+// desynced keep-alive backend — not reusable.
+TEST(upstream_reuse, no_body_response_with_surplus_not_reusable) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // 204 No Content carries no body, but the backend appended a stray byte.
+    static const char kResp[] = "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\nX";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(!c->upstream_keep_alive);  // surplus after no-body headers → not reusable
+}
+
+// A clean, self-framed keep-alive response to a keep-alive request marks the
+// upstream fd reusable (upstream_keep_alive = true → it gets pooled).
+TEST(upstream_reuse, keepalive_request_pools_clean_response) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // The forwarded request asked the origin to keep the connection alive.
+    c->req_keep_alive = true;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(c->upstream_keep_alive);  // request + response both keep-alive → reusable
+}
+
+// Finding (F1) regression: a request that carried Connection: close (req_keep_alive
+// false) forwards that close intent to the origin verbatim, so even a self-framed
+// HTTP/1.1 keep-alive RESPONSE must NOT be pooled — the origin may close right after.
+// Gating on the parsed-request keep-alive (not conn.keep_alive, which is drain-derived)
+// is what catches this on a live (non-draining) shard.
+TEST(upstream_reuse, connection_close_request_not_pooled) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    // Live shard: conn.keep_alive stays true (it tracks drain state, not the request).
+    c->keep_alive = true;
+    // ...but the client's request carried Connection: close, forwarded to the origin.
+    c->req_keep_alive = false;
+    // The response itself is a perfectly self-framed keep-alive reply.
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+    CHECK(!c->upstream_keep_alive);  // request asked origin to close → never pooled
+}
+
+// capture_request_metadata records the parsed request's keep-alive intent on the
+// Connection so the upstream-pool gate reads it (not the drain-derived conn.keep_alive).
+TEST(upstream_reuse, capture_records_request_keep_alive) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+
+    // HTTP/1.1 with no Connection header → keep-alive request.
+    static const char ka[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(ka), sizeof(ka) - 1);
+    rut::capture_request_metadata(*c);
+    CHECK(c->req_keep_alive);
+
+    // HTTP/1.1 with Connection: close → not keep-alive.
+    static const char close_req[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(close_req), sizeof(close_req) - 1);
+    rut::capture_request_metadata(*c);
+    CHECK(!c->req_keep_alive);
+
+    // HTTP/1.0 default is close.
+    static const char http10[] = "GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(http10), sizeof(http10) - 1);
+    rut::capture_request_metadata(*c);
+    CHECK(!c->req_keep_alive);
 }
 
 // === RouteTable validation ===
@@ -9768,22 +10514,6 @@ TEST(early_response, consume_upstream_sent_normal) {
     u32 remaining = consume_upstream_sent(*c);
     CHECK_EQ(remaining, 0u);
     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
-}
-
-// === Coverage: upstream pool free with open fd ===
-
-TEST(upstream_pool, free_closes_fd) {
-    UpstreamPool pool;
-    pool.init();
-    auto* c = pool.alloc();
-    REQUIRE(c != nullptr);
-    // Give it a real fd (dup of stderr so close doesn't fail)
-    c->fd = dup(2);
-    REQUIRE(c->fd >= 0);
-    pool.free(c);
-    CHECK_EQ(c->fd, -1);
-    CHECK_EQ(c->allocated, false);
-    pool.shutdown();
 }
 
 // === Coverage: legacy EventLoop<Backend> alloc_upstream_buf ===

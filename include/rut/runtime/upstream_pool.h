@@ -1,25 +1,34 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include <atomic>
 
+#include <errno.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace rut {
 
-// Per-shard upstream connection pool.
+// Per-shard idle upstream connection pool (HTTP/1 keep-alive reuse).
 //
-// Manages idle (reusable) upstream connections grouped by upstream target.
-// Each shard owns one UpstreamPool — no cross-shard sharing.
+// Holds connected, currently-unused upstream sockets so a later proxy request to
+// the same endpoint can skip the TCP connect. Each shard owns one UpstreamPool;
+// fd slots remain shard-local, while idle_count is atomic so tests/metrics can
+// observe progress without racing the owner thread. An idle entry is keyed by the
+// endpoint it connects to: (upstream_id, backend_idx) — multi-backend upstreams keep a
+// separate reusable socket per backend address.
 //
-// Phase 2: simple fixed-array pool with free-stack.
-// Phase 3: SlabPool-backed, health checking, weighted load balancing.
+// Lifecycle: the proxy completion path calls put_idle() to hand a live fd over
+// (detached from its Connection); a new proxy request calls take_idle() to borrow
+// one back. The pool never owns a Connection — only the raw fd.
 
 struct UpstreamConn {
     i32 fd = -1;
-    u16 upstream_id = 0;     // which upstream target this connects to
-    bool idle = false;       // true = available for reuse
-    bool allocated = false;  // true = slot in use (guards double-free)
+    u16 upstream_id = 0;
+    u8 backend_idx = 0;      // which backend endpoint of the upstream this connects to
+    bool idle = false;       // true = parked, available for reuse
+    bool allocated = false;  // true = slot in use
+    u32 parked_sec = 0;      // monotonic seconds when parked (idle-timeout sweep)
 };
 
 struct UpstreamPool {
@@ -28,85 +37,109 @@ struct UpstreamPool {
     UpstreamConn conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top = 0;
+    // live idle entries — lets take_idle() skip the scan when cold. Atomic only for
+    // cross-thread observation; pool slot ownership remains single-threaded.
+    std::atomic<u32> idle_count{0};
 
     void init() {
         free_top = kMaxConns;
+        idle_count.store(0, std::memory_order_relaxed);
         for (u32 i = 0; i < kMaxConns; i++) {
-            conns[i].fd = -1;
-            conns[i].upstream_id = 0;
-            conns[i].idle = false;
-            conns[i].allocated = false;
+            conns[i] = UpstreamConn{};
             free_stack[i] = i;
         }
     }
 
-    // Allocate a new upstream connection slot.
-    // Caller must create the socket and initiate connect.
-    UpstreamConn* alloc() {
-        if (free_top == 0) return nullptr;
-        u32 idx = free_stack[--free_top];
-        conns[idx].fd = -1;
-        conns[idx].upstream_id = 0;
-        conns[idx].idle = false;
-        conns[idx].allocated = true;
-        return &conns[idx];
+    // Park a connected, idle upstream fd for reuse by a later request to the same
+    // (upstream_id, backend_idx) endpoint. Returns false if the pool is full (the
+    // caller must close the fd itself). The fd must have no I/O armed on it.
+    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
+        if (fd < 0 || free_top == 0) return false;
+        const u32 idx = free_stack[--free_top];
+        conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
+        idle_count.fetch_add(1, std::memory_order_release);
+        return true;
     }
 
-    // Free an upstream connection slot.
-    void free(UpstreamConn* c) {
-        if (!c || c < conns || c >= conns + kMaxConns) return;
-        if (!c->allocated) return;  // double-free detection
-        if (c->fd >= 0) {
-            close(c->fd);
-            c->fd = -1;
-        }
-        c->idle = false;
-        c->allocated = false;
-        u32 idx = static_cast<u32>(c - conns);
-        if (free_top >= kMaxConns) return;
-        free_stack[free_top++] = idx;
-    }
-
-    // Find an idle connection for the given upstream target.
-    // Returns nullptr if none available (caller should allocate + connect).
-    UpstreamConn* find_idle(u16 upstream_id) {
+    // Close parked sockets idle for at least max_idle_sec — bounds resource use for
+    // sockets a backend silently closes while parked (no event watches an idle fd;
+    // take_idle's probe only fires for endpoints that receive another request, so a
+    // low-traffic or removed endpoint could otherwise hold dead fds until reload).
+    // Driven by the per-shard 1s timer tick. No-op when the pool is empty.
+    void sweep(u32 now_sec, u32 max_idle_sec) {
+        if (idle_count.load(std::memory_order_acquire) == 0) return;
         for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].idle && conns[i].upstream_id == upstream_id && conns[i].fd >= 0) {
-                conns[i].idle = false;  // mark as busy
-                return &conns[i];
-            }
+            UpstreamConn& c = conns[i];
+            if (!c.idle || !c.allocated || c.fd < 0) continue;
+            if (now_sec - c.parked_sec < max_idle_sec) continue;
+            ::close(c.fd);
+            release_slot(i);
         }
-        return nullptr;
     }
 
-    // Return a connection to the idle pool for reuse.
-    void return_idle(UpstreamConn* c) {
-        if (!c || c < conns || c >= conns + kMaxConns) return;
-        if (!c->allocated || c->fd < 0) return;
-        c->idle = true;
-    }
-
-    // Close all connections and fully reset to initial state.
-    void shutdown() {
+    // Borrow a reusable idle fd for the given endpoint, or -1 if none is live.
+    // Each candidate is liveness-probed with a non-blocking MSG_PEEK: a socket the
+    // backend already closed (EOF) or errored is closed and skipped, and one with
+    // unexpected pending bytes (a desynced/half-pipelined socket) is discarded too
+    // — only an EAGAIN (nothing buffered, still open) socket is handed back. This
+    // catches the common idle-timeout race before any request bytes are sent; the
+    // residual probe-vs-send race is handled by the caller's idempotent resend.
+    i32 take_idle(u16 upstream_id, u8 backend_idx) {
+        if (idle_count.load(std::memory_order_acquire) == 0) return -1;
         for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].fd >= 0) {
-                close(conns[i].fd);
-                conns[i].fd = -1;
-            }
-            conns[i].idle = false;
-            conns[i].allocated = false;
-            conns[i].upstream_id = 0;
+            UpstreamConn& c = conns[i];
+            if (!c.idle || !c.allocated || c.fd < 0) continue;
+            if (c.upstream_id != upstream_id || c.backend_idx != backend_idx) continue;
+            const i32 fd = c.fd;
+            release_slot(i);
+            char probe;
+            const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
+            ::close(fd);  // EOF / unexpected data / hard error → not reusable
         }
-        // Rebuild free stack (all slots available)
+        return -1;
+    }
+
+    // Close every parked socket and return to the empty (but usable) state. Called
+    // on config reload: a hot reload can repoint an upstream endpoint while keeping
+    // the same (upstream_id, backend_idx), so idle sockets parked under the old
+    // config must not be handed out for the new endpoint. No-op when already empty.
+    void drain() {
+        if (idle_count.load(std::memory_order_acquire) == 0) return;
+        for (u32 i = 0; i < kMaxConns; i++) {
+            if (conns[i].fd >= 0) ::close(conns[i].fd);
+            conns[i] = UpstreamConn{};
+        }
         free_top = kMaxConns;
+        idle_count.store(0, std::memory_order_release);
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
-    // Create a non-blocking socket for upstream connection.
-    // Returns fd on success, -1 on failure.
+    // Close every parked socket and reset to the initial all-free state.
+    void shutdown() {
+        for (u32 i = 0; i < kMaxConns; i++) {
+            if (conns[i].fd >= 0) ::close(conns[i].fd);
+            conns[i] = UpstreamConn{};
+        }
+        free_top = kMaxConns;
+        idle_count.store(0, std::memory_order_release);
+        for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
+    }
+
+    // Create a non-blocking upstream socket. Returns fd on success, -1 on failure.
     static i32 create_socket() {
-        i32 fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        return fd;
+        return socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    }
+
+private:
+    void release_slot(u32 i) {
+        conns[i] = UpstreamConn{};
+        if (free_top < kMaxConns) free_stack[free_top++] = i;
+        u32 count = idle_count.load(std::memory_order_relaxed);
+        while (count > 0 &&
+               !idle_count.compare_exchange_weak(
+                   count, count - 1, std::memory_order_release, std::memory_order_relaxed)) {
+        }
     }
 };
 

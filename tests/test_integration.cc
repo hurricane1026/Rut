@@ -3900,6 +3900,9 @@ TEST(uring, upstream_recv_stale_data_cqe_discarded_and_rolled_back) {
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_terminal_stale = true;  // body-done pause
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    conn.idle_return_fd = sv[0];
 
     // Simulate wait() having appended 100 stale bytes to the upstream recv buffer.
     static u8 backing[4096];
@@ -3912,7 +3915,11 @@ TEST(uring, upstream_recv_stale_data_cqe_discarded_and_rolled_back) {
     loop->dispatch(make_ev_more(conn.id, IoEventType::UpstreamRecv, 100, /*more=*/1));
     CHECK(!g_upstream_recv_delivered);           // not delivered to the (repointed) slot
     CHECK_EQ(conn.upstream_recv_buf.len(), 0u);  // stale bytes rolled back
+    CHECK(conn.upstream_recv_idle_stale_bytes);  // rollback still leaves a no-pool marker
     CHECK(conn.upstream_recv_cancel_inflight);   // still draining (F_MORE is not terminal)
+    close(conn.idle_return_fd);
+    conn.idle_return_fd = -1;
+    close(sv[1]);
     loop->shutdown();
 }
 
@@ -3977,6 +3984,49 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
     CHECK_EQ(loop->pending_free_count, 0u);  // reclaim removed it from the pending-free list
     CHECK_EQ(loop->free_top, 1u);            // and pushed the slot back onto the free stack
     loop->shutdown();
+}
+
+// Codex P1 (PR #160): if close_conn runs while idle_return_fd is waiting for the
+// previous upstream recv/cancel drain, do not submit a second close-path
+// UpstreamRecv cancel for a newer upstream_fd on the same conn_id. The original
+// parked recv owns upstream_recv_* until try_deferred_upstream_rearm drains it.
+TEST(uring, close_with_idle_return_drain_skips_second_upstream_recv_cancel) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!loop->init(0, -1)) {
+        CHECK(true);
+        return;
+    }
+
+    Connection& conn = loop->conns[0];
+    conn.reset();
+    conn.id = 0;
+    i32 cli[2];
+    i32 upstream[2];
+    i32 parked[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, upstream), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, parked), 0);
+
+    conn.fd = cli[0];
+    conn.upstream_fd = upstream[0];   // newer upstream already opened
+    conn.idle_return_fd = parked[0];  // old reusable upstream parked
+    conn.pending_ops = 1;             // old recv terminal still in flight
+    conn.upstream_recv_armed = true;  // owned by the old parked recv drain
+    conn.upstream_recv_cancel_inflight = true;
+
+    loop->close_conn_impl(conn);
+
+    CHECK(conn.close_after_idle_return);
+    CHECK(conn.upstream_recv_armed);
+    CHECK(conn.upstream_recv_cancel_inflight);
+    CHECK_EQ(conn.pending_ops, 2u);  // old recv + UpstreamConnect cancel only; no 2nd recv cancel
+    CHECK(::close(cli[0]) < 0);
+    CHECK(::close(upstream[0]) < 0);
+
+    close(cli[1]);
+    close(upstream[1]);
+    close(parked[1]);
+    loop->shutdown();  // closes parked[0]
 }
 
 // Verify IoUringEventLoop::pause_recv blocks recv arming while a send wait is
@@ -6131,10 +6181,9 @@ TEST(shard, upstream_pool_initialized) {
     REQUIRE(lfd >= 0);
     REQUIRE(shard.init(0, lfd).has_value());
     CHECK(shard.upstream != nullptr);
-    // Pool should be fresh (all free)
-    auto* c = shard.upstream->alloc();
-    CHECK(c != nullptr);
-    shard.upstream->free(c);
+    // Pool should be fresh (no idle connections parked yet).
+    CHECK_EQ(shard.upstream->idle_count, 0u);
+    CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
     shard.shutdown();
     close(lfd);
 }
@@ -8516,10 +8565,11 @@ struct ScopedProxyLoop {
     u16 port = 0;
     LoopThread lt{};
     bool loop_started = false;
+    UpstreamPool* pool = nullptr;  // wired only when enable_reuse=true (idle reuse)
 
     ~ScopedProxyLoop() { teardown(); }
 
-    bool setup(const RouteConfig** active, i32 iters) {
+    bool setup(const RouteConfig** active, i32 iters, bool enable_reuse = false) {
         loop = create_real_loop();
         if (loop == nullptr) return false;
         auto lfd_result = create_listen_socket(0);
@@ -8534,6 +8584,11 @@ struct ScopedProxyLoop {
             return false;
         }
         loop->config_ptr = active;
+        if (enable_reuse) {
+            pool = new UpstreamPool();
+            pool->init();
+            loop->upstream = pool;  // enable HTTP/1 idle upstream connection reuse
+        }
         lt.loop = loop;
         lt.thread = {};
         lt.max_iters = iters;
@@ -8559,8 +8614,423 @@ struct ScopedProxyLoop {
             destroy_real_loop(loop);
             loop = nullptr;
         }
+        if (pool != nullptr) {
+            pool->shutdown();
+            delete pool;
+            pool = nullptr;
+        }
     }
 };
+
+// Upstream that serves many keep-alive requests per TCP connection and counts how
+// many distinct connections it accepted — so a test can prove the gateway reused a
+// single upstream socket across several proxied requests. Each request ends at the
+// CRLFCRLF header terminator (GETs have no body); each gets a fixed keep-alive 200.
+struct KeepAliveCountingUpstream {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<int> accept_count{0};
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~KeepAliveCountingUpstream() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<KeepAliveCountingUpstream*>(arg);
+        static const char kResp[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 c = accept(s->listen_fd, nullptr, nullptr);
+            if (c < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            s->accept_count.fetch_add(1, std::memory_order_relaxed);
+            char buf[4096];
+            u32 have = 0;
+            while (s->running.load(std::memory_order_acquire)) {
+                i32 n = recv_timeout(c, buf + have, sizeof(buf) - have, 1000);
+                if (n <= 0) break;  // peer closed / idle timeout → end this connection
+                have += static_cast<u32>(n);
+                u32 scan = 0;
+                for (u32 i = scan; i + 4 <= have; i++) {
+                    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+                        buf[i + 3] == '\n') {
+                        (void)send_all(c, kResp, sizeof(kResp) - 1);
+                        scan = i + 4;
+                    }
+                }
+                if (scan > 0) {
+                    __builtin_memmove(buf, buf + scan, have - scan);
+                    have -= scan;
+                }
+            }
+            close(c);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        started = (pthread_create(&thread, nullptr, &run, this) == 0);
+        return started;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+template <typename ShardT>
+bool wait_for_idle_pool_count(ShardT& shard, u32 expected, u32 timeout_ms = 1000) {
+    for (u32 waited = 0; waited < timeout_ms; waited++) {
+        if (shard.upstream &&
+            shard.upstream->idle_count.load(std::memory_order_acquire) >= expected)
+            return true;
+        usleep(1000);
+    }
+    return shard.upstream && shard.upstream->idle_count.load(std::memory_order_acquire) >= expected;
+}
+
+// End-to-end: three sequential keep-alive requests on ONE client connection to a
+// proxy route must share a SINGLE upstream connection — the gateway returns the
+// upstream fd to the per-shard idle pool after each response and borrows it back
+// for the next request, so the backend accepts exactly one TCP connection.
+TEST(proxy_reuse, reuses_idle_upstream_across_keepalive_requests) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true));
+
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    for (int i = 0; i < 3; i++) {
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+    }
+    close(c);
+    usleep(50000);
+
+    CHECK_EQ(backend.accept_count.load(), 1);  // one upstream connection, reused 3×
+    CHECK_EQ(proxy.pool->idle_count, 1u);      // parked for the next request
+
+    proxy.teardown();
+}
+
+// io_uring variant of the reuse e2e (Shard wires the pool for both backends). Unlike
+// epoll's synchronous detach, io_uring defers the pool-return until the cancelled
+// multishot recv drains, so the test waits until the fd actually re-enters the pool
+// before the next request borrows it. Skips where io_uring is unavailable.
+TEST(proxy_reuse, reuses_idle_upstream_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    for (int i = 0; i < 3; i++) {
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+        REQUIRE(wait_for_idle_pool_count(shard, 1));  // deferred recv-cancel drained
+    }
+    close(c);
+    usleep(50000);
+
+    CHECK_EQ(backend.accept_count.load(), 1);  // one upstream connection, reused 3×
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A request carrying Connection: close is forwarded to the origin as such, so the
+// upstream fd must not be pooled: the origin is allowed to close it after the response.
+// This mirrors the parsed-request keep-alive gate in the epoll path.
+TEST(proxy_reuse, iouring_connection_close_request_not_pooled) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    // Three requests, each on its own downstream connection that asks the gateway to
+    // close after the response (Connection: close → proxy_stream_complete tears the
+    // conn down while the deferred upstream pool-return is mid-drain).
+    for (int i = 0; i < 3; i++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        set_socket_timeouts(c, 2);
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+        close(c);
+    }
+    usleep(50000);
+
+    CHECK_EQ(backend.accept_count.load(), 3);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// Unit-level coverage for the io_uring deferred idle-pool return guards. These
+// drive try_deferred_upstream_rearm directly (the recv-drain terminal site) on a
+// non-spawned shard, so they run without live io_uring async completions: only
+// the shard's io_uring queue init must succeed (skipped otherwise). The end-to-end
+// reuse paths above still cover the wired data path on CI/real Linux.
+//
+// F1 (config recheck): a hot reload between parking idle_return_fd and the recv
+//   drain must close the parked fd rather than pool a stale-config socket.
+// F2 (stale bytes): surplus upstream bytes copied into upstream_recv_buf while the
+//   cancel drained desync reuse, so the fd must be closed, not pooled.
+TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg_a{};
+    RouteConfig cfg_b{};
+
+    // Match + empty buffer → pooled and reusable.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[0];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 5;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);            // parked fd consumed
+        CHECK_EQ(shard.upstream->idle_count, 1u);  // pooled, not closed
+        CHECK_EQ(shard.upstream->take_idle(5, 0), sv[0]);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    // Config swapped under the parked fd → closed, never pooled.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[1];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 6;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_b;  // parked under a now-superseded config
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: not pooled
+        CHECK(::close(sv[0]) < 0);                 // try_deferred already closed it
+        close(sv[1]);
+    }
+    // Config matches but stale bytes were copied into upstream_recv_buf → closed and
+    // the stale buffer is dropped so a later request cannot parse it as a response.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[2];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        u8 slice[64];
+        c.upstream_recv_buf.bind(slice, sizeof(slice));
+        const u8 junk[3] = {'a', 'b', 'c'};
+        c.upstream_recv_buf.write(junk, 3);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 7;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK_EQ(shard.upstream->idle_count, 0u);  // refused: desynced socket
+        CHECK_EQ(c.upstream_recv_buf.len(), 0u);
+        CHECK(::close(sv[0]) < 0);  // closed, not pooled
+        c.upstream_recv_buf.bind(nullptr, 0);
+        close(sv[1]);
+    }
+
+    // A positive stale idle-return CQE rolls bytes back out of upstream_recv_buf before
+    // the deferred drain runs; the separate marker must still make the fd non-reusable.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[4];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.upstream_recv_idle_stale_bytes = true;
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 9;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK(!c.upstream_recv_idle_stale_bytes);
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+        CHECK(::close(sv[0]) < 0);
+        close(sv[1]);
+    }
+
+    // Idle-return cancellation marks the old recv terminal/data stale even when
+    // resp_fully_buffered was already cleared by proxy completion.
+    {
+        shard.active_config = &cfg_a;
+        auto& c = shard.loop->conns[3];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.id = 3;
+        c.upstream_fd = sv[0];
+        c.upstream_recv_armed = true;
+        c.resp_fully_buffered = false;
+        c.upstream_recv_terminal_stale = false;
+        shard.loop->return_idle_upstream(c, 8, 0);
+        CHECK(c.upstream_recv_terminal_stale);
+        if (c.idle_return_fd >= 0) {
+            close(c.idle_return_fd);
+            c.idle_return_fd = -1;
+        }
+        close(sv[1]);
+    }
+
+    shard.shutdown();
+    close(lfd);
+}
+
+// F3: forced drain-deadline shutdown and normal shard shutdown must close a parked
+// idle_return_fd whose recv cancel may never drain. No leak, no double-close.
+TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    // Live client (fd >= 0) with a parked upstream fd whose recv is still draining.
+    auto& live = shard.loop->conns[0];
+    live.reset();
+    i32 cli[2];
+    i32 up0[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, up0), 0);
+    live.fd = cli[0];
+    live.pending_ops = 0;
+    live.upstream_recv_cancel_inflight = true;  // recv draining → close_conn defers
+    live.idle_return_fd = up0[0];
+    live.idle_return_uid = 9;
+    live.idle_return_bidx = 0;
+    live.idle_return_config = &cfg;
+
+    // Already-deferred-closed slot (client fd already gone).
+    auto& deferred = shard.loop->conns[1];
+    deferred.reset();
+    i32 up1[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, up1), 0);
+    deferred.fd = -1;
+    deferred.idle_return_fd = up1[0];
+    deferred.idle_return_uid = 11;
+    deferred.idle_return_bidx = 0;
+
+    shard.loop->force_close_all();
+
+    CHECK_EQ(live.idle_return_fd, -1);
+    CHECK_EQ(deferred.idle_return_fd, -1);
+    CHECK(::close(cli[0]) < 0);  // client fd closed by close_conn
+    CHECK(::close(up0[0]) < 0);  // parked upstream fd closed (live-client case)
+    CHECK(::close(up1[0]) < 0);  // parked upstream fd closed (deferred-close case)
+    close(cli[1]);
+    close(up0[1]);
+    close(up1[1]);
+
+    // Normal shutdown has no drain-deadline force_close_all call, but must still
+    // scan per-connection parked fds before destroying the loop.
+    auto& normal = shard.loop->conns[2];
+    normal.reset();
+    i32 up2[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, up2), 0);
+    normal.idle_return_fd = up2[0];
+
+    shard.shutdown();
+    CHECK(::close(up2[0]) < 0);
+    close(up2[1]);
+    close(lfd);
+}
 
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers

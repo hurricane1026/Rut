@@ -110,6 +110,10 @@ void capture_request_metadata(Connection& conn) {
     conn.req_body_remaining = 0;
     conn.req_chunk_parser.reset();
     conn.req_malformed = false;
+    // Default to "request asked the origin to close": only a cleanly parsed
+    // keep-alive request flips this true. A request we can't strictly parse
+    // (fallback path below) must never qualify its upstream fd for pooling.
+    conn.req_keep_alive = false;
     conn.req_wants_upgrade = false;
     conn.req_upgrade_is_websocket = false;
     conn.req_header_end = 0;
@@ -129,6 +133,10 @@ void capture_request_metadata(Connection& conn) {
         // hop-by-hop, so the token alone is not a valid client upgrade request.
         conn.req_wants_upgrade = req.upgrade && req.has_upgrade_header;
         conn.req_upgrade_is_websocket = req.upgrade_is_websocket;
+        // req.keep_alive already folds in the HTTP version default and a
+        // "Connection: close" token (close → false). This is the verbatim-
+        // forwarded request's keep-alive intent toward the origin.
+        conn.req_keep_alive = req.keep_alive && !req.connection_close;
         conn.req_method = map_log_method(req.method);
         u32 copy_len = req.path.len;
         if (copy_len >= sizeof(conn.req_path)) copy_len = sizeof(conn.req_path) - 1;
@@ -275,7 +283,8 @@ void pipeline_stash(Connection& conn) {
         conn.pipeline_stash_len = 0;
         return;
     }
-    conn.send_buf.reset();
+    const u32 kStashOff = conn.retry_req_send_len;
+    if (kStashOff == 0) conn.send_buf.reset();
     if (kLeftover > conn.send_buf.write_avail()) {
         conn.pipeline_stash_len = 0;
         return;
@@ -289,7 +298,9 @@ bool pipeline_recover(Connection& conn) {
     const u16 kStashLen = conn.pipeline_stash_len;
     conn.pipeline_stash_len = 0;
     if (kStashLen == 0) return false;
-    const u8* src = conn.send_buf.data();
+    const u32 kStashOff = conn.retry_req_send_len;
+    const u8* src = conn.send_buf.data() + kStashOff;
+    conn.retry_req_send_len = 0;
     const u32 kExisting = conn.recv_buf.len();
     if (kExisting == 0) {
         // HTTP/1 pipeline path (and the common WS case): recv_buf is empty, just

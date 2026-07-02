@@ -135,6 +135,7 @@ struct Shard {
         }
         upstream = new (up_mem) UpstreamPool();
         upstream->init();
+        loop->upstream = upstream;  // wire idle-reuse pool into the proxy data path
 
         // Access log ring is allocated lazily via init_access_log(),
         // only when --access-log is specified. No ring = no per-request overhead.
@@ -278,8 +279,14 @@ struct Shard {
     // If stopped/not spawned, applies directly (no thread to race with).
     void reload_config(const RouteConfig* cfg) {
         if (!thread_spawned) {
-            // No thread — direct apply.
+            // No thread — direct apply. The running path's poll_command() drains
+            // the idle pool on every config adopt; this not-running path must do
+            // the same, or idle fds parked under the OLD config (pointing at old
+            // endpoints) would survive into the new config and be handed out for a
+            // now-different (upstream_id, backend_idx). drain() is a no-op on an
+            // empty pool, so an apply-before-spawn is harmless.
             active_config = cfg;
+            if (upstream) upstream->drain();
             return;
         }
         // Thread may be running or exiting. Queue atomically.
@@ -304,7 +311,14 @@ struct Shard {
             // Apply any pending updates the thread didn't consume.
             // Thread is guaranteed gone — no race.
             auto* cfg = control.pending_config.exchange(nullptr, std::memory_order_acq_rel);
-            if (cfg) active_config = cfg;
+            if (cfg) {
+                // Mirror poll_command(): adopting a config on the not-running join
+                // path must also drop idle sockets parked under the old config, or
+                // a stop/join → reload → spawn sequence could hand a stale backend
+                // fd to a now-different (upstream_id, backend_idx).
+                active_config = cfg;
+                if (upstream) upstream->drain();
+            }
             auto* jit = control.pending_jit.exchange(nullptr, std::memory_order_acq_rel);
             if (jit) jit_code = jit;
             auto* cap = control.pending_capture.exchange(nullptr, std::memory_order_acq_rel);

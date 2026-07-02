@@ -123,6 +123,46 @@ struct ConnectionBase {
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    // HTTP/1 idle upstream reuse: `upstream_keep_alive` is set when the upstream
+    // response is parsed iff its connection may be reused (keep-alive, not
+    // close-delimited) — the completion path then returns the fd to the per-shard
+    // idle pool instead of closing it. `upstream_reused` marks a request whose
+    // upstream socket came from that pool, so a send/recv failure before any
+    // response byte can fall back to a fresh connect (idempotent methods only).
+    bool upstream_keep_alive;
+    bool upstream_reused;
+    // Set when a request-body write to the upstream FAILS (initial forward or a
+    // streamed chunk) so the upload was not fully delivered. The body counters
+    // (req_body_remaining / req_chunk_parser) are advanced before the send is
+    // submitted, so they can read "complete" even though those bytes never landed;
+    // this flag is the authoritative "upload finished cleanly" signal that
+    // proxy_upstream_reusable consults before pooling — a socket whose upload
+    // desynced must never be reused (the next request would be parsed as leftover
+    // body). Reset at the per-request boundary like the other reuse flags.
+    bool upstream_request_incomplete;
+    // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
+    // once its cancelled multishot recv terminal drains (handing the fd out while a
+    // recv is still draining on it would let two recvs race the same socket). -1 =
+    // none. epoll detaches synchronously and never uses this. See
+    // IoUringEventLoop::return_idle_upstream / try_deferred_upstream_rearm.
+    i32 idle_return_fd;
+    u16 idle_return_uid;
+    u8 idle_return_bidx;
+    // Active RouteConfig pinned when idle_return_fd was parked (return_idle_upstream).
+    // A hot reload can land while the cancelled recv is still draining; poll_command
+    // only drains sockets ALREADY in the pool, so the deferred fd would escape that
+    // drain and later be put_idle'd into the freshly-drained pool under a now-stale
+    // (upstream_id, backend_idx). try_deferred_upstream_rearm compares this against the
+    // live config and CLOSES instead of pooling on mismatch. request_config can't be
+    // reused: the keep-alive client repoints it on its next request while this drains.
+    const RouteConfig* idle_return_config;
+    // io_uring-only deferred close: close_conn was called on a conn whose deferred
+    // idle-pool return (idle_return_fd) had not yet drained its cancelled recv. Rather
+    // than discard the still-reusable upstream fd (and free the slot), the conn is kept
+    // allocated with this set; once the recv drains, try_deferred_upstream_rearm parks
+    // the fd in the pool AND performs the slot-free close_conn deferred. See
+    // IoUringEventLoop::close_conn_impl / try_deferred_upstream_rearm.
+    bool close_after_idle_return;
     // Active health-check probe (slice 2, epoll only): this Connection is not a
     // real client request but a built-in periodic HTTP probe to one upstream
     // backend (fd == -1, no downstream; upstream_fd is the probe socket). Gates
@@ -352,16 +392,41 @@ struct ConnectionBase {
     u16 pipeline_stash_len;  // bytes of next request stashed in send_buf (proxy)
 
     // Body streaming state (proxy large body support)
-    u32 req_header_end;              // offset past request headers (\r\n\r\n)
-    u32 req_content_length;          // original Content-Length value (for send capping)
-    u32 req_initial_send_len;        // max bytes to send in initial upstream forward
-    bool req_malformed;              // true if request body is malformed (reject)
+    u32 req_header_end;        // offset past request headers (\r\n\r\n)
+    u32 req_content_length;    // original Content-Length value (for send capping)
+    u32 req_initial_send_len;  // max bytes to send in initial upstream forward
+    // Idle-reuse retry snapshot length. When a request is forwarded to a REUSED
+    // pooled upstream socket, recv_buf is reset at request-sent (so pipelined
+    // downstream bytes read during the wait flow through pipeline_recover, and the
+    // just-sent request can't leak into the next request). To still allow the rare
+    // post-send dead-socket fallback (origin FIN landing just after take_idle's
+    // MSG_PEEK probe), the exact request bytes are snapshotted into the front of
+    // send_buf. If the same client read also carried pipelined surplus, pipeline_stash
+    // appends that suffix after this snapshot; pipeline_stash_len describes the suffix.
+    // >0 means "a replayable copy lives in send_buf" and on_upstream_connected replays
+    // [0, retry_req_send_len) instead of recv_buf. Reset at the per-request boundary
+    // like the reuse flags.
+    u32 retry_req_send_len;
+    bool req_malformed;  // true if request body is malformed (reject)
+    // Request-side keep-alive intent of the CURRENT request, as parsed from its
+    // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
+    // false, "Connection: close" → false). The proxy forwards the client's
+    // request bytes (incl. its Connection header / version) verbatim upstream, so
+    // this is what told the origin whether it may close after responding. Gate
+    // upstream idle-pooling on THIS, not on conn.keep_alive (which is derived from
+    // drain state, not the request). Recorded by capture_request_metadata.
+    bool req_keep_alive;
     bool req_wants_upgrade;          // client sent Connection: upgrade (gates 101 tunnel)
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
     BodyMode req_body_mode;
     u32 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
+    // True once any request-body byte has started streaming upstream (recv_buf is
+    // reset + refilled with body chunks, so the original headers+body are gone).
+    // Once set, the request can no longer be replayed from recv_buf, so the
+    // reused-socket retry predicate refuses it. Reset at the per-request boundary.
+    bool req_body_streamed;
     BodyMode resp_body_mode;
     u32 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
@@ -398,6 +463,10 @@ struct ConnectionBase {
     // proxy_stream_complete clears resp_fully_buffered before that terminal drains, so
     // the live flag is unreliable. Cleared with upstream_recv_cancel_inflight.
     bool upstream_recv_terminal_stale;
+    // True when an idle-return stale upstream recv CQE carried bytes. The stale branch
+    // rolls those bytes back out of upstream_recv_buf, so the deferred pool-return path
+    // needs this separate marker to close rather than reuse a desynced fd.
+    bool upstream_recv_idle_stale_bytes;
     // True while a handler yield timer is logically armed. For io_uring,
     // the timer may be backed either by an IORING_OP_TIMEOUT SQE or by the
     // coarse timer wheel fallback.
@@ -491,6 +560,14 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
+        upstream_keep_alive = false;
+        upstream_reused = false;
+        upstream_request_incomplete = false;
+        idle_return_fd = -1;
+        idle_return_uid = 0;
+        idle_return_bidx = 0;
+        idle_return_config = nullptr;
+        close_after_idle_return = false;
         is_health_probe = false;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
@@ -575,13 +652,16 @@ struct ConnectionBase {
         req_header_end = 0;
         req_content_length = 0;
         req_initial_send_len = 0;
+        retry_req_send_len = 0;
         req_malformed = false;
+        req_keep_alive = false;
         req_wants_upgrade = false;
         req_upgrade_is_websocket = false;
         resp_upgrade_is_websocket = false;
         req_body_mode = BodyMode::None;
         req_body_remaining = 0;
         req_chunk_parser.reset();
+        req_body_streamed = false;
         resp_body_mode = BodyMode::None;
         resp_body_remaining = 0;
         resp_chunk_parser.reset();
@@ -599,6 +679,7 @@ struct ConnectionBase {
         upstream_recv_pause_rearm_pending = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
+        upstream_recv_idle_stale_bytes = false;
         yield_armed = false;
         yield_timeout_armed = false;
         resp_status = 0;
