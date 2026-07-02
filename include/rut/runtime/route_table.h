@@ -575,19 +575,24 @@ struct RouteConfig {
     // probing is performed yet. `path` (length `path_len`, not required to be
     // NUL-terminated) is the probe path; `interval_ms` the probe period;
     // `status` the status code that marks a backend healthy. Returns false on a
-    // bad upstream id, an over-long path, or a non-origin-form path (empty or
-    // missing the leading '/').
+    // bad upstream id, an over-long path, a non-origin-form path (empty, missing
+    // the leading '/', or containing bytes that would break the request line),
+    // or an impossible expected HTTP status.
     bool set_upstream_health_check(
         u32 uid, const char* path, u32 path_len, u32 interval_ms, u16 status) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
         if (path_len >= sizeof(up.hc_path)) return false;
+        if (status < 100 || status > 599) return false;
         // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
-        // be an origin-form target (leading '/'). Reject a bare/empty path so a
-        // host application that pre-binds an upstream and calls this directly
-        // can't produce a malformed request line. The DSL path is also checked
-        // at parse time; this is defense-in-depth for the public API.
+        // be an origin-form target that cannot inject spaces/control bytes into
+        // the request line. The DSL path is also checked at parse time; this is
+        // defense-in-depth for the public API.
         if (path_len == 0 || path[0] != '/') return false;
+        for (u32 i = 0; i < path_len; i++) {
+            const unsigned char ch = static_cast<unsigned char>(path[i]);
+            if (ch <= 0x20 || ch == 0x7f) return false;
+        }
         for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
         up.hc_path[path_len] = '\0';
         up.hc_path_len = path_len;

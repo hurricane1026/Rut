@@ -306,13 +306,16 @@ public:
                 if (budget == 0) break;  // out of budget — defer remaining upstreams
                 bool all_issued = true;
                 for (u32 b = 0; b < up.addr_count; b++) {
+                    if (probe_in_flight(static_cast<u16>(u), b)) continue;
                     if (budget == 0) {
                         all_issued = false;
                         break;
                     }
-                    // Only a launched probe consumes a ring slot; an in-flight skip
-                    // / local failure returns false and costs no budget.
-                    if (start_health_probe(&self(), static_cast<u16>(u), b)) budget--;
+                    if (start_health_probe(&self(), static_cast<u16>(u), b)) {
+                        budget--;
+                    } else {
+                        all_issued = false;
+                    }
                 }
                 // Re-arm from now (not the missed deadline) to avoid a catch-up
                 // burst after a stall, mirroring fire_due_timers — but only once

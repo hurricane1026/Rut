@@ -1635,7 +1635,8 @@ struct Parser {
                             if (!lit) return core::make_unexpected(lit.error());
                             // The probe writes this verbatim into
                             // `GET <path> HTTP/1.1`, so it must be an
-                            // origin-form target (leading '/'). A bare
+                            // origin-form target that cannot inject spaces or
+                            // control bytes into the request line. A bare
                             // "healthz" would emit a malformed request line
                             // that origins reject — marking an otherwise
                             // healthy backend down. Reject at parse time
@@ -1647,6 +1648,14 @@ struct Parser {
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       span_from(*lit.value()),
                                                       path_text);
+                            for (u32 i = 0; i < path_text.len; i++) {
+                                const unsigned char ch =
+                                    static_cast<unsigned char>(path_text.ptr[i]);
+                                if (ch <= 0x20 || ch == 0x7f)
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*lit.value()),
+                                                          path_text);
+                            }
                             item.upstream.hc_path_lit = path_text;
                             seen_path = true;
                         } else if (hc_key.eq({"interval", 8})) {

@@ -128,6 +128,11 @@ void throttle_resume(Loop* loop, Connection& conn);
 template <typename Loop>
 bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 
+// True while a built-in active health-check probe is already outstanding for the
+// backend. Defined in callbacks_impl.h; EventLoopCRTP uses it to distinguish an
+// intentional in-flight skip from a local launch deferral.
+bool probe_in_flight(u16 upstream_id, u32 backend_idx);
+
 // Minimal teardown for a health-probe Connection: clears the in-flight guard for
 // the probe's (upstream, backend) then routes through Loop::free_health_probe.
 // Invoked from the per-shard timer tick to reap a stalled probe. Defined in

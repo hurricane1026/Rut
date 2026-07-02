@@ -2479,6 +2479,148 @@ TEST(active_health, timeout_sweep_runs_before_reap) {
     destroy_real_loop(loop);
 }
 
+TEST(active_health, route_config_rejects_invalid_probe_config) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 8080);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+
+    const char with_space[] = "/health check";
+    const char with_control[] = {'/', 'h', '\t', 'x'};
+    const char with_del[] = {'/', 'h', static_cast<char>(0x7f), 'x'};
+
+    CHECK(!cfg.set_upstream_health_check(
+        uid, with_space, sizeof(with_space) - 1, /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(
+        uid, with_control, sizeof(with_control), /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(
+        uid, with_del, sizeof(with_del), /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/99));
+    CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/600));
+    CHECK(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/204));
+}
+
+TEST(active_health, sweep_keeps_due_deadline_on_probe_deferral) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+
+    const u32 saved_free_top = loop->free_top;
+    loop->free_top = 0;  // force start_health_probe's local slot-reserve deferral
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    loop->free_top = saved_free_top;
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, sweep_rearms_deadline_for_inflight_probe) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, true);
+    const u32 saved_free_top = loop->free_top;
+    loop->free_top = 0;  // prove in-flight coverage does not call start_health_probe
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK_GT(loop->health_probe_deadline_ns[uid], 0u);
+    CHECK(probe_in_flight(uid, 0));
+    loop->free_top = saved_free_top;
+    set_probe_in_flight(uid, 0, false);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, draining_timeout_skips_probe_sweep) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->drain(1);
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
 // === Basic I/O (libuv: test-tcp-connect, libevent: test_simpleread/write) ===
 
 TEST(io, simple_request_response) {

@@ -761,7 +761,7 @@ public:
                 // deferral. The sweep arms new probes upstream_timeout (~30) slots
                 // ahead on the wheel, so a normal 1-tick reap below never touches
                 // them.
-                this->sweep_health_probes();
+                if (!is_draining()) this->sweep_health_probes();
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;

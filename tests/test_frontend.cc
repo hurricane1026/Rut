@@ -1717,7 +1717,7 @@ TEST(frontend, parse_upstream_health_check_rejects_non_origin_path) {
     // The probe writes the path verbatim into `GET <path> HTTP/1.1`, so a path
     // without a leading '/' (e.g. "healthz") would emit a malformed request line
     // that origins reject — marking a healthy backend down. Reject at parse time.
-    for (const char* path : {"healthz", "", "http://x/y"}) {
+    for (const char* path : {"healthz", "", "http://x/y", "/with space", "/with\tcontrol"}) {
         char src[200];
         snprintf(src,
                  sizeof(src),
