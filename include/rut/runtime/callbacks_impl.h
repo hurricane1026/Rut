@@ -118,10 +118,7 @@ inline bool* probe_in_flight_slot(u16 upstream_id, u32 backend_idx) {
     return &in_flight[upstream_id][backend_idx];
 }
 
-inline bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
-    const bool* s = probe_in_flight_slot(upstream_id, backend_idx);
-    return s != nullptr && *s;
-}
+bool probe_in_flight(u16 upstream_id, u32 backend_idx);
 
 inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
     bool* s = probe_in_flight_slot(upstream_id, backend_idx);

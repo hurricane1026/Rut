@@ -772,6 +772,11 @@ void reset_backend_health() {
         }
 }
 
+bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
+    const bool* s = probe_in_flight_slot(upstream_id, backend_idx);
+    return s != nullptr && *s;
+}
+
 // The probe teardown / config-pin helpers are also odr-used directly from the
 // epoll timer tick (stalled-probe reap), where only their callbacks.h
 // declarations are visible — emit the epoll instantiations here.
