@@ -9,15 +9,28 @@ Outstanding work items, prioritized for the next implementation passes.
 each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 
 **Work** (roughly in dependency order):
-- Lexer: drop `and`/`or`/`not` keywords → `&&` `||` `!`; drop bitwise operator
-  tokens (`&` binary, `^`, `~`, `<<`, `>>`); keep `|` (pipeline-only in
-  expressions); add keywords `respond`, `break`, `continue`, `package`
-  (variant/protocol/impl/type already parsed).
-- Parser: `if let` / `guard let x` shorthand; `guard` condition must be bool
-  (reject bare-value truthiness with fix-it); remove postfix `?` nil-check;
-  `break`/`continue` statements; `respond status[, body] | resp` statement;
-  websocket trailing block takes explicit `{ frame in }`; object literal only
-  in call-argument position; pipeline RHS must contain `_`/`_N` placeholder.
+- [x] Lexer: `&&` `||` `!` `!=` `<=` `>=` emitted; `and`/`or`/`not` lex to
+  fix-it errors; lone `&`/`^`/`~` → bitwise.* fix-it; `?` → if-let fix-it
+  (commit: slice 1). `respond`/`break`/`continue` keywords still pending.
+- [x] Parser: `!`/`!=`/`<=`/`>=` desugar to Eq/Lt/Gt (+ `== false` wrap);
+  `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
+  sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
+  (slice 2a). `guard let x` shorthand (slice 2b-1).
+- [ ] Parser/analyze: `if let name = expr { }` — plan: parse like guard-let
+  into the If stmt (name/bind_value fields), then in EVERY If analysis site
+  (analyze.cc ~4483/8630/8726/8831/11180 + nested-match copies) lower cond to
+  HirExprKind::HasValue(expr) and inject a narrowed HirLocal (clone the
+  guard-let binding block at analyze.cc ~8579) visible only in then-branch
+  scoped_locals. Reuse make_guard_bound_init.
+- [ ] `respond status[, body] | resp` statement — NEW semantics: today a
+  func's `=> 401`-style guard values are the *function's return value*, not
+  an HTTP short-circuit. respond needs an HIR terminal (like ReturnStatus)
+  legal inside funcs, carried through inlining so the inlined route sends the
+  response and stops. Design first: extend HirGuard::FailKind/Term reuse.
+- [ ] `guard` condition bool-only check + fix-it (verify current
+  analyze_guard_cond behavior for bare non-bool values first).
+- [ ] websocket trailing block `{ frame in }`; object literal only in
+  call-argument position; pipeline RHS placeholder validation.
 - Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;
   `req.header/set/add/getAll` + `resp.set/remove/add/header` (remove hyphenated
   header property paths); `req.params.*` capture namespace (flat `req.<capture>`
