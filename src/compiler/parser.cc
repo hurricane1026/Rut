@@ -15,6 +15,9 @@ constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `patter
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
+constexpr Str kIfLetPendingDetail = lit_str(
+    "if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
+    "for now (TODO.md: front-end migration)");
 constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
 constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
 constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
@@ -1590,6 +1593,12 @@ struct Parser {
         }
         if (take(TokenType::KwIf)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
+            // `if let` parses (Swift-identical surface) but analysis is
+            // pending — reject here with the migration fix-it so generated
+            // code gets a real diagnostic instead of a stray UnexpectedToken.
+            if (!is_const && cur().type == TokenType::KwLet)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kIfLetPendingDetail);
             auto cond = parse_expr();
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -1843,6 +1852,9 @@ struct Parser {
             return parse_func_guard_stmt(prev());
         }
         if (take(TokenType::KwIf)) {
+            if (cur().type == TokenType::KwLet)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kIfLetPendingDetail);
             auto cond = parse_expr();
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);

@@ -16,7 +16,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
   sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
   (slice 2a). `guard let x` shorthand (slice 2b-1).
-- [ ] Parser/analyze: `if let name = expr { }` — plan: parse like guard-let
+- [ ] Parser/analyze: `if let name = expr { }` — the parser now rejects
+  `if let` with a targeted pending fix-it (was: stray UnexpectedToken).
+  Full plan: parse like guard-let
   into the If stmt (name/bind_value fields), then in EVERY If analysis site
   (analyze.cc ~4483/8630/8726/8831/11180 + nested-match copies) lower cond to
   HirExprKind::HasValue(expr) and inject a narrowed HirLocal (clone the

@@ -27577,6 +27577,26 @@ route GET "/users" {
     REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
 }
 
+TEST(frontend, if_let_rejects_with_pending_fixit) {
+    // `if let` is spec'd (language card marks it pending); the parser gives a
+    // targeted migration diagnostic instead of a stray UnexpectedToken.
+    const char* sources[] = {
+        "func f(ok: bool) -> i32 { if let v = maybe(ok) { v } else { 0 } }\n"
+        "func maybe(ok: bool) -> i32 { if ok { 1 } else { error(.none) } }\n",
+        "route GET \"/x\" { if let q = req.query(\"q\") { return 200 } else { return 404 } }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(ast.error().detail.eq(
+            lit("if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
+                "for now (TODO.md: front-end migration)")));
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
