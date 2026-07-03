@@ -12269,6 +12269,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
             up.ip = ip;
             up.port = static_cast<u16>(port_value);
         }
+        // Active health-check config (parser already validated path/interval
+        // presence + ranges). Carried verbatim; no probing in this slice.
+        up.hc_enabled = item.upstream.hc_enabled;
+        up.hc_path = item.upstream.hc_path_lit;
+        up.hc_interval_ms = item.upstream.hc_interval_ms;
+        up.hc_expected_status = item.upstream.hc_expected_status;
         if (!mod.upstreams.push(up))
             return frontend_error(FrontendError::TooManyItems, item.upstream.span);
     }

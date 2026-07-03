@@ -209,6 +209,142 @@ public:
                 now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
         }
     }
+
+    // --- Active health-check probes (`health_check { ... }`) — EPOLL ONLY ---
+    // Per-upstream probe deadlines, mirroring timer_deadline_ns. Re-armed (from
+    // activation) whenever the active config changes — same generation guard as
+    // fire_due_timers — so an upstream's `interval` measures from config install,
+    // not from a stale deadline. Lives in the CRTP base so the re-arm bookkeeping
+    // runs on BOTH backends; the actual probe issue is gated to epoll this slice
+    // (Derived::kSupportsHealthProbe), since only the epoll loop can synchronously
+    // tear a probe Connection down. io_uring probing is a deliberate follow-up.
+    u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
+    const RouteConfig* health_armed_config = nullptr;
+    u32 health_probe_sweep_cursor = 0;
+
+    // Detect a config swap (first install or hot reload) and, if so, reset the
+    // per-shard health verdicts and re-arm the per-upstream probe deadlines from
+    // now. Returns true iff a swap was just handled.
+    //
+    // BackendHealth is thread_local and keyed only by NUMERIC (upstream_idx,
+    // backend_idx) with no config pin; active_down has no timed expiry. After a
+    // hot reload the same numeric slot can mean a different endpoint, so a stale
+    // verdict (or a passive eject) would wrongly suppress the new backend — and
+    // if the new config disables health checks there is no future probe to clear
+    // it. Resetting here gives the new config a clean slate. (probe_in_flight is
+    // intentionally NOT reset — see reset_backend_health.)
+    //
+    // The run loop calls this on startup and immediately after every
+    // poll_command() so the reset happens the instant a config is installed, not
+    // a tick later when the 1 Hz sweep first runs — otherwise requests accepted
+    // in that window would route off stale numeric-slot verdicts. It advances
+    // health_armed_config, so the subsequent sweep on the Timeout path sees no
+    // change and does NOT double-reset (reset happens exactly once per swap).
+    // Runs on BOTH backends (probe issue below stays epoll-only).
+    bool arm_health_on_config_change() {
+        const RouteConfig** cfg_ptr = self().config_ptr;
+        const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
+        if (cfg == health_armed_config) return false;
+        health_armed_config = cfg;
+        health_probe_sweep_cursor = 0;
+        reset_backend_health();
+        if (cfg != nullptr) {
+            const u64 now = monotonic_ns();
+            const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
+                              ? cfg->upstream_count
+                              : RouteConfig::kMaxUpstreams;
+            for (u32 u = 0; u < m; u++)
+                health_probe_deadline_ns[u] =
+                    now + static_cast<u64>(cfg->upstreams[u].hc_interval_ms) * 1'000'000ull;
+        }
+        return true;
+    }
+
+    void sweep_health_probes() {
+        // A swap detected here just reset + re-armed deadlines; probes wait for
+        // the next tick. In the run loop the swap is normally already absorbed by
+        // arm_health_on_config_change() right after poll_command(), so this is a
+        // no-op there — but tests drive sweep_health_probes() directly, where this
+        // is the install path.
+        if (arm_health_on_config_change()) return;
+        const RouteConfig** cfg_ptr = self().config_ptr;
+        const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
+        const u64 now = monotonic_ns();
+        if (cfg == nullptr || cfg->upstream_count == 0) return;
+        // The config-change re-arm (arm_health_on_config_change) runs on both
+        // backends; the probe issue below is epoll only. On io_uring this
+        // returns here (a safe no-op for the sweep).
+        if constexpr (!Derived::kSupportsHealthProbe) {
+            return;
+        } else {
+            const u32 n = cfg->upstream_count < RouteConfig::kMaxUpstreams
+                              ? cfg->upstream_count
+                              : RouteConfig::kMaxUpstreams;
+            // Bound probes issued this sweep. A full fan-out (kMaxUpstreams ×
+            // kMaxBackendsPerUpstream) far exceeds the epoll backend's FIXED
+            // pending-completion ring (kPendingCap): each probe's synchronous
+            // connect can queue one immediate completion, and the ring silently
+            // drops anything past kPendingCap. A dropped completion strands a
+            // healthy probe as probe_in_flight until the timer reaps it as a
+            // FAILURE — wrongly marking a live backend down. So cap probes per
+            // sweep AND reserve ring headroom for real traffic's immediate sends
+            // (which share this same ring across the whole dispatch batch).
+            // Upstreams we cannot fully cover keep their (already-due) deadline,
+            // so the NEXT 1s tick retries them; probe_in_flight makes the retry
+            // idempotent for backends already launched. No health coverage is
+            // dropped — only deferred by a tick under heavy fan-out. A rotating
+            // cursor resumes at the first deferred upstream, so low-index upstreams
+            // that complete quickly cannot consume the whole budget every tick.
+            static constexpr u32 kMaxProbesPerSweep = 32;
+            static constexpr u32 kProbePendingReserve = 16;
+            const u32 ring = self().backend.kPendingCap;
+            const u32 pend = self().backend.pending_count;
+            const u32 avail =
+                (pend + kProbePendingReserve < ring) ? (ring - kProbePendingReserve - pend) : 0;
+            u32 budget = avail < kMaxProbesPerSweep ? avail : kMaxProbesPerSweep;
+            const u32 start = (n == 0) ? 0 : (health_probe_sweep_cursor % n);
+            u32 next_cursor = start;
+            bool cursor_advanced = false;
+            for (u32 scanned = 0; scanned < n; scanned++) {
+                const u32 u = (start + scanned) % n;
+                const UpstreamTarget& up = cfg->upstreams[u];
+                if (!up.hc_enabled) continue;
+                if (now < health_probe_deadline_ns[u]) continue;
+                if (budget == 0) {
+                    health_probe_sweep_cursor = u;  // out of budget — resume here next tick
+                    return;
+                }
+                bool all_issued = true;
+                for (u32 b = 0; b < up.addr_count; b++) {
+                    if (probe_in_flight(static_cast<u16>(u), b)) continue;
+                    if (budget == 0) {
+                        all_issued = false;
+                        break;
+                    }
+                    if (start_health_probe(&self(), static_cast<u16>(u), b)) {
+                        budget--;
+                    } else {
+                        all_issued = false;
+                    }
+                }
+                // Re-arm from now (not the missed deadline) to avoid a catch-up
+                // burst after a stall, mirroring fire_due_timers — but only once
+                // this upstream is fully covered. If budget ran out mid-upstream,
+                // leave the (past) deadline so the next tick re-probes the rest.
+                if (all_issued)
+                    health_probe_deadline_ns[u] =
+                        now + static_cast<u64>(up.hc_interval_ms) * 1'000'000ull;
+                if (all_issued) {
+                    next_cursor = (u + 1) % n;
+                    cursor_advanced = true;
+                } else if (budget == 0) {
+                    health_probe_sweep_cursor = u;
+                    return;
+                }
+            }
+            if (cursor_advanced) health_probe_sweep_cursor = next_cursor;
+        }
+    }
 };
 
 template <typename Backend>
@@ -562,6 +698,10 @@ public:
     // Includes pending_free slots: they're closed but still waiting for
     // CQEs, so drain must keep running until they're reclaimed too.
     u32 active_count() const { return kMaxConns - free_top; }
+
+    // Allocatable Connection slots remaining (free_stack depth). Used by
+    // start_health_probe to keep a reserve for real client accepts.
+    u32 free_conn_slots() const { return free_top; }
 
     // --- CRTP implementations ---
 

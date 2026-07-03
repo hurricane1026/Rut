@@ -66,6 +66,10 @@ private:
 
 public:
     static constexpr u32 kMaxConns = 16384;
+    // Active health-check probing requires synchronous probe teardown; the
+    // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
+    // deadlines here and issues no connects (epoll-only this slice).
+    static constexpr bool kSupportsHealthProbe = false;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
     // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
@@ -209,6 +213,10 @@ public:
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
+        // Reset/arm active-health state at activation (#161 F4). io_uring issues
+        // no probes this slice, but the reset still clears stale numeric-slot
+        // verdicts that routing reads.
+        this->arm_health_on_config_change();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
@@ -221,6 +229,10 @@ public:
             poll_command();
             // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
             this->fire_due_timers();
+            // Reset/arm active-health state on hot reload (#161 F4). No-op when
+            // unchanged; advances health_armed_config so the later sweep doesn't
+            // double-reset.
+            this->arm_health_on_config_change();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 // Drain the idle upstream pool on the shard thread (NOT in drain(),
@@ -1092,6 +1104,9 @@ public:
                     });
                 }
                 this->fire_due_timers();
+                // io_uring: sweep re-arms health-probe deadlines but issues no
+                // probes (kSupportsHealthProbe == false). EPOLL-only this slice.
+                this->sweep_health_probes();
                 // Evict idle pooled upstream sockets past the keepalive deadline
                 // (1s-granular) — bounds dead-socket accumulation for endpoints that
                 // never get another request to trigger take_idle's probe.

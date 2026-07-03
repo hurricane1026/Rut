@@ -29,6 +29,9 @@ static_assert(static_cast<u8>(IoEventType::Count) == 8u,
 // cancels, aux 0). Shared by the io_uring backend (sets it) and the event loop
 // (recognizes it via IoEvent::aux to re-arm only after the cancel has drained).
 inline constexpr u8 kPauseCancelAux = 1;
+// Local backend submission/registration failure. The completion is synthetic: real
+// proxy paths fail closed, while health probes drop it without recording backend health.
+inline constexpr u8 kLocalSubmitFailureAux = 2;
 
 // Unified completion event — field order optimized for minimal padding.
 struct IoEvent {

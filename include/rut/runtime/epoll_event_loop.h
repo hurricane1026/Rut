@@ -180,6 +180,8 @@ private:
     std::atomic<bool> draining_;
     std::atomic<u64> drain_start_;
     std::atomic<u32> drain_period_;
+    bool dispatching_event_batch_ = false;
+    bool health_sweep_after_batch_ = false;
 
 public:
     static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
@@ -195,6 +197,11 @@ public:
     // so this rarely matters). Idle keep-alive uses keepalive_timeout — a
     // separate knob. TODO: a dedicated connect-timeout if hung connects matter.
     static constexpr u32 kDefaultUpstreamTimeout = 30;
+    // The epoll loop can synchronously tear down a health-probe Connection
+    // (close upstream_fd, EPOLL_CTL_DEL, free the slot), so it issues active
+    // health-check probes from EventLoopCRTP::sweep_health_probes. io_uring sets
+    // this false — its sweep only re-arms deadlines (probing is a follow-up).
+    static constexpr bool kSupportsHealthProbe = true;
     SlicePool pool;
     // Per-shard HTTP/2 engine pool — lazily handed out when a connection
     // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
@@ -302,13 +309,15 @@ public:
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
+        // Likewise reset/arm active-health state at activation so requests
+        // accepted before the first 1s sweep don't route off stale numeric-slot
+        // verdicts (#161 F4). Probe issue still waits for the Timeout sweep.
+        this->arm_health_on_config_change();
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
-            for (u32 i = 0; i < n; i++) {
-                dispatch(events[i]);
-            }
+            dispatch_batch(events, n);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
             // timers now so a freshly activated `every: D` measures from the reload
@@ -316,6 +325,11 @@ public:
             // interval before it actually fires). Cheap no-op when the config is
             // unchanged (fire_due_timers compares the armed config pointer).
             this->fire_due_timers();
+            // Reset/arm active-health state the instant a hot reload installs a
+            // new config, so it doesn't route off stale numeric-slot verdicts
+            // until the next 1s sweep (#161 F4). No-op when unchanged; advances
+            // health_armed_config so the later sweep doesn't double-reset.
+            this->arm_health_on_config_change();
             if (draining_.load(std::memory_order_acquire)) {
                 close_listen();
                 // Empty the idle upstream pool on the SHARD thread (here), not in
@@ -404,6 +418,11 @@ public:
     }
 
     u32 active_count() const { return kMaxConns - free_top; }
+
+    // Allocatable Connection slots remaining. Used by start_health_probe to
+    // keep a reserve for real client accepts (epoll frees slots synchronously,
+    // so this is exact — no pending_free deferral as on io_uring).
+    u32 free_conn_slots() const { return free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
     // Only called when a connection starts proxying — non-proxy connections
@@ -584,7 +603,36 @@ public:
         backend.pause_upstream_recv(c.id, c.ws_client_send_pending);
     }
 
+    // Minimal teardown for a health-probe Connection (fd == -1, no downstream).
+    // Deliberately does NOT touch metrics / epoch / access-log / keepalive — a
+    // probe never ran a real request, so none of close_conn's per-request
+    // side-effects apply. Removes the probe socket from epoll, closes it, drops
+    // the fd-map + send-state bookkeeping, and returns the slot to the free list.
+    void free_health_probe(Connection& c) {
+        if (c.upstream_fd >= 0) {
+            backend.cancel(c.upstream_fd, c.id);  // EPOLL_CTL_DEL
+            ::close(c.upstream_fd);
+            c.upstream_fd = -1;
+        }
+        c.upstream_recv_armed = false;
+        c.upstream_send_armed = false;
+        if (c.id < EpollBackend::kMaxFdMap) {
+            backend.upstream_fd_map[c.id] = -1;
+            backend.downstream_fd_map[c.id] = -1;
+        }
+        backend.clear_send_state(c.id);
+        this->free_conn(c);  // timer.remove + free slices + return slot (no metrics)
+    }
+
     void close_conn_impl(Connection& c) {
+        // A health probe never ran a real request: route it through the minimal
+        // teardown so no metrics/epoch/access-log counters move (covers the rare
+        // keepalive-timeout / drain / force-close path that reaches a stalled
+        // probe; the normal probe lifecycle frees via free_probe_conn).
+        if (c.is_health_probe) {
+            free_probe_conn(this, c);
+            return;
+        }
         // epoch_held covers a suspended HTTP/2 async (wait/proxy) stream pinning
         // the config epoch without an h1-style req_start_us (see event_loop.h).
         if (c.req_start_us != 0 || c.epoch_held) epoch_leave();
@@ -753,6 +801,24 @@ public:
 
     // --- Dispatch ---
 
+    void request_health_sweep_after_batch() { health_sweep_after_batch_ = true; }
+
+    void drain_deferred_health_sweep() {
+        if (!health_sweep_after_batch_) return;
+        health_sweep_after_batch_ = false;
+        if (!is_draining()) this->sweep_health_probes();
+    }
+
+    void dispatch_batch(const IoEvent* events, u32 count) {
+        const bool was_dispatching = dispatching_event_batch_;
+        dispatching_event_batch_ = true;
+        for (u32 i = 0; i < count; i++) {
+            dispatch(events[i]);
+        }
+        dispatching_event_batch_ = was_dispatching;
+        if (!dispatching_event_batch_) drain_deferred_health_sweep();
+    }
+
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
             case IoEventType::Accept:
@@ -767,8 +833,40 @@ public:
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
+                const bool catchup_reaches_probe_timeout =
+                    ticks > 1 && ticks >= static_cast<i32>(upstream_timeout);
+                // A Timeout makes due health checks eligible, but the sweep must run
+                // only after every event from this backend.wait() batch has drained.
+                // Earlier I/O completions in the same batch can free a probe slot
+                // before the Timeout event, and stale trailing events address only
+                // conn_id; launching a replacement probe inline could reuse that slot
+                // before those stale events are ignored.
+                //
+                // If timerfd coalesced enough ticks to cross upstream_timeout, do
+                // not launch fresh probes after replaying those ticks: the same
+                // catch-up dispatch would have immediately reaped new probes as
+                // stalled before their I/O can run. Skip this sweep; the next timer
+                // event retries due probe deadlines after the catch-up batch is gone.
+                if (!catchup_reaches_probe_timeout && !is_draining())
+                    request_health_sweep_after_batch();
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+                        // A stalled active health probe: it accepted the connect
+                        // (or stayed pending) but never produced a parseable
+                        // response within upstream_timeout. Record a health FAILURE
+                        // for its backend (an unresponsive backend is unhealthy)
+                        // and tear the probe down. MUST come first: a probe has
+                        // fd == -1, so falling through to respond_upstream_timeout
+                        // would client_send to fd -1. record_probe_if_current pins
+                        // the launching config, so a timeout straddling a hot
+                        // reload frees without recording against the wrong
+                        // upstream; free_probe_conn clears probe_in_flight so the
+                        // next sweep re-probes.
+                        if (c->is_health_probe) {
+                            record_probe_if_current(this, *c, /*healthy=*/false, monotonic_us());
+                            free_probe_conn(this, *c);
+                            return;
+                        }
                         // A timer can now expire for two reasons:
                         //   (1) keepalive — close the connection (existing).
                         //   (2) a JIT handler yielded with wait(ms), or wait-any
@@ -837,10 +935,20 @@ public:
                         // don't let stray events (e.g. a stale -ENOBUFS on the
                         // upstream fd) bump it back to the keepalive timeout, which
                         // would strand the parked pump until keepalive expiry.
-                        if (!conn.throttle_paused)
+                        // A health probe is functionally an upstream request but
+                        // stays in the default (Idle) state, so the Proxying check
+                        // alone would refresh its deadline to keepalive_timeout
+                        // (60s) on every connect/send event — overwriting the
+                        // upstream_timeout (30s) bound start_health_probe armed and
+                        // delaying the stalled-probe reap. Special-case it here
+                        // (least blast radius: no ConnState semantics touched, so
+                        // the proxy-timeout 504 / traffic-capture paths that key off
+                        // Proxying stay untouched for a probe with fd == -1).
+                        if (!conn.throttle_paused && !conn.is_health_probe) {
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
+                        }
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
@@ -865,6 +973,7 @@ public:
             case IoEventType::Count:
                 break;
         }
+        if (!dispatching_event_batch_) drain_deferred_health_sweep();
     }
 
 private:
@@ -913,9 +1022,21 @@ private:
         }
     }
 
+public:
     void force_close_all() {
         for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].fd >= 0) {
+            // A health probe deliberately has fd == -1 with upstream_fd >= 0 (no
+            // downstream socket), so the fd >= 0 guard alone would leak its
+            // upstream socket + slot when graceful drain hits its deadline mid-
+            // probe. Route it through free_probe_conn (clears probe_in_flight,
+            // then free_health_probe closes upstream_fd + EPOLL_CTL_DEL + returns
+            // the slot). free_health_probe touches only the still-live loop/backend
+            // (epoll set, fd maps, slice pool), all valid here — force_close_all
+            // runs inside run() before running_ is cleared. Mirrors the io_uring
+            // deferred-idle fd-leak fix (PR #160).
+            if (conns[i].is_health_probe) {
+                free_probe_conn(this, conns[i]);
+            } else if (conns[i].fd >= 0) {
                 this->close_conn(conns[i]);
             }
         }

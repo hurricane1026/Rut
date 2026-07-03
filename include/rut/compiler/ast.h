@@ -281,6 +281,16 @@ struct AstUpstreamDecl {
     static constexpr u32 kMaxBackends = 8;
     u32 backend_count = 0;  // 0 → single-address form via host_lit/port_lit
     Str backend_lits[kMaxBackends]{};
+
+    //   D. `{ ..., health_check: { path: "/healthz", interval: 5s, status: 200 } }`
+    //      → hc_enabled = true. path/interval are required when the block is
+    //      present; status defaults to 200. Config-only data threaded verbatim
+    //      through HIR→MIR→RIR into RouteConfig::set_upstream_health_check; no
+    //      runtime probing in this slice.
+    bool hc_enabled = false;
+    Str hc_path_lit{};             // raw `path:` string literal
+    u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms
+    u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
 };
 
 struct AstFunctionDecl {

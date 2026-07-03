@@ -2893,6 +2893,20 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             out.module.upstreams[i].extra_ips[b] = mir.upstreams[i].extra_ips[b];
             out.module.upstreams[i].extra_ports[b] = mir.upstreams[i].extra_ports[b];
         }
+        // Active health-check config. hc_path is copied into arena memory (like
+        // name) so the RIR module owns it independently of the AST/HIR/MIR.
+        out.module.upstreams[i].hc_enabled = mir.upstreams[i].hc_enabled;
+        const Str src_hc_path = mir.upstreams[i].hc_path;
+        char* hc_path_buf = nullptr;
+        if (src_hc_path.len > 0) {
+            hc_path_buf = out.module.arena->alloc_array<char>(src_hc_path.len);
+            if (!hc_path_buf)
+                return frontend_error(FrontendError::OutOfMemory, mir.upstreams[i].span);
+            for (u32 k = 0; k < src_hc_path.len; k++) hc_path_buf[k] = src_hc_path.ptr[k];
+        }
+        out.module.upstreams[i].hc_path = {hc_path_buf, src_hc_path.len};
+        out.module.upstreams[i].hc_interval_ms = mir.upstreams[i].hc_interval_ms;
+        out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
     }
     out.module.upstream_count = mir.upstreams.len;
 

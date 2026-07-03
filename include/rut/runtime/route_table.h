@@ -43,6 +43,16 @@ struct UpstreamTarget {
     // cap the runtime answers 503 before connecting.
     u32 max_inflight = 0;
 
+    // Active health-check config from `health_check: { ... }` (data only — no
+    // probing wired up yet). hc_enabled gates the rest; hc_path is the probe
+    // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
+    // period, hc_expected_status the status that marks a backend healthy.
+    bool hc_enabled = false;
+    char hc_path[64];
+    u32 hc_path_len = 0;
+    u32 hc_interval_ms = 0;
+    u16 hc_expected_status = 200;
+
     void set_name(const char* n) {
         name_len = 0;
         while (n[name_len] && name_len < sizeof(name) - 1) {
@@ -558,6 +568,39 @@ struct RouteConfig {
     bool set_upstream_max_inflight(u32 uid, u32 max_inflight) {
         if (uid >= upstream_count) return false;
         upstreams[uid].max_inflight = max_inflight;
+        return true;
+    }
+
+    // Attach active health-check config to an upstream (by id). Data only — no
+    // probing is performed yet. `path` (length `path_len`, not required to be
+    // NUL-terminated) is the probe path; `interval_ms` the probe period;
+    // `status` the status code that marks a backend healthy. Returns false on a
+    // bad upstream id, an over-long path, a non-origin-form path (empty, missing
+    // the leading '/', or containing bytes that would break the request line),
+    // or an impossible expected HTTP status.
+    bool set_upstream_health_check(
+        u32 uid, const char* path, u32 path_len, u32 interval_ms, u16 status) {
+        if (uid >= upstream_count) return false;
+        UpstreamTarget& up = upstreams[uid];
+        if (path == nullptr) return false;
+        if (path_len >= sizeof(up.hc_path)) return false;
+        if (interval_ms == 0) return false;
+        if (status < 100 || status > 599) return false;
+        // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
+        // be an origin-form target that cannot inject spaces/control bytes into
+        // the request line. The DSL path is also checked at parse time; this is
+        // defense-in-depth for the public API.
+        if (path_len == 0 || path[0] != '/') return false;
+        for (u32 i = 0; i < path_len; i++) {
+            const unsigned char ch = static_cast<unsigned char>(path[i]);
+            if (ch <= 0x20 || ch == 0x7f) return false;
+        }
+        for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
+        up.hc_path[path_len] = '\0';
+        up.hc_path_len = path_len;
+        up.hc_interval_ms = interval_ms;
+        up.hc_expected_status = status;
+        up.hc_enabled = true;
         return true;
     }
 

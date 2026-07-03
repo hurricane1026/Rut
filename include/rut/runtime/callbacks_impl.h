@@ -42,7 +42,8 @@ inline constexpr u64 kBackendEjectCooldownUs = 5'000'000;  // 5s
 
 struct BackendHealth {
     u16 fails;           // consecutive connect failures
-    u64 eject_until_us;  // ejected while now < this (0 = healthy)
+    u64 eject_until_us;  // passively ejected while now < this (0 = healthy)
+    bool active_down;    // active-probe failure: down until a probe SUCCEEDS (no timed expiry)
 };
 
 // thread_local health table. Returns a mutable ref, or nullptr if indices are
@@ -57,7 +58,12 @@ inline BackendHealth* backend_health(u16 upstream_id, u32 backend_idx) {
 
 inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
     const BackendHealth* h = backend_health(upstream_id, backend_idx);
-    return h != nullptr && now_us < h->eject_until_us;
+    if (h == nullptr) return false;
+    // `active_down` (an active-probe failure) has no timed expiry — only a
+    // successful probe clears it, so it suppresses the backend independent of the
+    // passive 5s cooldown (which would otherwise resume routing to a dead backend
+    // between probes when the health-check interval exceeds the cooldown).
+    return h->active_down || now_us < h->eject_until_us;
 }
 
 // Record the outcome of a connect attempt to (upstream_id, backend_idx).
@@ -74,6 +80,71 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     if (h->fails < 0xffff) h->fails++;
     if (h->fails >= kBackendFailThreshold) h->eject_until_us = now_us + kBackendEjectCooldownUs;
 }
+
+// Record the outcome of an ACTIVE health probe to (upstream_id, backend_idx).
+// Unlike passive ejection — a fixed 5s cooldown — an active failure keeps the
+// backend out of rotation until a probe SUCCEEDS: `active_down` is the authority
+// and has no timed expiry. This closes the gap where, with health_check.interval
+// > kBackendEjectCooldownUs, the passive cooldown would lapse between probes and
+// select_backend would resume routing to a still-dead backend. On success the
+// backend is fully healthy again: clear active_down AND the passive fail/eject
+// record. (`fails` is still bumped on failure for observability; active_down is
+// what select_backend honors.)
+inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
+    (void)now_us;  // active suppression is success-gated, not time-gated
+    BackendHealth* h = backend_health(upstream_id, backend_idx);
+    if (h == nullptr) return;
+    if (healthy) {
+        h->active_down = false;
+        h->fails = 0;
+        h->eject_until_us = 0;
+        return;
+    }
+    h->active_down = true;
+    if (h->fails < 0xffff) h->fails++;
+}
+
+// In-flight guard for active probes: at most one outstanding probe per
+// (upstream, backend). A health endpoint that accepts but never responds keeps
+// its probe Connection alive until keepalive_timeout; without this guard every
+// due sweep would launch ANOTHER probe for the same backend, accumulating probe
+// Connection slots without bound and eventually starving real client accepts.
+// Per-shard thread_local — same rationale as BackendHealth / rr_cursor.
+inline bool* probe_in_flight_slot(u16 upstream_id, u32 backend_idx) {
+    static thread_local bool in_flight[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends] =
+        {};
+    if (upstream_id >= RouteConfig::kMaxUpstreams || backend_idx >= UpstreamTarget::kMaxBackends)
+        return nullptr;
+    return &in_flight[upstream_id][backend_idx];
+}
+
+bool probe_in_flight(u16 upstream_id, u32 backend_idx);
+
+inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
+    bool* s = probe_in_flight_slot(upstream_id, backend_idx);
+    if (s != nullptr) *s = v;
+}
+
+// Clear ALL per-(upstream, backend) health verdicts. Called from
+// sweep_health_probes on a config change (hot reload). The BackendHealth table is
+// thread_local and keyed only by NUMERIC (upstream_idx, backend_idx) — it carries
+// no config pin and active_down has no timed expiry — so after a reload a verdict
+// recorded under the OLD config would wrongly suppress (or pass) a DIFFERENT
+// endpoint that now occupies the same numeric slot, and if the new config
+// disables health checks there is no future probe to clear it. Reset all three
+// fields (active_down + the passive fails/eject, since indices may now mean a
+// different backend). O(kMaxUpstreams * kMaxBackends); runs only on reload.
+//
+// probe_in_flight is deliberately NOT reset. A probe launched under the old config
+// may still be in flight via a live Connection that owns its slot's flag; every
+// probe now carries a bounded timer (see start_health_probe), so the flag always
+// self-clears within upstream_timeout on the probe's teardown. Clearing it here
+// would let the next sweep launch a SECOND probe for the same backend while the
+// old one is still live, defeating the in-flight overlap guard.
+//
+// Defined out-of-line in callbacks.cc (not inline here): it is odr-used from
+// sweep_health_probes — instantiated in main.cc and the test TUs — and a single
+// strong symbol avoids multiple-definition across TUs that include this header.
 
 // Pick the next backend index for `upstream_id` via round-robin, skipping
 // ejected backends. If every backend is ejected, falls back to plain
@@ -92,6 +163,280 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     const u32 idx = rr_cursor[upstream_id] % backend_count;
     rr_cursor[upstream_id] = static_cast<u16>((rr_cursor[upstream_id] + 1) % backend_count);
     return idx;
+}
+
+// --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
+//
+// A probe is a Connection with fd == -1 (no downstream client) whose upstream_fd
+// is a fresh socket to ONE backend of an hc_enabled upstream. The 1s sweep
+// (EventLoopCRTP::sweep_health_probes) calls start_health_probe per backend; the
+// probe connects, sends `GET <hc_path> HTTP/1.1`, parses the response status, and
+// feeds the result into the SAME per-shard BackendHealth used by passive
+// ejection (record_backend_result), so select_backend honors both signals — no
+// parallel health state. Teardown goes through free_probe_conn (never the full
+// close_conn, which moves per-request metrics/epoch/access-log counters).
+//
+// Format "<ipv4>:<port>" (network-order sockaddr_in) for the probe Host header.
+// out must hold >= 22 bytes ("255.255.255.255:65535"). Returns bytes written.
+inline u32 format_probe_host(char* out, const struct sockaddr_in& addr) {
+    u32 w = 0;
+    const auto* bytes = reinterpret_cast<const u8*>(&addr.sin_addr.s_addr);
+    for (u32 i = 0; i < 4; i++) {
+        if (i > 0) out[w++] = '.';
+        const u8 kOctet = bytes[i];
+        if (kOctet >= 100) out[w++] = static_cast<char>('0' + kOctet / 100);
+        if (kOctet >= 10) out[w++] = static_cast<char>('0' + (kOctet / 10) % 10);
+        out[w++] = static_cast<char>('0' + kOctet % 10);
+    }
+    out[w++] = ':';
+    u16 port = ntohs(addr.sin_port);
+    char tmp[5];
+    u32 t = 0;
+    if (port == 0) tmp[t++] = '0';
+    while (port > 0) {
+        tmp[t++] = static_cast<char>('0' + port % 10);
+        port = static_cast<u16>(port / 10);
+    }
+    for (u32 i = 0; i < t; i++) out[w++] = tmp[t - 1 - i];
+    return w;
+}
+
+// Build `GET <hc_path> HTTP/1.1\r\nHost: <ip:port>\r\nConnection: close\r\n
+// User-Agent: rut-healthcheck\r\n\r\n` into the connection-owned recv_buf (a
+// probe never receives client bytes, so recv_buf is free for the request).
+inline void build_probe_request(Connection& conn, const UpstreamTarget& target, u32 backend_idx) {
+    Buffer& buf = conn.recv_buf;
+    static const char kGet[] = "GET ";
+    buf.write(reinterpret_cast<const u8*>(kGet), 4);
+    if (target.hc_path_len > 0)
+        buf.write(reinterpret_cast<const u8*>(target.hc_path), target.hc_path_len);
+    else
+        buf.write(reinterpret_cast<const u8*>("/"), 1);
+    static const char kProto[] = " HTTP/1.1\r\nHost: ";
+    buf.write(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
+    char host[24];
+    const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
+    buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+    static const char kTail[] = "\r\nConnection: close\r\nUser-Agent: rut-healthcheck\r\n\r\n";
+    buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
+}
+
+template <typename Loop>
+void free_probe_conn(Loop* loop, Connection& conn) {
+    // Minimal teardown — close the probe socket (EPOLL_CTL_DEL first) and return
+    // the slot. Never touches metrics/epoch/access-log/keepalive (the probe is
+    // not a real request). free_health_probe is epoll-only; probes never run on
+    // io_uring this slice, so this is only instantiated for the epoll loop.
+    //
+    // Clearing the in-flight guard here covers every connected/sent/response
+    // teardown path (success and error). The probe carries the SAME
+    // (upstream_idx, backend_idx) it was launched against, so the flag is cleared
+    // at exactly the slot that was marked. The one mark-then-exit path that does
+    // NOT route through here — the create_socket-failure branch in
+    // start_health_probe (which calls free_conn directly) — clears it inline.
+    set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
+    loop->free_health_probe(conn);
+}
+
+// Record an active-probe outcome, but only if the config that LAUNCHED the probe
+// is still current. A hot reload (*config_ptr swap) mid-probe can repoint the
+// numeric upstream_idx at a different upstream/backend; a stale result recorded
+// against that index would wrongly suppress or clear the new backend. After a
+// swap the result is meaningless, so drop it.
+template <typename Loop>
+inline void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us) {
+    const RouteConfig* cur = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (cur == conn.request_config)
+        record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us);
+}
+
+template <typename Loop>
+void on_probe_response(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_probe_sent(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_probe_connected(void* lp, Connection& conn, IoEvent ev);
+
+// Returns true iff a probe socket was actually submitted (a connect that may
+// queue one synchronous completion into the epoll pending ring). Returns false
+// when the probe was skipped (already in-flight) or aborted before submit
+// (invalid index / local resource failure) — i.e. when no pending-ring slot was
+// consumed. sweep_health_probes uses this to budget probes against the ring.
+template <typename Loop>
+bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
+    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (config == nullptr || upstream_idx >= config->upstream_count) return false;
+    const UpstreamTarget& target = config->upstreams[upstream_idx];
+    if (backend_idx >= target.addr_count) return false;
+
+    // Reserve a margin of Connection slots for real client traffic. Near
+    // kMaxConns a due sweep can launch up to kMaxProbesPerSweep (32) probes,
+    // and a stalled health endpoint pins each probe slot until upstream_timeout
+    // (~30s). Without a floor those probes could consume the last free slots
+    // and real accepts would be refused for that whole window. Refuse to
+    // allocate a probe when free slots are below the reserve; the deferred
+    // probe simply retries on the next sweep (probe_in_flight is left unset, so
+    // the retry is idempotent). The reserve (64) comfortably exceeds a full
+    // 32-probe sweep burst yet is negligible against kMaxConns (16384), so it
+    // never meaningfully reduces real-traffic capacity. Checked before
+    // set_probe_in_flight so a deferral leaves no guard to clear.
+    static constexpr u32 kHealthProbeSlotReserve = 64;
+    if (loop->free_conn_slots() < kHealthProbeSlotReserve) return false;
+
+    // At most one outstanding probe per backend (see probe_in_flight). A backend
+    // that accepts but never responds otherwise accumulates a probe Connection per
+    // due sweep until each times out. Mark BEFORE alloc_conn and clear on EVERY
+    // exit-after-mark path below (alloc/create-socket failure here, every other
+    // path through free_probe_conn).
+    if (probe_in_flight(upstream_idx, backend_idx)) return false;
+    set_probe_in_flight(upstream_idx, backend_idx, true);
+
+    Connection* cptr = loop->alloc_conn();
+    if (cptr == nullptr) {  // slot exhaustion: never starve real traffic
+        set_probe_in_flight(upstream_idx, backend_idx, false);
+        return false;
+    }
+    Connection& conn = *cptr;
+    conn.is_health_probe = true;
+    conn.fd = -1;
+    conn.upstream_idx = upstream_idx;
+    conn.upstream_backend_idx = static_cast<u8>(backend_idx);
+    // Pin the launching config so on_probe_* drops results after a hot swap.
+    conn.request_config = config;
+
+    // Probe-SETUP failures below (create_socket / alloc_buf / submit_connect) are
+    // LOCAL resource or kernel-submission failures, not backend health signals —
+    // they must NOT mark the backend down (else local fd/slice pressure would
+    // eject healthy backends, and active_down is success-gated so it would stay
+    // ejected). Just free and skip this probe; the next sweep retries. Only
+    // genuine on-wire outcomes (connect refused/reset, send/recv result, response)
+    // feed record_active_probe_result.
+    const i32 kProbeFd = UpstreamPool::create_socket();
+    if (kProbeFd < 0) {
+        // The one mark-then-exit path that bypasses free_probe_conn, so clear the
+        // in-flight guard inline.
+        set_probe_in_flight(upstream_idx, backend_idx, false);
+        loop->free_conn(conn);
+        return false;
+    }
+    conn.upstream_fd = kProbeFd;
+    // The response lands in upstream_recv_buf (recv_buf holds the request).
+    if (!loop->alloc_upstream_buf(conn)) {
+        free_probe_conn(loop, conn);
+        return false;
+    }
+
+    conn.recv_buf.reset();
+    build_probe_request(conn, target, backend_idx);
+
+    conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
+    if (!loop->submit_connect(
+            conn, &target.addrs[backend_idx], sizeof(target.addrs[backend_idx]))) {
+        free_probe_conn(loop, conn);
+        return false;
+    }
+    // Bound the probe's lifetime. A probe Connection is not a client accept, so
+    // nothing else puts it on the keepalive wheel; a backend that completes the
+    // connect but never responds (or a connect that stays pending) would otherwise
+    // keep this Connection alive forever with upstream I/O armed and
+    // probe_in_flight set — permanently suppressing all future probes for the
+    // backend and leaking the slot. Arm it on the 1s timer wheel with the same
+    // bound a real proxied upstream response gets (upstream_timeout, default 30s,
+    // already < TimerWheel::kSlots): the Timeout tick reaps a stalled probe as a
+    // health FAILURE and frees it (clearing probe_in_flight so the next sweep
+    // re-probes). Every fast completion path frees via free_probe_conn ->
+    // free_health_probe -> free_conn, which removes the wheel entry, so a completed
+    // probe can never leave a stale entry to fire later against a reused slot.
+    loop->timer.add(&conn, loop->upstream_timeout);
+    return true;
+}
+
+template <typename Loop>
+void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result < 0) {
+        record_probe_if_current(loop, conn, /*healthy=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    conn.set_slots(nullptr, nullptr, nullptr, &on_probe_sent<Loop>);
+    // submit failure is local (kernel submission), not a backend signal — skip.
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), conn.recv_buf.len())) {
+        free_probe_conn(loop, conn);
+    }
+}
+
+template <typename Loop>
+void on_probe_sent(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result < 0) {
+        record_probe_if_current(loop, conn, /*healthy=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    conn.set_slots(nullptr, nullptr, &on_probe_response<Loop>, nullptr);
+    if (conn.upstream_recv_buf.len() > 0) {
+        IoEvent synth = {conn.id,
+                         static_cast<i32>(conn.upstream_recv_buf.len()),
+                         0,
+                         0,
+                         IoEventType::UpstreamRecv,
+                         0};
+        on_probe_response<Loop>(lp, conn, synth);
+        return;
+    }
+    // submit failure is local (kernel submission), not a backend signal — skip.
+    if (!loop->submit_recv_upstream(conn)) {
+        free_probe_conn(loop, conn);
+    }
+}
+
+template <typename Loop>
+void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    const u64 kNowUs = monotonic_us();
+    if (ev.aux == kLocalSubmitFailureAux) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        record_probe_if_current(loop, conn, /*healthy=*/false, kNowUs);
+        free_probe_conn(loop, conn);
+        return;
+    }
+    HttpResponseParser parser;
+    ParsedResponse resp;
+    resp.reset();
+    parser.reset();
+    const ParseStatus kStatus =
+        parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    // Headers split across packets: keep reading while bytes arrive and buffer space
+    // remains. The probe's upstream_timeout bounds stalled/trickling responses.
+    if (kStatus == ParseStatus::Incomplete && ev.result > 0 &&
+        conn.upstream_recv_buf.write_avail() > 0) {
+        if (!loop->submit_recv_upstream(conn)) {
+            free_probe_conn(loop, conn);
+        }
+        return;
+    }
+    // Pin to the launching config: a hot reload mid-probe can repoint the numeric
+    // upstream_idx at a different upstream. Guard BEFORE the expected-status
+    // comparison — after a swap the response is meaningless, so free without
+    // recording (the stale result must not touch the new backend at this index).
+    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (config != conn.request_config) {
+        free_probe_conn(loop, conn);
+        return;
+    }
+    // Complete + expected status → healthy; anything else (Error, Incomplete with
+    // no more data, unexpected status) → failure.
+    bool healthy = false;
+    if (kStatus == ParseStatus::Complete && config != nullptr &&
+        conn.upstream_idx < config->upstream_count) {
+        healthy = (resp.status_code == config->upstreams[conn.upstream_idx].hc_expected_status);
+    }
+    record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, kNowUs);
+    free_probe_conn(loop, conn);
 }
 
 u8 map_log_method(HttpMethod method);
@@ -1531,7 +1876,19 @@ void handle_jit_outcome(Loop* loop,
             }
             conn.upstream_fd = kUpstreamFd;
             conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-            loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
+            if (!loop->submit_connect(
+                    conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+                ::close(conn.upstream_fd);
+                conn.upstream_fd = -1;
+                conn.upstream_idx = 0;
+                loop->clear_upstream_fd(conn.id);
+                conn.resp_status = kStatusBadGateway;
+                format_static_response(conn, 502, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             return;
         }
         case JitDispatchOutcome::Kind::Error:
@@ -1615,7 +1972,16 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     const u32 kBackend =
         select_backend(conn.upstream_idx, target.addr_count, conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
-    return loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
+    if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
+        return true;
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+    }
+    return false;
 }
 
 // The upstream timed out before any response bytes reached the client → emit
@@ -2003,7 +2369,10 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                    nullptr,
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_upstream_request_sent<Loop>);
-    loop->submit_send_upstream(conn, req_src, req_send_len);
+    if (!loop->submit_send_upstream(conn, req_src, req_send_len)) {
+        IoEvent synth = {conn.id, -EIO, 0, 0, IoEventType::UpstreamSend, 0};
+        on_upstream_request_sent<Loop>(lp, conn, synth);
+    }
 }
 
 template <typename Loop>
@@ -3167,7 +3536,10 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                    nullptr,
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_request_body_sent<Loop>);
-    loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len)) {
+        conn.upstream_request_incomplete = true;
+        loop->close_conn(conn);
+    }
 }
 
 #if RUT_ENABLE_WEBSOCKET

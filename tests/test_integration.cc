@@ -10,6 +10,7 @@
 #include "rut/jit/jit_engine.h"
 #endif
 #include "rut/runtime/callbacks_h2.h"
+#include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/hpack.h"
@@ -47,6 +48,8 @@ struct TestConn {
         conn.send_buf.bind(send_storage, kTestBufSize);
     }
 };
+
+static u32 fill_socket_send_buffer(i32 fd, i32 peer);
 
 namespace {
 
@@ -1954,6 +1957,1137 @@ TEST(upstream_concurrency_e2e, slot_released_on_upstream_failure) {
     CHECK_EQ(one_shot(), 502);  // slot was released → not stuck at 503
 
     lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// A tiny backend whose HTTP status for the health path is switchable at runtime
+// (atomic), so one server can model a failing-then-recovering backend. Each probe
+// uses Connection: close, so every probe is a fresh accepted connection.
+struct HealthProbeServer {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<u16> status{200};
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~HealthProbeServer() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<HealthProbeServer*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            char req[1024];
+            (void)recv_timeout(client, req, sizeof(req), 1000);
+            const u16 code = s->status.load(std::memory_order_acquire);
+            char resp[128];
+            const char* reason = (code == 200) ? "OK" : "Service Unavailable";
+            int n = snprintf(resp,
+                             sizeof(resp),
+                             "HTTP/1.1 %u %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                             static_cast<unsigned>(code),
+                             reason);
+            if (n > 0) (void)send_all(client, resp, static_cast<u32>(n));
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Active health checks (slice 2, epoll): the built-in probe sweep connects to an
+// hc_enabled backend, GETs the health path, and feeds the result into the SHARED
+// BackendHealth via record_backend_result. A backend that answers the probe with
+// 503 (!= hc_expected_status) is ejected once it crosses the consecutive-failure
+// threshold; a recovered 200 clears the ejection. Driven deterministically in the
+// test thread — sweep + a manual event pump — so probes share the thread_local
+// health table we assert against (no multi-second sleeps).
+TEST(active_health_e2e, probe_ejects_failing_backend_then_recovers) {
+    using namespace rut;
+    HealthProbeServer backend;
+    REQUIRE(backend.setup());
+    backend.status.store(503, std::memory_order_release);  // unhealthy first
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/1, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    // Start from a clean health record (thread_local may carry state across tests
+    // that ran a proxy on this same thread).
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    // Pump events on THIS thread until the in-flight probe frees its slot. Probe
+    // I/O is local + responsive, so wait() only blocks until the next probe step.
+    auto pump = [&]() {
+        IoEvent events[64];
+        for (int it = 0; it < 200 && loop->active_count() > 0; it++) {
+            u32 n = loop->backend.wait(events, 64, loop->conns, RealLoop::kMaxConns);
+            for (u32 i = 0; i < n; i++) loop->dispatch(events[i]);
+        }
+    };
+
+    // First sweep detects the config install → arms deadlines, issues nothing.
+    loop->sweep_health_probes();
+
+    // Three failing probes (== kBackendFailThreshold) eject the backend.
+    for (u32 round = 0; round < 3; round++) {
+        loop->health_probe_deadline_ns[uid] = 0;  // force "due"
+        loop->sweep_health_probes();              // issues one probe
+        pump();                                   // run it to completion
+    }
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    // Backend recovers: a single successful probe clears the ejection.
+    backend.status.store(200, std::memory_order_release);
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    pump();
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+    backend.teardown();
+}
+
+// An active-probe failure must keep the backend OUT of rotation until a probe
+// SUCCEEDS — not merely until the passive 5s cooldown expires. Otherwise, with a
+// health-check interval longer than the cooldown, select_backend would resume
+// routing to a still-dead backend in the gap between probes. Drives the shared
+// per-shard BackendHealth directly (same thread_local table the probe path feeds).
+TEST(active_health, failed_probe_keeps_backend_down_until_success) {
+    using namespace rut;
+    const u16 uid = 40;  // distinct index — avoid colliding with other tests' state
+    const u32 bidx = 0;
+    const u64 now = monotonic_us();
+
+    // Clean slate, then a fresh active failure suppresses the backend immediately.
+    record_active_probe_result(uid, bidx, /*healthy=*/true, now);
+    CHECK(!backend_ejected(uid, bidx, now));
+    record_active_probe_result(uid, bidx, /*healthy=*/false, now);
+    CHECK(backend_ejected(uid, bidx, now));
+
+    // Still down well past the passive 5s cooldown — only a success can clear it.
+    CHECK(backend_ejected(uid, bidx, now + kBackendEjectCooldownUs + 1));
+    CHECK(backend_ejected(uid, bidx, now + 60'000'000));
+
+    // A later successful probe restores the backend to rotation.
+    record_active_probe_result(uid, bidx, /*healthy=*/true, now + 60'000'000);
+    CHECK(!backend_ejected(uid, bidx, now + 60'000'000));
+}
+
+// A probe to a backend that accepts the TCP connect but never sends a response
+// parks the probe Connection on its upstream recv. Without a bounded probe
+// timeout it would stay alive forever with probe_in_flight set — permanently
+// blocking future probes for the backend and leaking the slot. start_health_probe
+// arms the probe on the 1s timer wheel (upstream_timeout); the Timeout tick must
+// reap it as a health FAILURE, clear probe_in_flight, and free the slot, so the
+// next sweep re-probes. Driven deterministically: we issue the probe but never
+// pump its I/O (it stays parked), then advance the wheel by hand.
+TEST(active_health, stalled_probe_reaped_then_reprobed) {
+    using namespace rut;
+    // A bare listening socket: the kernel completes the handshake via the backlog,
+    // so connect succeeds, but nothing ever accept()s or replies → the probe
+    // stalls. We never pump the loop, so the connect/recv completions are never
+    // delivered; the probe simply sits on the wheel until the tick reaps it.
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    // Large interval so the sweep that runs inside dispatch(Timeout) does not
+    // re-issue a probe and perturb the assertions.
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    // Short probe deadline so a handful of wheel ticks reaps it deterministically.
+    loop->upstream_timeout = 3;
+
+    // First sweep: config install → arms deadlines + clears the health table.
+    loop->sweep_health_probes();
+    // Defensive clean slate (the thread_local tables may carry state across tests
+    // that ran on this same thread).
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    // Force one probe. It connects to a backend that never responds; we
+    // deliberately do NOT pump the I/O, so it stays parked on the timer wheel.
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK(probe_in_flight(uid, 0));                   // probe launched, in flight
+    CHECK_EQ(loop->active_count(), 1u);               // one probe Connection taken
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));  // not failed yet
+
+    // Advance the wheel past the probe deadline (upstream_timeout=3) → reap.
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    loop->dispatch(tick);
+
+    // Reaped: backend recorded down, in-flight guard cleared, slot freed.
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+
+    // The cleared guard re-enables probing: a later sweep issues a fresh probe.
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK(probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 1u);
+
+    // Reap the second probe so no Connection dangles past teardown.
+    loop->dispatch(tick);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+// F2 (#161): a probe's stalled-recv reap must fire at upstream_timeout, not the
+// (longer) keepalive_timeout. A probe stays in the default (Idle) state, so the
+// dispatch timer-refresh — `state == Proxying ? upstream_timeout : keepalive` —
+// would bump the probe's deadline to keepalive on its connect/send events,
+// delaying the reap. Health probes now keep the deadline armed at launch. Here
+// we drive a connect event through dispatch (the refresh site), then prove the
+// probe is reaped after only upstream_timeout+1 wheel ticks (far below
+// keepalive): if the event had refreshed to keepalive, those ticks would not
+// reach it.
+TEST(active_health, probe_deadline_stays_upstream_timeout) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    // Large interval so the sweep that runs inside dispatch(Timeout) does not
+    // re-issue a probe and perturb the assertions.
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    // upstream_timeout deliberately far below keepalive_timeout (default 60).
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();  // launch one probe (connect via backlog)
+    REQUIRE(probe_in_flight(uid, 0));
+    REQUIRE_EQ(loop->active_count(), 1u);
+
+    // Locate the probe slot to address a synthetic connect-completion at it.
+    u32 cid = RealLoop::kMaxConns;
+    for (u32 i = 0; i < RealLoop::kMaxConns; i++)
+        if (loop->conns[i].is_health_probe) {
+            cid = i;
+            break;
+        }
+    REQUIRE(cid < RealLoop::kMaxConns);
+
+    // Drive the connect completion through dispatch — this is the path that
+    // refreshes the probe's wheel deadline (the line the fix touches). With the
+    // fix it refreshes to upstream_timeout; the pre-fix code used keepalive.
+    IoEvent connected{};
+    connected.type = IoEventType::UpstreamConnect;
+    connected.conn_id = cid;
+    connected.result = 0;
+    loop->dispatch(connected);
+    REQUIRE_EQ(loop->active_count(), 1u);  // probe still parked (submit_send ok)
+
+    // Advance the wheel by upstream_timeout+1 ticks. Reaped → the refresh used
+    // upstream_timeout. (Pre-fix: deadline would be keepalive (60), unreached.)
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, partial_probe_response_does_not_extend_probe_deadline) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, "/health", 7, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    c->set_slots(nullptr, nullptr, &on_probe_response<EpollEventLoop>, nullptr);
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>("H"), 1), 1u);
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+    loop->timer.add(c, loop->upstream_timeout);
+
+    IoEvent first_tick{};
+    first_tick.type = IoEventType::Timeout;
+    first_tick.result = 1;
+    loop->dispatch(first_tick);
+    REQUIRE_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+
+    IoEvent partial{};
+    partial.type = IoEventType::UpstreamRecv;
+    partial.conn_id = c->id;
+    partial.result = 1;
+    loop->dispatch(partial);
+    REQUIRE_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout);
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    if (::fcntl(fds[0], F_GETFD) != -1) close(fds[0]);
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// F1 (#161): a single sweep can have far more due backend probes than the epoll
+// backend's fixed pending-completion ring (kPendingCap) can hold; each probe's
+// synchronous connect may queue one completion, so an unbounded sweep would
+// overflow the ring and silently drop healthy probe results. The sweep caps
+// probes per tick and reserves ring headroom for real traffic. Here 5 upstreams ×
+// 8 backends = 40 due probes exceed kMaxProbesPerSweep (32); the sweep must launch
+// exactly the cap, never overflow the ring, and keep the un-covered upstreams
+// "due" so a later tick picks them up (no dropped health coverage).
+TEST(active_health, sweep_caps_probes_per_tick) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    const u32 kUps = 5;  // 5 × 8 = 40 due probes > kMaxProbesPerSweep (32)
+    u16 uids[kUps];
+    const char kPath[] = "/healthz";
+    for (u32 u = 0; u < kUps; u++) {
+        auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+        REQUIRE(id.has_value());
+        uids[u] = static_cast<u16>(id.value());
+        for (u32 b = 1; b < 8; b++)  // add_upstream gave backend 0; add 7 more → 8
+            REQUIRE(cfg.add_upstream_backend(uids[u], 0x7F000001, backend_port));
+        REQUIRE(cfg.set_upstream_health_check(
+            uids[u], kPath, sizeof(kPath) - 1, /*interval_ms=*/1, /*status=*/200));
+    }
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    // Clean slate for every (upstream, backend) this test touches.
+    for (u32 u = 0; u < kUps; u++)
+        for (u32 b = 0; b < 8; b++) set_probe_in_flight(uids[u], b, false);
+
+    loop->sweep_health_probes();  // config install → arms, issues nothing
+    CHECK_EQ(loop->active_count(), 0u);
+
+    for (u32 u = 0; u < kUps; u++) loop->health_probe_deadline_ns[uids[u]] = 0;  // all due
+    loop->sweep_health_probes();
+
+    // Exactly the per-sweep cap launched (pending starts empty: budget =
+    // min(kPendingCap - reserve, kMaxProbesPerSweep) = 32), and the ring never
+    // overflowed.
+    CHECK_EQ(loop->active_count(), 32u);
+    CHECK_LE(loop->backend.pending_count, EpollBackend::kPendingCap);
+    // The last upstream couldn't be covered this sweep → its deadline stays in the
+    // past, so the next tick re-probes it (coverage deferred, not dropped).
+    CHECK_EQ(loop->health_probe_deadline_ns[uids[kUps - 1]], 0u);
+
+    // Tear down the in-flight probes (clears probe_in_flight via free_probe_conn).
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    for (u32 u = 0; u < kUps; u++)
+        for (u32 b = 0; b < 8; b++) CHECK(!probe_in_flight(uids[u], b));
+
+    // The next sweep must resume at the upstream deferred by the first sweep. With
+    // a fixed upstream-0 start, completing low-index probes each tick can consume
+    // the whole budget again and starve the last upstream indefinitely.
+    for (u32 u = 0; u < kUps; u++) loop->health_probe_deadline_ns[uids[u]] = 0;
+    loop->sweep_health_probes();
+    for (u32 b = 0; b < 8; b++) CHECK(probe_in_flight(uids[kUps - 1], b));
+    CHECK_GT(loop->health_probe_deadline_ns[uids[kUps - 1]], 0u);
+
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    for (u32 u = 0; u < kUps; u++)
+        for (u32 b = 0; b < 8; b++) CHECK(!probe_in_flight(uids[u], b));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, fragmented_probe_headers_rearm_until_timeout) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    static const char kPartial[] = "HTTP/1.1 ";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1),
+        sizeof(kPartial) - 1);
+
+    for (u32 i = 0; i < 8; i++) {
+        on_probe_response<EpollEventLoop>(
+            loop, *c, IoEvent{c->id, 1, 0, 0, IoEventType::UpstreamRecv, 0});
+        REQUIRE_EQ(loop->active_count(), 1u);
+        CHECK(probe_in_flight(uid, 0));
+        CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    }
+
+    free_probe_conn(loop, *c);
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+// F3 (#161): graceful-drain force-close must tear down an in-flight probe. A probe
+// has fd == -1 (no downstream) with upstream_fd >= 0, so force_close_all()'s
+// `fd >= 0` guard alone would leak its upstream socket + slot at the drain
+// deadline. force_close_all must route probes through free_probe_conn (close the
+// upstream fd, return the slot, clear probe_in_flight).
+TEST(active_health, force_close_tears_down_inflight_probe) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();  // launch one probe
+    REQUIRE(probe_in_flight(uid, 0));
+    REQUIRE_EQ(loop->active_count(), 1u);
+
+    // Capture the probe's upstream fd so we can verify force-close closed it.
+    i32 probe_fd = -1;
+    for (u32 i = 0; i < RealLoop::kMaxConns; i++)
+        if (loop->conns[i].is_health_probe) {
+            probe_fd = loop->conns[i].upstream_fd;
+            break;
+        }
+    REQUIRE(probe_fd >= 0);
+
+    loop->force_close_all();
+
+    CHECK_EQ(loop->active_count(), 0u);        // slot returned
+    CHECK(!probe_in_flight(uid, 0));           // in-flight guard cleared
+    CHECK_EQ(::fcntl(probe_fd, F_GETFD), -1);  // upstream fd closed (no leak)
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+// F4 (#161): stale events from one backend.wait() batch carry only conn_id. If an
+// earlier probe I/O completion frees a slot, dispatch(Timeout) must not sweep and
+// allocate a replacement probe into that slot until the rest of the same batch has
+// drained; otherwise a trailing stale event for the old probe can close/drive the
+// replacement and suppress timely detection.
+TEST(active_health, timeout_sweep_defers_until_batch_drains) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    const char kPath[] = "/healthz";
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, kPath, sizeof(kPath) - 1, /*interval_ms=*/1, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    c->set_slots(nullptr, nullptr, nullptr, &on_probe_sent<EpollEventLoop>);
+    set_probe_in_flight(uid, 0, true);
+    const u32 old_cid = c->id;
+
+    // The UpstreamSend error frees old_cid and clears probe_in_flight. The Timeout
+    // marks a due sweep. The trailing UpstreamRecv is stale for old_cid and must be
+    // ignored before the deferred sweep is allowed to allocate the replacement.
+    loop->health_probe_deadline_ns[uid] = 0;
+    IoEvent batch[3] = {
+        make_ev(old_cid, IoEventType::UpstreamSend, -ECONNRESET),
+        make_ev(0, IoEventType::Timeout, 1),
+        make_ev(old_cid, IoEventType::UpstreamRecv, -ECONNRESET),
+    };
+    loop->dispatch_batch(batch, 3);
+
+    CHECK_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
+
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, coalesced_timeout_does_not_reap_new_probe) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, one_second_upstream_timeout_still_sweeps_on_normal_tick) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 1;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+    CHECK_GT(loop->health_probe_deadline_ns[uid], 0u);
+
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, route_config_rejects_invalid_probe_config) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 8080);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+
+    const char with_space[] = "/health check";
+    const char with_control[] = {'/', 'h', '\t', 'x'};
+    const char with_del[] = {'/', 'h', static_cast<char>(0x7f), 'x'};
+
+    CHECK(!cfg.set_upstream_health_check(
+        uid, with_space, sizeof(with_space) - 1, /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(
+        uid, with_control, sizeof(with_control), /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(
+        uid, with_del, sizeof(with_del), /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, nullptr, 1, /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, nullptr, 0, /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/0, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/99));
+    CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/600));
+    CHECK(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/204));
+}
+
+TEST(active_health, sweep_keeps_due_deadline_on_probe_deferral) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+
+    const u32 saved_free_top = loop->free_top;
+    loop->free_top = 0;  // force start_health_probe's local slot-reserve deferral
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    loop->free_top = saved_free_top;
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, sweep_rearms_deadline_for_inflight_probe) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, true);
+    const u32 saved_free_top = loop->free_top;
+    loop->free_top = 0;  // prove in-flight coverage does not call start_health_probe
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+    CHECK_GT(loop->health_probe_deadline_ns[uid], 0u);
+    CHECK(probe_in_flight(uid, 0));
+    loop->free_top = saved_free_top;
+    set_probe_in_flight(uid, 0, false);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, draining_timeout_skips_probe_sweep) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->drain(1);
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, generic_probe_close_clears_inflight) {
+    using namespace rut;
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1).has_value());
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u16 uid = 3;
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    set_probe_in_flight(uid, 0, true);
+
+    loop->close_conn(*c);
+
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, connect_registration_failure_defers_without_downing_backend) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    loop->sweep_health_probes();  // config install + health reset
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    close(loop->backend.epoll_fd);
+    loop->backend.epoll_fd = -1;  // force add_connect's epoll registration to fail
+    loop->health_probe_deadline_ns[uid] = 0;
+    loop->sweep_health_probes();
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK_EQ(loop->health_probe_deadline_ns[uid], 0u);
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, send_registration_failure_defers_without_downing_backend) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    (void)fill_socket_send_buffer(fds[0], fds[1]);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("GET / HTTP/1.1\r\n\r\n"), 18), 18u);
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    close(loop->backend.epoll_fd);
+    loop->backend.epoll_fd = -1;  // force add_send_upstream's epoll registration to fail
+    on_probe_connected<EpollEventLoop>(
+        loop, *c, IoEvent{c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, recv_registration_failure_defers_without_downing_backend) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    close(loop->backend.epoll_fd);
+    loop->backend.epoll_fd = -1;  // force add_recv_upstream's epoll registration to fail
+    on_probe_sent<EpollEventLoop>(loop, *c, IoEvent{c->id, 18, 0, 0, IoEventType::UpstreamSend, 0});
+    REQUIRE_EQ(loop->backend.pending_count, 1u);
+    IoEvent local_failure = loop->backend.pending_completions[0];
+    CHECK_EQ(local_failure.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(local_failure.aux, kLocalSubmitFailureAux);
+    loop->dispatch(local_failure);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, probe_sent_preserves_preread_response) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1),
+               sizeof(kResp) - 1);
+    set_probe_in_flight(uid, 0, true);
+    record_active_probe_result(uid, 0, /*healthy=*/false, monotonic_us());
+    REQUIRE(backend_ejected(uid, 0, monotonic_us()));
+
+    on_probe_sent<EpollEventLoop>(loop, *c, IoEvent{c->id, 18, 0, 0, IoEventType::UpstreamSend, 0});
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+    CHECK(!backend_ejected(uid, 0, monotonic_us()));
+    CHECK_EQ(::fcntl(fds[0], F_GETFD), -1);
+
+    close(fds[1]);
     loop->shutdown();
     close(listen_fd);
     destroy_real_loop(loop);
@@ -7749,8 +8883,8 @@ TEST(route, jit_handler_custom_body_real_socket) {
     const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[2048];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n, 0);
+    i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+    REQUIRE_GT(n, 0);
     buf[n < static_cast<i32>(sizeof(buf)) ? n : static_cast<i32>(sizeof(buf)) - 1] = '\0';
 
     // Response must contain "200", "Content-Length: 12", default
@@ -9679,8 +10813,8 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     const char kReq[] = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n, 0);
+    i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+    REQUIRE_GT(n, 0);
     // Assert the default reason-phrase body — not just that 200 is
     // anywhere in the response. For 200 the default body is "OK" (2
     // bytes), and format_static_response does NOT emit Content-Type,
@@ -11151,6 +12285,107 @@ TEST(route, upstream_backends_list_compiles) {
     CHECK_EQ(__builtin_bswap32(cfg.upstreams[0].addrs[0].sin_addr.s_addr), 0x7F000001u);
     CHECK_EQ(__builtin_bswap16(cfg.upstreams[0].addrs[2].sin_port), 8083u);
     rir.destroy();
+}
+
+// `health_check: { path, interval, status }` threads through every IR layer
+// into UpstreamTarget (config data only; no runtime probing in this slice).
+TEST(route, upstream_health_check_compiles) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { path: \"/healthz\", interval: 5s, status: 200 }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.upstream_count, 1u);
+    CHECK(rir.module.upstreams[0].hc_enabled);
+    CHECK_EQ(rir.module.upstreams[0].hc_interval_ms, 5000u);
+    CHECK_EQ(rir.module.upstreams[0].hc_expected_status, 200u);
+    REQUIRE_EQ(rir.module.upstreams[0].hc_path.len, 8u);
+    CHECK((rir.module.upstreams[0].hc_path.eq({"/healthz", 8})));
+    // populate_route_config copies the config into UpstreamTarget.
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    CHECK(cfg.upstreams[0].hc_enabled);
+    CHECK_EQ(cfg.upstreams[0].hc_path_len, 8u);
+    CHECK((Str{cfg.upstreams[0].hc_path, cfg.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
+    CHECK_EQ(cfg.upstreams[0].hc_interval_ms, 5000u);
+    CHECK_EQ(cfg.upstreams[0].hc_expected_status, 200u);
+    rir.destroy();
+}
+
+// `status:` is optional and defaults to 200.
+TEST(route, upstream_health_check_status_defaults_to_200) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { path: \"/up\", interval: 10s }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    CHECK(rir.module.upstreams[0].hc_enabled);
+    CHECK_EQ(rir.module.upstreams[0].hc_interval_ms, 10000u);
+    CHECK_EQ(rir.module.upstreams[0].hc_expected_status, 200u);
+    rir.destroy();
+}
+
+// `health_check` missing the required `path` key is rejected at parse time.
+TEST(route, upstream_health_check_missing_path_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { interval: 5s }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // parser rejects: required `path` missing
+}
+
+// `health_check` missing the required `interval` key is rejected at parse time.
+TEST(route, upstream_health_check_missing_interval_rejected) {
+    using namespace rut;
+    const char* src =
+        "upstream api {\n"
+        "  backends: [\"127.0.0.1:8081\"]\n"
+        "  health_check: { path: \"/healthz\" }\n"
+        "}\n"
+        "route GET \"/api\" { return forward(api) }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    CHECK(!ast);  // parser rejects: required `interval` missing
 }
 
 // Mixing `backends:` with `host`/`port` in one upstream dict is rejected.

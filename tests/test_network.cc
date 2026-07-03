@@ -824,6 +824,25 @@ TEST(proxy, connect_fail_502) {
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed, not looped back
 }
 
+TEST(proxy, upstream_initial_send_submit_failure_closes_immediately) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 100));
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+
+    const u32 cid = conn->id;
+    loop.backend.fail_upstream_send = true;
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamConnect, 0));
+
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
 // Upstream send fails → close
 TEST(proxy, upstream_send_error) {
     SmallLoop loop;
@@ -8203,6 +8222,28 @@ TEST(proxy, upstream_request_sent_wrong_type) {
     CHECK(loop.conns[cid].fd >= 0);
 }
 
+TEST(streaming, request_body_send_submit_failure_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("abc"), 3), 3u);
+    c->state = ConnState::Proxying;
+    c->upstream_fd = 100;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 3;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
+
+    const u32 cid = c->id;
+    loop.backend.fail_upstream_send = true;
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 3));
+
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
 // === Coverage: upstream connected wrong event type ===
 
 TEST(proxy, upstream_connected_wrong_type) {
@@ -8542,6 +8583,37 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     close(ufds[0]);
     close(ufds[1]);
     c->fd = -1;
+    c->upstream_fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_loop, upstream_recv_registration_failure_queues_local_error) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto res = loop->init(0, -1, 0);
+    REQUIRE(res.has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    c->upstream_fd = fds[0];
+
+    close(loop->backend.epoll_fd);
+    loop->backend.epoll_fd = -1;
+    CHECK(loop->backend.add_recv_upstream(fds[0], cid));
+    REQUIRE_EQ(loop->backend.pending_count, 1u);
+    CHECK_EQ(loop->backend.pending_completions[0].conn_id, cid);
+    CHECK_EQ(loop->backend.pending_completions[0].type, IoEventType::UpstreamRecv);
+    CHECK_LT(loop->backend.pending_completions[0].result, 0);
+    CHECK_EQ(loop->backend.pending_completions[0].aux, kLocalSubmitFailureAux);
+    CHECK_EQ(loop->backend.upstream_fd_map[cid], -1);
+
+    close(fds[0]);
+    close(fds[1]);
     c->upstream_fd = -1;
     loop->free_conn(*c);
     loop->shutdown();
@@ -13275,6 +13347,80 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     }
     close(old_fds[0]);
     close(new_fds[1]);
+}
+
+TEST(state_invariant, jit_forward_connect_submit_failure_sends_502) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    SmallLoop loop;
+    loop.setup();
+
+    i32 fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ScopedFakeSocket fake_socket(fds[0]);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = upstream.value();
+    loop.backend.clear_ops();
+    loop.backend.fail_connect = true;
+
+    handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(c->pending_handler_fn, nullptr);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_EQ(c->upstream_idx, 0u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+
+    close(fds[1]);
+}
+
+TEST(state_invariant, backend_retry_connect_submit_failure_closes_retry_fd) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_upstream_backend(static_cast<u16>(upstream.value()), 0x7F000001, 9001));
+    SmallLoop loop;
+    loop.setup();
+
+    i32 old_fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, old_fds) == 0);
+    i32 retry_fds[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, retry_fds) == 0);
+    ScopedFakeSocket fake_socket(retry_fds[0]);
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_fd = old_fds[1];
+    c->upstream_attempts = 1;
+    c->upstream_recv_armed = true;
+    c->upstream_send_armed = true;
+    loop.backend.fail_connect = true;
+
+    CHECK(!try_connect_next_backend<SmallLoop>(&loop, *c));
+
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(!c->upstream_recv_armed);
+    CHECK(!c->upstream_send_armed);
+    CHECK_EQ(fcntl(old_fds[1], F_GETFD), -1);
+    CHECK_EQ(fcntl(retry_fds[0], F_GETFD), -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    close(old_fds[0]);
+    close(retry_fds[1]);
 }
 
 // State 1: Accept → ReadingHeader {on_recv=header, rest=null}

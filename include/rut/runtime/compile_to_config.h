@@ -216,6 +216,16 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             for (u32 b = 0; b < up.extra_count; b++) {
                 if (!cfg.add_upstream_backend(i, up.extra_ips[b], up.extra_ports[b])) return false;
             }
+            // Attach active health-check config (data only; the frontend already
+            // validated path/interval). Fails only on an over-long path.
+            if (up.hc_enabled) {
+                if (!cfg.set_upstream_health_check(i,
+                                                   up.hc_path.ptr,
+                                                   up.hc_path.len,
+                                                   up.hc_interval_ms,
+                                                   up.hc_expected_status))
+                    return false;
+            }
         }
     } else {
         // Pre-bound mode: verify the caller added upstreams in DSL
@@ -239,6 +249,21 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
             if (cfg.upstreams[i].name_len != up.name.len) return false;
             for (u32 j = 0; j < up.name.len; j++) {
                 if (cfg.upstreams[i].name[j] != up.name.ptr[j]) return false;
+            }
+        }
+        // Attach active health-check config onto the pre-bound upstreams too —
+        // the caller bound only addresses, so without this the hc fields stay at
+        // their defaults (hc_enabled == false) and no probes ever run. Mirrors the
+        // empty-upstreams branch above. Fails only on an over-long path.
+        for (u32 i = 0; i < mod.upstream_count; i++) {
+            const auto& up = mod.upstreams[i];
+            if (up.hc_enabled) {
+                if (!cfg.set_upstream_health_check(i,
+                                                   up.hc_path.ptr,
+                                                   up.hc_path.len,
+                                                   up.hc_interval_ms,
+                                                   up.hc_expected_status))
+                    return false;
             }
         }
     }

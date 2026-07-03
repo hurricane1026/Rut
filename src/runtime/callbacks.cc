@@ -752,6 +752,36 @@ template void resume_jit_handler<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void respond_upstream_timeout<EpollEventLoop>(EpollEventLoop*, Connection&);
 template void h2_proxy_fail<EpollEventLoop>(EpollEventLoop*, Connection&, u16);
 template void throttle_resume<EpollEventLoop>(EpollEventLoop*, Connection&);
+// Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
+// re-arms deadlines but issues no probes), so only the epoll instantiation is
+// emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
+template bool start_health_probe<EpollEventLoop>(EpollEventLoop*, u16, u32);
+
+// Out-of-line definition (declared in callbacks.h, documented in callbacks_impl.h)
+// — odr-used from sweep_health_probes in multiple TUs, so a single strong symbol
+// here avoids multiple-definition.
+void reset_backend_health() {
+    for (u16 u = 0; u < RouteConfig::kMaxUpstreams; u++)
+        for (u32 b = 0; b < UpstreamTarget::kMaxBackends; b++) {
+            BackendHealth* h = backend_health(u, b);
+            if (h != nullptr) {
+                h->fails = 0;
+                h->eject_until_us = 0;
+                h->active_down = false;
+            }
+        }
+}
+
+bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
+    const bool* s = probe_in_flight_slot(upstream_id, backend_idx);
+    return s != nullptr && *s;
+}
+
+// The probe teardown / config-pin helpers are also odr-used directly from the
+// epoll timer tick (stalled-probe reap), where only their callbacks.h
+// declarations are visible — emit the epoll instantiations here.
+template void free_probe_conn<EpollEventLoop>(EpollEventLoop*, Connection&);
+template void record_probe_if_current<EpollEventLoop>(EpollEventLoop*, Connection&, bool, u64);
 
 template void on_request_complete<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16, u32);
 template void pipeline_dispatch<IoUringEventLoop>(IoUringEventLoop*, Connection&);
