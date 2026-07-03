@@ -33,8 +33,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   to a HasValue condition with the bound local narrowed (review follow-up).
 - [ ] Lowering: opt carrier for pure-optional values (`may_nil` without
   `may_error`) — HasValue/guard-let runtime nil exits currently can't lower
-  (emit_opt_is_nil needs an opt-typed carrier); analyze passes such guards
-  through and intentionally keeps `may_nil` on the binding until this lands.
+  (emit_opt_is_nil needs an opt-typed carrier). guard-let over such values is
+  now REJECTED with a fix-it ("use an error-capable source") rather than
+  silently passing; lift the rejection when the carrier lands.
 - [ ] Runtime ordering: guard-let over a runtime error value lowers a
   HasValue cond, but the resume-state-0 error prelude intercepts with 500
   before the guard branch. Per spec the guard's else should win; revisit the

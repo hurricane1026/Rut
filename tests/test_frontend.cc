@@ -7962,7 +7962,7 @@ route GET "/users" {
 TEST(frontend, route_guard_bound_struct_preserves_shape_index) {
     const char* src =
         "struct Box { value: i32 }\n"
-        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.missing) } }\n"
         "route GET \"/users\" { guard let picked = maybeBox(true) else { return 401 } if "
         "picked.value == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
@@ -8004,7 +8004,7 @@ TEST(frontend, match_arm_guard_bound_struct_preserves_shape_index) {
     const char* src =
         "struct Box { value: i32 }\n"
         "variant Result { ok, err }\n"
-        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.missing) } }\n"
         "route GET \"/users\" { let state = Result.ok match state { .ok => { guard let picked = "
         "maybeBox(true) else { return 401 } if picked.value == 200 { return 200 } else { return "
         "500 } } .err => return 404 } }\n";
@@ -27436,7 +27436,7 @@ TEST(frontend, guard_let_shorthand_rebinds_same_name) {
     // Swift 5.7 shorthand: `guard let x else { ... }` == `guard let x = x else`.
     const char* src =
         "struct Box { value: i32 }\n"
-        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.missing) } }\n"
         "route GET \"/users\" { let picked = maybeBox(true) guard let picked else { return 401 } "
         "if picked.value == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
@@ -27503,6 +27503,52 @@ TEST(frontend, guard_let_on_runtime_error_value_uses_has_value_cond) {
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+}
+
+TEST(frontend, guard_let_on_runtime_optional_only_value_rejects_with_detail) {
+    // Pure-optional runtime values cannot lower a nil test yet — reject
+    // loudly instead of silently passing the guard (PR #162 review).
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "route GET \"/x\" { guard let picked = maybeBox(req.http11) else { return 401 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("guard let cannot test a runtime optional-only value yet (nil-carrier "
+            "lowering pending); use an error-capable source")));
+}
+
+TEST(frontend, braced_match_arm_body_allows_multiline_member_chain) {
+    // The newline-dot arm boundary only applies to unbraced bodies; inside a
+    // braced body multiline member chains must keep parsing (PR #162 review).
+    const auto src = R"rut(
+variant Auth { ok, denied }
+route GET "/users" {
+    let a = Auth.ok
+    match a {
+        .ok => {
+            let host = req
+                .header("Host")
+            return 200
+        }
+        _ => return 403
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[1].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
 }
 
 int main(int argc, char** argv) {

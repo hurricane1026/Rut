@@ -7,6 +7,11 @@ task — if a form is not on this card, do not invent it. Derived from DESIGN.md
 Core contract: **Swift-exact or absent** — anything that looks like Swift
 behaves exactly like Swift; near-miss variants do not exist in this language.
 
+**Implementation status**: this card documents the target surface. The
+front-end migration is in progress (TODO.md → "Front-End Migration"); forms
+marked ⏳ are specified but **not yet accepted by the current compiler** —
+they fail to compile today rather than misbehave. Everything unmarked works.
+
 ## File anatomy
 
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
@@ -54,7 +59,7 @@ json({ users: [], total: 0 })           // object literal: ONLY as call argument
 ->                                      // function return type
 @                                       // decorator
 
-// Bitwise = named functions, never symbols
+// Bitwise = named functions, never symbols — ⏳ namespace pending
 bitwise.and(a, b)  bitwise.or(a, b)  bitwise.xor(a, b)
 bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 ```
@@ -70,7 +75,7 @@ var n = 0                     // mutable, handler-local only
 const key = env("SECRET")     // must be compile-time evaluable
 
 if cond { ... } else { ... }              // bool branch — always braces
-if let v = expr { ... }                   // bind usable value (Swift-identical)
+if let v = expr { ... }                   // ⏳ bind usable value (Swift-identical)
 guard cond else { return 400 }            // cond MUST be bool; else must exit
 guard let v = expr else { return 400 }    // bind or exit (nil AND error alike)
 guard let v else { ... }                  // Swift 5.7 shorthand: rebind v
@@ -81,8 +86,8 @@ match status {                            // general dispatch — no `case` keyw
     _        => "other"                   // exhaustive: all cases or _
 }
 
-for item in order.items {                 // finite collections only, no while
-    if item.qty == 0 { continue }         // break / continue allowed
+for item in order.items {                 // ⏳ finite collections only, no while
+    if item.qty == 0 { continue }         // ⏳ break / continue allowed
     guard item.qty > 0 else { return 400 }
 }
 
@@ -93,16 +98,16 @@ Nil/error handling — pick by situation, nothing else exists:
 
 | Situation | Write |
 |---|---|
-| fallback value | `req.query("page").or("1")` |
-| branch if present | `if let v = expr { ... }` |
+| fallback value | `req.query("page").or("1")` ⏳ (today: `any(x, default)`) |
+| branch if present | `if let v = expr { ... }` ⏳ |
 | stop if absent/failed | `guard let v = expr else { return 400 }` |
-| bare presence test | `x != nil` / `x == nil` |
+| bare presence test | `x != nil` / `x == nil` ⏳ |
 | failure *reason* matters | `match` on the error |
 
 There is NO `x?` postfix, NO `?.`, NO `??`, NO force-unwrap `!x`/`x!`, no
 exceptions, no try/catch. `!` is logical not only.
 
-## return vs respond — the one asymmetry to remember
+## return vs respond — the one asymmetry to remember ⏳ (`respond` keyword pending)
 
 - **Handler** (route entry body): its value IS the response → `return 200`,
   `return 200, body`, `return resp`, `return forward(x)`.
@@ -180,9 +185,9 @@ req.header("X-Request-ID")   // string?
 req.set("X-User-ID", "123")  req.add("X-Tag", "a")   req.getAll("Accept")
 
 // Route captures / query / cookies / body
-req.params.id                // from :id — captures NEVER shadow built-ins
+req.params.id                // ⏳ from :id — captures NEVER shadow built-ins
 req.query("page")            // string? (first value)
-req.queryAll("tags")         // [string]
+req.queryAll("tags")         // ⏳ [string]
 req.cookie("session")        // string?
 req.body(User)               // typed parse, error-capable → guard let
 req.bodyRaw                  // string, error-capable; assignable before forward

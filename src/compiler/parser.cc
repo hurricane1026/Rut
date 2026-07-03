@@ -81,14 +81,27 @@ struct Parser {
         AstStatement block{};
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
+        // A braced body is delimited by its closing brace, so the match-arm
+        // newline-dot heuristic must not cut multiline member chains here.
+        const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+        arm_body_stops_cross_line_dot = false;
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             auto inner = parse_stmt();
-            if (!inner) return core::make_unexpected(inner.error());
+            if (!inner) {
+                arm_body_stops_cross_line_dot = saved_dot_stop;
+                return core::make_unexpected(inner.error());
+            }
             auto inner_ptr = alloc_stmt(inner.value());
-            if (!inner_ptr) return core::make_unexpected(inner_ptr.error());
-            if (!block.block_stmts.push(inner_ptr.value()))
+            if (!inner_ptr) {
+                arm_body_stops_cross_line_dot = saved_dot_stop;
+                return core::make_unexpected(inner_ptr.error());
+            }
+            if (!block.block_stmts.push(inner_ptr.value())) {
+                arm_body_stops_cross_line_dot = saved_dot_stop;
                 return frontend_error(FrontendError::TooManyItems, inner->span);
+            }
         }
+        arm_body_stops_cross_line_dot = saved_dot_stop;
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
         if (block.block_stmts.len == 0)
@@ -234,7 +247,7 @@ struct Parser {
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                arm_body_stops_cross_line_dot = true;
+                arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
                 auto arm_stmt = parse_func_body_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
@@ -956,14 +969,27 @@ struct Parser {
             AstStatement stmt{};
             stmt.kind = AstStmtKind::Block;
             stmt.span = span_from(start);
+            // Braced blocks are brace-delimited — suspend the match-arm
+            // newline-dot heuristic so multiline member chains parse.
+            const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+            arm_body_stops_cross_line_dot = false;
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
                 auto inner = parse_stmt();
-                if (!inner) return core::make_unexpected(inner.error());
+                if (!inner) {
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
+                    return core::make_unexpected(inner.error());
+                }
                 auto inner_ptr = alloc_stmt(inner.value());
-                if (!inner_ptr) return core::make_unexpected(inner_ptr.error());
-                if (!stmt.block_stmts.push(inner_ptr.value()))
+                if (!inner_ptr) {
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
+                    return core::make_unexpected(inner_ptr.error());
+                }
+                if (!stmt.block_stmts.push(inner_ptr.value())) {
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
                     return frontend_error(FrontendError::TooManyItems, inner->span);
+                }
             }
+            arm_body_stops_cross_line_dot = saved_dot_stop;
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
             if (stmt.block_stmts.len == 0)
@@ -1058,7 +1084,7 @@ struct Parser {
                     auto arrow = expect(TokenType::Arrow);
                     if (!arrow) return core::make_unexpected(arrow.error());
                     const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                    arm_body_stops_cross_line_dot = true;
+                    arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
                     auto arm_stmt = parse_stmt();
                     arm_body_stops_cross_line_dot = saved_dot_stop;
                     if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
@@ -1624,7 +1650,7 @@ struct Parser {
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                arm_body_stops_cross_line_dot = true;
+                arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
                 auto arm_stmt = parse_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
@@ -1870,7 +1896,7 @@ struct Parser {
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                arm_body_stops_cross_line_dot = true;
+                arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
                 auto arm_stmt = parse_func_body_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());

@@ -31,6 +31,11 @@ static Str intern_generated_name(const std::string& value) {
 // Fix-it detail for bare guards on non-bool values (DESIGN.md §3.6).
 constexpr Str kGuardBoolDetail =
     lit_str("guard condition must be bool; to bind a value use `guard let x = ...`");
+// Honest rejection until the pure-optional carrier can lower a runtime nil
+// test (TODO.md: opt carrier for may_nil-only values).
+constexpr Str kGuardLetNilCarrierDetail = lit_str(
+    "guard let cannot test a runtime optional-only value yet (nil-carrier "
+    "lowering pending); use an error-capable source");
 
 static std::string str_to_std_string(Str s) {
     return std::string(s.ptr, s.len);
@@ -8414,11 +8419,11 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
             cond.error_variant_index = analyzed->error_variant_index;
             return cond;
         }
-        // Runtime optional-only value: the opt carrier is not lowerable yet
-        // (TODO in TODO.md), so the guard passes through and the binding
-        // keeps may_nil — no false narrowing. Known-nil inits fold above.
-        cond.bool_value = true;
-        return cond;
+        // Runtime optional-only value: the nil test needs an opt carrier that
+        // lowering does not provide yet (TODO.md). Reject loudly instead of
+        // silently passing the guard. Known-nil inits fold above.
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, expr.span, kGuardLetNilCarrierDetail);
     }
 
     if (!is_match_guard) {
@@ -11201,8 +11206,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                     local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
                 // Success path: HasValue conds (error-capable sources) rule out both
-                // channels; pure-optional runtime values keep may_nil (see
-                // analyze_guard_cond — their carrier is not lowerable yet).
+                // channels. Only the known-nil case (cond folded false, body
+                // unreachable) still binds a may_nil value.
                 local.may_nil = bound->may_nil && !bound->may_error;
                 local.may_error = false;
                 local.variant_index = bound->variant_index;
