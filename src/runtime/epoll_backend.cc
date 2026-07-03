@@ -93,6 +93,7 @@ static void queue_pending_completion(IoEvent* pending_completions,
     pending_completions[pending_count].buf_id = 0;
     pending_completions[pending_count].has_buf = 0;
     pending_completions[pending_count].more = 0;
+    pending_completions[pending_count].aux = 0;
     pending_count++;
 }
 
@@ -328,6 +329,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = 0;
             pending_count++;
         }
         return true;
@@ -341,6 +343,7 @@ bool EpollBackend::add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = 0;
             pending_count++;
         }
         return true;
@@ -388,7 +391,19 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id) {
         }
     }
     if (set_fd_interest(epoll_fd, fd, conn_id, type, events) < 0) {
+        const i32 err = errno;
         if (conn_id < kMaxFdMap) upstream_fd_map[conn_id] = -1;
+        if (pending_count < kPendingCap) {
+            pending_completions[pending_count].conn_id = conn_id;
+            pending_completions[pending_count].type = IoEventType::UpstreamRecv;
+            pending_completions[pending_count].result = -err;
+            pending_completions[pending_count].buf_id = 0;
+            pending_completions[pending_count].has_buf = 0;
+            pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = kLocalSubmitFailureAux;
+            pending_count++;
+            return true;
+        }
         return false;
     }
     return true;
@@ -405,6 +420,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = 0;
             pending_count++;
         }
         return true;
@@ -418,6 +434,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = 0;
             pending_count++;
         }
         return true;
@@ -447,6 +464,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len) {
         pending_completions[pending_count].buf_id = 0;
         pending_completions[pending_count].has_buf = 0;
         pending_completions[pending_count].more = 0;
+        pending_completions[pending_count].aux = 0;
         pending_count++;
     }
     return true;
@@ -497,6 +515,7 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = 0;
             pending_count++;
         }
         return true;
@@ -509,6 +528,7 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
         pending_completions[pending_count].buf_id = 0;
         pending_completions[pending_count].has_buf = 0;
         pending_completions[pending_count].more = 0;
+        pending_completions[pending_count].aux = 0;
         pending_count++;
     }
     return true;
@@ -529,6 +549,7 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
             pending_completions[pending_count].buf_id = 0;
             pending_completions[pending_count].has_buf = 0;
             pending_completions[pending_count].more = 0;
+            pending_completions[pending_count].aux = 0;
             pending_count++;
         }
         return true;
@@ -549,6 +570,7 @@ bool EpollBackend::add_connect(i32 fd, u32 conn_id, const void* addr, u32 addr_l
         pending_completions[pending_count].buf_id = 0;
         pending_completions[pending_count].has_buf = 0;
         pending_completions[pending_count].more = 0;
+        pending_completions[pending_count].aux = 0;
         pending_count++;
     }
     return true;
@@ -621,6 +643,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 events[out].buf_id = 0;
                 events[out].has_buf = 0;
                 events[out].more = 0;
+                events[out].aux = 0;
                 out++;
             }
         } else if (conn_id == kTimerConnId) {
@@ -638,6 +661,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 events[out].buf_id = 0;
                 events[out].has_buf = 0;
                 events[out].more = 0;
+                events[out].aux = 0;
                 out++;
             }
         } else if (type == IoEventType::UpstreamConnect && has_write) {
@@ -651,6 +675,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].buf_id = 0;
             events[out].has_buf = 0;
             events[out].more = 0;
+            events[out].aux = 0;
             out++;
             continue;
         } else if (type == IoEventType::Recv && conn_id < max_conns && conns[conn_id].tls_active &&
@@ -709,6 +734,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                             events[out].buf_id = 0;
                             events[out].has_buf = 0;
                             events[out].more = 0;
+                            events[out].aux = 0;
                             out++;
                             continue;
                         }
@@ -784,6 +810,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].buf_id = 0;
             events[out].has_buf = 0;
             events[out].more = 0;
+            events[out].aux = 0;
             out++;
 
             if (has_write && conn_id < kMaxFdMap && out < max_events) {
@@ -881,6 +908,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             events[out].buf_id = 0;
             events[out].has_buf = 0;
             events[out].more = 0;
+            events[out].aux = 0;
             out++;
         }
     }

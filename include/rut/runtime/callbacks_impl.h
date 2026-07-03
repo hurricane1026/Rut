@@ -395,6 +395,10 @@ template <typename Loop>
 void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const u64 kNowUs = monotonic_us();
+    if (ev.aux == kLocalSubmitFailureAux) {
+        free_probe_conn(loop, conn);
+        return;
+    }
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
         record_probe_if_current(loop, conn, /*healthy=*/false, kNowUs);
         free_probe_conn(loop, conn);
@@ -1968,7 +1972,16 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     const u32 kBackend =
         select_backend(conn.upstream_idx, target.addr_count, conn.upstream_start_us);
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
-    return loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]));
+    if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
+        return true;
+    if (conn.upstream_fd >= 0) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+    }
+    return false;
 }
 
 // The upstream timed out before any response bytes reached the client → emit

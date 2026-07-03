@@ -2979,6 +2979,11 @@ TEST(active_health, recv_registration_failure_defers_without_downing_backend) {
     close(loop->backend.epoll_fd);
     loop->backend.epoll_fd = -1;  // force add_recv_upstream's epoll registration to fail
     on_probe_sent<EpollEventLoop>(loop, *c, IoEvent{c->id, 18, 0, 0, IoEventType::UpstreamSend, 0});
+    REQUIRE_EQ(loop->backend.pending_count, 1u);
+    IoEvent local_failure = loop->backend.pending_completions[0];
+    CHECK_EQ(local_failure.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(local_failure.aux, kLocalSubmitFailureAux);
+    loop->dispatch(local_failure);
 
     CHECK_EQ(loop->active_count(), 0u);
     CHECK(!probe_in_flight(uid, 0));
