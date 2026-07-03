@@ -180,6 +180,8 @@ private:
     std::atomic<bool> draining_;
     std::atomic<u64> drain_start_;
     std::atomic<u32> drain_period_;
+    bool dispatching_event_batch_ = false;
+    bool health_sweep_after_batch_ = false;
 
 public:
     static constexpr u32 kMaxConns = epoll_yield::kMaxConns;
@@ -315,9 +317,7 @@ public:
 
         while (is_running()) {
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, kMaxConns);
-            for (u32 i = 0; i < n; i++) {
-                dispatch(events[i]);
-            }
+            dispatch_batch(events, n);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
             // timers now so a freshly activated `every: D` measures from the reload
@@ -801,6 +801,24 @@ public:
 
     // --- Dispatch ---
 
+    void request_health_sweep_after_batch() { health_sweep_after_batch_ = true; }
+
+    void drain_deferred_health_sweep() {
+        if (!health_sweep_after_batch_) return;
+        health_sweep_after_batch_ = false;
+        if (!is_draining()) this->sweep_health_probes();
+    }
+
+    void dispatch_batch(const IoEvent* events, u32 count) {
+        const bool was_dispatching = dispatching_event_batch_;
+        dispatching_event_batch_ = true;
+        for (u32 i = 0; i < count; i++) {
+            dispatch(events[i]);
+        }
+        dispatching_event_batch_ = was_dispatching;
+        if (!dispatching_event_batch_) drain_deferred_health_sweep();
+    }
+
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
             case IoEventType::Accept:
@@ -817,21 +835,20 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;
                 const bool catchup_reaches_probe_timeout =
                     ticks >= static_cast<i32>(upstream_timeout);
-                // For normal 1s ticks, issue health probes BEFORE the timer wheel
-                // reaps (F4 / #161). A stalled probe is freed by the reap below —
-                // its slot returns to the free list and its upstream fd is
-                // EPOLL_CTL_DEL'd (so no NEW events), but stale
-                // UpstreamConnect/UpstreamRecv events for that fd already collected
-                // in THIS epoll_wait batch can still trail behind. Running the
-                // sweep first guarantees the just-freed slot is NOT re-allocated to
-                // a replacement probe within this same batch.
+                // A Timeout makes due health checks eligible, but the sweep must run
+                // only after every event from this backend.wait() batch has drained.
+                // Earlier I/O completions in the same batch can free a probe slot
+                // before the Timeout event, and stale trailing events address only
+                // conn_id; launching a replacement probe inline could reuse that slot
+                // before those stale events are ignored.
                 //
                 // If timerfd coalesced enough ticks to cross upstream_timeout, do
-                // not launch fresh probes before replaying those ticks: the same
-                // catch-up pass would immediately reap the new probes as stalled
-                // before their I/O can run. Skip this sweep; the next timer event
-                // retries due probe deadlines after the catch-up batch is gone.
-                if (!catchup_reaches_probe_timeout && !is_draining()) this->sweep_health_probes();
+                // not launch fresh probes after replaying those ticks: the same
+                // catch-up dispatch would have immediately reaped new probes as
+                // stalled before their I/O can run. Skip this sweep; the next timer
+                // event retries due probe deadlines after the catch-up batch is gone.
+                if (!catchup_reaches_probe_timeout && !is_draining())
+                    request_health_sweep_after_batch();
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
                         // A stalled active health probe: it accepted the connect
@@ -956,6 +973,7 @@ public:
             case IoEventType::Count:
                 break;
         }
+        if (!dispatching_event_batch_) drain_deferred_health_sweep();
     }
 
 private:

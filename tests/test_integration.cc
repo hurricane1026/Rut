@@ -2561,17 +2561,12 @@ TEST(active_health, force_close_tears_down_inflight_probe) {
     destroy_real_loop(loop);
 }
 
-// F4 (#161): the same-batch stale-event race (a reaped probe's slot reused by a
-// replacement probe within the same epoll_wait batch, letting stale events for the
-// old conn_id misroute) is not directly reproducible at unit level. Instead pin
-// the ORDERING that prevents it: dispatch(Timeout) runs sweep_health_probes BEFORE
-// the timer-wheel reap. Consequence — when a stalled probe is reaped on a tick
-// where its upstream is also due, the (earlier) sweep sees probe_in_flight still
-// set and skips it, so no replacement probe is allocated into the slot the reap is
-// about to free in this same dispatch. We assert active_count() == 0 afterward;
-// under the old (reap-then-sweep) order the reap would clear the guard and the
-// due sweep would immediately re-allocate the freed slot (active_count() == 1).
-TEST(active_health, timeout_sweep_runs_before_reap) {
+// F4 (#161): stale events from one backend.wait() batch carry only conn_id. If an
+// earlier probe I/O completion frees a slot, dispatch(Timeout) must not sweep and
+// allocate a replacement probe into that slot until the rest of the same batch has
+// drained; otherwise a trailing stale event for the old probe can close/drive the
+// replacement and suppress timely detection.
+TEST(active_health, timeout_sweep_defers_until_batch_drains) {
     using namespace rut;
     auto lfd_be = create_listen_socket(0);
     REQUIRE(lfd_be.has_value());
@@ -2600,28 +2595,41 @@ TEST(active_health, timeout_sweep_runs_before_reap) {
     set_probe_in_flight(uid, 0, false);
     record_backend_result(uid, 0, /*success=*/true, monotonic_us());
 
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    c->set_slots(nullptr, nullptr, nullptr, &on_probe_sent<EpollEventLoop>);
+    set_probe_in_flight(uid, 0, true);
+    const u32 old_cid = c->id;
+
+    // The UpstreamSend error frees old_cid and clears probe_in_flight. The Timeout
+    // marks a due sweep. The trailing UpstreamRecv is stale for old_cid and must be
+    // ignored before the deferred sweep is allowed to allocate the replacement.
     loop->health_probe_deadline_ns[uid] = 0;
-    loop->sweep_health_probes();  // launch the probe that will stall + be reaped
-    REQUIRE(probe_in_flight(uid, 0));
-    REQUIRE_EQ(loop->active_count(), 1u);
+    IoEvent batch[3] = {
+        make_ev(old_cid, IoEventType::UpstreamSend, -ECONNRESET),
+        make_ev(0, IoEventType::Timeout, 1),
+        make_ev(old_cid, IoEventType::UpstreamRecv, -ECONNRESET),
+    };
+    loop->dispatch_batch(batch, 3);
 
-    IoEvent tick{};
-    tick.type = IoEventType::Timeout;
-    tick.result = 1;
-    loop->dispatch(tick);
-    loop->dispatch(tick);
-    loop->dispatch(tick);
+    CHECK_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+    CHECK(backend_ejected(uid, 0, monotonic_us()));
 
-    // Force the upstream "due" for the sweep that runs INSIDE the final single-tick
-    // Timeout dispatch. This tick also reaps the original stalled probe.
-    loop->health_probe_deadline_ns[uid] = 0;
-    loop->dispatch(tick);
-
-    // Sweep ran first (saw the probe in-flight → no re-probe), THEN the reap freed
-    // the slot. No replacement probe was allocated into the freed slot this batch.
+    loop->force_close_all();
     CHECK_EQ(loop->active_count(), 0u);
     CHECK(!probe_in_flight(uid, 0));
 
+    close(fds[1]);
     loop->shutdown();
     close(listen_fd);
     close(backend_fd);
