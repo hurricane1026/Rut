@@ -584,7 +584,7 @@ TEST(frontend, lex_rejects_reserved_optional_symbols_with_fixit) {
     }
 }
 
-TEST(frontend, lex_rejects_word_boolean_operators_with_fixit) {
+TEST(frontend, parse_rejects_word_boolean_operators_with_fixit) {
     struct Case {
         const char* src;
         const char* detail;
@@ -599,9 +599,11 @@ TEST(frontend, lex_rejects_word_boolean_operators_with_fixit) {
     };
     for (const Case& c : cases) {
         auto lexed = lex(lit(c.src));
-        REQUIRE(!lexed);
-        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(lexed.error().detail.eq(lit(c.detail)));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(ast.error().detail.eq(lit(c.detail)));
     }
 }
 
@@ -767,9 +769,11 @@ TEST(frontend, parse_desugars_negated_comparisons) {
 TEST(frontend, parse_rejects_or_function_call_form) {
     const char* src = "route GET \"/x\" { let x = or(maybe(), 200) return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_or_function_call_form_with_header) {
@@ -777,9 +781,11 @@ TEST(frontend, parse_rejects_or_function_call_form_with_header) {
         "route GET \"/x\" { let host = req.header(\"Host\") let x = or(host, \"fallback\") return "
         "200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
@@ -787,17 +793,21 @@ TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
         "route GET \"/x\" { let sid = req.cookie(\"sid\") let x = or(sid, \"fallback\") return 200 "
         "}\n";
     auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form) {
     const char* src = "route GET \"/x\" { let x = and(maybe(), 200) return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form_with_header) {
@@ -805,9 +815,11 @@ TEST(frontend, parse_rejects_and_function_call_form_with_header) {
         "route GET \"/x\" { let host = req.header(\"Host\") let x = and(host, \"fallback\") return "
         "200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
@@ -815,9 +827,11 @@ TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
         "route GET \"/x\" { let sid = req.cookie(\"sid\") let x = and(sid, \"fallback\") return "
         "200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_pipe_with_bool_operator_rhs) {
@@ -3209,14 +3223,16 @@ TEST(frontend, parse_rejects_non_string_error_message_with_detail) {
 TEST(frontend, analyze_accepts_let_guard_wait_source_order) {
     // Guards and waits are threaded in source order after pre-wait locals.
     const char* src =
-        "route GET \"/x\" { let k = 42 guard k else { return 401 } wait(50) return 204 }\n";
+        "route GET \"/x\" { let k = 42 guard let k else { return 401 } wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    // Two locals: the original `k` and the guard-let shorthand's rebinding.
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("k")));
     REQUIRE_EQ(hir->routes[0].guards.len, 1u);
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
@@ -7079,7 +7095,8 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let failed "
-        "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
+        "= error(7) guard let failed else { return 401 } if x == 200 { return 200 } else { return "
+        "500 "
         "} } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -10003,7 +10020,8 @@ TEST(frontend, route_if_branch_block_with_let_lowers_via_match_shape) {
 }
 TEST(frontend, route_if_branch_block_with_guard_is_supported) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { "
+        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard let failed else "
+        "{ "
         "return 401 } return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -10018,7 +10036,7 @@ TEST(frontend, route_if_branch_block_with_guard_is_supported) {
 TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) guard failed else { return 401 } return "
+        "route GET \"/users\" { let failed = error(7) guard let failed else { return 401 } return "
         "forward(api) "
         "}\n";
     auto lexed = lex(lit(src));
@@ -10056,7 +10074,8 @@ TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
 }
 TEST(frontend, guard_else_block_with_let_is_supported) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code "
+        "route GET \"/users\" { let failed = error(7) guard let failed else { let code = 401 if "
+        "code "
         "== 401 { return 401 } else { return 500 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -10116,7 +10135,9 @@ TEST(frontend, guard_let_binds_success_value) {
     CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
              static_cast<u8>(MirTerminatorKind::Branch));
 }
-TEST(frontend, guard_let_does_not_unwrap_nil) {
+TEST(frontend, guard_let_takes_else_branch_on_known_nil) {
+    // Spec §3.3.7: guard let treats nil and error alike — no usable value
+    // means the else branch. A known-nil init folds the condition to false.
     const char* src =
         "route GET \"/users\" { guard let maybe = nil else { return 401 } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -10127,12 +10148,13 @@ TEST(frontend, guard_let_does_not_unwrap_nil) {
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].name.eq(lit("maybe")));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Unknown));
+    // The always-false cond makes the success path unreachable; the binding
+    // keeps its optional-ness (pure-nil carriers are not narrowable yet).
     CHECK(hir->routes[0].locals[0].may_nil);
     CHECK_FALSE(hir->routes[0].locals[0].may_error);
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
              static_cast<u8>(HirExprKind::BoolLit));
-    CHECK(hir->routes[0].guards[0].cond.bool_value);
+    CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
 }
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
@@ -12020,7 +12042,8 @@ TEST(frontend, analyze_rejects_wildcard_outer_arm_with_nested_match) {
 TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) let code = 200 guard code else { return 401 "
+        "route GET \"/users\" { let failed = error(7) let code = 200 guard let code else { return "
+        "401 "
         "} match code { 200 => return forward(api) _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -12045,8 +12068,9 @@ TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
 }
 TEST(frontend, multiple_top_level_guards_are_allowed) {
     const char* src =
-        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) "
-        "guard failed else { return 402 } return 200 }\n";
+        "route GET \"/users\" { let ok = 200 guard let ok else { return 401 } let failed = "
+        "error(7) "
+        "guard let failed else { return 402 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12244,7 +12268,8 @@ TEST(frontend, analyze_rejects_match_without_wildcard) {
 TEST(frontend, guard_lowers_from_error_alias) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) let alias = failed guard alias else { return "
+        "route GET \"/users\" { let failed = error(7) let alias = failed guard let alias else { "
+        "return "
         "401 } return forward(api) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -12307,7 +12332,9 @@ TEST(frontend, analyze_allows_any_with_fallible_fallback) {
     CHECK(hir->routes[0].locals[0].init.may_error);
     CHECK_FALSE(hir->routes[0].locals[0].init.may_nil);
 }
-TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
+TEST(frontend, guard_let_on_known_error_folds_to_else_branch) {
+    // Spec §3.3.7: nil and error alike are "no usable value" — a known-error
+    // init folds the condition to false (always else) and skips the binding.
     const char* src =
         "route GET \"/users\" { guard let code = error(7) else { return 401 } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -12315,10 +12342,14 @@ TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
+    CHECK_EQ(hir->routes[0].locals.len, 0u);  // binding skipped
 }
-TEST(frontend, analyze_rejects_guard_let_binding_error_alias) {
+TEST(frontend, guard_let_on_known_error_alias_folds_to_else_branch) {
     const char* src =
         "route GET \"/users\" { let failed = error(7) let alias = failed guard let code = alias "
         "else { return 401 } return 200 }\n";
@@ -12327,8 +12358,9 @@ TEST(frontend, analyze_rejects_guard_let_binding_error_alias) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
 }
 TEST(frontend, build_mir_preserves_runtime_or_value) {
     auto* hir = new HirModule{};
@@ -16053,7 +16085,7 @@ TEST(frontend, source_custom_protocol_default_method_supports_guard_prefix) {
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
         let y = maybefail(ok)
-        guard y else { 401 }
+        guard let y else { 401 }
         200
     }
 }
@@ -19070,7 +19102,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard y else { 401 }
+    guard let y else { 401 }
     200
 }
 route GET "/users" {
@@ -27419,6 +27451,58 @@ TEST(frontend, guard_let_shorthand_rebinds_same_name) {
     CHECK(route.statements[1].expr.name.eq(lit("picked")));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+}
+
+TEST(frontend, member_names_or_and_stay_lexable) {
+    // `or` / `and` lex as identifiers so member calls stay reachable:
+    // `.or(default)` fallback and the `bitwise.and(...)` namespace.
+    const char* fallback = "route GET \"/x\" { let q = req.query(\"p\").or(\"1\") return 200 }\n";
+    auto lexed = lex(lit(fallback));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    const char* bit = "route GET \"/x\" { let m = bitwise.and(coreMask(), 3) return 200 }\n";
+    lexed = lex(lit(bit));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+}
+
+TEST(frontend, lex_rejects_postfix_bang_force_unwrap_with_fixit) {
+    const char* sources[] = {
+        "route GET \"/x\" { let t = token! return 200 }\n",
+        "route GET \"/x\" { let t = find()! return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(!lexed);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(
+            lit("postfix `!` (force unwrap) is not supported; use if let / guard let")));
+    }
+}
+
+TEST(frontend, guard_let_on_runtime_error_value_uses_has_value_cond) {
+    // A runtime error-capable init lowers the guard condition to a HasValue
+    // test (usable-value semantics) instead of blindly passing through.
+    const char* src =
+        "func fail() -> str => error(.timeout)\n"
+        "route GET \"/x\" { let value = any(req.query(\"q\"), fail()) "
+        "guard let value else { return 401 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    // The rebound `value` is narrowed on the success path.
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
 }
 
 int main(int argc, char** argv) {

@@ -27,8 +27,18 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   an HTTP short-circuit. respond needs an HIR terminal (like ReturnStatus)
   legal inside funcs, carried through inlining so the inlined route sends the
   response and stops. Design first: extend HirGuard::FailKind/Term reuse.
-- [ ] `guard` condition bool-only check + fix-it (verify current
-  analyze_guard_cond behavior for bare non-bool values first).
+- [x] `guard` condition bool-only check + fix-it; guard-let usable-value
+  semantics: known nil/error inits fold the condition to false (else always
+  runs, binding skipped for known error); runtime error-capable inits lower
+  to a HasValue condition with the bound local narrowed (review follow-up).
+- [ ] Lowering: opt carrier for pure-optional values (`may_nil` without
+  `may_error`) — HasValue/guard-let runtime nil exits currently can't lower
+  (emit_opt_is_nil needs an opt-typed carrier); analyze passes such guards
+  through and intentionally keeps `may_nil` on the binding until this lands.
+- [ ] Runtime ordering: guard-let over a runtime error value lowers a
+  HasValue cond, but the resume-state-0 error prelude intercepts with 500
+  before the guard branch. Per spec the guard's else should win; revisit the
+  prelude/guard ordering in mir_build.
 - [ ] websocket trailing block `{ frame in }`; object literal only in
   call-argument position; pipeline RHS placeholder validation.
 - Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;

@@ -28,6 +28,10 @@ static Str intern_generated_name(const std::string& value) {
     return {kept.c_str(), static_cast<u32>(kept.size())};
 }
 
+// Fix-it detail for bare guards on non-bool values (DESIGN.md §3.6).
+constexpr Str kGuardBoolDetail =
+    lit_str("guard condition must be bool; to bind a value use `guard let x = ...`");
+
 static std::string str_to_std_string(Str s) {
     return std::string(s.ptr, s.len);
 }
@@ -3186,7 +3190,9 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
                                                   const HirModule& mod,
                                                   const HirLocal* locals,
                                                   u32 local_count,
-                                                  const MatchPayloadBinding* binding);
+                                                  const MatchPayloadBinding* binding,
+                                                  bool binds_value,
+                                                  bool is_match_guard);
 static bool is_standard_error_field(Str field_name);
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
@@ -3701,7 +3707,8 @@ static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
     for (u32 i = 0; i < init.generic_protocol_count; i++)
         init.generic_protocol_indices[i] = bound.generic_protocol_indices[i];
     init.shape_index = bound.shape_index;
-    init.may_nil = bound.may_nil;
+    // Success path of a value-binding guard — both missing channels cleared.
+    init.may_nil = false;
     init.may_error = false;
     init.variant_index = bound.variant_index;
     init.struct_index = bound.struct_index;
@@ -4871,17 +4878,24 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 auto bound =
                     analyze_expr(inner.expr, scratch, mod, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(
-                    inner.expr, scratch, mod, cur_locals, cur_local_count, nullptr);
+                auto cond = analyze_guard_cond(inner.expr,
+                                               scratch,
+                                               mod,
+                                               cur_locals,
+                                               cur_local_count,
+                                               nullptr,
+                                               inner.bind_value,
+                                               inner.match_arms.len != 0);
                 if (!cond) return core::make_unexpected(cond.error());
 
                 HirLocal succ_locals[HirRoute::kMaxLocals]{};
                 for (u32 i = 0; i < cur_local_count; i++) succ_locals[i] = cur_locals[i];
                 u32 succ_count = cur_local_count;
-                if (inner.bind_value) {
-                    if (known_value_state(bound.value(), cur_locals, cur_local_count, 0) ==
-                        KnownValueState::Error)
-                        return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
+                // A known-error init folds the guard condition to false, so the
+                // success path (and with it the binding) is unreachable — skip it.
+                if (inner.bind_value &&
+                    known_value_state(bound.value(), cur_locals, cur_local_count, 0) !=
+                        KnownValueState::Error) {
                     HirLocal local{};
                     local.span = inner.span;
                     local.name = inner.name;
@@ -4895,7 +4909,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     local.generic_protocol_count = bound->generic_protocol_count;
                     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                         local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                    local.may_nil = bound->may_nil;
+                    // Success path: HasValue conds (error-capable sources) rule out both
+                    // channels; pure-optional runtime values keep may_nil (see
+                    // analyze_guard_cond — their carrier is not lowerable yet).
+                    local.may_nil = bound->may_nil && !bound->may_error;
                     local.may_error = false;
                     local.variant_index = bound->variant_index;
                     local.struct_index = bound->struct_index;
@@ -6852,7 +6869,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.rhs = rhs_ptr;
         return out;
     }
-    for (u32 i = 0; i < local_count; i++) {
+    // Scan newest-first so a same-name rebinding (e.g. the `guard let x`
+    // shorthand's narrowed local) shadows the earlier binding.
+    for (u32 ri = local_count; ri > 0; ri--) {
+        const u32 i = ri - 1;
         if (locals[i].name.eq(expr.name)) {
             if (locals[i].type == HirTypeKind::Tuple) {
                 HirExpr tuple = locals[i].init;
@@ -8360,7 +8380,9 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
                                                   const HirModule& mod,
                                                   const HirLocal* locals,
                                                   u32 local_count,
-                                                  const MatchPayloadBinding* binding) {
+                                                  const MatchPayloadBinding* binding,
+                                                  bool binds_value,
+                                                  bool is_match_guard) {
     auto analyzed = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!analyzed) return core::make_unexpected(analyzed.error());
 
@@ -8369,19 +8391,52 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
     cond.kind = HirExprKind::BoolLit;
     cond.type = HirTypeKind::Bool;
 
-    if (!analyzed->may_error) {
-        // Plain boolean — pass through so `guard <cond> else { ... }`
-        // rejects on falsy (Swift-style reject-or-continue). Without
-        // this, any non-errorable guard would fold to always-true.
-        if (analyzed->type == HirTypeKind::Bool && !analyzed->may_nil) {
+    if (binds_value) {
+        // `guard let x = expr` — usable-value test. nil and error alike take
+        // the else branch (DESIGN.md §3.3.7: one binding idiom, two channels).
+        const auto state = known_value_state(analyzed.value(), locals, local_count, 0);
+        if (state == KnownValueState::Error || state == KnownValueState::Nil) {
+            cond.bool_value = false;
+            return cond;
+        }
+        if (state == KnownValueState::Available || (!analyzed->may_nil && !analyzed->may_error)) {
+            cond.bool_value = true;
+            return cond;
+        }
+        if (analyzed->may_error) {
             if (!route->exprs.push(analyzed.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            return route->exprs[route->exprs.len - 1];
+            cond.kind = HirExprKind::HasValue;
+            cond.lhs = &route->exprs[route->exprs.len - 1];
+            cond.variant_index = analyzed->variant_index;
+            cond.struct_index = analyzed->struct_index;
+            cond.error_struct_index = analyzed->error_struct_index;
+            cond.error_variant_index = analyzed->error_variant_index;
+            return cond;
         }
+        // Runtime optional-only value: the opt carrier is not lowerable yet
+        // (TODO in TODO.md), so the guard passes through and the binding
+        // keeps may_nil — no false narrowing. Known-nil inits fold above.
         cond.bool_value = true;
         return cond;
     }
 
+    if (!is_match_guard) {
+        // Bare `guard <cond>` — the condition must be a plain bool. No
+        // implicit truthiness, no implicit narrowing (DESIGN.md §3.3.7).
+        if (analyzed->type != HirTypeKind::Bool || analyzed->may_nil || analyzed->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kGuardBoolDetail);
+        if (!route->exprs.push(analyzed.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return route->exprs[route->exprs.len - 1];
+    }
+
+    // `guard match` — dispatches on the error channel; nil stays on the value
+    // channel (legacy behavior, unchanged).
+    if (!analyzed->may_error) {
+        cond.bool_value = true;
+        return cond;
+    }
     const auto state = known_value_state(analyzed.value(), locals, local_count, 0);
     if (state == KnownValueState::Error) {
         cond.bool_value = false;
@@ -8533,8 +8588,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 auto bound = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(
-                    inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
+                auto cond = analyze_guard_cond(inner.expr,
+                                               route,
+                                               mod,
+                                               scoped_locals.data,
+                                               scoped_locals.len,
+                                               binding,
+                                               inner.bind_value,
+                                               inner.match_arms.len != 0);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard.cond = cond.value();
                 if (inner.match_arms.len != 0) {
@@ -8576,11 +8637,11 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 }
                 if (!arm->guards.push(guard))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                if (inner.bind_value) {
-                    if (known_value_state(
-                            bound.value(), scoped_locals.data, scoped_locals.len, 0) ==
-                        KnownValueState::Error)
-                        return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
+                // A known-error init folds the guard condition to false, so the
+                // success path (and with it the binding) is unreachable — skip it.
+                if (inner.bind_value &&
+                    known_value_state(bound.value(), scoped_locals.data, scoped_locals.len, 0) !=
+                        KnownValueState::Error) {
                     HirLocal local{};
                     local.span = inner.span;
                     local.name = inner.name;
@@ -8595,7 +8656,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     local.generic_protocol_count = bound->generic_protocol_count;
                     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                         local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                    local.may_nil = bound->may_nil;
+                    // Success path: HasValue conds (error-capable sources) rule out both
+                    // channels; pure-optional runtime values keep may_nil (see
+                    // analyze_guard_cond — their carrier is not lowerable yet).
+                    local.may_nil = bound->may_nil && !bound->may_error;
                     local.may_error = false;
                     local.variant_index = bound->variant_index;
                     local.struct_index = bound->struct_index;
@@ -11057,8 +11121,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto bound = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!bound) return core::make_unexpected(bound.error());
-            auto cond = analyze_guard_cond(
-                bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
+            auto cond = analyze_guard_cond(bstmt.expr,
+                                           route,
+                                           mod,
+                                           route->locals.data,
+                                           route->locals.len,
+                                           nullptr,
+                                           bstmt.bind_value,
+                                           bstmt.match_arms.len != 0);
             if (!cond) return core::make_unexpected(cond.error());
             guard.cond = cond.value();
             if (bstmt.match_arms.len != 0) {
@@ -11130,7 +11200,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 local.generic_protocol_count = bound->generic_protocol_count;
                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                     local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                local.may_nil = bound->may_nil;
+                // Success path: HasValue conds (error-capable sources) rule out both
+                // channels; pure-optional runtime values keep may_nil (see
+                // analyze_guard_cond — their carrier is not lowerable yet).
+                local.may_nil = bound->may_nil && !bound->may_error;
                 local.may_error = false;
                 local.variant_index = bound->variant_index;
                 local.struct_index = bound->struct_index;
@@ -11690,7 +11763,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                            mod,
                                                            arm_scoped_locals.data,
                                                            arm_scoped_locals.len,
-                                                           arm_binding_ptr);
+                                                           arm_binding_ptr,
+                                                           inner.bind_value,
+                                                           inner.match_arms.len != 0);
                             if (!cond) return core::make_unexpected(cond.error());
                             guard.cond = cond.value();
                             if (inner.match_arms.len != 0) {
@@ -11735,13 +11810,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             }
                             if (!arm.guards.push(guard))
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
-                            if (inner.bind_value) {
-                                if (known_value_state(bound.value(),
-                                                      arm_scoped_locals.data,
-                                                      arm_scoped_locals.len,
-                                                      0) == KnownValueState::Error)
-                                    return frontend_error(FrontendError::UnsupportedSyntax,
-                                                          inner.expr.span);
+                            // A known-error init folds the guard condition to false, so
+                            // the success path (and the binding) is unreachable — skip it.
+                            if (inner.bind_value &&
+                                known_value_state(bound.value(),
+                                                  arm_scoped_locals.data,
+                                                  arm_scoped_locals.len,
+                                                  0) != KnownValueState::Error) {
                                 for (u32 li = 0; li < arm_scoped_locals.len; li++) {
                                     if (arm_scoped_locals[li].name.len != 0 &&
                                         arm_scoped_locals[li].name.eq(inner.name))
@@ -11765,7 +11840,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                                     local.generic_protocol_indices[cpi] =
                                         bound->generic_protocol_indices[cpi];
-                                local.may_nil = bound->may_nil;
+                                // Success path: HasValue conds (error-capable sources) rule out
+                                // both
+                                // channels; pure-optional runtime values keep may_nil (see
+                                // analyze_guard_cond — their carrier is not lowerable yet).
+                                local.may_nil = bound->may_nil && !bound->may_error;
                                 local.may_error = false;
                                 local.variant_index = bound->variant_index;
                                 local.struct_index = bound->struct_index;
@@ -15554,8 +15633,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto bound = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(
-                    stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                auto cond = analyze_guard_cond(stmt.expr,
+                                               &route,
+                                               mod,
+                                               route.locals.data,
+                                               route.locals.len,
+                                               nullptr,
+                                               stmt.bind_value,
+                                               stmt.match_arms.len != 0);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard.cond = cond.value();
                 if (stmt.match_arms.len != 0) {
@@ -15592,10 +15677,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         if (!fail_body) return core::make_unexpected(fail_body.error());
                     }
                 }
-                if (stmt.bind_value) {
-                    if (known_value_state(bound.value(), route.locals.data, route.locals.len, 0) ==
-                        KnownValueState::Error)
-                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                // A known-error init folds the guard condition to false, so the
+                // success path (and with it the binding) is unreachable — skip it.
+                if (stmt.bind_value &&
+                    known_value_state(bound.value(), route.locals.data, route.locals.len, 0) !=
+                        KnownValueState::Error) {
                     HirLocal local{};
                     local.span = stmt.span;
                     local.name = stmt.name;
@@ -15610,7 +15696,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     local.generic_protocol_count = bound->generic_protocol_count;
                     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                         local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                    local.may_nil = bound->may_nil;
+                    // Success path: HasValue conds (error-capable sources) rule out both
+                    // channels; pure-optional runtime values keep may_nil (see
+                    // analyze_guard_cond — their carrier is not lowerable yet).
+                    local.may_nil = bound->may_nil && !bound->may_error;
                     local.may_error = false;
                     local.variant_index = bound->variant_index;
                     local.struct_index = bound->struct_index;

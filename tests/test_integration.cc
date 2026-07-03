@@ -11529,9 +11529,12 @@ TEST(route, req_query_rejects_or_function_call_form) {
         "route GET \"/search\" { let q = req.query(\"q\") let value = or(q, \"\") if value == "
         "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
 }
 
 TEST(route, req_query_rejects_and_function_call_form) {
@@ -11540,9 +11543,12 @@ TEST(route, req_query_rejects_and_function_call_form) {
         "route GET \"/search\" { let q = req.query(\"q\") let value = and(q, \"\") if value == "
         "\"rut\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
 }
 
 TEST(route, req_header_rejects_or_function_call_form) {
@@ -11552,9 +11558,12 @@ TEST(route, req_header_rejects_or_function_call_form) {
         "value == \"localhost\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
 }
 
 TEST(route, req_header_rejects_and_function_call_form) {
@@ -11564,9 +11573,12 @@ TEST(route, req_header_rejects_and_function_call_form) {
         "value == \"localhost\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
 }
 
 TEST(route, req_cookie_rejects_or_function_call_form) {
@@ -11576,9 +11588,12 @@ TEST(route, req_cookie_rejects_or_function_call_form) {
         "== \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
 }
 
 TEST(route, req_cookie_rejects_and_function_call_form) {
@@ -11588,9 +11603,12 @@ TEST(route, req_cookie_rejects_and_function_call_form) {
         "value == \"ok\" { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
-    CHECK(lexed.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE_FALSE(ast);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
 }
 
 TEST(route, req_query_accepts_double_ampersand_operator) {

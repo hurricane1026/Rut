@@ -1238,10 +1238,11 @@ TEST(jit, frontend_rejects_or_function_call_form) {
         "route GET \"/users\" { let token = req.header(\"Authorization\") let x = or(token, \"\") "
         "return 200 }\n";
     auto lexed = lex(lit(src));
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(static_cast<u8>(lexed.error().code),
-             static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(lexed.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(jit, frontend_rejects_and_function_call_form) {
@@ -1249,10 +1250,11 @@ TEST(jit, frontend_rejects_and_function_call_form) {
         "route GET \"/users\" { let query = req.query(\"x\") let x = and(query, \"\") return 200 "
         "}\n";
     auto lexed = lex(lit(src));
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(static_cast<u8>(lexed.error().code),
-             static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(lexed.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(jit, frontend_accepts_double_ampersand_operator) {
@@ -3990,7 +3992,8 @@ TEST(jit, frontend_variant_payload_binding_match_block_with_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let failed "
-        "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
+        "= error(7) guard let failed else { return 401 } if x == 200 { return 200 } else { return "
+        "500 "
         "} } .err => return 404 } }\n";
 
     auto lexed = lex(lit(src));
@@ -4787,8 +4790,9 @@ TEST(jit, frontend_custom_error_struct_with_tuple_field_guard_match) {
 
 TEST(jit, frontend_multiple_top_level_guards) {
     const char* src =
-        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) "
-        "guard failed else { return 402 } return 200 }\n";
+        "route GET \"/users\" { let ok = 200 guard let ok else { return 401 } let failed = "
+        "error(7) "
+        "guard let failed else { return 402 } return 200 }\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5486,7 +5490,8 @@ TEST(jit, frontend_route_if_branch_block_with_let) {
 
 TEST(jit, frontend_route_if_branch_block_with_guard) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { "
+        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard let failed else "
+        "{ "
         "return 401 } return 200 } else { return 404 } }\n";
 
     auto lexed = lex(lit(src));
@@ -5526,7 +5531,8 @@ TEST(jit, frontend_route_if_branch_block_with_guard) {
 
 TEST(jit, frontend_guard_else_block_with_let) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code "
+        "route GET \"/users\" { let failed = error(7) guard let failed else { let code = 401 if "
+        "code "
         "== 401 { return 401 } else { return 500 } } return 200 }\n";
 
     auto lexed = lex(lit(src));
@@ -10860,7 +10866,7 @@ TEST(jit, frontend_custom_protocol_default_method_supports_guard_prefix) {
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
         let y = maybefail(ok)
-        guard y else { 401 }
+        guard let y else { 401 }
         200
     }
 }
@@ -15030,7 +15036,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard y else { 401 }
+    guard let y else { 401 }
     200
 }
 route GET "/users" {
@@ -17157,6 +17163,7 @@ func fail() -> str => error(.timeout)
 route GET "/" {
     let value = any(req.query("q"), fail())
     guard req.path == "/" else { return 404 }
+    guard let value else { return 500 }
     guard value == "rut" else { return 401 }
     wait(1000)
     return 204

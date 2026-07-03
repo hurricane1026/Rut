@@ -13,6 +13,11 @@ constexpr Str kGuardMatchArmIfDetail = lit_str("guard match arms do not support 
 constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
 constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
+// The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
+// member names work); the parser rejects them in operator/operand positions.
+constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
+constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
+constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
 
 struct Parser {
     const LexedTokens* toks = nullptr;
@@ -799,8 +804,24 @@ struct Parser {
         return expr;
     }
 
+    // Removed word-operator check for operand position (`not x`, `or(a, b)`,
+    // `and(a, b)`). Member names after `.` never reach here, so `.or(...)`
+    // and `bitwise.and(...)` stay valid.
+    FrontendResult<bool> reject_word_operator_operand() {
+        if (cur().type != TokenType::Ident) return true;
+        if (cur().text.eq({"and", 3}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), kAndDetail);
+        if (cur().text.eq({"or", 2}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), kOrDetail);
+        if (cur().text.eq({"not", 3}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), kNotDetail);
+        return true;
+    }
+
     // Prefix `!` — Swift-identical logical not, binds tighter than comparisons.
     FrontendResult<AstExpr> parse_unary_expr() {
+        auto word_check = reject_word_operator_operand();
+        if (!word_check) return core::make_unexpected(word_check.error());
         const Token* bang = take(TokenType::Bang);
         if (!bang) return parse_primary_expr();
         auto operand = parse_unary_expr();
@@ -861,7 +882,12 @@ struct Parser {
     FrontendResult<AstExpr> parse_and_expr() {
         auto lhs = parse_eq_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
-        while (take(TokenType::AmpAmp)) {
+        while (true) {
+            // Operator-position fix-it: `a and b`.
+            if (cur().type == TokenType::Ident && cur().text.eq({"and", 3}))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kAndDetail);
+            if (!take(TokenType::AmpAmp)) break;
             auto rhs = parse_eq_expr();
             if (!rhs) return core::make_unexpected(rhs.error());
             auto lhs_ptr = alloc_expr(lhs.value());
@@ -882,7 +908,12 @@ struct Parser {
     FrontendResult<AstExpr> parse_or_expr() {
         auto lhs = parse_and_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
-        while (take(TokenType::PipePipe)) {
+        while (true) {
+            // Operator-position fix-it: `a or b`.
+            if (cur().type == TokenType::Ident && cur().text.eq({"or", 2}))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kOrDetail);
+            if (!take(TokenType::PipePipe)) break;
             auto rhs = parse_and_expr();
             if (!rhs) return core::make_unexpected(rhs.error());
             auto lhs_ptr = alloc_expr(lhs.value());
