@@ -11180,13 +11180,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             guard_step.span = bstmt.span;
             if (!loop.body.steps.push(guard_step))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
-            if (bstmt.bind_value) {
-                if (known_value_state(bound.value(), route->locals.data, route->locals.len, 0) ==
-                    KnownValueState::Error)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        bstmt.expr.span,
-                        lit_str("guard let inside static for-loop cannot bind a known error"));
+            // A known-error init folds the guard condition to false, so the
+            // success path (and with it the binding) is unreachable — skip it,
+            // matching the route/function/match-arm guard-let paths.
+            if (bstmt.bind_value &&
+                known_value_state(bound.value(), route->locals.data, route->locals.len, 0) !=
+                    KnownValueState::Error) {
                 for (u32 li = 0; li < route->locals.len; li++) {
                     if (route->locals[li].name.len != 0 && route->locals[li].name.eq(bstmt.name))
                         return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);

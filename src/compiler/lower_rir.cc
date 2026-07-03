@@ -3389,6 +3389,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     value->rhs->kind == MirValueKind::ValueOf &&
                     local_ref_matches(value->rhs->lhs, local_index))
                     return true;
+                // A bare usable-value test (guard-let condition): the guard's
+                // else branch consumes the error, so the state-0 error prelude
+                // must not intercept it with a generic 500 first.
+                if (value->kind == MirValueKind::HasValue &&
+                    local_ref_matches(value->lhs, local_index))
+                    return true;
                 return false;
             }
 

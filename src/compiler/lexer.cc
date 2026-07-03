@@ -373,8 +373,14 @@ LexResult lex(Str source) {
                 // whitespace, so "value token immediately before, no gap"
                 // identifies the postfix reading.
                 const Token* last = out.tokens.len > 0 ? &out.tokens[out.tokens.len - 1] : nullptr;
+                // String/regex tokens store `end` at the closing quote, so
+                // the character after the literal starts at end + 1.
+                const bool last_is_quoted =
+                    last != nullptr &&
+                    (last->type == TokenType::StringLit || last->type == TokenType::RegexLit);
+                const u32 last_end = last == nullptr ? 0 : last->end + (last_is_quoted ? 1 : 0);
                 const bool after_value_token =
-                    last != nullptr && last->end == tok.start &&
+                    last != nullptr && last_end == tok.start &&
                     (last->type == TokenType::Ident || last->type == TokenType::IntLit ||
                      last->type == TokenType::FloatLit || last->type == TokenType::DurLit ||
                      last->type == TokenType::StringLit || last->type == TokenType::RegexLit ||

@@ -18322,6 +18322,57 @@ TEST(jit, ws_handler_close_returns_close) {
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
+TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
+    // Spec 3.3.7: guard let binds the usable value or takes else at RUNTIME.
+    // The guard's HasValue cond consumes the error, so the state-0 error
+    // prelude must not intercept with a generic 500 first (PR #162 review).
+    const char* src =
+        "func pick(ok: bool) -> str { if ok { \"rut\" } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = pick(req.http11) "
+        "guard let value else { return 401 } "
+        "if value == \"rut\" { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> pick(true) -> usable value bound and narrowed -> 200.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> pick(false) errors -> the guard's else, not a generic 500.
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

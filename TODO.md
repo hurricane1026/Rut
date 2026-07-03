@@ -36,10 +36,11 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   (emit_opt_is_nil needs an opt-typed carrier). guard-let over such values is
   now REJECTED with a fix-it ("use an error-capable source") rather than
   silently passing; lift the rejection when the carrier lands.
-- [ ] Runtime ordering: guard-let over a runtime error value lowers a
-  HasValue cond, but the resume-state-0 error prelude intercepts with 500
-  before the guard branch. Per spec the guard's else should win; revisit the
-  prelude/guard ordering in mir_build.
+- [x] Runtime ordering: guard-let over a runtime error value now wins over
+  the resume-state-0 error prelude — RecoveryScan treats a bare
+  HasValue(LocalRef) guard condition as a recovering use, so the prelude
+  skips locals whose error the guard consumes (e2e: pick(req.http11) ->
+  200 / guard else 401).
 - [ ] websocket trailing block `{ frame in }`; object literal only in
   call-argument position; pipeline RHS placeholder validation.
 - Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;

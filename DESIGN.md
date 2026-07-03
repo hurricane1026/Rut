@@ -5400,33 +5400,33 @@ Rules for this family of features:
 - these features must not participate in C++-style overload viability or ranking
 - implementation remains monomorphized; no trait objects or erased dispatch are implied
 
-Current implementation status: the first front-end slice supports top-level
-generic type aliases and ordered type-level `match` aliases (note: this slice
-still spells arms with a legacy `case` prefix; the target syntax above drops
-`case` to match value-level `match`):
+Current implementation status: the front-end supports top-level generic type
+aliases and ordered type-level `match` aliases, using the same caseless
+`pattern => ...` arm spelling as value-level `match` (a legacy `case` prefix
+is rejected with the no-`case` fix-it):
 
 ```rut
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 
 type Choice<T, U> match {
-    case T == U => Same<T>
-    case _ => Diff<T, U>
+    T == U => Same<T>
+    _ => Diff<T, U>
 }
 
 type Selected<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 ```
 
 The implemented matcher currently supports generic type parameters,
-protocol-predicate arms (`case T: Eq => ...`, `case T: Error => ...`, and
+protocol-predicate arms (`T: Eq => ...`, `T: Error => ...`, and
 custom protocol predicates when conformance metadata is available), type
-equality arms (`case T == U => ...`), associated-type equality arms
-(`case C.Elem == U => ...`) once impl associated type bindings are available,
+equality arms (`T == U => ...`), associated-type equality arms
+(`C.Elem == U => ...`) once impl associated type bindings are available,
 and a wildcard fallback. Alias expansion works in ordinary type positions such
 as `let` annotations, function parameters, function return types, protocol method
 requirements, impl associated type bindings, struct fields, and variant payloads.
