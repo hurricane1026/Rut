@@ -2680,6 +2680,53 @@ TEST(active_health, coalesced_timeout_does_not_reap_new_probe) {
     destroy_real_loop(loop);
 }
 
+TEST(active_health, one_second_upstream_timeout_still_sweeps_on_normal_tick) {
+    using namespace rut;
+    auto lfd_be = create_listen_socket(0);
+    REQUIRE(lfd_be.has_value());
+    const i32 backend_fd = lfd_be.value();
+    const u16 backend_port = get_port(backend_fd);
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend_port);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 1;
+
+    loop->sweep_health_probes();  // config install
+    set_probe_in_flight(uid, 0, false);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+
+    loop->health_probe_deadline_ns[uid] = 0;
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 1;
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+    CHECK_GT(loop->health_probe_deadline_ns[uid], 0u);
+
+    loop->force_close_all();
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    loop->shutdown();
+    close(listen_fd);
+    close(backend_fd);
+    destroy_real_loop(loop);
+}
+
 TEST(active_health, route_config_rejects_invalid_probe_config) {
     using namespace rut;
     RouteConfig cfg{};
@@ -2699,6 +2746,7 @@ TEST(active_health, route_config_rejects_invalid_probe_config) {
         uid, with_del, sizeof(with_del), /*interval_ms=*/1000, /*status=*/200));
     CHECK(!cfg.set_upstream_health_check(uid, nullptr, 1, /*interval_ms=*/1000, /*status=*/200));
     CHECK(!cfg.set_upstream_health_check(uid, nullptr, 0, /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/0, /*status=*/200));
     CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/99));
     CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/600));
     CHECK(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/204));

@@ -834,7 +834,7 @@ public:
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
                 const bool catchup_reaches_probe_timeout =
-                    ticks >= static_cast<i32>(upstream_timeout);
+                    ticks > 1 && ticks >= static_cast<i32>(upstream_timeout);
                 // A Timeout makes due health checks eligible, but the sweep must run
                 // only after every event from this backend.wait() batch has drained.
                 // Earlier I/O completions in the same batch can free a probe slot

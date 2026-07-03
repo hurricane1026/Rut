@@ -584,6 +584,7 @@ struct RouteConfig {
         UpstreamTarget& up = upstreams[uid];
         if (path == nullptr) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
+        if (interval_ms == 0) return false;
         if (status < 100 || status > 599) return false;
         // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
         // be an origin-form target that cannot inject spaces/control bytes into
