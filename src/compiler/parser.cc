@@ -247,7 +247,7 @@ struct Parser {
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
+                arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                 auto arm_stmt = parse_func_body_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
@@ -817,6 +817,19 @@ struct Parser {
         return expr;
     }
 
+    // An arm body that starts with a statement keyword (or a brace) is
+    // self-delimiting — only bare-expression bodies (and `return <expr>`
+    // tails) need the newline-dot arm boundary.
+    bool arm_body_needs_dot_stop() const {
+        const TokenType t = cur().type;
+        if (t == TokenType::LBrace) return false;
+        if (t == TokenType::KwIf || t == TokenType::KwMatch || t == TokenType::KwGuard ||
+            t == TokenType::KwLet || t == TokenType::KwFor || t == TokenType::KwWait ||
+            t == TokenType::KwForward)
+            return false;
+        return true;
+    }
+
     // Removed word-operator check for operand position (`not x`, `or(a, b)`,
     // `and(a, b)`). Member names after `.` never reach here, so `.or(...)`
     // and `bitwise.and(...)` stay valid.
@@ -1084,7 +1097,7 @@ struct Parser {
                     auto arrow = expect(TokenType::Arrow);
                     if (!arrow) return core::make_unexpected(arrow.error());
                     const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                    arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
+                    arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                     auto arm_stmt = parse_stmt();
                     arm_body_stops_cross_line_dot = saved_dot_stop;
                     if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
@@ -1650,7 +1663,7 @@ struct Parser {
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
+                arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                 auto arm_stmt = parse_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
@@ -1896,7 +1909,7 @@ struct Parser {
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
                 const bool saved_dot_stop = arm_body_stops_cross_line_dot;
-                arm_body_stops_cross_line_dot = cur().type != TokenType::LBrace;
+                arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                 auto arm_stmt = parse_func_body_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());

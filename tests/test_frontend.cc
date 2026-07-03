@@ -580,7 +580,8 @@ TEST(frontend, lex_rejects_reserved_optional_symbols_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)")));
+            lit("`?` / `??` / `?.` are not supported; use guard let, or any(value, "
+                "default) for a fallback (if let / .or(default) are spec'd, pending)")));
     }
 }
 
@@ -618,7 +619,8 @@ TEST(frontend, lex_rejects_bitwise_symbols_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("bitwise operators are functions: bitwise.and/or/xor/flip/shiftLeft/shiftRight")));
+            lit("bitwise symbols are not Rut syntax; the bitwise.and/or/xor/flip/"
+                "shiftLeft/shiftRight builtins are spec'd but not implemented yet")));
     }
 }
 
@@ -27479,7 +27481,8 @@ TEST(frontend, lex_rejects_postfix_bang_force_unwrap_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("postfix `!` (force unwrap) is not supported; use if let / guard let")));
+            lit("postfix `!` (force unwrap) is not supported; use guard let (if let is "
+                "spec'd, pending)")));
     }
 }
 
@@ -27547,6 +27550,29 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto& route = ast->items[1].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
+}
+
+TEST(frontend, unbraced_if_arm_body_allows_multiline_chain_in_condition) {
+    // The newline-dot arm boundary applies only to bare-expression arm
+    // bodies; a statement-keyword body (if/match/guard/...) is delimited by
+    // its own closing brace, so multiline chains in its condition parse.
+    const auto src = R"rut(
+route GET "/users" {
+    let code = 200
+    match code {
+        200 => if req
+            .header("Host") == "localhost" { return 200 } else { return 201 }
+        _ => return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
     REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
     REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
 }

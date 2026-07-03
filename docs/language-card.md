@@ -71,7 +71,7 @@ Comments: `// line only`.
 
 ```swift
 let x = 42                    // immutable (default)
-var n = 0                     // mutable, handler-local only
+var n = 0                     // ⏳ mutable, handler-local only
 const key = env("SECRET")     // must be compile-time evaluable
 
 if cond { ... } else { ... }              // bool branch — always braces
