@@ -2213,10 +2213,11 @@ TEST(active_health, stalled_probe_reaped_then_reprobed) {
 // (longer) keepalive_timeout. A probe stays in the default (Idle) state, so the
 // dispatch timer-refresh — `state == Proxying ? upstream_timeout : keepalive` —
 // would bump the probe's deadline to keepalive on its connect/send events,
-// delaying the reap. The fix special-cases is_health_probe in that refresh. Here
-// we drive a connect event through dispatch (which runs the refresh), then prove
-// the probe is reaped after only upstream_timeout+1 wheel ticks (far below
-// keepalive): if the refresh had used keepalive, those ticks would not reach it.
+// delaying the reap. Health probes now keep the deadline armed at launch. Here
+// we drive a connect event through dispatch (the refresh site), then prove the
+// probe is reaped after only upstream_timeout+1 wheel ticks (far below
+// keepalive): if the event had refreshed to keepalive, those ticks would not
+// reach it.
 TEST(active_health, probe_deadline_stays_upstream_timeout) {
     using namespace rut;
     auto lfd_be = create_listen_socket(0);
@@ -2287,6 +2288,73 @@ TEST(active_health, probe_deadline_stays_upstream_timeout) {
     loop->shutdown();
     close(listen_fd);
     close(backend_fd);
+    destroy_real_loop(loop);
+}
+
+TEST(active_health, partial_probe_response_does_not_extend_probe_deadline) {
+    using namespace rut;
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, 1);
+    REQUIRE(id.has_value());
+    const u16 uid = static_cast<u16>(id.value());
+    REQUIRE(cfg.set_upstream_health_check(
+        uid, "/health", 7, /*interval_ms=*/3'600'000, /*status=*/200));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    loop->upstream_timeout = 3;
+
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->is_health_probe = true;
+    c->fd = -1;
+    c->upstream_fd = fds[0];
+    c->upstream_idx = uid;
+    c->upstream_backend_idx = 0;
+    c->request_config = &cfg;
+    c->set_slots(nullptr, nullptr, &on_probe_response<EpollEventLoop>, nullptr);
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>("H"), 1), 1u);
+    set_probe_in_flight(uid, 0, true);
+    record_backend_result(uid, 0, /*success=*/true, monotonic_us());
+    loop->timer.add(c, loop->upstream_timeout);
+
+    IoEvent first_tick{};
+    first_tick.type = IoEventType::Timeout;
+    first_tick.result = 1;
+    loop->dispatch(first_tick);
+    REQUIRE_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+
+    IoEvent partial{};
+    partial.type = IoEventType::UpstreamRecv;
+    partial.conn_id = c->id;
+    partial.result = 1;
+    loop->dispatch(partial);
+    REQUIRE_EQ(loop->active_count(), 1u);
+    CHECK(probe_in_flight(uid, 0));
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = static_cast<i32>(loop->upstream_timeout);
+    loop->dispatch(tick);
+
+    CHECK_EQ(loop->active_count(), 0u);
+    CHECK(!probe_in_flight(uid, 0));
+
+    if (::fcntl(fds[0], F_GETFD) != -1) close(fds[0]);
+    close(fds[1]);
+    loop->shutdown();
+    close(listen_fd);
     destroy_real_loop(loop);
 }
 
@@ -2621,6 +2689,8 @@ TEST(active_health, route_config_rejects_invalid_probe_config) {
         uid, with_control, sizeof(with_control), /*interval_ms=*/1000, /*status=*/200));
     CHECK(!cfg.set_upstream_health_check(
         uid, with_del, sizeof(with_del), /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, nullptr, 1, /*interval_ms=*/1000, /*status=*/200));
+    CHECK(!cfg.set_upstream_health_check(uid, nullptr, 0, /*interval_ms=*/1000, /*status=*/200));
     CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/99));
     CHECK(!cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/600));
     CHECK(cfg.set_upstream_health_check(uid, "/health", 7, /*interval_ms=*/1000, /*status=*/204));

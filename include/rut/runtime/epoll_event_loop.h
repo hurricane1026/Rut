@@ -927,12 +927,11 @@ public:
                         // (least blast radius: no ConnState semantics touched, so
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
-                        if (!conn.throttle_paused)
-                            timer.refresh(
-                                &conn,
-                                (conn.is_health_probe || conn.state == ConnState::Proxying)
-                                    ? upstream_timeout
-                                    : keepalive_timeout);
+                        if (!conn.throttle_paused && !conn.is_health_probe) {
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
+                        }
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {

@@ -582,6 +582,7 @@ struct RouteConfig {
         u32 uid, const char* path, u32 path_len, u32 interval_ms, u16 status) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
+        if (path == nullptr) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
         if (status < 100 || status > 599) return false;
         // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must

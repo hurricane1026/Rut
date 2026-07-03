@@ -8222,6 +8222,28 @@ TEST(proxy, upstream_request_sent_wrong_type) {
     CHECK(loop.conns[cid].fd >= 0);
 }
 
+TEST(streaming, request_body_send_submit_failure_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("abc"), 3), 3u);
+    c->state = ConnState::Proxying;
+    c->upstream_fd = 100;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 3;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
+
+    const u32 cid = c->id;
+    loop.backend.fail_upstream_send = true;
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, 3));
+
+    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+}
+
 // === Coverage: upstream connected wrong event type ===
 
 TEST(proxy, upstream_connected_wrong_type) {

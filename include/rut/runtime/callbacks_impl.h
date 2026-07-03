@@ -3523,7 +3523,10 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                    nullptr,
                    &on_early_upstream_recvd_send_inflight<Loop>,
                    &on_request_body_sent<Loop>);
-    loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len);
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), send_len)) {
+        conn.upstream_request_incomplete = true;
+        loop->close_conn(conn);
+    }
 }
 
 #if RUT_ENABLE_WEBSOCKET
