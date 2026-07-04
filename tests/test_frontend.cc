@@ -27637,6 +27637,24 @@ TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
     CHECK_FALSE(rir_has_prelude_block(rir));
 }
 
+TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_path) {
+    // Mixed case: the SAME error-carrier local is guard-let-recovered in one
+    // branch but only COMPARED in a sibling branch. The prelude is emitted once
+    // per local, so recovery in one branch must NOT strip it from the
+    // compare-only path — otherwise the carrier's error masquerades as success
+    // there. Suppression requires EVERY use to recover; a lone non-recovering
+    // (compare/observe) use keeps the prelude (PR #162 re-review, err toward
+    // keeping the prelude).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "if req.http11 { guard let checked = value else { return 401 } return 204 } "
+        "else { if value == 200 { return 200 } else { return 500 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+}
+
 TEST(frontend, unbraced_arm_body_allows_line_broken_member_access_in_call_arg) {
     // The newline-dot arm boundary must be suspended inside a call argument:
     // a line-broken member access nested in a call arg (`choose(r\n .host)`) is
