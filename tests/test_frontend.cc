@@ -10169,6 +10169,7 @@ TEST(frontend, guard_let_takes_else_branch_on_known_nil) {
     // The whole route now lowers end-to-end (previously rejected at lower_to_rir).
     FrontendRirModule rir{};
     CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
 }
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
@@ -27623,6 +27624,7 @@ TEST(frontend, compare_only_fallible_local_keeps_error_prelude) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
 }
 
 TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
@@ -27637,6 +27639,7 @@ TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
 }
 
 TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_path) {
@@ -27655,6 +27658,7 @@ TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
 }
 
 TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
@@ -27672,6 +27676,7 @@ TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
 }
 
 TEST(frontend, unbraced_arm_body_allows_line_broken_member_access_in_call_arg) {

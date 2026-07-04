@@ -4896,11 +4896,15 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 HirLocal succ_locals[HirRoute::kMaxLocals]{};
                 for (u32 i = 0; i < cur_local_count; i++) succ_locals[i] = cur_locals[i];
                 u32 succ_count = cur_local_count;
-                // A known-error init folds the guard condition to false, so the
-                // success path (and with it the binding) is unreachable — skip it.
-                if (inner.bind_value &&
-                    known_value_state(bound.value(), cur_locals, cur_local_count, 0) !=
-                        KnownValueState::Error) {
+                // A known-error OR known-nil init folds the guard condition to
+                // false, so the success path (and with it the binding) is
+                // unreachable — skip it (same as the route-level guard-let path;
+                // materializing an unreachable known-nil binding makes lower_to_rir
+                // reject the always-else continuation).
+                const KnownValueState kInnerState =
+                    known_value_state(bound.value(), cur_locals, cur_local_count, 0);
+                if (inner.bind_value && kInnerState != KnownValueState::Error &&
+                    kInnerState != KnownValueState::Nil) {
                     HirLocal local{};
                     local.span = inner.span;
                     local.name = inner.name;
