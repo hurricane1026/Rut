@@ -27702,24 +27702,182 @@ route GET "/users" {
     REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
 }
 
-TEST(frontend, if_let_rejects_with_pending_fixit) {
-    // `if let` is spec'd (language card marks it pending); the parser gives a
-    // targeted migration diagnostic instead of a stray UnexpectedToken.
-    const char* sources[] = {
-        "func f(ok: bool) -> i32 { if let v = maybe(ok) { v } else { 0 } }\n"
-        "func maybe(ok: bool) -> i32 { if ok { 1 } else { error(.none) } }\n",
-        "route GET \"/x\" { if let q = req.query(\"q\") { return 200 } else { return 404 } }\n",
-    };
-    for (const char* src : sources) {
-        auto lexed = lex(lit(src));
-        REQUIRE(lexed);
-        auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
-        CHECK(ast.error().detail.eq(
-            lit("if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
-                "for now (TODO.md: front-end migration)")));
-    }
+TEST(frontend, if_let_parses_binding_fields) {
+    // `if let name = expr { } else { }` parses like guard-let: the If records
+    // the binding name and marks bind_value, with the bound expr on `expr`.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let value = any(200, fallback()) if let checked = value { return 200 } "
+        "else { return 401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& if_stmt = ast->items[1].route.statements[1];
+    REQUIRE_EQ(static_cast<u8>(if_stmt.kind), static_cast<u8>(AstStmtKind::If));
+    CHECK(if_stmt.bind_value);
+    CHECK(if_stmt.name.eq(lit("checked")));
+    // A plain `if cond { } else { }` is unchanged: no binding.
+    const char* plain = "route GET \"/u\" { if true { return 200 } else { return 401 } }\n";
+    auto lexed2 = lex(lit(plain));
+    REQUIRE(lexed2);
+    auto ast2 = parse_file_heap(lexed2.value());
+    REQUIRE(ast2);
+    const auto& plain_if = ast2->items[0].route.statements[0];
+    REQUIRE_EQ(static_cast<u8>(plain_if.kind), static_cast<u8>(AstStmtKind::If));
+    CHECK_FALSE(plain_if.bind_value);
+}
+
+TEST(frontend, if_let_binds_narrowed_value_in_then_branch_only) {
+    // `if let x = <error-capable>` narrows the binding into the THEN branch
+    // scope; the else branch (and everything outside the if) never sees it.
+    // The whole route lowers end-to-end (representative full-pipeline case).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let value = any(200, fallback()) if let checked = value { if checked "
+        "== 200 { return 200 } else { return 500 } } else { return 401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // The route holds the fallible carrier `value` (index 0) plus the narrowed
+    // `checked` binding (index 1), which is error/nil-free on the success path.
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("checked")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::I32));
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+    // The condition is a runtime usable-value test (not a folded constant).
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.match_expr.kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_binding_not_visible_in_else_branch) {
+    // Referencing the binding from the else branch must fail to resolve — the
+    // narrowed local is then-branch-scoped, not continuation-scoped like guard.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let value = any(200, fallback()) if let checked = value { return 200 } "
+        "else { if checked == 200 { return 401 } else { return 402 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, if_let_in_function_body_binds_then_expression) {
+    // Function-body `if let` (analyze_function_body_stmt): the binding is
+    // usable in the then expression, and the whole thing lowers end-to-end.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "func pick() -> i32 { let value = any(200, fallback()) if let checked = value { checked } "
+        "else { 0 } }\n"
+        "route GET \"/u\" { let r = pick() if r == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_function_body_binding_not_visible_in_else) {
+    // The function-body if-let binding is not in scope in the else expression.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "func pick() -> i32 { let value = any(200, fallback()) if let checked = value { 1 } "
+        "else { checked } }\n"
+        "route GET \"/u\" { let r = pick() return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, if_let_known_error_folds_condition_and_skips_binding) {
+    // A known-error init folds the cond to `false`: the then branch is
+    // unreachable and the binding is skipped (mirrors guard-let).
+    const char* src =
+        "route GET \"/u\" { if let x = error(7) { return 500 } else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(hir->routes[0].control.cond.bool_value);
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_known_nil_folds_condition_and_skips_binding) {
+    const char* src = "route GET \"/u\" { if let x = nil { return 500 } else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.cond.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(hir->routes[0].control.cond.bool_value);
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_on_runtime_optional_only_value_rejects_with_detail) {
+    // Pure-optional runtime values (may_nil without may_error) cannot lower a
+    // nil test yet — `if let` reuses guard-let's nil-carrier rejection.
+    const char* src =
+        "route GET \"/x\" { if let q = req.query(\"q\") { return 200 } else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("guard let cannot test a runtime optional-only value yet (nil-carrier "
+            "lowering pending); use an error-capable source")));
+}
+
+TEST(frontend, if_let_nested_inside_match_arm) {
+    // `if let` as the tail of a braced match-arm body (analyze_match_arm_body
+    // If site): the cond folds to HasValue and the route lowers end-to-end.
+    const char* src =
+        "variant Result { ok, err }\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let state = Result.ok let value = any(200, fallback()) match state { "
+        ".ok => { if let checked = value { return 200 } else { return 401 } } .err => return 404 } "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
 }
 
 TEST(frontend, compare_only_fallible_local_keeps_error_prelude) {

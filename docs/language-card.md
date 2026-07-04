@@ -76,7 +76,8 @@ var n = 0                     // ⏳ mutable, handler-local only
 const key = env("SECRET")     // must be compile-time evaluable
 
 if cond { ... } else { ... }              // bool branch — always braces
-if let v = expr { ... }                   // ⏳ bind usable value (Swift-identical)
+if let v = expr { ... } else { ... }      // bind usable value in then-branch; error-capable expr
+                                          // works, ⏳ pure-optional expr (req.query/header) pending
 guard cond else { return 400 }            // cond MUST be bool; else must exit
 guard let v = expr else { return 400 }    // bind or exit; error-capable expr works,
                                           // ⏳ pure-optional expr (req.query/header) pending
@@ -101,7 +102,7 @@ Nil/error handling — pick by situation, nothing else exists:
 | Situation | Write |
 |---|---|
 | fallback value | `req.query("page").or("1")` ⏳ (today: `any(x, default)`) |
-| branch if present | `if let v = expr { ... }` ⏳ |
+| branch if present | `if let v = expr { ... } else { ... }` (⏳ pure-optional expr) |
 | stop if absent/failed | `guard let v = expr else { return 400 }` |
 | bare presence test | `x != nil` / `x == nil` ⏳ |
 | failure *reason* matters | `match` on the error |
@@ -333,7 +334,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 | Wrong (foreign habit) | Right |
 |---|---|
 | `and` / `or` / `not` | `&&` / `\|\|` / `!` |
-| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` (`if let` / `.or(default)` / `!= nil` ⏳) |
+| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` / `if let` (`.or(default)` / `!= nil` ⏳) |
 | `guard claims else {}` (non-bool) | `guard let claims else {}` |
 | `req.X-Request-ID` | `req.header("X-Request-ID")` |
 | `resp.Server = nil` | `resp.remove("Server")` |
