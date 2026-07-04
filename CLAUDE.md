@@ -103,12 +103,12 @@ LLM-facing surface contract).
 - **Swift-exact or absent**: anything that looks like Swift behaves exactly like Swift; near-miss variants don't exist
 - `respond <status>[, body]` / `respond resp` — short-circuit the request from middleware (⏳ pending — `respond` is not a parser keyword yet); `return` has ONE meaning everywhere (produce the function's/handler's value; a handler's value is its response, so handlers use `return 200`)
 - `guard <bool> else { respond 401 }` (middleware) / `guard ... else { return 401 }` (handler); `guard let x = expr else { }` binds a usable value (nil and error handled uniformly; Swift-identical incl. `guard let x` shorthand). `if let x = expr { }` is ⏳ pending (currently rejected with a pending diagnostic)
-- Route captures live in `req.params` (`req.params.id`) — never shadow built-ins like `req.path`; query: `req.query(k) -> string?`, `req.queryAll(k) -> [string]`
+- Route captures live in `req.params` — `req.params.id` is ⏳ pending (analyzer rejects `params` today); never shadow built-ins like `req.path`. Query: `req.query(k) -> str?` works; `req.queryAll(k) -> [str]` is ⏳ pending
 - `=> expr` — single expression, implicit return. `{ stmts }` — block, explicit `return`
 - Named parameters: `auth(req, role: "user")`
 - UFCS: `req.auth(role: "user")` rewrites to `auth(req, role: "user")` — blessed form when value flows into the first parameter
 - Pipeline: `a | f(_, ...)` — shell-style `|`; in expressions `|` means pipeline ONLY; RHS must be a call with an explicit `_`/`_N` placeholder; use when value lands in a non-first position
-- Bitwise ops are functions in the built-in `bitwise` namespace, not symbols: `bitwise.and`/`bitwise.or`/`bitwise.xor`/`bitwise.flip`/`bitwise.shiftLeft`/`bitwise.shiftRight` (same style as `log.info`)
+- Bitwise ops are functions in the built-in `bitwise` namespace, not symbols: `bitwise.and`/`bitwise.or`/`bitwise.xor`/`bitwise.flip`/`bitwise.shiftLeft`/`bitwise.shiftRight` (same style as `log.info`) — ⏳ pending (spec'd, the builtins are not implemented yet; the removed `&`/`~`/`<<` symbols do emit a fix-it)
 - `match` with `=>` (expression) or `{}` (block); no `case` keyword. `if` always uses `{}`
 - Header access is function-style: `req.header("X-Request-ID")`, `req.set(...)`, `resp.set(...)`, `resp.remove(...)` — hyphenated property access does not exist (would parse as subtraction)
 - `@decorator` for middleware — `@func` on routes/groups, `@func pattern` for bindings
@@ -127,9 +127,9 @@ LLM-facing surface contract).
 - **Pre/post middleware** inferred from signature: first param `Request` → pre, `Response` → post
 - **State types**: Hash, LRU (with coalesce), Set, Counter, Bloom, Bitmap — per-shard, bounded capacity, mmap pre-allocated
 - **Regex**: `re"pattern"` literals, Vectorscan backend, multi-pattern auto-merge
-- **Error handling**: Result + `guard let` / `if let` / `.or(default)` / `== nil`; no postfix `x?`, no `?.` / `??` / force-unwrap `!`; no exceptions
+- **Error handling**: Result + `guard let` (⏳ `if let` / `.or(default)` / `== nil`/`!= nil` presence test are pending); no postfix `x?`, no `?.` / `??` / force-unwrap `!`; no exceptions
 - **Boolean**: `&&` / `||` / `!` (identical to Swift), `true`/`false`/`nil` literals
-- **Loops**: `for ... in` only (no `while`); `break`/`continue` allowed (bound preserved)
+- **Loops**: ⏳ pending — `for ... in` (no `while`) with `break`/`continue` is spec'd, but the parser rejects `for` today ("for loops are unsupported in Rut Core")
 - **Domain types**: Duration, ByteSize, StatusCode, Method, IP, CIDR, Port, MediaType, Regex, Time, Tuple
 - **Response**: `response(status)` builder — no `{ }` for headers, explicit construction
 - **Tracing**: automatic runtime instrumentation (OTLP/Zipkin), zero user code

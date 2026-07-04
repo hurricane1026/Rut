@@ -149,7 +149,7 @@ All functions inline at compile time.
 
 Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
 MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
-tuples `(a, b)` with `.0/.1` access and `let (x, y) = pair` destructuring.
+tuples `(a, b)` — ⏳ `.0`/`.1` projection and `let (x, y) = pair` destructuring pending.
 
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
@@ -167,11 +167,11 @@ match e {
     _          => log.warn("other")
 }
 protocol Hashable { func hash() -> u64 }
-impl User: Hashable { func hash() -> u64 => fnv64(self.id) }  // always explicit
+User impl Hashable { func hash() -> u64 => fnv64(self.id) }  // Type impl Protocol (NOT impl T: P)
 
-parseInt("42")        // i32? — parse APIs for text (also parseFloat, IP.parse,
-                      //         CIDR.parse, Duration.parse)
-200 as str            // infallible conversion; checked form: as?
+parseInt("42")        // ⏳ i32? — parse APIs for text (parseFloat, IP.parse,
+                      //         CIDR.parse, Duration.parse) all pending
+200 as str            // ⏳ infallible conversion (`as` / checked `as?` pending)
 ```
 
 ## Request / Response
@@ -333,7 +333,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 | Wrong (foreign habit) | Right |
 |---|---|
 | `and` / `or` / `not` | `&&` / `\|\|` / `!` |
-| `x?` , `x?.y` , `a ?? b` , `x!` | `if let` / `guard let` / `.or(default)` / `!= nil` |
+| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` (`if let` / `.or(default)` / `!= nil` ⏳) |
 | `guard claims else {}` (non-bool) | `guard let claims else {}` |
 | `req.X-Request-ID` | `req.header("X-Request-ID")` |
 | `resp.Server = nil` | `resp.remove("Server")` |
