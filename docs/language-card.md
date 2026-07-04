@@ -20,15 +20,15 @@ A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 import { rateLimit } from "stdlib/ratelimit.rut"   // selective import
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
-listen :443                       // ports
+listen :443                       // ⏳ ports (no top-level listen yet)
 tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
 let limits = Counter<IP>(capacity: 100000, window: 1m)   // state (per-shard)
 
-struct Ctx { userId: string }     // types
-func auth(_ req: Request, role: string) { ... }     // middleware/helpers
+struct Ctx { userId: str }        // types
+func auth(_ req: Request, role: str) { ... }     // middleware/helpers
 timer cleanup, every: 1m { ... }  // background tasks
 init { ... }    shutdown { ... }  // lifecycle hooks
 route { ... }                     // exactly one route block
@@ -40,20 +40,21 @@ route { ... }                     // exactly one route block
 
 ```swift
 // Literals
-42   3.14   0xFF   1_000_000            // numbers
+42                                      // number (plain integer)
+3.14   0xFF   1_000_000                 // ⏳ float / hex / underscored (lexer takes plain digit runs only)
 "text"   "\(req.path)/x"                // strings, \() interpolation (ONLY form)
-500ms  1s  5m  1h  1d                   // Duration
-64b  1kb  16kb  1mb  1gb                // ByteSize
+500ms  1s  5m  1h                       // Duration (1d ⏳ — lexer knows ms/s/m/h only)
+64b  1kb  16kb  1mb  1gb                // ⏳ ByteSize (no byte-size literal in lexer)
 10.0.0.0/8                              // CIDR
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
-json({ users: [], total: 0 })           // object literal: ONLY as call argument
+json({ users: [], total: 0 })           // ⏳ object literal (no object-literal production yet)
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
 |                                       // pipeline ONLY (see below)
-+  -  *  /  %                           // arithmetic
++  -  *  /  %                           // ⏳ arithmetic (no arithmetic in lexer/parser yet)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
@@ -82,7 +83,7 @@ guard let v else { ... }                  // Swift 5.7 shorthand: rebind v
 
 match status {                            // general dispatch — no `case` keyword
     200      => "ok"                      // pattern => expr
-    404, 410 => "gone"
+    404      => "gone"
     _        => "other"                   // exhaustive: all cases or _
 }
 
@@ -91,7 +92,7 @@ for item in order.items {                 // ⏳ finite collections only, no whi
     guard item.qty > 0 else { return 400 }
 }
 
-defer conn.close()                        // runs on every exit path, LIFO
+defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)
 ```
 
 Nil/error handling — pick by situation, nothing else exists:
@@ -116,7 +117,7 @@ exceptions, no try/catch. `!` is logical not only.
   **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
 
 ```swift
-func auth(_ req: Request, role: string) -> User {
+func auth(_ req: Request, role: str) -> User {
     let token = req.authorization.or("")
     guard token.hasPrefix("Bearer ") else { respond 401 }
     let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
@@ -130,7 +131,7 @@ func auth(_ req: Request, role: string) -> User {
 
 ```swift
 func f(_ req: Request, limit: ByteSize) { ... }   // first param unlabeled, rest named
-f(req, limit: 1mb)
+f(req, limit: 1mb)                // ⏳ mixed positional+named call args (parser rejects the label)
 req.f(limit: 1mb)                 // UFCS: t.f(a) == f(t, a) — use when value
                                   // flows into the FIRST parameter
 req.path.trimPrefix("/api").split("/")            // UFCS chaining
@@ -146,18 +147,18 @@ All functions inline at compile time.
 ## Types
 
 Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
-MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `string`, `[T]`,
+MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
 tuples `(a, b)` with `.0/.1` access and `let (x, y) = pair` destructuring.
 
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
-    id: string
-    role: string
+    id: str
+    role: str
 }
 variant NetError {            // closed sum type
     timeout
     refused
-    dns(string)               // case with payload
+    dns(str)                  // case with payload
 }
 match e {
     .timeout   => log.warn("timeout")
@@ -169,33 +170,33 @@ impl User: Hashable { func hash() -> u64 => fnv64(self.id) }  // always explicit
 
 parseInt("42")        // i32? — parse APIs for text (also parseFloat, IP.parse,
                       //         CIDR.parse, Duration.parse)
-200 as string         // infallible conversion; checked form: as?
+200 as str            // infallible conversion; checked form: as?
 ```
 
 ## Request / Response
 
 ```swift
 // Typed built-in properties (standard headers)
-req.method == .GET          req.path (string)        req.remoteAddr (IP)
+req.method == .GET          req.path (str)           req.remoteAddr (IP)
 req.contentLength (ByteSize)  req.contentType (MediaType)
-req.authorization (string?)   req.host  req.userAgent  req.origin (string?)
+req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 
 // Raw headers — function access ONLY (never req.X-Foo property syntax)
-req.header("X-Request-ID")   // string?
-req.set("X-User-ID", "123")  req.add("X-Tag", "a")   req.getAll("Accept")
+req.header("X-Request-ID")   // str?
+req.set("X-User-ID", "123")  req.add("X-Tag", "a")   req.getAll("Accept")   // ⏳ only req.header is wired up
 
 // Route captures / query / cookies / body
 req.params.id                // ⏳ from :id — captures NEVER shadow built-ins
-req.query("page")            // string? (first value)
-req.queryAll("tags")         // ⏳ [string]
-req.cookie("session")        // string?
+req.query("page")            // str? (first value)
+req.queryAll("tags")         // ⏳ [str]
+req.cookie("session")        // str?
 req.body(User)               // typed parse, error-capable → guard let
-req.bodyRaw                  // string, error-capable; assignable before forward
+req.bodyRaw                  // str, error-capable; assignable before forward
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
 
-// Response construction
-let resp = response(429)
+// Response construction — ⏳ only `return response(...)` works today; locals + mutators pending
+let resp = response(429)          // ⏳ (no general response() builder; see note above)
 resp.set("Retry-After", "60")     // set/replace header
 resp.remove("Server")             // delete header
 resp.add("Set-Cookie", "a=1")     // append multi-value
@@ -207,12 +208,12 @@ return resp
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let sessions  = Hash<string, Session>(capacity: 50000, ttl: 30m)
-let cache     = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
+let sessions  = Hash<str, Session>(capacity: 50000, ttl: 30m)
+let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)
 let blacklist = Set<IP>(capacity: 100000)          // Set<CIDR> = LPM trie
 let limits    = Counter<IP>(capacity: 100000, window: 1m)      // sliding window
 let bursts    = Counter<IP>(capacity: 100000, rate: 100, burst: 20) // token bucket
-let seen      = Bloom<string>(capacity: 1000000, errorRate: 0.01)
+let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)
 let flags     = Bitmap(size: 256)
 
 sessions.set(k, v)  sessions.get(k) /*V?*/  sessions.delete(k)  sessions.contains(k)
@@ -299,7 +300,7 @@ wait(2s)                                                  // sleep
 
 // Raw TCP/UDP
 guard let conn = tcp("redis:6379") else { return 502 }
-defer conn.close()
+defer conn.close()                             // ⏳ (no defer in parser yet)
 conn.send("PING\r\n")
 guard let data = conn.recv(maxSize: 4kb) else { return 502 }
 
@@ -351,7 +352,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ## Minimal complete example
 
 ```swift
-listen :80
+listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
 let limits = Counter<IP>(capacity: 100000, window: 1m)
 
@@ -371,7 +372,7 @@ route {
 }
 
 struct User {
-    id: string
-    role: string
+    id: str
+    role: str
 }
 ```
