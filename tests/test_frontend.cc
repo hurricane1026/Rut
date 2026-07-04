@@ -142,6 +142,16 @@ static bool lower_src_to_rir(const char* src, FrontendRirModule& rir) {
     return static_cast<bool>(lowered);
 }
 
+static bool rir_has_prelude_block(const FrontendRirModule& rir) {
+    for (u32 f = 0; f < rir.module.func_count; f++) {
+        const auto& fn = rir.module.functions[f];
+        for (u32 b = 0; b < fn.block_count; b++) {
+            if (fn.blocks[b].label.eq(lit("prelude"))) return true;
+        }
+    }
+    return false;
+}
+
 static std::string format_verify_text(const rir::VerifyResult& result) {
     char msg_data[256];
     rir::PrintBuf msg;
@@ -551,31 +561,114 @@ TEST(frontend, lex_regex_literal_reports_trailing_escape_at_literal_start) {
     CHECK_EQ(lexed.error().span.col, 1u);
 }
 
-TEST(frontend, lex_recognizes_and_or_keywords) {
-    const char* src = "a and b or c";
+TEST(frontend, lex_recognizes_logical_operator_tokens) {
+    const char* src = "a && b || c";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
-    REQUIRE_EQ(lexed->tokens.len, 6u);  // a, and, b, or, c, EOF
-    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::KwAnd));
-    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::KwOr));
+    REQUIRE_EQ(lexed->tokens.len, 6u);  // a, &&, b, ||, c, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::AmpAmp));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::PipePipe));
 }
 
-TEST(frontend, lex_rejects_non_core_optional_symbols) {
+TEST(frontend, lex_recognizes_comparison_operator_tokens) {
+    const char* src = "a != b <= c >= d";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    REQUIRE_EQ(lexed->tokens.len, 8u);  // a, !=, b, <=, c, >=, d, EOF
+    CHECK_EQ(static_cast<u8>(lexed->tokens[1].type), static_cast<u8>(TokenType::BangEq));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[3].type), static_cast<u8>(TokenType::LtEq));
+    CHECK_EQ(static_cast<u8>(lexed->tokens[5].type), static_cast<u8>(TokenType::GtEq));
+}
+
+TEST(frontend, lex_rejects_reserved_optional_symbols_with_fixit) {
     const char* sources[] = {
         "route GET \"/x\" { let name = req.query(\"name\") ?? \"anonymous\" return 200 }\n",
         "route GET \"/x\" { let ok = req.authorization?.hasPrefix(\"Bearer\") return 200 }\n",
-        "route GET \"/x\" { guard !req.path.contains(\"/../\") else { return 403 } return 200 "
-        "}\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
         REQUIRE(!lexed);
-        CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(
+            lit("`?` / `??` / `?.` are not supported; use guard let, or any(value, "
+                "default) for a fallback (if let / .or(default) are spec'd, pending)")));
     }
 }
 
+TEST(frontend, parse_rejects_word_boolean_operators_with_fixit) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {"route GET \"/x\" { let x = true and false return 200 }\n",
+         "`and` is not Rut syntax; use `&&`"},
+        {"route GET \"/x\" { let x = true or false return 200 }\n",
+         "`or` is not Rut syntax; use `||`"},
+        {"route GET \"/x\" { guard not x else { return 403 } return 200 }\n",
+         "`not` is not Rut syntax; use `!`"},
+    };
+    for (const Case& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(ast.error().detail.eq(lit(c.detail)));
+    }
+}
+
+TEST(frontend, lex_rejects_bitwise_symbols_with_fixit) {
+    const char* sources[] = {
+        "route GET \"/x\" { let x = 1 & 2 return 200 }\n",
+        "route GET \"/x\" { let x = 1 ^ 2 return 200 }\n",
+        "route GET \"/x\" { let x = ~1 return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(!lexed);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(
+            lit("bitwise symbols are not Rut syntax; the bitwise.and/or/xor/flip/"
+                "shiftLeft/shiftRight builtins are spec'd but not implemented yet")));
+    }
+}
+
+TEST(frontend, parse_supports_prefix_bang_negation_in_guard) {
+    // Parse-level only: `contains` is not an analyze-supported method yet.
+    const char* src =
+        "route GET \"/x\" { guard !req.path.contains(\"/../\") else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+}
+
+TEST(frontend, analyze_supports_bang_negation_of_bool_condition) {
+    // `!` desugars to `== false`; the whole chain must survive analyze.
+    const char* src = "route GET \"/x\" { guard !(1 == 2) else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_supports_negated_comparison_operators) {
+    const char* src =
+        "route GET \"/x\" { guard 1 != 2 else { return 403 } guard 1 <= 2 else { return 403 } "
+        "guard 2 >= 1 else { return 403 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, parse_supports_infix_or_expression) {
-    const char* src = "route GET \"/x\" { let x = true or false return 200 }\n";
+    const char* src = "route GET \"/x\" { let x = true || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -589,7 +682,7 @@ TEST(frontend, parse_supports_infix_or_expression) {
 }
 
 TEST(frontend, parse_supports_infix_and_expression) {
-    const char* src = "route GET \"/x\" { let x = true and false return 200 }\n";
+    const char* src = "route GET \"/x\" { let x = true && false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -635,7 +728,7 @@ TEST(frontend, parse_supports_any_function_call_form) {
 }
 
 TEST(frontend, parse_infix_and_or_is_left_associative) {
-    const char* src = "route GET \"/x\" { let x = true and false or false return 200 }\n";
+    const char* src = "route GET \"/x\" { let x = true && false || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -650,20 +743,39 @@ TEST(frontend, parse_infix_and_or_is_left_associative) {
     CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
 }
 
-TEST(frontend, parse_rejects_double_ampersand_operator) {
-    const char* src = "route GET \"/x\" { let x = true && false return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(!lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
-}
-
-TEST(frontend, parse_rejects_double_pipe_operator) {
-    const char* src = "route GET \"/x\" { let x = true || false return 200 }\n";
+TEST(frontend, parse_and_binds_tighter_than_or) {
+    // Swift/C precedence: a || b && c parses as a || (b && c).
+    const char* src = "route GET \"/x\" { let x = true || false && false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    auto& expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
+    CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::BoolLit));
+    CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::And));
+}
+
+TEST(frontend, parse_desugars_negated_comparisons) {
+    // a != b → (a == b) == false; likewise <= / >= via > / <.
+    const char* src =
+        "route GET \"/x\" { let x = 1 != 2 let y = 1 <= 2 let z = 1 >= 2 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 4u);
+    auto check_desugar = [&](const AstExpr& e, AstExprKind inner) {
+        CHECK_EQ(static_cast<u8>(e.kind), static_cast<u8>(AstExprKind::Eq));
+        CHECK_EQ(static_cast<u8>(e.lhs->kind), static_cast<u8>(inner));
+        CHECK_EQ(static_cast<u8>(e.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
+        CHECK_EQ(e.rhs->bool_value, false);
+    };
+    check_desugar(route.statements[0].expr, AstExprKind::Eq);  // !=
+    check_desugar(route.statements[1].expr, AstExprKind::Gt);  // <=
+    check_desugar(route.statements[2].expr, AstExprKind::Lt);  // >=
 }
 
 TEST(frontend, parse_rejects_or_function_call_form) {
@@ -671,8 +783,9 @@ TEST(frontend, parse_rejects_or_function_call_form) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_or_function_call_form_with_header) {
@@ -682,8 +795,9 @@ TEST(frontend, parse_rejects_or_function_call_form_with_header) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
@@ -693,8 +807,9 @@ TEST(frontend, parse_rejects_or_function_call_form_with_cookie) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`or` is not Rut syntax; use `||`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form) {
@@ -702,8 +817,9 @@ TEST(frontend, parse_rejects_and_function_call_form) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form_with_header) {
@@ -713,8 +829,9 @@ TEST(frontend, parse_rejects_and_function_call_form_with_header) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
@@ -724,14 +841,15 @@ TEST(frontend, parse_rejects_and_function_call_form_with_cookie) {
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(!ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("`and` is not Rut syntax; use `&&`")));
 }
 
 TEST(frontend, parse_rejects_pipe_with_bool_operator_rhs) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true | pass_bool(_) or false return 200 }\n";
+        "route GET \"/x\" { let x = true | pass_bool(_) || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -742,7 +860,7 @@ TEST(frontend, parse_rejects_pipe_with_bool_operator_rhs) {
 TEST(frontend, parse_allows_parenthesized_pipe_with_or) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = (true | pass_bool(_)) or false return 200 }\n";
+        "route GET \"/x\" { let x = (true | pass_bool(_)) || false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -761,7 +879,7 @@ TEST(frontend, parse_allows_parenthesized_pipe_with_or) {
 TEST(frontend, parse_supports_and_expr_before_pipe) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true and false | pass_bool(_) return 200 }\n";
+        "route GET \"/x\" { let x = true && false | pass_bool(_) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -779,7 +897,7 @@ TEST(frontend, parse_supports_and_expr_before_pipe) {
 TEST(frontend, parse_supports_or_expr_before_pipe) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true or false | pass_bool(_) return 200 }\n";
+        "route GET \"/x\" { let x = true || false | pass_bool(_) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -827,7 +945,7 @@ route GET "/users" {
 TEST(frontend, parse_rejects_pipe_with_unclear_and_operand) {
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/x\" { let x = true | pass_bool(_) and false return 200 }\n";
+        "route GET \"/x\" { let x = true | pass_bool(_) && false return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -836,7 +954,7 @@ TEST(frontend, parse_rejects_pipe_with_unclear_and_operand) {
 }
 
 TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
-    const char* lhs_mismatch = "route GET \"/users\" { let code = 200 and true return 200 }\n";
+    const char* lhs_mismatch = "route GET \"/users\" { let code = 200 && true return 200 }\n";
     auto lexed = lex(lit(lhs_mismatch));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -846,7 +964,7 @@ TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
     CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 
     const char* rhs_mismatch =
-        "route GET \"/users\" { let code = true and \"fallback\" return 200 }\n";
+        "route GET \"/users\" { let code = true && \"fallback\" return 200 }\n";
     lexed = lex(lit(rhs_mismatch));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -857,7 +975,7 @@ TEST(frontend, analyze_rejects_and_with_non_bool_operands) {
 }
 
 TEST(frontend, analyze_rejects_and_with_fallible_operands) {
-    const char* lhs_fallible = "route GET \"/users\" { let code = error(7) and true return 200 }\n";
+    const char* lhs_fallible = "route GET \"/users\" { let code = error(7) && true return 200 }\n";
     auto lexed = lex(lit(lhs_fallible));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -866,7 +984,7 @@ TEST(frontend, analyze_rejects_and_with_fallible_operands) {
     REQUIRE_FALSE(lhs);
     CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 
-    const char* rhs_fallible = "route GET \"/users\" { let code = true and error(7) return 200 }\n";
+    const char* rhs_fallible = "route GET \"/users\" { let code = true && error(7) return 200 }\n";
     lexed = lex(lit(rhs_fallible));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -877,7 +995,7 @@ TEST(frontend, analyze_rejects_and_with_fallible_operands) {
 }
 
 TEST(frontend, analyze_rejects_and_with_nil_operands) {
-    const char* lhs_optional = "route GET \"/users\" { let code = nil and true return 200 }\n";
+    const char* lhs_optional = "route GET \"/users\" { let code = nil && true return 200 }\n";
     auto lexed = lex(lit(lhs_optional));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -887,7 +1005,7 @@ TEST(frontend, analyze_rejects_and_with_nil_operands) {
     CHECK_EQ(static_cast<u8>(lhs.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 
     const char* rhs_optional =
-        "route GET \"/users\" { let maybe = nil let code = true and maybe return 200 }\n";
+        "route GET \"/users\" { let maybe = nil let code = true && maybe return 200 }\n";
     lexed = lex(lit(rhs_optional));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -899,7 +1017,7 @@ TEST(frontend, analyze_rejects_and_with_nil_operands) {
 
 TEST(frontend, analyze_constant_folds_and_with_false) {
     const char* src =
-        "route GET \"/users\" { let code = false and false if code { return 200 } else { return "
+        "route GET \"/users\" { let code = false && false if code { return 200 } else { return "
         "401 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -917,7 +1035,7 @@ TEST(frontend, analyze_constant_folds_and_with_false) {
 
 TEST(frontend, analyze_constant_folds_and_with_true_to_rhs) {
     const char* src =
-        "route GET \"/users\" { let code = true and true if code { return 200 } else { return 401 "
+        "route GET \"/users\" { let code = true && true if code { return 200 } else { return 401 "
         "} "
         "}\n";
     auto lexed = lex(lit(src));
@@ -936,7 +1054,7 @@ TEST(frontend, analyze_constant_folds_and_with_true_to_rhs) {
 
 TEST(frontend, analyze_preserves_non_constant_and_as_if_else) {
     const char* src =
-        "func gate(left: bool, right: bool) -> bool => left and right\n"
+        "func gate(left: bool, right: bool) -> bool => left && right\n"
         "route GET \"/users\" { return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -954,7 +1072,7 @@ TEST(frontend, analyze_preserves_non_constant_and_as_if_else) {
 
 TEST(frontend, analyze_constant_folds_or_with_true) {
     const char* src =
-        "route GET \"/users\" { let code = false or true if code { return 200 } else { return 401 "
+        "route GET \"/users\" { let code = false || true if code { return 200 } else { return 401 "
         "} "
         "}\n";
     auto lexed = lex(lit(src));
@@ -973,7 +1091,7 @@ TEST(frontend, analyze_constant_folds_or_with_true) {
 
 TEST(frontend, analyze_constant_folds_or_with_false) {
     const char* src =
-        "route GET \"/users\" { let code = false or false if code { return 200 } else { return "
+        "route GET \"/users\" { let code = false || false if code { return 200 } else { return "
         "401 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1062,7 +1180,7 @@ TEST(frontend, analyze_preserves_optional_all_as_if_else) {
 
 TEST(frontend, analyze_preserves_non_constant_or_as_if_else) {
     const char* src =
-        "func gate(left: bool, right: bool) -> bool => left or right\n"
+        "func gate(left: bool, right: bool) -> bool => left || right\n"
         "route GET \"/users\" { return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1461,11 +1579,11 @@ TEST(frontend, analyze_accepts_websocket_direction_guard) {
 }
 
 TEST(frontend, analyze_accepts_websocket_text_match_guard) {
-    // `guard not frame.text.matches(re"badword") else { frame.drop() }` then forward → one
+    // `guard !frame.text.matches(re"badword") else { frame.drop() }` then forward → one
     // TextMatch guard (negated, pattern "badword", Drop) — a content blocklist.
     const char* src =
         "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
-        "  guard not frame.text.matches(re\"badword\") else { frame.drop() }\n"
+        "  guard !frame.text.matches(re\"badword\") else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
@@ -2416,7 +2534,7 @@ struct Payload { value: i32 }
 variant Box { value(Payload) }
 route GET "/users" {
     match Box.value(Payload(value: 42)) {
-        case .value(req): if req.value == 42 { return 200 } else { return 500 }
+        .value(req) => if req.value == 42 { return 200 } else { return 500 }
     }
 }
 )rut";
@@ -3197,7 +3315,7 @@ TEST(frontend, parse_wait_rejects_unknown_suffix) {
 }
 
 TEST(frontend, parse_rejects_empty_if_block_with_detail) {
-    const char* src = "route GET \"/x\" { if true { } else { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { if true { } else { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -3229,14 +3347,16 @@ TEST(frontend, parse_rejects_non_string_error_message_with_detail) {
 TEST(frontend, analyze_accepts_let_guard_wait_source_order) {
     // Guards and waits are threaded in source order after pre-wait locals.
     const char* src =
-        "route GET \"/x\" { let k = 42 guard k else { return 401 } wait(50) return 204 }\n";
+        "route GET \"/x\" { let k = 42 guard let k else { return 401 } wait(50) return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    // Two locals: the original `k` and the guard-let shorthand's rebinding.
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[1].name.eq(lit("k")));
     REQUIRE_EQ(hir->routes[0].guards.len, 1u);
     REQUIRE_EQ(hir->routes[0].waits.len, 1u);
 }
@@ -3421,8 +3541,8 @@ TEST(frontend, lower_wait_result_then_guard_let_preserves_local_refs) {
 
 TEST(frontend, lower_wait_result_then_match_terminal) {
     const char* src =
-        "route GET \"/x\" { let ev = wait(downstream.recv()) match ev.kind { case 5: return 204 "
-        "case _: return 500 } }\n";
+        "route GET \"/x\" { let ev = wait(downstream.recv()) match ev.kind { 5 => return 204 "
+        "_ => return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -4343,7 +4463,7 @@ TEST(frontend, import_relative_file_merges_imported_variant_symbol) {
 import "types.rut"
 route GET "/users" {
     let state = AuthState.ok
-    match state { case .ok: return 200 case _: return 500 }
+    match state { .ok => return 200 _ => return 500 }
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -5161,7 +5281,7 @@ TEST(frontend,
 import "proto.rut"
 func run<T: MaybeCode>(x: T) -> i32 {
     let failed = x.code(false)
-    guard match failed else { case .timeout => 401 case _ => 500 }
+    guard match failed else { .timeout => 401 _ => 500 }
     200
 }
 route GET "/users" { if run(Box(value: 1)) == 401 { return 200 } else { return 500 } }
@@ -5230,8 +5350,8 @@ TEST(frontend, import_relative_file_merges_type_match_alias_symbol) {
         out << "struct Inline<T> { value: T }\n";
         out << "struct Ref<T> { value: i32 }\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Eq => Inline<T>\n";
-        out << "    case _ => Ref<T>\n";
+        out << "    T: Eq => Inline<T>\n";
+        out << "    _ => Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5265,8 +5385,8 @@ TEST(frontend, selective_import_relative_file_merges_selected_type_match_alias_s
         out << "struct Inline<T> { value: T }\n";
         out << "struct Ref<T> { value: i32 }\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Eq => Inline<T>\n";
-        out << "    case _ => Ref<T>\n";
+        out << "    T: Eq => Inline<T>\n";
+        out << "    _ => Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5300,8 +5420,8 @@ TEST(frontend, import_namespace_alias_rewrites_type_match_alias_target_symbols) 
         out << "struct Inline<T> { value: T }\n";
         out << "struct Ref<T> { value: i32 }\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Eq => Inline<T>\n";
-        out << "    case _ => Ref<T>\n";
+        out << "    T: Eq => Inline<T>\n";
+        out << "    _ => Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5335,8 +5455,8 @@ TEST(frontend, selective_import_alias_rewrites_type_match_alias_target_symbols) 
         out << "struct Inline<T> { value: T }\n";
         out << "struct Ref<T> { value: i32 }\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Eq => Inline<T>\n";
-        out << "    case _ => Ref<T>\n";
+        out << "    T: Eq => Inline<T>\n";
+        out << "    _ => Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5373,8 +5493,8 @@ TEST(frontend, import_namespace_alias_rewrites_type_match_alias_protocol_constra
         out << "struct Ref<T> { value: i32 }\n";
         out << "Box<i32> impl Hashable {}\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Hashable => Inline<T>\n";
-        out << "    case _ => Ref<T>\n";
+        out << "    T: Hashable => Inline<T>\n";
+        out << "    _ => Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5411,8 +5531,8 @@ TEST(frontend, selective_import_alias_rewrites_type_match_alias_protocol_constra
         out << "struct Ref<T> { value: i32 }\n";
         out << "Box<i32> impl Hashable {}\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Hashable => Inline<T>\n";
-        out << "    case _ => Ref<T>\n";
+        out << "    T: Hashable => Inline<T>\n";
+        out << "    _ => Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5450,8 +5570,8 @@ TEST(frontend, imported_type_match_alias_rewrites_qualified_target_symbols) {
         std::ofstream out(dir + "/traits.rut", std::ios::binary);
         out << "import * as proto from \"proto.rut\"\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: Eq => proto.Box<T>\n";
-        out << "    case _ => proto.Ref<T>\n";
+        out << "    T: Eq => proto.Box<T>\n";
+        out << "    _ => proto.Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5490,8 +5610,8 @@ TEST(frontend, imported_type_match_alias_rewrites_qualified_protocol_constraints
         std::ofstream out(dir + "/traits.rut", std::ios::binary);
         out << "import * as proto from \"proto.rut\"\n";
         out << "type Storage<T> match {\n";
-        out << "    case T: proto.Hashable => proto.Inline<T>\n";
-        out << "    case _ => proto.Ref<T>\n";
+        out << "    T: proto.Hashable => proto.Inline<T>\n";
+        out << "    _ => proto.Ref<T>\n";
         out << "}\n";
     }
     const auto src = R"rut(
@@ -5748,8 +5868,8 @@ TEST(frontend, import_namespace_generic_type_ref_is_supported) {
 import "proto.rut"
 func pick(x: proto.Result<i32>) -> i32 {
     match x {
-    case .ok(v) => v
-    case .err => 0
+    .ok(v) => v
+    .err => 0
     }
 }
 route GET "/users" { if pick(proto.Result<i32>.ok(1)) == 1 { return 200 } else { return 500 } }
@@ -5772,7 +5892,7 @@ TEST(frontend, import_namespace_nested_generic_payload_lowering_path_is_supporte
     const auto src = R"rut(
 import * as proto from "proto.rut"
 func wrap(x: proto.Result<proto.Box<proto.Result<i32>>>) -> proto.Result<proto.Box<proto.Result<i32>>> => x
-route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { case .ok(v): return 200 case .err: return 500 } }
+route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { .ok(v) => return 200 .err => return 500 } }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5793,7 +5913,7 @@ TEST(frontend, import_namespace_nested_generic_payload_shape_is_carrier_ready_in
     const auto src = R"rut(
 import * as proto from "proto.rut"
 func wrap(x: proto.Result<proto.Box<proto.Result<i32>>>) -> proto.Result<proto.Box<proto.Result<i32>>> => x
-route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { case .ok(v): return 200 case .err: return 500 } }
+route GET "/users" { let state = wrap(proto.Result<proto.Box<proto.Result<i32>>>.ok(proto.Box<proto.Result<i32>>(value: proto.Result<i32>.ok(1)))) match state { .ok(v) => return 200 .err => return 500 } }
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -5912,8 +6032,8 @@ func unwrap<T>(x: Holder<T>) -> Result<T> => x.state
 route GET "/users" {
     let state = unwrap(Holder(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -5990,8 +6110,8 @@ TEST(frontend, import_namespace_variant_constructor_is_supported) {
 import "proto.rut"
 route GET "/users" {
     match proto.Result.ok(200) {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -6013,8 +6133,8 @@ TEST(frontend, import_namespace_payloadless_variant_case_is_supported) {
 import "proto.rut"
 route GET "/users" {
     match proto.Token.ready {
-    case .ready: return 200
-    case .pending: return 500
+    .ready => return 200
+    .pending => return 500
     }
 }
 )rut";
@@ -6890,8 +7010,8 @@ route GET "/users" { return 200 }
 TEST(frontend, variant_match_lowers_to_tag_compare) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
-        "200 case _: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { .timeout => return "
+        "200 _ => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6941,8 +7061,8 @@ TEST(frontend, variant_match_lowers_to_tag_compare) {
 TEST(frontend, variant_match_all_cases_without_wildcard_is_exhaustive) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
-        "200 case .forbidden: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { .timeout => return "
+        "200 .forbidden => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -6978,8 +7098,8 @@ TEST(frontend, variant_match_all_cases_without_wildcard_is_exhaustive) {
 TEST(frontend, variant_single_payload_case_parses_and_lowers) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): return 200 "
-        "case .err: return 500 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => return 200 "
+        ".err => return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7018,8 +7138,8 @@ TEST(frontend, variant_single_payload_case_parses_and_lowers) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): if x == 200 "
-        "{ return 200 } else { return 500 } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => if x == 200 "
+        "{ return 200 } else { return 500 } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7060,8 +7180,8 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_if) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let y = x "
-        "if y == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let y = x "
+        "if y == 200 { return 200 } else { return 500 } } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7098,9 +7218,10 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block) {
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
-        "= error(7) guard failed else { return 401 } if x == 200 { return 200 } else { return 500 "
-        "} } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let failed "
+        "= error(7) guard let failed else { return 401 } if x == 200 { return 200 } else { return "
+        "500 "
+        "} } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7130,9 +7251,9 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard) {
 TEST(frontend, match_arm_block_guard_else_local_named_error_gets_hidden_variant) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/users\" { let state = Result.ok match state { case .ok: { guard false else "
+        "route GET \"/users\" { let state = Result.ok match state { .ok => { guard false else "
         "{ let failed = error(.timeout) if true { return 401 } else { return 402 } } return 200 } "
-        "case .err: return 404 } }\n";
+        ".err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7151,9 +7272,9 @@ TEST(frontend, match_arm_block_guard_else_local_named_error_gets_hidden_variant)
 TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { let failed "
-        "= error(.timeout) guard match failed else { case .timeout: return 401 case _: return 402 "
-        "} if x == 200 { return 200 } else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { let failed "
+        "= error(.timeout) guard match failed else { .timeout => return 401 _ => return 402 "
+        "} if x == 200 { return 200 } else { return 500 } } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7183,9 +7304,9 @@ TEST(frontend, variant_payload_binding_flows_into_match_arm_block_with_guard_mat
 TEST(frontend, variant_mixed_payload_cases_lower) {
     const char* src =
         "variant Mixed { count(i32), ready(bool), label(str), none }\n"
-        "route GET \"/users\" { let state = Mixed.ready(true) match state { case .count(x): return "
-        "200 case .ready(flag): if flag == true { return 201 } else { return 202 } case "
-        ".label(name): return 203 case .none: return 204 } }\n";
+        "route GET \"/users\" { let state = Mixed.ready(true) match state { .count(x) => return "
+        "200 .ready(flag) => if flag == true { return 201 } else { return 202 } "
+        ".label(name) => return 203 .none => return 204 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7220,9 +7341,9 @@ TEST(frontend, variant_tuple_payload_binding_flows_into_pipe_multi_slot) {
     const char* src =
         "variant Result { ok((i32, i32)), err }\n"
         "func second(a: i32, b: i32) -> i32 => b\n"
-        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { case .ok(pair): { "
-        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } case "
-        ".err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok((200, 500)) match state { .ok(pair) => { "
+        "let code = pair | second(_2, _1) if code == 200 { return 200 } else { return 500 } } "
+        ".err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7252,9 +7373,10 @@ TEST(frontend, route_match_struct_payload_binding_preserves_shape) {
         "struct Box { value: i32 }\n"
         "variant Result { ok(Box), err }\n"
         "func boxCode(x: Box) -> i32 => x.value\n"
-        "route GET \"/users\" { let state = Result.ok(Box(value: 200)) match state { case "
-        ".ok(box): { let code = box | boxCode(_) if code == 200 { return 200 } else { return 500 } "
-        "} case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(Box(value: 200)) match state { "
+        ".ok(box) => { let code = box | boxCode(_) if code == 200 { return 200 } else { return 500 "
+        "} "
+        "} .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7275,8 +7397,8 @@ TEST(frontend, route_match_nested_struct_payload_projection) {
         "struct Outer { inner: Box }\n"
         "variant Result { ok(Outer), err }\n"
         "route GET \"/users\" { let state = Result.ok(Outer(inner: Box(value: 200))) match state { "
-        "case .ok(v): { let code = v.inner.value if code == 200 { return 200 } else { return 500 } "
-        "} case .err: return 404 } }\n";
+        ".ok(v) => { let code = v.inner.value if code == 200 { return 200 } else { return 500 } "
+        "} .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -7301,11 +7423,11 @@ import "proto.rut"
 route GET "/users" {
     let state = proto.Result.ok(proto.Outer(inner: proto.Box(value: 200)))
     match state {
-    case .ok(v): {
+    .ok(v) => {
         let code = v.inner.value
         if code == 200 { return 200 } else { return 500 }
     }
-    case .err: return 404
+    .err => return 404
     }
 }
 )rut";
@@ -7333,11 +7455,11 @@ import "proto.rut"
 route GET "/users" {
     let state = proto.Result.ok(proto.Outer(inner: proto.Box(value: 200)))
     match state {
-    case .ok(v): {
+    .ok(v) => {
         let code = v.inner.value
         if code == 200 { return 200 } else { return 500 }
     }
-    case .err: return 404
+    .err => return 404
     }
 }
 )rut";
@@ -7426,8 +7548,8 @@ TEST(frontend, import_relative_file_preserves_imported_function_body_shape_indic
         out << "func pickOr(ok: bool) -> i32 => any(maybe(ok), 500)\n";
         out << "func pickMatch(x: Result) -> i32 {\n";
         out << "    match x {\n";
-        out << "        case .ok => 200\n";
-        out << "        case .err => 500\n";
+        out << "        .ok => 200\n";
+        out << "        .err => 500\n";
         out << "    }\n";
         out << "}\n";
     }
@@ -7895,8 +8017,8 @@ TEST(frontend, lower_to_rir_supports_imported_function_body_match) {
         out << "variant Result { ok, err }\n";
         out << "func pick(x: Result) -> i32 {\n";
         out << "    match x {\n";
-        out << "        case .ok => 200\n";
-        out << "        case .err => 500\n";
+        out << "        .ok => 200\n";
+        out << "        .err => 500\n";
         out << "    }\n";
         out << "}\n";
     }
@@ -7938,11 +8060,11 @@ import "proto.rut"
 route GET "/users" {
     let state = proto.Result.ok(proto.Outer(inner: proto.Box(value: 200)))
     match state {
-    case .ok(v): {
+    .ok(v) => {
         let code = v.inner.value
         if code == 200 { return 200 } else { return 500 }
     }
-    case .err: return 404
+    .err => return 404
     }
 }
 )rut";
@@ -7964,7 +8086,7 @@ route GET "/users" {
 TEST(frontend, route_guard_bound_struct_preserves_shape_index) {
     const char* src =
         "struct Box { value: i32 }\n"
-        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.missing) } }\n"
         "route GET \"/users\" { guard let picked = maybeBox(true) else { return 401 } if "
         "picked.value == 200 { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
@@ -8006,10 +8128,10 @@ TEST(frontend, match_arm_guard_bound_struct_preserves_shape_index) {
     const char* src =
         "struct Box { value: i32 }\n"
         "variant Result { ok, err }\n"
-        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
-        "route GET \"/users\" { let state = Result.ok match state { case .ok: { guard let picked = "
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.missing) } }\n"
+        "route GET \"/users\" { let state = Result.ok match state { .ok => { guard let picked = "
         "maybeBox(true) else { return 401 } if picked.value == 200 { return 200 } else { return "
-        "500 } } case .err: return 404 } }\n";
+        "500 } } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -8028,8 +8150,8 @@ variant Result<T> { ok(T), err }
 route GET "/users" {
     let state = Result<i32>.ok(200)
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8052,8 +8174,8 @@ variant Wrap<T> { some(T), none }
 route GET "/users" {
     let state = Wrap<Box<i32>>.some(Box<i32>(value: 200))
     match state {
-    case .some(v): return 200
-    case .none: return 500
+    .some(v) => return 200
+    .none => return 500
     }
 }
 )rut";
@@ -8079,8 +8201,8 @@ variant Result<T> { ok(T), err }
 route GET "/users" {
     let state = Result.ok(200)
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8138,8 +8260,8 @@ variant Result<T> { ok(T), err }
 route GET "/users" {
     let state = Result.ok((Item(value: 7), 9))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8804,8 +8926,8 @@ variant Result<T> { ok(T), err }
 route GET "/users" {
     let state: Result<i32> = Result.ok(200)
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8826,8 +8948,8 @@ func wrap(x: Result<i32>) -> Result<i32> => x
 route GET "/users" {
     let state = wrap(Result.ok(200))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -8872,8 +8994,8 @@ struct Holder { state: Result<i32> }
 route GET "/users" {
     let holder = Holder(state: Result.ok(200))
     match holder.state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9020,18 +9142,18 @@ variant Result<T> { ok(T), err }
 variant Outer { wrap(Result<i32>), bad }
 func isOk(x: Result<i32>) -> bool {
     match x {
-    case .ok => true
-    case .err => false
+    .ok => true
+    .err => false
     }
 }
 route GET "/users" {
     let state = Outer.wrap(Result.ok(200))
     match state {
-    case .wrap(inner): {
+    .wrap(inner) => {
         let ok = isOk(inner)
         if ok { return 200 } else { return 500 }
     }
-    case .bad:
+    .bad =>
         return 404
     }
 }
@@ -9054,11 +9176,11 @@ func is200(x: Box<i32>) -> bool => x.value == 200
 route GET "/users" {
     let state = Outer.wrap(Box(value: 200))
     match state {
-    case .wrap(inner): {
+    .wrap(inner) => {
         let ok = is200(inner)
         if ok { return 200 } else { return 500 }
     }
-    case .bad:
+    .bad =>
         return 404
     }
 }
@@ -9080,8 +9202,8 @@ struct Holder<T> { state: Result<T> }
 route GET "/users" {
     let holder = Holder<i32>(state: Result.ok(200))
     match holder.state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9105,10 +9227,10 @@ variant Wrap<T> { some(Box<T>), none }
 route GET "/users" {
     let state = Wrap<i32>.some(Box(value: 200))
     match state {
-    case .some(box): {
+    .some(box) => {
         if box.value == 200 { return 200 } else { return 500 }
     }
-    case .none:
+    .none =>
         return 404
     }
 }
@@ -9137,8 +9259,8 @@ func unwrap(x: Holder<i32>) -> Result<i32> => x.state
 route GET "/users" {
     let state = unwrap(Holder<i32>(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9167,8 +9289,8 @@ func unwrap(x: Holder<Result<i32>>) -> Result<i32> => x.state
 route GET "/users" {
     let state = unwrap(Holder<Result<i32>>(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9196,8 +9318,8 @@ struct Holder<T> { state: T }
 route GET "/users" {
     let holder = Holder<Result<i32>>(state: Result<i32>.ok(200))
     match holder.state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -9223,8 +9345,8 @@ struct Box<T> { value: T }
 variant Wrap<T> { some(T), none }
 func unwrap(x: Wrap<Box<i32>>) -> Box<i32> {
     match x {
-    case .some(v) => v
-    case .none => Box<i32>(value: 0)
+    .some(v) => v
+    .none => Box<i32>(value: 0)
     }
 }
 route GET "/users" {
@@ -9255,8 +9377,8 @@ struct Box<T> { value: T }
 variant Wrap<T> { some(Box<T>), none }
 func is200(x: Wrap<i32>) -> bool {
     match x {
-    case .some(box) => box.value == 200
-    case .none => false
+    .some(box) => box.value == 200
+    .none => false
     }
 }
 route GET "/users" {
@@ -9435,8 +9557,8 @@ TEST(frontend, plain_struct_variant_field_can_flow_into_match) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
         "struct Foo { state: AuthState }\n"
-        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { case "
-        ".timeout: return 200 case _: return 403 } }\n";
+        "route GET \"/users\" { let foo = Foo(state: AuthState.timeout) match foo.state { "
+        ".timeout => return 200 _ => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9518,8 +9640,8 @@ TEST(frontend, source_error_file_and_func_fields_are_accessible) {
 }
 TEST(frontend, known_named_error_match_selects_error_case) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return "
-        "503 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { .timeout => return "
+        "503 _ => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9539,9 +9661,9 @@ TEST(frontend, known_named_error_match_selects_error_case) {
 }
 TEST(frontend, known_named_error_match_arm_guard_false_selects_wildcard) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout if "
-        "false: "
-        "return 503 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { .timeout if "
+        "false => "
+        "return 503 _ => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9560,8 +9682,8 @@ TEST(frontend, known_named_error_match_arm_guard_false_selects_wildcard) {
 TEST(frontend, known_explicit_error_match_arm_guard_false_selects_wildcard) {
     const char* src =
         "variant AuthError { timeout, denied }\n"
-        "route GET \"/users\" { let failed = error(AuthError.timeout) match failed { case .timeout "
-        "if false: return 503 case _: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(AuthError.timeout) match failed { .timeout "
+        "if false => return 503 _ => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9580,7 +9702,7 @@ TEST(frontend, known_explicit_error_match_arm_guard_false_selects_wildcard) {
 TEST(frontend, known_named_error_match_runtime_arm_guard_falls_back_to_match) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) let allow = req.method == GET match "
-        "failed { case .timeout if allow: return 503 case _: return 200 } }\n";
+        "failed { .timeout if allow => return 503 _ => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9603,7 +9725,7 @@ TEST(frontend, known_named_error_match_runtime_arm_guard_falls_back_to_match) {
 TEST(frontend, known_named_error_match_runtime_guard_keeps_other_named_error_cases) {
     const char* src =
         "route GET \"/users\" { let failed = error(.timeout) let allow = req.method == GET match "
-        "failed { case .denied: return 403 case .timeout if allow: return 503 case _: return 200 "
+        "failed { .denied => return 403 .timeout if allow => return 503 _ => return 200 "
         "} }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9627,8 +9749,8 @@ TEST(frontend, known_named_error_match_runtime_guard_keeps_other_named_error_cas
 }
 TEST(frontend, analyze_rejects_known_named_error_match_wildcard_arm_guard) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .denied: return "
-        "403 case _ if true: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { .denied => return "
+        "403 _ if true => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9639,8 +9761,8 @@ TEST(frontend, analyze_rejects_known_named_error_match_wildcard_arm_guard) {
 }
 TEST(frontend, analyze_rejects_known_named_error_matched_arm_before_wildcard_guard) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) match failed { case .timeout: return "
-        "503 case _ if true: return 200 } }\n";
+        "route GET \"/users\" { let failed = error(.timeout) match failed { .timeout => return "
+        "503 _ if true => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9666,7 +9788,7 @@ TEST(frontend, if_const_selects_then_without_checking_else) {
 
 TEST(frontend, if_const_folds_constant_local_boolean_or) {
     const char* src =
-        "route GET \"/users\" { let flag = true if const flag or false { return 200 } else { "
+        "route GET \"/users\" { let flag = true if const flag || false { return 200 } else { "
         "return forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9682,7 +9804,7 @@ TEST(frontend, if_const_folds_constant_local_boolean_or) {
 
 TEST(frontend, if_const_folds_constant_local_boolean_and) {
     const char* src =
-        "route GET \"/users\" { let flag = false if const flag and true { return forward(missing) "
+        "route GET \"/users\" { let flag = false if const flag && true { return forward(missing) "
         "} else { return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9698,7 +9820,7 @@ TEST(frontend, if_const_folds_constant_local_boolean_and) {
 
 TEST(frontend, if_const_folds_const_comparison_boolean_or) {
     const char* src =
-        "route GET \"/users\" { if const (POST == GET) or true { return 200 } else { return "
+        "route GET \"/users\" { if const (POST == GET) || true { return 200 } else { return "
         "forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9714,7 +9836,7 @@ TEST(frontend, if_const_folds_const_comparison_boolean_or) {
 
 TEST(frontend, if_const_folds_const_comparison_boolean_and) {
     const char* src =
-        "route GET \"/users\" { if const (POST == GET) and true { return forward(missing) } else { "
+        "route GET \"/users\" { if const (POST == GET) && true { return forward(missing) } else { "
         "return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9743,8 +9865,8 @@ TEST(frontend, if_const_rejects_runtime_condition) {
 TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match const state { case .ok(x): if x "
-        "== 200 { return 200 } else { return 500 } case .err: return forward(missing) } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match const state { .ok(x) => if x "
+        "== 200 { return 200 } else { return 500 } .err => return forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9761,8 +9883,8 @@ TEST(frontend, match_const_selects_variant_case_without_checking_other_arms) {
 }
 TEST(frontend, match_const_selects_string_case_without_checking_other_arms) {
     const char* src =
-        "route GET \"/users\" { let path = \"/users\" match const path { case \"/users\": return "
-        "200 case \"/admin\": return forward(missing) } }\n";
+        "route GET \"/users\" { let path = \"/users\" match const path { \"/users\" => return "
+        "200 \"/admin\" => return forward(missing) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9774,8 +9896,8 @@ TEST(frontend, match_const_selects_string_case_without_checking_other_arms) {
 }
 TEST(frontend, analyze_rejects_match_const_arm_guard) {
     const char* src =
-        "route GET \"/users\" { let path = \"/users\" match const path { case \"/users\" if true: "
-        "return 200 case _: return 404 } }\n";
+        "route GET \"/users\" { let path = \"/users\" match const path { \"/users\" if true => "
+        "return 200 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9789,13 +9911,13 @@ TEST(frontend, function_match_const_preserves_outer_payload_binding) {
         "variant Result { ok(i32), err }\n"
         "func pick(x: Result) -> i32 {\n"
         "  match x {\n"
-        "    case .ok(v) => {\n"
+        "    .ok(v) => {\n"
         "      match const true {\n"
-        "        case true => v\n"
-        "        case false => 500\n"
+        "        true => v\n"
+        "        false => 500\n"
         "      }\n"
         "    }\n"
-        "    case .err => 404\n"
+        "    .err => 404\n"
         "  }\n"
         "}\n"
         "route GET \"/users\" { let code = pick(Result.ok(200)) if code == 200 { return 200 } else "
@@ -9812,8 +9934,8 @@ TEST(frontend, function_match_const_preserves_outer_payload_binding) {
 TEST(frontend, match_const_rejects_runtime_subject) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { match const req.header(\"Host\") { case .timeout: return 200 case "
-        "_: return 500 } }\n";
+        "route GET \"/users\" { match const req.header(\"Host\") { .timeout => return 200 "
+        "_ => return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9841,8 +9963,8 @@ variant Pair<T, U> { one(T), two(U) }
 route GET "/users" {
     let state = Pair.one(200)
     match state {
-    case .one(v): return 200
-    case .two(v): return 500
+    .one(v) => return 200
+    .two(v) => return 500
     }
 }
 )rut";
@@ -9896,7 +10018,7 @@ TEST(frontend, analyze_rejects_payload_on_payloadless_variant_case) {
 TEST(frontend, analyze_rejects_variant_match_missing_case_without_wildcard) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
+        "route GET \"/users\" { let state = AuthState.timeout match state { .timeout => return "
         "200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -9909,8 +10031,8 @@ TEST(frontend, analyze_rejects_variant_match_missing_case_without_wildcard) {
 TEST(frontend, analyze_rejects_duplicate_variant_match_case) {
     const char* src =
         "variant AuthState { timeout, forbidden }\n"
-        "route GET \"/users\" { let state = AuthState.timeout match state { case .timeout: return "
-        "200 case .timeout: return 403 } }\n";
+        "route GET \"/users\" { let state = AuthState.timeout match state { .timeout => return "
+        "200 .timeout => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -9921,8 +10043,8 @@ TEST(frontend, analyze_rejects_duplicate_variant_match_case) {
 }
 TEST(frontend, analyze_rejects_duplicate_bool_match_case) {
     const char* src =
-        "route GET \"/users\" { let ok = true match ok { case true: return 200 case true: return "
-        "403 case false: return 500 } }\n";
+        "route GET \"/users\" { let ok = true match ok { true => return 200 true => return "
+        "403 false => return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -10022,7 +10144,8 @@ TEST(frontend, route_if_branch_block_with_let_lowers_via_match_shape) {
 }
 TEST(frontend, route_if_branch_block_with_guard_is_supported) {
     const char* src =
-        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard failed else { "
+        "route GET \"/users\" { let ok = true if ok { let failed = error(7) guard let failed else "
+        "{ "
         "return 401 } return 200 } else { return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -10037,7 +10160,7 @@ TEST(frontend, route_if_branch_block_with_guard_is_supported) {
 TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) guard failed else { return 401 } return "
+        "route GET \"/users\" { let failed = error(7) guard let failed else { return 401 } return "
         "forward(api) "
         "}\n";
     auto lexed = lex(lit(src));
@@ -10075,7 +10198,8 @@ TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
 }
 TEST(frontend, guard_else_block_with_let_is_supported) {
     const char* src =
-        "route GET \"/users\" { let failed = error(7) guard failed else { let code = 401 if code "
+        "route GET \"/users\" { let failed = error(7) guard let failed else { let code = 401 if "
+        "code "
         "== 401 { return 401 } else { return 500 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -10135,7 +10259,12 @@ TEST(frontend, guard_let_binds_success_value) {
     CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[1].term.kind),
              static_cast<u8>(MirTerminatorKind::Branch));
 }
-TEST(frontend, guard_let_does_not_unwrap_nil) {
+TEST(frontend, guard_let_takes_else_branch_on_known_nil) {
+    // Spec §3.3.7: guard let treats nil and error alike — no usable value means
+    // the else branch. A known-nil init folds the condition to false, and (like a
+    // known-error init) the unreachable success-path binding is SKIPPED:
+    // previously materializing it left an always-else route that lower_to_rir
+    // rejected (PR #162 re-review — known-nil == known-error here).
     const char* src =
         "route GET \"/users\" { guard let maybe = nil else { return 401 } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -10144,14 +10273,15 @@ TEST(frontend, guard_let_does_not_unwrap_nil) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].name.eq(lit("maybe")));
-    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::Unknown));
-    CHECK(hir->routes[0].locals[0].may_nil);
-    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    // Success-path binding skipped (unreachable) — no `maybe` local.
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
              static_cast<u8>(HirExprKind::BoolLit));
-    CHECK(hir->routes[0].guards[0].cond.bool_value);
+    CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
+    // The whole route now lowers end-to-end (previously rejected at lower_to_rir).
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
 }
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
@@ -11519,7 +11649,7 @@ TEST(frontend, analyze_rejects_unknown_upstream) {
 TEST(frontend, match_lowers_to_cmp_eq_chain) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let code = 200 match code { case 200: return forward(api) case _: "
+        "route GET \"/users\" { let code = 200 match code { 200 => return forward(api) _ => "
         "return "
         "404 } }\n";
     auto lexed = lex(lit(src));
@@ -11552,8 +11682,8 @@ TEST(frontend, match_lowers_to_cmp_eq_chain) {
 }
 TEST(frontend, string_match_lowers_to_cmp_eq_chain) {
     const char* src =
-        "route GET \"/users\" { let path = \"/users\" match path { case \"/users\": return 200 "
-        "case _: return 404 } }\n";
+        "route GET \"/users\" { let path = \"/users\" match path { \"/users\" => return 200 "
+        "_ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11573,7 +11703,7 @@ TEST(frontend, string_match_lowers_to_cmp_eq_chain) {
 }
 TEST(frontend, bool_match_true_false_cases_are_exhaustive) {
     const char* src =
-        "route GET \"/users\" { let ok = true match ok { case true: return 200 case false: return "
+        "route GET \"/users\" { let ok = true match ok { true => return 200 false => return "
         "500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11586,8 +11716,8 @@ TEST(frontend, bool_match_true_false_cases_are_exhaustive) {
 }
 TEST(frontend, route_bool_match_guarded_duplicate_case_can_fall_through) {
     const char* src =
-        "route GET \"/users\" { let ok = true match ok { case true if false: return 403 case true: "
-        "return 200 case _: return 500 } }\n";
+        "route GET \"/users\" { let ok = true match ok { true if false => return 403 true => "
+        "return 200 _ => return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11600,7 +11730,7 @@ TEST(frontend, route_bool_match_guarded_duplicate_case_can_fall_through) {
 }
 TEST(frontend, route_match_arm_guard_falls_through_to_default) {
     const char* src =
-        "route GET \"/users\" { let code = 200 match code { case 200 if false: return 500 case _: "
+        "route GET \"/users\" { let code = 200 match code { 200 if false => return 500 _ => "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11621,8 +11751,8 @@ TEST(frontend, route_match_arm_guard_falls_through_to_default) {
 TEST(frontend, route_match_arm_guard_can_use_payload_binding) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(code) if code "
-        "== 200: return 200 case _: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(code) if code "
+        "== 200 => return 200 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11641,8 +11771,8 @@ TEST(frontend, route_match_arm_guard_can_use_payload_binding) {
 TEST(frontend, route_match_guarded_variant_case_falls_through_to_same_case) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(201) match state { case .ok(code) if code "
-        "== 200: return 200 case .ok(code): return 201 case _: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(201) match state { .ok(code) if code "
+        "== 200 => return 200 .ok(code) => return 201 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11663,7 +11793,7 @@ TEST(frontend, route_match_guarded_variant_case_falls_through_to_same_case) {
 TEST(frontend, route_match_arm_guard_after_route_guards_falls_through_to_next_test) {
     const char* src =
         "route GET \"/users\" { guard true else { return 401 } guard true else { return 402 } let "
-        "code = 200 match code { case 200 if false: return 500 case 201: return 201 case _: "
+        "code = 200 match code { 200 if false => return 500 201 => return 201 _ => "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11680,8 +11810,8 @@ TEST(frontend, route_match_arm_guard_after_route_guards_falls_through_to_next_te
 TEST(frontend, analyze_rejects_route_match_arm_optional_error_guard) {
     const char* src =
         "func maybe(ok: bool) -> bool { if ok { true } else { error(.timeout) } }\n"
-        "route GET \"/users\" { let cond = maybe(false) let code = 200 match code { case 200 if "
-        "cond: return 200 case _: return 404 } }\n";
+        "route GET \"/users\" { let cond = maybe(false) let code = 200 match code { 200 if "
+        "cond => return 200 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11692,7 +11822,7 @@ TEST(frontend, analyze_rejects_route_match_arm_optional_error_guard) {
 }
 TEST(frontend, analyze_rejects_route_match_arm_guard_without_wildcard) {
     const char* src =
-        "route GET \"/users\" { let code = 200 match code { case 200 if true: return 200 } }\n";
+        "route GET \"/users\" { let code = 200 match code { 200 if true => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11733,8 +11863,8 @@ TEST(frontend, build_mir_rejects_last_match_arm_guard_fallthrough) {
 TEST(frontend, route_match_arm_direct_nested_match_lowers) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
-        "match path { case \"/users\": return 200 case _: return 404 } case .denied: return 403 } "
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => "
+        "match path { \"/users\" => return 200 _ => return 404 } .denied => return 403 } "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11755,8 +11885,8 @@ TEST(frontend, route_match_arm_direct_nested_match_lowers) {
 TEST(frontend, analyze_rejects_route_match_arm_nested_match_with_let_prefix) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { let path = "
-        "\"/users\" match path { case \"/users\": return 200 case _: return 404 } } case .denied: "
+        "route GET \"/users\" { let auth = Auth.ok match auth { .ok => { let path = "
+        "\"/users\" match path { \"/users\" => return 200 _ => return 404 } } .denied => "
         "return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11769,9 +11899,9 @@ TEST(frontend, analyze_rejects_route_match_arm_nested_match_with_let_prefix) {
 TEST(frontend, route_match_arm_guarded_same_case_can_fall_through_to_nested_match) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok if "
-        "req.method == POST: return 401 case .ok: match path { case \"/users\": return 200 case "
-        "_: return 404 } case .denied: return 403 case _: return 404 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok if "
+        "req.method == POST => return 401 .ok => match path { \"/users\" => return 200 "
+        "_ => return 404 } .denied => return 403 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11791,9 +11921,9 @@ TEST(frontend, route_match_arm_guarded_same_case_can_fall_through_to_nested_matc
 TEST(frontend, analyze_rejects_route_match_arm_nested_match_after_guard_prefix) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: { "
-        "guard true else { return 401 } match path { case \"/users\": return 200 case _: return "
-        "404 } } case .denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => { "
+        "guard true else { return 401 } match path { \"/users\" => return 200 _ => return "
+        "404 } } .denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11805,9 +11935,9 @@ TEST(frontend, analyze_rejects_route_match_arm_nested_match_after_guard_prefix) 
 TEST(frontend, route_match_arm_nested_match_const_selects_inner_case_only) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
-        "match const path { case \"/users\": return 200 case \"/admin\": return forward(missing) } "
-        "case .denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => "
+        "match const path { \"/users\" => return 200 \"/admin\" => return forward(missing) } "
+        ".denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11822,9 +11952,9 @@ TEST(frontend, route_match_arm_nested_match_const_selects_inner_case_only) {
 TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_variant_case) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
-        "match path { case \"/users\": return 200 case _: return 404 } case .ok: return 201 case "
-        ".denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => "
+        "match path { \"/users\" => return 200 _ => return 404 } .ok => return 201 "
+        ".denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11837,8 +11967,8 @@ TEST(frontend, analyze_rejects_route_nested_match_foreign_outer_variant_case) {
     const char* src =
         "variant Auth { ok, denied }\n"
         "variant Other { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case "
-        "Other.ok: match path { case \"/users\": return 200 case _: return 404 } case .denied: "
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { "
+        "Other.ok => match path { \"/users\" => return 200 _ => return 404 } .denied => "
         "return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11851,8 +11981,8 @@ TEST(frontend, analyze_rejects_route_nested_match_foreign_outer_variant_case) {
 TEST(frontend, route_match_arm_block_prefix_without_nested_match_inserts_local_once) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { let path = "
-        "\"/users\" if path == \"/users\" { return 200 } else { return 404 } } case .denied: "
+        "route GET \"/users\" { let auth = Auth.ok match auth { .ok => { let path = "
+        "\"/users\" if path == \"/users\" { return 200 } else { return 404 } } .denied => "
         "return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11866,8 +11996,8 @@ TEST(frontend, route_match_arm_block_prefix_without_nested_match_inserts_local_o
 TEST(frontend, route_match_arm_nested_bool_match_is_exhaustive) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let allowed = true match auth { case .ok: match "
-        "allowed { case true: return 200 case false: return 404 } case .denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let allowed = true match auth { .ok => match "
+        "allowed { true => return 200 false => return 404 } .denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11881,9 +12011,9 @@ TEST(frontend, route_match_arm_nested_bool_match_is_exhaustive) {
 TEST(frontend, analyze_rejects_route_nested_match_duplicate_bool_case) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let allowed = true match auth { case .ok: match "
-        "allowed { case true: return 200 case true: return 201 case false: return 404 } case "
-        ".denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let allowed = true match auth { .ok => match "
+        "allowed { true => return 200 true => return 201 false => return 404 } "
+        ".denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11896,8 +12026,8 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_bool_case) {
 TEST(frontend, analyze_rejects_route_nested_match_duplicate_int_case) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let code = 1 match auth { case .ok: match "
-        "code { case 1: return 200 case 1: return 201 case _: return 404 } case .denied: return "
+        "route GET \"/users\" { let auth = Auth.ok let code = 1 match auth { .ok => match "
+        "code { 1 => return 200 1 => return 201 _ => return 404 } .denied => return "
         "403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11911,9 +12041,9 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_int_case) {
 TEST(frontend, analyze_rejects_route_nested_match_duplicate_string_case) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
-        "match path { case \"/users\": return 200 case \"/users\": return 201 case _: return "
-        "404 } case .denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => "
+        "match path { \"/users\" => return 200 \"/users\" => return 201 _ => return "
+        "404 } .denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11925,9 +12055,9 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_string_case) {
 
 TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_bool_case) {
     const char* src =
-        "route GET \"/users\" { let ok = true let allowed = true match ok { case true: match "
-        "allowed { case true: return 200 case false: return 404 } case true: return 201 case "
-        "false: return 403 } }\n";
+        "route GET \"/users\" { let ok = true let allowed = true match ok { true => match "
+        "allowed { true => return 200 false => return 404 } true => return 201 "
+        "false => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -11939,8 +12069,8 @@ TEST(frontend, analyze_rejects_route_nested_match_duplicate_outer_bool_case) {
 TEST(frontend, analyze_rejects_route_nested_match_inner_arm_guard) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { case .ok: "
-        "match path { case \"/users\" if true: return 200 case _: return 404 } case .denied: "
+        "route GET \"/users\" { let auth = Auth.ok let path = \"/users\" match auth { .ok => "
+        "match path { \"/users\" if true => return 200 _ => return 404 } .denied => "
         "return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11954,8 +12084,8 @@ TEST(frontend, analyze_rejects_route_nested_match_inner_payload_binding) {
     const char* src =
         "variant Auth { ok, denied }\n"
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let auth = Auth.ok let result = Result.ok(200) match auth { case "
-        ".ok: match result { case .ok(code): return 200 case _: return 404 } case .denied: return "
+        "route GET \"/users\" { let auth = Auth.ok let result = Result.ok(200) match auth { "
+        ".ok => match result { .ok(code) => return 200 _ => return 404 } .denied => return "
         "403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11970,8 +12100,8 @@ TEST(frontend, analyze_rejects_route_nested_match_foreign_inner_variant_case) {
         "variant Auth { ok, denied }\n"
         "variant Result { ok, err }\n"
         "variant Other { ok, err }\n"
-        "route GET \"/users\" { let auth = Auth.ok let result = Result.ok match auth { case .ok: "
-        "match result { case Other.ok: return 200 case _: return 404 } case .denied: return 403 } "
+        "route GET \"/users\" { let auth = Auth.ok let result = Result.ok match auth { .ok => "
+        "match result { Other.ok => return 200 _ => return 404 } .denied => return 403 } "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11985,8 +12115,8 @@ TEST(frontend, analyze_rejects_route_nested_match_optional_error_subject) {
     const char* src =
         "variant Auth { ok, denied }\n"
         "func maybe_path(ok: bool) -> str { if ok { \"/users\" } else { error(.timeout) } }\n"
-        "route GET \"/users\" { let auth = Auth.ok let path = maybe_path(false) match auth { case "
-        ".ok: match path { case \"/users\": return 200 case _: return 404 } case .denied: return "
+        "route GET \"/users\" { let auth = Auth.ok let path = maybe_path(false) match auth { "
+        ".ok => match path { \"/users\" => return 200 _ => return 404 } .denied => return "
         "403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -11999,8 +12129,8 @@ TEST(frontend, analyze_rejects_route_nested_match_optional_error_subject) {
 TEST(frontend, analyze_rejects_route_nested_match_after_guard_prefix) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: { guard true else { "
-        "return 401 } match true { case true: return 200 case false: return 404 } } case .denied: "
+        "route GET \"/users\" { let auth = Auth.ok match auth { .ok => { guard true else { "
+        "return 401 } match true { true => return 200 false => return 404 } } .denied => "
         "return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -12013,8 +12143,8 @@ TEST(frontend, analyze_rejects_route_nested_match_after_guard_prefix) {
 TEST(frontend, analyze_rejects_guarded_outer_arm_with_nested_match) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok if true: match true { "
-        "case true: return 200 case false: return 404 } case .denied: return 403 } }\n";
+        "route GET \"/users\" { let auth = Auth.ok match auth { .ok if true => match true { "
+        "true => return 200 false => return 404 } .denied => return 403 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12026,8 +12156,8 @@ TEST(frontend, analyze_rejects_guarded_outer_arm_with_nested_match) {
 TEST(frontend, analyze_rejects_wildcard_outer_arm_with_nested_match) {
     const char* src =
         "variant Auth { ok, denied }\n"
-        "route GET \"/users\" { let auth = Auth.ok match auth { case .ok: return 200 case _: "
-        "match true { case true: return 201 case false: return 404 } } }\n";
+        "route GET \"/users\" { let auth = Auth.ok match auth { .ok => return 200 _ => "
+        "match true { true => return 201 false => return 404 } } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12039,8 +12169,9 @@ TEST(frontend, analyze_rejects_wildcard_outer_arm_with_nested_match) {
 TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) let code = 200 guard code else { return 401 "
-        "} match code { case 200: return forward(api) case _: return 404 } }\n";
+        "route GET \"/users\" { let failed = error(7) let code = 200 guard let code else { return "
+        "401 "
+        "} match code { 200 => return forward(api) _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12064,8 +12195,9 @@ TEST(frontend, guard_then_match_lowers_to_guard_and_match_blocks) {
 }
 TEST(frontend, multiple_top_level_guards_are_allowed) {
     const char* src =
-        "route GET \"/users\" { let ok = 200 guard ok else { return 401 } let failed = error(7) "
-        "guard failed else { return 402 } return 200 }\n";
+        "route GET \"/users\" { let ok = 200 guard let ok else { return 401 } let failed = "
+        "error(7) "
+        "guard let failed else { return 402 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12084,8 +12216,8 @@ TEST(frontend, multiple_top_level_guards_are_allowed) {
 }
 TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-        ".timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+        ".timeout => return 503 _ => return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12109,8 +12241,8 @@ TEST(frontend, guard_match_lowers_to_fail_side_match_arms) {
 
 TEST(frontend, lower_to_rir_supports_guard_match_known_error_fail_side) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-        ".timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+        ".timeout => return 503 _ => return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12127,8 +12259,8 @@ TEST(frontend, lower_to_rir_supports_guard_match_known_error_fail_side) {
 
 TEST(frontend, parse_rejects_guard_match_arm_guard) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-        ".timeout if true: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+        ".timeout if true => return 503 _ => return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12138,8 +12270,8 @@ TEST(frontend, parse_rejects_guard_match_arm_guard) {
 }
 TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-        ".timeout: return 503 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+        ".timeout => return 503 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12150,8 +12282,8 @@ TEST(frontend, analyze_rejects_guard_match_without_wildcard) {
 }
 TEST(frontend, analyze_rejects_guard_match_wildcard_before_last) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case _: "
-        "return 500 case .timeout: return 503 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { _ => "
+        "return 500 .timeout => return 503 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12162,8 +12294,8 @@ TEST(frontend, analyze_rejects_guard_match_wildcard_before_last) {
 }
 TEST(frontend, analyze_rejects_guard_match_duplicate_case) {
     const char* src =
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-        ".timeout: return 503 case .timeout: return 504 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+        ".timeout => return 503 .timeout => return 504 _ => return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12175,8 +12307,8 @@ TEST(frontend, analyze_rejects_guard_match_duplicate_case) {
 TEST(frontend, analyze_rejects_guard_match_pattern_type_mismatch) {
     const char* src =
         "variant AuthError { timeout, forbidden }\n"
-        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { case "
-        "AuthError.timeout: return 503 case _: return 500 } return 200 }\n";
+        "route GET \"/users\" { let failed = error(.timeout) guard match failed else { "
+        "AuthError.timeout => return 503 _ => return 500 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12188,9 +12320,9 @@ TEST(frontend, analyze_rejects_guard_match_pattern_type_mismatch) {
 TEST(frontend, analyze_rejects_match_arm_block_guard_match_on_non_error_value) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/users\" { let state = Result.ok(200) match state { case .ok(x): { guard "
-        "match x else { case .timeout: return 401 case _: return 402 } if x == 200 { return 200 } "
-        "else { return 500 } } case .err: return 404 } }\n";
+        "route GET \"/users\" { let state = Result.ok(200) match state { .ok(x) => { guard "
+        "match x else { .timeout => return 401 _ => return 402 } if x == 200 { return 200 } "
+        "else { return 500 } } .err => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12202,8 +12334,8 @@ TEST(frontend, analyze_rejects_match_arm_block_guard_match_on_non_error_value) {
 
 TEST(frontend, analyze_rejects_route_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/users\" { let code = 200 guard match code else { case true: return 401 "
-        "case _: return 402 } return 200 }\n";
+        "route GET \"/users\" { let code = 200 guard match code else { true => return 401 "
+        "_ => return 402 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12251,8 +12383,7 @@ TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
 }
 
 TEST(frontend, analyze_rejects_match_without_wildcard) {
-    const char* src =
-        "route GET \"/users\" { let code = 200 match code { case 200: return 200 } }\n";
+    const char* src = "route GET \"/users\" { let code = 200 match code { 200 => return 200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -12264,7 +12395,8 @@ TEST(frontend, analyze_rejects_match_without_wildcard) {
 TEST(frontend, guard_lowers_from_error_alias) {
     const char* src =
         "upstream api\n"
-        "route GET \"/users\" { let failed = error(7) let alias = failed guard alias else { return "
+        "route GET \"/users\" { let failed = error(7) let alias = failed guard let alias else { "
+        "return "
         "401 } return forward(api) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -12280,7 +12412,7 @@ TEST(frontend, guard_lowers_from_error_alias) {
 }
 TEST(frontend, analyze_rejects_match_wildcard_before_last) {
     const char* src =
-        "route GET \"/users\" { let code = 200 match code { case _: return 404 case 200: return "
+        "route GET \"/users\" { let code = 200 match code { _ => return 404 200 => return "
         "200 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -12292,7 +12424,7 @@ TEST(frontend, analyze_rejects_match_wildcard_before_last) {
 }
 TEST(frontend, analyze_rejects_match_pattern_type_mismatch) {
     const char* src =
-        "route GET \"/users\" { let ok = true match ok { case 200: return 200 case _: return 404 } "
+        "route GET \"/users\" { let ok = true match ok { 200 => return 200 _ => return 404 } "
         "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -12327,7 +12459,9 @@ TEST(frontend, analyze_allows_any_with_fallible_fallback) {
     CHECK(hir->routes[0].locals[0].init.may_error);
     CHECK_FALSE(hir->routes[0].locals[0].init.may_nil);
 }
-TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
+TEST(frontend, guard_let_on_known_error_folds_to_else_branch) {
+    // Spec §3.3.7: nil and error alike are "no usable value" — a known-error
+    // init folds the condition to false (always else) and skips the binding.
     const char* src =
         "route GET \"/users\" { guard let code = error(7) else { return 401 } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -12335,10 +12469,14 @@ TEST(frontend, analyze_rejects_guard_let_binding_error_value) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::BoolLit));
+    CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
+    CHECK_EQ(hir->routes[0].locals.len, 0u);  // binding skipped
 }
-TEST(frontend, analyze_rejects_guard_let_binding_error_alias) {
+TEST(frontend, guard_let_on_known_error_alias_folds_to_else_branch) {
     const char* src =
         "route GET \"/users\" { let failed = error(7) let alias = failed guard let code = alias "
         "else { return 401 } return 200 }\n";
@@ -12347,8 +12485,9 @@ TEST(frontend, analyze_rejects_guard_let_binding_error_alias) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
 }
 TEST(frontend, build_mir_preserves_runtime_or_value) {
     auto* hir = new HirModule{};
@@ -13290,8 +13429,8 @@ func unwrap<T>(x: Holder<T>) -> Result<T> => x.state
 route GET "/users" {
     let state = unwrap(Holder(state: Result.ok(200)))
     match state {
-    case .ok(v): return 200
-    case .err: return 500
+    .ok(v) => return 200
+    .err => return 500
     }
 }
 )rut";
@@ -13398,8 +13537,8 @@ protocol Iterable {
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 struct Box<T> { value: T }
 Box<T> impl Iterable {
@@ -13706,8 +13845,8 @@ TEST(frontend, type_match_alias_selects_protocol_arm_for_function_param) {
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 func accept(x: Storage<i32>) -> i32 {
     200
@@ -13737,8 +13876,8 @@ TEST(frontend, type_match_alias_uses_wildcard_when_protocol_arm_does_not_match) 
 struct Inline<T> { value: i32 }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Error => Inline<T>
-    case _ => Ref<T>
+    T: Error => Inline<T>
+    _ => Ref<T>
 }
 func accept(x: Storage<i32>) -> i32 {
     200
@@ -13767,8 +13906,8 @@ TEST(frontend, type_match_alias_selects_protocol_arm_for_constrained_generic_par
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 func accept<T: Eq>(x: Storage<T>) -> i32 {
     200
@@ -13798,8 +13937,8 @@ TEST(frontend, type_match_alias_selects_protocol_arm_for_where_constrained_gener
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 func accept<T>(x: Storage<T>) -> i32 where Eq(T) {
     200
@@ -13829,8 +13968,8 @@ TEST(frontend, type_match_alias_uses_wildcard_for_unconstrained_generic_param) {
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 func accept<T>(x: Storage<T>) -> i32 {
     200
@@ -13861,8 +14000,8 @@ protocol Hashable {}
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Hashable => Inline<T>
-    case _ => Ref<T>
+    T: Hashable => Inline<T>
+    _ => Ref<T>
 }
 func accept<T: Hashable>(x: Storage<T>) -> i32 {
     200
@@ -13892,8 +14031,8 @@ TEST(frontend, type_match_alias_expands_in_struct_field_type) {
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 struct Holder {
     value: Storage<i32>
@@ -13931,8 +14070,8 @@ TEST(frontend, type_match_alias_expands_in_variant_payload_type) {
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 variant Event {
     some(Storage<i32>)
@@ -13971,8 +14110,8 @@ TEST(frontend, type_match_alias_type_equality_uses_struct_generic_param_in_field
 struct Same<T> { value: T }
 struct Diff<T, U> { value: i32 }
 type Choice<T, U> match {
-    case T == U => Same<T>
-    case _ => Diff<T, U>
+    T == U => Same<T>
+    _ => Diff<T, U>
 }
 struct Holder<T> {
     value: Choice<T, T>
@@ -14011,8 +14150,8 @@ TEST(frontend, type_match_alias_selects_type_equality_arm) {
 struct Same<T> { value: T }
 struct Diff<T, U> { value: i32 }
 type Choice<T, U> match {
-    case T == U => Same<T>
-    case _ => Diff<T, U>
+    T == U => Same<T>
+    _ => Diff<T, U>
 }
 func accept(x: Choice<i32, i32>) -> i32 {
     200
@@ -14042,8 +14181,8 @@ TEST(frontend, type_match_alias_uses_wildcard_when_type_equality_does_not_match)
 struct Same<T> { value: T }
 struct Diff<T, U> { value: i32 }
 type Choice<T, U> match {
-    case T == U => Same<T>
-    case _ => Diff<T, U>
+    T == U => Same<T>
+    _ => Diff<T, U>
 }
 func accept(x: Choice<i32, str>) -> i32 {
     200
@@ -14074,8 +14213,8 @@ TEST(frontend, type_match_alias_selects_type_equality_arm_for_same_generic_param
 struct Same<T> { value: T }
 struct Diff<T, U> { value: i32 }
 type Choice<T, U> match {
-    case T == U => Same<T>
-    case _ => Diff<T, U>
+    T == U => Same<T>
+    _ => Diff<T, U>
 }
 func accept<T>(x: Choice<T, T>) -> i32 {
     200
@@ -14105,8 +14244,8 @@ TEST(frontend, type_match_alias_uses_wildcard_when_generic_params_differ) {
 struct Same<T> { value: T }
 struct Diff<T, U> { value: i32 }
 type Choice<T, U> match {
-    case T == U => Same<T>
-    case _ => Diff<T, U>
+    T == U => Same<T>
+    _ => Diff<T, U>
 }
 func accept<T, U>(x: Choice<T, U>) -> i32 {
     200
@@ -14145,8 +14284,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 route GET "/users" {
     let y: Select<Box<i32>, i32> = Hit(value: 201)
@@ -14186,8 +14325,8 @@ Box impl Second {
 struct Hit { value: i32 }
 struct Miss { value: i32 }
 type Select<C> match {
-    case C.Item == i32 => Hit
-    case _ => Miss
+    C.Item == i32 => Hit
+    _ => Miss
 }
 func accept(x: Select<Box>) -> i32 {
     200
@@ -14216,8 +14355,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func accept<T>(x: Select<Box<T>, T>) -> i32 {
     200
@@ -14255,8 +14394,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func accept(x: Select<Box<i32>, (i32, i32)>) -> i32 {
     200
@@ -14295,8 +14434,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func accept<T, U>(x: Select<Box<T>, U>) -> i32 {
     200
@@ -14334,8 +14473,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func accept(x: Select<Box<i32>, i32>) -> i32 {
     200
@@ -14372,8 +14511,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func make() -> Select<Box<i32>, i32> {
     Hit(value: 201)
@@ -14415,8 +14554,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 route GET "/users" {
     let y: Select<Box<i32>, str> = Miss<Box<i32>, str>(value: 201)
@@ -14451,8 +14590,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func accept(x: Select<Box<i32>, str>) -> i32 {
     200
@@ -14490,8 +14629,8 @@ Box<T> impl Iterable {
 struct Hit<U> { value: U }
 struct Miss<C, U> { value: i32 }
 type Select<C, U> match {
-    case C.Elem == U => Hit<U>
-    case _ => Miss<C, U>
+    C.Elem == U => Hit<U>
+    _ => Miss<C, U>
 }
 func make() -> Select<Box<i32>, str> {
     Miss<Box<i32>, str>(value: 201)
@@ -14626,8 +14765,8 @@ TEST(frontend, type_match_alias_expands_in_protocol_method_requirement_signature
 struct Inline<T> { value: T }
 struct Ref<T> { value: i32 }
 type Storage<T> match {
-    case T: Eq => Inline<T>
-    case _ => Ref<T>
+    T: Eq => Inline<T>
+    _ => Ref<T>
 }
 protocol Boxed {
     func wrap(x: Storage<i32>) -> Storage<i32>
@@ -14764,7 +14903,7 @@ protocol Hashable {
 variant Wrap<T> { some(T) }
 func unwrap<T: Hashable>(state: Wrap<T>) -> T {
     match state {
-    case .some(v) => v
+    .some(v) => v
     }
 }
 route GET "/users" { return 200 }
@@ -16073,7 +16212,7 @@ TEST(frontend, source_custom_protocol_default_method_supports_guard_prefix) {
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
         let y = maybefail(ok)
-        guard y else { 401 }
+        guard let y else { 401 }
         200
     }
 }
@@ -16096,7 +16235,7 @@ TEST(frontend, source_custom_protocol_default_method_supports_guard_match_prefix
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
         let y = maybefail(ok)
-        guard match y else { case .timeout => 401 case _ => 500 }
+        guard match y else { .timeout => 401 _ => 500 }
         200
     }
 }
@@ -16119,7 +16258,7 @@ TEST(frontend, analyze_rejects_protocol_default_method_guard_match_without_wildc
 protocol MaybeCode {
     func code(ok: bool) -> i32 {
         let y = maybefail(ok)
-        guard match y else { case .timeout => 401 }
+        guard match y else { .timeout => 401 }
         200
     }
 }
@@ -16143,7 +16282,7 @@ TEST(frontend, analyze_rejects_protocol_default_method_guard_match_on_non_error_
 protocol MaybeCode {
     func code() -> i32 {
         let y = 200
-        guard match y else { case _ => 401 }
+        guard match y else { _ => 401 }
         200
     }
 }
@@ -18732,8 +18871,8 @@ variant AuthState { ok, err }
 func success() -> AuthState => AuthState.ok
 route GET "/users" {
     match success() {
-    case .ok: return 200
-    case _: return 500
+    .ok => return 200
+    _ => return 500
     }
 }
 )";
@@ -18763,8 +18902,8 @@ variant AuthState { ok, err }
 func success() => AuthState.ok
 route GET "/users" {
     match success() {
-    case .ok: return 200
-    case _: return 500
+    .ok => return 200
+    _ => return 500
     }
 }
 )";
@@ -19090,7 +19229,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard y else { 401 }
+    guard let y else { 401 }
     200
 }
 route GET "/users" {
@@ -19141,7 +19280,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard match y else { case .timeout => 401 case _ => 500 }
+    guard match y else { .timeout => 401 _ => 500 }
     200
 }
 route GET "/users" {
@@ -19167,7 +19306,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard match y else { case .timeout if true => 401 case _ => 500 }
+    guard match y else { .timeout if true => 401 _ => 500 }
     200
 }
 route GET "/users" { return 200 }
@@ -19186,7 +19325,7 @@ func maybefail(ok: bool) -> i32 {
 }
 func wrap(ok: bool) -> i32 {
     let y = maybefail(ok)
-    guard match y else { case .timeout => 401 }
+    guard match y else { .timeout => 401 }
     200
 }
 route GET "/users" { return 200 }
@@ -19201,7 +19340,7 @@ route GET "/users" { return 200 }
 TEST(frontend, analyze_rejects_function_block_guard_match_on_non_error_value) {
     const auto src = R"(
 func wrap(x: i32) -> i32 {
-    guard match x else { case .timeout => 401 case _ => 500 }
+    guard match x else { .timeout => 401 _ => 500 }
     200
 }
 route GET "/users" { return 200 }
@@ -19388,8 +19527,8 @@ variant Result { ok, err }
 func pick(x: Result) -> i32 {
     let y = x
     match y {
-        case .ok => 200
-        case .err => 500
+        .ok => 200
+        .err => 500
     }
 }
 route GET "/users" {
@@ -19415,8 +19554,8 @@ TEST(frontend, source_function_match_arm_block_with_let_inlines) {
 variant Result { ok, err }
 func pick(x: Result) -> i32 {
     match x {
-        case .ok => { let y = 200 y }
-        case .err => { let z = 500 z }
+        .ok => { let y = 200 y }
+        .err => { let z = 500 z }
     }
 }
 route GET "/users" {
@@ -19439,8 +19578,8 @@ TEST(frontend, source_function_match_arm_guard_inlines) {
     const auto src = R"(
 func pick(x: i32) -> i32 {
     match x {
-        case 200 if false => 201
-        case _ => 404
+        200 if false => 201
+        _ => 404
     }
 }
 route GET "/users" {
@@ -19471,8 +19610,8 @@ TEST(frontend, source_function_match_arm_guard_can_use_payload_binding) {
 variant Result { ok(i32), err }
 func pick(result: Result) -> i32 {
     match result {
-        case .ok(code) if code == 200 => code
-        case _ => 404
+        .ok(code) if code == 200 => code
+        _ => 404
     }
 }
 route GET "/users" {
@@ -19503,9 +19642,9 @@ TEST(frontend, source_function_guarded_variant_case_falls_through_to_same_case) 
 variant Result { ok(i32), err }
 func pick(result: Result) -> i32 {
     match result {
-        case .ok(code) if code == 200 => 200
-        case .ok(code) => code
-        case _ => 404
+        .ok(code) if code == 200 => 200
+        .ok(code) => code
+        _ => 404
     }
 }
 route GET "/users" {
@@ -19526,8 +19665,8 @@ TEST(frontend, source_function_bool_match_true_false_cases_are_exhaustive) {
     const auto src = R"(
 func pick(ok: bool) -> i32 {
     match ok {
-        case true => 200
-        case false => 500
+        true => 200
+        false => 500
     }
 }
 route GET "/users" {
@@ -19546,9 +19685,9 @@ TEST(frontend, analyze_rejects_source_function_duplicate_bool_match_case) {
     const auto src = R"(
 func pick(ok: bool) -> i32 {
     match ok {
-        case true => 200
-        case true => 201
-        case false => 500
+        true => 200
+        true => 201
+        false => 500
     }
 }
 route GET "/users" { let code = pick(true) return 200 }
@@ -19565,9 +19704,9 @@ TEST(frontend, source_function_bool_match_guarded_duplicate_case_can_fall_throug
     const auto src = R"(
 func pick(ok: bool) -> i32 {
     match ok {
-        case true if false => 201
-        case true => 200
-        case _ => 500
+        true if false => 201
+        true => 200
+        _ => 500
     }
 }
 route GET "/users" { let code = pick(true) return 200 }
@@ -19583,7 +19722,7 @@ TEST(frontend, analyze_rejects_source_function_match_arm_guard_without_wildcard)
     const auto src = R"(
 func pick(x: i32) -> i32 {
     match x {
-        case 200 if true => 200
+        200 if true => 200
     }
 }
 route GET "/users" { let code = pick(200) return 200 }
@@ -19604,8 +19743,8 @@ func maybe(ok: bool) -> bool {
 func pick(x: i32) -> i32 {
     let cond = maybe(false)
     match x {
-        case 200 if cond => 200
-        case _ => 404
+        200 if cond => 200
+        _ => 404
     }
 }
 route GET "/users" {
@@ -19625,8 +19764,8 @@ TEST(frontend, source_function_string_match_inlines) {
     const auto src = R"(
 func pick(path: str) -> i32 {
     match path {
-        case "/users" => 200
-        case _ => 404
+        "/users" => 200
+        _ => 404
     }
 }
 route GET "/users" {
@@ -19648,8 +19787,8 @@ TEST(frontend, source_function_infers_optional_return_from_match_without_annotat
 variant Result { ok, err }
 func pick(x: Result) {
     match x {
-        case .ok => 200
-        case .err => nil
+        .ok => 200
+        .err => nil
     }
 }
 route GET "/users" {
@@ -19673,8 +19812,8 @@ TEST(frontend, source_function_infers_error_return_from_match_without_annotation
 variant Result { ok, err }
 func pick(x: Result) {
     match x {
-        case .ok => 200
-        case .err => error(.timeout)
+        .ok => 200
+        .err => error(.timeout)
     }
 }
 route GET "/users" {
@@ -19698,8 +19837,8 @@ TEST(frontend, source_function_allows_pure_error_match_with_explicit_return_type
 variant Result { ok, err }
 func pick(x: Result) -> i32 {
     match x {
-        case .ok => error(.timeout)
-        case .err => error(.timeout)
+        .ok => error(.timeout)
+        .err => error(.timeout)
     }
 }
 route GET "/users" {
@@ -21384,7 +21523,7 @@ TEST(frontend, analyze_guard_fail_body_local_scoped_to_fail_body) {
 
 TEST(frontend, mir_for_loop_wildcard_only_match_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case _: { guard false else { "
+        "route GET \"/x\" { for item in [1] { match item { _ => { guard false else { "
         "return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21407,7 +21546,7 @@ TEST(frontend, mir_for_loop_wildcard_only_match_enters_prelude_guard) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_wildcard_only_match_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case _: { guard false else { return 400 "
+        "route GET \"/x\" { for item in [1] { match item { _ => { guard false else { return 400 "
         "} "
         "return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
@@ -21431,7 +21570,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_wildcard_only_match_enters_prelude_gua
 
 TEST(frontend, mir_unrolls_for_loop_wildcard_only_match_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case _: { guard false else { "
+        "route GET \"/x\" { for item in [1] { match item { _ => { guard false else { "
         "return 400 } "
         "return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
@@ -21455,7 +21594,7 @@ TEST(frontend, mir_unrolls_for_loop_wildcard_only_match_enters_prelude_guard) {
 
 TEST(frontend, mir_for_loop_wildcard_fallthrough_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [2] { match item { case 1: return 201 case _: { "
+        "route GET \"/x\" { for item in [2] { match item { 1 => return 201 _ => { "
         "guard false else { return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21478,7 +21617,7 @@ TEST(frontend, mir_for_loop_wildcard_fallthrough_enters_prelude_guard) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_wildcard_fallthrough_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [2] { match item { case 1: return 201 case _: { "
+        "route GET \"/x\" { for item in [2] { match item { 1 => return 201 _ => { "
         "guard false else { return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21501,7 +21640,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_wildcard_fallthrough_enters_prelude_gu
 
 TEST(frontend, mir_unrolls_for_loop_wildcard_fallthrough_enters_prelude_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [2] { match item { case 1: return 201 case _: { "
+        "route GET \"/x\" { for item in [2] { match item { 1 => return 201 _ => { "
         "guard false else { return 400 } return 200 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -21576,7 +21715,7 @@ TEST(frontend, analyze_for_body_if_rejects_fallible_bool) {
 TEST(frontend, analyze_for_loop_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
-        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+        "_ => if ok { return 200 } else { return 400 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21591,7 +21730,7 @@ TEST(frontend, analyze_for_loop_match_arm_if_rejects_fallible_bool) {
 TEST(frontend, analyze_plain_for_loop_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
-        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+        "_ => if ok { return 200 } else { return 400 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21603,7 +21742,7 @@ TEST(frontend, analyze_plain_for_loop_match_arm_if_rejects_fallible_bool) {
 TEST(frontend, analyze_plain_for_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
-        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+        "_ => if ok { return 200 } else { return 400 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21615,7 +21754,7 @@ TEST(frontend, analyze_plain_for_match_arm_if_rejects_fallible_bool) {
 TEST(frontend, analyze_for_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { let ok: bool = error(.timeout) for item in [1] { match item { "
-        "case _: if ok { return 200 } else { return 400 } } } return 204 }\n";
+        "_ => if ok { return 200 } else { return 400 } } } return 204 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21627,9 +21766,9 @@ TEST(frontend, analyze_for_match_arm_if_rejects_fallible_bool) {
 TEST(frontend, analyze_for_loop_nested_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
-        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "1 => match item { 1 => if ok { return 200 } else { return 400 } _ => return 404 "
         "} "
-        "case _: return 204 } } return 500 }\n";
+        "_ => return 204 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21641,9 +21780,9 @@ TEST(frontend, analyze_for_loop_nested_match_arm_if_rejects_fallible_bool) {
 TEST(frontend, analyze_plain_for_loop_nested_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
-        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "1 => match item { 1 => if ok { return 200 } else { return 400 } _ => return 404 "
         "} "
-        "case _: return 204 } } return 500 }\n";
+        "_ => return 204 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21655,9 +21794,9 @@ TEST(frontend, analyze_plain_for_loop_nested_match_arm_if_rejects_fallible_bool)
 TEST(frontend, analyze_plain_for_nested_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
-        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "1 => match item { 1 => if ok { return 200 } else { return 400 } _ => return 404 "
         "} "
-        "case _: return 204 } } return 500 }\n";
+        "_ => return 204 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -21669,9 +21808,9 @@ TEST(frontend, analyze_plain_for_nested_match_arm_if_rejects_fallible_bool) {
 TEST(frontend, analyze_for_nested_match_arm_if_rejects_fallible_bool) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let ok: bool = error(.timeout) match item { "
-        "case 1: match item { case 1: if ok { return 200 } else { return 400 } case _: return 404 "
+        "1 => match item { 1 => if ok { return 200 } else { return 400 } _ => return 404 "
         "} "
-        "case _: return 204 } } return 500 }\n";
+        "_ => return 204 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22056,7 +22195,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_into_route_if_control) {
 TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_control) {
     const char* src =
         "route GET \"/x\" { let path = \"/x\" for item in [1, 2] { guard item > 0 else "
-        "{ return 400 } } match path { case \"/x\": return 200 case _: return 404 } }\n";
+        "{ return 400 } } match path { \"/x\" => return 200 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22180,7 +22319,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_substitutes_element_in_cond) {
 TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
     // A body terminator exits the route during the first iteration, so later
     // iterations are unreachable under normal loop semantics.
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22196,7 +22335,7 @@ TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
 }
 
 TEST(frontend, mir_unrolls_plain_for_loop_with_body_terminator) {
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22535,8 +22674,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_over_struct_array_field_access) {
 TEST(frontend, mir_unrolls_for_loop_over_variant_array_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { for state in [Result.ok(1)] { match state { case .ok(code): "
-        "return 201 case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for state in [Result.ok(1)] { match state { .ok(code) => "
+        "return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22566,8 +22705,8 @@ TEST(frontend, mir_unrolls_for_loop_over_variant_array_match) {
 TEST(frontend, mir_unrolls_plain_for_loop_over_variant_array_match) {
     const char* src =
         "variant Result { ok(i32), err }\n"
-        "route GET \"/x\" { for state in [Result.ok(1)] { match state { case .ok(code): "
-        "return 201 case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for state in [Result.ok(1)] { match state { .ok(code) => "
+        "return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -23118,7 +23257,7 @@ TEST(frontend, mir_unrolls_for_loop_into_route_if_control) {
 TEST(frontend, mir_unrolls_for_loop_into_route_match_control) {
     const char* src =
         "route GET \"/x\" { let path = \"/x\" for item in [1, 2] { guard item > 0 else "
-        "{ return 400 } } match path { case \"/x\": return 200 case _: return 404 } }\n";
+        "{ return 400 } } match path { \"/x\" => return 200 _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -23148,7 +23287,7 @@ TEST(frontend, mir_unrolls_for_loop_into_route_match_control) {
 TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_guard) {
     const char* src =
         "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
-        "item > 0 else { return 400 } } match path { case \"/x\" if allow: return 200 case _: "
+        "item > 0 else { return 400 } } match path { \"/x\" if allow => return 200 _ => "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23170,7 +23309,7 @@ TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_guard) {
 TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_arm_guard) {
     const char* src =
         "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
-        "item > 0 else { return 400 } } match path { case \"/x\" if allow: return 200 case _: "
+        "item > 0 else { return 400 } } match path { \"/x\" if allow => return 200 _ => "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -23192,8 +23331,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_arm_guard) {
 TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_if_body) {
     const char* src =
         "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
-        "item > 0 else { return 400 } } match path { case \"/x\": if allow { return 200 } else { "
-        "return 201 } case _: return 404 } }\n";
+        "item > 0 else { return 400 } } match path { \"/x\" => if allow { return 200 } else { "
+        "return 201 } _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -23215,8 +23354,8 @@ TEST(frontend, mir_unrolls_for_loop_into_route_match_arm_if_body) {
 TEST(frontend, mir_unrolls_plain_for_loop_into_route_match_arm_if_body) {
     const char* src =
         "route GET \"/x\" { let path = \"/x\" let allow = true for item in [1, 2] { guard "
-        "item > 0 else { return 400 } } match path { case \"/x\": if allow { return 200 } else { "
-        "return 201 } case _: return 404 } }\n";
+        "item > 0 else { return 400 } } match path { \"/x\" => if allow { return 200 } else { "
+        "return 201 } _ => return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -23686,7 +23825,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_if_with_body_local_cond) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_with_body_local_subject) {
     const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { 1 => return 201 _ => "
         "return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
@@ -23962,8 +24101,8 @@ TEST(frontend, analyze_for_rejects_statement_after_body_if) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_with_body_local_subject) {
     const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: return 201 "
-        "case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { 1 => return 201 "
+        "_ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -23999,7 +24138,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_with_body_local_subject) {
 
 TEST(frontend, analyze_for_loop_rejects_statement_after_body_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => return 201 _ => "
         "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24011,7 +24150,7 @@ TEST(frontend, analyze_for_loop_rejects_statement_after_body_match) {
 
 TEST(frontend, analyze_plain_for_loop_rejects_statement_after_body_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => return 201 _ => "
         "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24023,7 +24162,7 @@ TEST(frontend, analyze_plain_for_loop_rejects_statement_after_body_match) {
 
 TEST(frontend, analyze_for_rejects_statement_after_body_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => return 201 _ => "
         "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24035,7 +24174,7 @@ TEST(frontend, analyze_for_rejects_statement_after_body_match) {
 
 TEST(frontend, analyze_plain_for_rejects_statement_after_body_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => return 201 _ => "
         "return 402 } guard item > 0 else { return 400 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24290,8 +24429,8 @@ TEST(frontend, mir_plain_for_preserves_nested_for_before_later_parent_guard) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: if n > 0 "
-        "{ return 201 } else { return 202 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { 1 => if n > 0 "
+        "{ return 201 } else { return 202 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24328,8 +24467,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_if) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1, 2] { let n = item match n { case 1: if n > 0 "
-        "{ return 201 } else { return 202 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1, 2] { let n = item match n { 1 => if n > 0 "
+        "{ return 201 } else { return 202 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24366,8 +24505,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_if) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
-        "> 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let ok = n "
+        "> 0 if ok { return 201 } else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24408,8 +24547,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_if) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
-        "> 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let ok = n "
+        "> 0 if ok { return 201 } else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24452,7 +24591,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_block_let_
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { let ok = code > 0 if ok { return 201 } else { return 202 } } case _: "
+        ".ok(code) => { let ok = code > 0 if ok { return 201 } else { return 202 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24495,7 +24634,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_bloc
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { let ok = code > 0 if ok { return 201 } else { return 202 } } case _: "
+        ".ok(code) => { let ok = code > 0 if ok { return 201 } else { return 202 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24536,8 +24675,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_bloc
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_chain_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let a = n "
-        "let ok = a > 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return "
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let a = n "
+        "let ok = a > 0 if ok { return 201 } else { return 202 } } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24579,8 +24718,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_chain_if) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_chain_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let a = n "
-        "let ok = a > 0 if ok { return 201 } else { return 202 } } case _: return 402 } } return "
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let a = n "
+        "let ok = a > 0 if ok { return 201 } else { return 202 } } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24622,8 +24761,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_chain_if) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_prefix) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
-        "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } case _: "
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let ok = n "
+        "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24667,8 +24806,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_prefix) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_prefix) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
-        "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } case _: "
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let ok = n "
+        "> 0 guard ok else { return 499 } if ok { return 201 } else { return 202 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24714,8 +24853,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_block_guar
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
-        "else { return 202 } } case _: return 402 } } return 500 }\n";
+        ".ok(code) => { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
+        "else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24758,8 +24897,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_bloc
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
-        "else { return 202 } } case _: return 402 } } return 500 }\n";
+        ".ok(code) => { let ok = code > 0 guard ok else { return 499 } if ok { return 201 } "
+        "else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24800,8 +24939,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_bloc
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_let_prefix) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { guard let n = item "
-        "else { return 498 } if n == 1 { return 201 } else { return 202 } } case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { guard let n = item "
+        "else { return 498 } if n == 1 { return 201 } else { return 202 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24845,8 +24984,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_let_prefix) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_let_prefix) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { guard let n = item "
-        "else { return 498 } if n == 1 { return 201 } else { return 202 } } case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { guard let n = item "
+        "else { return 498 } if n == 1 { return 201 } else { return 202 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -24890,9 +25029,9 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_let_prefix)
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_match_prefix) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let failed = "
-        "error(.timeout) guard match failed else { case .timeout: return 498 case _: return 499 } "
-        "if item == 1 { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let failed = "
+        "error(.timeout) guard match failed else { .timeout => return 498 _ => return 499 } "
+        "if item == 1 { return 201 } else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24937,9 +25076,9 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_match_prefix) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_match_prefix) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let failed = "
-        "error(.timeout) guard match failed else { case .timeout: return 498 case _: return 499 } "
-        "if item == 1 { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let failed = "
+        "error(.timeout) guard match failed else { .timeout => return 498 _ => return 499 } "
+        "if item == 1 { return 201 } else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24984,8 +25123,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_match_prefi
 
 TEST(frontend, analyze_rejects_for_loop_body_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { guard match item > 0 else { case true: return "
-        "498 case _: return 499 } } return 200 }\n";
+        "route GET \"/x\" { for item in [1] { guard match item > 0 else { true => return "
+        "498 _ => return 499 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -24998,8 +25137,8 @@ TEST(frontend, analyze_rejects_for_loop_body_guard_match_on_non_error_value) {
 
 TEST(frontend, analyze_plain_for_rejects_for_loop_body_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { guard match item > 0 else { case true: return "
-        "498 case _: return 499 } } return 200 }\n";
+        "route GET \"/x\" { for item in [1] { guard match item > 0 else { true => return "
+        "498 _ => return 499 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25011,8 +25150,8 @@ TEST(frontend, analyze_plain_for_rejects_for_loop_body_guard_match_on_non_error_
 
 TEST(frontend, analyze_for_rejects_for_loop_body_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { guard match item > 0 else { case true: return "
-        "498 case _: return 499 } } return 200 }\n";
+        "route GET \"/x\" { for item in [1] { guard match item > 0 else { true => return "
+        "498 _ => return 499 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25050,9 +25189,9 @@ TEST(frontend, analyze_plain_for_rejects_for_loop_after_loop_body_return) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_fail_body) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let ok = item > 1 "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let ok = item > 1 "
         "guard ok else { let fail = item == 1 if fail { return 498 } else { return 499 } } "
-        "return 201 } case _: return 402 } } return 500 }\n";
+        "return 201 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25096,9 +25235,9 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_fail_body) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_fail_body) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let ok = item > 1 "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let ok = item > 1 "
         "guard ok else { let fail = item == 1 if fail { return 498 } else { return 499 } } "
-        "return 201 } case _: return 402 } } return 500 }\n";
+        "return 201 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25142,8 +25281,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_fail_body) 
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": return 201 case _: return 404 } case _: return 402 } } "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => return 201 _ => return 404 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25184,8 +25323,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": return 201 case _: return 404 } case _: return 402 } } "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => return 201 _ => return 404 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25226,9 +25365,9 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match) {
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": if item == 1 { return 201 } else { return 202 } case _: "
-        "return 404 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => if item == 1 { return 201 } else { return 202 } _ => "
+        "return 404 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25270,9 +25409,9 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_if) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": if item == 1 { return 201 } else { return 202 } case _: "
-        "return 404 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => if item == 1 { return 201 } else { return 202 } _ => "
+        "return 404 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25314,8 +25453,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_if) {
 
 TEST(frontend, analyze_for_loop_body_nested_match_preserves_outer_arm_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1 if false: match item { "
-        "case 1: return 201 case _: return 202 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 if false => match item { "
+        "1 => return 201 _ => return 202 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25344,8 +25483,8 @@ TEST(frontend, analyze_for_loop_body_nested_match_preserves_outer_arm_guard) {
 
 TEST(frontend, analyze_plain_for_loop_body_nested_match_preserves_outer_arm_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1 if false: match item { "
-        "case 1: return 201 case _: return 202 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 if false => match item { "
+        "1 => return 201 _ => return 202 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25374,9 +25513,9 @@ TEST(frontend, analyze_plain_for_loop_body_nested_match_preserves_outer_arm_guar
 
 TEST(frontend, analyze_for_loop_nested_match_rejects_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: match item { case 1: { "
-        "guard match item > 0 else { case true: return 401 case _: return 402 } return 201 } case "
-        "_: return 404 } case _: return 500 } } return 200 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => match item { 1 => { "
+        "guard match item > 0 else { true => return 401 _ => return 402 } return 201 } "
+        "_ => return 404 } _ => return 500 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25388,9 +25527,9 @@ TEST(frontend, analyze_for_loop_nested_match_rejects_guard_match_on_non_error_va
 
 TEST(frontend, analyze_plain_for_loop_nested_match_rejects_guard_match_on_non_error_value) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: match item { case 1: { guard "
-        "match item > 0 else { case true: return 401 case _: return 402 } return 201 } case _: "
-        "return 404 } case _: return 500 } } return 200 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => match item { 1 => { guard "
+        "match item > 0 else { true => return 401 _ => return 402 } return 201 } _ => "
+        "return 404 } _ => return 500 } } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25403,8 +25542,8 @@ TEST(frontend, analyze_plain_for_loop_nested_match_rejects_guard_match_on_non_er
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_variant_match) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
-        "match state { case .ok: return 201 case _: return 404 } case _: return 402 } } return "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { 1 => "
+        "match state { .ok => return 201 _ => return 404 } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25448,8 +25587,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_variant_match) {
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_variant_match) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
-        "match state { case .ok: return 201 case _: return 404 } case _: return 402 } } return "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { 1 => "
+        "match state { .ok => return 201 _ => return 404 } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25492,8 +25631,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_variant_match) {
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_arm_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\" if true: return 201 case _: return 404 } case _: return "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" if true => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25505,8 +25644,8 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_arm_gu
 
 TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_arm_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\" if true: return 201 case _: return 404 } case _: return "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" if true => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25520,7 +25659,7 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_payloa
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match item { "
-        "case 1: match state { case .ok(code): return 201 case _: return 404 } case _: return "
+        "1 => match state { .ok(code) => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25534,7 +25673,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match item { "
-        "case 1: match state { case .ok(code): return 201 case _: return 404 } case _: return "
+        "1 => match state { .ok(code) => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25546,8 +25685,8 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_missing_inner_wildcard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": return 201 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => return 201 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25558,8 +25697,8 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_missing_inne
 
 TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_missing_inner_wildcard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": return 201 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => return 201 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25570,8 +25709,8 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_missin
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_wildcard_before_last) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case _: return 404 case \"/users\": return 201 } case _: return 402 } } "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { _ => return 404 \"/users\" => return 201 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25584,8 +25723,8 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_inner_wildca
 TEST(frontend,
      analyze_plain_for_loop_body_match_arm_nested_match_rejects_inner_wildcard_before_last) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case _: return 404 case \"/users\": return 201 } case _: return 402 } } "
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { _ => return 404 \"/users\" => return 201 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25597,8 +25736,8 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_bool_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let allowed = true match item { case 1: "
-        "match allowed { case true: return 201 case true: return 202 case _: return 404 } case _: "
+        "route GET \"/x\" { for item in [1] { let allowed = true match item { 1 => "
+        "match allowed { true => return 201 true => return 202 _ => return 404 } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25611,8 +25750,8 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_in
 TEST(frontend,
      analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_bool_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let allowed = true match item { case 1: "
-        "match allowed { case true: return 201 case true: return 202 case _: return 404 } case _: "
+        "route GET \"/x\" { for item in [1] { let allowed = true match item { 1 => "
+        "match allowed { true => return 201 true => return 202 _ => return 404 } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25624,8 +25763,8 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_int_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let code = 1 match item { case 1: "
-        "match code { case 1: return 201 case 1: return 202 case _: return 404 } case _: return "
+        "route GET \"/x\" { for item in [1] { let code = 1 match item { 1 => "
+        "match code { 1 => return 201 1 => return 202 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25638,8 +25777,8 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_in
 TEST(frontend,
      analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_int_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let code = 1 match item { case 1: "
-        "match code { case 1: return 201 case 1: return 202 case _: return 404 } case _: return "
+        "route GET \"/x\" { for item in [1] { let code = 1 match item { 1 => "
+        "match code { 1 => return 201 1 => return 202 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25651,9 +25790,9 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_string_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": return 201 case \"/users\": return 202 case _: return "
-        "404 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => return 201 \"/users\" => return 202 _ => return "
+        "404 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25665,9 +25804,9 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_in
 TEST(frontend,
      analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_string_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: "
-        "match path { case \"/users\": return 201 case \"/users\": return 202 case _: return "
-        "404 } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => "
+        "match path { \"/users\" => return 201 \"/users\" => return 202 _ => return "
+        "404 } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25679,8 +25818,8 @@ TEST(frontend,
 TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_variant_case) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
-        "match state { case .ok: return 201 case .ok: return 202 case _: return 404 } case _: "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { 1 => "
+        "match state { .ok => return 201 .ok => return 202 _ => return 404 } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25694,8 +25833,8 @@ TEST(frontend,
      analyze_plain_for_loop_body_match_arm_nested_match_rejects_duplicate_inner_variant_case) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
-        "match state { case .ok: return 201 case .ok: return 202 case _: return 404 } case _: "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { 1 => "
+        "match state { .ok => return 201 .ok => return 202 _ => return 404 } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25709,8 +25848,8 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_foreign_inne
     const char* src =
         "variant Result { ok, err }\n"
         "variant Other { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
-        "match state { case Other.ok: return 201 case _: return 404 } case _: return 402 } } "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { 1 => "
+        "match state { Other.ok => return 201 _ => return 404 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25725,8 +25864,8 @@ TEST(frontend,
     const char* src =
         "variant Result { ok, err }\n"
         "variant Other { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { case 1: "
-        "match state { case Other.ok: return 201 case _: return 404 } case _: return 402 } } "
+        "route GET \"/x\" { for item in [1] { let state = Result.ok match item { 1 => "
+        "match state { Other.ok => return 201 _ => return 404 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25740,7 +25879,7 @@ TEST(frontend, analyze_for_loop_body_match_arm_nested_match_rejects_fallible_inn
     const char* src =
         "func maybe_path(ok: bool) -> str { if ok { \"/users\" } else { error(.timeout) } }\n"
         "route GET \"/x\" { for item in [1] { let path = maybe_path(false) match item { "
-        "case 1: match path { case \"/users\": return 201 case _: return 404 } case _: return "
+        "1 => match path { \"/users\" => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25754,7 +25893,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_fallib
     const char* src =
         "func maybe_path(ok: bool) -> str { if ok { \"/users\" } else { error(.timeout) } }\n"
         "route GET \"/x\" { for item in [1] { let path = maybe_path(false) match item { "
-        "case 1: match path { case \"/users\": return 201 case _: return 404 } case _: return "
+        "1 => match path { \"/users\" => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25766,8 +25905,8 @@ TEST(frontend, analyze_plain_for_loop_body_match_arm_nested_match_rejects_fallib
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
-        "\"/users\" match path { case \"/users\": return 201 case _: return 404 } } case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let path = "
+        "\"/users\" match path { \"/users\" => return 201 _ => return 404 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25810,8 +25949,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
-        "\"/users\" match path { case \"/users\": return 201 case _: return 404 } } case _: "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let path = "
+        "\"/users\" match path { \"/users\" => return 201 _ => return 404 } } _ => "
         "return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25855,8 +25994,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match)
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_variant_match) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let state = Result.ok "
-        "match state { case .ok: return 201 case _: return 404 } } case _: return 402 } } return "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let state = Result.ok "
+        "match state { .ok => return 201 _ => return 404 } } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25902,8 +26041,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_variant_matc
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_variant_match) {
     const char* src =
         "variant Result { ok, err }\n"
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let state = Result.ok "
-        "match state { case .ok: return 201 case _: return 404 } } case _: return 402 } } return "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let state = Result.ok "
+        "match state { .ok => return 201 _ => return 404 } } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -25948,9 +26087,9 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_varian
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
-        "\"/users\" match path { case \"/users\": if item == 1 { return 201 } else { return 202 } "
-        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let path = "
+        "\"/users\" match path { \"/users\" => if item == 1 { return 201 } else { return 202 } "
+        "_ => return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -25993,9 +26132,9 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_let_nested_match_if) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_let_nested_match_if) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
-        "\"/users\" match path { case \"/users\": if item == 1 { return 201 } else { return 202 } "
-        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let path = "
+        "\"/users\" match path { \"/users\" => if item == 1 { return 201 } else { return 202 } "
+        "_ => return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26040,7 +26179,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_nested_match_on_payload
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { match code { case 1: return 201 case _: return 404 } } case _: return "
+        ".ok(code) => { match code { 1 => return 201 _ => return 404 } } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26079,7 +26218,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_on_p
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { match code { case 1: return 201 case _: return 404 } } case _: return "
+        ".ok(code) => { match code { 1 => return 201 _ => return 404 } } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26118,7 +26257,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_nested_match_on_payload) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): match code { case 1: return 201 case _: return 404 } case _: return "
+        ".ok(code) => match code { 1 => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26156,7 +26295,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_nested_match_on_payload
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): match code { case 1: return 201 case _: return 404 } case _: return "
+        ".ok(code) => match code { 1 => return 201 _ => return 404 } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26194,8 +26333,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_payload_then_nest
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { guard code > 0 else { return 499 } match code { case 1: return 201 "
-        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+        ".ok(code) => { guard code > 0 else { return 499 } match code { 1 => return 201 "
+        "_ => return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26252,8 +26391,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_payload_the
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { guard code > 0 else { return 499 } match code { case 1: return 201 "
-        "case _: return 404 } } case _: return 402 } } return 500 }\n";
+        ".ok(code) => { guard code > 0 else { return 499 } match code { 1 => return 201 "
+        "_ => return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26310,8 +26449,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_nested_match_if_uses_pa
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { let path = \"/users\" match path { case \"/users\": if code > 0 { "
-        "return 201 } else { return 202 } case _: return 404 } } case _: return 402 } } return "
+        ".ok(code) => { let path = \"/users\" match path { \"/users\" => if code > 0 { "
+        "return 201 } else { return 202 } _ => return 404 } } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26352,8 +26491,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_if_u
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): { let path = \"/users\" match path { case \"/users\": if code > 0 { "
-        "return 201 } else { return 202 } case _: return 404 } } case _: return 402 } } return "
+        ".ok(code) => { let path = \"/users\" match path { \"/users\" => if code > 0 { "
+        "return 201 } else { return 202 } _ => return 404 } } _ => return 402 } } return "
         "500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26392,9 +26531,9 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_nested_match_if_u
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_nested_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: { "
-        "guard item == 1 else { return 499 } match path { case \"/users\": return 201 case _: "
-        "return 404 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => { "
+        "guard item == 1 else { return 499 } match path { \"/users\" => return 201 _ => "
+        "return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26436,9 +26575,9 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_guard_nested_match) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_nested_match) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { case 1: { "
-        "guard item == 1 else { return 499 } match path { case \"/users\": return 201 case _: "
-        "return 404 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let path = \"/users\" match item { 1 => { "
+        "guard item == 1 else { return 499 } match path { \"/users\" => return 201 _ => "
+        "return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26485,8 +26624,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_guard_nested_matc
 TEST(frontend,
      analyze_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_int_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let code = 1 match "
-        "code { case 1: return 201 case 1: return 202 case _: return 404 } } case _: return "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let code = 1 match "
+        "code { 1 => return 201 1 => return 202 _ => return 404 } } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26499,9 +26638,9 @@ TEST(frontend,
 TEST(frontend,
      analyze_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_string_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
-        "\"/users\" match path { case \"/users\": return 201 case \"/users\": return 202 case _: "
-        "return 404 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let path = "
+        "\"/users\" match path { \"/users\" => return 201 \"/users\" => return 202 _ => "
+        "return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26513,8 +26652,8 @@ TEST(frontend,
 TEST(frontend,
      analyze_plain_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_int_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let code = 1 match "
-        "code { case 1: return 201 case 1: return 202 case _: return 404 } } case _: return "
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let code = 1 match "
+        "code { 1 => return 201 1 => return 202 _ => return 404 } } _ => return "
         "402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26527,9 +26666,9 @@ TEST(frontend,
 TEST(frontend,
      analyze_plain_for_loop_body_match_arm_block_nested_match_rejects_duplicate_inner_string_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: { let path = "
-        "\"/users\" match path { case \"/users\": return 201 case \"/users\": return 202 case _: "
-        "return 404 } } case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => { let path = "
+        "\"/users\" match path { \"/users\" => return 201 \"/users\" => return 202 _ => "
+        "return 404 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26540,9 +26679,9 @@ TEST(frontend,
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_multiple_guard_prefixes) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let ok = n "
         "> 0 let still_ok = ok guard ok else { return 498 } guard still_ok else { return 499 } if "
-        "still_ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+        "still_ok { return 201 } else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26584,9 +26723,9 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_block_multiple_guard_prefixes
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_block_multiple_guard_prefixes) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1: { let ok = n "
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 => { let ok = n "
         "> 0 let still_ok = ok guard ok else { return 498 } guard still_ok else { return 499 } if "
-        "still_ok { return 201 } else { return 202 } } case _: return 402 } } return 500 }\n";
+        "still_ok { return 201 } else { return 202 } } _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26630,7 +26769,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_if) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): if code > 0 { return 201 } else { return 202 } case _: return 402 } } "
+        ".ok(code) => if code > 0 { return 201 } else { return 202 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26671,7 +26810,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_if) 
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code): if code > 0 { return 201 } else { return 202 } case _: return 402 } } "
+        ".ok(code) => if code > 0 { return 201 } else { return 202 } _ => return 402 } } "
         "return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26710,8 +26849,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_if) 
 
 TEST(frontend, mir_unrolls_for_loop_body_match_arm_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if n > 0: "
-        "return 201 case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 if n > 0 => "
+        "return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26746,8 +26885,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_arm_guard) {
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_arm_guard) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if n > 0: "
-        "return 201 case _: return 402 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 if n > 0 => "
+        "return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26784,7 +26923,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_payload_binding_in_arm_guard) {
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code) if code > 0: return 201 case _: return 402 } } return 500 }\n";
+        ".ok(code) if code > 0 => return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26827,7 +26966,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_payload_binding_in_arm_guar
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code) if code > 0: return 201 case _: return 402 } } return 500 }\n";
+        ".ok(code) if code > 0 => return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26870,7 +27009,7 @@ TEST(frontend, analyze_for_loop_body_match_rejects_payload_binding_on_payloadles
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.err match state { "
-        "case .err(code): return 201 case _: return 402 } } return 500 }\n";
+        ".err(code) => return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26883,7 +27022,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_rejects_payload_binding_on_payl
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.err match state { "
-        "case .err(code): return 201 case _: return 402 } } return 500 }\n";
+        ".err(code) => return 201 _ => return 402 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -26896,7 +27035,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_guarded_variant_case_falls_throug
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code) if code > 200: return 200 case .ok(code): return 201 case _: return 404 "
+        ".ok(code) if code > 200 => return 200 .ok(code) => return 201 _ => return 404 "
         "} } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26940,7 +27079,7 @@ TEST(frontend,
     const char* src =
         "variant Result { ok(i32), err }\n"
         "route GET \"/x\" { for item in [1] { let state = Result.ok(item) match state { "
-        "case .ok(code) if code > 200: return 200 case .ok(code): return 201 case _: return 404 "
+        ".ok(code) if code > 200 => return 200 .ok(code) => return 201 _ => return 404 "
         "} } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -26981,8 +27120,8 @@ TEST(frontend,
 
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let flag = true match flag { case true if "
-        "item > 1: return 201 case true: return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let flag = true match flag { true if "
+        "item > 1: return 201 true => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27020,8 +27159,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_guarded_bool_case_falls_through_t
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let flag = true match flag { case true if "
-        "item > 1: return 201 case true: return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let flag = true match flag { true if "
+        "item > 1: return 201 true => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27059,8 +27198,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_bool_case_falls_thr
 
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_int_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if item > 1: "
-        "return 201 case 1: return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 if item > 1 => "
+        "return 201 1 => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27096,8 +27235,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_guarded_int_case_falls_through_to
 
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_int_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let n = item match n { case 1 if item > 1: "
-        "return 201 case 1: return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let n = item match n { 1 if item > 1 => "
+        "return 201 1 => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27133,8 +27272,8 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_int_case_falls_thro
 
 TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_string_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\": return "
-        "201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { \"a\" => return "
+        "201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27145,8 +27284,8 @@ TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_string_ca
 
 TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_string_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\": return "
-        "201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { \"a\" => return "
+        "201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27157,8 +27296,8 @@ TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_str
 
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\" if item "
-        "> 1: return 201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { \"a\" if item "
+        "> 1: return 201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27195,8 +27334,8 @@ TEST(frontend, mir_unrolls_for_loop_body_match_guarded_string_case_falls_through
 TEST(frontend,
      mir_unrolls_plain_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { case \"a\" if item "
-        "> 1: return 201 case \"a\": return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { let s = \"a\" match s { \"a\" if item "
+        "> 1: return 201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27232,8 +27371,8 @@ TEST(frontend,
 
 TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_int_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case 1: "
-        "return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => return 201 1 => "
+        "return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27244,8 +27383,8 @@ TEST(frontend, analyze_for_loop_body_match_rejects_unguarded_duplicate_int_case)
 
 TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_int_case) {
     const char* src =
-        "route GET \"/x\" { for item in [1] { match item { case 1: return 201 case 1: "
-        "return 202 case _: return 404 } } return 500 }\n";
+        "route GET \"/x\" { for item in [1] { match item { 1 => return 201 1 => "
+        "return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27259,7 +27398,7 @@ TEST(frontend, mir_unrolls_for_loop_body_guard_match_with_body_local_subject) {
 route GET "/x" {
     for item in [1] {
         let failed = error(.timeout)
-        guard match failed else { case .timeout: return 401 case _: return 402 }
+        guard match failed else { .timeout => return 401 _ => return 402 }
     }
     return 200
 }
@@ -27293,7 +27432,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_body_guard_match_with_body_local_subje
 route GET "/x" {
     for item in [1] {
         let failed = error(.timeout)
-        guard match failed else { case .timeout: return 401 case _: return 402 }
+        guard match failed else { .timeout => return 401 _ => return 402 }
     }
     return 200
 }
@@ -27358,6 +27497,351 @@ TEST(frontend, parse_for_loop_rejects_missing_in) {
 }
 
 #endif
+TEST(frontend, match_rejects_case_keyword_with_fixit) {
+    const char* src =
+        "route GET \"/users\" { let code = 200 match code { case 200 => return 200 _ => return "
+        "404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("match arms do not use `case`; write `pattern => ...`")));
+}
+
+TEST(frontend, match_rejects_colon_arm_with_fixit) {
+    const char* src =
+        "route GET \"/users\" { let code = 200 match code { 200: return 200 _ => return 404 } "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("match arms use `=>`, not `:`")));
+}
+
+TEST(frontend, match_arm_dot_pattern_on_new_line_starts_new_arm) {
+    // Without a `case` separator, a leading-dot pattern on a NEW line must
+    // start the next arm instead of chaining as postfix onto the previous
+    // arm's expression body (`401` + `.refused` must NOT parse as
+    // `401.refused`). Multi-line guard-match arms exercise exactly that.
+    const auto src = R"rut(
+func maybefail(ok: bool) -> i32 {
+    if ok { error(.refused) } else { error(.timeout) }
+}
+func wrap(ok: bool) -> i32 {
+    let y = maybefail(ok)
+    guard match y else {
+        .timeout => 401
+        .refused => 502
+        _ => 500
+    }
+    200
+}
+route GET "/users" {
+    let code = wrap(false)
+    if code == 401 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[1].kind, AstItemKind::Func);
+    const AstStatement* body = ast->items[1].func.body;  // wrap()
+    REQUIRE(body != nullptr);
+    REQUIRE_EQ(static_cast<u8>(body->kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE_EQ(body->block_stmts.len, 3u);
+    CHECK_EQ(static_cast<u8>(body->block_stmts[1]->kind), static_cast<u8>(AstStmtKind::Guard));
+    CHECK_EQ(body->block_stmts[1]->match_arms.len, 3u);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, guard_let_shorthand_rebinds_same_name) {
+    // Swift 5.7 shorthand: `guard let x else { ... }` == `guard let x = x else`.
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { error(.missing) } }\n"
+        "route GET \"/users\" { let picked = maybeBox(true) guard let picked else { return 401 } "
+        "if picked.value == 200 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[2].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Guard));
+    CHECK(route.statements[1].bind_value);
+    CHECK(route.statements[1].name.eq(lit("picked")));
+    CHECK_EQ(static_cast<u8>(route.statements[1].expr.kind), static_cast<u8>(AstExprKind::Ident));
+    CHECK(route.statements[1].expr.name.eq(lit("picked")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, member_names_or_and_stay_lexable) {
+    // `or` / `and` lex as identifiers so member calls stay reachable:
+    // `.or(default)` fallback and the `bitwise.and(...)` namespace.
+    const char* fallback = "route GET \"/x\" { let q = req.query(\"p\").or(\"1\") return 200 }\n";
+    auto lexed = lex(lit(fallback));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    const char* bit = "route GET \"/x\" { let m = bitwise.and(coreMask(), 3) return 200 }\n";
+    lexed = lex(lit(bit));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+}
+
+TEST(frontend, lex_rejects_postfix_bang_force_unwrap_with_fixit) {
+    const char* sources[] = {
+        "route GET \"/x\" { let t = token! return 200 }\n",
+        "route GET \"/x\" { let t = find()! return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(!lexed);
+        CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(lexed.error().detail.eq(
+            lit("postfix `!` (force unwrap) is not supported; use guard let (if let is "
+                "spec'd, pending)")));
+    }
+}
+
+TEST(frontend, guard_let_on_runtime_error_value_uses_has_value_cond) {
+    // A runtime error-capable init lowers the guard condition to a HasValue
+    // test (usable-value semantics) instead of blindly passing through.
+    const char* src =
+        "func fail() -> str => error(.timeout)\n"
+        "route GET \"/x\" { let value = any(req.query(\"q\"), fail()) "
+        "guard let value else { return 401 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
+             static_cast<u8>(HirExprKind::HasValue));
+    // The rebound `value` is narrowed on the success path.
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
+}
+
+TEST(frontend, guard_let_on_runtime_optional_only_value_rejects_with_detail) {
+    // Pure-optional runtime values cannot lower a nil test yet — reject
+    // loudly instead of silently passing the guard (PR #162 review).
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
+        "route GET \"/x\" { guard let picked = maybeBox(req.http11) else { return 401 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("guard let cannot test a runtime optional-only value yet (nil-carrier "
+            "lowering pending); use an error-capable source")));
+}
+
+TEST(frontend, braced_match_arm_body_allows_multiline_member_chain) {
+    // The newline-dot arm boundary only applies to unbraced bodies; inside a
+    // braced body multiline member chains must keep parsing (PR #162 review).
+    const auto src = R"rut(
+variant Auth { ok, denied }
+route GET "/users" {
+    let a = Auth.ok
+    match a {
+        .ok => {
+            let host = req
+                .header("Host")
+            return 200
+        }
+        _ => return 403
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[1].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
+}
+
+TEST(frontend, unbraced_if_arm_body_allows_multiline_chain_in_condition) {
+    // The newline-dot arm boundary applies only to bare-expression arm
+    // bodies; a statement-keyword body (if/match/guard/...) is delimited by
+    // its own closing brace, so multiline chains in its condition parse.
+    const auto src = R"rut(
+route GET "/users" {
+    let code = 200
+    match code {
+        200 => if req
+            .header("Host") == "localhost" { return 200 } else { return 201 }
+        _ => return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
+}
+
+TEST(frontend, if_let_rejects_with_pending_fixit) {
+    // `if let` is spec'd (language card marks it pending); the parser gives a
+    // targeted migration diagnostic instead of a stray UnexpectedToken.
+    const char* sources[] = {
+        "func f(ok: bool) -> i32 { if let v = maybe(ok) { v } else { 0 } }\n"
+        "func maybe(ok: bool) -> i32 { if ok { 1 } else { error(.none) } }\n",
+        "route GET \"/x\" { if let q = req.query(\"q\") { return 200 } else { return 404 } }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(ast.error().detail.eq(
+            lit("if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
+                "for now (TODO.md: front-end migration)")));
+    }
+}
+
+TEST(frontend, compare_only_fallible_local_keeps_error_prelude) {
+    // A fallible local (error carrier) that is only *compared* — never
+    // guard-recovered — must keep its state-0 error prelude. Equality lowering
+    // emits an internal `HasValue(local)` to decide whether to compare the
+    // payload; that nested test must NOT be mistaken for a guard-let recovery
+    // use (PR #162 review — otherwise the failing carrier would fall through
+    // to 200 instead of the default error).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) let ok = value == 200 "
+        "return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
+    // Control for the case above: when the same error-carrier local IS consumed
+    // by a guard-let, the guard's else branch takes the error, so the prelude
+    // is correctly suppressed. This top-level guard-condition recovery is what
+    // the equality-comparison's nested HasValue must NOT be confused with.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "guard let checked = value else { return 401 } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_path) {
+    // Mixed case: the SAME error-carrier local is guard-let-recovered in one
+    // branch but only COMPARED in a sibling branch. The prelude is emitted once
+    // per local, so recovery in one branch must NOT strip it from the
+    // compare-only path — otherwise the carrier's error masquerades as success
+    // there. Suppression requires EVERY use to recover; a lone non-recovering
+    // (compare/observe) use keeps the prelude (PR #162 re-review, err toward
+    // keeping the prelude).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "if req.http11 { guard let checked = value else { return 401 } return 204 } "
+        "else { if value == 200 { return 200 } else { return 500 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
+    // The ONLY use of the error-carrier local is a guard-let nested inside a
+    // CONDITIONAL branch; the sibling (else) path does not use it and returns
+    // success. That guard does not dominate the local's error paths, so the
+    // prelude must stay — otherwise `if req.http11` false + a `value` error falls
+    // through to 200 (PR #162 re-review: a guard recovery counts as suppressing
+    // the prelude only when it is the entry-block terminator, i.e. unconditional).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "if req.http11 { guard let checked = value else { return 401 } return 204 } "
+        "else { return 200 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, case_in_match_arm_still_rejected_with_fixit) {
+    // `case` is now contextual (not a global keyword), but at match-arm position it
+    // still earns the "arms don't use `case`" fix-it (PR #162 re-review).
+    const char* src = "route GET \"/x\" { let r = match 200 { case 200 => 1 _ => 0 } return r }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+}
+
+TEST(frontend, case_usable_as_identifier_outside_match_arms) {
+    // `case` is no longer reserved globally — it lexes as an ordinary identifier,
+    // so a struct field named `case` parses (mirrors at/timer/websocket).
+    const char* src = "struct S { case: i32 }\nroute GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+}
+
+TEST(frontend, unbraced_arm_body_allows_line_broken_member_access_in_call_arg) {
+    // The newline-dot arm boundary must be suspended inside a call argument:
+    // a line-broken member access nested in a call arg (`choose(r\n .host)`) is
+    // a valid expression, not the next arm's `.pattern`. Without the paren-depth
+    // scoping the `.host` is mistaken for a `.host` arm pattern and the arm is
+    // rejected unless braced (PR #162 review — dot-stop only at the top level of
+    // the bare-expression arm body).
+    const auto src = R"rut(
+struct Req { host: str }
+func choose(h: str) -> i32 => 200
+func handle(r: Req) -> i32 {
+    let failed = error(.timeout)
+    guard match failed else {
+        .timeout => choose(r
+            .host)
+        _ => 500
+    }
+    200
+}
+route GET "/x" { if handle(Req(host: "h")) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    // Full pipeline: the arm body must also analyze/lower, proving the parse is
+    // semantically well-formed, not merely token-accepted.
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -2,6 +2,65 @@
 
 Outstanding work items, prioritized for the next implementation passes.
 
+## P0: Front-End Migration to the Revised Syntax Spec (branch design_syntax)
+
+**Goal**: Migrate lexer/parser/checker to the 2026-07 DESIGN.md §3 revision
+("Swift-exact or absent"). `docs/language-card.md` is the target surface;
+each item should land with fix-it diagnostics matching DESIGN.md §3.6.
+
+**Work** (roughly in dependency order):
+- [x] Lexer: `&&` `||` `!` `!=` `<=` `>=` emitted; `and`/`or`/`not` lex to
+  fix-it errors; lone `&`/`^`/`~` → bitwise.* fix-it; `?` → if-let fix-it
+  (commit: slice 1). `respond`/`break`/`continue` keywords still pending.
+- [x] Parser: `!`/`!=`/`<=`/`>=` desugar to Eq/Lt/Gt (+ `== false` wrap);
+  `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
+  sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
+  (slice 2a). `guard let x` shorthand (slice 2b-1).
+- [ ] Parser/analyze: `if let name = expr { }` — the parser now rejects
+  `if let` with a targeted pending fix-it (was: stray UnexpectedToken).
+  Full plan: parse like guard-let
+  into the If stmt (name/bind_value fields), then in EVERY If analysis site
+  (analyze.cc ~4483/8630/8726/8831/11180 + nested-match copies) lower cond to
+  HirExprKind::HasValue(expr) and inject a narrowed HirLocal (clone the
+  guard-let binding block at analyze.cc ~8579) visible only in then-branch
+  scoped_locals. Reuse make_guard_bound_init.
+- [ ] `respond status[, body] | resp` statement — NEW semantics: today a
+  func's `=> 401`-style guard values are the *function's return value*, not
+  an HTTP short-circuit. respond needs an HIR terminal (like ReturnStatus)
+  legal inside funcs, carried through inlining so the inlined route sends the
+  response and stops. Design first: extend HirGuard::FailKind/Term reuse.
+- [x] `guard` condition bool-only check + fix-it; guard-let usable-value
+  semantics: known nil/error inits fold the condition to false (else always
+  runs, binding skipped for known error); runtime error-capable inits lower
+  to a HasValue condition with the bound local narrowed (review follow-up).
+- [ ] Lowering: opt carrier for pure-optional values (`may_nil` without
+  `may_error`) — HasValue/guard-let runtime nil exits currently can't lower
+  (emit_opt_is_nil needs an opt-typed carrier). guard-let over such values is
+  now REJECTED with a fix-it ("use an error-capable source") rather than
+  silently passing; lift the rejection when the carrier lands.
+- [x] Runtime ordering: guard-let over a runtime error value now wins over
+  the resume-state-0 error prelude — RecoveryScan treats a bare
+  HasValue(LocalRef) guard condition as a recovering use, so the prelude
+  skips locals whose error the guard consumes (e2e: pick(req.http11) ->
+  200 / guard else 401).
+- [ ] websocket trailing block `{ frame in }`; object literal only in
+  call-argument position; pipeline RHS placeholder validation.
+- Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;
+  `req.header/set/add/getAll` + `resp.set/remove/add/header` (remove hyphenated
+  header property paths); `req.params.*` capture namespace (flat `req.<capture>`
+  becomes an error with fix-it); `req.queryAll`; `respond` legality (middleware
+  only) vs status-`return` (handler only); `stats()/metrics()/reload()/
+  upstream.mark()` declarations.
+- Diagnostics: implement the §3.6 fix-it rows for `?.`, `??`, postfix `!`,
+  truthiness guard, bitwise symbols, placeholder-less pipeline, `case`,
+  middleware/handler return-respond confusion.
+- Tests/examples: migrate `examples/*.rut`, test fixtures, and docs/ topic
+  pages (match.md, pipe.md, decorators.md, for-loops.md, ...) to the new
+  surface once the front-end accepts it.
+
+**Acceptance**: language-card examples all parse and type-check; old forms
+produce the documented fix-its; `./dev.sh test` green.
+
 ## Recently Completed
 
 - [x] epoll partial-send proactor semantics and recv-buffer integration.

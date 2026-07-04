@@ -60,9 +60,6 @@ enum class TokenType : u8 {
     KwFirewall,
     KwThrottle,
     KwPer,
-    KwAnd,
-    KwOr,
-    KwNot,
     KwNil,
     KwTrue,
     KwFalse,
@@ -104,10 +101,12 @@ enum class TokenType : u8 {
     Slash,
     Percent,
     Amp,
+    AmpAmp,  // && (logical and — Swift-identical)
     Pipe,
+    PipePipe,  // || (logical or — Swift-identical)
     Caret,
     Tilde,
-    Bang,
+    Bang,  // ! (logical not — Swift-identical)
     Question,
     DoubleQuestion,  // ?? (null coalescing)
     At,

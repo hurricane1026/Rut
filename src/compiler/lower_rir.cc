@@ -3393,7 +3393,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                        value->local_index == local_index;
             }
 
-            static bool is_recovering_use(const MirValue* value, u32 local_index) {
+            // Coalescing shapes that consume the local's error inline (`x || y`,
+            // `x.has ? x.value : ...`). These genuinely recover the error no
+            // matter how deeply they are nested, so they are matched anywhere.
+            static bool is_coalescing_use(const MirValue* value, u32 local_index) {
                 if (value == nullptr) return false;
                 if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, local_index))
                     return true;
@@ -3406,9 +3409,23 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return false;
             }
 
+            // A bare usable-value test — the guard-let condition shape. It only
+            // recovers the error when it IS the guard branch's condition (the
+            // guard's else branch consumes the error, so the state-0 error
+            // prelude must not intercept it with a generic 500). It must be
+            // matched only at the top level of a branch terminator's condition:
+            // equality lowering emits its own nested `HasValue(local)` to decide
+            // whether to compare a fallible payload, and that internal test is
+            // NOT a recovering use — treating it as one would wrongly suppress
+            // the error prelude for a compare-only fallible local.
+            static bool is_guard_condition(const MirValue* value, u32 local_index) {
+                return value != nullptr && value->kind == MirValueKind::HasValue &&
+                       local_ref_matches(value->lhs, local_index);
+            }
+
             static bool contains_recovering_use(const MirValue* value, u32 local_index) {
                 if (value == nullptr) return false;
-                if (is_recovering_use(value, local_index)) return true;
+                if (is_coalescing_use(value, local_index)) return true;
                 if (contains_recovering_use(value->lhs, local_index)) return true;
                 if (contains_recovering_use(value->rhs, local_index)) return true;
                 for (u32 ai = 0; ai < value->args.len; ai++) {
@@ -3420,6 +3437,69 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 }
                 return false;
             }
+
+            // A use that OBSERVES the local's error without recovering it: a
+            // nested `HasValue(local)` (an equality/optional test that masks the
+            // error as a default value) or a bare `LocalRef(local)` reached
+            // outside any recovery construct. Such a use needs the state-0 error
+            // prelude so the carrier's error cannot masquerade as success — even
+            // when a SIBLING branch recovers the same local via guard-let (the
+            // prelude is emitted once per local, so it must be kept whenever any
+            // path fails to recover). The recovery constructs — coalescing
+            // `Or`/`IfElse`, the guard-narrowing `ValueOf(local)` success-path
+            // unwrap, and the top-level guard condition — are NOT observing uses
+            // and are skipped without descending into the recovered operands.
+            static bool contains_non_recovering_use(const MirValue* value,
+                                                    u32 local_index,
+                                                    bool top_level_cond) {
+                if (value == nullptr) return false;
+                // Coalescing `local || fallback`: the local is recovered; only
+                // the fallback arm can carry a fresh observing use.
+                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, local_index)) {
+                    if (contains_non_recovering_use(value->rhs, local_index, false)) return true;
+                    for (u32 ai = 0; ai < value->args.len; ai++)
+                        if (contains_non_recovering_use(value->args[ai], local_index, false))
+                            return true;
+                    return false;
+                }
+                // Coalescing `local.has ? local.value : fallback`: recovered.
+                if (value->kind == MirValueKind::IfElse && value->lhs != nullptr &&
+                    value->lhs->kind == MirValueKind::HasValue &&
+                    local_ref_matches(value->lhs->lhs, local_index) && value->rhs != nullptr &&
+                    value->rhs->kind == MirValueKind::ValueOf &&
+                    local_ref_matches(value->rhs->lhs, local_index)) {
+                    for (u32 ai = 0; ai < value->args.len; ai++)
+                        if (contains_non_recovering_use(value->args[ai], local_index, false))
+                            return true;
+                    return false;
+                }
+                // Top-level guard condition: the guard's else consumes the error.
+                if (top_level_cond && value->kind == MirValueKind::HasValue &&
+                    local_ref_matches(value->lhs, local_index))
+                    return false;
+                // Guard-narrowing / success-path unwrap: only reached once the
+                // error is already handled, so not an observing use.
+                if (value->kind == MirValueKind::ValueOf &&
+                    local_ref_matches(value->lhs, local_index))
+                    return false;
+                // A nested usable-value test masks the error as a default value
+                // (equality/optional compare) — that path needs the prelude.
+                if (value->kind == MirValueKind::HasValue &&
+                    local_ref_matches(value->lhs, local_index))
+                    return true;
+                // A bare reference propagates/observes the error.
+                if (local_ref_matches(value, local_index)) return true;
+                if (contains_non_recovering_use(value->lhs, local_index, false)) return true;
+                if (contains_non_recovering_use(value->rhs, local_index, false)) return true;
+                for (u32 ai = 0; ai < value->args.len; ai++)
+                    if (contains_non_recovering_use(value->args[ai], local_index, false))
+                        return true;
+                for (u32 fi = 0; fi < value->field_inits.len; fi++)
+                    if (contains_non_recovering_use(
+                            value->field_inits[fi].value, local_index, false))
+                        return true;
+                return false;
+            }
         };
         auto has_recovering_or_use = [&](u32 local_index) -> bool {
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
@@ -3429,9 +3509,47 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
+                // The guard-let condition only counts at the top level of the
+                // branch condition, not when nested inside an equality
+                // comparison's internal HasValue test. It ALSO only counts as an
+                // unconditional recovery when it is the entry block's terminator
+                // (bi == 0): a top-level `guard let x = value else { ... }`
+                // dominates every path out of the local. A guard nested inside a
+                // conditional branch (`if c { guard let x = value } else { ... }`)
+                // lives in a later block, so it does NOT recover the error on the
+                // sibling path — keep the prelude there (conservative over-keep: a
+                // spurious prelude just returns the default error, a missing one
+                // lets an error masquerade as success).
+                if (bi == 0 && RecoveryScan::is_guard_condition(&term.cond, local_index))
+                    return true;
                 if (RecoveryScan::contains_recovering_use(&term.cond, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.lhs, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.rhs, local_index))
+                    return true;
+            }
+            return false;
+        };
+        // The state-0 error prelude is emitted once per local (all-or-nothing).
+        // Suppress it ONLY when EVERY use of the local recovers its error;
+        // if any path merely observes/masks the error (compare, bare use), the
+        // prelude must stay so that path cannot fall through as success — even
+        // if a sibling branch recovers the same local. Erring toward keeping is
+        // safe: a spurious prelude returns the default error; a missing one lets
+        // an error masquerade as success.
+        auto has_non_recovering_use = [&](u32 local_index) -> bool {
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                if (RecoveryScan::contains_non_recovering_use(
+                        &mir.functions[i].locals[li].init, local_index, /*top_level_cond=*/false))
+                    return true;
+            }
+            for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
+                const auto& term = mir.functions[i].blocks[bi].term;
+                if (RecoveryScan::contains_non_recovering_use(
+                        &term.cond, local_index, /*top_level_cond=*/true) ||
+                    RecoveryScan::contains_non_recovering_use(
+                        &term.lhs, local_index, /*top_level_cond=*/false) ||
+                    RecoveryScan::contains_non_recovering_use(
+                        &term.rhs, local_index, /*top_level_cond=*/false))
                     return true;
             }
             return false;
@@ -3443,7 +3561,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     (local.init.is_eager_fallback &&
                      local.init.lhs->kind == MirValueKind::BoolConst &&
                      local.init.lhs->bool_value)) &&
-                   !local.init.is_pipe_conditional && !has_recovering_or_use(local.ref_index);
+                   !local.init.is_pipe_conditional &&
+                   (!has_recovering_or_use(local.ref_index) ||
+                    has_non_recovering_use(local.ref_index));
         };
 
         u32 error_local_count = 0;

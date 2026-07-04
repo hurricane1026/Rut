@@ -11,11 +11,44 @@ namespace {
 
 constexpr Str kGuardMatchArmIfDetail = lit_str("guard match arms do not support if guards");
 constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
+constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
+constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
+// The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
+// member names work); the parser rejects them in operator/operand positions.
+constexpr Str kIfLetPendingDetail = lit_str(
+    "if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
+    "for now (TODO.md: front-end migration)");
+constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
+constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
+constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
 
 struct Parser {
     const LexedTokens* toks = nullptr;
     AstFile* file = nullptr;
     u32 pos = 0;
+    // While parsing a match-arm body, a postfix `.` on a NEW line ends the
+    // expression instead of chaining — the dot begins the next arm's
+    // `.variant` pattern. Match arms have no `case` separator, so line
+    // position is the only boundary signal (Swift-style newline sensitivity,
+    // scoped to arm bodies only).
+    bool arm_body_stops_cross_line_dot = false;
+    // Depth of enclosing `(...)` / `[...]` while parsing an arm body. The
+    // newline-dot boundary only applies at the top level of the arm body: a
+    // line-broken member access inside a call argument or group (e.g.
+    // `choose(req\n    .header("Host"))`) must chain normally, not be cut as
+    // the next arm's pattern.
+    u32 arm_body_dot_stop_depth = 0;
+
+    // RAII: suspends the arm-body newline-dot boundary for the extent of a
+    // parenthesized/bracketed sub-expression. Restores on every scope exit,
+    // including the parser's early error returns.
+    struct NestedDelimiterGuard {
+        Parser* parser;
+        explicit NestedDelimiterGuard(Parser* p) : parser(p) { parser->arm_body_dot_stop_depth++; }
+        ~NestedDelimiterGuard() { parser->arm_body_dot_stop_depth--; }
+        NestedDelimiterGuard(const NestedDelimiterGuard&) = delete;
+        NestedDelimiterGuard& operator=(const NestedDelimiterGuard&) = delete;
+    };
 
     const Token& cur() const { return toks->tokens[pos]; }
     const Token& prev() const { return toks->tokens[pos - 1]; }
@@ -68,14 +101,27 @@ struct Parser {
         AstStatement block{};
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
+        // A braced body is delimited by its closing brace, so the match-arm
+        // newline-dot heuristic must not cut multiline member chains here.
+        const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+        arm_body_stops_cross_line_dot = false;
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             auto inner = parse_stmt();
-            if (!inner) return core::make_unexpected(inner.error());
+            if (!inner) {
+                arm_body_stops_cross_line_dot = saved_dot_stop;
+                return core::make_unexpected(inner.error());
+            }
             auto inner_ptr = alloc_stmt(inner.value());
-            if (!inner_ptr) return core::make_unexpected(inner_ptr.error());
-            if (!block.block_stmts.push(inner_ptr.value()))
+            if (!inner_ptr) {
+                arm_body_stops_cross_line_dot = saved_dot_stop;
+                return core::make_unexpected(inner_ptr.error());
+            }
+            if (!block.block_stmts.push(inner_ptr.value())) {
+                arm_body_stops_cross_line_dot = saved_dot_stop;
                 return frontend_error(FrontendError::TooManyItems, inner->span);
+            }
         }
+        arm_body_stops_cross_line_dot = saved_dot_stop;
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
         if (block.block_stmts.len == 0)
@@ -134,10 +180,10 @@ struct Parser {
     // bare frame verdict (frame.drop()/forward()/close()). Reuses AstStmtKind::Guard with
     // expr=cond and else_stmt=the verdict Expr — the WsTerminate analyze path interprets it.
     FrontendResult<AstStatement> parse_ws_frame_guard(const Token& guard_tok) {
-        // A leading `not`/`!` negates the condition (e.g. `guard not frame.text.matches(re"…")`).
-        // General prefix-not isn't in the expression grammar; it's consumed here, scoped to the
-        // frame guard, and carried on cond_negated for the WsTerminate analyze path.
-        const bool negated = take(TokenType::KwNot) != nullptr || take(TokenType::Bang) != nullptr;
+        // A leading `!` negates the condition (e.g. `guard !frame.text.matches(re"…")`).
+        // It's consumed here, scoped to the frame guard, and carried on cond_negated for
+        // the WsTerminate analyze path (which pattern-matches the bare condition shape).
+        const bool negated = take(TokenType::Bang) != nullptr;
         auto cond = parse_expr();
         if (!cond) return core::make_unexpected(cond.error());
         auto kw_else = expect(TokenType::KwElse);
@@ -168,27 +214,42 @@ struct Parser {
         AstStatement stmt{};
         stmt.kind = AstStmtKind::Guard;
         const bool is_match_guard = take(TokenType::KwMatch) != nullptr;
+        bool cond_done = false;
         if (!is_match_guard && take(TokenType::KwLet)) {
             auto name = expect(TokenType::Ident);
             if (!name) return core::make_unexpected(name.error());
-            auto eq = expect(TokenType::Eq);
-            if (!eq) return core::make_unexpected(eq.error());
             stmt.name = name.value()->text;
             stmt.bind_value = true;
+            if (cur().type == TokenType::KwElse) {
+                // Swift 5.7 shorthand: `guard let x else { ... }` rebinds an
+                // existing optional name — sugar for `guard let x = x else`.
+                AstExpr self_ref{};
+                self_ref.kind = AstExprKind::Ident;
+                self_ref.name = stmt.name;
+                self_ref.span = span_from(*name.value());
+                stmt.expr = self_ref;
+                cond_done = true;
+            } else {
+                auto eq = expect(TokenType::Eq);
+                if (!eq) return core::make_unexpected(eq.error());
+            }
         }
-        auto cond = parse_expr();
-        if (!cond) return core::make_unexpected(cond.error());
-        stmt.expr = cond.value();
+        if (!cond_done) {
+            auto cond = parse_expr();
+            if (!cond) return core::make_unexpected(cond.error());
+            stmt.expr = cond.value();
+        }
         auto kw_else = expect(TokenType::KwElse);
         if (!kw_else) return core::make_unexpected(kw_else.error());
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         if (is_match_guard) {
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                auto kw_case = expect(TokenType::KwCase);
-                if (!kw_case) return core::make_unexpected(kw_case.error());
+                if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                 AstStatement::MatchArm arm{};
-                arm.span = span_from(*kw_case.value());
+                arm.span = span_from(cur());
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
@@ -200,9 +261,15 @@ struct Parser {
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*kw_if),
                                           kGuardMatchArmIfDetail);
+                if (cur().type == TokenType::Colon)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), kMatchColonDetail);
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
+                const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+                arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                 auto arm_stmt = parse_func_body_stmt();
+                arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
                 auto arm_ptr = alloc_stmt(arm_stmt.value());
                 if (!arm_ptr) return core::make_unexpected(arm_ptr.error());
@@ -233,6 +300,7 @@ struct Parser {
         const Token start = cur();
         AstExpr expr{};
         if (take(TokenType::LBracket)) {
+            NestedDelimiterGuard nested(this);
             AstExpr arr{};
             arr.kind = AstExprKind::ArrayLit;
             while (!take(TokenType::RBracket)) {
@@ -250,6 +318,7 @@ struct Parser {
             return arr;
         }
         if (take(TokenType::LParen)) {
+            NestedDelimiterGuard nested(this);
             auto first = parse_expr();
             if (!first) return core::make_unexpected(first.error());
             if (!take(TokenType::Comma)) {
@@ -290,6 +359,7 @@ struct Parser {
             expr.kind = AstExprKind::VariantCase;
             expr.str_value = case_name.value()->text;
             if (take(TokenType::LParen)) {
+                NestedDelimiterGuard nested(this);
                 auto payload = parse_expr();
                 if (!payload) return core::make_unexpected(payload.error());
                 auto rparen = expect(TokenType::RParen);
@@ -577,6 +647,7 @@ struct Parser {
                 if (parsed_ok) continue;
             }
             if (take(TokenType::LParen)) {
+                NestedDelimiterGuard nested(this);
                 if (expr.kind != AstExprKind::Ident)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
                 if (!take(TokenType::RParen) &&
@@ -630,6 +701,10 @@ struct Parser {
                     expr = call;
                 }
                 continue;
+            }
+            if (arm_body_stops_cross_line_dot && arm_body_dot_stop_depth == 0 &&
+                cur().type == TokenType::Dot && pos > 0 && cur().line != prev().line) {
+                break;  // new-line `.x` starts the next match arm's pattern
             }
             if (!take(TokenType::Dot)) break;
             const Token* field_name = nullptr;
@@ -685,6 +760,7 @@ struct Parser {
                 }
             }
             if (take(TokenType::LParen)) {
+                NestedDelimiterGuard nested(this);
                 const u32 after_lparen = pos;
                 const bool maybe_named_init =
                     expr.kind == AstExprKind::Ident && cur().type != TokenType::RParen &&
@@ -746,44 +822,123 @@ struct Parser {
         return expr;
     }
 
+    // Wrap `operand` as `operand == false` — the parse-time desugar shared by
+    // prefix `!` and the negated comparisons (`!=`, `<=`, `>=`). No new
+    // AST/HIR/MIR node kinds are needed; Bool equality lowers like any Eq.
+    FrontendResult<AstExpr> make_eq_false(AstExpr operand) {
+        AstExpr false_lit{};
+        false_lit.kind = AstExprKind::BoolLit;
+        false_lit.bool_value = false;
+        false_lit.span = operand.span;
+        auto lhs_ptr = alloc_expr(operand);
+        if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+        auto rhs_ptr = alloc_expr(false_lit);
+        if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+        AstExpr expr{};
+        expr.kind = AstExprKind::Eq;
+        expr.lhs = lhs_ptr.value();
+        expr.rhs = rhs_ptr.value();
+        expr.span = operand.span;
+        return expr;
+    }
+
+    // An arm body that starts with a statement keyword (or a brace) is
+    // self-delimiting — only bare-expression bodies (and `return <expr>`
+    // tails) need the newline-dot arm boundary.
+    bool arm_body_needs_dot_stop() const {
+        const TokenType t = cur().type;
+        if (t == TokenType::LBrace) return false;
+        if (t == TokenType::KwIf || t == TokenType::KwMatch || t == TokenType::KwGuard ||
+            t == TokenType::KwLet || t == TokenType::KwFor || t == TokenType::KwWait ||
+            t == TokenType::KwForward)
+            return false;
+        return true;
+    }
+
+    // Removed word-operator check for operand position (`not x`, `or(a, b)`,
+    // `and(a, b)`). Member names after `.` never reach here, so `.or(...)`
+    // and `bitwise.and(...)` stay valid.
+    FrontendResult<bool> reject_word_operator_operand() {
+        if (cur().type != TokenType::Ident) return true;
+        if (cur().text.eq({"and", 3}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), kAndDetail);
+        if (cur().text.eq({"or", 2}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), kOrDetail);
+        if (cur().text.eq({"not", 3}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), kNotDetail);
+        return true;
+    }
+
+    // Prefix `!` — Swift-identical logical not, binds tighter than comparisons.
+    FrontendResult<AstExpr> parse_unary_expr() {
+        auto word_check = reject_word_operator_operand();
+        if (!word_check) return core::make_unexpected(word_check.error());
+        const Token* bang = take(TokenType::Bang);
+        if (!bang) return parse_primary_expr();
+        auto operand = parse_unary_expr();
+        if (!operand) return core::make_unexpected(operand.error());
+        auto expr = make_eq_false(operand.value());
+        if (!expr) return core::make_unexpected(expr.error());
+        AstExpr out = expr.value();
+        out.span = Span{bang->start, operand->span.end, bang->line, bang->col};
+        return out;
+    }
+
     FrontendResult<AstExpr> parse_eq_expr() {
-        auto lhs = parse_primary_expr();
+        auto lhs = parse_unary_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         TokenType op = TokenType::Error;
         if (take(TokenType::EqEq))
             op = TokenType::EqEq;
+        else if (take(TokenType::BangEq))
+            op = TokenType::BangEq;
+        else if (take(TokenType::LtEq))
+            op = TokenType::LtEq;
+        else if (take(TokenType::GtEq))
+            op = TokenType::GtEq;
         else if (take(TokenType::Lt))
             op = TokenType::Lt;
         else if (take(TokenType::Gt))
             op = TokenType::Gt;
         else
             return lhs.value();
-        auto rhs = parse_primary_expr();
+        auto rhs = parse_unary_expr();
         if (!rhs) return core::make_unexpected(rhs.error());
         auto lhs_ptr = alloc_expr(lhs.value());
         if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
         auto rhs_ptr = alloc_expr(rhs.value());
         if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
         AstExpr expr{};
-        expr.kind = op == TokenType::EqEq
-                        ? AstExprKind::Eq
-                        : (op == TokenType::Lt ? AstExprKind::Lt : AstExprKind::Gt);
+        // `!=` → `(a == b) == false`, `<=` → `(a > b) == false`,
+        // `>=` → `(a < b) == false` — parse-time desugar, see make_eq_false.
+        const bool negate =
+            op == TokenType::BangEq || op == TokenType::LtEq || op == TokenType::GtEq;
+        if (op == TokenType::EqEq || op == TokenType::BangEq)
+            expr.kind = AstExprKind::Eq;
+        else if (op == TokenType::Lt || op == TokenType::GtEq)
+            expr.kind = AstExprKind::Lt;
+        else
+            expr.kind = AstExprKind::Gt;
         expr.lhs = lhs_ptr.value();
         expr.rhs = rhs_ptr.value();
         expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
-        return expr;
+        if (!negate) return expr;
+        auto negated = make_eq_false(expr);
+        if (!negated) return core::make_unexpected(negated.error());
+        AstExpr out = negated.value();
+        out.span = expr.span;
+        return out;
     }
 
-    FrontendResult<AstExpr> parse_or_expr() {
+    FrontendResult<AstExpr> parse_and_expr() {
         auto lhs = parse_eq_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         while (true) {
-            const auto op = [&]() -> TokenType {
-                if (take(TokenType::KwAnd)) return TokenType::KwAnd;
-                if (take(TokenType::KwOr)) return TokenType::KwOr;
-                return TokenType::Error;
-            }();
-            if (op == TokenType::Error) break;
+            // Operator-position fix-it: `a and b`.
+            if (cur().type == TokenType::Ident && cur().text.eq({"and", 3}))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kAndDetail);
+            if (!take(TokenType::AmpAmp)) break;
             auto rhs = parse_eq_expr();
             if (!rhs) return core::make_unexpected(rhs.error());
             auto lhs_ptr = alloc_expr(lhs.value());
@@ -791,7 +946,33 @@ struct Parser {
             auto rhs_ptr = alloc_expr(rhs.value());
             if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
             AstExpr expr{};
-            expr.kind = op == TokenType::KwAnd ? AstExprKind::And : AstExprKind::Or;
+            expr.kind = AstExprKind::And;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
+    }
+
+    // `&&` binds tighter than `||` (Swift/C precedence).
+    FrontendResult<AstExpr> parse_or_expr() {
+        auto lhs = parse_and_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (true) {
+            // Operator-position fix-it: `a or b`.
+            if (cur().type == TokenType::Ident && cur().text.eq({"or", 2}))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kOrDetail);
+            if (!take(TokenType::PipePipe)) break;
+            auto rhs = parse_and_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = AstExprKind::Or;
             expr.lhs = lhs_ptr.value();
             expr.rhs = rhs_ptr.value();
             expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
@@ -826,14 +1007,27 @@ struct Parser {
             AstStatement stmt{};
             stmt.kind = AstStmtKind::Block;
             stmt.span = span_from(start);
+            // Braced blocks are brace-delimited — suspend the match-arm
+            // newline-dot heuristic so multiline member chains parse.
+            const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+            arm_body_stops_cross_line_dot = false;
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
                 auto inner = parse_stmt();
-                if (!inner) return core::make_unexpected(inner.error());
+                if (!inner) {
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
+                    return core::make_unexpected(inner.error());
+                }
                 auto inner_ptr = alloc_stmt(inner.value());
-                if (!inner_ptr) return core::make_unexpected(inner_ptr.error());
-                if (!stmt.block_stmts.push(inner_ptr.value()))
+                if (!inner_ptr) {
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
+                    return core::make_unexpected(inner_ptr.error());
+                }
+                if (!stmt.block_stmts.push(inner_ptr.value())) {
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
                     return frontend_error(FrontendError::TooManyItems, inner->span);
+                }
             }
+            arm_body_stops_cross_line_dot = saved_dot_stop;
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
             if (stmt.block_stmts.len == 0)
@@ -871,16 +1065,30 @@ struct Parser {
             const bool is_match_guard = take(TokenType::KwMatch) != nullptr;
             Str bind_name{};
             bool bind_value = false;
+            AstExpr cond_expr{};
+            bool cond_done = false;
             if (!is_match_guard && take(TokenType::KwLet)) {
                 auto name = expect(TokenType::Ident);
                 if (!name) return core::make_unexpected(name.error());
-                auto eq = expect(TokenType::Eq);
-                if (!eq) return core::make_unexpected(eq.error());
                 bind_name = name.value()->text;
                 bind_value = true;
+                if (cur().type == TokenType::KwElse) {
+                    // Swift 5.7 shorthand: `guard let x else { ... }` rebinds
+                    // an existing optional name — sugar for `guard let x = x`.
+                    cond_expr.kind = AstExprKind::Ident;
+                    cond_expr.name = bind_name;
+                    cond_expr.span = span_from(*name.value());
+                    cond_done = true;
+                } else {
+                    auto eq = expect(TokenType::Eq);
+                    if (!eq) return core::make_unexpected(eq.error());
+                }
             }
-            auto cond = parse_expr();
-            if (!cond) return core::make_unexpected(cond.error());
+            if (!cond_done) {
+                auto cond = parse_expr();
+                if (!cond) return core::make_unexpected(cond.error());
+                cond_expr = cond.value();
+            }
             auto kw_else = expect(TokenType::KwElse);
             if (!kw_else) return core::make_unexpected(kw_else.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -889,13 +1097,14 @@ struct Parser {
             stmt.kind = AstStmtKind::Guard;
             stmt.name = bind_name;
             stmt.bind_value = bind_value;
-            stmt.expr = cond.value();
+            stmt.expr = cond_expr;
             if (is_match_guard) {
                 while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                    auto kw_case = expect(TokenType::KwCase);
-                    if (!kw_case) return core::make_unexpected(kw_case.error());
+                    if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                     AstStatement::MatchArm arm{};
-                    arm.span = span_from(*kw_case.value());
+                    arm.span = span_from(cur());
                     if (take(TokenType::Underscore)) {
                         arm.is_wildcard = true;
                     } else {
@@ -907,9 +1116,15 @@ struct Parser {
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(*kw_if),
                                               kGuardMatchArmIfDetail);
-                    auto colon = expect(TokenType::Colon);
-                    if (!colon) return core::make_unexpected(colon.error());
+                    if (cur().type == TokenType::Colon)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, span_from(cur()), kMatchColonDetail);
+                    auto arrow = expect(TokenType::Arrow);
+                    if (!arrow) return core::make_unexpected(arrow.error());
+                    const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+                    arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                     auto arm_stmt = parse_stmt();
+                    arm_body_stops_cross_line_dot = saved_dot_stop;
                     if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
                     if (arm_stmt->kind != AstStmtKind::ReturnStatus &&
                         arm_stmt->kind != AstStmtKind::ForwardUpstream) {
@@ -1400,6 +1615,12 @@ struct Parser {
         }
         if (take(TokenType::KwIf)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
+            // `if let` parses (Swift-identical surface) but analysis is
+            // pending — reject here with the migration fix-it so generated
+            // code gets a real diagnostic instead of a stray UnexpectedToken.
+            if (!is_const && cur().type == TokenType::KwLet)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kIfLetPendingDetail);
             auto cond = parse_expr();
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -1447,10 +1668,11 @@ struct Parser {
             stmt.is_const = is_const;
             stmt.expr = subject.value();
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                auto kw_case = expect(TokenType::KwCase);
-                if (!kw_case) return core::make_unexpected(kw_case.error());
+                if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                 AstStatement::MatchArm arm{};
-                arm.span = span_from(*kw_case.value());
+                arm.span = span_from(cur());
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
@@ -1466,9 +1688,15 @@ struct Parser {
                     arm.has_guard = true;
                     arm.guard = guard_ptr.value();
                 }
-                auto colon = expect(TokenType::Colon);
-                if (!colon) return core::make_unexpected(colon.error());
+                if (cur().type == TokenType::Colon)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), kMatchColonDetail);
+                auto arrow = expect(TokenType::Arrow);
+                if (!arrow) return core::make_unexpected(arrow.error());
+                const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+                arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                 auto arm_stmt = parse_stmt();
+                arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
                 if (arm_stmt->kind == AstStmtKind::Let || arm_stmt->kind == AstStmtKind::Guard) {
                     return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
@@ -1781,6 +2009,9 @@ struct Parser {
             return parse_func_guard_stmt(prev());
         }
         if (take(TokenType::KwIf)) {
+            if (cur().type == TokenType::KwLet)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kIfLetPendingDetail);
             auto cond = parse_expr();
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -1821,10 +2052,11 @@ struct Parser {
             stmt.is_const = is_const;
             stmt.expr = subject.value();
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                auto kw_case = expect(TokenType::KwCase);
-                if (!kw_case) return core::make_unexpected(kw_case.error());
+                if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                 AstStatement::MatchArm arm{};
-                arm.span = span_from(*kw_case.value());
+                arm.span = span_from(cur());
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
@@ -1840,9 +2072,15 @@ struct Parser {
                     arm.has_guard = true;
                     arm.guard = guard_ptr.value();
                 }
+                if (cur().type == TokenType::Colon)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(cur()), kMatchColonDetail);
                 auto arrow = expect(TokenType::Arrow);
                 if (!arrow) return core::make_unexpected(arrow.error());
+                const bool saved_dot_stop = arm_body_stops_cross_line_dot;
+                arm_body_stops_cross_line_dot = arm_body_needs_dot_stop();
                 auto arm_stmt = parse_func_body_stmt();
+                arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
                 auto arm_ptr = alloc_stmt(arm_stmt.value());
                 if (!arm_ptr) return core::make_unexpected(arm_ptr.error());
@@ -2486,8 +2724,10 @@ struct Parser {
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-            auto case_kw = expect(TokenType::KwCase);
-            if (!case_kw) return core::make_unexpected(case_kw.error());
+            if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
+            const Token arm_start = cur();
             AstTypeAliasDecl::ArmDecl arm{};
             if (take(TokenType::Underscore)) {
                 arm.is_wildcard = true;
@@ -2534,7 +2774,7 @@ struct Parser {
             if (!target) return core::make_unexpected(target.error());
             arm.type = target.value();
             if (!item.type_alias.arms.push(arm))
-                return frontend_error(FrontendError::TooManyItems, span_from(*case_kw.value()));
+                return frontend_error(FrontendError::TooManyItems, span_from(arm_start));
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());

@@ -25,7 +25,10 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"let", 3})) return TokenType::KwLet;
     if (text.eq({"const", 5})) return TokenType::KwConst;
     if (text.eq({"guard", 5})) return TokenType::KwGuard;
-    if (text.eq({"case", 4})) return TokenType::KwCase;
+    // `case` is recognized CONTEXTUALLY by the parser (only at match-arm position,
+    // where it earns the "arms don't use `case`" fix-it), NOT reserved globally —
+    // otherwise ordinary identifiers (`let case = ...`, a struct field `case`, a
+    // `.case` variant payload) would stop parsing. Mirrors `at`/`timer`/`websocket`.
     if (text.eq({"error", 5})) return TokenType::KwError;
     if (text.eq({"protocol", 8})) return TokenType::KwProtocol;
     if (text.eq({"impl", 4})) return TokenType::KwImpl;
@@ -41,9 +44,11 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"else", 4})) return TokenType::KwElse;
     if (text.eq({"for", 3})) return TokenType::KwFor;
     if (text.eq({"in", 2})) return TokenType::KwIn;
-    if (text.eq({"and", 3})) return TokenType::KwAnd;
-    if (text.eq({"or", 2})) return TokenType::KwOr;
-    if (text.eq({"not", 3})) return TokenType::KwNot;
+    // `and` / `or` / `not` are NOT keywords — boolean operators are the
+    // Swift-identical `&&` / `||` / `!`. The words lex as ordinary
+    // identifiers so member names like `.or(default)` and `bitwise.and(...)`
+    // stay reachable; the parser rejects them with fix-its in operator and
+    // operand positions (see kAndDetail etc. in parser.cc).
     if (text.eq({"nil", 3})) return TokenType::KwNil;
     if (text.eq({"upstream", 8})) return TokenType::KwUpstream;
     if (text.eq({"downstream", 10})) return TokenType::KwDownstream;
@@ -77,6 +82,17 @@ static TokenType keyword_type(Str text) {
 static Span token_span(const Token& tok) {
     return Span{tok.start, tok.end, tok.line, tok.col};
 }
+
+// Fix-it details for removed / reserved surface forms (DESIGN.md §3.6).
+constexpr Str kForceUnwrapDetail = lit_str(
+    "postfix `!` (force unwrap) is not supported; use guard let (if let is "
+    "spec'd, pending)");
+constexpr Str kBitwiseDetail = lit_str(
+    "bitwise symbols are not Rut syntax; the bitwise.and/or/xor/flip/"
+    "shiftLeft/shiftRight builtins are spec'd but not implemented yet");
+constexpr Str kQuestionDetail = lit_str(
+    "`?` / `??` / `?.` are not supported; use guard let, or any(value, "
+    "default) for a fallback (if let / .or(default) are spec'd, pending)");
 
 }  // namespace
 
@@ -291,6 +307,34 @@ LexResult lex(Str source) {
                 return frontend_error(FrontendError::TooManyTokens, token_span(tok));
             continue;
         }
+        // Two-char operators (Swift-identical boolean/comparison set).
+        {
+            const char next = pos < source.len ? source.ptr[pos] : '\0';
+            // Removed shift symbol `<<` gets the bitwise migration fix-it, caught
+            // here before `<` would tokenize as two comparison ops (which reports an
+            // unrelated unexpected `<` instead of pointing to bitwise.shiftLeft).
+            // NOTE: `>>` is NOT caught — it is the legitimate close of a nested
+            // generic type (`Hash<K, Foo<V>>`); `bitwise.shiftRight` covers that op.
+            if (c == '<' && next == '<')
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kBitwiseDetail);
+            TokenType two = TokenType::Error;
+            if (c == '&' && next == '&') two = TokenType::AmpAmp;
+            if (c == '|' && next == '|') two = TokenType::PipePipe;
+            if (c == '!' && next == '=') two = TokenType::BangEq;
+            if (c == '<' && next == '=') two = TokenType::LtEq;
+            if (c == '>' && next == '=') two = TokenType::GtEq;
+            if (two != TokenType::Error) {
+                pos++;
+                col++;
+                tok.end = pos;
+                tok.text = source.slice(tok.start, tok.end);
+                tok.type = two;
+                if (!out.tokens.push(tok))
+                    return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+                continue;
+            }
+        }
         switch (c) {
             case '{':
                 tok.type = TokenType::LBrace;
@@ -337,6 +381,42 @@ LexResult lex(Str source) {
             case '@':
                 tok.type = TokenType::At;
                 break;
+            case '!': {
+                // Postfix `!` (Swift force unwrap) is a removed form. Prefix
+                // not (`!x`) never directly follows a value token without
+                // whitespace, so "value token immediately before, no gap"
+                // identifies the postfix reading.
+                const Token* last = out.tokens.len > 0 ? &out.tokens[out.tokens.len - 1] : nullptr;
+                // String/regex tokens store `end` at the closing quote, so
+                // the character after the literal starts at end + 1.
+                const bool last_is_quoted =
+                    last != nullptr &&
+                    (last->type == TokenType::StringLit || last->type == TokenType::RegexLit);
+                const u32 last_end = last == nullptr ? 0 : last->end + (last_is_quoted ? 1 : 0);
+                const bool after_value_token =
+                    last != nullptr && last_end == tok.start &&
+                    (last->type == TokenType::Ident || last->type == TokenType::IntLit ||
+                     last->type == TokenType::FloatLit || last->type == TokenType::DurLit ||
+                     last->type == TokenType::StringLit || last->type == TokenType::RegexLit ||
+                     last->type == TokenType::RParen || last->type == TokenType::RBracket ||
+                     last->type == TokenType::KwTrue || last->type == TokenType::KwFalse ||
+                     last->type == TokenType::KwNil);
+                if (after_value_token) {
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, token_span(tok), kForceUnwrapDetail);
+                }
+                tok.type = TokenType::Bang;
+                break;
+            }
+            // Removed / reserved symbols get targeted fix-its (DESIGN.md §3.6).
+            case '&':
+            case '^':
+            case '~':
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kBitwiseDetail);
+            case '?':
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kQuestionDetail);
             default:
                 return frontend_error(FrontendError::UnexpectedChar, token_span(tok), tok.text);
         }

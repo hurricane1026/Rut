@@ -12957,7 +12957,7 @@ TEST(route, req_query_or_allows_expected_alternative) {
     using namespace rut;
     const char* src =
         "route GET \"/search\" { let q = req.query(\"q\") let value = any(q, \"\") if value == "
-        "\"rut\" or req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
+        "\"rut\" || req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -13033,7 +13033,7 @@ TEST(route, req_query_all_allows_expected_alternative) {
     using namespace rut;
     const char* src =
         "route GET \"/search\" { let q = req.query(\"q\") let value = all(q, \"rut\") if value == "
-        "\"rut\" or req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
+        "\"rut\" || req.queryString == \"q=admin\" { return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -13114,7 +13114,9 @@ TEST(route, req_query_rejects_or_function_call_form) {
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
 }
 
 TEST(route, req_query_rejects_and_function_call_form) {
@@ -13126,7 +13128,9 @@ TEST(route, req_query_rejects_and_function_call_form) {
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
 }
 
 TEST(route, req_header_rejects_or_function_call_form) {
@@ -13139,7 +13143,9 @@ TEST(route, req_header_rejects_or_function_call_form) {
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
 }
 
 TEST(route, req_header_rejects_and_function_call_form) {
@@ -13152,7 +13158,9 @@ TEST(route, req_header_rejects_and_function_call_form) {
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
 }
 
 TEST(route, req_cookie_rejects_or_function_call_form) {
@@ -13165,7 +13173,9 @@ TEST(route, req_cookie_rejects_or_function_call_form) {
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`or` is not Rut syntax; use `||`", 32}));
 }
 
 TEST(route, req_cookie_rejects_and_function_call_form) {
@@ -13178,20 +13188,27 @@ TEST(route, req_cookie_rejects_and_function_call_form) {
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    std::unique_ptr<AstFile> ast_guard(ast ? ast.value() : nullptr);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(Str{"`and` is not Rut syntax; use `&&`", 33}));
 }
 
-TEST(route, req_query_rejects_double_ampersand_operator) {
+TEST(route, req_query_accepts_double_ampersand_operator) {
     using namespace rut;
     const char* src =
         "route GET \"/search\" { let value = true && false if value { return 204 } else { return "
         "401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-    REQUIRE_FALSE(lexed);
-    CHECK_EQ(lexed.error().code, FrontendError::UnexpectedChar);
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
 }
 
-TEST(route, req_query_rejects_double_pipe_operator) {
+TEST(route, req_query_accepts_double_pipe_operator) {
     using namespace rut;
     const char* src =
         "route GET \"/search\" { let value = true || false if value { return 204 } else { return "
@@ -13199,15 +13216,18 @@ TEST(route, req_query_rejects_double_pipe_operator) {
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
-    REQUIRE_FALSE(ast);
-    CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
 }
 
 TEST(route, req_query_rejects_pipe_rhs_with_bool_operator) {
     using namespace rut;
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/search\" { let value = req.http11 | pass_bool(_) or false if value { "
+        "route GET \"/search\" { let value = req.http11 | pass_bool(_) || false if value { "
         "return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
@@ -13220,7 +13240,7 @@ TEST(route, req_query_accepts_parenthesized_pipe_with_bool_operator_real_socket)
     using namespace rut;
     const char* src =
         "func pass_bool(v: bool) -> bool { v }\n"
-        "route GET \"/search\" { let value = (req.http11 | pass_bool(_)) or false if value "
+        "route GET \"/search\" { let value = (req.http11 | pass_bool(_)) || false if value "
         "{ return 204 } else { return 401 } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
