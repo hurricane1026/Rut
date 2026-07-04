@@ -25,7 +25,10 @@ static TokenType keyword_type(Str text) {
     if (text.eq({"let", 3})) return TokenType::KwLet;
     if (text.eq({"const", 5})) return TokenType::KwConst;
     if (text.eq({"guard", 5})) return TokenType::KwGuard;
-    if (text.eq({"case", 4})) return TokenType::KwCase;
+    // `case` is recognized CONTEXTUALLY by the parser (only at match-arm position,
+    // where it earns the "arms don't use `case`" fix-it), NOT reserved globally —
+    // otherwise ordinary identifiers (`let case = ...`, a struct field `case`, a
+    // `.case` variant payload) would stop parsing. Mirrors `at`/`timer`/`websocket`.
     if (text.eq({"error", 5})) return TokenType::KwError;
     if (text.eq({"protocol", 8})) return TokenType::KwProtocol;
     if (text.eq({"impl", 4})) return TokenType::KwImpl;

@@ -245,7 +245,7 @@ struct Parser {
         if (!lbrace) return core::make_unexpected(lbrace.error());
         if (is_match_guard) {
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                if (cur().type == TokenType::KwCase)
+                if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                 AstStatement::MatchArm arm{};
@@ -1668,7 +1668,7 @@ struct Parser {
             stmt.is_const = is_const;
             stmt.expr = subject.value();
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                if (cur().type == TokenType::KwCase)
+                if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                 AstStatement::MatchArm arm{};
@@ -1917,7 +1917,7 @@ struct Parser {
             stmt.is_const = is_const;
             stmt.expr = subject.value();
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-                if (cur().type == TokenType::KwCase)
+                if (cur().type == TokenType::Ident && cur().text.eq({"case", 4}))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, span_from(cur()), kCaseDetail);
                 AstStatement::MatchArm arm{};

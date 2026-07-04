@@ -27679,6 +27679,26 @@ TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
     rir.destroy();
 }
 
+TEST(frontend, case_in_match_arm_still_rejected_with_fixit) {
+    // `case` is now contextual (not a global keyword), but at match-arm position it
+    // still earns the "arms don't use `case`" fix-it (PR #162 re-review).
+    const char* src = "route GET \"/x\" { let r = match 200 { case 200 => 1 _ => 0 } return r }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+}
+
+TEST(frontend, case_usable_as_identifier_outside_match_arms) {
+    // `case` is no longer reserved globally — it lexes as an ordinary identifier,
+    // so a struct field named `case` parses (mirrors at/timer/websocket).
+    const char* src = "struct S { case: i32 }\nroute GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+}
+
 TEST(frontend, unbraced_arm_body_allows_line_broken_member_access_in_call_arg) {
     // The newline-dot arm boundary must be suspended inside a call argument:
     // a line-broken member access nested in a call arg (`choose(r\n .host)`) is
