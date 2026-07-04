@@ -101,8 +101,8 @@ LLM-facing surface contract).
 
 ### Key syntax patterns:
 - **Swift-exact or absent**: anything that looks like Swift behaves exactly like Swift; near-miss variants don't exist
-- `respond <status>[, body]` / `respond resp` — short-circuit the request from middleware; `return` has ONE meaning everywhere (produce the function's/handler's value; a handler's value is its response, so handlers use `return 200`)
-- `guard <bool> else { respond 401 }` (middleware) / `guard ... else { return 401 }` (handler); `guard let x = expr else { }` / `if let x = expr { }` bind a usable value (nil and error handled uniformly; Swift-identical incl. `guard let x` shorthand)
+- `respond <status>[, body]` / `respond resp` — short-circuit the request from middleware (⏳ pending — `respond` is not a parser keyword yet); `return` has ONE meaning everywhere (produce the function's/handler's value; a handler's value is its response, so handlers use `return 200`)
+- `guard <bool> else { respond 401 }` (middleware) / `guard ... else { return 401 }` (handler); `guard let x = expr else { }` binds a usable value (nil and error handled uniformly; Swift-identical incl. `guard let x` shorthand). `if let x = expr { }` is ⏳ pending (currently rejected with a pending diagnostic)
 - Route captures live in `req.params` (`req.params.id`) — never shadow built-ins like `req.path`; query: `req.query(k) -> string?`, `req.queryAll(k) -> [string]`
 - `=> expr` — single expression, implicit return. `{ stmts }` — block, explicit `return`
 - Named parameters: `auth(req, role: "user")`

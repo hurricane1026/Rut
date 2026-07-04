@@ -3497,8 +3497,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 const auto& term = mir.functions[i].blocks[bi].term;
                 // The guard-let condition only counts at the top level of the
                 // branch condition, not when nested inside an equality
-                // comparison's internal HasValue test.
-                if (RecoveryScan::is_guard_condition(&term.cond, local_index)) return true;
+                // comparison's internal HasValue test. It ALSO only counts as an
+                // unconditional recovery when it is the entry block's terminator
+                // (bi == 0): a top-level `guard let x = value else { ... }`
+                // dominates every path out of the local. A guard nested inside a
+                // conditional branch (`if c { guard let x = value } else { ... }`)
+                // lives in a later block, so it does NOT recover the error on the
+                // sibling path — keep the prelude there (conservative over-keep: a
+                // spurious prelude just returns the default error, a missing one
+                // lets an error masquerade as success).
+                if (bi == 0 && RecoveryScan::is_guard_condition(&term.cond, local_index))
+                    return true;
                 if (RecoveryScan::contains_recovering_use(&term.cond, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.lhs, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.rhs, local_index))

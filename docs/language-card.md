@@ -78,7 +78,8 @@ const key = env("SECRET")     // must be compile-time evaluable
 if cond { ... } else { ... }              // bool branch — always braces
 if let v = expr { ... }                   // ⏳ bind usable value (Swift-identical)
 guard cond else { return 400 }            // cond MUST be bool; else must exit
-guard let v = expr else { return 400 }    // bind or exit (nil AND error alike)
+guard let v = expr else { return 400 }    // bind or exit; error-capable expr works,
+                                          // ⏳ pure-optional expr (req.query/header) pending
 guard let v else { ... }                  // Swift 5.7 shorthand: rebind v
 
 match status {                            // general dispatch — no `case` keyword

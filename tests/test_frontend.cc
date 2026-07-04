@@ -10148,8 +10148,11 @@ TEST(frontend, guard_let_binds_success_value) {
              static_cast<u8>(MirTerminatorKind::Branch));
 }
 TEST(frontend, guard_let_takes_else_branch_on_known_nil) {
-    // Spec §3.3.7: guard let treats nil and error alike — no usable value
-    // means the else branch. A known-nil init folds the condition to false.
+    // Spec §3.3.7: guard let treats nil and error alike — no usable value means
+    // the else branch. A known-nil init folds the condition to false, and (like a
+    // known-error init) the unreachable success-path binding is SKIPPED:
+    // previously materializing it left an always-else route that lower_to_rir
+    // rejected (PR #162 re-review — known-nil == known-error here).
     const char* src =
         "route GET \"/users\" { guard let maybe = nil else { return 401 } return 200 }\n";
     auto lexed = lex(lit(src));
@@ -10158,15 +10161,14 @@ TEST(frontend, guard_let_takes_else_branch_on_known_nil) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].name.eq(lit("maybe")));
-    // The always-false cond makes the success path unreachable; the binding
-    // keeps its optional-ness (pure-nil carriers are not narrowable yet).
-    CHECK(hir->routes[0].locals[0].may_nil);
-    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    // Success-path binding skipped (unreachable) — no `maybe` local.
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
              static_cast<u8>(HirExprKind::BoolLit));
     CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
+    // The whole route now lowers end-to-end (previously rejected at lower_to_rir).
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
 }
 TEST(frontend, equality_expression_lowers_to_cmp_eq) {
     const char* src =
@@ -27650,6 +27652,23 @@ TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_
         "route GET \"/search\" { let value = any(200, fallback()) "
         "if req.http11 { guard let checked = value else { return 401 } return 204 } "
         "else { if value == 200 { return 200 } else { return 500 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+}
+
+TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
+    // The ONLY use of the error-carrier local is a guard-let nested inside a
+    // CONDITIONAL branch; the sibling (else) path does not use it and returns
+    // success. That guard does not dominate the local's error paths, so the
+    // prelude must stay — otherwise `if req.http11` false + a `value` error falls
+    // through to 200 (PR #162 re-review: a guard recovery counts as suppressing
+    // the prelude only when it is the entry-block terminator, i.e. unconditional).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "if req.http11 { guard let checked = value else { return 401 } return 204 } "
+        "else { return 200 } }\n";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK(rir_has_prelude_block(rir));

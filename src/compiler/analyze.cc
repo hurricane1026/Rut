@@ -15681,11 +15681,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         if (!fail_body) return core::make_unexpected(fail_body.error());
                     }
                 }
-                // A known-error init folds the guard condition to false, so the
-                // success path (and with it the binding) is unreachable — skip it.
-                if (stmt.bind_value &&
-                    known_value_state(bound.value(), route.locals.data, route.locals.len, 0) !=
-                        KnownValueState::Error) {
+                // A known-error OR known-nil init folds the guard condition to
+                // false, so the success path (and with it the binding) is
+                // unreachable — skip it. analyze_guard_cond folds both to a false
+                // guard; materializing an unreachable binding for a known-nil init
+                // here left an always-else route that lower_to_rir then rejected.
+                const KnownValueState kBoundState =
+                    known_value_state(bound.value(), route.locals.data, route.locals.len, 0);
+                if (stmt.bind_value && kBoundState != KnownValueState::Error &&
+                    kBoundState != KnownValueState::Nil) {
                     HirLocal local{};
                     local.span = stmt.span;
                     local.name = stmt.name;
