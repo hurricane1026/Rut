@@ -142,6 +142,16 @@ static bool lower_src_to_rir(const char* src, FrontendRirModule& rir) {
     return static_cast<bool>(lowered);
 }
 
+static bool rir_has_prelude_block(const FrontendRirModule& rir) {
+    for (u32 f = 0; f < rir.module.func_count; f++) {
+        const auto& fn = rir.module.functions[f];
+        for (u32 b = 0; b < fn.block_count; b++) {
+            if (fn.blocks[b].label.eq(lit("prelude"))) return true;
+        }
+    }
+    return false;
+}
+
 static std::string format_verify_text(const rir::VerifyResult& result) {
     char msg_data[256];
     rir::PrintBuf msg;
@@ -3193,7 +3203,7 @@ TEST(frontend, parse_wait_rejects_unknown_suffix) {
 }
 
 TEST(frontend, parse_rejects_empty_if_block_with_detail) {
-    const char* src = "route GET \"/x\" { if true { } else { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { if true { } else { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22194,7 +22204,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_substitutes_element_in_cond) {
 TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
     // A body terminator exits the route during the first iteration, so later
     // iterations are unreachable under normal loop semantics.
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -22210,7 +22220,7 @@ TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
 }
 
 TEST(frontend, mir_unrolls_plain_for_loop_with_body_terminator) {
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } else { return 500 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -27595,6 +27605,67 @@ TEST(frontend, if_let_rejects_with_pending_fixit) {
             lit("if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
                 "for now (TODO.md: front-end migration)")));
     }
+}
+
+TEST(frontend, compare_only_fallible_local_keeps_error_prelude) {
+    // A fallible local (error carrier) that is only *compared* — never
+    // guard-recovered — must keep its state-0 error prelude. Equality lowering
+    // emits an internal `HasValue(local)` to decide whether to compare the
+    // payload; that nested test must NOT be mistaken for a guard-let recovery
+    // use (PR #162 review — otherwise the failing carrier would fall through
+    // to 200 instead of the default error).
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) let ok = value == 200 "
+        "return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+}
+
+TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
+    // Control for the case above: when the same error-carrier local IS consumed
+    // by a guard-let, the guard's else branch takes the error, so the prelude
+    // is correctly suppressed. This top-level guard-condition recovery is what
+    // the equality-comparison's nested HasValue must NOT be confused with.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "guard let checked = value else { return 401 } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+}
+
+TEST(frontend, unbraced_arm_body_allows_line_broken_member_access_in_call_arg) {
+    // The newline-dot arm boundary must be suspended inside a call argument:
+    // a line-broken member access nested in a call arg (`choose(r\n .host)`) is
+    // a valid expression, not the next arm's `.pattern`. Without the paren-depth
+    // scoping the `.host` is mistaken for a `.host` arm pattern and the arm is
+    // rejected unless braced (PR #162 review — dot-stop only at the top level of
+    // the bare-expression arm body).
+    const auto src = R"rut(
+struct Req { host: str }
+func choose(h: str) -> i32 => 200
+func handle(r: Req) -> i32 {
+    let failed = error(.timeout)
+    guard match failed else {
+        .timeout => choose(r
+            .host)
+        _ => 500
+    }
+    200
+}
+route GET "/x" { if handle(Req(host: "h")) == 200 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    // Full pipeline: the arm body must also analyze/lower, proving the parse is
+    // semantically well-formed, not merely token-accepted.
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
 }
 
 int main(int argc, char** argv) {

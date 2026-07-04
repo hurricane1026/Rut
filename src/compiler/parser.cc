@@ -32,6 +32,23 @@ struct Parser {
     // position is the only boundary signal (Swift-style newline sensitivity,
     // scoped to arm bodies only).
     bool arm_body_stops_cross_line_dot = false;
+    // Depth of enclosing `(...)` / `[...]` while parsing an arm body. The
+    // newline-dot boundary only applies at the top level of the arm body: a
+    // line-broken member access inside a call argument or group (e.g.
+    // `choose(req\n    .header("Host"))`) must chain normally, not be cut as
+    // the next arm's pattern.
+    u32 arm_body_dot_stop_depth = 0;
+
+    // RAII: suspends the arm-body newline-dot boundary for the extent of a
+    // parenthesized/bracketed sub-expression. Restores on every scope exit,
+    // including the parser's early error returns.
+    struct NestedDelimiterGuard {
+        Parser* parser;
+        explicit NestedDelimiterGuard(Parser* p) : parser(p) { parser->arm_body_dot_stop_depth++; }
+        ~NestedDelimiterGuard() { parser->arm_body_dot_stop_depth--; }
+        NestedDelimiterGuard(const NestedDelimiterGuard&) = delete;
+        NestedDelimiterGuard& operator=(const NestedDelimiterGuard&) = delete;
+    };
 
     const Token& cur() const { return toks->tokens[pos]; }
     const Token& prev() const { return toks->tokens[pos - 1]; }
@@ -283,6 +300,7 @@ struct Parser {
         const Token start = cur();
         AstExpr expr{};
         if (take(TokenType::LBracket)) {
+            NestedDelimiterGuard nested(this);
             AstExpr arr{};
             arr.kind = AstExprKind::ArrayLit;
             while (!take(TokenType::RBracket)) {
@@ -300,6 +318,7 @@ struct Parser {
             return arr;
         }
         if (take(TokenType::LParen)) {
+            NestedDelimiterGuard nested(this);
             auto first = parse_expr();
             if (!first) return core::make_unexpected(first.error());
             if (!take(TokenType::Comma)) {
@@ -340,6 +359,7 @@ struct Parser {
             expr.kind = AstExprKind::VariantCase;
             expr.str_value = case_name.value()->text;
             if (take(TokenType::LParen)) {
+                NestedDelimiterGuard nested(this);
                 auto payload = parse_expr();
                 if (!payload) return core::make_unexpected(payload.error());
                 auto rparen = expect(TokenType::RParen);
@@ -627,6 +647,7 @@ struct Parser {
                 if (parsed_ok) continue;
             }
             if (take(TokenType::LParen)) {
+                NestedDelimiterGuard nested(this);
                 if (expr.kind != AstExprKind::Ident)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
                 if (!take(TokenType::RParen) &&
@@ -681,8 +702,8 @@ struct Parser {
                 }
                 continue;
             }
-            if (arm_body_stops_cross_line_dot && cur().type == TokenType::Dot && pos > 0 &&
-                cur().line != prev().line) {
+            if (arm_body_stops_cross_line_dot && arm_body_dot_stop_depth == 0 &&
+                cur().type == TokenType::Dot && pos > 0 && cur().line != prev().line) {
                 break;  // new-line `.x` starts the next match arm's pattern
             }
             if (!take(TokenType::Dot)) break;
@@ -739,6 +760,7 @@ struct Parser {
                 }
             }
             if (take(TokenType::LParen)) {
+                NestedDelimiterGuard nested(this);
                 const u32 after_lparen = pos;
                 const bool maybe_named_init =
                     expr.kind == AstExprKind::Ident && cur().type != TokenType::RParen &&

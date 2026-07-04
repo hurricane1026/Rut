@@ -3379,7 +3379,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                        value->local_index == local_index;
             }
 
-            static bool is_recovering_use(const MirValue* value, u32 local_index) {
+            // Coalescing shapes that consume the local's error inline (`x || y`,
+            // `x.has ? x.value : ...`). These genuinely recover the error no
+            // matter how deeply they are nested, so they are matched anywhere.
+            static bool is_coalescing_use(const MirValue* value, u32 local_index) {
                 if (value == nullptr) return false;
                 if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, local_index))
                     return true;
@@ -3389,18 +3392,26 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     value->rhs->kind == MirValueKind::ValueOf &&
                     local_ref_matches(value->rhs->lhs, local_index))
                     return true;
-                // A bare usable-value test (guard-let condition): the guard's
-                // else branch consumes the error, so the state-0 error prelude
-                // must not intercept it with a generic 500 first.
-                if (value->kind == MirValueKind::HasValue &&
-                    local_ref_matches(value->lhs, local_index))
-                    return true;
                 return false;
+            }
+
+            // A bare usable-value test — the guard-let condition shape. It only
+            // recovers the error when it IS the guard branch's condition (the
+            // guard's else branch consumes the error, so the state-0 error
+            // prelude must not intercept it with a generic 500). It must be
+            // matched only at the top level of a branch terminator's condition:
+            // equality lowering emits its own nested `HasValue(local)` to decide
+            // whether to compare a fallible payload, and that internal test is
+            // NOT a recovering use — treating it as one would wrongly suppress
+            // the error prelude for a compare-only fallible local.
+            static bool is_guard_condition(const MirValue* value, u32 local_index) {
+                return value != nullptr && value->kind == MirValueKind::HasValue &&
+                       local_ref_matches(value->lhs, local_index);
             }
 
             static bool contains_recovering_use(const MirValue* value, u32 local_index) {
                 if (value == nullptr) return false;
-                if (is_recovering_use(value, local_index)) return true;
+                if (is_coalescing_use(value, local_index)) return true;
                 if (contains_recovering_use(value->lhs, local_index)) return true;
                 if (contains_recovering_use(value->rhs, local_index)) return true;
                 for (u32 ai = 0; ai < value->args.len; ai++) {
@@ -3421,6 +3432,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
+                // The guard-let condition only counts at the top level of the
+                // branch condition, not when nested inside an equality
+                // comparison's internal HasValue test.
+                if (RecoveryScan::is_guard_condition(&term.cond, local_index)) return true;
                 if (RecoveryScan::contains_recovering_use(&term.cond, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.lhs, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.rhs, local_index))
