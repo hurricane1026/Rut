@@ -4556,22 +4556,44 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                            /*is_match_guard=*/false);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
-            // A known-error/known-nil init folds the cond to `false`; the
-            // then-branch is unreachable so the binding is skipped.
+            // A known-error/known-nil init folds the cond to constant `false`.
             const bool folds_false =
                 cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
-            if (!folds_false) {
-                auto bound = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
-                if (!bound) return core::make_unexpected(bound.error());
-                const u32 ref_index = next_local_ref_index(scratch, locals, local_count);
-                auto local =
-                    make_if_let_local(scratch, bound.value(), stmt.name, ref_index, stmt.span);
-                if (!local) return core::make_unexpected(local.error());
-                auto inserted = insert_scoped_local(
-                    then_scoped, then_count, HirRoute::kMaxLocals, local.value(), stmt.span);
-                if (!inserted) return core::make_unexpected(inserted.error());
-                if (!scratch->locals.push(local.value()))
-                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+            // Inject the narrowed binding into the THEN-branch scope so the then
+            // expression can reference it. This happens even when the cond folds
+            // false: Swift still type-checks a statically-dead if-let then branch
+            // and lets it use the binding, so it must analyze — not be dropped
+            // with an unresolved-identifier error.
+            const u32 saved_locals = scratch->locals.len;
+            auto bound = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
+            if (!bound) return core::make_unexpected(bound.error());
+            const u32 ref_index = next_local_ref_index(scratch, locals, local_count);
+            auto local = make_if_let_local(scratch, bound.value(), stmt.name, ref_index, stmt.span);
+            if (!local) return core::make_unexpected(local.error());
+            auto inserted = insert_scoped_local(
+                then_scoped, then_count, HirRoute::kMaxLocals, local.value(), stmt.span);
+            if (!inserted) return core::make_unexpected(inserted.error());
+            if (!scratch->locals.push(local.value()))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            if (folds_false) {
+                // The then branch is statically dead. Type-check it (with the
+                // binding in scope) for well-formedness, then DISCARD it: roll
+                // back the binding and every local the then branch pushed onto
+                // scratch->locals, so their ValueOf(known-error) / dependent
+                // inits never reach lowering. The statically-false `if`
+                // evaluates to the else branch, which becomes the result — but
+                // the then/else shapes must still merge (if-expression parity).
+                auto dead_then = analyze_function_body_stmt(
+                    *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding);
+                if (!dead_then) return core::make_unexpected(dead_then.error());
+                scratch->locals.len = saved_locals;
+                auto live_else = analyze_function_body_stmt(
+                    *stmt.else_stmt, scratch, mod, locals, local_count, binding);
+                if (!live_else) return core::make_unexpected(live_else.error());
+                HirExpr merged_shape{};
+                if (!merge_expr_shape(dead_then.value(), live_else.value(), &merged_shape))
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                return live_else.value();
             }
         } else {
             auto cond = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
@@ -9088,21 +9110,41 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         if (stmt.bind_value) {
             const bool folds_false =
                 cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
-            if (!folds_false) {
-                auto bound = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
-                if (!bound) return core::make_unexpected(bound.error());
-                const u32 ref_index = next_local_ref_index(route, locals, local_count);
-                auto local =
-                    make_if_let_local(route, bound.value(), stmt.name, ref_index, stmt.span);
-                if (!local) return core::make_unexpected(local.error());
-                if (!route->locals.push(local.value()))
-                    return frontend_error(FrontendError::TooManyItems, stmt.span);
-                auto inserted = insert_scoped_local(then_locals.data,
-                                                    then_locals.len,
-                                                    HirRoute::kMaxLocals,
-                                                    local.value(),
-                                                    stmt.span);
-                if (!inserted) return core::make_unexpected(inserted.error());
+            // Inject the narrowed binding into the THEN-arm scope so the then
+            // body can reference it. This happens even when the condition folds
+            // to constant false: Swift still type-checks a statically-dead if-let
+            // then branch (and lets it reference the binding), so we must
+            // analyze it for well-formedness rather than reject it.
+            const u32 saved_locals = route->locals.len;
+            auto bound = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+            if (!bound) return core::make_unexpected(bound.error());
+            const u32 ref_index = next_local_ref_index(route, locals, local_count);
+            auto local = make_if_let_local(route, bound.value(), stmt.name, ref_index, stmt.span);
+            if (!local) return core::make_unexpected(local.error());
+            if (!route->locals.push(local.value()))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            auto inserted = insert_scoped_local(
+                then_locals.data, then_locals.len, HirRoute::kMaxLocals, local.value(), stmt.span);
+            if (!inserted) return core::make_unexpected(inserted.error());
+            if (folds_false) {
+                // The bound source is a statically-known error/nil, so the then
+                // arm is dead. Type-check it (with the binding in scope) for
+                // well-formedness, then DISCARD it — roll back every local the
+                // dead arm introduced (the binding plus any `let`s in its body)
+                // and emit ONLY the live else branch as the route control. This
+                // keeps the binding's ValueOf(known-error) init — which cannot
+                // materialize — out of the lowered, unreachable arm entirely.
+                HirMatchArm dead_then{};
+                auto dead_body = analyze_match_arm_body(*stmt.then_stmt,
+                                                        &dead_then,
+                                                        route,
+                                                        mod,
+                                                        then_locals.data,
+                                                        then_locals.len,
+                                                        binding);
+                if (!dead_body) return core::make_unexpected(dead_body.error());
+                route->locals.len = saved_locals;
+                return analyze_control_stmt(*stmt.else_stmt, route, mod, binding);
             }
         }
 

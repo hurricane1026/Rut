@@ -3501,6 +3501,60 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return false;
             }
         };
+        // Blocks reached from the entry block (0) through ONLY unconditional
+        // control transfers: a `wait` yield's linear continuation, or a
+        // degenerate Branch whose two arms coincide. A guard-let / if-let
+        // recovery condition sitting in such a block still dominates every exit
+        // of the local — exactly like a condition in block 0 — so its else/false
+        // arm is guaranteed to intercept the error before it can escape as a
+        // success. A block reached only through a CONDITIONAL branch is NOT
+        // included: a sibling arm could return success without recovering, so
+        // the prelude must stay there (masquerade guard). This set only widens
+        // recovery RECOGNITION; it never on its own suppresses a prelude.
+        bool linearly_dominated[MirFunction::kMaxBlocks]{};
+        if (mir.functions[i].blocks.len != 0) {
+            linearly_dominated[0] = true;
+            u32 cur = 0;
+            for (u32 walk = 0; walk < mir.functions[i].blocks.len; walk++) {
+                const auto& term = mir.functions[i].blocks[cur].term;
+                u32 next = 0;
+                bool has_next = false;
+                if (term.kind == MirTerminatorKind::YieldTimer &&
+                    mir.functions[i].has_explicit_resume_blocks &&
+                    term.yield_next_state <= mir.functions[i].waits.len) {
+                    // A `wait` yields, then resumes unconditionally at the
+                    // recorded continuation block — a linear transfer.
+                    next = mir.functions[i].resume_blocks[term.yield_next_state];
+                    has_next = true;
+                } else if (term.kind == MirTerminatorKind::Branch &&
+                           term.then_block == term.else_block) {
+                    // Both arms land on the same block: unconditional.
+                    next = term.then_block;
+                    has_next = true;
+                }
+                if (!has_next || next >= mir.functions[i].blocks.len || linearly_dominated[next])
+                    break;
+                linearly_dominated[next] = true;
+                cur = next;
+            }
+        }
+        // A guard-let / if-let condition whose false/else arm consumes the
+        // local's error, in a block that dominates the local's exits. Two
+        // lowered shapes recover: the plain branch condition
+        // (`term.cond = HasValue(local)`, from guard-let / simple if-let) and
+        // the complex if-let form lowered to a match, whose usable-value test
+        // lands in the match SUBJECT (`use_cmp && term.lhs = HasValue(local)`,
+        // not term.cond). Both recover only at a linearly-dominated block; a
+        // condition reached through a conditional branch does not (its sibling
+        // arm could escape with the error unrecovered).
+        auto is_dominating_recovery = [&](u32 bi, u32 local_index) -> bool {
+            if (!linearly_dominated[bi]) return false;
+            const auto& term = mir.functions[i].blocks[bi].term;
+            if (RecoveryScan::is_guard_condition(&term.cond, local_index)) return true;
+            if (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, local_index))
+                return true;
+            return false;
+        };
         auto has_recovering_or_use = [&](u32 local_index) -> bool {
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
                 if (RecoveryScan::contains_recovering_use(&mir.functions[i].locals[li].init,
@@ -3509,19 +3563,18 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
-                // The guard-let condition only counts at the top level of the
-                // branch condition, not when nested inside an equality
-                // comparison's internal HasValue test. It ALSO only counts as an
-                // unconditional recovery when it is the entry block's terminator
-                // (bi == 0): a top-level `guard let x = value else { ... }`
-                // dominates every path out of the local. A guard nested inside a
-                // conditional branch (`if c { guard let x = value } else { ... }`)
-                // lives in a later block, so it does NOT recover the error on the
-                // sibling path — keep the prelude there (conservative over-keep: a
-                // spurious prelude just returns the default error, a missing one
-                // lets an error masquerade as success).
-                if (bi == 0 && RecoveryScan::is_guard_condition(&term.cond, local_index))
-                    return true;
+                // A top-level guard/if-let condition (plain-branch cond OR match
+                // subject) counts as an unconditional recovery only when its
+                // block dominates every path out of the local (linearly_dominated
+                // — block 0, or a linear `wait` continuation). A condition nested
+                // inside a conditional branch (`if c { guard let x = value } else
+                // { ... }`) lives in a non-dominated block, so it does NOT recover
+                // the error on the sibling path — keep the prelude there
+                // (conservative over-keep: a spurious prelude just returns the
+                // default error, a missing one lets an error masquerade as
+                // success). The condition must be at the top level of its slot,
+                // not nested inside an equality comparison's internal HasValue.
+                if (is_dominating_recovery(bi, local_index)) return true;
                 if (RecoveryScan::contains_recovering_use(&term.cond, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.lhs, local_index) ||
                     RecoveryScan::contains_recovering_use(&term.rhs, local_index))
@@ -3544,10 +3597,20 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
+                // The complex if-let form lowers to a match whose usable-value
+                // test is the match SUBJECT (`use_cmp && term.lhs =
+                // HasValue(local)`). Like a plain guard condition, that subject
+                // RECOVERS the error (its false arm is the if-let else) — it is
+                // not an error-masking compare — so scan term.lhs as a top-level
+                // guard condition there, exactly as term.cond is treated. Any
+                // genuinely observing use nested deeper is still caught (the
+                // top-level skip does not propagate into operands).
+                const bool lhs_is_match_subject =
+                    term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, local_index);
                 if (RecoveryScan::contains_non_recovering_use(
                         &term.cond, local_index, /*top_level_cond=*/true) ||
                     RecoveryScan::contains_non_recovering_use(
-                        &term.lhs, local_index, /*top_level_cond=*/false) ||
+                        &term.lhs, local_index, /*top_level_cond=*/lhs_is_match_subject) ||
                     RecoveryScan::contains_non_recovering_use(
                         &term.rhs, local_index, /*top_level_cond=*/false))
                     return true;

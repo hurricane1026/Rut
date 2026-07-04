@@ -27949,6 +27949,146 @@ TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
     rir.destroy();
 }
 
+TEST(frontend, if_let_complex_branch_recovers_carrier_drops_error_prelude) {
+    // Finding 1: a complex-branch `if let` (then body is itself an `if`) lowers
+    // to a Match whose usable-value test lands in the match SUBJECT
+    // (`use_cmp && term.lhs = HasValue(carrier)`), NOT term.cond. That subject at
+    // the dominating entry block recovers the carrier's error via the if-let else
+    // (`return 401`), so the state-0 prelude must be suppressed — otherwise the
+    // else recovery is defeated by a generic error return.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let v = any(200, fallback()) if let x = v { if x == 200 { return 200 } "
+        "else { return 500 } } else { return 401 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_complex_branch_else_observing_use_keeps_error_prelude) {
+    // Adversarial control for finding 1: the match-subject recovery must not be
+    // allowed to strip the prelude when the SAME carrier is also observed on a
+    // non-recovering path. Here the if-let else branch COMPARES the carrier
+    // (`v == 200`), an error-masking use, so the prelude must stay — proving the
+    // match-subject recognition did not open a masquerade hole.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let v = any(200, fallback()) if let x = v { if x == 200 { return 200 } "
+        "else { return 500 } } else { if v == 200 { return 401 } else { return 402 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_after_wait_recovers_carrier_drops_error_prelude) {
+    // Finding 2: after a top-level `wait`, the if-let branch condition
+    // (`term.cond = HasValue(carrier)`) lives in the wait's continuation block,
+    // not block 0. That block is still linearly dominated by the entry (the wait
+    // resumes unconditionally), so the if-let else (`return 401`) recovers the
+    // carrier and the prelude must be suppressed.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let v = any(200, fallback()) wait(1ms) if let x = v { return 200 } "
+        "else { return 401 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, guard_let_after_wait_recovers_carrier_drops_error_prelude) {
+    // Finding 2 guard-let parity: guard-let has the same lowered shape as the
+    // simple if-let (branch cond = HasValue(carrier)); after a wait it too lands
+    // in a linearly-dominated continuation block, so its else (`return 401`)
+    // recovers and the prelude is suppressed — uniform with if-let.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let v = any(200, fallback()) wait(1ms) guard let x = v else { return "
+        "401 } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, guard_let_nested_in_conditional_after_wait_keeps_error_prelude) {
+    // Adversarial (b/c) for finding 2: a guard-let recovery that sits inside a
+    // CONDITIONAL branch AFTER a wait is not linearly dominated (the branch, not
+    // an unconditional jump, leads to it). The sibling path returns success
+    // without recovering the carrier, so the prelude must stay — the post-wait
+    // dominance widening must not leak into conditionally-reached blocks.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { let v = any(200, fallback()) wait(1ms) "
+        "if req.http11 { guard let x = v else { return 401 } return 204 } else { return 200 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_folded_false_function_body_dead_then_references_binding_lowers) {
+    // Finding 3 (function-body site): a known-error init folds the cond to false,
+    // making the then branch statically dead. Swift still type-checks that dead
+    // then branch and lets it reference the binding (`x`). It must compile AND
+    // lower — the binding's unmaterializable ValueOf(known-error) init is
+    // discarded with the dead arm, and the `if` yields the else value.
+    const char* src =
+        "func maybe() -> i32 => error(.timeout)\n"
+        "func f() -> i32 { if let x = maybe() { x } else { 0 } }\n"
+        "route GET \"/u\" { let r = f() return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_folded_false_route_dead_then_references_binding_lowers) {
+    // Finding 3 (route-control site): the folded-false then arm is a block that
+    // binds a `let` off the if-let binding (`let y = x`). The whole dead arm —
+    // binding and its dependent locals — is type-checked then discarded, and only
+    // the live else branch becomes the route control. It must compile AND lower.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { if let x = error(7) { let y = x return 200 } else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // The dead then arm's binding + `let y` are rolled back: only the live else
+    // branch (a bare `return 200`, no locals) survives on the route.
+    CHECK_EQ(hir->routes[0].locals.len, 0u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    FrontendRirModule rir{};
+    CHECK(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_folded_false_rejects_illformed_dead_then_branch) {
+    // Finding 3 well-formedness guard: discarding the dead then branch must not
+    // skip type-checking it. An unresolved identifier inside the statically-dead
+    // then branch is still an error (Swift parity) — the branch is analyzed, then
+    // discarded, so a bad reference is caught, not silently accepted.
+    const char* src =
+        "route GET \"/u\" { if let x = error(7) { let y = nope return 200 } else { return 200 } "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, case_in_match_arm_still_rejected_with_fixit) {
     // `case` is now contextual (not a global keyword), but at match-arm position it
     // still earns the "arms don't use `case`" fix-it (PR #162 re-review).
