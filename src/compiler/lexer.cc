@@ -307,6 +307,14 @@ LexResult lex(Str source) {
         // Two-char operators (Swift-identical boolean/comparison set).
         {
             const char next = pos < source.len ? source.ptr[pos] : '\0';
+            // Removed shift symbol `<<` gets the bitwise migration fix-it, caught
+            // here before `<` would tokenize as two comparison ops (which reports an
+            // unrelated unexpected `<` instead of pointing to bitwise.shiftLeft).
+            // NOTE: `>>` is NOT caught — it is the legitimate close of a nested
+            // generic type (`Hash<K, Foo<V>>`); `bitwise.shiftRight` covers that op.
+            if (c == '<' && next == '<')
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, token_span(tok), kBitwiseDetail);
             TokenType two = TokenType::Error;
             if (c == '&' && next == '&') two = TokenType::AmpAmp;
             if (c == '|' && next == '|') two = TokenType::PipePipe;

@@ -8646,11 +8646,15 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 }
                 if (!arm->guards.push(guard))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                // A known-error init folds the guard condition to false, so the
-                // success path (and with it the binding) is unreachable — skip it.
-                if (inner.bind_value &&
-                    known_value_state(bound.value(), scoped_locals.data, scoped_locals.len, 0) !=
-                        KnownValueState::Error) {
+                // A known-error OR known-nil init folds the guard condition to
+                // false, so the success path (and with it the binding) is
+                // unreachable — skip it (same as the route / function-block guard
+                // paths; an unreachable known-nil binding makes lower_to_rir reject
+                // the always-else arm).
+                const KnownValueState kArmState =
+                    known_value_state(bound.value(), scoped_locals.data, scoped_locals.len, 0);
+                if (inner.bind_value && kArmState != KnownValueState::Error &&
+                    kArmState != KnownValueState::Nil) {
                     HirLocal local{};
                     local.span = inner.span;
                     local.name = inner.name;
