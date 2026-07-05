@@ -3730,6 +3730,50 @@ static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
     return init;
 }
 
+// Builds the narrowed success-path local for an `if let name = expr` binding,
+// mirroring the guard-let binding block: the missing channels are cleared
+// (may_error dropped, may_nil kept only for a pure-optional carrier) and the
+// init is wrapped in a `ValueOf` when the source is error-capable. The caller
+// registers the result on the route and makes it visible in the THEN-branch
+// scope only. `ref_index` must be a fresh slot from next_local_ref_index.
+static FrontendResult<HirLocal> make_if_let_local(
+    HirRoute* route, const HirExpr& bound, Str name, u32 ref_index, Span span) {
+    HirLocal local{};
+    local.span = span;
+    local.name = name;
+    local.ref_index = ref_index;
+    local.type = bound.type;
+    local.generic_index = bound.generic_index;
+    local.associated_name = bound.associated_name;
+    local.generic_has_error_constraint = bound.generic_has_error_constraint;
+    local.generic_has_eq_constraint = bound.generic_has_eq_constraint;
+    local.generic_has_ord_constraint = bound.generic_has_ord_constraint;
+    local.generic_protocol_index = bound.generic_protocol_index;
+    local.generic_protocol_count = bound.generic_protocol_count;
+    for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
+        local.generic_protocol_indices[cpi] = bound.generic_protocol_indices[cpi];
+    // Success path: HasValue conds (error-capable sources) rule out both
+    // channels; pure-optional runtime values keep may_nil (see analyze_guard_cond
+    // — their carrier is not lowerable yet, so those are rejected upstream).
+    local.may_nil = bound.may_nil && !bound.may_error;
+    local.may_error = false;
+    local.variant_index = bound.variant_index;
+    local.struct_index = bound.struct_index;
+    local.tuple_len = bound.tuple_len;
+    for (u32 ti = 0; ti < bound.tuple_len; ti++) {
+        local.tuple_types[ti] = bound.tuple_types[ti];
+        local.tuple_variant_indices[ti] = bound.tuple_variant_indices[ti];
+        local.tuple_struct_indices[ti] = bound.tuple_struct_indices[ti];
+    }
+    local.error_struct_index = bound.error_struct_index;
+    local.error_variant_index = 0xffffffffu;
+    local.shape_index = bound.shape_index;
+    auto init = make_guard_bound_init(route, bound, span);
+    if (!init) return core::make_unexpected(init.error());
+    local.init = init.value();
+    return local;
+}
+
 static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count) {
     u32 next = 0;
     for (u32 i = 0; i < local_count; i++) {
@@ -4493,12 +4537,74 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         return analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
 
     if (stmt.kind == AstStmtKind::If) {
-        auto cond = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
-        if (!cond) return core::make_unexpected(cond.error());
-        if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
-            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-        auto then_expr =
-            analyze_function_body_stmt(*stmt.then_stmt, scratch, mod, locals, local_count, binding);
+        // `if let name = expr { then } else { else }`: the condition folds to
+        // `HasValue(expr)` (via analyze_guard_cond), and the narrowed binding is
+        // injected into the THEN-branch scope only. The else branch and the
+        // enclosing scope never see the binding. Plain `if cond` keeps the
+        // non-fallible-bool condition path unchanged.
+        HirLocal then_scoped[HirRoute::kMaxLocals]{};
+        for (u32 i = 0; i < local_count; i++) then_scoped[i] = locals[i];
+        u32 then_count = local_count;
+        HirExpr cond_expr{};
+        if (stmt.bind_value) {
+            auto cond = analyze_guard_cond(stmt.expr,
+                                           scratch,
+                                           mod,
+                                           locals,
+                                           local_count,
+                                           binding,
+                                           /*binds_value=*/true,
+                                           /*is_match_guard=*/false);
+            if (!cond) return core::make_unexpected(cond.error());
+            cond_expr = cond.value();
+            // A known-error/known-nil init folds the cond to constant `false`.
+            const bool folds_false =
+                cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
+            // Inject the narrowed binding into the THEN-branch scope so the then
+            // expression can reference it. This happens even when the cond folds
+            // false: Swift still type-checks a statically-dead if-let then branch
+            // and lets it use the binding, so it must analyze — not be dropped
+            // with an unresolved-identifier error.
+            const u32 saved_locals = scratch->locals.len;
+            auto bound = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
+            if (!bound) return core::make_unexpected(bound.error());
+            const u32 ref_index = next_local_ref_index(scratch, locals, local_count);
+            auto local = make_if_let_local(scratch, bound.value(), stmt.name, ref_index, stmt.span);
+            if (!local) return core::make_unexpected(local.error());
+            auto inserted = insert_scoped_local(
+                then_scoped, then_count, HirRoute::kMaxLocals, local.value(), stmt.span);
+            if (!inserted) return core::make_unexpected(inserted.error());
+            if (!scratch->locals.push(local.value()))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            if (folds_false) {
+                // The then branch is statically dead. Type-check it (with the
+                // binding in scope) for well-formedness, then DISCARD it: roll
+                // back the binding and every local the then branch pushed onto
+                // scratch->locals, so their ValueOf(known-error) / dependent
+                // inits never reach lowering. The statically-false `if`
+                // evaluates to the else branch, which becomes the result — but
+                // the then/else shapes must still merge (if-expression parity).
+                auto dead_then = analyze_function_body_stmt(
+                    *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding);
+                if (!dead_then) return core::make_unexpected(dead_then.error());
+                scratch->locals.len = saved_locals;
+                auto live_else = analyze_function_body_stmt(
+                    *stmt.else_stmt, scratch, mod, locals, local_count, binding);
+                if (!live_else) return core::make_unexpected(live_else.error());
+                HirExpr merged_shape{};
+                if (!merge_expr_shape(dead_then.value(), live_else.value(), &merged_shape))
+                    return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                return live_else.value();
+            }
+        } else {
+            auto cond = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
+            if (!cond) return core::make_unexpected(cond.error());
+            if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+            cond_expr = cond.value();
+        }
+        auto then_expr = analyze_function_body_stmt(
+            *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding);
         if (!then_expr) return core::make_unexpected(then_expr.error());
         auto else_expr =
             analyze_function_body_stmt(*stmt.else_stmt, scratch, mod, locals, local_count, binding);
@@ -4507,6 +4613,19 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (!merge_expr_shape(then_expr.value(), else_expr.value(), &merged_shape))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 
+        // A value-position `if let x = v { x } else { … }` lowers to an IfElse
+        // MirValue, which the RIR expr lowerer materializes eagerly: BOTH arms
+        // are emitted before a `select`. So the then arm's `ValueOf(v)` unwrap
+        // runs even when `v` is an error and the else is chosen. This is benign
+        // in the -fno-exceptions runtime: `ValueOf`/`StructField` lower to pure
+        // `LLVMBuildExtractValue` and the merge to a pure `LLVMBuildSelect`
+        // (jit/codegen.cc) — total SSA ops with no load, branch, trap, or
+        // error-channel write. On the error path the unwrap yields a
+        // garbage-but-harmless payload that the select (cond = HasValue(v),
+        // defined false) discards, so the result is exactly the else value.
+        // A lazy (branch-based) lowering would need to rewrite the shared
+        // IfElse/coalesce/guard-narrowing select lowering wholesale for zero
+        // observable gain, so this is left as-is by design.
         HirExpr out{};
         out.kind = HirExprKind::IfElse;
         out.type = merged_shape.type;
@@ -4532,7 +4651,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         out.error_struct_index = merged_shape.error_struct_index;
         out.error_variant_index = merged_shape.error_variant_index;
         out.span = stmt.span;
-        if (!scratch->exprs.push(cond.value()))
+        if (!scratch->exprs.push(cond_expr))
             return frontend_error(FrontendError::TooManyItems, stmt.span);
         out.lhs = &scratch->exprs[scratch->exprs.len - 1];
         if (!scratch->exprs.push(then_expr.value()))
@@ -4911,6 +5030,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     local.ref_index = next_local_ref_index(scratch, cur_locals, cur_local_count);
                     local.type = bound->type;
                     local.generic_index = bound->generic_index;
+                    local.associated_name = bound->associated_name;
                     local.generic_has_error_constraint = bound->generic_has_error_constraint;
                     local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                     local.generic_has_ord_constraint = bound->generic_has_ord_constraint;
@@ -8662,6 +8782,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         next_local_ref_index(route, scoped_locals.data, scoped_locals.len);
                     local.type = bound->type;
                     local.generic_index = bound->generic_index;
+                    local.associated_name = bound->associated_name;
                     local.generic_has_error_constraint = bound->generic_has_error_constraint;
                     local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                     local.generic_has_ord_constraint = bound->generic_has_ord_constraint;
@@ -8706,11 +8827,31 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
     if (stmt.kind == AstStmtKind::If) {
         arm->body_kind = HirMatchArm::BodyKind::If;
-        auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
-        if (!cond) return core::make_unexpected(cond.error());
-        if (cond->type != HirTypeKind::Bool)
-            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-        arm->cond = cond.value();
+        // `if let` inside a match arm: the cond folds to `HasValue(expr)` (with
+        // known-value folding + pure-optional rejection via analyze_guard_cond).
+        // Both branches here are route terminators (return/forward), which take
+        // no locals, so the binding is never referenceable — no local is
+        // injected. Plain `if cond` keeps its bool-condition path.
+        HirExpr cond_expr{};
+        if (stmt.bind_value) {
+            auto cond = analyze_guard_cond(stmt.expr,
+                                           route,
+                                           mod,
+                                           locals,
+                                           local_count,
+                                           binding,
+                                           /*binds_value=*/true,
+                                           /*is_match_guard=*/false);
+            if (!cond) return core::make_unexpected(cond.error());
+            cond_expr = cond.value();
+        } else {
+            auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+            if (!cond) return core::make_unexpected(cond.error());
+            if (cond->type != HirTypeKind::Bool)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+            cond_expr = cond.value();
+        }
+        arm->cond = cond_expr;
         auto then_term = analyze_term(*stmt.then_stmt, mod);
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod);
@@ -8802,11 +8943,30 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
     }
     if (stmt.kind == AstStmtKind::If) {
         body->body_kind = HirGuardBody::BodyKind::If;
-        auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
-        if (!cond) return core::make_unexpected(cond.error());
-        if (cond->type != HirTypeKind::Bool)
-            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-        body->cond = cond.value();
+        // `if let` inside a guard-fail body: cond folds to `HasValue(expr)`
+        // (known-value folding + pure-optional rejection via analyze_guard_cond).
+        // Both branches are route terminators (no locals), so the binding is
+        // never referenceable — no local is injected.
+        HirExpr cond_expr{};
+        if (stmt.bind_value) {
+            auto cond = analyze_guard_cond(stmt.expr,
+                                           route,
+                                           mod,
+                                           locals,
+                                           local_count,
+                                           binding,
+                                           /*binds_value=*/true,
+                                           /*is_match_guard=*/false);
+            if (!cond) return core::make_unexpected(cond.error());
+            cond_expr = cond.value();
+        } else {
+            auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+            if (!cond) return core::make_unexpected(cond.error());
+            if (cond->type != HirTypeKind::Bool)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+            cond_expr = cond.value();
+        }
+        body->cond = cond_expr;
         auto then_term = analyze_term(*stmt.then_stmt, mod);
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod);
@@ -8820,6 +8980,29 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
+}
+
+// True if `expr` reads any wait-result state — a `WaitField` access (e.g.
+// `ev.result`) or a direct wait-result carrier. Route locals (including if-let
+// bindings) are materialized in state 0, BEFORE a wait's resume fills the
+// result, so a binding whose source reads wait-result state would capture a
+// stale value (and trips SSA domination in the JIT, since the state-0
+// definition does not dominate the post-resume use). Used to reject such
+// post-wait if-let bindings, mirroring the post-wait `let` rejection
+// (analyze_rejects_let_after_wait). A binding off a PRE-wait local — persisted
+// in its own context slot across the yield — reads no wait-result state and is
+// unaffected.
+static bool hir_expr_reads_wait_result(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::WaitField || expr.is_wait_result) return true;
+    if (expr.lhs != nullptr && hir_expr_reads_wait_result(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_wait_result(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_reads_wait_result(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_wait_result(*expr.field_inits[i].value))
+            return true;
+    return false;
 }
 
 static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
@@ -8906,17 +9089,38 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     }
 
     if (stmt.kind == AstStmtKind::If) {
-        auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
-        if (!cond) return core::make_unexpected(cond.error());
-        if (cond->type != HirTypeKind::Bool)
-            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+        // `if let name = expr { ... } else { ... }` at route control level:
+        // cond folds to `HasValue(expr)` (analyze_guard_cond handles known-value
+        // folding + pure-optional rejection). The narrowed binding is injected
+        // into the THEN arm's scope only (the else arm keeps the outer scope).
+        HirExpr cond_expr{};
+        if (stmt.bind_value) {
+            auto cond = analyze_guard_cond(stmt.expr,
+                                           route,
+                                           mod,
+                                           locals,
+                                           local_count,
+                                           binding,
+                                           /*binds_value=*/true,
+                                           /*is_match_guard=*/false);
+            if (!cond) return core::make_unexpected(cond.error());
+            cond_expr = cond.value();
+        } else {
+            auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+            if (!cond) return core::make_unexpected(cond.error());
+            if (cond->type != HirTypeKind::Bool)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+            cond_expr = cond.value();
+        }
         const auto simple_branch = [](const AstStatement& branch) {
             return branch.kind == AstStmtKind::ReturnStatus ||
                    branch.kind == AstStmtKind::ForwardUpstream;
         };
         if (simple_branch(*stmt.then_stmt) && simple_branch(*stmt.else_stmt)) {
+            // Terminator branches take no locals, so an `if let` binding here is
+            // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
-            route->control.cond = cond.value();
+            route->control.cond = cond_expr;
             auto then_term = analyze_term(*stmt.then_stmt, mod);
             if (!then_term) return core::make_unexpected(then_term.error());
             auto else_term = analyze_term(*stmt.else_stmt, mod);
@@ -8934,8 +9138,110 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         if (!supported_branch(*stmt.then_stmt) || !supported_branch(*stmt.else_stmt))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 
+        // Build the THEN-arm scope: outer locals plus the narrowed binding
+        // (unless the cond folded to constant false — then the arm is
+        // unreachable and the binding is skipped).
+        FixedVec<HirLocal, HirRoute::kMaxLocals> then_locals;
+        for (u32 i = 0; i < local_count; i++) {
+            if (!then_locals.push(locals[i]))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+        // Set when a folded-false if-let has a multi-statement Block else that the
+        // two-arm Match builder below must emit — with the statically-dead then arm
+        // NEUTERED (see the folds_false handling for the rationale).
+        bool neuter_dead_then = false;
+        // Mirror flag for a folded-TRUE if-let with a Block then: the dead else
+        // arm is type-checked, rolled back, and neutered so its (unreachable)
+        // fallible locals never reach state-0 materialization or the error
+        // prelude.
+        bool neuter_dead_else = false;
+        if (stmt.bind_value) {
+            const bool folds_false =
+                cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
+            // Inject the narrowed binding into the THEN-arm scope so the then
+            // body can reference it. This happens even when the condition folds
+            // to constant false: Swift still type-checks a statically-dead if-let
+            // then branch (and lets it reference the binding), so we must
+            // analyze it for well-formedness rather than reject it.
+            const u32 saved_locals = route->locals.len;
+            auto bound = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+            if (!bound) return core::make_unexpected(bound.error());
+            // A post-wait if-let whose bound SOURCE reads wait-result state
+            // (`if let r = ev.result` after `let ev = wait(...)`) would
+            // materialize its binding in state 0 — before the wait's resume
+            // fills the result — capturing a stale value; the JIT even rejects
+            // the SSA (state-0 def does not dominate the post-resume use). Route
+            // locals have no post-resume rematerialization yet, so reject it
+            // specifically, mirroring the post-wait `let` rejection. A binding
+            // off a pre-wait local (persisted across the yield in its own
+            // context slot) reads no wait-result state and is unaffected.
+            if (route->waits.len != 0 && hir_expr_reads_wait_result(bound.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("if-let cannot bind wait-result state after a wait"));
+            const u32 ref_index = next_local_ref_index(route, locals, local_count);
+            auto local = make_if_let_local(route, bound.value(), stmt.name, ref_index, stmt.span);
+            if (!local) return core::make_unexpected(local.error());
+            if (!route->locals.push(local.value()))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            auto inserted = insert_scoped_local(
+                then_locals.data, then_locals.len, HirRoute::kMaxLocals, local.value(), stmt.span);
+            if (!inserted) return core::make_unexpected(inserted.error());
+            if (folds_false) {
+                // The bound source is a statically-known error/nil, so the then
+                // arm is dead. Type-check it (with the binding in scope) for
+                // well-formedness, then DISCARD it — roll back every local the
+                // dead arm introduced (the binding plus any `let`s in its body)
+                // so the binding's ValueOf(known-error) init — which cannot
+                // materialize — never reaches lowering.
+                HirMatchArm dead_then{};
+                auto dead_body = analyze_match_arm_body(*stmt.then_stmt,
+                                                        &dead_then,
+                                                        route,
+                                                        mod,
+                                                        then_locals.data,
+                                                        then_locals.len,
+                                                        binding);
+                if (!dead_body) return core::make_unexpected(dead_body.error());
+                route->locals.len = saved_locals;
+                // A Return/Forward/If else is a plain terminator or branch that
+                // analyze_control_stmt lowers directly as the route control (the
+                // parser collapses a single-statement `{ return N }` else to a
+                // bare terminator, so those reach here too). A MULTI-statement
+                // Block else is NOT a valid HirControl terminator — analyze_control_stmt
+                // has no Block case — so fall through to the two-arm Match builder
+                // below (the same mechanism the non-folded path uses, which handles
+                // block lets/guards/nested-if uniformly) with the dead then arm
+                // NEUTERED to a bare literal return. The subject folds to constant
+                // false, so that arm is never taken; a literal return references no
+                // rolled-back binding, so nothing unmaterializable is lowered.
+                if (stmt.else_stmt->kind != AstStmtKind::Block)
+                    return analyze_control_stmt(*stmt.else_stmt, route, mod, binding);
+                neuter_dead_then = true;
+            }
+            const bool folds_true = cond_expr.kind == HirExprKind::BoolLit && cond_expr.bool_value;
+            if (folds_true) {
+                // The bound source is statically known-available, so the ELSE
+                // arm is dead. Type-check it for well-formedness (outer scope —
+                // the binding is then-only), then roll back every local it
+                // introduced so a dead fallible `let` cannot be materialized in
+                // state 0 and trip the generic error prelude.
+                const u32 saved_after_bind = route->locals.len;
+                HirMatchArm dead_else{};
+                auto dead_body = analyze_match_arm_body(
+                    *stmt.else_stmt, &dead_else, route, mod, locals, local_count, binding);
+                if (!dead_body) return core::make_unexpected(dead_body.error());
+                route->locals.len = saved_after_bind;
+                // Non-Block then: lower it directly as the route control (the
+                // pushed binding is visible via route->locals).
+                if (stmt.then_stmt->kind != AstStmtKind::Block)
+                    return analyze_control_stmt(*stmt.then_stmt, route, mod, binding);
+                neuter_dead_else = true;
+            }
+        }
+
         route->control.kind = HirControlKind::Match;
-        route->control.match_expr = cond.value();
+        route->control.match_expr = cond_expr;
         route->control.match_arms.len = 0;
 
         auto make_bool_pattern = [&](bool value, Span span) {
@@ -8950,18 +9256,42 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         HirMatchArm then_arm{};
         then_arm.span = stmt.then_stmt->span;
         then_arm.pattern = make_bool_pattern(true, stmt.then_stmt->span);
-        auto then_body = analyze_match_arm_body(
-            *stmt.then_stmt, &then_arm, route, mod, locals, local_count, binding);
-        if (!then_body) return core::make_unexpected(then_body.error());
+        if (neuter_dead_then) {
+            // Statically-dead then arm (subject folded to constant false): emit a
+            // bare literal return instead of analyzing the then body, so the
+            // rolled-back if-let binding is never referenced by lowered code. The
+            // status is irrelevant — the constant-false subject never selects it.
+            then_arm.body_kind = HirMatchArm::BodyKind::Direct;
+            then_arm.direct_term.kind = HirTerminatorKind::ReturnStatus;
+            then_arm.direct_term.source_kind = HirTerminatorSourceKind::Literal;
+            then_arm.direct_term.status_code = 500;
+            then_arm.direct_term.span = stmt.then_stmt->span;
+        } else {
+            auto then_body = analyze_match_arm_body(
+                *stmt.then_stmt, &then_arm, route, mod, then_locals.data, then_locals.len, binding);
+            if (!then_body) return core::make_unexpected(then_body.error());
+        }
         if (!route->control.match_arms.push(then_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.then_stmt->span);
 
         HirMatchArm else_arm{};
         else_arm.span = stmt.else_stmt->span;
         else_arm.pattern = make_bool_pattern(false, stmt.else_stmt->span);
-        auto else_body = analyze_match_arm_body(
-            *stmt.else_stmt, &else_arm, route, mod, locals, local_count, binding);
-        if (!else_body) return core::make_unexpected(else_body.error());
+        if (neuter_dead_else) {
+            // Statically-dead else arm (subject folded to constant true): emit a
+            // bare literal return instead of the analyzed body, so its rolled-back
+            // locals are never referenced by lowered code. The constant-true
+            // subject never selects this arm.
+            else_arm.body_kind = HirMatchArm::BodyKind::Direct;
+            else_arm.direct_term.kind = HirTerminatorKind::ReturnStatus;
+            else_arm.direct_term.source_kind = HirTerminatorSourceKind::Literal;
+            else_arm.direct_term.status_code = 500;
+            else_arm.direct_term.span = stmt.else_stmt->span;
+        } else {
+            auto else_body = analyze_match_arm_body(
+                *stmt.else_stmt, &else_arm, route, mod, locals, local_count, binding);
+            if (!else_body) return core::make_unexpected(else_body.error());
+        }
         if (!route->control.match_arms.push(else_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.else_stmt->span);
         return {};
@@ -11205,6 +11535,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     next_local_ref_index(route, route->locals.data, route->locals.len);
                 local.type = bound->type;
                 local.generic_index = bound->generic_index;
+                local.associated_name = bound->associated_name;
                 local.generic_has_error_constraint = bound->generic_has_error_constraint;
                 local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                 local.generic_has_ord_constraint = bound->generic_has_ord_constraint;
@@ -11263,6 +11594,20 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             continue;
         }
         if (bstmt.kind == AstStmtKind::If) {
+            // `if let` inside a static for-loop body is currently unreachable —
+            // the parser rejects for-loops wholesale ("for loops are unsupported
+            // in Rut Core"), so no AstStmtKind::For is ever produced and this
+            // analyzer is dead code. Reject the binding form explicitly (fail
+            // loud) rather than fall through: this handler analyzes the cond with
+            // analyze_expr (plain bool), NOT analyze_guard_cond, so it would
+            // mis-treat an if-let's usable-value test as the condition. If static
+            // for-loops are ever enabled, the binding's per-iteration
+            // materialization must be designed before this rejection is lifted.
+            if (bstmt.bind_value)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("if-let is not supported inside a static for-loop body"));
             if (loop.body.has_term)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
@@ -11842,6 +12187,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     route, arm_scoped_locals.data, arm_scoped_locals.len);
                                 local.type = bound->type;
                                 local.generic_index = bound->generic_index;
+                                local.associated_name = bound->associated_name;
                                 local.generic_has_error_constraint =
                                     bound->generic_has_error_constraint;
                                 local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
@@ -15711,6 +16057,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         next_local_ref_index(&route, route.locals.data, route.locals.len);
                     local.type = bound->type;
                     local.generic_index = bound->generic_index;
+                    local.associated_name = bound->associated_name;
                     local.generic_has_error_constraint = bound->generic_has_error_constraint;
                     local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                     local.generic_has_ord_constraint = bound->generic_has_ord_constraint;

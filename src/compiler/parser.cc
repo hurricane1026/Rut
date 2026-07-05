@@ -15,9 +15,6 @@ constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `patter
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
-constexpr Str kIfLetPendingDetail = lit_str(
-    "if let is spec'd but not implemented yet; use `guard let x = ... else { }` "
-    "for now (TODO.md: front-end migration)");
 constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
 constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
 constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
@@ -1615,12 +1612,23 @@ struct Parser {
         }
         if (take(TokenType::KwIf)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
-            // `if let` parses (Swift-identical surface) but analysis is
-            // pending — reject here with the migration fix-it so generated
-            // code gets a real diagnostic instead of a stray UnexpectedToken.
-            if (!is_const && cur().type == TokenType::KwLet)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, span_from(cur()), kIfLetPendingDetail);
+            // `if let name = expr { ... } else { ... }` — value-binding form
+            // (Swift-identical surface). Parsed exactly like `guard let`: the
+            // binding name is captured on `stmt.name`, `bind_value` marks the
+            // If as a let-binding, and `stmt.expr` holds the bound expression
+            // (analyze lowers it to `HasValue(expr)` and narrows the binding
+            // into the then-branch scope only). A plain `if cond { }` leaves
+            // bind_value false and `stmt.expr` as the boolean condition.
+            bool is_let = false;
+            Str let_name{};
+            if (!is_const && take(TokenType::KwLet)) {
+                auto name = expect(TokenType::Ident);
+                if (!name) return core::make_unexpected(name.error());
+                let_name = name.value()->text;
+                is_let = true;
+                auto eq = expect(TokenType::Eq);
+                if (!eq) return core::make_unexpected(eq.error());
+            }
             auto cond = parse_expr();
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -1640,6 +1648,8 @@ struct Parser {
             AstStatement stmt{};
             stmt.kind = AstStmtKind::If;
             stmt.is_const = is_const;
+            stmt.bind_value = is_let;
+            stmt.name = let_name;
             stmt.expr = cond.value();
             stmt.then_stmt = then_ptr.value();
             stmt.else_stmt = else_ptr.value();
@@ -2009,9 +2019,20 @@ struct Parser {
             return parse_func_guard_stmt(prev());
         }
         if (take(TokenType::KwIf)) {
-            if (cur().type == TokenType::KwLet)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, span_from(cur()), kIfLetPendingDetail);
+            // `if let name = expr { ... } else { ... }` — value-binding form,
+            // parsed like `guard let` (see the route-block If site for the full
+            // rationale). Binding name on `stmt.name`, `bind_value` set, bound
+            // expr on `stmt.expr`.
+            bool is_let = false;
+            Str let_name{};
+            if (take(TokenType::KwLet)) {
+                auto name = expect(TokenType::Ident);
+                if (!name) return core::make_unexpected(name.error());
+                let_name = name.value()->text;
+                is_let = true;
+                auto eq = expect(TokenType::Eq);
+                if (!eq) return core::make_unexpected(eq.error());
+            }
             auto cond = parse_expr();
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);
@@ -2030,6 +2051,8 @@ struct Parser {
             if (!else_rbrace) return core::make_unexpected(else_rbrace.error());
             AstStatement stmt{};
             stmt.kind = AstStmtKind::If;
+            stmt.bind_value = is_let;
+            stmt.name = let_name;
             stmt.expr = cond.value();
             auto then_ptr = alloc_stmt(then_stmt.value());
             if (!then_ptr) return core::make_unexpected(then_ptr.error());

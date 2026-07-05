@@ -102,7 +102,7 @@ LLM-facing surface contract).
 ### Key syntax patterns:
 - **Swift-exact or absent**: anything that looks like Swift behaves exactly like Swift; near-miss variants don't exist
 - `respond <status>[, body]` / `respond resp` — short-circuit the request from middleware (⏳ pending — `respond` is not a parser keyword yet); `return` has ONE meaning everywhere (produce the function's/handler's value; a handler's value is its response, so handlers use `return 200`)
-- `guard <bool> else { respond 401 }` (middleware) / `guard ... else { return 401 }` (handler); `guard let x = expr else { }` binds a usable value (nil and error handled uniformly; Swift-identical incl. `guard let x` shorthand). `if let x = expr { }` is ⏳ pending (currently rejected with a pending diagnostic)
+- `guard <bool> else { respond 401 }` (middleware) / `guard ... else { return 401 }` (handler); `guard let x = expr else { }` binds a usable value (nil and error handled uniformly; Swift-identical incl. `guard let x` shorthand). `if let x = expr { } else { }` binds the usable value in the then-branch only (error-capable expr works; ⏳ pure-optional expr like `req.query`/`req.header` still rejected, same as guard let)
 - Route captures live in `req.params` — `req.params.id` is ⏳ pending (analyzer rejects `params` today); never shadow built-ins like `req.path`. Query: `req.query(k) -> str?` works; `req.queryAll(k) -> [str]` is ⏳ pending
 - `=> expr` — single expression, implicit return. `{ stmts }` — block, explicit `return`
 - Named parameters: `auth(req, role: "user")`
@@ -127,7 +127,7 @@ LLM-facing surface contract).
 - **Pre/post middleware** inferred from signature: first param `Request` → pre, `Response` → post
 - **State types**: Hash, LRU (with coalesce), Set, Counter, Bloom, Bitmap — per-shard, bounded capacity, mmap pre-allocated
 - **Regex**: `re"pattern"` literals, Vectorscan backend, multi-pattern auto-merge
-- **Error handling**: Result + `guard let` (⏳ `if let` / `.or(default)` / `== nil`/`!= nil` presence test are pending); no postfix `x?`, no `?.` / `??` / force-unwrap `!`; no exceptions
+- **Error handling**: Result + `guard let` / `if let` (⏳ `.or(default)` / `== nil`/`!= nil` presence test are pending; `if let` over a pure-optional carrier is still rejected); no postfix `x?`, no `?.` / `??` / force-unwrap `!`; no exceptions
 - **Boolean**: `&&` / `||` / `!` (identical to Swift), `true`/`false`/`nil` literals
 - **Loops**: ⏳ pending — `for ... in` (no `while`) with `break`/`continue` is spec'd, but the parser rejects `for` today ("for loops are unsupported in Rut Core")
 - **Domain types**: Duration, ByteSize, StatusCode, Method, IP, CIDR, Port, MediaType, Regex, Time, Tuple

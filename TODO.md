@@ -16,14 +16,15 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
   sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
   (slice 2a). `guard let x` shorthand (slice 2b-1).
-- [ ] Parser/analyze: `if let name = expr { }` — the parser now rejects
-  `if let` with a targeted pending fix-it (was: stray UnexpectedToken).
-  Full plan: parse like guard-let
-  into the If stmt (name/bind_value fields), then in EVERY If analysis site
-  (analyze.cc ~4483/8630/8726/8831/11180 + nested-match copies) lower cond to
-  HirExprKind::HasValue(expr) and inject a narrowed HirLocal (clone the
-  guard-let binding block at analyze.cc ~8579) visible only in then-branch
-  scoped_locals. Reuse make_guard_bound_init.
+- [x] Parser/analyze: `if let name = expr { } else { }` — parses like
+  guard-let (bind_value/name/expr reused on the If stmt at both parse sites).
+  Every non-const If analysis site (analyze.cc: analyze_function_body_stmt,
+  analyze_match_arm_body, analyze_guard_fail_body, analyze_control_stmt) lowers
+  the cond to HirExprKind::HasValue(expr) via analyze_guard_cond (known-value
+  folding + pure-optional rejection reused) and injects a narrowed HirLocal
+  (make_if_let_local → make_guard_bound_init) into the THEN-branch scope only
+  (else/continuation never see it). Terminator-branch sites only swap the cond
+  (binding unreferenceable there). Pure-optional carrier still rejected (below).
 - [ ] `respond status[, body] | resp` statement — NEW semantics: today a
   func's `=> 401`-style guard values are the *function's return value*, not
   an HTTP short-circuit. respond needs an HIR terminal (like ReturnStatus)
@@ -43,6 +44,14 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   HasValue(LocalRef) guard condition as a recovering use, so the prelude
   skips locals whose error the guard consumes (e2e: pick(req.http11) ->
   200 / guard else 401).
+- [ ] Error-prelude suppression: upgrade the linear-dominance walk to real
+  per-local exit-dominance so a recovery behind a benign pre-reject
+  (`guard ok else { return 403 }` before `wait`/recovery) can suppress the
+  prelude WITHOUT letting a terminating sibling that returns success mask
+  an unrecovered error (see
+  conditional_guard_keeps_error_prelude_on_unguarded_sibling — the two
+  shapes are structurally identical to a single-continuation walk; only
+  exit-dominance separates them). Until then: conservative over-keep.
 - [ ] websocket trailing block `{ frame in }`; object literal only in
   call-argument position; pipeline RHS placeholder validation.
 - Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;
