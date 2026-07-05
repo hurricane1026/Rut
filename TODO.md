@@ -70,6 +70,20 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 **Acceptance**: language-card examples all parse and type-check; old forms
 produce the documented fix-its; `./dev.sh test` green.
 
+## P1: Parser Stack-Frame Fragility
+
+`AstItem` is ~485KB and `AstStatement` ~22KB; recursive-descent parse
+functions hold them BY VALUE on the stack (`parse_route_entry`'s local
+`AstItem` alone is half a megabyte). gcc 16.1 Debug deterministically
+overflows the default 8MB stack in
+`test_rate_limit_dsl_decorator_compiles_to_route_limit`
+(`cmake -B build-nojit -DRUT_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Debug`
+with system gcc, then run test_integration — SIGSEGV, stack address
+exhaustion in Parser::parse_route_entry). CI's gcc 13/14 frames still
+fit — one toolchain drift from red. Fix: arena-allocate AstItem in the
+item parsers the way alloc_stmt/alloc_expr already work, or shrink the
+FixedVec capacities that dominate sizeof(AstItem).
+
 ## Recently Completed
 
 - [x] epoll partial-send proactor semantics and recv-buffer integration.
