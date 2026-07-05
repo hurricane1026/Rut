@@ -3323,9 +3323,25 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     // `.or(default)` — the blessed value-fallback surface (DESIGN.md §3.3.7):
     // pure sugar for the eager builtin `any(value, default)`, inheriting its
     // known-value folding and type rules. Pipeline stage receivers keep the
-    // explicit `any(_, default)` spelling.
+    // explicit `any(_, default)` spelling. A user-defined `or` (free function,
+    // impl or protocol method) wins over the sugar so real methods stay
+    // reachable (PR #164 review).
+    const auto module_defines_or_member = [&]() -> bool {
+        if (find_function_index(mod, {"or", 2}) < mod.functions.len) return true;
+        for (u32 ii = 0; ii < mod.impls.len; ii++) {
+            for (u32 mi = 0; mi < mod.impls[ii].methods.len; mi++) {
+                if (mod.impls[ii].methods[mi].name.eq({"or", 2})) return true;
+            }
+        }
+        for (u32 pi = 0; pi < mod.protocols.len; pi++) {
+            for (u32 mi = 0; mi < mod.protocols[pi].methods.len; mi++) {
+                if (mod.protocols[pi].methods[mi].name.eq({"or", 2})) return true;
+            }
+        }
+        return false;
+    };
     if (receiver_override == nullptr && expr.name.eq({"or", 2}) && expr.args.len == 1 &&
-        expr.args[0] != nullptr) {
+        expr.args[0] != nullptr && !module_defines_or_member()) {
         AstExpr any_call{};
         any_call.kind = AstExprKind::Call;
         any_call.span = expr.span;
@@ -4008,6 +4024,18 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
                                                          u32 generic_binding_count) {
+    // Helper bodies analyze against a scratch route (empty path), so their
+    // req.params / req.param accesses skip capture validation. Instantiation
+    // targets the CONCRETE attached route — revalidate here so a helper
+    // reading a capture the route does not provide is rejected (PR #164).
+    if (expr.kind == HirExprKind::ReqParam && route != nullptr && route->path.len != 0 &&
+        !route_path_has_param(route->path, expr.str_value)) {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("helper reads a route capture the attached route does not provide "
+                    "(req.params)"));
+    }
     HirExpr out =
         apply_generic_binding_to_expr(expr, generic_bindings, generic_binding_count, &mod);
     auto concretized =

@@ -28445,6 +28445,58 @@ route {
     REQUIRE_EQ(hir->routes[0].guards.len, 1u);
 }
 
+TEST(frontend, chain_helper_unknown_capture_rejected_at_attachment) {
+    // PR #164 round 3: helper analysis skips capture validation (scratch
+    // route), so instantiation into the concrete route must revalidate — a
+    // helper reading a capture the attached route lacks is rejected there.
+    const auto src = R"rut(
+func require_id(_ req: i32) -> bool {
+    if req.params.id == "42" { true } else { false }
+}
+chain secure {
+    before require_id(req) else 404
+}
+route {
+    use chain secure
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper reads a route capture the attached route does not provide "
+            "(req.params)")));
+}
+
+TEST(frontend, user_defined_or_method_wins_over_fallback_sugar) {
+    // PR #164 round 3: a real user `or` (impl method here) must stay
+    // reachable — the .or(default) sugar applies only when no user-defined
+    // `or` member exists in the module.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Box { value: i32 }
+Box impl Fallback {
+    func or(self: Box, alt: i32) -> i32 => self.value
+}
+route GET "/x" {
+    let v = Box(value: 7).or(2)
+    if v == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
