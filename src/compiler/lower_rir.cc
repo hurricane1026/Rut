@@ -3532,6 +3532,18 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     next = term.then_block;
                     has_next = true;
                 }
+                // NOT extended to single-continuation conditional branches
+                // (one arm terminating, the other continuing): a terminating
+                // sibling arm can return a SUCCESS status while the local
+                // still carries an unrecovered error (see
+                // conditional_guard_keeps_error_prelude_on_unguarded_sibling),
+                // so treating the continuation as dominating would let an
+                // error masquerade as success. Distinguishing a benign
+                // pre-recovery reject (`guard ok else { return 403 }`) from
+                // that masquerade needs real per-local exit-dominance
+                // analysis — tracked in TODO.md. Until then the prelude is
+                // conservatively kept (worst case: generic 500 instead of the
+                // programmed else — never a wrong-direction result).
                 if (!has_next || next >= mir.functions[i].blocks.len || linearly_dominated[next])
                     break;
                 linearly_dominated[next] = true;

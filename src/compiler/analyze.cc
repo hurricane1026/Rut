@@ -3744,6 +3744,7 @@ static FrontendResult<HirLocal> make_if_let_local(
     local.ref_index = ref_index;
     local.type = bound.type;
     local.generic_index = bound.generic_index;
+    local.associated_name = bound.associated_name;
     local.generic_has_error_constraint = bound.generic_has_error_constraint;
     local.generic_has_eq_constraint = bound.generic_has_eq_constraint;
     local.generic_has_ord_constraint = bound.generic_has_ord_constraint;
@@ -5029,6 +5030,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     local.ref_index = next_local_ref_index(scratch, cur_locals, cur_local_count);
                     local.type = bound->type;
                     local.generic_index = bound->generic_index;
+                    local.associated_name = bound->associated_name;
                     local.generic_has_error_constraint = bound->generic_has_error_constraint;
                     local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                     local.generic_has_ord_constraint = bound->generic_has_ord_constraint;
@@ -8780,6 +8782,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         next_local_ref_index(route, scoped_locals.data, scoped_locals.len);
                     local.type = bound->type;
                     local.generic_index = bound->generic_index;
+                    local.associated_name = bound->associated_name;
                     local.generic_has_error_constraint = bound->generic_has_error_constraint;
                     local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                     local.generic_has_ord_constraint = bound->generic_has_ord_constraint;
@@ -9147,6 +9150,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         // two-arm Match builder below must emit — with the statically-dead then arm
         // NEUTERED (see the folds_false handling for the rationale).
         bool neuter_dead_then = false;
+        // Mirror flag for a folded-TRUE if-let with a Block then: the dead else
+        // arm is type-checked, rolled back, and neutered so its (unreachable)
+        // fallible locals never reach state-0 materialization or the error
+        // prelude.
+        bool neuter_dead_else = false;
         if (stmt.bind_value) {
             const bool folds_false =
                 cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
@@ -9211,6 +9219,25 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     return analyze_control_stmt(*stmt.else_stmt, route, mod, binding);
                 neuter_dead_then = true;
             }
+            const bool folds_true = cond_expr.kind == HirExprKind::BoolLit && cond_expr.bool_value;
+            if (folds_true) {
+                // The bound source is statically known-available, so the ELSE
+                // arm is dead. Type-check it for well-formedness (outer scope —
+                // the binding is then-only), then roll back every local it
+                // introduced so a dead fallible `let` cannot be materialized in
+                // state 0 and trip the generic error prelude.
+                const u32 saved_after_bind = route->locals.len;
+                HirMatchArm dead_else{};
+                auto dead_body = analyze_match_arm_body(
+                    *stmt.else_stmt, &dead_else, route, mod, locals, local_count, binding);
+                if (!dead_body) return core::make_unexpected(dead_body.error());
+                route->locals.len = saved_after_bind;
+                // Non-Block then: lower it directly as the route control (the
+                // pushed binding is visible via route->locals).
+                if (stmt.then_stmt->kind != AstStmtKind::Block)
+                    return analyze_control_stmt(*stmt.then_stmt, route, mod, binding);
+                neuter_dead_else = true;
+            }
         }
 
         route->control.kind = HirControlKind::Match;
@@ -9250,9 +9277,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         HirMatchArm else_arm{};
         else_arm.span = stmt.else_stmt->span;
         else_arm.pattern = make_bool_pattern(false, stmt.else_stmt->span);
-        auto else_body = analyze_match_arm_body(
-            *stmt.else_stmt, &else_arm, route, mod, locals, local_count, binding);
-        if (!else_body) return core::make_unexpected(else_body.error());
+        if (neuter_dead_else) {
+            // Statically-dead else arm (subject folded to constant true): emit a
+            // bare literal return instead of the analyzed body, so its rolled-back
+            // locals are never referenced by lowered code. The constant-true
+            // subject never selects this arm.
+            else_arm.body_kind = HirMatchArm::BodyKind::Direct;
+            else_arm.direct_term.kind = HirTerminatorKind::ReturnStatus;
+            else_arm.direct_term.source_kind = HirTerminatorSourceKind::Literal;
+            else_arm.direct_term.status_code = 500;
+            else_arm.direct_term.span = stmt.else_stmt->span;
+        } else {
+            auto else_body = analyze_match_arm_body(
+                *stmt.else_stmt, &else_arm, route, mod, locals, local_count, binding);
+            if (!else_body) return core::make_unexpected(else_body.error());
+        }
         if (!route->control.match_arms.push(else_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.else_stmt->span);
         return {};
@@ -11496,6 +11535,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     next_local_ref_index(route, route->locals.data, route->locals.len);
                 local.type = bound->type;
                 local.generic_index = bound->generic_index;
+                local.associated_name = bound->associated_name;
                 local.generic_has_error_constraint = bound->generic_has_error_constraint;
                 local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                 local.generic_has_ord_constraint = bound->generic_has_ord_constraint;
@@ -12147,6 +12187,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     route, arm_scoped_locals.data, arm_scoped_locals.len);
                                 local.type = bound->type;
                                 local.generic_index = bound->generic_index;
+                                local.associated_name = bound->associated_name;
                                 local.generic_has_error_constraint =
                                     bound->generic_has_error_constraint;
                                 local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
@@ -16016,6 +16057,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         next_local_ref_index(&route, route.locals.data, route.locals.len);
                     local.type = bound->type;
                     local.generic_index = bound->generic_index;
+                    local.associated_name = bound->associated_name;
                     local.generic_has_error_constraint = bound->generic_has_error_constraint;
                     local.generic_has_eq_constraint = bound->generic_has_eq_constraint;
                     local.generic_has_ord_constraint = bound->generic_has_ord_constraint;

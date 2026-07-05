@@ -28300,6 +28300,70 @@ route GET "/x" { if handle(Req(host: "h")) == 200 { return 200 } else { return 5
     REQUIRE(hir);
 }
 
+TEST(frontend, if_let_folded_true_rolls_back_dead_else_locals) {
+    // Round-3 finding: a constant-TRUE if-let (non-fallible bound source) must
+    // mirror the folded-false rollback — the dead else's fallible `let` may
+    // not reach state-0 materialization (no error prelude), and the else arm
+    // is neutered rather than analyzed into route locals.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { if let x = 1 { let k = x return 200 } else { let v = any(200, "
+        "fallback()) if v == 200 { return 500 } else { return 501 } } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_folded_true_non_block_then_lowers_directly) {
+    // Same fold with a plain-terminator then: the route control collapses to
+    // the then terminator; the dead else (fallible local included) is
+    // type-checked, rolled back, and discarded.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/u\" { if let x = 1 { return 200 } else { let v = any(200, fallback()) "
+        "if v == 200 { return 500 } else { return 501 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].control.kind), static_cast<u8>(HirControlKind::Direct));
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, if_let_binding_preserves_associated_type_projection) {
+    // Round-3 finding: an if-let/guard-let binding over a value whose type is
+    // an associated projection (C.Elem) must carry associated_name onto the
+    // narrowed local so later concretization still knows the projection.
+    const auto src = R"rut(
+protocol Iterable {
+    type Elem
+}
+struct Box<T> { value: T }
+Box<T> impl Iterable {
+    type Elem = T
+}
+func firstOf<C>(c: C) -> C.Elem where Iterable(C) {
+    nil
+}
+route GET "/users" {
+    let x = firstOf(Box(value: 200))
+    if let v = x { return 200 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

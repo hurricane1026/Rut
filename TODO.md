@@ -44,6 +44,14 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   HasValue(LocalRef) guard condition as a recovering use, so the prelude
   skips locals whose error the guard consumes (e2e: pick(req.http11) ->
   200 / guard else 401).
+- [ ] Error-prelude suppression: upgrade the linear-dominance walk to real
+  per-local exit-dominance so a recovery behind a benign pre-reject
+  (`guard ok else { return 403 }` before `wait`/recovery) can suppress the
+  prelude WITHOUT letting a terminating sibling that returns success mask
+  an unrecovered error (see
+  conditional_guard_keeps_error_prelude_on_unguarded_sibling — the two
+  shapes are structurally identical to a single-continuation walk; only
+  exit-dominance separates them). Until then: conservative over-keep.
 - [ ] websocket trailing block `{ frame in }`; object literal only in
   call-argument position; pipeline RHS placeholder validation.
 - Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;
