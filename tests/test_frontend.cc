@@ -28419,6 +28419,32 @@ TEST(frontend, or_method_folds_known_available_receiver) {
              static_cast<u8>(HirExprKind::IntLit));
 }
 
+TEST(frontend, req_params_usable_in_chain_helper_body) {
+    // PR #164 review: chain/decorator helpers analyze with a scratch route
+    // (empty path), so req.params.<name> must skip capture validation there —
+    // mirroring req.param("name") — and validate per attached route instead.
+    const auto src = R"rut(
+func require_id(_ req: i32) -> bool {
+    if req.params.id == "42" { true } else { false }
+}
+chain secure {
+    before require_id(req) else 404
+}
+route {
+    use chain secure
+    GET "/users/:id" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

@@ -5815,7 +5815,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (expr.lhs->kind == AstExprKind::Field && expr.lhs->lhs != nullptr &&
             expr.lhs->name.eq({"params", 6}) && expr.lhs->lhs->kind == AstExprKind::Ident &&
             magic_req_receiver(*expr.lhs->lhs, mod, locals, local_count, binding)) {
-            if (route != nullptr && route_path_has_param(route->path, expr.name)) {
+            // Helper bodies (chain/decorator callees with the magic `req`
+            // param) analyze against a scratch route whose path is empty —
+            // the capture set is only known per attached route, so capture
+            // validation is skipped there, mirroring req.param("name").
+            const bool helper_context = route == nullptr || route->path.len == 0;
+            if (helper_context || route_path_has_param(route->path, expr.name)) {
                 HirExpr out{};
                 out.span = expr.span;
                 out.kind = HirExprKind::ReqParam;
