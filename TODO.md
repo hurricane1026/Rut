@@ -54,12 +54,12 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   exit-dominance separates them). Until then: conservative over-keep.
 - [ ] websocket trailing block `{ frame in }`; object literal only in
   call-argument position; pipeline RHS placeholder validation.
-- Checker/builtins: `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace;
-  `req.header/set/add/getAll` + `resp.set/remove/add/header` (remove hyphenated
-  header property paths); `req.params.*` capture namespace (flat `req.<capture>`
-  becomes an error with fix-it); `req.queryAll`; `respond` legality (middleware
-  only) vs status-`return` (handler only); `stats()/metrics()/reload()/
-  upstream.mark()` declarations.
+- Checker/builtins: [x] `.or(default)` (sugar for eager `any(value, default)`);
+  [x] `req.params.*` capture namespace (flat `req.<capture>` is an error with a
+  fix-it). Still pending: `bitwise.and/or/xor/flip/shiftLeft/shiftRight`
+  namespace; `req.set/add` + `resp.set/remove/add/header` write paths;
+  `req.queryAll`; `respond` legality (middleware only) vs status-`return`
+  (handler only); `stats()/metrics()/reload()/upstream.mark()` declarations.
 - Diagnostics: implement the §3.6 fix-it rows for `?.`, `??`, postfix `!`,
   truthiness guard, bitwise symbols, placeholder-less pipeline, `case`,
   middleware/handler return-respond confusion.

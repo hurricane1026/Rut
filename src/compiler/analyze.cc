@@ -3320,6 +3320,23 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         return out;
     }
 
+    // `.or(default)` — the blessed value-fallback surface (DESIGN.md §3.3.7):
+    // pure sugar for the eager builtin `any(value, default)`, inheriting its
+    // known-value folding and type rules. Pipeline stage receivers keep the
+    // explicit `any(_, default)` spelling.
+    if (receiver_override == nullptr && expr.name.eq({"or", 2}) && expr.args.len == 1 &&
+        expr.args[0] != nullptr) {
+        AstExpr any_call{};
+        any_call.kind = AstExprKind::Call;
+        any_call.span = expr.span;
+        any_call.name = Str{"any", 3};
+        if (!any_call.args.push(expr.lhs))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (!any_call.args.push(expr.args[0]))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return analyze_call_expr(any_call, route, mod, locals, local_count, binding, nullptr);
+    }
+
     auto build_cmp = [&](HirExprKind kind,
                          const HirExpr& lhs_expr,
                          const HirExpr& rhs_expr) -> FrontendResult<HirExpr> {
@@ -5778,10 +5795,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return out;
             }
             if (route != nullptr && route_path_has_param(route->path, expr.name)) {
-                out.kind = HirExprKind::ReqParam;
-                out.type = HirTypeKind::Str;
-                out.str_value = expr.name;
-                return out;
+                // Flat capture access is a removed form — captures live in the
+                // params namespace so they can never shadow a built-in
+                // property (DESIGN.md §3.3.4).
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("route captures live in req.params; use req.params.<name>"));
             }
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         }
@@ -5790,6 +5810,23 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        // `req.params.<name>` — route captures live in the params namespace
+        // (DESIGN.md §3.3.4). Mirrors the ReqParam lowering of req.param("name").
+        if (expr.lhs->kind == AstExprKind::Field && expr.lhs->lhs != nullptr &&
+            expr.lhs->name.eq({"params", 6}) && expr.lhs->lhs->kind == AstExprKind::Ident &&
+            magic_req_receiver(*expr.lhs->lhs, mod, locals, local_count, binding)) {
+            if (route != nullptr && route_path_has_param(route->path, expr.name)) {
+                HirExpr out{};
+                out.span = expr.span;
+                out.kind = HirExprKind::ReqParam;
+                out.type = HirTypeKind::Str;
+                out.str_value = expr.name;
+                return out;
+            }
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("route has no such capture in req.params"));
+        }
         if (expr.lhs->kind == AstExprKind::Ident) {
             const u32 variant_index = [&]() {
                 for (u32 i = 0; i < mod.variants.len; i++) {

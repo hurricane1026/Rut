@@ -84,15 +84,13 @@ static Span token_span(const Token& tok) {
 }
 
 // Fix-it details for removed / reserved surface forms (DESIGN.md §3.6).
-constexpr Str kForceUnwrapDetail = lit_str(
-    "postfix `!` (force unwrap) is not supported; use guard let (if let is "
-    "spec'd, pending)");
+constexpr Str kForceUnwrapDetail =
+    lit_str("postfix `!` (force unwrap) is not supported; use if let / guard let");
 constexpr Str kBitwiseDetail = lit_str(
     "bitwise symbols are not Rut syntax; the bitwise.and/or/xor/flip/"
     "shiftLeft/shiftRight builtins are spec'd but not implemented yet");
-constexpr Str kQuestionDetail = lit_str(
-    "`?` / `??` / `?.` are not supported; use guard let, or any(value, "
-    "default) for a fallback (if let / .or(default) are spec'd, pending)");
+constexpr Str kQuestionDetail =
+    lit_str("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)");
 
 }  // namespace
 

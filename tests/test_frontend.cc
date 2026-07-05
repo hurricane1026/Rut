@@ -590,8 +590,7 @@ TEST(frontend, lex_rejects_reserved_optional_symbols_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("`?` / `??` / `?.` are not supported; use guard let, or any(value, "
-                "default) for a fallback (if let / .or(default) are spec'd, pending)")));
+            lit("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)")));
     }
 }
 
@@ -10555,7 +10554,7 @@ TEST(frontend, req_param_flows_as_str) {
 
 TEST(frontend, req_route_param_field_flows_as_str) {
     const char* src =
-        "route GET \"/users/:id\" { let id = req.id if id == \"42\" { return 200 } else { "
+        "route GET \"/users/:id\" { let id = req.params.id if id == \"42\" { return 200 } else { "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -27606,8 +27605,7 @@ TEST(frontend, lex_rejects_postfix_bang_force_unwrap_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("postfix `!` (force unwrap) is not supported; use guard let (if let is "
-                "spec'd, pending)")));
+            lit("postfix `!` (force unwrap) is not supported; use if let / guard let")));
     }
 }
 
@@ -28362,6 +28360,63 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+}
+
+TEST(frontend, flat_route_capture_rejects_with_params_fixit) {
+    // DESIGN.md 3.3.4: captures live in req.params so they can never shadow a
+    // built-in property; the flat form gets a migration fix-it.
+    const char* src = "route GET \"/users/:id\" { let id = req.id return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("route captures live in req.params; use req.params.<name>")));
+}
+
+TEST(frontend, req_params_unknown_capture_rejects) {
+    const char* src = "route GET \"/users/:id\" { let x = req.params.name return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("route has no such capture in req.params")));
+}
+
+TEST(frontend, or_method_desugars_to_any_fallback) {
+    // `.or(default)` is sugar for the eager `any(value, default)` builtin —
+    // same folding, same Or lowering, narrowed non-fallible result.
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\").or(\"dflt\") "
+        "if q == \"rut\" { return 200 } else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, or_method_folds_known_available_receiver) {
+    const char* src =
+        "route GET \"/x\" { let v = 200 .or(0) if v == 200 { return 200 } else { return 500 } "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
 }
 
 int main(int argc, char** argv) {

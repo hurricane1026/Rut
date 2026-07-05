@@ -447,7 +447,8 @@ TEST(jit, frontend_req_remote_addr_read) {
 
 TEST(jit, frontend_req_route_param_field_guard) {
     const char* src =
-        "route GET \"/users/:id\" { if req.id == \"42\" { return 204 } else { return 401 } }\n";
+        "route GET \"/users/:id\" { if req.params.id == \"42\" { return 204 } else { return 401 } "
+        "}\n";
 
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -18455,6 +18456,49 @@ TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
         nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, or_fallback_runtime_present_and_absent) {
+    // `.or(default)` end-to-end: query present -> value; absent -> default.
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\").or(\"dflt\") "
+        "if q == \"rut\" { return 200 } else { if q == \"dflt\" { return 404 } else { return "
+        "500 } } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char with_q[] = "GET /search?q=rut HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    static const char without_q[] = "GET /search HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 404);
 
     engine.shutdown();
     rir.destroy();
