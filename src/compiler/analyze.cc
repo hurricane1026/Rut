@@ -4612,6 +4612,19 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (!merge_expr_shape(then_expr.value(), else_expr.value(), &merged_shape))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
 
+        // A value-position `if let x = v { x } else { … }` lowers to an IfElse
+        // MirValue, which the RIR expr lowerer materializes eagerly: BOTH arms
+        // are emitted before a `select`. So the then arm's `ValueOf(v)` unwrap
+        // runs even when `v` is an error and the else is chosen. This is benign
+        // in the -fno-exceptions runtime: `ValueOf`/`StructField` lower to pure
+        // `LLVMBuildExtractValue` and the merge to a pure `LLVMBuildSelect`
+        // (jit/codegen.cc) — total SSA ops with no load, branch, trap, or
+        // error-channel write. On the error path the unwrap yields a
+        // garbage-but-harmless payload that the select (cond = HasValue(v),
+        // defined false) discards, so the result is exactly the else value.
+        // A lazy (branch-based) lowering would need to rewrite the shared
+        // IfElse/coalesce/guard-narrowing select lowering wholesale for zero
+        // observable gain, so this is left as-is by design.
         HirExpr out{};
         out.kind = HirExprKind::IfElse;
         out.type = merged_shape.type;
@@ -8966,6 +8979,29 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
     return {};
 }
 
+// True if `expr` reads any wait-result state — a `WaitField` access (e.g.
+// `ev.result`) or a direct wait-result carrier. Route locals (including if-let
+// bindings) are materialized in state 0, BEFORE a wait's resume fills the
+// result, so a binding whose source reads wait-result state would capture a
+// stale value (and trips SSA domination in the JIT, since the state-0
+// definition does not dominate the post-resume use). Used to reject such
+// post-wait if-let bindings, mirroring the post-wait `let` rejection
+// (analyze_rejects_let_after_wait). A binding off a PRE-wait local — persisted
+// in its own context slot across the yield — reads no wait-result state and is
+// unaffected.
+static bool hir_expr_reads_wait_result(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::WaitField || expr.is_wait_result) return true;
+    if (expr.lhs != nullptr && hir_expr_reads_wait_result(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_wait_result(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_reads_wait_result(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_wait_result(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
 static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -9107,6 +9143,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             if (!then_locals.push(locals[i]))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
+        // Set when a folded-false if-let has a multi-statement Block else that the
+        // two-arm Match builder below must emit — with the statically-dead then arm
+        // NEUTERED (see the folds_false handling for the rationale).
+        bool neuter_dead_then = false;
         if (stmt.bind_value) {
             const bool folds_false =
                 cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
@@ -9118,6 +9158,19 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             const u32 saved_locals = route->locals.len;
             auto bound = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
             if (!bound) return core::make_unexpected(bound.error());
+            // A post-wait if-let whose bound SOURCE reads wait-result state
+            // (`if let r = ev.result` after `let ev = wait(...)`) would
+            // materialize its binding in state 0 — before the wait's resume
+            // fills the result — capturing a stale value; the JIT even rejects
+            // the SSA (state-0 def does not dominate the post-resume use). Route
+            // locals have no post-resume rematerialization yet, so reject it
+            // specifically, mirroring the post-wait `let` rejection. A binding
+            // off a pre-wait local (persisted across the yield in its own
+            // context slot) reads no wait-result state and is unaffected.
+            if (route->waits.len != 0 && hir_expr_reads_wait_result(bound.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("if-let cannot bind wait-result state after a wait"));
             const u32 ref_index = next_local_ref_index(route, locals, local_count);
             auto local = make_if_let_local(route, bound.value(), stmt.name, ref_index, stmt.span);
             if (!local) return core::make_unexpected(local.error());
@@ -9131,9 +9184,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 // arm is dead. Type-check it (with the binding in scope) for
                 // well-formedness, then DISCARD it — roll back every local the
                 // dead arm introduced (the binding plus any `let`s in its body)
-                // and emit ONLY the live else branch as the route control. This
-                // keeps the binding's ValueOf(known-error) init — which cannot
-                // materialize — out of the lowered, unreachable arm entirely.
+                // so the binding's ValueOf(known-error) init — which cannot
+                // materialize — never reaches lowering.
                 HirMatchArm dead_then{};
                 auto dead_body = analyze_match_arm_body(*stmt.then_stmt,
                                                         &dead_then,
@@ -9144,7 +9196,20 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                         binding);
                 if (!dead_body) return core::make_unexpected(dead_body.error());
                 route->locals.len = saved_locals;
-                return analyze_control_stmt(*stmt.else_stmt, route, mod, binding);
+                // A Return/Forward/If else is a plain terminator or branch that
+                // analyze_control_stmt lowers directly as the route control (the
+                // parser collapses a single-statement `{ return N }` else to a
+                // bare terminator, so those reach here too). A MULTI-statement
+                // Block else is NOT a valid HirControl terminator — analyze_control_stmt
+                // has no Block case — so fall through to the two-arm Match builder
+                // below (the same mechanism the non-folded path uses, which handles
+                // block lets/guards/nested-if uniformly) with the dead then arm
+                // NEUTERED to a bare literal return. The subject folds to constant
+                // false, so that arm is never taken; a literal return references no
+                // rolled-back binding, so nothing unmaterializable is lowered.
+                if (stmt.else_stmt->kind != AstStmtKind::Block)
+                    return analyze_control_stmt(*stmt.else_stmt, route, mod, binding);
+                neuter_dead_then = true;
             }
         }
 
@@ -9164,9 +9229,21 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         HirMatchArm then_arm{};
         then_arm.span = stmt.then_stmt->span;
         then_arm.pattern = make_bool_pattern(true, stmt.then_stmt->span);
-        auto then_body = analyze_match_arm_body(
-            *stmt.then_stmt, &then_arm, route, mod, then_locals.data, then_locals.len, binding);
-        if (!then_body) return core::make_unexpected(then_body.error());
+        if (neuter_dead_then) {
+            // Statically-dead then arm (subject folded to constant false): emit a
+            // bare literal return instead of analyzing the then body, so the
+            // rolled-back if-let binding is never referenced by lowered code. The
+            // status is irrelevant — the constant-false subject never selects it.
+            then_arm.body_kind = HirMatchArm::BodyKind::Direct;
+            then_arm.direct_term.kind = HirTerminatorKind::ReturnStatus;
+            then_arm.direct_term.source_kind = HirTerminatorSourceKind::Literal;
+            then_arm.direct_term.status_code = 500;
+            then_arm.direct_term.span = stmt.then_stmt->span;
+        } else {
+            auto then_body = analyze_match_arm_body(
+                *stmt.then_stmt, &then_arm, route, mod, then_locals.data, then_locals.len, binding);
+            if (!then_body) return core::make_unexpected(then_body.error());
+        }
         if (!route->control.match_arms.push(then_arm))
             return frontend_error(FrontendError::TooManyItems, stmt.then_stmt->span);
 
@@ -11477,6 +11554,20 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             continue;
         }
         if (bstmt.kind == AstStmtKind::If) {
+            // `if let` inside a static for-loop body is currently unreachable —
+            // the parser rejects for-loops wholesale ("for loops are unsupported
+            // in Rut Core"), so no AstStmtKind::For is ever produced and this
+            // analyzer is dead code. Reject the binding form explicitly (fail
+            // loud) rather than fall through: this handler analyzes the cond with
+            // analyze_expr (plain bool), NOT analyze_guard_cond, so it would
+            // mis-treat an if-let's usable-value test as the condition. If static
+            // for-loops are ever enabled, the binding's per-iteration
+            // materialization must be designed before this rejection is lifted.
+            if (bstmt.bind_value)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("if-let is not supported inside a static for-loop body"));
             if (loop.body.has_term)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,

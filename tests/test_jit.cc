@@ -867,6 +867,93 @@ TEST(jit, frontend_req_query_any_non_short_circuit_eager_rhs_is_observed_with_pr
     rir.destroy();
 }
 
+TEST(jit, frontend_if_let_function_body_eager_arm_jit_valid_and_recovers) {
+    // Round-2 finding 4: a value-position function-body `if let x = v { x } else
+    // { 0 }` lowers to an IfElse MirValue whose arms are materialized eagerly
+    // before a select — the then arm's `ValueOf(v)` unwrap runs even on v's error
+    // path. This asserts the eager lowering produces a JIT-VALID module (a real
+    // domination bug would fail engine.compile, as the post-wait finding-1 shape
+    // did) and RUNS correctly on the ERROR path: `any(literal, fallback())`
+    // eagerly evaluates fallback(), whose error propagates, so v is an error at
+    // runtime. The eager `ValueOf(v)` unwrap therefore executes over an errored
+    // carrier (a pure, total LLVMBuildExtractValue yielding a discarded garbage
+    // payload — no fault, no deref, no error-channel write), the select (cond =
+    // HasValue(v) = false) picks the else, and the if-let recovers x = 0. f
+    // returns 0, so the route observes 0 != 200 and returns 401. That the result
+    // is a clean 401 (not a leaked-error prelude 500, nor a crash) is the direct
+    // runtime proof the eager arm is benign.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "func f() -> i32 { let v = any(200, fallback()) if let x = v { x } else { 0 } }\n"
+        "route GET \"/api/users\" { if f() == 200 { return 204 } else { return 401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 401u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_guard_let_function_body_parity_jit_valid_and_recovers) {
+    // Finding 4 guard-let parity: the guard-let form of the same recovery
+    // (`guard let x = v else { 0 } x`) is JIT-valid and, on the identical error
+    // path (v is an eager-error at runtime), takes its else and recovers to 0, so
+    // the route observes 0 != 200 and returns 401 — identical to the if-let form
+    // above. Same recovery, same observable result: parity holds.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "func g() -> i32 { let v = any(200, fallback()) guard let x = v else { 0 } x }\n"
+        "route GET \"/api/users\" { if g() == 200 { return 204 } else { return 401 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 401u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_header_all_non_short_circuit_eager_rhs_is_observed_with_present_header) {
     const char* src =
         "func fallback() -> str => error(.timeout)\n"
