@@ -105,7 +105,7 @@ Nil/error handling — pick by situation, nothing else exists:
 | fallback value | `req.query("page").or("1")` (eager sugar for `any(x, default)`) |
 | branch if present | `if let v = expr { ... } else { ... }` (⏳ pure-optional expr) |
 | stop if absent/failed | `guard let v = expr else { return 400 }` |
-| bare presence test | `x != nil` / `x == nil` ⏳ |
+| bare presence test | `x != nil` / `x == nil` (nil and error are uniformly "absent"; never-nil sources are a compile error) |
 | failure *reason* matters | `match` on the error |
 
 There is NO `x?` postfix, NO `?.`, NO `??`, NO force-unwrap `!x`/`x!`, no

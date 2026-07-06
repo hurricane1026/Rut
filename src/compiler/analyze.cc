@@ -7101,6 +7101,49 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                               expr.rhs->span,
                               lit_str("pipe rhs must be a call stage or _.method(...) stage"));
     }
+    if (expr.kind == AstExprKind::Eq &&
+        (expr.lhs->kind == AstExprKind::Nil) != (expr.rhs->kind == AstExprKind::Nil)) {
+        // `x == nil` / `nil == x` — the blessed bare presence test (DESIGN.md
+        // §3.3.7): true iff x carries no usable value. Nil and error are
+        // uniformly "absent", matching guard let / if let / .or(default).
+        // `x != nil` arrives here through the parser's != desugar as
+        // `(x == nil) == false`.
+        const AstExpr& carrier_ast = expr.lhs->kind == AstExprKind::Nil ? *expr.rhs : *expr.lhs;
+        auto carrier = analyze_expr(carrier_ast, route, mod, locals, local_count, binding);
+        if (!carrier) return core::make_unexpected(carrier.error());
+        if (!carrier->may_nil && !carrier->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("this value is never nil; a presence test needs an "
+                                          "optional or fallible source"));
+        HirExpr out{};
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        const auto state = known_value_state(carrier.value(), locals, local_count, 0);
+        if (state != KnownValueState::Unknown) {
+            out.kind = HirExprKind::BoolLit;
+            out.bool_value = state != KnownValueState::Available;
+            return out;
+        }
+        if (!route->exprs.push(carrier.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr has{};
+        has.kind = HirExprKind::HasValue;
+        has.type = HirTypeKind::Bool;
+        has.span = expr.span;
+        has.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(has)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr false_lit{};
+        false_lit.kind = HirExprKind::BoolLit;
+        false_lit.type = HirTypeKind::Bool;
+        false_lit.span = expr.span;
+        if (!route->exprs.push(false_lit))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.kind = HirExprKind::Eq;
+        out.lhs = &route->exprs[route->exprs.len - 2];
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     if (expr.kind == AstExprKind::Eq || expr.kind == AstExprKind::Lt ||
         expr.kind == AstExprKind::Gt) {
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);

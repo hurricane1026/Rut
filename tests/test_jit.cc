@@ -264,6 +264,46 @@ TEST(jit, return_200) {
     tc.destroy();
 }
 
+TEST(jit, frontend_nil_presence_test_executes_both_ways) {
+    const char* src =
+        "route GET \"/users\" { let h = req.header(\"Host\") let m = req.header(\"X-Missing\") "
+        "guard h != nil else { return 401 } if m == nil { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_header_any_fallback) {
     const char* src =
         "route GET \"/users\" { let host = req.header(\"Host\") let value = any(host, "

@@ -127,7 +127,7 @@ LLM-facing surface contract).
 - **Pre/post middleware** inferred from signature: first param `Request` → pre, `Response` → post
 - **State types**: Hash, LRU (with coalesce), Set, Counter, Bloom, Bitmap — per-shard, bounded capacity, mmap pre-allocated
 - **Regex**: `re"pattern"` literals, Vectorscan backend, multi-pattern auto-merge
-- **Error handling**: Result + `guard let` / `if let` (⏳ `.or(default)` / `== nil`/`!= nil` presence test are pending; `if let` over a pure-optional carrier is still rejected); no postfix `x?`, no `?.` / `??` / force-unwrap `!`; no exceptions
+- **Error handling**: Result + `guard let` / `if let` + `.or(default)` + `x == nil`/`x != nil` presence test (nil and error uniformly "absent"; never-nil sources are a compile error; ⏳ `if let` over a pure-optional carrier is still rejected); no postfix `x?`, no `?.` / `??` / force-unwrap `!`; no exceptions
 - **Boolean**: `&&` / `||` / `!` (identical to Swift), `true`/`false`/`nil` literals
 - **Loops**: ⏳ pending — `for ... in` (no `while`) with `break`/`continue` is spec'd, but the parser rejects `for` today ("for loops are unsupported in Rut Core")
 - **Domain types**: Duration, ByteSize, StatusCode, Method, IP, CIDR, Port, MediaType, Regex, Time, Tuple
