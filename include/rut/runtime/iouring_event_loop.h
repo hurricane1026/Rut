@@ -1095,8 +1095,12 @@ public:
                         } else if (c->throttle_paused) {
                             throttle_resume<IoUringEventLoop>(this, *c);
 #if RUT_ENABLE_WEBSOCKET
-                        } else if (c->is_ws_tunnel) {
-                            // WebSocket tunnel: no idle keepalive timeout (no-op).
+                        } else if (c->is_ws_tunnel || c->is_ws_terminate) {
+                            // WebSocket tunnel/terminate: long-lived sessions
+                            // have no idle keepalive timeout — a quiet-but-
+                            // healthy WebSocket must not be reaped at the HTTP
+                            // keep-alive deadline (RFC 6455 liveness is
+                            // ping/pong, not idle close).
 #endif
                         } else {
                             this->close_conn(*c);

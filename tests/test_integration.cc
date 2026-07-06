@@ -10524,6 +10524,91 @@ static rut::WsFrameAction terminate_test_handler(
 // End-to-end terminate mode: the gateway parses/reassembles/re-frames frames in both
 // directions (not a raw splice). Proves the handler's Forward/Drop verdicts take effect
 // over a real socket, and that Sec-WebSocket-Extensions is stripped from the upgrade.
+TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
+    // Repro for the recurring CI flake in terminate_inspects_forwards_and_drops:
+    // on a loaded runner the server thread can be descheduled long enough for
+    // the client's DROP and PONG to coalesce into ONE recv batch. The inspect
+    // loop must keep draining the buffered PONG after the dropped DROP
+    // (produced==0) instead of waiting for a recv event that will never come.
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+    char buf[1024];
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    CHECK(n > 0 && buf_contains(buf, n, "101", 3));
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    auto frame_text = [&](u8* fr, const char* s, u32 slen) -> u32 {
+        u32 hl = ws_write_header(fr, WsOpcode::Text, true, true, kKey, slen);
+        for (u32 i = 0; i < slen; i++) fr[hl + i] = static_cast<u8>(s[i]);
+        ws_unmask(fr + hl, slen, kKey);
+        return hl + slen;
+    };
+    // DROP and PONG in one TCP segment: one recv batch on the server side.
+    u8 two[512];
+    u32 len = frame_text(two, "DROP", 4);
+    len += frame_text(two + len, "PONG", 4);
+    REQUIRE(send_all(c, reinterpret_cast<char*>(two), len));
+
+    u8 racc[2048];
+    u32 rhave = 0;
+    auto recv_text = [&](u8* out, u32* outlen) -> bool {
+        for (int tries = 0; tries < 50; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                *outlen = static_cast<u32>(h.payload_len);
+                const u32 total = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];
+                rhave -= total;
+                return true;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 5000);
+            if (m <= 0) return false;
+            rhave += static_cast<u32>(m);
+        }
+        return false;
+    };
+    u8 pl[256];
+    u32 pn = 0;
+    CHECK(recv_text(pl, &pn));
+    CHECK(pn == 4 && memcmp(pl, "PONG", 4) == 0);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     using namespace rut;
     WsFrameEchoServer backend;
