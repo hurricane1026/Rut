@@ -3320,6 +3320,84 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         return out;
     }
 
+    // `.or(default)` — the blessed value-fallback surface (DESIGN.md §3.3.7):
+    // pure sugar for the eager builtin `any(value, default)`, inheriting its
+    // known-value folding and type rules. Pipeline stage receivers keep the
+    // explicit `any(_, default)` spelling. A user-defined `or` that applies to
+    // THIS receiver (impl method on its type, UFCS free function taking it, or
+    // a protocol constraint declaring one) wins over the sugar; an unrelated
+    // `or` elsewhere in the module does not disable the sugar (PR #164 rounds
+    // 3 + 4).
+    if (receiver_override == nullptr && expr.name.eq({"or", 2}) && expr.args.len == 1 &&
+        expr.args[0] != nullptr) {
+        // Probe the receiver to scope the user-method check. analyze_expr can
+        // append scratch nodes to route->exprs; the probe result is discarded
+        // after the boolean decision, so roll the pool back — both
+        // continuations re-analyze the receiver themselves (PR #164 round 6).
+        const u32 probe_saved_exprs = route->exprs.len;
+        auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        const auto receiver_has_or_member = [&]() -> bool {
+            if (!recv) return false;  // sugar's any() will re-report the error
+            // A missing-capable receiver cannot dispatch a real method (the
+            // method path rejects may_nil/may_error receivers), so the sugar
+            // always applies — .or(default) on an optional/error value IS the
+            // spec'd fallback form (PR #164 round 6).
+            if (recv->may_nil || recv->may_error) return false;
+            // NOTE: a free function named `or` deliberately does NOT count —
+            // the method resolver here never dispatches UFCS free functions,
+            // and call syntax `or(x, d)` is rejected at parse (operand-position
+            // fix-it), so counting one would only strand the caller with no
+            // working spelling.
+            for (u32 ii = 0; ii < mod.impls.len; ii++) {
+                const auto& impl = mod.impls[ii];
+                // Same template matching as method resolution: a generic
+                // impl on Box<T> applies only to instances of THAT template,
+                // not to every struct receiver.
+                if (!impl_matches_type(mod, impl, recv->type, recv->struct_index)) continue;
+                for (u32 mi = 0; mi < impl.methods.len; mi++) {
+                    if (impl.methods[mi].name.eq({"or", 2})) return true;
+                }
+                // A conformance may inherit the protocol's DEFAULT `or`
+                // without an explicit override entry in impl.methods. Generic-
+                // template conformances are excluded: the concrete dispatcher
+                // does not resolve generic default methods yet, so suppressing
+                // the sugar would strand the receiver with no working spelling
+                // (PR #164 round 7). Tighten when that dispatch lands.
+                if (!impl.is_generic_template && impl.protocol_index < mod.protocols.len) {
+                    const auto& proto = mod.protocols[impl.protocol_index];
+                    for (u32 mi = 0; mi < proto.methods.len; mi++) {
+                        if (proto.methods[mi].name.eq({"or", 2}) &&
+                            proto.methods[mi].function_index != 0xffffffffu)
+                            return true;
+                    }
+                }
+            }
+            if (recv->type == HirTypeKind::Generic) {
+                for (u32 ci = 0; ci < recv->generic_protocol_count; ci++) {
+                    const u32 pi = recv->generic_protocol_indices[ci];
+                    if (pi >= mod.protocols.len) continue;
+                    for (u32 mi = 0; mi < mod.protocols[pi].methods.len; mi++) {
+                        if (mod.protocols[pi].methods[mi].name.eq({"or", 2})) return true;
+                    }
+                }
+            }
+            return false;
+        };
+        const bool suppress_sugar = receiver_has_or_member();
+        route->exprs.len = probe_saved_exprs;  // drop probe scratch nodes
+        if (!suppress_sugar) {
+            AstExpr any_call{};
+            any_call.kind = AstExprKind::Call;
+            any_call.span = expr.span;
+            any_call.name = Str{"any", 3};
+            if (!any_call.args.push(expr.lhs))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!any_call.args.push(expr.args[0]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            return analyze_call_expr(any_call, route, mod, locals, local_count, binding, nullptr);
+        }
+    }
+
     auto build_cmp = [&](HirExprKind kind,
                          const HirExpr& lhs_expr,
                          const HirExpr& rhs_expr) -> FrontendResult<HirExpr> {
@@ -3991,6 +4069,18 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
                                                          u32 generic_binding_count) {
+    // Helper bodies analyze against a scratch route (empty path), so their
+    // req.params / req.param accesses skip capture validation. Instantiation
+    // targets the CONCRETE attached route — revalidate here so a helper
+    // reading a capture the route does not provide is rejected (PR #164).
+    if (expr.kind == HirExprKind::ReqParam && route != nullptr && !route->is_helper_scratch &&
+        !route_path_has_param(route->path, expr.str_value)) {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("helper reads a route capture the attached route does not provide "
+                    "(req.params)"));
+    }
     HirExpr out =
         apply_generic_binding_to_expr(expr, generic_bindings, generic_binding_count, &mod);
     auto concretized =
@@ -5778,10 +5868,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return out;
             }
             if (route != nullptr && route_path_has_param(route->path, expr.name)) {
-                out.kind = HirExprKind::ReqParam;
-                out.type = HirTypeKind::Str;
-                out.str_value = expr.name;
-                return out;
+                // Flat capture access is a removed form — captures live in the
+                // params namespace so they can never shadow a built-in
+                // property (DESIGN.md §3.3.4).
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("route captures live in req.params; use req.params.<name>"));
             }
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         }
@@ -5790,6 +5883,29 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        // `req.params.<name>` — route captures live in the params namespace
+        // (DESIGN.md §3.3.4). Mirrors the ReqParam lowering of req.param("name").
+        if (expr.lhs->kind == AstExprKind::Field && expr.lhs->lhs != nullptr &&
+            expr.lhs->name.eq({"params", 6}) && expr.lhs->lhs->kind == AstExprKind::Ident &&
+            magic_req_receiver(*expr.lhs->lhs, mod, locals, local_count, binding)) {
+            // Helper bodies (chain/decorator callees with the magic `req`
+            // param) analyze against a helper-scratch route — the capture set
+            // is only known per attached route, so capture validation is
+            // skipped there, mirroring req.param("name"). A concrete route
+            // whose path merely happens to be empty still validates.
+            const bool helper_context = route == nullptr || route->is_helper_scratch;
+            if (helper_context || route_path_has_param(route->path, expr.name)) {
+                HirExpr out{};
+                out.span = expr.span;
+                out.kind = HirExprKind::ReqParam;
+                out.type = HirTypeKind::Str;
+                out.str_value = expr.name;
+                return out;
+            }
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("route has no such capture in req.params"));
+        }
         if (expr.lhs->kind == AstExprKind::Ident) {
             const u32 variant_index = [&]() {
                 for (u32 i = 0; i < mod.variants.len; i++) {
@@ -13865,6 +13981,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     auto analyze_function_body_like =
         [&](HirFunction& fn, const AstFunctionDecl& ast_func, Span span) -> FrontendResult<void> {
         HirRoute scratch{};
+        scratch.is_helper_scratch = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*ast_func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());
@@ -15393,6 +15510,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax, item.func.span, item.func.name);
         HirFunction& fn = mod.functions[fn_index];
         HirRoute scratch{};
+        scratch.is_helper_scratch = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*item.func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());

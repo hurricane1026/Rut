@@ -590,8 +590,7 @@ TEST(frontend, lex_rejects_reserved_optional_symbols_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("`?` / `??` / `?.` are not supported; use guard let, or any(value, "
-                "default) for a fallback (if let / .or(default) are spec'd, pending)")));
+            lit("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)")));
     }
 }
 
@@ -10555,7 +10554,7 @@ TEST(frontend, req_param_flows_as_str) {
 
 TEST(frontend, req_route_param_field_flows_as_str) {
     const char* src =
-        "route GET \"/users/:id\" { let id = req.id if id == \"42\" { return 200 } else { "
+        "route GET \"/users/:id\" { let id = req.params.id if id == \"42\" { return 200 } else { "
         "return 404 } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -27606,8 +27605,7 @@ TEST(frontend, lex_rejects_postfix_bang_force_unwrap_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("postfix `!` (force unwrap) is not supported; use guard let (if let is "
-                "spec'd, pending)")));
+            lit("postfix `!` (force unwrap) is not supported; use if let / guard let")));
     }
 }
 
@@ -28354,6 +28352,319 @@ func firstOf<C>(c: C) -> C.Elem where Iterable(C) {
 route GET "/users" {
     let x = firstOf(Box(value: 200))
     if let v = x { return 200 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, flat_route_capture_rejects_with_params_fixit) {
+    // DESIGN.md 3.3.4: captures live in req.params so they can never shadow a
+    // built-in property; the flat form gets a migration fix-it.
+    const char* src = "route GET \"/users/:id\" { let id = req.id return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("route captures live in req.params; use req.params.<name>")));
+}
+
+TEST(frontend, req_params_unknown_capture_rejects) {
+    const char* src = "route GET \"/users/:id\" { let x = req.params.name return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("route has no such capture in req.params")));
+}
+
+TEST(frontend, or_method_desugars_to_any_fallback) {
+    // `.or(default)` is sugar for the eager `any(value, default)` builtin —
+    // same folding, same Or lowering, narrowed non-fallible result.
+    const char* src =
+        "route GET \"/search\" { let q = req.query(\"q\").or(\"dflt\") "
+        "if q == \"rut\" { return 200 } else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
+    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, or_method_folds_known_available_receiver) {
+    const char* src =
+        "route GET \"/x\" { let v = 200 .or(0) if v == 200 { return 200 } else { return 500 } "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
+}
+
+TEST(frontend, req_params_usable_in_chain_helper_body) {
+    // PR #164 review: chain/decorator helpers analyze with a scratch route
+    // (empty path), so req.params.<name> must skip capture validation there —
+    // mirroring req.param("name") — and validate per attached route instead.
+    const auto src = R"rut(
+func require_id(_ req: i32) -> bool {
+    if req.params.id == "42" { true } else { false }
+}
+chain secure {
+    before require_id(req) else 404
+}
+route {
+    use chain secure
+    GET "/users/:id" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, chain_helper_unknown_capture_rejected_at_attachment) {
+    // PR #164 round 3: helper analysis skips capture validation (scratch
+    // route), so instantiation into the concrete route must revalidate — a
+    // helper reading a capture the attached route lacks is rejected there.
+    const auto src = R"rut(
+func require_id(_ req: i32) -> bool {
+    if req.params.id == "42" { true } else { false }
+}
+chain secure {
+    before require_id(req) else 404
+}
+route {
+    use chain secure
+    GET "/users" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper reads a route capture the attached route does not provide "
+            "(req.params)")));
+}
+
+TEST(frontend, user_defined_or_method_wins_over_fallback_sugar) {
+    // PR #164 round 3: a real user `or` (impl method here) must stay
+    // reachable — the .or(default) sugar applies only when no user-defined
+    // `or` member exists in the module.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Box { value: i32 }
+Box impl Fallback {
+    func or(self: Box, alt: i32) -> i32 => self.value
+}
+route GET "/x" {
+    let v = Box(value: 7).or(2)
+    if v == 7 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, unrelated_or_method_does_not_disable_fallback_sugar) {
+    // PR #164 round 4: an `or` member on an UNRELATED type must not disable
+    // the .or(default) sugar for other receivers — suppression is scoped to
+    // receivers the user method actually applies to.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Box { value: i32 }
+Box impl Fallback {
+    func or(self: Box, alt: i32) -> i32 => self.value
+}
+route GET "/search" {
+    let boxed = Box(value: 7).or(2)
+    let q = req.query("q").or("dflt")
+    if boxed == 7 && q == "dflt" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // boxed dispatches to the impl; q lowers through the any() sugar (Or).
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, default_protocol_or_method_wins_over_fallback_sugar) {
+    // PR #164 round 5: a conformance that only INHERITS the protocol's
+    // default `or` (empty impl block) must still win over the sugar.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32 => alt
+}
+struct Box { value: i32 }
+Box impl Fallback {}
+route GET "/x" {
+    let v = Box(value: 7).or(2)
+    if v == 2 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, generic_or_impl_on_other_template_does_not_disable_sugar) {
+    // PR #164 round 5: a generic impl's `or` applies only to instances of
+    // ITS template — receivers of other types keep the fallback sugar.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Wrap<T> { value: T }
+Wrap<T> impl Fallback {
+    func or(self: Wrap<T>, alt: i32) -> i32 => alt
+}
+route GET "/search" {
+    let q = req.query("q").or("dflt")
+    if q == "dflt" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, free_or_function_does_not_block_fallback_sugar) {
+    // PR #164 round 5: a free `or` function is not dispatchable here (no UFCS
+    // free-function resolution in method calls; `or(x, d)` call syntax is a
+    // parse fix-it), so it must not suppress the sugar and strand the caller.
+    const auto src = R"rut(
+func or(_ x: str, alt: str) -> str => alt
+route GET "/search" {
+    let q = req.query("q").or("dflt")
+    if q == "dflt" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, or_sugar_applies_to_optional_receiver_despite_type_method) {
+    // PR #164 round 6: a missing-capable receiver cannot dispatch a real
+    // method, so an `or` member on the UNDERLYING type must not suppress the
+    // sugar — .or(default) on optional/error values is the spec'd fallback.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32 => alt
+}
+struct Box { value: i32 }
+Box impl Fallback {}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 7) } else { error(.missing) }
+}
+route GET "/x" {
+    let b = maybeBox(req.http11).or(Box(value: 1))
+    if b.value == 7 { return 200 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, repeated_or_sugar_does_not_exhaust_expr_pool) {
+    // PR #164 round 6: the member-probe must roll back its scratch nodes —
+    // many .or calls on non-trivial receivers must not hit TooManyItems.
+    const char* src =
+        "route GET \"/x\" { "
+        "let a = req.query(\"a\").or(\"1\") let b = req.query(\"b\").or(\"1\") "
+        "let c = req.query(\"c\").or(\"1\") let d = req.query(\"d\").or(\"1\") "
+        "let e = req.query(\"e\").or(\"1\") let f = req.query(\"f\").or(\"1\") "
+        "let g = req.query(\"g\").or(\"1\") let h = req.query(\"h\").or(\"1\") "
+        "let i = req.query(\"i\").or(\"1\") let j = req.query(\"j\").or(\"1\") "
+        "if a == b { return 200 } else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, empty_path_concrete_route_still_validates_req_params) {
+    // PR #164 round 7: a concrete route whose path happens to be empty is NOT
+    // a helper scratch — unknown captures must still be rejected.
+    const char* src = "route GET \"\" { let x = req.params.id return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("route has no such capture in req.params")));
+}
+
+TEST(frontend, generic_default_or_conformance_keeps_sugar_available) {
+    // PR #164 round 7: the concrete dispatcher cannot resolve a generic
+    // template's inherited default `or`, so suppressing the sugar would leave
+    // the receiver with no working spelling — the sugar stays available.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32 => alt
+}
+struct Wrap<T> { value: T }
+Wrap<T> impl Fallback {}
+route GET "/x" {
+    let w = Wrap(value: 1).or(Wrap(value: 2))
+    if w.value == 1 { return 200 } else { return 500 }
 }
 )rut";
     auto lexed = lex(lit(src));

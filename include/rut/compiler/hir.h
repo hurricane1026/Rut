@@ -956,6 +956,11 @@ struct HirWsHandler {
 };
 
 struct HirRoute {
+    // True for the scratch route used to analyze helper bodies (magic `req`
+    // functions) — capture validation and other per-route checks defer to the
+    // concrete attached route. NOT the same as a concrete route whose path
+    // happens to be empty (PR #164 round 7).
+    bool is_helper_scratch = false;
     struct DecoratorRef {
         Span span{};
         Str name{};

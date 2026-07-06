@@ -101,7 +101,7 @@ Nil/error handling — pick by situation, nothing else exists:
 
 | Situation | Write |
 |---|---|
-| fallback value | `req.query("page").or("1")` ⏳ (today: `any(x, default)`) |
+| fallback value | `req.query("page").or("1")` (eager sugar for `any(x, default)`) |
 | branch if present | `if let v = expr { ... } else { ... }` (⏳ pure-optional expr) |
 | stop if absent/failed | `guard let v = expr else { return 400 }` |
 | bare presence test | `x != nil` / `x == nil` ⏳ |
@@ -188,7 +188,7 @@ req.header("X-Request-ID")   // str?
 req.set("X-User-ID", "123")  req.add("X-Tag", "a")   req.getAll("Accept")   // ⏳ only req.header is wired up
 
 // Route captures / query / cookies / body
-req.params.id                // ⏳ from :id — captures NEVER shadow built-ins
+req.params.id                // from :id — captures NEVER shadow built-ins
 req.query("page")            // str? (first value)
 req.queryAll("tags")         // ⏳ [str]
 req.cookie("session")        // str?
@@ -334,7 +334,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 | Wrong (foreign habit) | Right |
 |---|---|
 | `and` / `or` / `not` | `&&` / `\|\|` / `!` |
-| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` / `if let` (`.or(default)` / `!= nil` ⏳) |
+| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` / `if let` / `.or(default)` (`!= nil` ⏳) |
 | `guard claims else {}` (non-bool) | `guard let claims else {}` |
 | `req.X-Request-ID` | `req.header("X-Request-ID")` |
 | `resp.Server = nil` | `resp.remove("Server")` |
