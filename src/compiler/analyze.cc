@@ -3323,34 +3323,54 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     // `.or(default)` — the blessed value-fallback surface (DESIGN.md §3.3.7):
     // pure sugar for the eager builtin `any(value, default)`, inheriting its
     // known-value folding and type rules. Pipeline stage receivers keep the
-    // explicit `any(_, default)` spelling. A user-defined `or` (free function,
-    // impl or protocol method) wins over the sugar so real methods stay
-    // reachable (PR #164 review).
-    const auto module_defines_or_member = [&]() -> bool {
-        if (find_function_index(mod, {"or", 2}) < mod.functions.len) return true;
-        for (u32 ii = 0; ii < mod.impls.len; ii++) {
-            for (u32 mi = 0; mi < mod.impls[ii].methods.len; mi++) {
-                if (mod.impls[ii].methods[mi].name.eq({"or", 2})) return true;
-            }
-        }
-        for (u32 pi = 0; pi < mod.protocols.len; pi++) {
-            for (u32 mi = 0; mi < mod.protocols[pi].methods.len; mi++) {
-                if (mod.protocols[pi].methods[mi].name.eq({"or", 2})) return true;
-            }
-        }
-        return false;
-    };
+    // explicit `any(_, default)` spelling. A user-defined `or` that applies to
+    // THIS receiver (impl method on its type, UFCS free function taking it, or
+    // a protocol constraint declaring one) wins over the sugar; an unrelated
+    // `or` elsewhere in the module does not disable the sugar (PR #164 rounds
+    // 3 + 4).
     if (receiver_override == nullptr && expr.name.eq({"or", 2}) && expr.args.len == 1 &&
-        expr.args[0] != nullptr && !module_defines_or_member()) {
-        AstExpr any_call{};
-        any_call.kind = AstExprKind::Call;
-        any_call.span = expr.span;
-        any_call.name = Str{"any", 3};
-        if (!any_call.args.push(expr.lhs))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        if (!any_call.args.push(expr.args[0]))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        return analyze_call_expr(any_call, route, mod, locals, local_count, binding, nullptr);
+        expr.args[0] != nullptr) {
+        auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        const auto receiver_has_or_member = [&]() -> bool {
+            if (!recv) return false;  // sugar's any() will re-report the error
+            const u32 fi = find_function_index(mod, {"or", 2});
+            if (fi < mod.functions.len && mod.functions[fi].params.len >= 1) {
+                auto expected = make_expected_param_expr(mod.functions[fi].params[0]);
+                if (same_hir_type_shape(mod, recv.value(), expected)) return true;
+            }
+            for (u32 ii = 0; ii < mod.impls.len; ii++) {
+                const auto& impl = mod.impls[ii];
+                const bool target_matches =
+                    impl.type == recv->type &&
+                    (impl.type != HirTypeKind::Struct || impl.is_generic_template ||
+                     impl.struct_index == recv->struct_index);
+                if (!target_matches) continue;
+                for (u32 mi = 0; mi < impl.methods.len; mi++) {
+                    if (impl.methods[mi].name.eq({"or", 2})) return true;
+                }
+            }
+            if (recv->type == HirTypeKind::Generic) {
+                for (u32 ci = 0; ci < recv->generic_protocol_count; ci++) {
+                    const u32 pi = recv->generic_protocol_indices[ci];
+                    if (pi >= mod.protocols.len) continue;
+                    for (u32 mi = 0; mi < mod.protocols[pi].methods.len; mi++) {
+                        if (mod.protocols[pi].methods[mi].name.eq({"or", 2})) return true;
+                    }
+                }
+            }
+            return false;
+        };
+        if (!receiver_has_or_member()) {
+            AstExpr any_call{};
+            any_call.kind = AstExprKind::Call;
+            any_call.span = expr.span;
+            any_call.name = Str{"any", 3};
+            if (!any_call.args.push(expr.lhs))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!any_call.args.push(expr.args[0]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            return analyze_call_expr(any_call, route, mod, locals, local_count, binding, nullptr);
+        }
     }
 
     auto build_cmp = [&](HirExprKind kind,

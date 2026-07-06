@@ -28497,6 +28497,35 @@ route GET "/x" {
     REQUIRE(hir);
 }
 
+TEST(frontend, unrelated_or_method_does_not_disable_fallback_sugar) {
+    // PR #164 round 4: an `or` member on an UNRELATED type must not disable
+    // the .or(default) sugar for other receivers — suppression is scoped to
+    // receivers the user method actually applies to.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Box { value: i32 }
+Box impl Fallback {
+    func or(self: Box, alt: i32) -> i32 => self.value
+}
+route GET "/search" {
+    let boxed = Box(value: 7).or(2)
+    let q = req.query("q").or("dflt")
+    if boxed == 7 && q == "dflt" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    // boxed dispatches to the impl; q lowers through the any() sugar (Or).
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
