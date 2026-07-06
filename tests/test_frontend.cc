@@ -28593,6 +28593,52 @@ route GET "/search" {
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
 }
 
+TEST(frontend, or_sugar_applies_to_optional_receiver_despite_type_method) {
+    // PR #164 round 6: a missing-capable receiver cannot dispatch a real
+    // method, so an `or` member on the UNDERLYING type must not suppress the
+    // sugar — .or(default) on optional/error values is the spec'd fallback.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32 => alt
+}
+struct Box { value: i32 }
+Box impl Fallback {}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 7) } else { error(.missing) }
+}
+route GET "/x" {
+    let b = maybeBox(req.http11).or(Box(value: 1))
+    if b.value == 7 { return 200 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, repeated_or_sugar_does_not_exhaust_expr_pool) {
+    // PR #164 round 6: the member-probe must roll back its scratch nodes —
+    // many .or calls on non-trivial receivers must not hit TooManyItems.
+    const char* src =
+        "route GET \"/x\" { "
+        "let a = req.query(\"a\").or(\"1\") let b = req.query(\"b\").or(\"1\") "
+        "let c = req.query(\"c\").or(\"1\") let d = req.query(\"d\").or(\"1\") "
+        "let e = req.query(\"e\").or(\"1\") let f = req.query(\"f\").or(\"1\") "
+        "let g = req.query(\"g\").or(\"1\") let h = req.query(\"h\").or(\"1\") "
+        "let i = req.query(\"i\").or(\"1\") let j = req.query(\"j\").or(\"1\") "
+        "if a == b { return 200 } else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

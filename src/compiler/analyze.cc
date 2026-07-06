@@ -3330,9 +3330,19 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     // 3 + 4).
     if (receiver_override == nullptr && expr.name.eq({"or", 2}) && expr.args.len == 1 &&
         expr.args[0] != nullptr) {
+        // Probe the receiver to scope the user-method check. analyze_expr can
+        // append scratch nodes to route->exprs; the probe result is discarded
+        // after the boolean decision, so roll the pool back — both
+        // continuations re-analyze the receiver themselves (PR #164 round 6).
+        const u32 probe_saved_exprs = route->exprs.len;
         auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         const auto receiver_has_or_member = [&]() -> bool {
             if (!recv) return false;  // sugar's any() will re-report the error
+            // A missing-capable receiver cannot dispatch a real method (the
+            // method path rejects may_nil/may_error receivers), so the sugar
+            // always applies — .or(default) on an optional/error value IS the
+            // spec'd fallback form (PR #164 round 6).
+            if (recv->may_nil || recv->may_error) return false;
             // NOTE: a free function named `or` deliberately does NOT count —
             // the method resolver here never dispatches UFCS free functions,
             // and call syntax `or(x, d)` is rejected at parse (operand-position
@@ -3369,7 +3379,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             }
             return false;
         };
-        if (!receiver_has_or_member()) {
+        const bool suppress_sugar = receiver_has_or_member();
+        route->exprs.len = probe_saved_exprs;  // drop probe scratch nodes
+        if (!suppress_sugar) {
             AstExpr any_call{};
             any_call.kind = AstExprKind::Call;
             any_call.span = expr.span;
