@@ -3324,14 +3324,12 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             bit_kind = HirExprKind::BitAnd;
         } else if (expr.name.eq({"or", 2})) {
             bit_kind = HirExprKind::BitOr;
-        } else if (expr.name.eq({"xor", 3})) {
+        } else if (expr.name.eq({"xor", 3}) || is_flip) {
             bit_kind = HirExprKind::BitXor;
         } else if (expr.name.eq({"shiftLeft", 9})) {
             bit_kind = HirExprKind::BitShl;
         } else if (expr.name.eq({"shiftRight", 10})) {
             bit_kind = HirExprKind::BitShr;
-        } else if (is_flip) {
-            bit_kind = HirExprKind::BitXor;
         } else {
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.span, kBitwiseMemberDetail);
