@@ -22733,6 +22733,27 @@ TEST(frontend, mir_unrolls_plain_for_loop_over_variant_array_match) {
     rir.destroy();
 }
 
+TEST(frontend, for_loop_match_arm_nested_match_inner_wildcard_lowers) {
+    const char* src =
+        "variant Auth { ok, denied }\n"
+        "route GET \"/x\" { let path = \"/u\" for a in [Auth.ok] { match a { .ok => "
+        "match path { \"/u\" => return 200 _ => return 404 } _ => return 403 } } "
+        "return 500 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, mir_unrolls_for_loop_over_tuple_array_pipe_slots) {
     const char* src =
         "func second(a: i32, b: i32) -> i32 => b\n"

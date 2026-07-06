@@ -12377,7 +12377,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
                     for (u32 iai = 0; iai < arm_stmt->match_arms.len; iai++) {
                         const auto& inner_ast_arm = arm_stmt->match_arms[iai];
-                        if (inner_ast_arm.has_guard || inner_ast_arm.pattern->lhs != nullptr)
+                        if (inner_ast_arm.has_guard ||
+                            (!inner_ast_arm.is_wildcard && inner_ast_arm.pattern->lhs != nullptr))
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   inner_ast_arm.span);
                         if (inner_seen_wildcard)
