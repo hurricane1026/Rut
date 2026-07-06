@@ -70,16 +70,19 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 **Acceptance**: language-card examples all parse and type-check; old forms
 produce the documented fix-its; `./dev.sh test` green.
 
-## P1: Parser Stack-Frame Fragility — first slice DONE
+## P1: Parser Stack-Frame Fragility — two slices DONE (PR #166)
 
-Route statements moved out of AstRouteDecl into AstFile::stmt_pool
-(pointers, alloc_stmt) — sizeof(AstItem) dropped 485KB -> 126KB and the
-gcc 16.1 Debug stack overflow
+Slice 1: route statements moved out of AstRouteDecl into
+AstFile::stmt_pool (pointers, alloc_stmt) — sizeof(AstItem) 485KB ->
+126KB; the gcc 16.1 Debug stack overflow
 (test_rate_limit_dsl_decorator_compiles_to_route_limit under
--DRUT_ENABLE_JIT=OFF) is fixed; full no-JIT suite passes under gcc 16.
-Remaining slimming if frames grow again: the next-largest inline decls
-inside AstItem (chain steps / upstream args hold AstExpr ~2.3KB inline),
-or arena-allocate whole AstItems in the item parsers.
+-DRUT_ENABLE_JIT=OFF) is fixed. Slice 2: MatchArm.pattern moved to
+expr_pool (nullptr for wildcard arms) — sizeof(AstStatement) 22976 ->
+4608. Pools sized 4096 to preserve pre-pool capacity. Full no-JIT suite
+passes under gcc 16. Invariant: wildcard arms carry a null pattern —
+guard `arm.pattern->` derefs with is_wildcard. Remaining slimming if
+frames grow again: impl (47.6KB) / protocol (36.6KB) / chain (18.7KB)
+inline decls in AstItem, or arena-allocate whole AstItems.
 
 ## Recently Completed
 
