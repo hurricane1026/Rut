@@ -2924,9 +2924,9 @@ TEST(frontend, parse_route_accepts_wait_any_statement) {
     REQUIRE_EQ(route.statements.len, 1u);
     CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::WaitAny));
     REQUIRE_EQ(route.statements[0]->match_arms.len, 2u);
-    CHECK_EQ(static_cast<u8>(route.statements[0]->match_arms[0].pattern.kind),
+    CHECK_EQ(static_cast<u8>(route.statements[0]->match_arms[0].pattern->kind),
              static_cast<u8>(AstExprKind::MethodCall));
-    CHECK_EQ(static_cast<u8>(route.statements[0]->match_arms[1].pattern.kind),
+    CHECK_EQ(static_cast<u8>(route.statements[0]->match_arms[1].pattern->kind),
              static_cast<u8>(AstExprKind::Call));
 }
 

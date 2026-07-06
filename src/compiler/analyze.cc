@@ -4521,7 +4521,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             }
 
             auto pattern = analyze_match_pattern(
-                arm.pattern, subject, scratch, mod, cur_locals, cur_local_count);
+                *arm.pattern, subject, scratch, mod, cur_locals, cur_local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             if (pattern->kind != HirExprKind::VariantCase)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
@@ -4778,7 +4778,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 continue;
             }
             auto pattern = analyze_match_pattern(
-                arm.pattern, subject.value(), scratch, mod, locals, local_count);
+                *arm.pattern, subject.value(), scratch, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
@@ -4799,11 +4799,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             selected_arm = &arm;
             if (pattern->kind == HirExprKind::VariantCase &&
                 mod.variants[pattern->variant_index].cases[pattern->case_index].has_payload &&
-                arm.pattern.lhs != nullptr) {
+                arm.pattern->lhs != nullptr) {
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
                 bind_match_payload(&selected_binding,
-                                   arm.pattern.lhs->name,
+                                   arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
                                    subject_ptr);
@@ -4937,7 +4937,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             }
 
             auto pattern = analyze_match_pattern(
-                arm.pattern, subject.value(), scratch, mod, locals, local_count);
+                *arm.pattern, subject.value(), scratch, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             if (pattern->kind != HirExprKind::BoolLit && pattern->kind != HirExprKind::IntLit &&
                 pattern->kind != HirExprKind::StrLit && pattern->kind != HirExprKind::VariantCase)
@@ -4971,9 +4971,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             if (pattern->type == HirTypeKind::Variant) {
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 const auto& case_decl = mod.variants[pattern->variant_index].cases[case_index];
-                if (case_decl.has_payload && arm.pattern.lhs != nullptr) {
+                if (case_decl.has_payload && arm.pattern->lhs != nullptr) {
                     bind_match_payload(
-                        &arm_binding, arm.pattern.lhs->name, case_decl, case_index, subject_ptr);
+                        &arm_binding, arm.pattern->lhs->name, case_decl, case_index, subject_ptr);
                     arm_binding_ptr = &arm_binding;
                 }
             }
@@ -8189,8 +8189,11 @@ static FrontendResult<void> collect_named_error_cases_ast(
         if (!block_cases) return block_cases;
     }
     for (u32 i = 0; i < stmt.match_arms.len; i++) {
-        auto pattern_cases = collect_named_error_cases_ast_expr(stmt.match_arms[i].pattern, cases);
-        if (!pattern_cases) return pattern_cases;
+        if (stmt.match_arms[i].pattern != nullptr) {
+            auto pattern_cases =
+                collect_named_error_cases_ast_expr(*stmt.match_arms[i].pattern, cases);
+            if (!pattern_cases) return pattern_cases;
+        }
         if (stmt.match_arms[i].guard != nullptr) {
             auto guard_cases = collect_named_error_cases_ast_expr(*stmt.match_arms[i].guard, cases);
             if (!guard_cases) return guard_cases;
@@ -8412,17 +8415,17 @@ static FrontendResult<void> analyze_guard_match_arms(
         if (!arm.is_wildcard) {
             HirExpr pattern{};
             if (subject.may_error && subject.error_variant_index == 0xffffffffu &&
-                arm.pattern.kind == AstExprKind::VariantCase && arm.pattern.name.len == 0) {
+                arm.pattern->kind == AstExprKind::VariantCase && arm.pattern->name.len == 0) {
                 pattern.kind = HirExprKind::VariantCase;
                 pattern.type = HirTypeKind::Variant;
-                pattern.span = arm.pattern.span;
+                pattern.span = arm.pattern->span;
                 pattern.variant_index = 0xffffffffu;
                 pattern.case_index = 0xffffffffu;
                 pattern.int_value = -1;
-                pattern.str_value = arm.pattern.str_value;
+                pattern.str_value = arm.pattern->str_value;
             } else {
                 auto analyzed_pattern =
-                    analyze_match_pattern(arm.pattern, subject, route, mod, locals, local_count);
+                    analyze_match_pattern(*arm.pattern, subject, route, mod, locals, local_count);
                 if (!analyzed_pattern) return core::make_unexpected(analyzed_pattern.error());
                 pattern = analyzed_pattern.value();
                 if (pattern.kind != HirExprKind::VariantCase)
@@ -8730,7 +8733,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 continue;
             }
             auto pattern = analyze_match_pattern(
-                inner_arm.pattern, subject.value(), route, mod, locals, local_count);
+                *inner_arm.pattern, subject.value(), route, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             bool matched = false;
             if (pattern->kind == HirExprKind::BoolLit && subject_value.type == HirTypeKind::Bool) {
@@ -8750,11 +8753,11 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             selected_arm = &inner_arm;
             if (pattern->kind == HirExprKind::VariantCase &&
                 mod.variants[pattern->variant_index].cases[pattern->case_index].has_payload &&
-                inner_arm.pattern.lhs != nullptr) {
+                inner_arm.pattern->lhs != nullptr) {
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
                 bind_match_payload(&selected_binding,
-                                   inner_arm.pattern.lhs->name,
+                                   inner_arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
                                    subject_ptr);
@@ -9162,7 +9165,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 continue;
             }
             auto pattern = analyze_match_pattern(
-                arm.pattern, subject.value(), route, mod, locals, local_count);
+                *arm.pattern, subject.value(), route, mod, locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
@@ -9184,11 +9187,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             selected_arm = &arm;
             if (pattern->kind == HirExprKind::VariantCase &&
                 mod.variants[pattern->variant_index].cases[pattern->case_index].has_payload &&
-                arm.pattern.lhs != nullptr) {
+                arm.pattern->lhs != nullptr) {
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
                 bind_match_payload(&selected_binding,
-                                   arm.pattern.lhs->name,
+                                   arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
                                    subject_ptr);
@@ -9445,14 +9448,14 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                             wildcard_arm = &arm;
                             continue;
                         }
-                        if (arm.pattern.kind != AstExprKind::VariantCase)
+                        if (arm.pattern->kind != AstExprKind::VariantCase)
                             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                         bool matched = false;
                         HirExpr matched_pattern{};
                         bool has_matched_pattern = false;
                         if (err_case.known) {
                             auto pattern = analyze_match_pattern(
-                                arm.pattern, subject.value(), route, mod, locals, local_count);
+                                *arm.pattern, subject.value(), route, mod, locals, local_count);
                             if (!pattern) return core::make_unexpected(pattern.error());
                             matched = pattern->kind == HirExprKind::VariantCase &&
                                       pattern->variant_index == err_case.variant_index &&
@@ -9462,19 +9465,19 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                 has_matched_pattern = true;
                             }
                         } else {
-                            matched = arm.pattern.str_value.eq(err_name);
+                            matched = arm.pattern->str_value.eq(err_name);
                         }
                         if (matched && arm.has_guard) {
                             if (arm.guard == nullptr)
                                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                             MatchPayloadBinding arm_binding{};
                             const MatchPayloadBinding* arm_binding_ptr = binding;
-                            if (has_matched_pattern && arm.pattern.lhs != nullptr) {
+                            if (has_matched_pattern && arm.pattern->lhs != nullptr) {
                                 const auto& case_decl = mod.variants[matched_pattern.variant_index]
                                                             .cases[matched_pattern.case_index];
                                 if (case_decl.has_payload) {
                                     bind_match_payload(&arm_binding,
-                                                       arm.pattern.lhs->name,
+                                                       arm.pattern->lhs->name,
                                                        case_decl,
                                                        matched_pattern.case_index,
                                                        &subject.value());
@@ -9543,7 +9546,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             u32 nested_local_count = local_count;
             for (u32 li = 0; li < local_count; li++) nested_locals[li] = locals[li];
             const bool can_expand_nested_match =
-                !arm.is_wildcard && !arm.has_guard && arm.pattern.lhs == nullptr;
+                !arm.is_wildcard && !arm.has_guard && arm.pattern->lhs == nullptr;
             if (can_expand_nested_match && arm.stmt != nullptr &&
                 arm.stmt->kind == AstStmtKind::Match && !arm.stmt->is_const) {
                 nested_match_stmt = arm.stmt;
@@ -9564,7 +9567,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 if (seen_wildcard)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 auto outer_pattern = analyze_match_pattern(
-                    arm.pattern, subject.value(), route, mod, locals, local_count);
+                    *arm.pattern, subject.value(), route, mod, locals, local_count);
                 if (!outer_pattern) return core::make_unexpected(outer_pattern.error());
                 if (outer_pattern->kind != HirExprKind::BoolLit &&
                     outer_pattern->kind != HirExprKind::IntLit &&
@@ -9622,7 +9625,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 u32 inner_seen_variant_case_count = 0;
                 for (u32 iai = 0; iai < nested_match_stmt->match_arms.len; iai++) {
                     const auto& inner_arm = nested_match_stmt->match_arms[iai];
-                    if (inner_arm.has_guard || inner_arm.pattern.lhs != nullptr)
+                    if (inner_arm.has_guard ||
+                        (!inner_arm.is_wildcard && inner_arm.pattern->lhs != nullptr))
                         return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
                     if (inner_seen_wildcard)
                         return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
@@ -9630,7 +9634,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     hir_arm.span = inner_arm.span;
                     hir_arm.pattern = outer_pattern.value();
                     if (!inner_arm.is_wildcard) {
-                        auto inner_pattern = analyze_match_pattern(inner_arm.pattern,
+                        auto inner_pattern = analyze_match_pattern(*inner_arm.pattern,
                                                                    inner_subject.value(),
                                                                    route,
                                                                    mod,
@@ -9763,19 +9767,19 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 HirExpr pattern{};
                 const bool can_use_unpatched_named_error_pattern =
                     subject_is_error_kind && subject->error_variant_index == 0xffffffffu &&
-                    arm.pattern.kind == AstExprKind::VariantCase && arm.pattern.name.len == 0 &&
-                    arm.pattern.lhs == nullptr;
+                    arm.pattern->kind == AstExprKind::VariantCase && arm.pattern->name.len == 0 &&
+                    arm.pattern->lhs == nullptr;
                 if (can_use_unpatched_named_error_pattern) {
                     pattern.kind = HirExprKind::VariantCase;
                     pattern.type = HirTypeKind::Variant;
-                    pattern.span = arm.pattern.span;
+                    pattern.span = arm.pattern->span;
                     pattern.variant_index = 0xffffffffu;
                     pattern.case_index = 0xffffffffu;
                     pattern.int_value = -1;
-                    pattern.str_value = arm.pattern.str_value;
+                    pattern.str_value = arm.pattern->str_value;
                 } else {
                     auto analyzed_pattern = analyze_match_pattern(
-                        arm.pattern, subject.value(), route, mod, locals, local_count);
+                        *arm.pattern, subject.value(), route, mod, locals, local_count);
                     if (!analyzed_pattern) return core::make_unexpected(analyzed_pattern.error());
                     pattern = analyzed_pattern.value();
                 }
@@ -9846,9 +9850,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                     if (!arm.has_guard) seen_unguarded_variant_cases[case_index] = true;
                     const auto& variant = mod.variants[pattern.variant_index];
                     const auto& case_decl = variant.cases[case_index];
-                    if (case_decl.has_payload && arm.pattern.lhs != nullptr) {
+                    if (case_decl.has_payload && arm.pattern->lhs != nullptr) {
                         hir_arm.bind_payload = true;
-                        hir_arm.bind_name = arm.pattern.lhs->name;
+                        hir_arm.bind_name = arm.pattern->lhs->name;
                         hir_arm.bind_type = case_decl.payload_type;
                         hir_arm.bind_variant_index = case_decl.payload_variant_index;
                         hir_arm.bind_struct_index = case_decl.payload_struct_index;
@@ -11259,14 +11263,14 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
         const auto& arm = stmt.match_arms[ai];
         u32 arm_timer_ms = 0;
-        if (wait_timer_call_ms(arm.pattern, arm_timer_ms)) {
+        if (wait_timer_call_ms(*arm.pattern, arm_timer_ms)) {
             if (timer_arm != nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
             timer_ms = arm_timer_ms;
             timer_arm = &arm;
             continue;
         }
-        auto event_spec = analyze_wait_io_op_spec(arm.pattern, mod);
+        auto event_spec = analyze_wait_io_op_spec(*arm.pattern, mod);
         if (!event_spec) return core::make_unexpected(event_spec.error());
         if (event_spec->kind != WaitEventKind::Recv || event_spec->payload != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
@@ -11377,7 +11381,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         arm.span = ast_arm.span;
         arm.pattern.kind = HirExprKind::IntLit;
         arm.pattern.type = HirTypeKind::I32;
-        arm.pattern.span = ast_arm.pattern.span;
+        arm.pattern.span = ast_arm.pattern->span;
         arm.pattern.int_value = wait_event_resume_kind_value(kind);
         FixedVec<HirLocal, HirRoute::kMaxLocals> scoped;
         auto scoped_result = scoped_locals_for_arm(ast_arm, kind, payload, scoped);
@@ -11794,7 +11798,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 const auto& ast_arm = bstmt.match_arms[ai];
                 const AstStatement* nested_match_stmt = nullptr;
                 const bool can_expand_nested_match =
-                    !ast_arm.is_wildcard && !ast_arm.has_guard && ast_arm.pattern.lhs == nullptr;
+                    !ast_arm.is_wildcard && !ast_arm.has_guard && ast_arm.pattern->lhs == nullptr;
                 if (can_expand_nested_match && ast_arm.stmt != nullptr &&
                     ast_arm.stmt->kind == AstStmtKind::Match && !ast_arm.stmt->is_const) {
                     nested_match_stmt = ast_arm.stmt;
@@ -11821,7 +11825,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 if (ast_arm.stmt == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, ast_arm.span);
                 if (nested_match_stmt != nullptr) {
-                    auto outer_pattern = analyze_match_pattern(ast_arm.pattern,
+                    auto outer_pattern = analyze_match_pattern(*ast_arm.pattern,
                                                                subject.value(),
                                                                route,
                                                                mod,
@@ -11894,7 +11898,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
                     for (u32 iai = 0; iai < nested_match_stmt->match_arms.len; iai++) {
                         const auto& inner_arm = nested_match_stmt->match_arms[iai];
-                        if (inner_arm.has_guard || inner_arm.pattern.lhs != nullptr)
+                        if (inner_arm.has_guard ||
+                            (!inner_arm.is_wildcard && inner_arm.pattern->lhs != nullptr))
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
                         if (inner_seen_wildcard)
                             return frontend_error(FrontendError::UnsupportedSyntax, inner_arm.span);
@@ -11904,7 +11909,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         arm.span = inner_arm.span;
                         arm.pattern = outer_pattern.value();
                         if (!inner_arm.is_wildcard) {
-                            auto inner_pattern = analyze_match_pattern(inner_arm.pattern,
+                            auto inner_pattern = analyze_match_pattern(*inner_arm.pattern,
                                                                        inner_subject.value(),
                                                                        route,
                                                                        mod,
@@ -12041,7 +12046,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 MatchPayloadBinding arm_binding{};
                 const MatchPayloadBinding* arm_binding_ptr = nullptr;
                 if (!ast_arm.is_wildcard) {
-                    auto pattern = analyze_match_pattern(ast_arm.pattern,
+                    auto pattern = analyze_match_pattern(*ast_arm.pattern,
                                                          subject.value(),
                                                          route,
                                                          mod,
@@ -12091,12 +12096,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         if (!ast_arm.has_guard) seen_unguarded_variant_cases[case_index] = true;
                         const auto& case_decl =
                             mod.variants[pattern->variant_index].cases[case_index];
-                        if (ast_arm.pattern.lhs != nullptr) {
+                        if (ast_arm.pattern->lhs != nullptr) {
                             if (!case_decl.has_payload)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
-                                                      ast_arm.pattern.lhs->span);
+                                                      ast_arm.pattern->lhs->span);
                             arm.bind_payload = true;
-                            arm.bind_name = ast_arm.pattern.lhs->name;
+                            arm.bind_name = ast_arm.pattern->lhs->name;
                             arm.bind_type = case_decl.payload_type;
                             arm.bind_variant_index = case_decl.payload_variant_index;
                             arm.bind_struct_index = case_decl.payload_struct_index;
@@ -12112,9 +12117,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 &arm_binding, arm.bind_name, case_decl, case_index, subject_ptr);
                             arm_binding_ptr = &arm_binding;
                         }
-                    } else if (ast_arm.pattern.lhs != nullptr) {
+                    } else if (ast_arm.pattern->lhs != nullptr) {
                         return frontend_error(FrontendError::UnsupportedSyntax,
-                                              ast_arm.pattern.lhs->span);
+                                              ast_arm.pattern->lhs->span);
                     }
                     arm.pattern = pattern.value();
                     if (ast_arm.has_guard) {
@@ -12372,7 +12377,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
                     for (u32 iai = 0; iai < arm_stmt->match_arms.len; iai++) {
                         const auto& inner_ast_arm = arm_stmt->match_arms[iai];
-                        if (inner_ast_arm.has_guard || inner_ast_arm.pattern.lhs != nullptr)
+                        if (inner_ast_arm.has_guard || inner_ast_arm.pattern->lhs != nullptr)
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   inner_ast_arm.span);
                         if (inner_seen_wildcard)
@@ -12423,7 +12428,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             return {};
                         };
                         if (!inner_ast_arm.is_wildcard) {
-                            auto inner_pattern = analyze_match_pattern(inner_ast_arm.pattern,
+                            auto inner_pattern = analyze_match_pattern(*inner_ast_arm.pattern,
                                                                        inner_subject.value(),
                                                                        route,
                                                                        mod,

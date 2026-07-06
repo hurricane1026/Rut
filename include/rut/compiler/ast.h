@@ -244,7 +244,11 @@ struct AstStatement {
         bool is_wildcard = false;
         bool bind_value = false;
         Str bind_name{};
-        AstExpr pattern{};
+        // Pattern lives in AstFile::expr_pool (alloc_expr) — nullptr for
+        // wildcard arms. Storing it inline made MatchArm ~2.4KB and
+        // AstStatement ~23KB (8 arms), so every level of statement nesting
+        // stacked 23KB in the recursive-descent parser.
+        AstExpr* pattern = nullptr;
         bool has_guard = false;
         AstExpr* guard = nullptr;
         AstStatement* stmt = nullptr;
@@ -531,10 +535,15 @@ struct AstItem {
 
 struct AstFile {
     static constexpr u32 kMaxItems = 128;
-    static constexpr u32 kMaxExprPool = 128;
-    // Route statements moved out of AstRouteDecl into this pool; sized for
-    // kMaxItems routes with several statements each plus nested block bodies.
-    static constexpr u32 kMaxStmtPool = 512;
+    // Match-arm patterns moved into this pool alongside sub-expressions; sized
+    // so pooled patterns cannot regress capacity for files that previously
+    // stored them inline (512 fully-loaded match statements at kMaxMatchArms).
+    static constexpr u32 kMaxExprPool = 4096;
+    // Route statements moved out of AstRouteDecl into this pool; sized to keep
+    // the pre-pool capacity of kMaxItems routes at kMaxStatements each (2048)
+    // plus nested block bodies. AstFile is heap-only (parse_file_heap), so the
+    // pools cost heap, not stack.
+    static constexpr u32 kMaxStmtPool = 4096;
     static constexpr u32 kMaxTypePool = 256;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
@@ -638,7 +647,8 @@ private:
             rebase_stmt_ptr(other, stmt.block_stmts[i]);
         }
         for (u32 i = 0; i < stmt.match_arms.len; i++) {
-            rebase_expr(other, stmt.match_arms[i].pattern);
+            // Patterns live in expr_pool (bulk-rebased); relocate the pointer.
+            rebase_expr_ptr(other, stmt.match_arms[i].pattern);
             rebase_expr_ptr(other, stmt.match_arms[i].guard);
             rebase_stmt_ptr(other, stmt.match_arms[i].stmt);
         }
