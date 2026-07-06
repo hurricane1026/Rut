@@ -3437,6 +3437,27 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                        value->local_index == local_index;
             }
 
+            // The analyze-emitted presence test `local == nil` / `local != nil`:
+            // one or more Eq wraps whose other side is a bool literal, ending
+            // at HasValue(local). Its value is ABOUT presence — error uniformly
+            // reads as "absent" — so like a coalescing use it consumes the
+            // error in any position (a stored `let missing = x == nil`
+            // included). At least one Eq wrap is required so the equality
+            // lowering's internal bare HasValue shapes never match.
+            static bool is_presence_test_use(const MirValue* value, u32 local_index) {
+                if (value == nullptr || value->kind != MirValueKind::Eq) return false;
+                while (value != nullptr && value->kind == MirValueKind::Eq) {
+                    if (value->rhs != nullptr && value->rhs->kind == MirValueKind::BoolConst)
+                        value = value->lhs;
+                    else if (value->lhs != nullptr && value->lhs->kind == MirValueKind::BoolConst)
+                        value = value->rhs;
+                    else
+                        return false;
+                }
+                return value != nullptr && value->kind == MirValueKind::HasValue &&
+                       local_ref_matches(value->lhs, local_index);
+            }
+
             // Coalescing shapes that consume the local's error inline (`x || y`,
             // `x.has ? x.value : ...`). These genuinely recover the error no
             // matter how deeply they are nested, so they are matched anywhere.
@@ -3485,6 +3506,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             static bool contains_recovering_use(const MirValue* value, u32 local_index) {
                 if (value == nullptr) return false;
                 if (is_coalescing_use(value, local_index)) return true;
+                if (is_presence_test_use(value, local_index)) return true;
                 if (contains_recovering_use(value->lhs, local_index)) return true;
                 if (contains_recovering_use(value->rhs, local_index)) return true;
                 for (u32 ai = 0; ai < value->args.len; ai++) {
@@ -3535,6 +3557,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 // Top-level guard condition (bare HasValue or the bool-literal
                 // presence-test wrap): the guard's else consumes the error.
                 if (top_level_cond && is_guard_condition(value, local_index)) return false;
+                // A presence test in VALUE position (`let missing = x == nil`,
+                // `(x == nil) == flag`) also consumes the error: its result is
+                // about presence only — error reads as "absent" — and the
+                // shape cannot leak the carrier's value. Nothing to descend
+                // into (operands are HasValue(local) and bool literals only).
+                if (is_presence_test_use(value, local_index)) return false;
                 // Guard-narrowing / success-path unwrap: only reached once the
                 // error is already handled, so not an observing use.
                 if (value->kind == MirValueKind::ValueOf &&
