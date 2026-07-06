@@ -3333,20 +3333,29 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         const auto receiver_has_or_member = [&]() -> bool {
             if (!recv) return false;  // sugar's any() will re-report the error
-            const u32 fi = find_function_index(mod, {"or", 2});
-            if (fi < mod.functions.len && mod.functions[fi].params.len >= 1) {
-                auto expected = make_expected_param_expr(mod.functions[fi].params[0]);
-                if (same_hir_type_shape(mod, recv.value(), expected)) return true;
-            }
+            // NOTE: a free function named `or` deliberately does NOT count —
+            // the method resolver here never dispatches UFCS free functions,
+            // and call syntax `or(x, d)` is rejected at parse (operand-position
+            // fix-it), so counting one would only strand the caller with no
+            // working spelling.
             for (u32 ii = 0; ii < mod.impls.len; ii++) {
                 const auto& impl = mod.impls[ii];
-                const bool target_matches =
-                    impl.type == recv->type &&
-                    (impl.type != HirTypeKind::Struct || impl.is_generic_template ||
-                     impl.struct_index == recv->struct_index);
-                if (!target_matches) continue;
+                // Same template matching as method resolution: a generic
+                // impl on Box<T> applies only to instances of THAT template,
+                // not to every struct receiver.
+                if (!impl_matches_type(mod, impl, recv->type, recv->struct_index)) continue;
                 for (u32 mi = 0; mi < impl.methods.len; mi++) {
                     if (impl.methods[mi].name.eq({"or", 2})) return true;
+                }
+                // A conformance may inherit the protocol's DEFAULT `or`
+                // without an explicit override entry in impl.methods.
+                if (impl.protocol_index < mod.protocols.len) {
+                    const auto& proto = mod.protocols[impl.protocol_index];
+                    for (u32 mi = 0; mi < proto.methods.len; mi++) {
+                        if (proto.methods[mi].name.eq({"or", 2}) &&
+                            proto.methods[mi].function_index != 0xffffffffu)
+                            return true;
+                    }
                 }
             }
             if (recv->type == HirTypeKind::Generic) {

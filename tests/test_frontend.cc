@@ -28526,6 +28526,73 @@ route GET "/search" {
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind), static_cast<u8>(HirExprKind::Or));
 }
 
+TEST(frontend, default_protocol_or_method_wins_over_fallback_sugar) {
+    // PR #164 round 5: a conformance that only INHERITS the protocol's
+    // default `or` (empty impl block) must still win over the sugar.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32 => alt
+}
+struct Box { value: i32 }
+Box impl Fallback {}
+route GET "/x" {
+    let v = Box(value: 7).or(2)
+    if v == 2 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, generic_or_impl_on_other_template_does_not_disable_sugar) {
+    // PR #164 round 5: a generic impl's `or` applies only to instances of
+    // ITS template — receivers of other types keep the fallback sugar.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Wrap<T> { value: T }
+Wrap<T> impl Fallback {
+    func or(self: Wrap<T>, alt: i32) -> i32 => alt
+}
+route GET "/search" {
+    let q = req.query("q").or("dflt")
+    if q == "dflt" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
+TEST(frontend, free_or_function_does_not_block_fallback_sugar) {
+    // PR #164 round 5: a free `or` function is not dispatchable here (no UFCS
+    // free-function resolution in method calls; `or(x, d)` call syntax is a
+    // parse fix-it), so it must not suppress the sugar and strand the caller.
+    const auto src = R"rut(
+func or(_ x: str, alt: str) -> str => alt
+route GET "/search" {
+    let q = req.query("q").or("dflt")
+    if q == "dflt" { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind), static_cast<u8>(HirExprKind::Or));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
