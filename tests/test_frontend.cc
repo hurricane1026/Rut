@@ -28639,6 +28639,42 @@ TEST(frontend, repeated_or_sugar_does_not_exhaust_expr_pool) {
     REQUIRE(hir);
 }
 
+TEST(frontend, empty_path_concrete_route_still_validates_req_params) {
+    // PR #164 round 7: a concrete route whose path happens to be empty is NOT
+    // a helper scratch — unknown captures must still be rejected.
+    const char* src = "route GET \"\" { let x = req.params.id return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("route has no such capture in req.params")));
+}
+
+TEST(frontend, generic_default_or_conformance_keeps_sugar_available) {
+    // PR #164 round 7: the concrete dispatcher cannot resolve a generic
+    // template's inherited default `or`, so suppressing the sugar would leave
+    // the receiver with no working spelling — the sugar stays available.
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32 => alt
+}
+struct Wrap<T> { value: T }
+Wrap<T> impl Fallback {}
+route GET "/x" {
+    let w = Wrap(value: 1).or(Wrap(value: 2))
+    if w.value == 1 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

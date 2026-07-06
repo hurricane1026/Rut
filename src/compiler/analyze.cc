@@ -3358,8 +3358,12 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                     if (impl.methods[mi].name.eq({"or", 2})) return true;
                 }
                 // A conformance may inherit the protocol's DEFAULT `or`
-                // without an explicit override entry in impl.methods.
-                if (impl.protocol_index < mod.protocols.len) {
+                // without an explicit override entry in impl.methods. Generic-
+                // template conformances are excluded: the concrete dispatcher
+                // does not resolve generic default methods yet, so suppressing
+                // the sugar would strand the receiver with no working spelling
+                // (PR #164 round 7). Tighten when that dispatch lands.
+                if (!impl.is_generic_template && impl.protocol_index < mod.protocols.len) {
                     const auto& proto = mod.protocols[impl.protocol_index];
                     for (u32 mi = 0; mi < proto.methods.len; mi++) {
                         if (proto.methods[mi].name.eq({"or", 2}) &&
@@ -4069,7 +4073,7 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     // req.params / req.param accesses skip capture validation. Instantiation
     // targets the CONCRETE attached route — revalidate here so a helper
     // reading a capture the route does not provide is rejected (PR #164).
-    if (expr.kind == HirExprKind::ReqParam && route != nullptr && route->path.len != 0 &&
+    if (expr.kind == HirExprKind::ReqParam && route != nullptr && !route->is_helper_scratch &&
         !route_path_has_param(route->path, expr.str_value)) {
         return frontend_error(
             FrontendError::UnsupportedSyntax,
@@ -5885,10 +5889,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             expr.lhs->name.eq({"params", 6}) && expr.lhs->lhs->kind == AstExprKind::Ident &&
             magic_req_receiver(*expr.lhs->lhs, mod, locals, local_count, binding)) {
             // Helper bodies (chain/decorator callees with the magic `req`
-            // param) analyze against a scratch route whose path is empty —
-            // the capture set is only known per attached route, so capture
-            // validation is skipped there, mirroring req.param("name").
-            const bool helper_context = route == nullptr || route->path.len == 0;
+            // param) analyze against a helper-scratch route — the capture set
+            // is only known per attached route, so capture validation is
+            // skipped there, mirroring req.param("name"). A concrete route
+            // whose path merely happens to be empty still validates.
+            const bool helper_context = route == nullptr || route->is_helper_scratch;
             if (helper_context || route_path_has_param(route->path, expr.name)) {
                 HirExpr out{};
                 out.span = expr.span;
@@ -13976,6 +13981,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     auto analyze_function_body_like =
         [&](HirFunction& fn, const AstFunctionDecl& ast_func, Span span) -> FrontendResult<void> {
         HirRoute scratch{};
+        scratch.is_helper_scratch = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*ast_func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());
@@ -15504,6 +15510,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax, item.func.span, item.func.name);
         HirFunction& fn = mod.functions[fn_index];
         HirRoute scratch{};
+        scratch.is_helper_scratch = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*item.func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());
