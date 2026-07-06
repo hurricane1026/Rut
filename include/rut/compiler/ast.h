@@ -244,7 +244,11 @@ struct AstStatement {
         bool is_wildcard = false;
         bool bind_value = false;
         Str bind_name{};
-        AstExpr pattern{};
+        // Pattern lives in AstFile::expr_pool (alloc_expr) — nullptr for
+        // wildcard arms. Storing it inline made MatchArm ~2.4KB and
+        // AstStatement ~23KB (8 arms), so every level of statement nesting
+        // stacked 23KB in the recursive-descent parser.
+        AstExpr* pattern = nullptr;
         bool has_guard = false;
         AstExpr* guard = nullptr;
         AstStatement* stmt = nullptr;
@@ -483,7 +487,12 @@ struct AstRouteDecl {
     u8 method = 0;
     Str path{};
     static constexpr u32 kMaxStatements = 16;
-    FixedVec<AstStatement, kMaxStatements> statements;
+    // Statements live in AstFile::stmt_pool (alloc_stmt) — storing them
+    // inline made sizeof(AstItem) ~485KB (AstStatement is ~23KB) and the
+    // recursive-descent parser's by-value AstItem frames overflowed the 8MB
+    // stack under gcc 16 Debug. Same treatment the AstTimerDecl comment
+    // already prescribed for large inline statement storage.
+    FixedVec<AstStatement*, kMaxStatements> statements;
     static constexpr u32 kMaxDecorators = 8;
     FixedVec<AstDecorator, kMaxDecorators> decorators;
     static constexpr u32 kMaxChains = 4;
@@ -526,8 +535,15 @@ struct AstItem {
 
 struct AstFile {
     static constexpr u32 kMaxItems = 128;
-    static constexpr u32 kMaxExprPool = 128;
-    static constexpr u32 kMaxStmtPool = 64;
+    // Match-arm patterns moved into this pool alongside sub-expressions; sized
+    // so pooled patterns cannot regress capacity for files that previously
+    // stored them inline (512 fully-loaded match statements at kMaxMatchArms).
+    static constexpr u32 kMaxExprPool = 4096;
+    // Route statements moved out of AstRouteDecl into this pool; sized to keep
+    // the pre-pool capacity of kMaxItems routes at kMaxStatements each (2048)
+    // plus nested block bodies. AstFile is heap-only (parse_file_heap), so the
+    // pools cost heap, not stack.
+    static constexpr u32 kMaxStmtPool = 4096;
     static constexpr u32 kMaxTypePool = 256;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
@@ -631,7 +647,8 @@ private:
             rebase_stmt_ptr(other, stmt.block_stmts[i]);
         }
         for (u32 i = 0; i < stmt.match_arms.len; i++) {
-            rebase_expr(other, stmt.match_arms[i].pattern);
+            // Patterns live in expr_pool (bulk-rebased); relocate the pointer.
+            rebase_expr_ptr(other, stmt.match_arms[i].pattern);
             rebase_expr_ptr(other, stmt.match_arms[i].guard);
             rebase_stmt_ptr(other, stmt.match_arms[i].stmt);
         }
@@ -719,8 +736,10 @@ private:
                     rebase_chain(other, items[i].chain);
                     break;
                 case AstItemKind::Route:
+                    // Route statements live in stmt_pool (bulk-rebased above);
+                    // only the pointers themselves need relocation here.
                     for (u32 j = 0; j < items[i].route.statements.len; j++) {
-                        rebase_stmt(other, items[i].route.statements[j]);
+                        rebase_stmt_ptr(other, items[i].route.statements[j]);
                     }
                     break;
                 default:

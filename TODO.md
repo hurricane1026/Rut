@@ -70,19 +70,19 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 **Acceptance**: language-card examples all parse and type-check; old forms
 produce the documented fix-its; `./dev.sh test` green.
 
-## P1: Parser Stack-Frame Fragility
+## P1: Parser Stack-Frame Fragility — two slices DONE (PR #166)
 
-`AstItem` is ~485KB and `AstStatement` ~22KB; recursive-descent parse
-functions hold them BY VALUE on the stack (`parse_route_entry`'s local
-`AstItem` alone is half a megabyte). gcc 16.1 Debug deterministically
-overflows the default 8MB stack in
-`test_rate_limit_dsl_decorator_compiles_to_route_limit`
-(`cmake -B build-nojit -DRUT_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Debug`
-with system gcc, then run test_integration — SIGSEGV, stack address
-exhaustion in Parser::parse_route_entry). CI's gcc 13/14 frames still
-fit — one toolchain drift from red. Fix: arena-allocate AstItem in the
-item parsers the way alloc_stmt/alloc_expr already work, or shrink the
-FixedVec capacities that dominate sizeof(AstItem).
+Slice 1: route statements moved out of AstRouteDecl into
+AstFile::stmt_pool (pointers, alloc_stmt) — sizeof(AstItem) 485KB ->
+126KB; the gcc 16.1 Debug stack overflow
+(test_rate_limit_dsl_decorator_compiles_to_route_limit under
+-DRUT_ENABLE_JIT=OFF) is fixed. Slice 2: MatchArm.pattern moved to
+expr_pool (nullptr for wildcard arms) — sizeof(AstStatement) 22976 ->
+4608. Pools sized 4096 to preserve pre-pool capacity. Full no-JIT suite
+passes under gcc 16. Invariant: wildcard arms carry a null pattern —
+guard `arm.pattern->` derefs with is_wildcard. Remaining slimming if
+frames grow again: impl (47.6KB) / protocol (36.6KB) / chain (18.7KB)
+inline decls in AstItem, or arena-allocate whole AstItems.
 
 ## Recently Completed
 

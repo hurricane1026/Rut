@@ -252,7 +252,9 @@ struct Parser {
                 } else {
                     auto pattern = parse_primary_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
-                    arm.pattern = pattern.value();
+                    auto pattern_ptr = alloc_expr(pattern.value());
+                    if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
+                    arm.pattern = pattern_ptr.value();
                 }
                 if (const Token* kw_if = take(TokenType::KwIf))
                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -1107,7 +1109,9 @@ struct Parser {
                     } else {
                         auto pattern = parse_primary_expr();
                         if (!pattern) return core::make_unexpected(pattern.error());
-                        arm.pattern = pattern.value();
+                        auto pattern_ptr = alloc_expr(pattern.value());
+                        if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
+                        arm.pattern = pattern_ptr.value();
                     }
                     if (const Token* kw_if = take(TokenType::KwIf))
                         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -1518,7 +1522,9 @@ struct Parser {
                     }
                     auto event = parse_expr();
                     if (!event) return core::make_unexpected(event.error());
-                    arm.pattern = event.value();
+                    auto event_ptr = alloc_expr(event.value());
+                    if (!event_ptr) return core::make_unexpected(event_ptr.error());
+                    arm.pattern = event_ptr.value();
                     auto arrow = expect(TokenType::Arrow);
                     if (!arrow) return core::make_unexpected(arrow.error());
                     auto body_lbrace = expect(TokenType::LBrace);
@@ -1688,7 +1694,9 @@ struct Parser {
                 } else {
                     auto pattern = parse_primary_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
-                    arm.pattern = pattern.value();
+                    auto pattern_ptr = alloc_expr(pattern.value());
+                    if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
+                    arm.pattern = pattern_ptr.value();
                 }
                 if (take(TokenType::KwIf)) {
                     auto guard = parse_expr();
@@ -2085,7 +2093,9 @@ struct Parser {
                 } else {
                     auto pattern = parse_primary_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
-                    arm.pattern = pattern.value();
+                    auto pattern_ptr = alloc_expr(pattern.value());
+                    if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
+                    arm.pattern = pattern_ptr.value();
                 }
                 if (take(TokenType::KwIf)) {
                     auto guard = parse_expr();
@@ -3211,7 +3221,9 @@ struct Parser {
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             auto stmt = parse_stmt();
             if (!stmt) return core::make_unexpected(stmt.error());
-            if (!item.route.statements.push(stmt.value()))
+            auto stmt_ptr = alloc_stmt(stmt.value());
+            if (!stmt_ptr) return core::make_unexpected(stmt_ptr.error());
+            if (!item.route.statements.push(stmt_ptr.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
             if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
                 stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For)
