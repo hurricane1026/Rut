@@ -481,7 +481,7 @@ TEST(frontend, lex_parse_return_route) {
     CHECK_EQ(static_cast<u8>(ast->items[1].kind), static_cast<u8>(AstItemKind::Route));
     CHECK(ast->items[1].route.path.eq(lit("/users")));
     REQUIRE_EQ(ast->items[1].route.statements.len, 1u);
-    CHECK_EQ(ast->items[1].route.statements[0].status_code, 200);
+    CHECK_EQ(ast->items[1].route.statements[0]->status_code, 200);
 }
 
 TEST(frontend, lex_keeps_inline_contextual) {
@@ -676,8 +676,8 @@ TEST(frontend, parse_supports_infix_or_expression) {
     REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
     auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(route.statements[0].expr.kind), static_cast<u8>(AstExprKind::Or));
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(route.statements[0]->expr.kind), static_cast<u8>(AstExprKind::Or));
 }
 
 TEST(frontend, parse_supports_infix_and_expression) {
@@ -690,8 +690,8 @@ TEST(frontend, parse_supports_infix_and_expression) {
     REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
     auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(route.statements[0].expr.kind), static_cast<u8>(AstExprKind::And));
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(static_cast<u8>(route.statements[0]->expr.kind), static_cast<u8>(AstExprKind::And));
 }
 
 TEST(frontend, parse_supports_all_function_call_form) {
@@ -704,8 +704,8 @@ TEST(frontend, parse_supports_all_function_call_form) {
     REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
     auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
-    auto& let_expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::Let));
+    auto& let_expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(let_expr.kind), static_cast<u8>(AstExprKind::Call));
     CHECK(let_expr.name.eq({"all", 3}));
 }
@@ -720,8 +720,8 @@ TEST(frontend, parse_supports_any_function_call_form) {
     REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
     auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Let));
-    auto& let_expr = route.statements[0].expr;
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::Let));
+    auto& let_expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(let_expr.kind), static_cast<u8>(AstExprKind::Call));
     CHECK(let_expr.name.eq({"any", 3}));
 }
@@ -736,7 +736,7 @@ TEST(frontend, parse_infix_and_or_is_left_associative) {
     REQUIRE_EQ(ast->items[0].kind, AstItemKind::Route);
     auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    auto& expr = route.statements[0].expr;
+    auto& expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
     CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::And));
     CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
@@ -750,7 +750,7 @@ TEST(frontend, parse_and_binds_tighter_than_or) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto& route = ast->items[0].route;
-    auto& expr = route.statements[0].expr;
+    auto& expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
     CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::BoolLit));
     CHECK_EQ(static_cast<u8>(expr.rhs->kind), static_cast<u8>(AstExprKind::And));
@@ -772,9 +772,9 @@ TEST(frontend, parse_desugars_negated_comparisons) {
         CHECK_EQ(static_cast<u8>(e.rhs->kind), static_cast<u8>(AstExprKind::BoolLit));
         CHECK_EQ(e.rhs->bool_value, false);
     };
-    check_desugar(route.statements[0].expr, AstExprKind::Eq);  // !=
-    check_desugar(route.statements[1].expr, AstExprKind::Gt);  // <=
-    check_desugar(route.statements[2].expr, AstExprKind::Lt);  // >=
+    check_desugar(route.statements[0]->expr, AstExprKind::Eq);  // !=
+    check_desugar(route.statements[1]->expr, AstExprKind::Gt);  // <=
+    check_desugar(route.statements[2]->expr, AstExprKind::Lt);  // >=
 }
 
 TEST(frontend, parse_rejects_or_function_call_form) {
@@ -868,7 +868,7 @@ TEST(frontend, parse_allows_parenthesized_pipe_with_or) {
     REQUIRE_EQ(ast->items[1].kind, AstItemKind::Route);
     auto& route = ast->items[1].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    auto& expr = route.statements[0].expr;
+    auto& expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Or));
     REQUIRE(expr.lhs != nullptr);
     CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::Pipe));
@@ -887,7 +887,7 @@ TEST(frontend, parse_supports_and_expr_before_pipe) {
     REQUIRE_EQ(ast->items[1].kind, AstItemKind::Route);
     auto& route = ast->items[1].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    auto& expr = route.statements[0].expr;
+    auto& expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Pipe));
     REQUIRE(expr.lhs != nullptr);
     CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::And));
@@ -905,7 +905,7 @@ TEST(frontend, parse_supports_or_expr_before_pipe) {
     REQUIRE_EQ(ast->items[1].kind, AstItemKind::Route);
     auto& route = ast->items[1].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    auto& expr = route.statements[0].expr;
+    auto& expr = route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(expr.kind), static_cast<u8>(AstExprKind::Pipe));
     REQUIRE(expr.lhs != nullptr);
     CHECK_EQ(static_cast<u8>(expr.lhs->kind), static_cast<u8>(AstExprKind::Or));
@@ -1207,10 +1207,11 @@ TEST(frontend, parse_return_response_status_only) {
     REQUIRE_EQ(ast->items.len, 1u);
     const auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 1u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(route.statements[0].status_code, 200u);
-    CHECK_EQ(route.statements[0].response_body.len, 0u);
-    CHECK(!route.statements[0].has_response_body);
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind),
+             static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[0]->status_code, 200u);
+    CHECK_EQ(route.statements[0]->response_body.len, 0u);
+    CHECK(!route.statements[0]->has_response_body);
     // Analyze accepts; HIR terminator matches the plain `return 200`
     // shape (Direct control flow, ReturnStatus with status 200).
     auto hir = analyze_file_heap(ast.value());
@@ -1236,7 +1237,7 @@ TEST(frontend, parse_return_response_with_body) {
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 1u);
     REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
-    const auto& stmt = ast->items[0].route.statements[0];
+    const AstStatement& stmt = *ast->items[0].route.statements[0];
     CHECK_EQ(stmt.status_code, 200u);
     REQUIRE_EQ(stmt.response_body.len, 5u);
     CHECK(stmt.response_body.eq(lit("Hello")));
@@ -1274,7 +1275,7 @@ TEST(frontend, parse_return_response_empty_body_is_noop) {
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 1u);
     REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
-    CHECK(ast->items[0].route.statements[0].has_response_body);
+    CHECK(ast->items[0].route.statements[0]->has_response_body);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     // HIR preserves the explicit kwarg via ptr-based sentinel: ptr
@@ -1320,7 +1321,7 @@ TEST(frontend, parse_return_forward_name) {
     // Route has a single ForwardUpstream statement naming "api".
     const auto& route = ast->items[1].route;
     REQUIRE_EQ(route.statements.len, 1u);
-    const auto& stmt = route.statements[0];
+    const AstStatement& stmt = *route.statements[0];
     CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
     CHECK(stmt.name.eq(lit("api")));
     // HIR resolves the name to upstream_index 0.
@@ -1344,7 +1345,7 @@ TEST(frontend, parse_return_websocket_bare_is_passthrough) {
     REQUIRE_EQ(ast->items.len, 2u);
     const auto& route = ast->items[1].route;
     REQUIRE_EQ(route.statements.len, 1u);
-    const auto& stmt = route.statements[0];
+    const AstStatement& stmt = *route.statements[0];
     CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::ForwardUpstream));
     CHECK(stmt.name.eq(lit("ws")));
 }
@@ -1363,7 +1364,7 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
     REQUIRE_EQ(ast->items.len, 2u);
     const auto& route = ast->items[1].route;
     REQUIRE_EQ(route.statements.len, 1u);
-    const auto& stmt = route.statements[0];
+    const AstStatement& stmt = *route.statements[0];
     CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
     CHECK(stmt.name.eq(lit("ws")));
     REQUIRE(stmt.then_stmt != nullptr);  // the frame-handler body
@@ -1666,7 +1667,7 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& stmt = ast->items[1].route.statements[0];
+    const AstStatement& stmt = *ast->items[1].route.statements[0];
     REQUIRE_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::WsTerminate));
     REQUIRE(stmt.then_stmt != nullptr);
     const auto& call = stmt.then_stmt->expr;
@@ -2643,7 +2644,7 @@ TEST(frontend, parse_return_response_with_headers) {
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 1u);
     REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
-    const auto& stmt = ast->items[0].route.statements[0];
+    const AstStatement& stmt = *ast->items[0].route.statements[0];
     REQUIRE_EQ(stmt.response_headers.len, 2u);
     CHECK(stmt.response_headers[0].key.eq(lit("X-Service")));
     CHECK(stmt.response_headers[0].value.eq(lit("auth")));
@@ -2852,7 +2853,7 @@ TEST(frontend, parse_return_response_body_and_headers_order_independent) {
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
         REQUIRE(ast);
-        const auto& stmt = ast->items[0].route.statements[0];
+        const AstStatement& stmt = *ast->items[0].route.statements[0];
         CHECK(stmt.has_response_body);
         CHECK(stmt.response_body.eq(lit("hi")));
         REQUIRE_EQ(stmt.response_headers.len, 1u);
@@ -2900,13 +2901,14 @@ TEST(frontend, parse_route_accepts_wait_statement) {
     REQUIRE_EQ(ast->items.len, 1u);
     const auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 3u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::Wait));
-    CHECK_EQ(route.statements[0].status_code, 1000);  // ms stored in status_code field
-    CHECK(!route.statements[0].has_wait_expr);
-    CHECK_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Wait));
-    CHECK(route.statements[1].has_wait_expr);
-    CHECK_EQ(static_cast<u8>(route.statements[2].kind), static_cast<u8>(AstStmtKind::ReturnStatus));
-    CHECK_EQ(route.statements[2].status_code, 200);
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::Wait));
+    CHECK_EQ(route.statements[0]->status_code, 1000);  // ms stored in status_code field
+    CHECK(!route.statements[0]->has_wait_expr);
+    CHECK_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Wait));
+    CHECK(route.statements[1]->has_wait_expr);
+    CHECK_EQ(static_cast<u8>(route.statements[2]->kind),
+             static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(route.statements[2]->status_code, 200);
 }
 
 TEST(frontend, parse_route_accepts_wait_any_statement) {
@@ -2920,11 +2922,11 @@ TEST(frontend, parse_route_accepts_wait_any_statement) {
     REQUIRE_EQ(ast->items.len, 1u);
     const auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 1u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].kind), static_cast<u8>(AstStmtKind::WaitAny));
-    REQUIRE_EQ(route.statements[0].match_arms.len, 2u);
-    CHECK_EQ(static_cast<u8>(route.statements[0].match_arms[0].pattern.kind),
+    CHECK_EQ(static_cast<u8>(route.statements[0]->kind), static_cast<u8>(AstStmtKind::WaitAny));
+    REQUIRE_EQ(route.statements[0]->match_arms.len, 2u);
+    CHECK_EQ(static_cast<u8>(route.statements[0]->match_arms[0].pattern.kind),
              static_cast<u8>(AstExprKind::MethodCall));
-    CHECK_EQ(static_cast<u8>(route.statements[0].match_arms[1].pattern.kind),
+    CHECK_EQ(static_cast<u8>(route.statements[0]->match_arms[1].pattern.kind),
              static_cast<u8>(AstExprKind::Call));
 }
 
@@ -2937,7 +2939,7 @@ TEST(frontend, parse_route_accepts_wait_any_arm_result_binding) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 1u);
-    const auto& wait_any = ast->items[0].route.statements[0];
+    const AstStatement& wait_any = *ast->items[0].route.statements[0];
     REQUIRE_EQ(wait_any.match_arms.len, 2u);
     CHECK(wait_any.match_arms[0].bind_value);
     CHECK(wait_any.match_arms[0].bind_name.eq(lit("ev")));
@@ -8338,7 +8340,7 @@ TEST(frontend, error_message_is_preserved_for_named_error) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
-    CHECK(ast->items[0].route.statements[0].expr.msg.eq(lit("request timed out")));
+    CHECK(ast->items[0].route.statements[0]->expr.msg.eq(lit("request timed out")));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
@@ -8430,9 +8432,9 @@ TEST(frontend, custom_error_struct_constructor_preserves_extra_field_inits) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    REQUIRE_EQ(ast->items[1].route.statements[0].expr.field_inits.len, 2u);
-    CHECK(ast->items[1].route.statements[0].expr.field_inits[0].name.eq(lit("token")));
-    CHECK(ast->items[1].route.statements[0].expr.field_inits[1].name.eq(lit("retry")));
+    REQUIRE_EQ(ast->items[1].route.statements[0]->expr.field_inits.len, 2u);
+    CHECK(ast->items[1].route.statements[0]->expr.field_inits[0].name.eq(lit("token")));
+    CHECK(ast->items[1].route.statements[0]->expr.field_inits[1].name.eq(lit("retry")));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals[0].init.field_inits.len, 2u);
@@ -8587,7 +8589,7 @@ TEST(frontend, error_message_is_preserved_for_explicit_error_variant) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items.len, 2u);
-    CHECK(ast->items[1].route.statements[0].expr.msg.eq(lit("timed out")));
+    CHECK(ast->items[1].route.statements[0]->expr.msg.eq(lit("timed out")));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
@@ -10095,9 +10097,9 @@ TEST(frontend, let_if_lowers_to_branching_rir) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[1].route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[0].kind),
+    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[0]->kind),
              static_cast<u8>(AstStmtKind::Let));
-    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[1].kind),
+    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[1]->kind),
              static_cast<u8>(AstStmtKind::If));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
@@ -10167,7 +10169,7 @@ TEST(frontend, guard_lowers_to_fail_and_continue_blocks) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[1].route.statements.len, 3u);
-    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[1].kind),
+    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[1]->kind),
              static_cast<u8>(AstStmtKind::Guard));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
@@ -10239,9 +10241,9 @@ TEST(frontend, guard_let_binds_success_value) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].kind),
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0]->kind),
              static_cast<u8>(AstStmtKind::Guard));
-    CHECK(ast->items[0].route.statements[0].bind_value);
+    CHECK(ast->items[0].route.statements[0]->bind_value);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
@@ -10319,9 +10321,9 @@ TEST(frontend, any_builtin_falls_back_from_nil) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].kind),
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0]->kind),
              static_cast<u8>(AstStmtKind::Let));
-    auto& any_expr = ast->items[0].route.statements[0].expr;
+    auto& any_expr = ast->items[0].route.statements[0]->expr;
     CHECK_EQ(static_cast<u8>(any_expr.kind), static_cast<u8>(AstExprKind::Call));
     CHECK(any_expr.name.eq({"any", 3}));
     auto hir = analyze_file_heap(ast.value());
@@ -10356,7 +10358,7 @@ TEST(frontend, req_header_flows_as_optional_str) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0]->expr.kind),
              static_cast<u8>(AstExprKind::MethodCall));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
@@ -10526,7 +10528,7 @@ TEST(frontend, req_param_flows_as_str) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0]->expr.kind),
              static_cast<u8>(AstExprKind::MethodCall));
 
     auto hir = analyze_file_heap(ast.value());
@@ -10613,7 +10615,7 @@ TEST(frontend, req_query_flows_as_optional_str) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0]->expr.kind),
              static_cast<u8>(AstExprKind::MethodCall));
 
     auto hir = analyze_file_heap(ast.value());
@@ -10929,7 +10931,7 @@ TEST(frontend, req_cookie_flows_as_optional_str) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
-    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0].expr.kind),
+    CHECK_EQ(static_cast<u8>(ast->items[0].route.statements[0]->expr.kind),
              static_cast<u8>(AstExprKind::MethodCall));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
@@ -11656,7 +11658,7 @@ TEST(frontend, match_lowers_to_cmp_eq_chain) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     REQUIRE_EQ(ast->items[1].route.statements.len, 2u);
-    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[1].kind),
+    CHECK_EQ(static_cast<u8>(ast->items[1].route.statements[1]->kind),
              static_cast<u8>(AstStmtKind::Match));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
@@ -21093,7 +21095,7 @@ TEST(frontend, parse_array_lit_basic) {
     REQUIRE_EQ(ast->items.len, 1u);
     const auto& route = ast->items[0].route;
     REQUIRE_EQ(route.statements.len, 2u);
-    const auto& let_stmt = route.statements[0];
+    const AstStatement& let_stmt = *route.statements[0];
     CHECK_EQ(static_cast<u8>(let_stmt.kind), static_cast<u8>(AstStmtKind::Let));
     CHECK(let_stmt.type.name.eq(lit("Array")));
     REQUIRE_EQ(let_stmt.type.type_args.len, 1u);
@@ -21117,7 +21119,7 @@ TEST(frontend, parse_array_lit_empty) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& let_stmt = ast->items[0].route.statements[0];
+    const AstStatement& let_stmt = *ast->items[0].route.statements[0];
     CHECK(let_stmt.type.name.eq(lit("Array")));
     CHECK_EQ(static_cast<u8>(let_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     CHECK_EQ(let_stmt.expr.args.len, 0u);
@@ -21132,7 +21134,7 @@ TEST(frontend, parse_array_lit_trailing_comma) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& let_stmt = ast->items[0].route.statements[0];
+    const AstStatement& let_stmt = *ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(let_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
     REQUIRE_EQ(let_stmt.expr.args.len, 3u);
     CHECK_EQ(let_stmt.expr.args[2]->int_value, 3);
@@ -21146,7 +21148,7 @@ TEST(frontend, parse_array_lit_nested_type) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& let_stmt = ast->items[0].route.statements[0];
+    const AstStatement& let_stmt = *ast->items[0].route.statements[0];
     CHECK(let_stmt.type.name.eq(lit("Array")));
     REQUIRE_EQ(let_stmt.type.type_args.len, 1u);
     CHECK(let_stmt.type.type_args[0]->name.eq(lit("Array")));
@@ -21207,7 +21209,7 @@ TEST(frontend, parse_for_loop_field_access_source) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
+    const AstStatement& for_stmt = *ast->items[0].route.statements[0];
     CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
     CHECK(for_stmt.name.eq(lit("server")));
     CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::Field));
@@ -21224,7 +21226,7 @@ TEST(frontend, parse_for_loop_multi_stmt_body) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& for_stmt = ast->items[0].route.statements[0];
+    const AstStatement& for_stmt = *ast->items[0].route.statements[0];
     REQUIRE(for_stmt.then_stmt != nullptr);
     CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::Block));
     REQUIRE_EQ(for_stmt.then_stmt->block_stmts.len, 2u);
@@ -27570,11 +27572,11 @@ TEST(frontend, guard_let_shorthand_rebinds_same_name) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto& route = ast->items[2].route;
-    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Guard));
-    CHECK(route.statements[1].bind_value);
-    CHECK(route.statements[1].name.eq(lit("picked")));
-    CHECK_EQ(static_cast<u8>(route.statements[1].expr.kind), static_cast<u8>(AstExprKind::Ident));
-    CHECK(route.statements[1].expr.name.eq(lit("picked")));
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Guard));
+    CHECK(route.statements[1]->bind_value);
+    CHECK(route.statements[1]->name.eq(lit("picked")));
+    CHECK_EQ(static_cast<u8>(route.statements[1]->expr.kind), static_cast<u8>(AstExprKind::Ident));
+    CHECK(route.statements[1]->expr.name.eq(lit("picked")));
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
 }
@@ -27673,8 +27675,8 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto& route = ast->items[1].route;
-    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
-    REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1]->match_arms.len, 2u);
 }
 
 TEST(frontend, unbraced_if_arm_body_allows_multiline_chain_in_condition) {
@@ -27696,8 +27698,8 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto& route = ast->items[0].route;
-    REQUIRE_EQ(static_cast<u8>(route.statements[1].kind), static_cast<u8>(AstStmtKind::Match));
-    REQUIRE_EQ(route.statements[1].match_arms.len, 2u);
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1]->match_arms.len, 2u);
 }
 
 TEST(frontend, if_let_parses_binding_fields) {
@@ -27711,7 +27713,7 @@ TEST(frontend, if_let_parses_binding_fields) {
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    const auto& if_stmt = ast->items[1].route.statements[1];
+    const AstStatement& if_stmt = *ast->items[1].route.statements[1];
     REQUIRE_EQ(static_cast<u8>(if_stmt.kind), static_cast<u8>(AstStmtKind::If));
     CHECK(if_stmt.bind_value);
     CHECK(if_stmt.name.eq(lit("checked")));
@@ -27721,7 +27723,7 @@ TEST(frontend, if_let_parses_binding_fields) {
     REQUIRE(lexed2);
     auto ast2 = parse_file_heap(lexed2.value());
     REQUIRE(ast2);
-    const auto& plain_if = ast2->items[0].route.statements[0];
+    const AstStatement& plain_if = *ast2->items[0].route.statements[0];
     REQUIRE_EQ(static_cast<u8>(plain_if.kind), static_cast<u8>(AstStmtKind::If));
     CHECK_FALSE(plain_if.bind_value);
 }

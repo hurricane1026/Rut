@@ -15949,7 +15949,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         bool seen_wait = false;
         bool seen_for = false;
         for (u32 si = 0; si < item.route.statements.len; si++) {
-            const auto& stmt = item.route.statements[si];
+            const AstStatement& stmt = *item.route.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
                 if (seen_for)
                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -16007,7 +16007,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto can_be_used_for_iter =
                     [&](const auto& self, const Str& target_name, u32 start_idx) -> bool {
                     for (u32 fi = start_idx; fi < item.route.statements.len; fi++) {
-                        const auto& future = item.route.statements[fi];
+                        const AstStatement& future = *item.route.statements[fi];
                         if (stmt_uses_iter(stmt_uses_iter, future, target_name)) return true;
                         if (future.kind == AstStmtKind::Let &&
                             future.expr.kind == AstExprKind::Ident &&
@@ -16219,7 +16219,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 seen_wait = true;
                 if (si + 1 != item.route.statements.len)
                     return frontend_error(FrontendError::UnsupportedSyntax,
-                                          item.route.statements[si + 1].span);
+                                          item.route.statements[si + 1]->span);
                 break;
             }
             if (stmt.kind == AstStmtKind::For) {
@@ -16236,7 +16236,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!control) return core::make_unexpected(control.error());
             if (si + 1 != item.route.statements.len)
                 return frontend_error(FrontendError::UnsupportedSyntax,
-                                      item.route.statements[si + 1].span);
+                                      item.route.statements[si + 1]->span);
             break;
         }
 

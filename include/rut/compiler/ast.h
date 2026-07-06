@@ -483,7 +483,12 @@ struct AstRouteDecl {
     u8 method = 0;
     Str path{};
     static constexpr u32 kMaxStatements = 16;
-    FixedVec<AstStatement, kMaxStatements> statements;
+    // Statements live in AstFile::stmt_pool (alloc_stmt) — storing them
+    // inline made sizeof(AstItem) ~485KB (AstStatement is ~23KB) and the
+    // recursive-descent parser's by-value AstItem frames overflowed the 8MB
+    // stack under gcc 16 Debug. Same treatment the AstTimerDecl comment
+    // already prescribed for large inline statement storage.
+    FixedVec<AstStatement*, kMaxStatements> statements;
     static constexpr u32 kMaxDecorators = 8;
     FixedVec<AstDecorator, kMaxDecorators> decorators;
     static constexpr u32 kMaxChains = 4;
@@ -527,7 +532,9 @@ struct AstItem {
 struct AstFile {
     static constexpr u32 kMaxItems = 128;
     static constexpr u32 kMaxExprPool = 128;
-    static constexpr u32 kMaxStmtPool = 64;
+    // Route statements moved out of AstRouteDecl into this pool; sized for
+    // kMaxItems routes with several statements each plus nested block bodies.
+    static constexpr u32 kMaxStmtPool = 512;
     static constexpr u32 kMaxTypePool = 256;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
@@ -719,8 +726,10 @@ private:
                     rebase_chain(other, items[i].chain);
                     break;
                 case AstItemKind::Route:
+                    // Route statements live in stmt_pool (bulk-rebased above);
+                    // only the pointers themselves need relocation here.
                     for (u32 j = 0; j < items[i].route.statements.len; j++) {
-                        rebase_stmt(other, items[i].route.statements[j]);
+                        rebase_stmt_ptr(other, items[i].route.statements[j]);
                     }
                     break;
                 default:

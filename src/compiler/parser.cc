@@ -3211,7 +3211,9 @@ struct Parser {
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             auto stmt = parse_stmt();
             if (!stmt) return core::make_unexpected(stmt.error());
-            if (!item.route.statements.push(stmt.value()))
+            auto stmt_ptr = alloc_stmt(stmt.value());
+            if (!stmt_ptr) return core::make_unexpected(stmt_ptr.error());
+            if (!item.route.statements.push(stmt_ptr.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
             if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
                 stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For)
