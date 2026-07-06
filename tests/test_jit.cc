@@ -300,6 +300,20 @@ TEST(jit, frontend_nil_presence_test_executes_both_ways) {
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 200);
 
+    // With X-Missing present, `m == nil` is false -> the else branch, 500.
+    static const char with_header[] =
+        "GET /api/users HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "X-Missing: here\r\n"
+        "\r\n";
+    r = HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(with_header),
+                                      sizeof(with_header) - 1,
+                                      nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 500);
+
     engine.shutdown();
     rir.destroy();
 }
@@ -18615,6 +18629,59 @@ TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
     CHECK(r.status_code == 200);
 
     // HTTP/1.0 -> pick(false) errors -> the guard's else, not a generic 500.
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, nil_presence_test_consumes_runtime_error) {
+    // `v == nil` on a fallible carrier consumes the error as "absent" — the
+    // state-0 error prelude must not intercept with a generic 500 first,
+    // exactly like the guard-let HasValue cond (PR #168 review).
+    // The eager-fallback init shape is the one gated by the state-0 error
+    // prelude (any() is non-short-circuit: pick()'s error propagates into
+    // `value` even though 200 is always usable).
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.http11)) "
+        "if value == nil { return 401 } else { return 200 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> pick(true) -> usable value -> the else branch, 200.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> pick(false) errors -> `== nil` is true -> 401, not 500.
     static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
     r = HandlerResult::unpack(handler(
         nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));

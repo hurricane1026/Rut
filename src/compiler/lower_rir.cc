@@ -3463,6 +3463,21 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             // NOT a recovering use — treating it as one would wrongly suppress
             // the error prelude for a compare-only fallible local.
             static bool is_guard_condition(const MirValue* value, u32 local_index) {
+                // The bare guard-let shape, plus the presence-test shape
+                // `local == nil` / `local != nil`: Eq nodes whose other side is
+                // a bool literal only negate the bare HasValue guard, so as a
+                // top-level condition they consume the error exactly the same
+                // way (both branch arms know the presence outcome; nothing
+                // escapes). An Eq whose sides are VALUES (an optional compare)
+                // does not match — its nested HasValue stays error-masking.
+                while (value != nullptr && value->kind == MirValueKind::Eq) {
+                    if (value->rhs != nullptr && value->rhs->kind == MirValueKind::BoolConst)
+                        value = value->lhs;
+                    else if (value->lhs != nullptr && value->lhs->kind == MirValueKind::BoolConst)
+                        value = value->rhs;
+                    else
+                        return false;
+                }
                 return value != nullptr && value->kind == MirValueKind::HasValue &&
                        local_ref_matches(value->lhs, local_index);
             }
@@ -3517,10 +3532,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                             return true;
                     return false;
                 }
-                // Top-level guard condition: the guard's else consumes the error.
-                if (top_level_cond && value->kind == MirValueKind::HasValue &&
-                    local_ref_matches(value->lhs, local_index))
-                    return false;
+                // Top-level guard condition (bare HasValue or the bool-literal
+                // presence-test wrap): the guard's else consumes the error.
+                if (top_level_cond && is_guard_condition(value, local_index)) return false;
                 // Guard-narrowing / success-path unwrap: only reached once the
                 // error is already handled, so not an observing use.
                 if (value->kind == MirValueKind::ValueOf &&

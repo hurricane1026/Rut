@@ -335,7 +335,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 | Wrong (foreign habit) | Right |
 |---|---|
 | `and` / `or` / `not` | `&&` / `\|\|` / `!` |
-| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` / `if let` / `.or(default)` (`!= nil` ⏳) |
+| `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` / `if let` / `.or(default)` / `!= nil` |
 | `guard claims else {}` (non-bool) | `guard let claims else {}` |
 | `req.X-Request-ID` | `req.header("X-Request-ID")` |
 | `resp.Server = nil` | `resp.remove("Server")` |
