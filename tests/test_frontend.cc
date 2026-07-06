@@ -628,8 +628,8 @@ TEST(frontend, lex_rejects_bitwise_symbols_with_fixit) {
         REQUIRE(!lexed);
         CHECK_EQ(lexed.error().code, FrontendError::UnsupportedSyntax);
         CHECK(lexed.error().detail.eq(
-            lit("bitwise symbols are not Rut syntax; the bitwise.and/or/xor/flip/"
-                "shiftLeft/shiftRight builtins are spec'd but not implemented yet")));
+            lit("bitwise symbols are not Rut syntax; use the bitwise.and/or/xor/flip/"
+                "shiftLeft/shiftRight builtins")));
     }
 }
 
@@ -1122,6 +1122,183 @@ TEST(frontend, analyze_constant_folds_any_when_lhs_present) {
     CHECK_EQ(hir->routes[0].locals[0].init.int_value, 200);
     CHECK_FALSE(hir->routes[0].locals[0].init.may_error);
     CHECK_FALSE(hir->routes[0].locals[0].init.may_nil);
+}
+
+TEST(frontend, analyze_constant_folds_bitwise_literals) {
+    const char* src =
+        "route GET \"/x\" { let a = bitwise.and(6, 3) let o = bitwise.or(6, 3) let x = "
+        "bitwise.xor(6, 3) let f = bitwise.flip(0) let l = bitwise.shiftLeft(1, 5) let r = "
+        "bitwise.shiftRight(bitwise.flip(0), 1) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 6u);
+    const i64 expected[6] = {2, 7, 5, -1, 32, -1};
+    for (u32 i = 0; i < 6; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_bitwise_shift_saturates_out_of_range_amounts) {
+    const char* src =
+        "route GET \"/x\" { let l = bitwise.shiftLeft(1, 40) let neg = bitwise.flip(7) let r "
+        "= bitwise.shiftRight(bitwise.flip(7), 40) let p = bitwise.shiftRight(6, 40) return "
+        "200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 0);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, -8);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, -1);
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 0);
+}
+
+TEST(frontend, analyze_bitwise_runtime_operands_lower_through_pipeline) {
+    const char* src =
+        "route GET \"/x\" { let a = 6 let v = bitwise.and(a, 3) if v == 2 { return 200 } "
+        "else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_unknown_bitwise_member_with_fixit) {
+    const char* src = "route GET \"/x\" { let v = bitwise.nand(1, 2) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_rejects_bitwise_wrong_arity) {
+    const char* src = "route GET \"/x\" { let v = bitwise.flip(1, 2) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_bitwise_non_i32_operand) {
+    const char* src = "route GET \"/x\" { let v = bitwise.and(\"a\", 1) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_bitwise_optional_operand) {
+    const char* src =
+        "route GET \"/x\" { let h = req.header(\"X-N\") let v = bitwise.and(h, 1) return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, bitwise_call_works_as_pipe_stage_with_placeholder) {
+    const char* src =
+        "route GET \"/x\" { let m = 6 let v = m | bitwise.and(_, 3) if v == 2 { return 200 } "
+        "else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bitwise_pipe_stage_supports_tuple_slot_placeholders) {
+    const char* src =
+        "route GET \"/x\" { let pair = (6, 3) let v = pair | bitwise.and(_1, _2) if v == 2 { "
+        "return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bitwise_pipe_stage_requires_placeholder) {
+    const char* src = "route GET \"/x\" { let m = 6 let v = m | bitwise.and(1, 3) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("pipe call missing placeholder")));
+}
+
+TEST(frontend, using_alias_named_bitwise_shadows_builtin_namespace) {
+    const char* src =
+        "using bitwise = v1.limiter\n"
+        "route GET \"/x\" { let v = bitwise.and(1, 2) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    // The alias claims the name, so bitwise.and must resolve through the
+    // alias (and fail here — v1 does not exist) instead of silently hitting
+    // the builtin namespace.
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, user_binding_named_bitwise_shadows_builtin_namespace) {
+    const char* src = "route GET \"/x\" { let bitwise = 1 let v = bitwise.and(1, 2) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    // The local shadows the namespace, so `.and` is an unknown method on i32
+    // rather than the builtin — the program is rejected, not silently folded.
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, analyze_preserves_optional_any_as_or_value) {

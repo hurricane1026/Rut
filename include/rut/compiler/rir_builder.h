@@ -682,6 +682,34 @@ struct Builder {
         return vid;
     }
 
+    // ── Bitwise ─────────────────────────────────────────────────────
+
+    static bool is_bit_opcode(Opcode op) {
+        switch (op) {
+            case Opcode::BitAnd:
+            case Opcode::BitOr:
+            case Opcode::BitXor:
+            case Opcode::BitShl:
+            case Opcode::BitShr:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    Result<ValueId> emit_bit(Opcode bit_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
+        if (!is_bit_opcode(bit_op) || !valid_val(lhs) || !valid_val(rhs))
+            return err(RirError::InvalidState);
+        if (!val_has_type(lhs, TypeKind::I32) || !val_has_type(rhs, TypeKind::I32))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(bit_op, ty, loc));
+        inst->operands[0] = lhs;
+        inst->operands[1] = rhs;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     // ── Domain operations ───────────────────────────────────────────
 
     Result<ValueId> emit_time_now(SourceLoc loc = {}) {

@@ -1081,6 +1081,47 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        // ── Bitwise ──
+        case rir::Opcode::BitAnd:
+        case rir::Opcode::BitOr:
+        case rir::Opcode::BitXor: {
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            LLVMValueRef r =
+                inst.op == rir::Opcode::BitAnd
+                    ? LLVMBuildAnd(c.builder, a, b, "bit.and")
+                    : (inst.op == rir::Opcode::BitOr ? LLVMBuildOr(c.builder, a, b, "bit.or")
+                                                     : LLVMBuildXor(c.builder, a, b, "bit.xor"));
+            c.set_value(inst.result, r);
+            break;
+        }
+        case rir::Opcode::BitShl:
+        case rir::Opcode::BitShr: {
+            // Shift amounts outside 0..31 saturate (0 for shl, sign fill for
+            // arithmetic shr) instead of leaving LLVM poison / hardware
+            // masking semantics.
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef n = c.get_value(inst.operands[1]);
+            LLVMValueRef in_range = LLVMBuildICmp(
+                c.builder, LLVMIntULT, n, LLVMConstInt(c.i32_ty, 32, 0), "bit.shift.inrange");
+            LLVMValueRef safe_n = LLVMBuildSelect(
+                c.builder, in_range, n, LLVMConstInt(c.i32_ty, 31, 0), "bit.shift.n");
+            if (inst.op == rir::Opcode::BitShl) {
+                LLVMValueRef shifted = LLVMBuildShl(c.builder, a, safe_n, "bit.shl.raw");
+                LLVMValueRef r = LLVMBuildSelect(
+                    c.builder, in_range, shifted, LLVMConstInt(c.i32_ty, 0, 0), "bit.shl");
+                c.set_value(inst.result, r);
+            } else {
+                LLVMValueRef shifted = LLVMBuildAShr(c.builder, a, safe_n, "bit.shr.raw");
+                LLVMValueRef sign_fill =
+                    LLVMBuildAShr(c.builder, a, LLVMConstInt(c.i32_ty, 31, 0), "bit.shr.sign");
+                LLVMValueRef r =
+                    LLVMBuildSelect(c.builder, in_range, shifted, sign_fill, "bit.shr");
+                c.set_value(inst.result, r);
+            }
+            break;
+        }
+
         // ── Comparisons ──
         case rir::Opcode::CmpEq:
         case rir::Opcode::CmpNe:

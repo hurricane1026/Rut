@@ -87,8 +87,8 @@ static Span token_span(const Token& tok) {
 constexpr Str kForceUnwrapDetail =
     lit_str("postfix `!` (force unwrap) is not supported; use if let / guard let");
 constexpr Str kBitwiseDetail = lit_str(
-    "bitwise symbols are not Rut syntax; the bitwise.and/or/xor/flip/"
-    "shiftLeft/shiftRight builtins are spec'd but not implemented yet");
+    "bitwise symbols are not Rut syntax; use the bitwise.and/or/xor/flip/"
+    "shiftLeft/shiftRight builtins");
 constexpr Str kQuestionDetail =
     lit_str("`?` / `??` / `?.` are not supported; use if let, guard let, or .or(default)");
 

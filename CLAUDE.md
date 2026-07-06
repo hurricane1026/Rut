@@ -108,7 +108,7 @@ LLM-facing surface contract).
 - Named parameters: `auth(req, role: "user")`
 - UFCS: `req.auth(role: "user")` rewrites to `auth(req, role: "user")` — blessed form when value flows into the first parameter
 - Pipeline: `a | f(_, ...)` — shell-style `|`; in expressions `|` means pipeline ONLY; RHS must be a call with an explicit `_`/`_N` placeholder; use when value lands in a non-first position
-- Bitwise ops are functions in the built-in `bitwise` namespace, not symbols: `bitwise.and`/`bitwise.or`/`bitwise.xor`/`bitwise.flip`/`bitwise.shiftLeft`/`bitwise.shiftRight` (same style as `log.info`) — ⏳ pending (spec'd, the builtins are not implemented yet; the removed `&`/`~`/`<<` symbols do emit a fix-it)
+- Bitwise ops are functions in the built-in `bitwise` namespace, not symbols: `bitwise.and`/`bitwise.or`/`bitwise.xor`/`bitwise.flip`/`bitwise.shiftLeft`/`bitwise.shiftRight` — implemented end-to-end (i32 only; shift amounts outside 0..31 saturate; `flip(a)` desugars to `xor(a, -1)`; literal operands fold at analyze time; the removed `&`/`~`/`<<` symbols emit a fix-it)
 - `match` with `=>` (expression) or `{}` (block); no `case` keyword. `if` always uses `{}`
 - Header access is function-style: `req.header("X-Request-ID")`, `req.set(...)`, `resp.set(...)`, `resp.remove(...)` — hyphenated property access does not exist (would parse as subtraction)
 - `@decorator` for middleware — `@func` on routes/groups, `@func pattern` for bindings

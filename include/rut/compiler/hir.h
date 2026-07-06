@@ -132,6 +132,13 @@ enum class HirExprKind : u8 {
     Eq,
     Lt,
     Gt,
+    // Bitwise builtins (`bitwise.and(a, b)` etc.) — binary i32 ops on
+    // lhs/rhs. `bitwise.flip(a)` desugars to BitXor(a, -1) at analyze time.
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitShl,
+    BitShr,
     Or,
     NoError,
     HasValue,

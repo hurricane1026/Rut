@@ -60,7 +60,8 @@ json({ users: [], total: 0 })           // ⏳ object literal (no object-literal
 ->                                      // function return type
 @                                       // decorator
 
-// Bitwise = named functions, never symbols — ⏳ namespace pending
+// Bitwise = named functions, never symbols (all i32; shift amounts
+// outside 0..31 saturate: shiftLeft → 0, shiftRight → sign fill)
 bitwise.and(a, b)  bitwise.or(a, b)  bitwise.xor(a, b)
 bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 ```

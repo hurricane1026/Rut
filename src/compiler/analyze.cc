@@ -36,6 +36,14 @@ constexpr Str kGuardBoolDetail =
 constexpr Str kGuardLetNilCarrierDetail = lit_str(
     "guard let cannot test a runtime optional-only value yet (nil-carrier "
     "lowering pending); use an error-capable source");
+// Fix-it details for the `bitwise` builtin namespace (DESIGN.md §3.2.1).
+constexpr Str kBitwiseMemberDetail = lit_str(
+    "unknown bitwise function; use bitwise.and(a, b) / bitwise.or(a, b) / "
+    "bitwise.xor(a, b) / bitwise.flip(a) / bitwise.shiftLeft(a, n) / "
+    "bitwise.shiftRight(a, n)");
+constexpr Str kBitwiseOperandDetail = lit_str(
+    "bitwise operands must be plain i32 values; bind optional or fallible "
+    "values first with guard let / if let / .or(default)");
 
 static std::string str_to_std_string(Str s) {
     return std::string(s.ptr, s.len);
@@ -3228,6 +3236,29 @@ static bool user_bound_req_name(const HirModule& mod,
     return has_import_namespace(mod, {"req", 3});
 }
 
+// Whether `name` is claimed by any user binding visible here — used to let
+// user code shadow builtin namespaces like `bitwise` (same precedence rule as
+// user_bound_req_name, minus the request-proxy special case).
+static bool user_bound_ident_name(const HirModule& mod,
+                                  const HirLocal* locals,
+                                  u32 local_count,
+                                  const MatchPayloadBinding* binding,
+                                  Str name) {
+    if (binding && binding->subject && binding->name.eq(name)) return true;
+    for (u32 i = 0; i < local_count; i++) {
+        if (locals[i].name.eq(name)) return true;
+    }
+    for (u32 i = 0; i < mod.variants.len; i++) {
+        if (mod.variants[i].name.eq(name)) return true;
+    }
+    if (find_function_index(mod, name) < mod.functions.len) return true;
+    if (find_struct_index(mod, name) < mod.structs.len) return true;
+    if (find_protocol_index(mod, name) < mod.protocols.len) return true;
+    if (find_alias(mod, name) != nullptr) return true;
+    if (find_type_alias(mod, name) != nullptr) return true;
+    return has_import_namespace(mod, name);
+}
+
 static bool magic_req_receiver(const AstExpr& lhs,
                                const HirModule& mod,
                                const HirLocal* locals,
@@ -3235,6 +3266,155 @@ static bool magic_req_receiver(const AstExpr& lhs,
                                const MatchPayloadBinding* binding) {
     return lhs.kind == AstExprKind::Ident && lhs.name.eq({"req", 3}) &&
            !user_bound_req_name(mod, locals, local_count, binding);
+}
+
+static bool bitwise_namespace_receiver(const AstExpr& lhs) {
+    return lhs.kind == AstExprKind::Ident && lhs.name.eq({"bitwise", 7});
+}
+
+// Builtin `bitwise` namespace (DESIGN.md §3.2.1): the only bit-operation
+// surface — the symbol forms (& | ^ ~ << >>) are lexer fix-its. All ops are
+// i32; `flip(a)` desugars to `xor(a, -1)`. Shift amounts outside 0..31
+// saturate (0 for shiftLeft, sign fill for shiftRight) instead of hitting
+// hardware-dependent masking. Callers check namespace shadowing. pipe_lhs,
+// when non-null, substitutes `_`/`_N` placeholder arguments (pipeline stage
+// form: `mask | bitwise.and(_, 3)`).
+static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& expr,
+                                                              HirRoute* route,
+                                                              const HirModule& mod,
+                                                              const HirLocal* locals,
+                                                              u32 local_count,
+                                                              const MatchPayloadBinding* binding,
+                                                              const HirExpr* pipe_lhs) {
+    auto analyze_arg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
+        if (arg.kind != AstExprKind::Placeholder)
+            return analyze_expr(arg, route, mod, locals, local_count, binding);
+        if (pipe_lhs == nullptr)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, arg.span, lit_str("placeholder outside pipe"));
+        if (arg.int_value <= 0 || arg.int_value > static_cast<i32>(kMaxTupleSlots))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("placeholder slot out of range"));
+        if (pipe_lhs->type != HirTypeKind::Tuple) {
+            if (arg.int_value != 1)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg.span,
+                                      lit_str("non-tuple source with non-unit placeholder"));
+            return *pipe_lhs;
+        }
+        if (arg.int_value > static_cast<i32>(pipe_lhs->tuple_len))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  arg.span,
+                                  lit_str("placeholder slot exceeds tuple arity"));
+        const u32 slot_index = static_cast<u32>(arg.int_value - 1);
+        if (pipe_lhs->args.len == pipe_lhs->tuple_len && pipe_lhs->args[slot_index] != nullptr)
+            return *pipe_lhs->args[slot_index];
+        HirExpr slot{};
+        slot.kind = HirExprKind::TupleSlot;
+        slot.type = pipe_lhs->tuple_types[slot_index];
+        if (slot.type == HirTypeKind::Generic)
+            slot.generic_index = pipe_lhs->tuple_struct_indices[slot_index];
+        else if (slot.type == HirTypeKind::Struct)
+            slot.struct_index = pipe_lhs->tuple_struct_indices[slot_index];
+        else if (slot.type == HirTypeKind::Variant)
+            slot.variant_index = pipe_lhs->tuple_variant_indices[slot_index];
+        auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                           slot.type,
+                                           slot.generic_index,
+                                           slot.variant_index,
+                                           slot.struct_index,
+                                           slot.tuple_len,
+                                           slot.tuple_types,
+                                           slot.tuple_variant_indices,
+                                           slot.tuple_struct_indices,
+                                           arg.span);
+        if (!shape) return core::make_unexpected(shape.error());
+        slot.shape_index = shape.value();
+        slot.span = arg.span;
+        slot.int_value = static_cast<i32>(slot_index);
+        if (!route->exprs.push(*pipe_lhs))
+            return frontend_error(FrontendError::TooManyItems, arg.span);
+        slot.lhs = &route->exprs[route->exprs.len - 1];
+        return slot;
+    };
+    const bool is_flip = expr.name.eq({"flip", 4});
+    HirExprKind bit_kind{};
+    if (expr.name.eq({"and", 3})) {
+        bit_kind = HirExprKind::BitAnd;
+    } else if (expr.name.eq({"or", 2})) {
+        bit_kind = HirExprKind::BitOr;
+    } else if (expr.name.eq({"xor", 3}) || is_flip) {
+        bit_kind = HirExprKind::BitXor;
+    } else if (expr.name.eq({"shiftLeft", 9})) {
+        bit_kind = HirExprKind::BitShl;
+    } else if (expr.name.eq({"shiftRight", 10})) {
+        bit_kind = HirExprKind::BitShr;
+    } else {
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kBitwiseMemberDetail);
+    }
+    const u32 want_args = is_flip ? 1u : 2u;
+    if (expr.args.len != want_args || expr.args[0] == nullptr ||
+        (!is_flip && expr.args[1] == nullptr))
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kBitwiseMemberDetail);
+    auto lhs = analyze_arg(*expr.args[0]);
+    if (!lhs) return core::make_unexpected(lhs.error());
+    HirExpr rhs_expr{};
+    if (is_flip) {
+        rhs_expr.kind = HirExprKind::IntLit;
+        rhs_expr.type = HirTypeKind::I32;
+        rhs_expr.span = expr.span;
+        rhs_expr.int_value = -1;
+    } else {
+        auto rhs = analyze_arg(*expr.args[1]);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        rhs_expr = rhs.value();
+    }
+    if (lhs->type != HirTypeKind::I32 || rhs_expr.type != HirTypeKind::I32 || lhs->may_nil ||
+        lhs->may_error || rhs_expr.may_nil || rhs_expr.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kBitwiseOperandDetail);
+    if (lhs->kind == HirExprKind::IntLit && rhs_expr.kind == HirExprKind::IntLit) {
+        const i32 a = static_cast<i32>(lhs->int_value);
+        const i32 n = static_cast<i32>(rhs_expr.int_value);
+        i32 folded = 0;
+        switch (bit_kind) {
+            case HirExprKind::BitAnd:
+                folded = static_cast<i32>(static_cast<u32>(a) & static_cast<u32>(n));
+                break;
+            case HirExprKind::BitOr:
+                folded = static_cast<i32>(static_cast<u32>(a) | static_cast<u32>(n));
+                break;
+            case HirExprKind::BitXor:
+                folded = static_cast<i32>(static_cast<u32>(a) ^ static_cast<u32>(n));
+                break;
+            case HirExprKind::BitShl:
+                folded = static_cast<u32>(n) >= 32u
+                             ? 0
+                             : static_cast<i32>(static_cast<u32>(a) << static_cast<u32>(n));
+                break;
+            case HirExprKind::BitShr:
+                folded = static_cast<u32>(n) >= 32u ? (a < 0 ? -1 : 0) : static_cast<i32>(a >> n);
+                break;
+            default:
+                break;
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::IntLit;
+        out.type = HirTypeKind::I32;
+        out.span = expr.span;
+        out.int_value = folded;
+        return out;
+    }
+    HirExpr out{};
+    out.kind = bit_kind;
+    out.type = HirTypeKind::I32;
+    out.span = expr.span;
+    if (!route->exprs.push(lhs.value()))
+        return frontend_error(FrontendError::TooManyItems, expr.span);
+    out.lhs = &route->exprs[route->exprs.len - 1];
+    if (!route->exprs.push(rhs_expr)) return frontend_error(FrontendError::TooManyItems, expr.span);
+    out.rhs = &route->exprs[route->exprs.len - 1];
+    return out;
 }
 
 static FrontendResult<HirExpr> analyze_method_call_expr(
@@ -3279,6 +3459,15 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         auto variant = analyze_expr(variant_expr, route, mod, locals, local_count, binding);
         if (variant) return variant;
     }
+    // Builtin `bitwise` namespace (DESIGN.md §3.2.1) — see
+    // analyze_bitwise_namespace_call. A user binding named `bitwise` (local,
+    // alias, function, type, import namespace) shadows the builtin.
+    if (receiver_override == nullptr && bitwise_namespace_receiver(*expr.lhs) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"bitwise", 7})) {
+        return analyze_bitwise_namespace_call(
+            expr, route, mod, locals, local_count, binding, nullptr);
+    }
+
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
         AstExpr variant_expr{};
         variant_expr.kind = AstExprKind::VariantCase;
@@ -6889,6 +7078,25 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (expr.rhs->kind == AstExprKind::Call)
             return analyze_call_expr(
                 *expr.rhs, route, mod, locals, local_count, binding, &lhs.value());
+        // `mask | bitwise.and(_, 3)` — the bitwise namespace is the only
+        // function-style spelling for bit operations, so its calls are valid
+        // pipe stages with the usual explicit-placeholder contract.
+        if (expr.rhs->kind == AstExprKind::MethodCall && expr.rhs->lhs != nullptr &&
+            bitwise_namespace_receiver(*expr.rhs->lhs) &&
+            !user_bound_ident_name(mod, locals, local_count, binding, {"bitwise", 7})) {
+            u32 pipe_placeholder_count = 0;
+            for (u32 i = 0; i < expr.rhs->args.len; i++) {
+                if (expr.rhs->args[i] != nullptr &&
+                    expr.rhs->args[i]->kind == AstExprKind::Placeholder)
+                    pipe_placeholder_count++;
+            }
+            if (pipe_placeholder_count == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.rhs->span,
+                                      lit_str("pipe call missing placeholder"));
+            return analyze_bitwise_namespace_call(
+                *expr.rhs, route, mod, locals, local_count, binding, &lhs.value());
+        }
         return frontend_error(FrontendError::UnsupportedSyntax,
                               expr.rhs->span,
                               lit_str("pipe rhs must be a call stage or _.method(...) stage"));
