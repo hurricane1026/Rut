@@ -2210,6 +2210,50 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!tag) return frontend_error(FrontendError::OutOfMemory, span);
         return tag.value();
     }
+    if (value.kind == MirValueKind::BitAnd || value.kind == MirValueKind::BitOr ||
+        value.kind == MirValueKind::BitXor || value.kind == MirValueKind::BitShl ||
+        value.kind == MirValueKind::BitShr) {
+        auto lhs = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = materialize_value(*value.rhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        rir::Opcode op = rir::Opcode::BitAnd;
+        if (value.kind == MirValueKind::BitOr)
+            op = rir::Opcode::BitOr;
+        else if (value.kind == MirValueKind::BitXor)
+            op = rir::Opcode::BitXor;
+        else if (value.kind == MirValueKind::BitShl)
+            op = rir::Opcode::BitShl;
+        else if (value.kind == MirValueKind::BitShr)
+            op = rir::Opcode::BitShr;
+        auto out = b.emit_bit(op, lhs.value(), rhs.value(), {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::Eq || value.kind == MirValueKind::Lt ||
         value.kind == MirValueKind::Gt) {
         const MirValue& lhs_expr = *value.lhs;

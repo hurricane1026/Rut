@@ -36,6 +36,14 @@ constexpr Str kGuardBoolDetail =
 constexpr Str kGuardLetNilCarrierDetail = lit_str(
     "guard let cannot test a runtime optional-only value yet (nil-carrier "
     "lowering pending); use an error-capable source");
+// Fix-it details for the `bitwise` builtin namespace (DESIGN.md §3.2.1).
+constexpr Str kBitwiseMemberDetail = lit_str(
+    "unknown bitwise function; use bitwise.and(a, b) / bitwise.or(a, b) / "
+    "bitwise.xor(a, b) / bitwise.flip(a) / bitwise.shiftLeft(a, n) / "
+    "bitwise.shiftRight(a, n)");
+constexpr Str kBitwiseOperandDetail = lit_str(
+    "bitwise operands must be plain i32 values; bind optional or fallible "
+    "values first with guard let / if let / .or(default)");
 
 static std::string str_to_std_string(Str s) {
     return std::string(s.ptr, s.len);
@@ -3228,6 +3236,28 @@ static bool user_bound_req_name(const HirModule& mod,
     return has_import_namespace(mod, {"req", 3});
 }
 
+// Whether `name` is claimed by any user binding visible here — used to let
+// user code shadow builtin namespaces like `bitwise` (same precedence rule as
+// user_bound_req_name, minus the request-proxy special case).
+static bool user_bound_ident_name(const HirModule& mod,
+                                  const HirLocal* locals,
+                                  u32 local_count,
+                                  const MatchPayloadBinding* binding,
+                                  Str name) {
+    if (binding && binding->subject && binding->name.eq(name)) return true;
+    for (u32 i = 0; i < local_count; i++) {
+        if (locals[i].name.eq(name)) return true;
+    }
+    for (u32 i = 0; i < mod.variants.len; i++) {
+        if (mod.variants[i].name.eq(name)) return true;
+    }
+    if (find_function_index(mod, name) < mod.functions.len) return true;
+    if (find_struct_index(mod, name) < mod.structs.len) return true;
+    if (find_protocol_index(mod, name) < mod.protocols.len) return true;
+    if (find_type_alias(mod, name) != nullptr) return true;
+    return has_import_namespace(mod, name);
+}
+
 static bool magic_req_receiver(const AstExpr& lhs,
                                const HirModule& mod,
                                const HirLocal* locals,
@@ -3279,6 +3309,101 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         auto variant = analyze_expr(variant_expr, route, mod, locals, local_count, binding);
         if (variant) return variant;
     }
+    // Builtin `bitwise` namespace (DESIGN.md §3.2.1): the only bit-operation
+    // surface — the symbol forms (& | ^ ~ << >>) are lexer fix-its. All ops
+    // are i32; `flip(a)` desugars to `xor(a, -1)`. Shift amounts outside
+    // 0..31 saturate (0 for shiftLeft, sign fill for shiftRight) instead of
+    // hitting hardware-dependent masking. A user binding named `bitwise`
+    // (local, function, type, import alias) shadows the namespace.
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq({"bitwise", 7}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"bitwise", 7})) {
+        const bool is_flip = expr.name.eq({"flip", 4});
+        HirExprKind bit_kind{};
+        if (expr.name.eq({"and", 3})) {
+            bit_kind = HirExprKind::BitAnd;
+        } else if (expr.name.eq({"or", 2})) {
+            bit_kind = HirExprKind::BitOr;
+        } else if (expr.name.eq({"xor", 3})) {
+            bit_kind = HirExprKind::BitXor;
+        } else if (expr.name.eq({"shiftLeft", 9})) {
+            bit_kind = HirExprKind::BitShl;
+        } else if (expr.name.eq({"shiftRight", 10})) {
+            bit_kind = HirExprKind::BitShr;
+        } else if (is_flip) {
+            bit_kind = HirExprKind::BitXor;
+        } else {
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kBitwiseMemberDetail);
+        }
+        const u32 want_args = is_flip ? 1u : 2u;
+        if (expr.args.len != want_args || expr.args[0] == nullptr ||
+            (!is_flip && expr.args[1] == nullptr))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kBitwiseMemberDetail);
+        auto lhs = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        HirExpr rhs_expr{};
+        if (is_flip) {
+            rhs_expr.kind = HirExprKind::IntLit;
+            rhs_expr.type = HirTypeKind::I32;
+            rhs_expr.span = expr.span;
+            rhs_expr.int_value = -1;
+        } else {
+            auto rhs = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+            if (!rhs) return core::make_unexpected(rhs.error());
+            rhs_expr = rhs.value();
+        }
+        if (lhs->type != HirTypeKind::I32 || rhs_expr.type != HirTypeKind::I32 || lhs->may_nil ||
+            lhs->may_error || rhs_expr.may_nil || rhs_expr.may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kBitwiseOperandDetail);
+        if (lhs->kind == HirExprKind::IntLit && rhs_expr.kind == HirExprKind::IntLit) {
+            const i32 a = static_cast<i32>(lhs->int_value);
+            const i32 n = static_cast<i32>(rhs_expr.int_value);
+            i32 folded = 0;
+            switch (bit_kind) {
+                case HirExprKind::BitAnd:
+                    folded = static_cast<i32>(static_cast<u32>(a) & static_cast<u32>(n));
+                    break;
+                case HirExprKind::BitOr:
+                    folded = static_cast<i32>(static_cast<u32>(a) | static_cast<u32>(n));
+                    break;
+                case HirExprKind::BitXor:
+                    folded = static_cast<i32>(static_cast<u32>(a) ^ static_cast<u32>(n));
+                    break;
+                case HirExprKind::BitShl:
+                    folded = static_cast<u32>(n) >= 32u
+                                 ? 0
+                                 : static_cast<i32>(static_cast<u32>(a) << static_cast<u32>(n));
+                    break;
+                case HirExprKind::BitShr:
+                    folded =
+                        static_cast<u32>(n) >= 32u ? (a < 0 ? -1 : 0) : static_cast<i32>(a >> n);
+                    break;
+                default:
+                    break;
+            }
+            HirExpr out{};
+            out.kind = HirExprKind::IntLit;
+            out.type = HirTypeKind::I32;
+            out.span = expr.span;
+            out.int_value = folded;
+            return out;
+        }
+        HirExpr out{};
+        out.kind = bit_kind;
+        out.type = HirTypeKind::I32;
+        out.span = expr.span;
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(rhs_expr))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
         AstExpr variant_expr{};
         variant_expr.kind = AstExprKind::VariantCase;

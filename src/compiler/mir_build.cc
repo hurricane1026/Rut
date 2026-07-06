@@ -497,7 +497,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         return v;
     }
     if (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
-        expr.kind == HirExprKind::Gt) {
+        expr.kind == HirExprKind::Gt || expr.kind == HirExprKind::BitAnd ||
+        expr.kind == HirExprKind::BitOr || expr.kind == HirExprKind::BitXor ||
+        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
@@ -508,10 +510,35 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         if (!fn->values.push(rhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
-        v.kind = expr.kind == HirExprKind::Eq
-                     ? MirValueKind::Eq
-                     : (expr.kind == HirExprKind::Lt ? MirValueKind::Lt : MirValueKind::Gt);
-        v.type = MirTypeKind::Bool;
+        switch (expr.kind) {
+            case HirExprKind::Eq:
+                v.kind = MirValueKind::Eq;
+                break;
+            case HirExprKind::Lt:
+                v.kind = MirValueKind::Lt;
+                break;
+            case HirExprKind::Gt:
+                v.kind = MirValueKind::Gt;
+                break;
+            case HirExprKind::BitAnd:
+                v.kind = MirValueKind::BitAnd;
+                break;
+            case HirExprKind::BitOr:
+                v.kind = MirValueKind::BitOr;
+                break;
+            case HirExprKind::BitXor:
+                v.kind = MirValueKind::BitXor;
+                break;
+            case HirExprKind::BitShl:
+                v.kind = MirValueKind::BitShl;
+                break;
+            default:
+                v.kind = MirValueKind::BitShr;
+                break;
+        }
+        const bool is_bit = expr.kind != HirExprKind::Eq && expr.kind != HirExprKind::Lt &&
+                            expr.kind != HirExprKind::Gt;
+        v.type = is_bit ? MirTypeKind::I32 : MirTypeKind::Bool;
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
         v.error_variant_index = expr.error_variant_index;

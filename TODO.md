@@ -56,10 +56,15 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   call-argument position; pipeline RHS placeholder validation.
 - Checker/builtins: [x] `.or(default)` (sugar for eager `any(value, default)`);
   [x] `req.params.*` capture namespace (flat `req.<capture>` is an error with a
-  fix-it). Still pending: `bitwise.and/or/xor/flip/shiftLeft/shiftRight`
-  namespace; `req.set/add` + `resp.set/remove/add/header` write paths;
-  `req.queryAll`; `respond` legality (middleware only) vs status-`return`
-  (handler only); `stats()/metrics()/reload()/upstream.mark()` declarations.
+  fix-it); [x] `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace
+  (end-to-end: analyze fold + HIR/MIR/RIR Bit* ops + LLVM codegen; i32 only,
+  shifts saturate outside 0..31, `flip` desugars to `xor(a, -1)`; user
+  bindings named `bitwise` shadow the namespace). Still pending: `req.set/add`
+  + `resp.set/remove/add/header` write paths (resp needs a runtime mutable
+  response-header store — today response headers are compile-time const sets);
+  `req.queryAll` (needs a runtime [str] value type — none exists); `respond`
+  legality (middleware only) vs status-`return` (handler only);
+  `stats()/metrics()/reload()/upstream.mark()` declarations.
 - Diagnostics: implement the §3.6 fix-it rows for `?.`, `??`, postfix `!`,
   truthiness guard, bitwise symbols, placeholder-less pipeline, `case`,
   middleware/handler return-respond confusion.

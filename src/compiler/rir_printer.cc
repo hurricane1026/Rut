@@ -220,6 +220,21 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrInterpolate:
             buf.put_cstr("str.interpolate");
             break;
+        case Opcode::BitAnd:
+            buf.put_cstr("bit.and");
+            break;
+        case Opcode::BitOr:
+            buf.put_cstr("bit.or");
+            break;
+        case Opcode::BitXor:
+            buf.put_cstr("bit.xor");
+            break;
+        case Opcode::BitShl:
+            buf.put_cstr("bit.shl");
+            break;
+        case Opcode::BitShr:
+            buf.put_cstr("bit.shr");
+            break;
         case Opcode::CmpEq:
             buf.put_cstr("cmp.eq");
             break;
@@ -553,6 +568,11 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::CmpGt:
         case Opcode::CmpLe:
         case Opcode::CmpGe:
+        case Opcode::BitAnd:
+        case Opcode::BitOr:
+        case Opcode::BitXor:
+        case Opcode::BitShl:
+        case Opcode::BitShr:
         case Opcode::TimeDiff:
             // Binary: %a, %b
             buf.put(' ');
