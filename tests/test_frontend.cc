@@ -1301,6 +1301,82 @@ TEST(frontend, user_binding_named_bitwise_shadows_builtin_namespace) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, nil_presence_test_on_optional_header_lowers) {
+    const char* src =
+        "route GET \"/x\" { let h = req.header(\"X-N\") if h == nil { return 404 } else { "
+        "return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, nil_presence_test_not_nil_guard_lowers) {
+    const char* src =
+        "route GET \"/x\" { let h = req.header(\"X-N\") guard h != nil else { return 401 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, nil_presence_test_nil_on_lhs_is_symmetric) {
+    const char* src =
+        "route GET \"/x\" { let h = req.header(\"X-N\") if nil == h { return 404 } else { "
+        "return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, nil_presence_test_rejects_fallback_resolved_value) {
+    // any(x, default) always yields a usable value, so a presence test on the
+    // result is statically meaningless — rejected like any never-nil source.
+    const char* src =
+        "route GET \"/x\" { let v = any(req.query(\"k\"), \"d\") if v == nil { return 500 } "
+        "else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, nil_presence_test_rejects_never_nil_value) {
+    const char* src =
+        "route GET \"/x\" { let s = \"a\" if s == nil { return 404 } else { return 200 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+}
+
 TEST(frontend, analyze_preserves_optional_any_as_or_value) {
     const char* src =
         "route GET \"/users\" { let maybe = req.query(\"code\") let code = any(maybe, "
