@@ -3558,26 +3558,33 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return true;
                     }
                 }
-                // Short-circuit lowerings fold through their condition:
-                // `a && b` is IfElse(a, b, false), `a || b` folds when `a`
-                // does. When the first operand is determined by the carrier's
-                // absence, only the arm the error path takes matters.
+                // Conditional selections fold through their condition
+                // (`a && b` is IfElse(a, b, false)) — and even with an
+                // unknown condition, the result is known when BOTH arms fold
+                // to the same value: `(a && x == nil) || x == nil` reads true
+                // under the error outcome whichever way `a` went. Sound for
+                // eager shapes too — select still picks one of two equal
+                // values.
                 if (value->kind == MirValueKind::IfElse && value->args.len == 1) {
                     bool cond_value = false;
                     if (fold_error_outcome(value->lhs, ci, &cond_value))
                         return fold_error_outcome(
                             cond_value ? value->rhs : value->args[0], ci, out);
-                }
-                if (value->kind == MirValueKind::Or) {
-                    bool lhs_value = false;
-                    if (fold_error_outcome(value->lhs, ci, &lhs_value)) {
-                        if (lhs_value) {
-                            *out = true;
-                            return true;
-                        }
-                        return fold_error_outcome(value->rhs, ci, out);
+                    bool then_value = false;
+                    bool else_value = false;
+                    if (fold_error_outcome(value->rhs, ci, &then_value) &&
+                        fold_error_outcome(value->args[0], ci, &else_value) &&
+                        then_value == else_value) {
+                        *out = then_value;
+                        return true;
                     }
                 }
+                // Coalescing `carrier || fallback` (the EAGER any/.or form —
+                // both operands materialize, then select on presence): under
+                // the error outcome the carrier reads absent, so the result
+                // is the fallback's.
+                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, ci))
+                    return fold_error_outcome(value->rhs, ci, out);
                 return false;
             }
 
@@ -3641,19 +3648,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     *rec_false = (cond_true || then_false) && (cond_false || else_false);
                     return;
                 }
-                if (value->kind == MirValueKind::Or) {
-                    bool lhs_true = false;
-                    bool lhs_false = false;
-                    bool rhs_true = false;
-                    bool rhs_false = false;
-                    recovers_on_paths(value->lhs, ci, &lhs_true, &lhs_false);
-                    recovers_on_paths(value->rhs, ci, &rhs_true, &rhs_false);
-                    *rec_true = lhs_true && (lhs_false || rhs_true);
-                    *rec_false = lhs_false || rhs_false;
-                    return;
-                }
-                // Any other node evaluates its children unconditionally: a
-                // child covered on both result sides covers every path.
+                // Any other node — including the EAGER Or (any/.or fallback:
+                // both operands materialize before the select) — evaluates
+                // its children unconditionally: a child covered on both
+                // result sides covers every path.
                 bool child_true = false;
                 bool child_false = false;
                 recovers_on_paths(value->lhs, ci, &child_true, &child_false);
@@ -3708,14 +3706,18 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 if (value == nullptr) return false;
                 if (is_coalescing_use(value, ci)) return true;
                 if (match_presence && is_presence_test_use(value, ci)) return true;
-                // Short-circuit constructs evaluate only their FIRST operand
-                // unconditionally: `a && b` lowers to IfElse(a, b, false),
-                // `a || b` to Or/IfElse. A presence test inside a
-                // conditionally-evaluated operand is not guaranteed to run —
-                // the untaken path could return success with the error live —
-                // so it must not count as recovering there.
+                // Short-circuit conditionals evaluate only their FIRST
+                // operand unconditionally: `a && b` / `a || b` lower to
+                // IfElse(a, ..). A presence test inside a conditionally-
+                // evaluated arm is not guaranteed to run — the untaken path
+                // could return success with the error live — so it must not
+                // count as recovering there. The eager shapes are exempt:
+                // eager-fallback IfElse and Or (any/.or) materialize every
+                // operand before selecting, so a presence test in any
+                // operand always runs and genuinely consumes the error.
+                // Pipe-conditional stays gated (conditional evaluation).
                 const bool operand_presence =
-                    (value->kind == MirValueKind::IfElse || value->kind == MirValueKind::Or)
+                    (value->kind == MirValueKind::IfElse && !value->is_eager_fallback)
                         ? false
                         : match_presence;
                 if (contains_recovering_use(value->lhs, ci, match_presence)) return true;
@@ -3786,18 +3788,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                             cond_value ? value->rhs : value->args[0], ci, false);
                     }
                 }
-                if (value->kind == MirValueKind::Or) {
-                    bool lhs_value = false;
-                    if (fold_error_outcome(value->lhs, ci, &lhs_value)) {
-                        if (contains_non_recovering_use(value->lhs, ci, false)) return true;
-                        if (!lhs_value && contains_non_recovering_use(value->rhs, ci, false))
-                            return true;
-                        for (u32 ai = 0; ai < value->args.len; ai++)
-                            if (contains_non_recovering_use(value->args[ai], ci, false))
-                                return true;
-                        return false;
-                    }
-                }
+                // (Or gets no such skip: it is the EAGER any/.or fallback —
+                // both operands materialize before the select, so every
+                // operand must be scanned. The coalescing case above already
+                // handled Or over this carrier.)
                 // Top-level guard condition (bare HasValue or the bool-literal
                 // presence-test wrap): the guard's else consumes the error.
                 if (top_level_cond && is_guard_condition(value, ci)) return false;
@@ -3933,9 +3927,13 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 const auto& term = mir.functions[i].blocks[bi].term;
                 bool covered = false;
                 if (term.kind == MirTerminatorKind::Branch) {
+                    // A match/use_cmp SUBJECT recovers the same way a plain
+                    // condition does — directly guard-shaped or covered on
+                    // every evaluation path.
                     if (RecoveryScan::is_guard_condition(&term.cond, ci) ||
                         RecoveryScan::recovers_on_all_paths(&term.cond, ci) ||
-                        (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci)))
+                        (term.use_cmp && (RecoveryScan::is_guard_condition(&term.lhs, ci) ||
+                                          RecoveryScan::recovers_on_all_paths(&term.lhs, ci))))
                         covered = true;
                     else
                         covered = self(self, term.then_block) && self(self, term.else_block);
@@ -3955,6 +3953,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 // here always runs and consumes the error (match_presence).
                 if (RecoveryScan::contains_recovering_use(
                         &mir.functions[i].locals[li].init, ci, /*match_presence=*/true))
+                    return true;
+                // A stored path-complete expression (`let covered = a && x ==
+                // nil || x == nil`) also recovers: the init evaluates eagerly
+                // and every one of its evaluation paths runs a presence test,
+                // even though no single unconditional operand does.
+                if (RecoveryScan::recovers_on_all_paths(&mir.functions[i].locals[li].init, ci))
                     return true;
             }
             if (all_paths_recover(ci)) return true;
