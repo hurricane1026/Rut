@@ -77,11 +77,11 @@ var n = 0                     // ⏳ mutable, handler-local only
 const key = env("SECRET")     // must be compile-time evaluable
 
 if cond { ... } else { ... }              // bool branch — always braces
-if let v = expr { ... } else { ... }      // bind usable value in then-branch; error-capable expr
-                                          // works, ⏳ pure-optional expr (req.query/header) pending
+if let v = expr { ... } else { ... }      // bind usable value in then-branch; error-capable AND
+                                          // pure-optional exprs (req.query/header) both work
 guard cond else { return 400 }            // cond MUST be bool; else must exit
-guard let v = expr else { return 400 }    // bind or exit; error-capable expr works,
-                                          // ⏳ pure-optional expr (req.query/header) pending
+guard let v = expr else { return 400 }    // bind or exit; error-capable AND pure-optional
+                                          // exprs both work
 guard let v else { ... }                  // Swift 5.7 shorthand: rebind v
 
 match status {                            // general dispatch — no `case` keyword
@@ -103,7 +103,7 @@ Nil/error handling — pick by situation, nothing else exists:
 | Situation | Write |
 |---|---|
 | fallback value | `req.query("page").or("1")` (eager sugar for `any(x, default)`) |
-| branch if present | `if let v = expr { ... } else { ... }` (⏳ pure-optional expr) |
+| branch if present | `if let v = expr { ... } else { ... }` |
 | stop if absent/failed | `guard let v = expr else { return 400 }` |
 | bare presence test | `x != nil` / `x == nil` (nil and error are uniformly "absent"; never-nil sources are a compile error) |
 | failure *reason* matters | `match` on the error |

@@ -31,11 +31,6 @@ static Str intern_generated_name(const std::string& value) {
 // Fix-it detail for bare guards on non-bool values (DESIGN.md §3.6).
 constexpr Str kGuardBoolDetail =
     lit_str("guard condition must be bool; to bind a value use `guard let x = ...`");
-// Honest rejection until the pure-optional carrier can lower a runtime nil
-// test (TODO.md: opt carrier for may_nil-only values).
-constexpr Str kGuardLetNilCarrierDetail = lit_str(
-    "guard let cannot test a runtime optional-only value yet (nil-carrier "
-    "lowering pending); use an error-capable source");
 // Fix-it details for the `bitwise` builtin namespace (DESIGN.md §3.2.1).
 constexpr Str kBitwiseMemberDetail = lit_str(
     "unknown bitwise function; use bitwise.and(a, b) / bitwise.or(a, b) / "
@@ -3986,7 +3981,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
                                                      const HirExpr& bound,
                                                      Span span) {
-    if (!bound.may_error) return bound;
+    // Both missing channels narrow through ValueOf: the error-capable
+    // carrier unwraps its payload field, the pure-optional carrier unwraps
+    // its Optional<inner> value. Only a plain (never-missing) bound passes
+    // through untouched.
+    if (!bound.may_error && !bound.may_nil) return bound;
     if (!route->exprs.push(bound)) return frontend_error(FrontendError::TooManyItems, span);
     HirExpr init{};
     init.kind = HirExprKind::ValueOf;
@@ -4040,10 +4039,10 @@ static FrontendResult<HirLocal> make_if_let_local(
     local.generic_protocol_count = bound.generic_protocol_count;
     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
         local.generic_protocol_indices[cpi] = bound.generic_protocol_indices[cpi];
-    // Success path: HasValue conds (error-capable sources) rule out both
-    // channels; pure-optional runtime values keep may_nil (see analyze_guard_cond
-    // — their carrier is not lowerable yet, so those are rejected upstream).
-    local.may_nil = bound.may_nil && !bound.may_error;
+    // Success path: the HasValue cond rules out both missing channels —
+    // error-capable AND pure-optional sources alike — so the narrowed
+    // binding is a plain usable value.
+    local.may_nil = false;
     local.may_error = false;
     local.variant_index = bound.variant_index;
     local.struct_index = bound.struct_index;
@@ -5338,10 +5337,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     local.generic_protocol_count = bound->generic_protocol_count;
                     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                         local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                    // Success path: HasValue conds (error-capable sources) rule out both
-                    // channels; pure-optional runtime values keep may_nil (see
-                    // analyze_guard_cond — their carrier is not lowerable yet).
-                    local.may_nil = bound->may_nil && !bound->may_error;
+                    // Success path: the HasValue cond rules out both missing
+                    // channels — error-capable AND pure-optional sources
+                    // alike — so the binding is a plain usable value.
+                    local.may_nil = false;
                     local.may_error = false;
                     local.variant_index = bound->variant_index;
                     local.struct_index = bound->struct_index;
@@ -8930,22 +8929,20 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
             cond.bool_value = true;
             return cond;
         }
-        if (analyzed->may_error) {
-            if (!route->exprs.push(analyzed.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
-            cond.kind = HirExprKind::HasValue;
-            cond.lhs = &route->exprs[route->exprs.len - 1];
-            cond.variant_index = analyzed->variant_index;
-            cond.struct_index = analyzed->struct_index;
-            cond.error_struct_index = analyzed->error_struct_index;
-            cond.error_variant_index = analyzed->error_variant_index;
-            return cond;
-        }
-        // Runtime optional-only value: the nil test needs an opt carrier that
-        // lowering does not provide yet (TODO.md). Reject loudly instead of
-        // silently passing the guard. Known-nil inits fold above.
-        return frontend_error(
-            FrontendError::UnsupportedSyntax, expr.span, kGuardLetNilCarrierDetail);
+        // Error-capable AND pure-optional (may_nil-only) sources both lower
+        // through HasValue: the error-capable carrier reads its {error,
+        // payload} struct, the pure-optional one is an Optional<inner> value
+        // (req.query/req.header, a func returning `nil` in a branch) tested
+        // with opt_is_nil. Known-nil inits folded above.
+        if (!route->exprs.push(analyzed.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        cond.kind = HirExprKind::HasValue;
+        cond.lhs = &route->exprs[route->exprs.len - 1];
+        cond.variant_index = analyzed->variant_index;
+        cond.struct_index = analyzed->struct_index;
+        cond.error_struct_index = analyzed->error_struct_index;
+        cond.error_variant_index = analyzed->error_variant_index;
+        return cond;
     }
 
     if (!is_match_guard) {
@@ -9188,10 +9185,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     local.generic_protocol_count = bound->generic_protocol_count;
                     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                         local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                    // Success path: HasValue conds (error-capable sources) rule out both
-                    // channels; pure-optional runtime values keep may_nil (see
-                    // analyze_guard_cond — their carrier is not lowerable yet).
-                    local.may_nil = bound->may_nil && !bound->may_error;
+                    // Success path: the HasValue cond rules out both missing
+                    // channels — error-capable AND pure-optional sources
+                    // alike — so the binding is a plain usable value.
+                    local.may_nil = false;
                     local.may_error = false;
                     local.variant_index = bound->variant_index;
                     local.struct_index = bound->struct_index;
@@ -16468,10 +16465,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     local.generic_protocol_count = bound->generic_protocol_count;
                     for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                         local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                    // Success path: HasValue conds (error-capable sources) rule out both
-                    // channels; pure-optional runtime values keep may_nil (see
-                    // analyze_guard_cond — their carrier is not lowerable yet).
-                    local.may_nil = bound->may_nil && !bound->may_error;
+                    // Success path: the HasValue cond rules out both missing
+                    // channels — error-capable AND pure-optional sources
+                    // alike — so the binding is a plain usable value.
+                    local.may_nil = false;
                     local.may_error = false;
                     local.variant_index = bound->variant_index;
                     local.struct_index = bound->struct_index;
