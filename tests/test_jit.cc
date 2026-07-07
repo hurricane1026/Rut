@@ -19434,6 +19434,61 @@ TEST(jit, split_presence_condition_folds_in_error_flood) {
     rir.destroy();
 }
 
+TEST(jit, presence_test_survives_never_missing_any_fold) {
+    // `any(false, value == nil)`: the lhs is never missing, so the old
+    // analyze fold dropped the whole fallback — including the eagerly-
+    // evaluated presence test that consumes value's error. The fold is now
+    // gated on the fallback containing a fallible HasValue, and the Or
+    // lowering yields the never-missing lhs after materializing the
+    // fallback, so a runtime error takes the programmed 204 branch instead
+    // of a state-0 500 (PR #168 review round 8).
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.http11)) "
+        "let handled = any(false, value == nil) "
+        "if handled { return 401 } else { return 204 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // handled is always false (the never-missing lhs wins the select) —
+    // the interesting difference is 204 vs 500 on the error path.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, or_fallback_runtime_present_and_absent) {
     // `.or(default)` end-to-end: query present -> value; absent -> default.
     const char* src =

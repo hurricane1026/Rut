@@ -3128,6 +3128,27 @@ static KnownValueState known_value_state(const HirExpr& expr,
                                          const HirLocal* locals,
                                          u32 local_count,
                                          u32 depth);
+
+// A HasValue test over a fallible source consumes that source's runtime
+// error (nil-presence semantics: error reads as "absent"). Folding away an
+// EAGERLY-evaluated operand that contains one — the any()/all() known-value
+// folds — would silently un-consume the error and re-arm the state-0 error
+// prelude, turning the programmed absent-path response into a generic 500.
+// Short-circuit folds (`false && x`) are exempt: the dropped operand would
+// not have evaluated at runtime anyway.
+static bool hir_contains_fallible_has_value(const HirExpr* expr) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::HasValue && expr->lhs != nullptr &&
+        (expr->lhs->may_error || expr->lhs->may_nil))
+        return true;
+    if (hir_contains_fallible_has_value(expr->lhs)) return true;
+    if (hir_contains_fallible_has_value(expr->rhs)) return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_contains_fallible_has_value(expr->args[ai])) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_contains_fallible_has_value(expr->field_inits[fi].value)) return true;
+    return false;
+}
 static bool const_eval_expr(
     const HirExpr& expr, const HirLocal* locals, u32 local_count, ConstValue* out, u32 depth);
 static KnownErrorCase known_error_case(const HirExpr& expr,
@@ -7631,7 +7652,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             folded.span = expr.span;
             return folded;
         }
-        if (!lhs->may_nil && !lhs->may_error && !rhs->may_error) {
+        // Never-missing lhs would normally fold the whole any() to it — but
+        // the fallback operand is EAGERLY evaluated, so a presence test
+        // inside it must be kept (it consumes its carrier's runtime error).
+        if (!lhs->may_nil && !lhs->may_error && !rhs->may_error &&
+            !hir_contains_fallible_has_value(rhs)) {
             HirExpr folded = *lhs;
             folded.span = expr.span;
             return folded;
@@ -7763,7 +7788,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             folded.span = expr.span;
             return folded;
         }
-        if (!lhs->may_nil && !lhs->may_error && !rhs->may_error) {
+        // Same eager-evaluation rule as any(): dropping the never-missing
+        // lhs must not discard a presence test it contains.
+        if (!lhs->may_nil && !lhs->may_error && !rhs->may_error &&
+            !hir_contains_fallible_has_value(lhs)) {
             HirExpr folded = *rhs;
             folded.span = expr.span;
             return folded;

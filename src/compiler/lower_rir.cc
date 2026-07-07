@@ -1727,6 +1727,14 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!rhs) return core::make_unexpected(rhs.error());
         if (value.lhs->kind == MirValueKind::Nil || value.lhs->kind == MirValueKind::Error)
             return rhs.value();
+        if (!value.lhs->may_error && !value.lhs->may_nil) {
+            // Never-missing lhs: the select is decided at compile time. The
+            // analyze fold keeps this shape only when the fallback contains
+            // a presence test that must still evaluate (it consumes its
+            // carrier's runtime error) — rhs is already materialized above,
+            // so just yield the lhs.
+            return lhs.value();
+        }
         const auto value_shape = resolved_shape(mir, value);
         auto inner = make_inner_type(value_shape);
         if (!inner) return core::make_unexpected(inner.error());
@@ -3652,6 +3660,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 // both operands materialize before the select) — evaluates
                 // its children unconditionally: a child covered on both
                 // result sides covers every path.
+                //
+                // KNOWN PRECISION LIMIT: coverage split across SIBLING
+                // children under complementary predicates — e.g.
+                // `(a && x == nil) == (!a && x == nil)`, where one operand
+                // recovers when `a` and the other when `!a` — is not
+                // recognized: the per-child (rec_true, rec_false) pair
+                // cannot express correlation through an unrelated condition;
+                // that needs predicate-domain dataflow. The miss is in the
+                // conservative direction only (the prelude stays: a generic
+                // 500 instead of the programmed branch, never an error
+                // escaping as success).
                 bool child_true = false;
                 bool child_false = false;
                 recovers_on_paths(value->lhs, ci, &child_true, &child_false);
