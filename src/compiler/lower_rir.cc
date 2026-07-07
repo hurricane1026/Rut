@@ -3558,6 +3558,26 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return true;
                     }
                 }
+                // Short-circuit lowerings fold through their condition:
+                // `a && b` is IfElse(a, b, false), `a || b` folds when `a`
+                // does. When the first operand is determined by the carrier's
+                // absence, only the arm the error path takes matters.
+                if (value->kind == MirValueKind::IfElse && value->args.len == 1) {
+                    bool cond_value = false;
+                    if (fold_error_outcome(value->lhs, ci, &cond_value))
+                        return fold_error_outcome(
+                            cond_value ? value->rhs : value->args[0], ci, out);
+                }
+                if (value->kind == MirValueKind::Or) {
+                    bool lhs_value = false;
+                    if (fold_error_outcome(value->lhs, ci, &lhs_value)) {
+                        if (lhs_value) {
+                            *out = true;
+                            return true;
+                        }
+                        return fold_error_outcome(value->rhs, ci, out);
+                    }
+                }
                 return false;
             }
 
@@ -3630,6 +3650,41 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     for (u32 ai = 0; ai < value->args.len; ai++)
                         if (contains_non_recovering_use(value->args[ai], ci, false)) return true;
                     return false;
+                }
+                // Short-circuit operand the error path cannot evaluate:
+                // `value != nil && value == 200` lowers to
+                // IfElse(presence, compare, false) — under the error outcome
+                // the condition folds false, the compare never runs, and the
+                // else branch handles the error, so the compare must not
+                // force the prelude (it cannot mask what it never sees). The
+                // condition operand itself is still scanned — an equality
+                // lowering's IfElse has the masking HasValue as its
+                // CONDITION, so plain optional compares keep observing.
+                // (Analyzer note: optional payload compares as `&&`/`||`
+                // operands are rejected today, so this branch is latent
+                // hardening for when they land.) Eager-fallback / pipe
+                // IfElse shapes evaluate BOTH arms at runtime — the skip
+                // only applies to genuine short-circuit conditionals.
+                if (value->kind == MirValueKind::IfElse && value->args.len == 1 &&
+                    !value->is_eager_fallback && !value->is_pipe_conditional) {
+                    bool cond_value = false;
+                    if (fold_error_outcome(value->lhs, ci, &cond_value)) {
+                        if (contains_non_recovering_use(value->lhs, ci, false)) return true;
+                        return contains_non_recovering_use(
+                            cond_value ? value->rhs : value->args[0], ci, false);
+                    }
+                }
+                if (value->kind == MirValueKind::Or) {
+                    bool lhs_value = false;
+                    if (fold_error_outcome(value->lhs, ci, &lhs_value)) {
+                        if (contains_non_recovering_use(value->lhs, ci, false)) return true;
+                        if (!lhs_value && contains_non_recovering_use(value->rhs, ci, false))
+                            return true;
+                        for (u32 ai = 0; ai < value->args.len; ai++)
+                            if (contains_non_recovering_use(value->args[ai], ci, false))
+                                return true;
+                        return false;
+                    }
                 }
                 // Top-level guard condition (bare HasValue or the bool-literal
                 // presence-test wrap): the guard's else consumes the error.
