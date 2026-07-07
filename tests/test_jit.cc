@@ -19119,6 +19119,114 @@ TEST(jit, presence_test_in_short_circuit_lhs_consumes_runtime_error) {
     rir.destroy();
 }
 
+TEST(jit, presence_test_split_across_short_circuit_paths_recovers) {
+    // `req.http11 && value == nil || value == nil`: no single operand
+    // dominates, but EVERY evaluation path of the condition runs one of
+    // the presence tests — the (rec_true, rec_false) result-path analysis
+    // must credit the split coverage and drop the prelude so a runtime
+    // error routes to the programmed 401 (PR #168 review round 6).
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.http11)) "
+        "if req.http11 && value == nil || value == nil { return 401 } "
+        "else { return 204 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> usable -> both tests read present -> 204.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    // HTTP/1.0 -> error -> whichever short-circuit path runs, a presence
+    // test reads absent -> 401, not a state-0 500.
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, presence_tests_in_both_arms_cover_all_paths) {
+    // Recovery split across sibling arms: neither presence branch
+    // dominates, but every control path from the entry evaluates one —
+    // the block-level path recursion must accept this and drop the
+    // prelude so each arm's programmed nil response fires
+    // (PR #168 review round 6).
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.http11)) "
+        "if req.http11 { if value == nil { return 401 } else { return 200 } } "
+        "else { if value == nil { return 402 } else { return 204 } } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> usable -> http11 arm -> present -> 200.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> error -> the else arm's own presence test reads absent
+    // -> 402, not a state-0 500.
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 402);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, or_fallback_runtime_present_and_absent) {
     // `.or(default)` end-to-end: query present -> value; absent -> default.
     const char* src =

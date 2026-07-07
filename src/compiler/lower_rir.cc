@@ -3581,6 +3581,118 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return false;
             }
 
+            // Result-path recovery: rec_true = every evaluation path of
+            // `value` that ends with result TRUE has evaluated a construct
+            // that consumes the carrier's error (presence test / coalescing
+            // use); rec_false the same for FALSE results. Tracking the two
+            // outcomes separately credits a test on exactly the paths that
+            // ran it: in `(a && x == nil) || x == nil` the || RHS only runs
+            // on paths where the LHS came out false WITHOUT having evaluated
+            // the test, and those are exactly the paths the RHS then covers.
+            static void recovers_on_paths(const MirValue* value,
+                                          const CarrierInfo& ci,
+                                          bool* rec_true,
+                                          bool* rec_false) {
+                *rec_true = false;
+                *rec_false = false;
+                if (value == nullptr) return;
+                if (is_presence_test_use(value, ci) || is_coalescing_use(value, ci)) {
+                    *rec_true = true;
+                    *rec_false = true;
+                    return;
+                }
+                if (value->kind == MirValueKind::BoolConst) {
+                    // The impossible result side is vacuously covered.
+                    *rec_true = !value->bool_value;
+                    *rec_false = value->bool_value;
+                    return;
+                }
+                if (value->kind == MirValueKind::Eq) {
+                    // Bool-literal wraps only relabel the result sides.
+                    if (value->rhs != nullptr && value->rhs->kind == MirValueKind::BoolConst) {
+                        bool wrapped_true = false;
+                        bool wrapped_false = false;
+                        recovers_on_paths(value->lhs, ci, &wrapped_true, &wrapped_false);
+                        *rec_true = value->rhs->bool_value ? wrapped_true : wrapped_false;
+                        *rec_false = value->rhs->bool_value ? wrapped_false : wrapped_true;
+                        return;
+                    }
+                    if (value->lhs != nullptr && value->lhs->kind == MirValueKind::BoolConst) {
+                        bool wrapped_true = false;
+                        bool wrapped_false = false;
+                        recovers_on_paths(value->rhs, ci, &wrapped_true, &wrapped_false);
+                        *rec_true = value->lhs->bool_value ? wrapped_true : wrapped_false;
+                        *rec_false = value->lhs->bool_value ? wrapped_false : wrapped_true;
+                        return;
+                    }
+                }
+                if (value->kind == MirValueKind::IfElse && value->args.len == 1 &&
+                    !value->is_eager_fallback && !value->is_pipe_conditional) {
+                    bool cond_true = false;
+                    bool cond_false = false;
+                    bool then_true = false;
+                    bool then_false = false;
+                    bool else_true = false;
+                    bool else_false = false;
+                    recovers_on_paths(value->lhs, ci, &cond_true, &cond_false);
+                    recovers_on_paths(value->rhs, ci, &then_true, &then_false);
+                    recovers_on_paths(value->args[0], ci, &else_true, &else_false);
+                    *rec_true = (cond_true || then_true) && (cond_false || else_true);
+                    *rec_false = (cond_true || then_false) && (cond_false || else_false);
+                    return;
+                }
+                if (value->kind == MirValueKind::Or) {
+                    bool lhs_true = false;
+                    bool lhs_false = false;
+                    bool rhs_true = false;
+                    bool rhs_false = false;
+                    recovers_on_paths(value->lhs, ci, &lhs_true, &lhs_false);
+                    recovers_on_paths(value->rhs, ci, &rhs_true, &rhs_false);
+                    *rec_true = lhs_true && (lhs_false || rhs_true);
+                    *rec_false = lhs_false || rhs_false;
+                    return;
+                }
+                // Any other node evaluates its children unconditionally: a
+                // child covered on both result sides covers every path.
+                bool child_true = false;
+                bool child_false = false;
+                recovers_on_paths(value->lhs, ci, &child_true, &child_false);
+                if (child_true && child_false) {
+                    *rec_true = true;
+                    *rec_false = true;
+                    return;
+                }
+                recovers_on_paths(value->rhs, ci, &child_true, &child_false);
+                if (child_true && child_false) {
+                    *rec_true = true;
+                    *rec_false = true;
+                    return;
+                }
+                for (u32 ai = 0; ai < value->args.len; ai++) {
+                    recovers_on_paths(value->args[ai], ci, &child_true, &child_false);
+                    if (child_true && child_false) {
+                        *rec_true = true;
+                        *rec_false = true;
+                        return;
+                    }
+                }
+                for (u32 fi = 0; fi < value->field_inits.len; fi++) {
+                    recovers_on_paths(value->field_inits[fi].value, ci, &child_true, &child_false);
+                    if (child_true && child_false) {
+                        *rec_true = true;
+                        *rec_false = true;
+                        return;
+                    }
+                }
+            }
+
+            static bool recovers_on_all_paths(const MirValue* value, const CarrierInfo& ci) {
+                bool rec_true = false;
+                bool rec_false = false;
+                recovers_on_paths(value, ci, &rec_true, &rec_false);
+                return rec_true && rec_false;
+            }
+
             // `match_presence` gates the presence-test match on whether this
             // value is guaranteed to evaluate. Local inits materialize eagerly
             // at state 0, so a presence test there always consumes the error
@@ -3803,6 +3915,40 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             if (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci)) return true;
             return false;
         };
+        // Recovery split across paths: every control path from the entry
+        // evaluates its own recovering branch (a guard/presence condition, or
+        // a condition whose every result path evaluates a presence test —
+        // recovers_on_all_paths). Subsumes the single-dominating-branch rule:
+        // dominance is just the case where one branch covers all paths. A
+        // path that exits (return/forward) before any recovering branch does
+        // NOT recover — the sibling-escape masquerade stays guarded exactly
+        // as before.
+        auto all_paths_recover = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
+            i8 memo[MirFunction::kMaxBlocks];
+            for (u32 bi = 0; bi < MirFunction::kMaxBlocks; bi++) memo[bi] = -1;
+            auto rec = [&](auto&& self, u32 bi) -> bool {
+                if (bi >= mir.functions[i].blocks.len) return false;
+                if (memo[bi] != -1) return memo[bi] == 1;
+                memo[bi] = 0;  // revisit-while-computing reads as false
+                const auto& term = mir.functions[i].blocks[bi].term;
+                bool covered = false;
+                if (term.kind == MirTerminatorKind::Branch) {
+                    if (RecoveryScan::is_guard_condition(&term.cond, ci) ||
+                        RecoveryScan::recovers_on_all_paths(&term.cond, ci) ||
+                        (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci)))
+                        covered = true;
+                    else
+                        covered = self(self, term.then_block) && self(self, term.else_block);
+                } else if (term.kind == MirTerminatorKind::YieldTimer &&
+                           mir.functions[i].has_explicit_resume_blocks &&
+                           term.yield_next_state <= mir.functions[i].waits.len) {
+                    covered = self(self, mir.functions[i].resume_blocks[term.yield_next_state]);
+                }
+                memo[bi] = covered ? 1 : 0;
+                return covered;
+            };
+            return mir.functions[i].blocks.len > 0 && rec(rec, 0);
+        };
         auto has_recovering_or_use = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
                 // Local inits evaluate eagerly at state 0, so a presence test
@@ -3811,6 +3957,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         &mir.functions[i].locals[li].init, ci, /*match_presence=*/true))
                     return true;
             }
+            if (all_paths_recover(ci)) return true;
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
                 // A top-level guard/if-let condition (plain-branch cond OR match
