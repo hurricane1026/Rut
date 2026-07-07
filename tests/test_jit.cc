@@ -18742,6 +18742,115 @@ TEST(jit, nil_presence_test_consumes_runtime_error) {
     rir.destroy();
 }
 
+TEST(jit, nested_nil_presence_test_keeps_error_prelude_on_unguarded_sibling) {
+    // A presence test nested under a conditional does NOT dominate: the
+    // sibling arm never observes the carrier, so dropping the state-0 error
+    // prelude would let pick()'s error masquerade as the sibling's 204. The
+    // prelude must stay — same dominance restriction as guard-let recovery
+    // (PR #168 review round 3, P1).
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.http11)) "
+        "if req.http11 { if value == nil { return 401 } else { return 200 } } "
+        "else { return 204 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> usable value -> nested presence test -> else branch, 200.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> pick(false) errors AND the outer condition routes to the
+    // sibling arm that never runs the presence test. The prelude must
+    // intercept with 500 — 204 here would be an error escaping as success.
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 500);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, dominating_nil_presence_test_allows_compare_in_present_arm) {
+    // A TOP-LEVEL presence branch dominates every exit: on error it routes to
+    // the nil arm before the present-arm compare can run, so an optional
+    // compare downstream must not force the prelude back — that would turn
+    // the programmed 401 into a generic 500 (PR #168 review round 3, P2).
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.http11)) "
+        "if value == nil { return 401 } "
+        "else { if value == 200 { return 200 } else { return 204 } } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> value usable (any()'s 200 arm) -> present arm -> the
+    // optional compare hits -> 200.
+    static const char with_q[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_q), sizeof(with_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> pick(false) errors -> dominating `== nil` reads true ->
+    // 401, NOT a generic 500 from a prelude the present-arm compare forced.
+    static const char without_q[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, or_fallback_runtime_present_and_absent) {
     // `.or(default)` end-to-end: query present -> value; absent -> default.
     const char* src =
