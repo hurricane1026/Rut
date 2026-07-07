@@ -3432,9 +3432,31 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
         }
         struct RecoveryScan {
-            static bool local_ref_matches(const MirValue* value, u32 local_index) {
+            // The carrier local plus everything statically derived from it.
+            // alias[k]: local k IS the carrier — a bare `let alias = value`
+            // copy materializes to the same RIR value, so a presence test on
+            // the alias observes the same error field as one on the carrier.
+            // presence_bool[k]: bool local whose init folds to a known value
+            // once the carrier is absent (`let missing = value == nil`), the
+            // folded value in presence_outcome[k] — branching on it routes an
+            // error exactly like branching on the presence test directly.
+            struct CarrierInfo {
+                bool alias[MirFunction::kMaxLocals]{};
+                bool presence_bool[MirFunction::kMaxLocals]{};
+                bool presence_outcome[MirFunction::kMaxLocals]{};
+            };
+
+            static bool local_ref_matches(const MirValue* value, const CarrierInfo& ci) {
                 return value != nullptr && value->kind == MirValueKind::LocalRef &&
-                       value->local_index == local_index;
+                       value->local_index < MirFunction::kMaxLocals && ci.alias[value->local_index];
+            }
+
+            // A pure rename of the carrier (`let alias = value`) — joins the
+            // alias set and is NOT an observing use (nothing is read; the
+            // alias materializes to the same RIR value).
+            static bool is_alias_copy_init(const MirValue& init, const CarrierInfo& ci) {
+                return init.kind == MirValueKind::LocalRef &&
+                       init.local_index < MirFunction::kMaxLocals && ci.alias[init.local_index];
             }
 
             // The analyze-emitted presence test `local == nil` / `local != nil`:
@@ -3444,7 +3466,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             // error in any position (a stored `let missing = x == nil`
             // included). At least one Eq wrap is required so the equality
             // lowering's internal bare HasValue shapes never match.
-            static bool is_presence_test_use(const MirValue* value, u32 local_index) {
+            static bool is_presence_test_use(const MirValue* value, const CarrierInfo& ci) {
                 if (value == nullptr || value->kind != MirValueKind::Eq) return false;
                 while (value != nullptr && value->kind == MirValueKind::Eq) {
                     if (value->rhs != nullptr && value->rhs->kind == MirValueKind::BoolConst)
@@ -3455,21 +3477,21 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return false;
                 }
                 return value != nullptr && value->kind == MirValueKind::HasValue &&
-                       local_ref_matches(value->lhs, local_index);
+                       local_ref_matches(value->lhs, ci);
             }
 
             // Coalescing shapes that consume the local's error inline (`x || y`,
             // `x.has ? x.value : ...`). These genuinely recover the error no
             // matter how deeply they are nested, so they are matched anywhere.
-            static bool is_coalescing_use(const MirValue* value, u32 local_index) {
+            static bool is_coalescing_use(const MirValue* value, const CarrierInfo& ci) {
                 if (value == nullptr) return false;
-                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, local_index))
+                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, ci))
                     return true;
                 if (value->kind == MirValueKind::IfElse && value->lhs != nullptr &&
                     value->lhs->kind == MirValueKind::HasValue &&
-                    local_ref_matches(value->lhs->lhs, local_index) && value->rhs != nullptr &&
+                    local_ref_matches(value->lhs->lhs, ci) && value->rhs != nullptr &&
                     value->rhs->kind == MirValueKind::ValueOf &&
-                    local_ref_matches(value->rhs->lhs, local_index))
+                    local_ref_matches(value->rhs->lhs, ci))
                     return true;
                 return false;
             }
@@ -3483,7 +3505,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             // whether to compare a fallible payload, and that internal test is
             // NOT a recovering use — treating it as one would wrongly suppress
             // the error prelude for a compare-only fallible local.
-            static bool is_guard_condition(const MirValue* value, u32 local_index) {
+            static bool is_guard_condition(const MirValue* value, const CarrierInfo& ci) {
                 // The bare guard-let shape, plus the presence-test shape
                 // `local == nil` / `local != nil`: Eq nodes whose other side is
                 // a bool literal only negate the bare HasValue guard, so as a
@@ -3500,19 +3522,41 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return false;
                 }
                 return value != nullptr && value->kind == MirValueKind::HasValue &&
-                       local_ref_matches(value->lhs, local_index);
+                       local_ref_matches(value->lhs, ci);
             }
 
-            // The value a guard-condition shape folds to when the local
-            // carries an error/nil: the innermost HasValue reads false and
-            // each bool-literal Eq wrap preserves or negates it. Only
-            // meaningful on shapes accepted by is_guard_condition.
-            static bool guard_error_outcome(const MirValue* value) {
-                if (value != nullptr && value->kind == MirValueKind::Eq) {
-                    if (value->rhs != nullptr && value->rhs->kind == MirValueKind::BoolConst)
-                        return guard_error_outcome(value->lhs) == value->rhs->bool_value;
-                    if (value->lhs != nullptr && value->lhs->kind == MirValueKind::BoolConst)
-                        return guard_error_outcome(value->rhs) == value->lhs->bool_value;
+            // Try to fold `value` to a compile-time constant under the ERROR
+            // outcome (the carrier reads as absent): HasValue(carrier/alias)
+            // is false, a stored presence bool has its recorded outcome, bool
+            // literals are themselves, and an Eq folds when both sides fold.
+            // Returns false when the value is not determined by the carrier's
+            // absence alone (then nothing may be assumed about it).
+            static bool fold_error_outcome(const MirValue* value,
+                                           const CarrierInfo& ci,
+                                           bool* out) {
+                if (value == nullptr) return false;
+                if (value->kind == MirValueKind::BoolConst) {
+                    *out = value->bool_value;
+                    return true;
+                }
+                if (value->kind == MirValueKind::HasValue && local_ref_matches(value->lhs, ci)) {
+                    *out = false;
+                    return true;
+                }
+                if (value->kind == MirValueKind::LocalRef &&
+                    value->local_index < MirFunction::kMaxLocals &&
+                    ci.presence_bool[value->local_index]) {
+                    *out = ci.presence_outcome[value->local_index];
+                    return true;
+                }
+                if (value->kind == MirValueKind::Eq) {
+                    bool lhs_value = false;
+                    bool rhs_value = false;
+                    if (fold_error_outcome(value->lhs, ci, &lhs_value) &&
+                        fold_error_outcome(value->rhs, ci, &rhs_value)) {
+                        *out = lhs_value == rhs_value;
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -3527,20 +3571,28 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             // callers pass linearly_dominated[bi] there. Coalescing keeps its
             // established match-anywhere stance.
             static bool contains_recovering_use(const MirValue* value,
-                                                u32 local_index,
+                                                const CarrierInfo& ci,
                                                 bool match_presence) {
                 if (value == nullptr) return false;
-                if (is_coalescing_use(value, local_index)) return true;
-                if (match_presence && is_presence_test_use(value, local_index)) return true;
-                if (contains_recovering_use(value->lhs, local_index, match_presence)) return true;
-                if (contains_recovering_use(value->rhs, local_index, match_presence)) return true;
+                if (is_coalescing_use(value, ci)) return true;
+                if (match_presence && is_presence_test_use(value, ci)) return true;
+                // Short-circuit constructs evaluate only their FIRST operand
+                // unconditionally: `a && b` lowers to IfElse(a, b, false),
+                // `a || b` to Or/IfElse. A presence test inside a
+                // conditionally-evaluated operand is not guaranteed to run —
+                // the untaken path could return success with the error live —
+                // so it must not count as recovering there.
+                const bool operand_presence =
+                    (value->kind == MirValueKind::IfElse || value->kind == MirValueKind::Or)
+                        ? false
+                        : match_presence;
+                if (contains_recovering_use(value->lhs, ci, match_presence)) return true;
+                if (contains_recovering_use(value->rhs, ci, operand_presence)) return true;
                 for (u32 ai = 0; ai < value->args.len; ai++) {
-                    if (contains_recovering_use(value->args[ai], local_index, match_presence))
-                        return true;
+                    if (contains_recovering_use(value->args[ai], ci, operand_presence)) return true;
                 }
                 for (u32 fi = 0; fi < value->field_inits.len; fi++) {
-                    if (contains_recovering_use(
-                            value->field_inits[fi].value, local_index, match_presence))
+                    if (contains_recovering_use(value->field_inits[fi].value, ci, match_presence))
                         return true;
                 }
                 return false;
@@ -3558,58 +3610,52 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             // unwrap, and the top-level guard condition — are NOT observing uses
             // and are skipped without descending into the recovered operands.
             static bool contains_non_recovering_use(const MirValue* value,
-                                                    u32 local_index,
+                                                    const CarrierInfo& ci,
                                                     bool top_level_cond) {
                 if (value == nullptr) return false;
                 // Coalescing `local || fallback`: the local is recovered; only
                 // the fallback arm can carry a fresh observing use.
-                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, local_index)) {
-                    if (contains_non_recovering_use(value->rhs, local_index, false)) return true;
+                if (value->kind == MirValueKind::Or && local_ref_matches(value->lhs, ci)) {
+                    if (contains_non_recovering_use(value->rhs, ci, false)) return true;
                     for (u32 ai = 0; ai < value->args.len; ai++)
-                        if (contains_non_recovering_use(value->args[ai], local_index, false))
-                            return true;
+                        if (contains_non_recovering_use(value->args[ai], ci, false)) return true;
                     return false;
                 }
                 // Coalescing `local.has ? local.value : fallback`: recovered.
                 if (value->kind == MirValueKind::IfElse && value->lhs != nullptr &&
                     value->lhs->kind == MirValueKind::HasValue &&
-                    local_ref_matches(value->lhs->lhs, local_index) && value->rhs != nullptr &&
+                    local_ref_matches(value->lhs->lhs, ci) && value->rhs != nullptr &&
                     value->rhs->kind == MirValueKind::ValueOf &&
-                    local_ref_matches(value->rhs->lhs, local_index)) {
+                    local_ref_matches(value->rhs->lhs, ci)) {
                     for (u32 ai = 0; ai < value->args.len; ai++)
-                        if (contains_non_recovering_use(value->args[ai], local_index, false))
-                            return true;
+                        if (contains_non_recovering_use(value->args[ai], ci, false)) return true;
                     return false;
                 }
                 // Top-level guard condition (bare HasValue or the bool-literal
                 // presence-test wrap): the guard's else consumes the error.
-                if (top_level_cond && is_guard_condition(value, local_index)) return false;
+                if (top_level_cond && is_guard_condition(value, ci)) return false;
                 // A presence test in VALUE position (`let missing = x == nil`,
                 // `(x == nil) == flag`) also consumes the error: its result is
                 // about presence only — error reads as "absent" — and the
                 // shape cannot leak the carrier's value. Nothing to descend
                 // into (operands are HasValue(local) and bool literals only).
-                if (is_presence_test_use(value, local_index)) return false;
+                if (is_presence_test_use(value, ci)) return false;
                 // Guard-narrowing / success-path unwrap: only reached once the
                 // error is already handled, so not an observing use.
-                if (value->kind == MirValueKind::ValueOf &&
-                    local_ref_matches(value->lhs, local_index))
+                if (value->kind == MirValueKind::ValueOf && local_ref_matches(value->lhs, ci))
                     return false;
                 // A nested usable-value test masks the error as a default value
                 // (equality/optional compare) — that path needs the prelude.
-                if (value->kind == MirValueKind::HasValue &&
-                    local_ref_matches(value->lhs, local_index))
+                if (value->kind == MirValueKind::HasValue && local_ref_matches(value->lhs, ci))
                     return true;
                 // A bare reference propagates/observes the error.
-                if (local_ref_matches(value, local_index)) return true;
-                if (contains_non_recovering_use(value->lhs, local_index, false)) return true;
-                if (contains_non_recovering_use(value->rhs, local_index, false)) return true;
+                if (local_ref_matches(value, ci)) return true;
+                if (contains_non_recovering_use(value->lhs, ci, false)) return true;
+                if (contains_non_recovering_use(value->rhs, ci, false)) return true;
                 for (u32 ai = 0; ai < value->args.len; ai++)
-                    if (contains_non_recovering_use(value->args[ai], local_index, false))
-                        return true;
+                    if (contains_non_recovering_use(value->args[ai], ci, false)) return true;
                 for (u32 fi = 0; fi < value->field_inits.len; fi++)
-                    if (contains_non_recovering_use(
-                            value->field_inits[fi].value, local_index, false))
+                    if (contains_non_recovering_use(value->field_inits[fi].value, ci, false))
                         return true;
                 return false;
             }
@@ -3672,20 +3718,42 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         // not term.cond). Both recover only at a linearly-dominated block; a
         // condition reached through a conditional branch does not (its sibling
         // arm could escape with the error unrecovered).
-        auto is_dominating_recovery = [&](u32 bi, u32 local_index) -> bool {
+        // Locals derived from the carrier, in declaration order (an alias or
+        // presence bool can only reference locals declared before it, so one
+        // forward pass closes the sets — including chains like an alias of an
+        // alias or a bool derived from a stored presence bool).
+        auto build_carrier_info = [&](u32 local_index) -> RecoveryScan::CarrierInfo {
+            RecoveryScan::CarrierInfo ci{};
+            if (local_index < MirFunction::kMaxLocals) ci.alias[local_index] = true;
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                const auto& lc = mir.functions[i].locals[li];
+                if (lc.ref_index >= MirFunction::kMaxLocals || lc.ref_index == local_index)
+                    continue;
+                if (RecoveryScan::is_alias_copy_init(lc.init, ci)) {
+                    ci.alias[lc.ref_index] = true;
+                    continue;
+                }
+                bool outcome = false;
+                if (RecoveryScan::fold_error_outcome(&lc.init, ci, &outcome)) {
+                    ci.presence_bool[lc.ref_index] = true;
+                    ci.presence_outcome[lc.ref_index] = outcome;
+                }
+            }
+            return ci;
+        };
+        auto is_dominating_recovery = [&](u32 bi, const RecoveryScan::CarrierInfo& ci) -> bool {
             if (!linearly_dominated[bi]) return false;
             const auto& term = mir.functions[i].blocks[bi].term;
-            if (RecoveryScan::is_guard_condition(&term.cond, local_index)) return true;
-            if (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, local_index))
-                return true;
+            if (RecoveryScan::is_guard_condition(&term.cond, ci)) return true;
+            if (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci)) return true;
             return false;
         };
-        auto has_recovering_or_use = [&](u32 local_index) -> bool {
+        auto has_recovering_or_use = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
                 // Local inits evaluate eagerly at state 0, so a presence test
                 // here always runs and consumes the error (match_presence).
                 if (RecoveryScan::contains_recovering_use(
-                        &mir.functions[i].locals[li].init, local_index, /*match_presence=*/true))
+                        &mir.functions[i].locals[li].init, ci, /*match_presence=*/true))
                     return true;
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
@@ -3701,19 +3769,16 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 // default error, a missing one lets an error masquerade as
                 // success). The condition must be at the top level of its slot,
                 // not nested inside an equality comparison's internal HasValue.
-                if (is_dominating_recovery(bi, local_index)) return true;
+                if (is_dominating_recovery(bi, ci)) return true;
                 // A terminator only evaluates if its block runs. A presence
                 // test in a NON-dominated block (reached through a conditional
                 // branch) does not recover: the sibling arm can return success
                 // with the error unobserved, so it needs the same dominance
                 // restriction as guard-let recovery (match_presence gates it).
                 const bool presence_dominates = linearly_dominated[bi];
-                if (RecoveryScan::contains_recovering_use(
-                        &term.cond, local_index, presence_dominates) ||
-                    RecoveryScan::contains_recovering_use(
-                        &term.lhs, local_index, presence_dominates) ||
-                    RecoveryScan::contains_recovering_use(
-                        &term.rhs, local_index, presence_dominates))
+                if (RecoveryScan::contains_recovering_use(&term.cond, ci, presence_dominates) ||
+                    RecoveryScan::contains_recovering_use(&term.lhs, ci, presence_dominates) ||
+                    RecoveryScan::contains_recovering_use(&term.rhs, ci, presence_dominates))
                     return true;
             }
             return false;
@@ -3725,21 +3790,24 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         // if a sibling branch recovers the same local. Erring toward keeping is
         // safe: a spurious prelude returns the default error; a missing one lets
         // an error masquerade as success.
-        auto has_non_recovering_use = [&](u32 local_index) -> bool {
-            // Blocks that may execute while `local` still carries an
+        auto has_non_recovering_use = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
+            // Blocks that may execute while the carrier still holds an
             // unhandled error (assuming the state-0 prelude were suppressed).
-            // The error is live from block 0; a dominating guard/presence
-            // branch routes it into exactly ONE arm — HasValue(local) reads
-            // false on error, so the branch outcome is known — and the flood
-            // follows only that arm there, all successors elsewhere. An
+            // The error is live from block 0. At ANY branch the flood visits,
+            // the error is live by construction — so whenever the branch
+            // condition folds under the error outcome (a presence test on the
+            // carrier or an alias, a stored presence bool, a guard HasValue),
+            // the error provably enters exactly one arm and only that arm is
+            // followed; no dominance requirement is needed for reachability
+            // narrowing (unlike recovery RECOGNITION, which needs it). An
             // observing use in a block the error can never reach (an optional
-            // compare in the present arm below a dominating `x == nil`
-            // branch, say) cannot mask anything and must not force the
-            // prelude back — that would turn the programmed absent-arm
-            // response into a generic 500. Uses in the arm the error DOES
-            // enter still count (a compare there masks the error as a plain
-            // value — the masquerade the prelude exists to stop), as do
-            // eager local inits: both evaluate with the error live.
+            // compare in the present arm below a `x == nil` branch, say)
+            // cannot mask anything and must not force the prelude back —
+            // that would turn the programmed absent-arm response into a
+            // generic 500. Uses in the arm the error DOES enter still count
+            // (a compare there masks the error as a plain value — the
+            // masquerade the prelude exists to stop), as do eager local
+            // inits: both evaluate with the error live.
             bool error_reachable[MirFunction::kMaxBlocks]{};
             if (mir.functions[i].blocks.len > 0) {
                 u32 stack[MirFunction::kMaxBlocks]{};
@@ -3754,19 +3822,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     if (term.kind == MirTerminatorKind::Branch) {
                         bool err_then = true;
                         bool err_else = true;
-                        if (is_dominating_recovery(bi, local_index)) {
-                            if (!term.use_cmp) {
-                                const bool outcome = RecoveryScan::guard_error_outcome(&term.cond);
-                                err_then = outcome;
-                                err_else = !outcome;
-                            } else if (term.rhs.kind == MirValueKind::BoolConst) {
-                                // Match-subject form: branch taken when the
-                                // folded subject equals the arm's pattern.
-                                const bool outcome = RecoveryScan::guard_error_outcome(&term.lhs) ==
-                                                     term.rhs.bool_value;
-                                err_then = outcome;
-                                err_else = !outcome;
-                            }
+                        bool outcome = false;
+                        if (!term.use_cmp &&
+                            RecoveryScan::fold_error_outcome(&term.cond, ci, &outcome)) {
+                            err_then = outcome;
+                            err_else = !outcome;
+                        } else if (term.use_cmp && term.rhs.kind == MirValueKind::BoolConst &&
+                                   RecoveryScan::fold_error_outcome(&term.lhs, ci, &outcome)) {
+                            // Match-subject form: branch taken when the folded
+                            // subject equals the arm's pattern.
+                            err_then = outcome == term.rhs.bool_value;
+                            err_else = !err_then;
                         }
                         if (err_then) succ[succ_count++] = term.then_block;
                         if (err_else) succ[succ_count++] = term.else_block;
@@ -3792,8 +3858,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 }
             }
             for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                // A pure alias copy is a rename, not an observation — the
+                // alias set already tracks every use made through it.
+                if (RecoveryScan::is_alias_copy_init(mir.functions[i].locals[li].init, ci))
+                    continue;
                 if (RecoveryScan::contains_non_recovering_use(
-                        &mir.functions[i].locals[li].init, local_index, /*top_level_cond=*/false))
+                        &mir.functions[i].locals[li].init, ci, /*top_level_cond=*/false))
                     return true;
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
@@ -3808,27 +3878,28 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 // genuinely observing use nested deeper is still caught (the
                 // top-level skip does not propagate into operands).
                 const bool lhs_is_match_subject =
-                    term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, local_index);
+                    term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci);
                 if (RecoveryScan::contains_non_recovering_use(
-                        &term.cond, local_index, /*top_level_cond=*/true) ||
+                        &term.cond, ci, /*top_level_cond=*/true) ||
                     RecoveryScan::contains_non_recovering_use(
-                        &term.lhs, local_index, /*top_level_cond=*/lhs_is_match_subject) ||
+                        &term.lhs, ci, /*top_level_cond=*/lhs_is_match_subject) ||
                     RecoveryScan::contains_non_recovering_use(
-                        &term.rhs, local_index, /*top_level_cond=*/false))
+                        &term.rhs, ci, /*top_level_cond=*/false))
                     return true;
             }
             return false;
         };
         auto local_needs_error_prelude = [&](const MirLocal& local) -> bool {
-            return local.may_error && local.init.kind == MirValueKind::IfElse &&
-                   local.init.lhs != nullptr &&
-                   (local.init.lhs->kind == MirValueKind::HasValue ||
-                    (local.init.is_eager_fallback &&
-                     local.init.lhs->kind == MirValueKind::BoolConst &&
-                     local.init.lhs->bool_value)) &&
-                   !local.init.is_pipe_conditional &&
-                   (!has_recovering_or_use(local.ref_index) ||
-                    has_non_recovering_use(local.ref_index));
+            if (!(local.may_error && local.init.kind == MirValueKind::IfElse &&
+                  local.init.lhs != nullptr &&
+                  (local.init.lhs->kind == MirValueKind::HasValue ||
+                   (local.init.is_eager_fallback &&
+                    local.init.lhs->kind == MirValueKind::BoolConst &&
+                    local.init.lhs->bool_value)) &&
+                  !local.init.is_pipe_conditional))
+                return false;
+            const RecoveryScan::CarrierInfo ci = build_carrier_info(local.ref_index);
+            return !has_recovering_or_use(ci) || has_non_recovering_use(ci);
         };
 
         u32 error_local_count = 0;
