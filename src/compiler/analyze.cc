@@ -7017,6 +7017,23 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     lit_str("pipe method stage with nil/error propagation must return bool, i32, "
                             "str, variant, or struct"));
             };
+            const auto analyze_conditional_method_stage_expr =
+                [&](const AstExpr& stage_expr) -> FrontendResult<HirExpr> {
+                const bool saved_allow_respond_effects = route->allow_respond_effects;
+                route->allow_respond_effects = false;
+                auto result = analyze_expr(stage_expr, route, mod, locals, local_count, binding);
+                route->allow_respond_effects = saved_allow_respond_effects;
+                return result;
+            };
+            const auto analyze_conditional_method_stage_call =
+                [&](const HirExpr& recv) -> FrontendResult<HirExpr> {
+                const bool saved_allow_respond_effects = route->allow_respond_effects;
+                route->allow_respond_effects = false;
+                auto result = analyze_method_call_expr(
+                    method_stage, route, mod, locals, local_count, binding, &recv);
+                route->allow_respond_effects = saved_allow_respond_effects;
+                return result;
+            };
             auto shape_only_result = [](HirExpr value) {
                 value.lhs = nullptr;
                 value.rhs = nullptr;
@@ -7031,8 +7048,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     method_stage.name.eq({"lt", 2}) || method_stage.name.eq({"gt", 2}) ||
                     method_stage.name.eq({"le", 2}) || method_stage.name.eq({"ge", 2});
                 if (lhs->type == HirTypeKind::Unknown && is_cmp && method_stage.args.len == 1) {
-                    auto rhs = analyze_expr(
-                        *method_stage.args[0], route, mod, locals, local_count, binding);
+                    auto rhs = analyze_conditional_method_stage_expr(*method_stage.args[0]);
                     if (!rhs) return core::make_unexpected(rhs.error());
                     if (rhs->may_nil || rhs->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -7065,8 +7081,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                      KnownValueState::Error;
                 recv.lhs = nullptr;
                 const u32 expr_len = route->exprs.len;
-                auto ret = analyze_method_call_expr(
-                    method_stage, route, mod, locals, local_count, binding, &recv);
+                auto ret = analyze_conditional_method_stage_call(recv);
                 route->exprs.len = expr_len;
                 if (!ret) return core::make_unexpected(ret.error());
                 return shape_only_result(ret.value());
@@ -7115,8 +7130,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 unwrapped.may_error = false;
                 unwrapped.lhs = lhs_ptr;
 
-                auto then_expr = analyze_method_call_expr(
-                    method_stage, route, mod, locals, local_count, binding, &unwrapped);
+                auto then_expr = analyze_conditional_method_stage_call(unwrapped);
                 if (!then_expr) return core::make_unexpected(then_expr.error());
                 if (!is_lowerable_missing_result(then_expr.value()))
                     return unsupported_missing_result();
@@ -8316,6 +8330,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
             HirExpr analyzed_args[AstExpr::kMaxArgs]{};
             u32 arg_offset = 0;
+            const auto analyze_conditional_pipe_stage_arg =
+                [&](const AstExpr& arg_expr) -> FrontendResult<HirExpr> {
+                const bool saved_allow_respond_effects = route->allow_respond_effects;
+                route->allow_respond_effects = false;
+                auto result = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
+                route->allow_respond_effects = saved_allow_respond_effects;
+                return result;
+            };
             if (pipe_inject_lhs) {
                 analyzed_args[0] = unwrapped;
                 auto checked = check_call_arg(0, analyzed_args[0], expr.span);
@@ -8328,7 +8350,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 if (arg_expr.kind == AstExprKind::Placeholder) {
                     analyzed_args[param_index] = unwrapped;
                 } else {
-                    auto arg = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
+                    auto arg = analyze_conditional_pipe_stage_arg(arg_expr);
                     if (!arg) return core::make_unexpected(arg.error());
                     if (arg->may_nil || arg->may_error)
                         return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
@@ -10658,6 +10680,10 @@ static FrontendResult<void> merge_imported_functions(
         }
         auto refreshed = refresh_imported_expr_shape(&fn->body, span);
         if (!refreshed) return core::make_unexpected(refreshed.error());
+        for (u32 gi = 0; gi < fn->respond_guards.len; gi++) {
+            refreshed = refresh_imported_expr_shape(&fn->respond_guards[gi].cond, span);
+            if (!refreshed) return core::make_unexpected(refreshed.error());
+        }
         return {};
     };
 
@@ -16288,6 +16314,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const auto& fn = mod.functions[fn_index];
             if (fn.return_type != HirTypeKind::Bool)
                 return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
+            if (fn.respond_guards.len != 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
             if (fn.type_params.len != 0)
                 return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
             if (step.call.args.len != fn.params.len)
@@ -17108,6 +17136,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             placeholder_req.span = ast_deco.span;
             HirExpr deco_args[1] = {placeholder_req};
             const auto& deco_fn = mod.functions[fn_index];
+            if (deco_fn.respond_guards.len != 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, ast_deco.span, deco_fn.name);
             auto inlined =
                 instantiate_function_expr(deco_fn.body, &route, mod, deco_args, 1u, nullptr, 0u);
             if (!inlined) return core::make_unexpected(inlined.error());

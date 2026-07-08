@@ -1575,6 +1575,46 @@ TEST(frontend, analyze_function_guard_respond_rejects_lazy_bool_context) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
+TEST(frontend, import_relative_file_refreshes_respond_guard_condition_shapes) {
+    const std::string dir = "/tmp/rut_import_respond_guard_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "func require_box(box: Box) -> i32 {\n";
+        out << "    guard box.value == 7 else { respond 401 }\n";
+        out << "    7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+struct Local { value: i32 }
+import "proto.rut"
+route GET "/x" {
+    let code = require_box(Box(value: 7))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    const HirFunction* imported_fn = nullptr;
+    for (u32 i = 0; i < hir->functions.len; i++) {
+        if (hir->functions[i].name.eq(lit("require_box"))) {
+            imported_fn = &hir->functions[i];
+            break;
+        }
+    }
+    REQUIRE(imported_fn != nullptr);
+    REQUIRE_EQ(imported_fn->respond_guards.len, 1u);
+    if (imported_fn->respond_guards[0].cond.shape_index != 0xffffffffu)
+        CHECK(imported_fn->respond_guards[0].cond.shape_index < hir->type_shapes.len);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
 TEST(frontend, parse_return_response_with_body) {
     // Covers the body: "..." kwarg through the compile-side pipeline:
     // parser → AST.response_body, analyze → HirTerminator.response_body,
@@ -4239,6 +4279,29 @@ route {
     CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
              static_cast<u8>(HirExprKind::IfElse));
+}
+
+TEST(frontend, analyze_rejects_chain_before_respond_capable_helper) {
+    const char* src = R"rut(
+func require_auth(_ req: i32) -> bool {
+    guard false else { respond 401 }
+    true
+}
+chain secure {
+    before require_auth(req) else 403
+}
+route GET "/users" use chain secure {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("require_auth")));
 }
 
 TEST(frontend, analyze_unused_chain_does_not_mark_callee_as_magic_request) {
@@ -20353,6 +20416,34 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
+
+TEST(frontend, analyze_rejects_conditional_pipe_respond_capable_method_stage) {
+    const auto src = R"(
+protocol Ident { func id() -> i32 }
+struct Box { value: i32 }
+Box impl Ident {
+    func id(self: Box) -> i32 {
+        guard false else { respond 401 }
+        self.value
+    }
+}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 200) } else { nil }
+}
+route GET "/users" {
+    let code = maybeBox(req.http11) | _.id()
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, source_pipe_placeholder_free_runtime_optional_lhs_flows_via_any) {
     const auto src = R"(
 func id(x: str) -> str => x
@@ -20376,6 +20467,28 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
+
+TEST(frontend, analyze_rejects_conditional_pipe_respond_capable_stage_argument) {
+    const auto src = R"(
+func reject(ok: bool) -> i32 {
+    guard ok else { respond 401 }
+    1
+}
+func pass(x: str, code: i32) -> str => x
+route GET "/users" {
+    let host = req.header("Host") | pass(_, reject(false))
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, source_pipe_method_stage_reuses_analyzed_lhs_receiver) {
     const auto src = R"(
 struct Box { value: i32 }
