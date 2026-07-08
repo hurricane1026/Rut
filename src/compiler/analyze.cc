@@ -3187,7 +3187,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                                           const HirModule& mod,
                                                           const HirLocal* locals,
                                                           u32 local_count,
-                                                          const MatchPayloadBinding* binding);
+                                                          const MatchPayloadBinding* binding,
+                                                          bool allow_respond_guards);
 static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -4563,13 +4564,13 @@ static FrontendResult<void> instantiate_function_respond_guards(
         if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, src_guard.span);
         HirGuard guard{};
-        guard.span = src_guard.span;
+        guard.span = call_span;
         guard.cond = cond.value();
         guard.fail_kind = HirGuard::FailKind::Term;
         guard.fail_term.kind = HirTerminatorKind::ReturnStatus;
         guard.fail_term.source_kind = HirTerminatorSourceKind::Literal;
         guard.fail_term.status_code = src_guard.status_code;
-        guard.fail_term.span = src_guard.span;
+        guard.fail_term.span = call_span;
         guard.fail_term.response_body = src_guard.response_body;
         for (u32 hi = 0; hi < src_guard.response_headers.len; hi++) {
             const auto& hdr = src_guard.response_headers[hi];
@@ -4665,7 +4666,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                                           const HirModule& mod,
                                                           const HirLocal* locals,
                                                           u32 local_count,
-                                                          const MatchPayloadBinding* binding) {
+                                                          const MatchPayloadBinding* binding,
+                                                          bool allow_respond_guards) {
     auto merge_expr_shape = [&](const HirExpr& lhs, const HirExpr& rhs, HirExpr* out) -> bool {
         HirTypeKind merged_type = lhs.type;
         u32 merged_generic_index = lhs.generic_index;
@@ -4764,7 +4766,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 seen_wildcard = true;
                 auto body = analyze_function_body_stmt(
-                    *arm.stmt, scratch, mod, cur_locals, cur_local_count, binding);
+                    *arm.stmt, scratch, mod, cur_locals, cur_local_count, binding, false);
                 if (!body) return core::make_unexpected(body.error());
                 result = body.value();
                 have_result = true;
@@ -4788,7 +4790,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             seen_variant_case_count++;
 
             auto body = analyze_function_body_stmt(
-                *arm.stmt, scratch, mod, cur_locals, cur_local_count, binding);
+                *arm.stmt, scratch, mod, cur_locals, cur_local_count, binding, false);
             if (!body) return core::make_unexpected(body.error());
             if (!have_result) {
                 result = body.value();
@@ -4926,11 +4928,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 // evaluates to the else branch, which becomes the result — but
                 // the then/else shapes must still merge (if-expression parity).
                 auto dead_then = analyze_function_body_stmt(
-                    *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding);
+                    *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding, false);
                 if (!dead_then) return core::make_unexpected(dead_then.error());
                 scratch->locals.len = saved_locals;
                 auto live_else = analyze_function_body_stmt(
-                    *stmt.else_stmt, scratch, mod, locals, local_count, binding);
+                    *stmt.else_stmt, scratch, mod, locals, local_count, binding, false);
                 if (!live_else) return core::make_unexpected(live_else.error());
                 HirExpr merged_shape{};
                 if (!merge_expr_shape(dead_then.value(), live_else.value(), &merged_shape))
@@ -4945,10 +4947,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             cond_expr = cond.value();
         }
         auto then_expr = analyze_function_body_stmt(
-            *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding);
+            *stmt.then_stmt, scratch, mod, then_scoped, then_count, binding, false);
         if (!then_expr) return core::make_unexpected(then_expr.error());
-        auto else_expr =
-            analyze_function_body_stmt(*stmt.else_stmt, scratch, mod, locals, local_count, binding);
+        auto else_expr = analyze_function_body_stmt(
+            *stmt.else_stmt, scratch, mod, locals, local_count, binding, false);
         if (!else_expr) return core::make_unexpected(else_expr.error());
         HirExpr merged_shape{};
         if (!merge_expr_shape(then_expr.value(), else_expr.value(), &merged_shape))
@@ -5067,7 +5069,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (selected_arm == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
         return analyze_function_body_stmt(
-            *selected_arm->stmt, scratch, mod, locals, local_count, selected_binding_ptr);
+            *selected_arm->stmt, scratch, mod, locals, local_count, selected_binding_ptr, false);
     }
 
     if (stmt.kind == AstStmtKind::Match) {
@@ -5180,7 +5182,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 seen_wildcard = true;
                 auto body = analyze_function_body_stmt(
-                    *arm.stmt, scratch, mod, locals, local_count, binding);
+                    *arm.stmt, scratch, mod, locals, local_count, binding, false);
                 if (!body) return core::make_unexpected(body.error());
                 result = body.value();
                 have_result = true;
@@ -5230,7 +5232,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             }
 
             auto body = analyze_function_body_stmt(
-                *arm.stmt, scratch, mod, locals, local_count, arm_binding_ptr);
+                *arm.stmt, scratch, mod, locals, local_count, arm_binding_ptr, false);
             if (!body) return core::make_unexpected(body.error());
             HirExpr body_expr = body.value();
             if (arm.has_guard) {
@@ -5408,6 +5410,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (inner.match_arms.len == 0 && inner.else_stmt != nullptr &&
                     inner.else_stmt->kind == AstStmtKind::RespondStatus) {
                     const auto& respond = *inner.else_stmt;
+                    if (!allow_respond_guards)
+                        return frontend_error(FrontendError::UnsupportedSyntax, respond.span);
                     if (respond.status_code < 100 || respond.status_code > 999)
                         return frontend_error(FrontendError::InvalidStatusCode, respond.span);
                     HirGuard guard{};
@@ -5438,8 +5442,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     else_expr = analyze_function_guard_match_expr(
                         inner.match_arms, bound.value(), cur_locals, cur_local_count);
                 } else {
-                    else_expr = analyze_function_body_stmt(
-                        *inner.else_stmt, scratch, mod, cur_locals, cur_local_count, binding);
+                    else_expr = analyze_function_body_stmt(*inner.else_stmt,
+                                                           scratch,
+                                                           mod,
+                                                           cur_locals,
+                                                           cur_local_count,
+                                                           binding,
+                                                           false);
                 }
                 if (!else_expr) return core::make_unexpected(else_expr.error());
                 HirExpr merged_shape{};
@@ -5486,7 +5495,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             if (!is_last && inner.kind != AstStmtKind::Let && inner.kind != AstStmtKind::Guard)
                 return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
             return analyze_function_body_stmt(
-                inner, scratch, mod, cur_locals, cur_local_count, binding);
+                inner, scratch, mod, cur_locals, cur_local_count, binding, allow_respond_guards);
         };
         return analyze_block_tail(analyze_block_tail, 0, scoped, scoped_count);
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
@@ -6759,10 +6768,19 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out_value = known.bool_value;
         return true;
     };
+    const auto analyze_lazy_bool_operand = [&](const AstExpr& operand) -> FrontendResult<HirExpr> {
+        if (route == nullptr)
+            return analyze_expr(operand, route, mod, locals, local_count, binding);
+        const bool saved_allow_respond_effects = route->allow_respond_effects;
+        route->allow_respond_effects = false;
+        auto result = analyze_expr(operand, route, mod, locals, local_count, binding);
+        route->allow_respond_effects = saved_allow_respond_effects;
+        return result;
+    };
     if (expr.kind == AstExprKind::Or) {
-        auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        auto lhs = analyze_lazy_bool_operand(*expr.lhs);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
+        auto rhs = analyze_lazy_bool_operand(*expr.rhs);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (lhs->may_nil || lhs->may_error || rhs->may_nil || rhs->may_error) {
             const bool error_on_rhs = lhs->may_nil || lhs->may_error;
@@ -6854,9 +6872,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
     if (expr.kind == AstExprKind::And) {
-        auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        auto lhs = analyze_lazy_bool_operand(*expr.lhs);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
+        auto rhs = analyze_lazy_bool_operand(*expr.rhs);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (lhs->type != HirTypeKind::Bool || rhs->type != HirTypeKind::Bool || lhs->may_nil ||
             lhs->may_error || rhs->may_nil || rhs->may_error) {
@@ -14410,7 +14428,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         auto body = analyze_function_body_stmt(
-            *ast_func.body, &scratch, mod, param_locals, fn.params.len, nullptr);
+            *ast_func.body, &scratch, mod, param_locals, fn.params.len, nullptr, true);
         if (!body) return core::make_unexpected(body.error());
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> named_error_cases;
         for (u32 li = 0; li < scratch.locals.len; li++) {
@@ -15970,7 +15988,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         auto body = analyze_function_body_stmt(
-            *item.func.body, &scratch, mod, param_locals, fn.params.len, nullptr);
+            *item.func.body, &scratch, mod, param_locals, fn.params.len, nullptr, true);
         if (!body) return core::make_unexpected(body.error());
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> named_error_cases;
         for (u32 li = 0; li < scratch.locals.len; li++) {

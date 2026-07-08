@@ -1525,6 +1525,56 @@ TEST(frontend, analyze_function_guard_respond_injects_route_guard) {
     CHECK(route.locals[0].name.eq(lit("code")));
 }
 
+TEST(frontend, analyze_function_guard_respond_uses_call_site_span) {
+    const char* src =
+        "func require(ok: bool) -> i32 { guard ok else { respond 401 } 7 }\n"
+        "route GET \"/x\" { guard req.http11 else { return 400 } let code = require(req.http11) "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].respond_guards.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 2u);
+    REQUIRE_EQ(route.locals.len, 1u);
+    CHECK(route.guards[1].span.start > route.guards[0].span.start);
+    CHECK(route.guards[1].span.start > hir->functions[0].respond_guards[0].span.start);
+    CHECK(route.guards[1].span.start >= route.locals[0].span.start);
+    CHECK(route.guards[1].span.start <= route.locals[0].span.end);
+}
+
+TEST(frontend, analyze_function_guard_respond_rejects_conditional_context) {
+    const char* src =
+        "func require(ok: bool, use: bool) -> i32 { match use { true => { guard ok else { respond "
+        "401 } 1 } false => 2 } }\n"
+        "route GET \"/x\" { let code = require(false, false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_function_guard_respond_rejects_lazy_bool_context) {
+    const char* src =
+        "func reject(ok: bool) -> bool { guard ok else { respond 401 } true }\n"
+        "route GET \"/x\" { let ok = true || reject(false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, parse_return_response_with_body) {
     // Covers the body: "..." kwarg through the compile-side pipeline:
     // parser → AST.response_body, analyze → HirTerminator.response_body,
