@@ -1477,6 +1477,54 @@ TEST(frontend, parse_return_response_status_only) {
     CHECK_EQ(hir_route.control.direct_term.status_code, 200);
 }
 
+TEST(frontend, parse_respond_status_with_body) {
+    const char* src = "route GET \"/x\" { respond 401, \"denied\" }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const AstStatement& stmt = *ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::RespondStatus));
+    CHECK_EQ(stmt.status_code, 401u);
+    CHECK(stmt.has_response_body);
+    CHECK(stmt.response_body.eq(lit("denied")));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(term.status_code, 401);
+    CHECK(term.response_body.eq(lit("denied")));
+}
+
+TEST(frontend, analyze_function_guard_respond_injects_route_guard) {
+    const char* src =
+        "func require(ok: bool) -> i32 { guard ok else { respond 401, \"denied\" } 7 }\n"
+        "route GET \"/x\" { let code = require(req.http11) if code == 7 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(hir->functions[0].respond_guards.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(route.guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Term));
+    CHECK_EQ(static_cast<u8>(route.guards[0].fail_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(route.guards[0].fail_term.status_code, 401);
+    CHECK(route.guards[0].fail_term.response_body.eq(lit("denied")));
+    REQUIRE_EQ(route.locals.len, 1u);
+    CHECK(route.locals[0].name.eq(lit("code")));
+}
+
 TEST(frontend, parse_return_response_with_body) {
     // Covers the body: "..." kwarg through the compile-side pipeline:
     // parser → AST.response_body, analyze → HirTerminator.response_body,
