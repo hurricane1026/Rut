@@ -19532,6 +19532,201 @@ TEST(jit, or_fallback_runtime_present_and_absent) {
     rir.destroy();
 }
 
+TEST(jit, guard_let_over_pure_optional_query_binds_and_narrows) {
+    // Migration slice: pure-optional carrier binding. `guard let q =
+    // req.query("q")` — present binds the narrowed str (usable in a plain
+    // compare), absent takes the else. No error channel involved anywhere.
+    const char* src =
+        "route GET \"/search\" { guard let q = req.query(\"q\") else { return 400 } "
+        "if q == \"rut\" { return 200 } else { return 204 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char match_q[] = "GET /search?q=rut HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(match_q), sizeof(match_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    static const char other_q[] = "GET /search?q=zig HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(other_q), sizeof(other_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char without_q[] = "GET /search HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 400);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, if_let_over_pure_optional_header_takes_both_branches) {
+    // `if let` over a pure-optional header: present -> then-branch with the
+    // narrowed binding usable; absent -> else-branch.
+    const char* src =
+        "route GET \"/tagged\" { if let tag = req.header(\"X-Tag\") "
+        "{ if tag == \"edge\" { return 200 } else { return 204 } } "
+        "else { return 404 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char with_tag[] = "GET /tagged HTTP/1.1\r\nHost: localhost\r\nX-Tag: edge\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(with_tag), sizeof(with_tag) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    static const char other_tag[] =
+        "GET /tagged HTTP/1.1\r\nHost: localhost\r\nX-Tag: core\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(other_tag), sizeof(other_tag) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    static const char without_tag[] = "GET /tagged HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(nullptr,
+                                      nullptr,
+                                      reinterpret_cast<const u8*>(without_tag),
+                                      sizeof(without_tag) - 1,
+                                      nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 404);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, guard_let_over_optional_struct_func_result) {
+    // Pure-optional STRUCT carrier: a func returning `nil` in one branch.
+    // The guard binds the struct on the present path (field access on the
+    // narrowed binding) and takes the else on nil.
+    const char* src =
+        "struct Box { value: i32 }\n"
+        "func maybeBox(ok: bool) -> Box { if ok { Box(value: 201) } else { nil } }\n"
+        "route GET \"/box\" { guard let picked = maybeBox(req.http11) else { return 401 } "
+        "if picked.value == 201 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> Box present -> narrowed field access compares -> 200.
+    static const char present[] = "GET /box HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(present), sizeof(present) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> nil -> guard else -> 401.
+    static const char absent[] = "GET /box HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(absent), sizeof(absent) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, guard_let_shorthand_over_pure_optional_local) {
+    // Swift 5.7 shorthand over a pure-optional local: `guard let q` rebinds
+    // the Optional<Str> local as a narrowed plain str.
+    const char* src =
+        "route GET \"/s\" { let q = req.query(\"q\") guard let q else { return 400 } "
+        "if q == \"rut\" { return 200 } else { return 204 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char match_q[] = "GET /s?q=rut HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(match_q), sizeof(match_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    static const char without_q[] = "GET /s HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 400);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

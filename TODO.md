@@ -34,11 +34,14 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   semantics: known nil/error inits fold the condition to false (else always
   runs, binding skipped for known error); runtime error-capable inits lower
   to a HasValue condition with the bound local narrowed (review follow-up).
-- [ ] Lowering: opt carrier for pure-optional values (`may_nil` without
-  `may_error`) — HasValue/guard-let runtime nil exits currently can't lower
-  (emit_opt_is_nil needs an opt-typed carrier). guard-let over such values is
-  now REJECTED with a fix-it ("use an error-capable source") rather than
-  silently passing; lift the rejection when the carrier lands.
+- [x] Lowering: opt carrier for pure-optional values (`may_nil` without
+  `may_error`) — the Optional<inner> carrier substrate (opt_is_nil/opt_unwrap,
+  req.query's Optional<Str>, opt-typed local storage) already existed; the
+  guard-let/if-let rejection is lifted: analyze_guard_cond emits HasValue for
+  pure-optional sources too, make_guard_bound_init ValueOf-wraps them, and
+  the narrowed binding clears may_nil (e2e: guard/if-let over req.query,
+  req.header, an optional-struct func result, and the `guard let q`
+  shorthand).
 - [x] Runtime ordering: guard-let over a runtime error value now wins over
   the resume-state-0 error prelude — RecoveryScan treats a bare
   HasValue(LocalRef) guard condition as a recovering use, so the prelude

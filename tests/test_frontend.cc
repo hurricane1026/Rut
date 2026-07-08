@@ -27907,24 +27907,19 @@ TEST(frontend, guard_let_on_runtime_error_value_uses_has_value_cond) {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
 }
 
-TEST(frontend, guard_let_on_runtime_optional_only_value_rejects_with_detail) {
-    // Pure-optional runtime values cannot lower a nil test yet — reject
-    // loudly instead of silently passing the guard (PR #162 review).
+TEST(frontend, guard_let_on_runtime_optional_only_value_lowers) {
+    // Pure-optional runtime values (may_nil without may_error) bind through
+    // guard-let now: the HasValue cond lowers via the Optional<inner>
+    // carrier's opt_is_nil, the binding narrows through ValueOf (migration
+    // slice: opt carrier for pure-optional values).
     const char* src =
         "struct Box { value: i32 }\n"
         "func maybeBox(ok: bool) -> Box { if ok { Box(value: 200) } else { nil } }\n"
         "route GET \"/x\" { guard let picked = maybeBox(req.http11) else { return 401 } "
         "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(
-        lit("guard let cannot test a runtime optional-only value yet (nil-carrier "
-            "lowering pending); use an error-capable source")));
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
 }
 
 TEST(frontend, braced_match_arm_body_allows_multiline_member_chain) {
@@ -28117,21 +28112,16 @@ TEST(frontend, if_let_known_nil_folds_condition_and_skips_binding) {
     rir.destroy();
 }
 
-TEST(frontend, if_let_on_runtime_optional_only_value_rejects_with_detail) {
-    // Pure-optional runtime values (may_nil without may_error) cannot lower a
-    // nil test yet — `if let` reuses guard-let's nil-carrier rejection.
+TEST(frontend, if_let_on_runtime_optional_only_value_lowers) {
+    // Pure-optional runtime values (may_nil without may_error) bind through
+    // `if let` now — it reuses guard-let's HasValue cond over the
+    // Optional<inner> carrier (migration slice: opt carrier for
+    // pure-optional values).
     const char* src =
         "route GET \"/x\" { if let q = req.query(\"q\") { return 200 } else { return 404 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(
-        lit("guard let cannot test a runtime optional-only value yet (nil-carrier "
-            "lowering pending); use an error-capable source")));
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
 }
 
 TEST(frontend, if_let_nested_inside_match_arm) {
