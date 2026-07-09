@@ -58,7 +58,8 @@ static TokenType keyword_type(Str text) {
     // available as a regular identifier in user code.
     if (text.eq({"route", 5})) return TokenType::KwRoute;
     if (text.eq({"return", 6})) return TokenType::KwReturn;
-    if (text.eq({"respond", 7})) return TokenType::KwRespond;
+    // `respond` is recognized CONTEXTUALLY in statement position, NOT reserved globally,
+    // so declarations and members named `respond` remain valid user identifiers.
     if (text.eq({"forward", 7})) return TokenType::KwForward;
     // `timer` is recognized CONTEXTUALLY at top level (a `timer name, every: ...`
     // declaration), NOT reserved — otherwise `wait any(recv, timer)` and any

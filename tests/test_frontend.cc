@@ -1500,6 +1500,33 @@ TEST(frontend, parse_respond_status_with_body) {
     CHECK(term.response_body.eq(lit("denied")));
 }
 
+TEST(frontend, respond_is_contextual_keyword_outside_statements) {
+    auto single = lex(lit("respond"));
+    REQUIRE(single);
+    REQUIRE_GE(single->tokens.len, 1u);
+    CHECK_EQ(static_cast<u8>(single->tokens[0].type), static_cast<u8>(TokenType::Ident));
+
+    const auto src = R"rut(
+struct Box { respond: i32 }
+func respond(value: i32) -> i32 => value
+func use(box: Box) -> i32 => box.respond
+route GET "/x" {
+    let respond = respond(1)
+    let value = use(Box(respond: respond))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("respond")));
+}
+
 TEST(frontend, analyze_function_guard_respond_injects_route_guard) {
     const char* src =
         "func require(ok: bool) -> i32 { guard ok else { respond 401, \"denied\" } 7 }\n"
