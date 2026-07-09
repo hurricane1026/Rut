@@ -4920,9 +4920,6 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                               const HirExpr& subject_expr,
                                               const HirLocal* cur_locals,
                                               u32 cur_local_count) -> FrontendResult<HirExpr> {
-        if (allow_respond_guards)
-            return analyze_match_pattern(
-                pattern_expr, subject_expr, scratch, mod, cur_locals, cur_local_count);
         const bool saved_allow_respond_effects = scratch->allow_respond_effects;
         scratch->allow_respond_effects = false;
         auto result = analyze_match_pattern(

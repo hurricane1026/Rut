@@ -1555,6 +1555,27 @@ route GET "/x" { let code = outer(false, false, false) return 200 }
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
+TEST(frontend, analyze_rejects_respond_helper_in_top_level_match_pattern) {
+    const auto src = R"rut(
+func pat(ok: bool) -> i32 { guard ok else { respond 401 } 1 }
+func outer(ok: bool, value: i32) -> i32 {
+    match value {
+        0 => 1
+        pat(ok) => 2
+        _ => 3
+    }
+}
+route GET "/x" { let code = outer(false, 0) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, analyze_function_guard_respond_injects_route_guard) {
     const char* src =
         "func require(ok: bool) -> i32 { guard ok else { respond 401, \"denied\" } 7 }\n"
