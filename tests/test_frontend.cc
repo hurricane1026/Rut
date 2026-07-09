@@ -1509,10 +1509,14 @@ TEST(frontend, respond_is_contextual_keyword_outside_statements) {
     const auto src = R"rut(
 struct Box { respond: i32 }
 func respond(value: i32) -> i32 => value
+func wrap(value: i32) -> i32 => respond(value)
+func tail() -> i32 { let respond = 1 respond }
 func use(box: Box) -> i32 => box.respond
 route GET "/x" {
     let respond = respond(1)
     let value = use(Box(respond: respond))
+    let wrapped = wrap(2)
+    let tailed = tail()
     return 200
 }
 )rut";
@@ -1523,8 +1527,32 @@ route GET "/x" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes.len, 1u);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
     CHECK(hir->routes[0].locals[0].name.eq(lit("respond")));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_in_conditional_match_pattern) {
+    const auto src = R"rut(
+func pat(ok: bool) -> bool { guard ok else { respond 401 } true }
+func outer(use: bool, ok: bool, flag: bool) -> i32 {
+    if use {
+        match flag {
+            pat(ok) => 1
+            _ => 2
+        }
+    } else {
+        3
+    }
+}
+route GET "/x" { let code = outer(false, false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
 TEST(frontend, analyze_function_guard_respond_injects_route_guard) {

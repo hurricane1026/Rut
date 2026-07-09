@@ -4916,6 +4916,21 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         return result;
     };
 
+    auto analyze_function_match_pattern = [&](const AstExpr& pattern_expr,
+                                              const HirExpr& subject_expr,
+                                              const HirLocal* cur_locals,
+                                              u32 cur_local_count) -> FrontendResult<HirExpr> {
+        if (allow_respond_guards)
+            return analyze_match_pattern(
+                pattern_expr, subject_expr, scratch, mod, cur_locals, cur_local_count);
+        const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+        scratch->allow_respond_effects = false;
+        auto result = analyze_match_pattern(
+            pattern_expr, subject_expr, scratch, mod, cur_locals, cur_local_count);
+        scratch->allow_respond_effects = saved_allow_respond_effects;
+        return result;
+    };
+
     if (stmt.kind == AstStmtKind::Expr)
         return analyze_function_expr(stmt.expr, locals, local_count, binding);
 
@@ -5070,8 +5085,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 wildcard_arm = &arm;
                 continue;
             }
-            auto pattern = analyze_match_pattern(
-                *arm.pattern, subject.value(), scratch, mod, locals, local_count);
+            auto pattern =
+                analyze_function_match_pattern(*arm.pattern, subject.value(), locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
 
             bool matched = false;
@@ -5234,8 +5249,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 continue;
             }
 
-            auto pattern = analyze_match_pattern(
-                *arm.pattern, subject.value(), scratch, mod, locals, local_count);
+            auto pattern =
+                analyze_function_match_pattern(*arm.pattern, subject.value(), locals, local_count);
             if (!pattern) return core::make_unexpected(pattern.error());
             if (pattern->kind != HirExprKind::BoolLit && pattern->kind != HirExprKind::IntLit &&
                 pattern->kind != HirExprKind::StrLit && pattern->kind != HirExprKind::VariantCase)

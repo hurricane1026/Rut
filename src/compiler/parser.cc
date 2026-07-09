@@ -62,11 +62,6 @@ struct Parser {
         return &toks->tokens[pos++];
     }
 
-    const Token* take_ident_text(Str text) {
-        if (cur().type != TokenType::Ident || !cur().text.eq(text)) return nullptr;
-        return &toks->tokens[pos++];
-    }
-
     FrontendResult<const Token*> expect(TokenType type) {
         if (cur().type == type) return &toks->tokens[pos++];
         if (cur().type == TokenType::Eof)
@@ -1162,7 +1157,9 @@ struct Parser {
             }
             return stmt;
         }
-        if (take_ident_text(lit_str("respond"))) {
+        if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
+            peek().type == TokenType::IntLit) {
+            pos++;
             AstStatement stmt{};
             stmt.kind = AstStmtKind::RespondStatus;
 
@@ -2065,7 +2062,8 @@ struct Parser {
         if (take(TokenType::KwGuard)) {
             return parse_func_guard_stmt(prev());
         }
-        if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond"))) {
+        if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
+            peek().type == TokenType::IntLit) {
             return parse_stmt();
         }
         if (take(TokenType::KwIf)) {
