@@ -3223,6 +3223,14 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
                                                   const MatchPayloadBinding* binding,
                                                   bool binds_value,
                                                   bool is_match_guard);
+static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& analyzed,
+                                                              Span span,
+                                                              HirRoute* route,
+                                                              const HirLocal* locals,
+                                                              u32 local_count,
+                                                              bool binds_value,
+                                                              bool is_match_guard,
+                                                              Str bool_detail);
 static bool is_standard_error_field(Str field_name);
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
@@ -4922,14 +4930,16 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         u32 then_count = local_count;
         HirExpr cond_expr{};
         if (stmt.bind_value) {
-            auto cond = analyze_guard_cond(stmt.expr,
-                                           scratch,
-                                           mod,
-                                           locals,
-                                           local_count,
-                                           binding,
-                                           /*binds_value=*/true,
-                                           /*is_match_guard=*/false);
+            auto bound = analyze_function_expr(stmt.expr, locals, local_count, binding);
+            if (!bound) return core::make_unexpected(bound.error());
+            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                       stmt.expr.span,
+                                                       scratch,
+                                                       locals,
+                                                       local_count,
+                                                       /*binds_value=*/true,
+                                                       /*is_match_guard=*/false,
+                                                       kGuardBoolDetail);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
             // A known-error/known-nil init folds the cond to constant `false`.
@@ -4941,8 +4951,6 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             // and lets it use the binding, so it must analyze — not be dropped
             // with an unresolved-identifier error.
             const u32 saved_locals = scratch->locals.len;
-            auto bound = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
-            if (!bound) return core::make_unexpected(bound.error());
             const u32 ref_index = next_local_ref_index(scratch, locals, local_count);
             auto local = make_if_let_local(scratch, bound.value(), stmt.name, ref_index, stmt.span);
             if (!local) return core::make_unexpected(local.error());
@@ -4972,7 +4980,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 return live_else.value();
             }
         } else {
-            auto cond = analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
+            auto cond = analyze_function_expr(stmt.expr, locals, local_count, binding);
             if (!cond) return core::make_unexpected(cond.error());
             if (cond->type != HirTypeKind::Bool || cond->may_nil || cond->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
@@ -5040,7 +5048,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     }
 
     if (stmt.kind == AstStmtKind::Match && stmt.is_const) {
-        auto subject = analyze_expr(stmt.expr, scratch, mod, locals, local_count, nullptr);
+        auto subject = analyze_function_expr(stmt.expr, locals, local_count, nullptr);
         if (!subject) return core::make_unexpected(subject.error());
         ConstValue subject_value{};
         if (!const_eval_expr(subject.value(), locals, local_count, &subject_value, 0))
@@ -5105,7 +5113,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     }
 
     if (stmt.kind == AstStmtKind::Match) {
-        auto subject = analyze_expr(stmt.expr, scratch, mod, locals, local_count, nullptr);
+        auto subject = analyze_function_expr(stmt.expr, locals, local_count, nullptr);
         if (!subject) return core::make_unexpected(subject.error());
         if (subject->may_nil || subject->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
@@ -5271,8 +5279,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (!have_result) return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 if (arm.guard == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+                scratch->allow_respond_effects = false;
                 auto guard =
                     analyze_expr(*arm.guard, scratch, mod, locals, local_count, arm_binding_ptr);
+                scratch->allow_respond_effects = saved_allow_respond_effects;
                 if (!guard) return core::make_unexpected(guard.error());
                 if (guard->type != HirTypeKind::Bool || guard->may_nil || guard->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
@@ -5376,14 +5387,14 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 auto bound =
                     analyze_function_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(inner.expr,
-                                               scratch,
-                                               mod,
-                                               cur_locals,
-                                               cur_local_count,
-                                               nullptr,
-                                               inner.bind_value,
-                                               inner.match_arms.len != 0);
+                auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                           inner.expr.span,
+                                                           scratch,
+                                                           cur_locals,
+                                                           cur_local_count,
+                                                           inner.bind_value,
+                                                           inner.match_arms.len != 0,
+                                                           kGuardBoolDetail);
                 if (!cond) return core::make_unexpected(cond.error());
 
                 HirLocal succ_locals[HirRoute::kMaxLocals]{};
@@ -9075,6 +9086,77 @@ static bool const_eval_expr(
     return false;
 }
 
+static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& analyzed,
+                                                              Span span,
+                                                              HirRoute* route,
+                                                              const HirLocal* locals,
+                                                              u32 local_count,
+                                                              bool binds_value,
+                                                              bool is_match_guard,
+                                                              Str bool_detail) {
+    HirExpr cond{};
+    cond.span = span;
+    cond.kind = HirExprKind::BoolLit;
+    cond.type = HirTypeKind::Bool;
+
+    if (binds_value) {
+        // `guard let x = expr` — usable-value test. nil and error alike take
+        // the else branch (DESIGN.md §3.3.7: one binding idiom, two channels).
+        const auto state = known_value_state(analyzed, locals, local_count, 0);
+        if (state == KnownValueState::Error || state == KnownValueState::Nil) {
+            cond.bool_value = false;
+            return cond;
+        }
+        if (state == KnownValueState::Available || (!analyzed.may_nil && !analyzed.may_error)) {
+            cond.bool_value = true;
+            return cond;
+        }
+        // Error-capable AND pure-optional (may_nil-only) sources both lower
+        // through HasValue: the error-capable carrier reads its {error,
+        // payload} struct, the pure-optional one is an Optional<inner> value
+        // (req.query/req.header, a func returning `nil` in a branch) tested
+        // with opt_is_nil. Known-nil inits folded above.
+        if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::TooManyItems, span);
+        cond.kind = HirExprKind::HasValue;
+        cond.lhs = &route->exprs[route->exprs.len - 1];
+        cond.variant_index = analyzed.variant_index;
+        cond.struct_index = analyzed.struct_index;
+        cond.error_struct_index = analyzed.error_struct_index;
+        cond.error_variant_index = analyzed.error_variant_index;
+        return cond;
+    }
+
+    if (!is_match_guard) {
+        // Bare `guard <cond>` — the condition must be a plain bool. No
+        // implicit truthiness, no implicit narrowing (DESIGN.md §3.3.7).
+        if (analyzed.type != HirTypeKind::Bool || analyzed.may_nil || analyzed.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, span, bool_detail);
+        if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::TooManyItems, span);
+        return route->exprs[route->exprs.len - 1];
+    }
+
+    // `guard match` — dispatches on the error channel; nil stays on the value
+    // channel (legacy behavior, unchanged).
+    if (!analyzed.may_error) {
+        cond.bool_value = true;
+        return cond;
+    }
+    const auto state = known_value_state(analyzed, locals, local_count, 0);
+    if (state == KnownValueState::Error) {
+        cond.bool_value = false;
+        return cond;
+    }
+    if (state == KnownValueState::Available || state == KnownValueState::Nil) {
+        cond.bool_value = true;
+        return cond;
+    }
+
+    if (!route->exprs.push(analyzed)) return frontend_error(FrontendError::TooManyItems, span);
+    cond.kind = HirExprKind::NoError;
+    cond.lhs = &route->exprs[route->exprs.len - 1];
+    return cond;
+}
+
 static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
                                                   HirRoute* route,
                                                   const HirModule& mod,
@@ -9085,71 +9167,14 @@ static FrontendResult<HirExpr> analyze_guard_cond(const AstExpr& expr,
                                                   bool is_match_guard) {
     auto analyzed = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!analyzed) return core::make_unexpected(analyzed.error());
-
-    HirExpr cond{};
-    cond.span = expr.span;
-    cond.kind = HirExprKind::BoolLit;
-    cond.type = HirTypeKind::Bool;
-
-    if (binds_value) {
-        // `guard let x = expr` — usable-value test. nil and error alike take
-        // the else branch (DESIGN.md §3.3.7: one binding idiom, two channels).
-        const auto state = known_value_state(analyzed.value(), locals, local_count, 0);
-        if (state == KnownValueState::Error || state == KnownValueState::Nil) {
-            cond.bool_value = false;
-            return cond;
-        }
-        if (state == KnownValueState::Available || (!analyzed->may_nil && !analyzed->may_error)) {
-            cond.bool_value = true;
-            return cond;
-        }
-        // Error-capable AND pure-optional (may_nil-only) sources both lower
-        // through HasValue: the error-capable carrier reads its {error,
-        // payload} struct, the pure-optional one is an Optional<inner> value
-        // (req.query/req.header, a func returning `nil` in a branch) tested
-        // with opt_is_nil. Known-nil inits folded above.
-        if (!route->exprs.push(analyzed.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        cond.kind = HirExprKind::HasValue;
-        cond.lhs = &route->exprs[route->exprs.len - 1];
-        cond.variant_index = analyzed->variant_index;
-        cond.struct_index = analyzed->struct_index;
-        cond.error_struct_index = analyzed->error_struct_index;
-        cond.error_variant_index = analyzed->error_variant_index;
-        return cond;
-    }
-
-    if (!is_match_guard) {
-        // Bare `guard <cond>` — the condition must be a plain bool. No
-        // implicit truthiness, no implicit narrowing (DESIGN.md §3.3.7).
-        if (analyzed->type != HirTypeKind::Bool || analyzed->may_nil || analyzed->may_error)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kGuardBoolDetail);
-        if (!route->exprs.push(analyzed.value()))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        return route->exprs[route->exprs.len - 1];
-    }
-
-    // `guard match` — dispatches on the error channel; nil stays on the value
-    // channel (legacy behavior, unchanged).
-    if (!analyzed->may_error) {
-        cond.bool_value = true;
-        return cond;
-    }
-    const auto state = known_value_state(analyzed.value(), locals, local_count, 0);
-    if (state == KnownValueState::Error) {
-        cond.bool_value = false;
-        return cond;
-    }
-    if (state == KnownValueState::Available || state == KnownValueState::Nil) {
-        cond.bool_value = true;
-        return cond;
-    }
-
-    if (!route->exprs.push(analyzed.value()))
-        return frontend_error(FrontendError::TooManyItems, expr.span);
-    cond.kind = HirExprKind::NoError;
-    cond.lhs = &route->exprs[route->exprs.len - 1];
-    return cond;
+    return build_guard_cond_from_analyzed(analyzed.value(),
+                                          expr.span,
+                                          route,
+                                          locals,
+                                          local_count,
+                                          binds_value,
+                                          is_match_guard,
+                                          kGuardBoolDetail);
 }
 
 static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,

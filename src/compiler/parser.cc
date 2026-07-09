@@ -270,6 +270,8 @@ struct Parser {
                 auto arm_stmt = parse_func_body_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
+                if (arm_stmt->kind == AstStmtKind::RespondStatus)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm_stmt->span);
                 auto arm_ptr = alloc_stmt(arm_stmt.value());
                 if (!arm_ptr) return core::make_unexpected(arm_ptr.error());
                 arm.stmt = arm_ptr.value();
