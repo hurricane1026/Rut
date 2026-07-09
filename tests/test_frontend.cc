@@ -1656,6 +1656,33 @@ TEST(frontend, analyze_or_receiver_probe_does_not_duplicate_respond_guard) {
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 
+TEST(frontend, analyze_or_receiver_probe_preserves_respond_capable_receiver_shape) {
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Box { value: i32 }
+Box impl Fallback {
+    func or(self: Box, alt: i32) -> i32 => self.value
+}
+func make(ok: bool) -> Box { guard ok else { respond 401 } Box(value: 7) }
+route GET "/x" {
+    let code = make(req.http11).or(2)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
 TEST(frontend, analyze_method_receiver_does_not_duplicate_respond_guard) {
     const auto src = R"rut(
 protocol Access {
@@ -1678,6 +1705,31 @@ route GET "/x" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_default_protocol_method_receiver_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+protocol Access {
+    func id() -> i32 => 7
+}
+struct Box { value: i32 }
+Box impl Access {}
+func make(ok: bool) -> Box { guard ok else { respond 401 } Box(value: 7) }
+route GET "/x" {
+    let code = make(req.http11).id()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 

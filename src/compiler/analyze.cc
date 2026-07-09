@@ -3542,10 +3542,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         // after the boolean decision, so roll the pool back — both
         // continuations re-analyze the receiver themselves (PR #164 round 6).
         const u32 probe_saved_exprs = route->exprs.len;
-        const bool probe_saved_allow_respond_effects = route->allow_respond_effects;
-        route->allow_respond_effects = false;
+        const u32 probe_saved_guards = route->guards.len;
         auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
-        route->allow_respond_effects = probe_saved_allow_respond_effects;
+        route->guards.len = probe_saved_guards;
         const auto receiver_has_or_member = [&]() -> bool {
             if (!recv) return false;  // sugar's any() will re-report the error
             // A missing-capable receiver cannot dispatch a real method (the
@@ -3970,7 +3969,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                      locals,
                                      local_count,
                                      binding,
-                                     receiver_override ? &recv : nullptr);
+                                     receiver_override ? &recv : nullptr,
+                                     receiver_override ? nullptr : &recv);
         }
     }
     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
