@@ -1576,6 +1576,41 @@ route GET "/x" { let code = outer(false, 0) return 200 }
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
+TEST(frontend, analyze_rejects_respond_guard_after_value_guard_continuation) {
+    const auto src = R"rut(
+func outer(use: bool, ok: bool) -> i32 {
+    guard use else { 2 }
+    guard ok else { respond 401 }
+    1
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_status_outside_http_range) {
+    const auto src = R"rut(
+func outer(ok: bool) -> i32 {
+    guard ok else { respond 700 }
+    1
+}
+route GET "/x" { let code = outer(false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::InvalidStatusCode));
+}
+
 TEST(frontend, analyze_function_guard_respond_injects_route_guard) {
     const char* src =
         "func require(ok: bool) -> i32 { guard ok else { respond 401, \"denied\" } 7 }\n"
