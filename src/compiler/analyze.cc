@@ -3230,7 +3230,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const HirLocal* locals,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
-                                                 const HirExpr* pipe_lhs);
+                                                 const HirExpr* pipe_lhs,
+                                                 const HirExpr* first_arg_override = nullptr);
 static bool user_bound_req_name(const HirModule& mod,
                                 const HirLocal* locals,
                                 u32 local_count,
@@ -3911,7 +3912,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                      locals,
                                      local_count,
                                      binding,
-                                     receiver_override ? &recv : nullptr);
+                                     receiver_override ? &recv : nullptr,
+                                     receiver_override ? nullptr : &recv);
         }
         u32 matched_protocol_index = 0xffffffffu;
         const HirProtocol::MethodDecl* matched_req = nullptr;
@@ -3980,7 +3982,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const HirLocal* locals,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
-                                                 const HirExpr* pipe_lhs);
+                                                 const HirExpr* pipe_lhs,
+                                                 const HirExpr* first_arg_override);
 
 static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
                                                      const HirExpr& bound,
@@ -5942,8 +5945,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, expr.span, expr.field_inits[fi].name);
                     const auto& field_decl = mod.structs[struct_index].fields[field_index];
+                    const u32 saved_guard_count = route->guards.len;
                     auto field_value = analyze_expr(
                         *expr.field_inits[fi].value, route, mod, locals, local_count, binding);
+                    route->guards.len = saved_guard_count;
                     if (!field_value) return core::make_unexpected(field_value.error());
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -6407,7 +6412,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             } else {
                 if (!template_case_decl.has_payload || expr.lhs == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                const u32 saved_guard_count = route->guards.len;
                 auto payload = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+                route->guards.len = saved_guard_count;
                 if (!payload) return core::make_unexpected(payload.error());
                 if (payload->may_nil || payload->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -7619,7 +7626,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const HirLocal* locals,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
-                                                 const HirExpr* pipe_lhs) {
+                                                 const HirExpr* pipe_lhs,
+                                                 const HirExpr* first_arg_override) {
     const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
         dst->type = src.type;
         dst->generic_index = src.generic_index;
@@ -8508,6 +8516,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 placeholder_slot_expr(*placeholder_source, arg_expr.int_value, arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
             analyzed_args[param_index] = slot_expr.value();
+        } else if (first_arg_override != nullptr && param_index == 0) {
+            analyzed_args[param_index] = *first_arg_override;
         } else {
             auto arg = analyze_expr(arg_expr, route, mod, locals, local_count, binding);
             if (!arg) return core::make_unexpected(arg.error());

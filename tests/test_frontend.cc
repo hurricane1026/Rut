@@ -1656,6 +1656,69 @@ TEST(frontend, analyze_or_receiver_probe_does_not_duplicate_respond_guard) {
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 
+TEST(frontend, analyze_method_receiver_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+protocol Access {
+    func id() -> i32
+}
+struct Box { value: i32 }
+Box impl Access {
+    func id(self: Box) -> i32 => self.value
+}
+func make(ok: bool) -> Box { guard ok else { respond 401 } Box(value: 7) }
+route GET "/x" {
+    let code = make(req.http11).id()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_generic_struct_inference_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+func require(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+route GET "/x" {
+    let box = Box(value: require(req.http11))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_generic_variant_inference_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+variant Wrap<T> { some(T), none }
+func require(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+route GET "/x" {
+    let state = Wrap.some(require(req.http11))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
 TEST(frontend, analyze_nested_respond_calls_order_argument_guard_first) {
     const char* src =
         "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 1 }\n"
