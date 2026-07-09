@@ -3541,7 +3541,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         // after the boolean decision, so roll the pool back — both
         // continuations re-analyze the receiver themselves (PR #164 round 6).
         const u32 probe_saved_exprs = route->exprs.len;
+        const bool probe_saved_allow_respond_effects = route->allow_respond_effects;
+        route->allow_respond_effects = false;
         auto recv = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        route->allow_respond_effects = probe_saved_allow_respond_effects;
         const auto receiver_has_or_member = [&]() -> bool {
             if (!recv) return false;  // sugar's any() will re-report the error
             // A missing-capable receiver cannot dispatch a real method (the
@@ -4377,6 +4380,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                                 expr.span);
             if (!filled) return core::make_unexpected(filled.error());
         }
+        if (fn.respond_guards.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, fn.name);
         auto inlined = instantiate_function_expr(
             fn.body, route, mod, call_args, call_arg_count, impl_bindings, impl_binding_count);
         if (!inlined) return core::make_unexpected(inlined.error());
@@ -8472,6 +8477,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     u32 placeholder_count = 0;
     const HirExpr* placeholder_source = pipe_lhs;
     u32 arg_offset = 0;
+    Span respond_guard_span = expr.span;
     if (pipe_inject_lhs) {
         if (!route->exprs.push(*pipe_lhs))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -8483,6 +8489,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     for (u32 i = 0; i < expr.args.len; i++) {
         const auto& arg_expr = *expr.args[i];
+        if (arg_expr.span.end > respond_guard_span.start) {
+            respond_guard_span.start = arg_expr.span.end;
+            if (respond_guard_span.end < respond_guard_span.start)
+                respond_guard_span.end = respond_guard_span.start;
+        }
         const u32 param_index = i + arg_offset;
         if (arg_expr.kind == AstExprKind::Placeholder) {
             if (pipe_lhs == nullptr)
@@ -8516,7 +8527,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                               effective_arg_count,
                                                               generic_bindings,
                                                               fn.type_params.len,
-                                                              expr.span);
+                                                              respond_guard_span);
     if (!respond_guards) return core::make_unexpected(respond_guards.error());
     auto inlined = instantiate_function_expr(fn.body,
                                              route,

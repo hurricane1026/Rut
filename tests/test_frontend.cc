@@ -1615,6 +1615,66 @@ route GET "/x" {
     REQUIRE(mir);
 }
 
+TEST(frontend, analyze_rejects_protocol_dispatched_respond_capable_method) {
+    const auto src = R"rut(
+protocol Auth {
+    func code() -> i32
+}
+struct Box { value: i32 }
+Box impl Auth {
+    func code(self: Box) -> i32 {
+        guard false else { respond 401 }
+        self.value
+    }
+}
+func run<T: Auth>(x: T) -> i32 => x.code()
+route GET "/x" {
+    let code = run(Box(value: 7))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_or_receiver_probe_does_not_duplicate_respond_guard) {
+    const char* src =
+        "func maybe(ok: bool) -> i32 { guard ok else { respond 401 } if ok { 7 } else { nil } }\n"
+        "route GET \"/x\" { let code = maybe(req.http11).or(0) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_nested_respond_calls_order_argument_guard_first) {
+    const char* src =
+        "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 1 }\n"
+        "func outer(ok: bool, value: i32) -> i32 { guard ok else { respond 402 } value }\n"
+        "route GET \"/x\" { let code = outer(false, inner(false)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 2u);
+    CHECK_EQ(route.guards[0].fail_term.status_code, 401);
+    CHECK_EQ(route.guards[1].fail_term.status_code, 402);
+    CHECK(route.guards[0].span.start <= route.guards[1].span.start);
+}
+
 TEST(frontend, parse_return_response_with_body) {
     // Covers the body: "..." kwarg through the compile-side pipeline:
     // parser → AST.response_body, analyze → HirTerminator.response_body,
