@@ -1791,6 +1791,26 @@ TEST(frontend, analyze_rejects_respond_helper_call_in_conditional_branch) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
+TEST(frontend, analyze_rejects_respond_helper_block_let_in_conditional_branch) {
+    const auto src = R"rut(
+func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+func outer(use: bool, ok: bool) -> i32 {
+    match use {
+        true => { let value = inner(ok) value }
+        false => 2
+    }
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, analyze_rejects_respond_helper_with_fallible_body) {
     const char* src =
         "func require(ok: bool) -> i32 { guard ok else { respond 401 } error(7) }\n"
@@ -1823,6 +1843,41 @@ route GET "/x" {
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 
+TEST(frontend, analyze_generic_struct_inference_rolls_back_respond_probe_exprs) {
+    const auto inferred_src = R"rut(
+struct Box<T> { value: T }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let box = Box(value: require(req.http11))
+    return 200
+}
+)rut";
+    const auto explicit_src = R"rut(
+struct Box<T> { value: T }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let box = Box<i32>(value: require(req.http11))
+    return 200
+}
+)rut";
+    auto inferred_lexed = lex(lit(inferred_src));
+    REQUIRE(inferred_lexed);
+    auto inferred_ast = parse_file_heap(inferred_lexed.value());
+    REQUIRE(inferred_ast);
+    auto inferred_hir = analyze_file_heap(inferred_ast.value());
+    REQUIRE(inferred_hir);
+    auto explicit_lexed = lex(lit(explicit_src));
+    REQUIRE(explicit_lexed);
+    auto explicit_ast = parse_file_heap(explicit_lexed.value());
+    REQUIRE(explicit_ast);
+    auto explicit_hir = analyze_file_heap(explicit_ast.value());
+    REQUIRE(explicit_hir);
+    REQUIRE_EQ(inferred_hir->routes.len, 1u);
+    REQUIRE_EQ(explicit_hir->routes.len, 1u);
+    CHECK_EQ(inferred_hir->routes[0].guards.len, explicit_hir->routes[0].guards.len);
+    CHECK_EQ(inferred_hir->routes[0].exprs.len, explicit_hir->routes[0].exprs.len);
+}
+
 TEST(frontend, analyze_generic_variant_inference_does_not_duplicate_respond_guard) {
     const auto src = R"rut(
 variant Wrap<T> { some(T), none }
@@ -1840,6 +1895,41 @@ route GET "/x" {
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes.len, 1u);
     CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_generic_variant_inference_rolls_back_respond_probe_exprs) {
+    const auto inferred_src = R"rut(
+variant Wrap<T> { some(T), none }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let state = Wrap.some(require(req.http11))
+    return 200
+}
+)rut";
+    const auto explicit_src = R"rut(
+variant Wrap<T> { some(T), none }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let state = Wrap<i32>.some(require(req.http11))
+    return 200
+}
+)rut";
+    auto inferred_lexed = lex(lit(inferred_src));
+    REQUIRE(inferred_lexed);
+    auto inferred_ast = parse_file_heap(inferred_lexed.value());
+    REQUIRE(inferred_ast);
+    auto inferred_hir = analyze_file_heap(inferred_ast.value());
+    REQUIRE(inferred_hir);
+    auto explicit_lexed = lex(lit(explicit_src));
+    REQUIRE(explicit_lexed);
+    auto explicit_ast = parse_file_heap(explicit_lexed.value());
+    REQUIRE(explicit_ast);
+    auto explicit_hir = analyze_file_heap(explicit_ast.value());
+    REQUIRE(explicit_hir);
+    REQUIRE_EQ(inferred_hir->routes.len, 1u);
+    REQUIRE_EQ(explicit_hir->routes.len, 1u);
+    CHECK_EQ(inferred_hir->routes[0].guards.len, explicit_hir->routes[0].guards.len);
+    CHECK_EQ(inferred_hir->routes[0].exprs.len, explicit_hir->routes[0].exprs.len);
 }
 
 TEST(frontend, analyze_nested_respond_calls_order_argument_guard_first) {

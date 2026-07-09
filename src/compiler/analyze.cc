@@ -5325,8 +5325,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             const auto& inner = *stmt.block_stmts[si];
             const bool is_last = si + 1 == stmt.block_stmts.len;
             if (inner.kind == AstStmtKind::Let && !is_last) {
-                auto init =
-                    analyze_expr(inner.expr, scratch, mod, cur_locals, cur_local_count, nullptr);
+                auto init = analyze_function_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!init) return core::make_unexpected(init.error());
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
@@ -5375,7 +5374,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             }
             if (inner.kind == AstStmtKind::Guard && !is_last) {
                 auto bound =
-                    analyze_expr(inner.expr, scratch, mod, cur_locals, cur_local_count, nullptr);
+                    analyze_function_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
                 auto cond = analyze_guard_cond(inner.expr,
                                                scratch,
@@ -5969,9 +5968,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, expr.span, expr.field_inits[fi].name);
                     const auto& field_decl = mod.structs[struct_index].fields[field_index];
+                    const u32 saved_expr_count = route->exprs.len;
                     const u32 saved_guard_count = route->guards.len;
                     auto field_value = analyze_expr(
                         *expr.field_inits[fi].value, route, mod, locals, local_count, binding);
+                    route->exprs.len = saved_expr_count;
                     route->guards.len = saved_guard_count;
                     if (!field_value) return core::make_unexpected(field_value.error());
                     if (field_value->may_nil || field_value->may_error)
@@ -6436,8 +6437,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             } else {
                 if (!template_case_decl.has_payload || expr.lhs == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+                const u32 saved_expr_count = route->exprs.len;
                 const u32 saved_guard_count = route->guards.len;
                 auto payload = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+                route->exprs.len = saved_expr_count;
                 route->guards.len = saved_guard_count;
                 if (!payload) return core::make_unexpected(payload.error());
                 if (payload->may_nil || payload->may_error)
