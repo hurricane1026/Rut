@@ -1642,7 +1642,7 @@ route GET "/x" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
-TEST(frontend, analyze_or_receiver_probe_does_not_duplicate_respond_guard) {
+TEST(frontend, analyze_or_receiver_rejects_fallible_respond_helper) {
     const char* src =
         "func maybe(ok: bool) -> i32 { guard ok else { respond 401 } if ok { 7 } else { nil } }\n"
         "route GET \"/x\" { let code = maybe(req.http11).or(0) return 200 }\n";
@@ -1651,9 +1651,8 @@ TEST(frontend, analyze_or_receiver_probe_does_not_duplicate_respond_guard) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes.len, 1u);
-    CHECK_EQ(hir->routes[0].guards.len, 1u);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
 TEST(frontend, analyze_variant_method_probe_does_not_duplicate_respond_guard) {
@@ -1776,6 +1775,33 @@ TEST(frontend, analyze_helper_wrapper_propagates_respond_guard) {
     CHECK_EQ(hir->functions[1].respond_guards.len, 1u);
     REQUIRE_EQ(hir->routes.len, 1u);
     CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_rejects_respond_helper_call_in_conditional_branch) {
+    const char* src =
+        "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }\n"
+        "func outer(use: bool, ok: bool) -> i32 { if use { inner(ok) } else { 2 } }\n"
+        "route GET \"/x\" { let code = outer(false, false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_with_fallible_body) {
+    const char* src =
+        "func require(ok: bool) -> i32 { guard ok else { respond 401 } error(7) }\n"
+        "route GET \"/x\" { let code = require(false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
 TEST(frontend, analyze_generic_struct_inference_does_not_duplicate_respond_guard) {

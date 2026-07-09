@@ -4567,6 +4567,8 @@ static FrontendResult<void> instantiate_function_respond_guards(
     u32 generic_binding_count,
     Span call_span) {
     if (fn.respond_guards.len == 0) return {};
+    if (fn.body.may_nil || fn.body.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, call_span);
     if (route == nullptr || !route->allow_respond_effects)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
@@ -4892,8 +4894,22 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         return result;
     };
 
+    auto analyze_function_expr =
+        [&](const AstExpr& expr,
+            const HirLocal* cur_locals,
+            u32 cur_local_count,
+            const MatchPayloadBinding* cur_binding) -> FrontendResult<HirExpr> {
+        if (allow_respond_guards)
+            return analyze_expr(expr, scratch, mod, cur_locals, cur_local_count, cur_binding);
+        const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+        scratch->allow_respond_effects = false;
+        auto result = analyze_expr(expr, scratch, mod, cur_locals, cur_local_count, cur_binding);
+        scratch->allow_respond_effects = saved_allow_respond_effects;
+        return result;
+    };
+
     if (stmt.kind == AstStmtKind::Expr)
-        return analyze_expr(stmt.expr, scratch, mod, locals, local_count, binding);
+        return analyze_function_expr(stmt.expr, locals, local_count, binding);
 
     if (stmt.kind == AstStmtKind::If) {
         // `if let name = expr { then } else { else }`: the condition folds to
@@ -14627,6 +14643,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
+        if (scratch.guards.len != 0 && (body->may_nil || body->may_error))
+            return frontend_error(FrontendError::UnsupportedSyntax, ast_func.body->span);
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
@@ -16174,6 +16192,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 body->variant_index != fn.return_variant_index)
                 return frontend_error(FrontendError::UnsupportedSyntax, item.func.body->span);
         }
+        if (scratch.guards.len != 0 && (body->may_nil || body->may_error))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.func.body->span);
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
