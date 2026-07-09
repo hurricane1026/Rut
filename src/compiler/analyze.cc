@@ -3464,6 +3464,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     Str qualified_type_name{};
     if (receiver_override == nullptr &&
         resolve_import_namespace_member(mod, *expr.lhs, qualified_type_name)) {
+        const u32 probe_saved_exprs = route->exprs.len;
+        const u32 probe_saved_guards = route->guards.len;
         AstExpr variant_expr{};
         variant_expr.kind = AstExprKind::VariantCase;
         variant_expr.span = expr.span;
@@ -3476,6 +3478,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto variant = analyze_expr(variant_expr, route, mod, locals, local_count, binding);
         if (variant) return variant;
+        route->exprs.len = probe_saved_exprs;
+        route->guards.len = probe_saved_guards;
     }
     // Builtin `bitwise` namespace (DESIGN.md §3.2.1) — see
     // analyze_bitwise_namespace_call. A user binding named `bitwise` (local,
@@ -3487,6 +3491,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
 
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
+        const u32 probe_saved_exprs = route->exprs.len;
+        const u32 probe_saved_guards = route->guards.len;
         AstExpr variant_expr{};
         variant_expr.kind = AstExprKind::VariantCase;
         variant_expr.span = expr.span;
@@ -3499,6 +3505,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto variant = analyze_expr(variant_expr, route, mod, locals, local_count, binding);
         if (variant) return variant;
+        route->exprs.len = probe_saved_exprs;
+        route->guards.len = probe_saved_guards;
     }
     if (receiver_override == nullptr &&
         magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
@@ -4559,7 +4567,7 @@ static FrontendResult<void> instantiate_function_respond_guards(
     u32 generic_binding_count,
     Span call_span) {
     if (fn.respond_guards.len == 0) return {};
-    if (route == nullptr || !route->allow_respond_effects || route->is_helper_scratch)
+    if (route == nullptr || !route->allow_respond_effects)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             call_span,
@@ -14402,6 +14410,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         [&](HirFunction& fn, const AstFunctionDecl& ast_func, Span span) -> FrontendResult<void> {
         HirRoute scratch{};
         scratch.is_helper_scratch = true;
+        scratch.allow_respond_effects = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*ast_func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());
@@ -15959,6 +15968,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         HirFunction& fn = mod.functions[fn_index];
         HirRoute scratch{};
         scratch.is_helper_scratch = true;
+        scratch.allow_respond_effects = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*item.func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());

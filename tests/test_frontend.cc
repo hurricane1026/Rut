@@ -1656,6 +1656,33 @@ TEST(frontend, analyze_or_receiver_probe_does_not_duplicate_respond_guard) {
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 
+TEST(frontend, analyze_variant_method_probe_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+variant Wrap { some(i32), none }
+protocol Pick {
+    func some(value: str) -> i32
+}
+struct Box { value: str }
+Box impl Pick {
+    func some(self: Box, value: str) -> i32 => 7
+}
+func reject(ok: bool) -> str { guard ok else { respond 401 } "x" }
+route GET "/x" {
+    let Wrap = Box(value: "box")
+    let code = Wrap.some(reject(req.http11))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
 TEST(frontend, analyze_or_receiver_probe_preserves_respond_capable_receiver_shape) {
     const auto src = R"rut(
 protocol Fallback {
@@ -1730,6 +1757,24 @@ route GET "/x" {
     REQUIRE_EQ(hir->routes.len, 1u);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_helper_wrapper_propagates_respond_guard) {
+    const char* src =
+        "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }\n"
+        "func outer(ok: bool) -> i32 { let value = inner(ok) value }\n"
+        "route GET \"/x\" { let code = outer(req.http11) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[0].respond_guards.len, 1u);
+    CHECK_EQ(hir->functions[1].respond_guards.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
 
