@@ -5108,8 +5108,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (selected_arm == nullptr) selected_arm = wildcard_arm;
         if (selected_arm == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-        return analyze_function_body_stmt(
-            *selected_arm->stmt, scratch, mod, locals, local_count, selected_binding_ptr, false);
+        return analyze_function_body_stmt(*selected_arm->stmt,
+                                          scratch,
+                                          mod,
+                                          locals,
+                                          local_count,
+                                          selected_binding_ptr,
+                                          allow_respond_guards);
     }
 
     if (stmt.kind == AstStmtKind::Match) {

@@ -1895,6 +1895,27 @@ route GET "/x" { let code = outer(req.http11) return 200 }
     CHECK_EQ(hir->functions[1].respond_guards.len, 2u);
 }
 
+TEST(frontend, analyze_const_match_selected_arm_propagates_respond_helper) {
+    const auto src = R"rut(
+func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+func outer(ok: bool) -> i32 {
+    match const true {
+        true => inner(ok)
+        _ => 2
+    }
+}
+route GET "/x" { let code = outer(req.http11) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[1].respond_guards.len, 1u);
+}
+
 TEST(frontend, analyze_rejects_respond_helper_with_fallible_body) {
     const char* src =
         "func require(ok: bool) -> i32 { guard ok else { respond 401 } error(7) }\n"
