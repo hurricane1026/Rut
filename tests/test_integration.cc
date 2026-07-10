@@ -1439,6 +1439,19 @@ static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut
 
 // The event loop fires a registered timer once its interval elapses, invoking the
 // compiled handler with no Connection/Request and bumping the per-timer count.
+// A shard selector within the compile-time range can still exceed the
+// RUNTIME --shards value; startup validation catches it (fail fast instead
+// of a silently dead timer). PR #172 review round 2.
+TEST(timer_dsl, out_of_range_shard_selector_detected_at_startup) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("a", 1, /*interval_ms=*/1000, &timer_probe_fn, /*shard=*/-1));
+    REQUIRE(cfg.add_timer("b", 1, /*interval_ms=*/1000, &timer_probe_fn, /*shard=*/5));
+    CHECK_EQ(cfg.first_out_of_range_timer_shard(/*shard_count=*/8), -1);
+    CHECK_EQ(cfg.first_out_of_range_timer_shard(/*shard_count=*/5), 1);  // 'b' dead
+    CHECK_EQ(cfg.first_out_of_range_timer_shard(/*shard_count=*/1), 1);
+}
+
 // Runtime filter: a shard-pinned timer fires only on the matching shard's loop.
 TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
     using namespace rut;

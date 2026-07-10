@@ -527,6 +527,23 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // Fail fast on a shard-pinned timer that can never fire with this
+    // --shards value (selector >= shard_count) instead of serving with a
+    // silently dead timer.
+    if (route_config != nullptr) {
+        const i32 bad = route_config->first_out_of_range_timer_shard(shard_count);
+        if (bad >= 0) {
+            write_str("Timer '");
+            write_str(route_config->timers[bad].name);
+            write_str("' pins shard ");
+            write_u32(static_cast<u32>(route_config->timers[bad].shard));
+            write_str(" but only ");
+            write_u32(shard_count);
+            write_str(" shard(s) are configured\n");
+            return 1;
+        }
+    }
+
     i32 rc = 0;
     // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
     // whenever available — TLS no longer forces the epoll fallback.
