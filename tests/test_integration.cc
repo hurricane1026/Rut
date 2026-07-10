@@ -12,6 +12,7 @@
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/compile_to_config.h"
+#include "rut/runtime/debug.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_conn.h"
@@ -10691,6 +10692,28 @@ static rut::WsFrameAction terminate_test_handler(
 // End-to-end terminate mode: the gateway parses/reassembles/re-frames frames in both
 // directions (not a raw splice). Proves the handler's Forward/Drop verdicts take effect
 // over a real socket, and that Sec-WebSocket-Extensions is stripped from the upgrade.
+// PONG-timeout diagnostics for the WS terminate flake family: on failure dump
+// the client's partial-frame accumulator and every live connection's debug
+// snapshot, so a CI-only strike carries evidence (PR #175 — the iteration-cap
+// theory was falsified in the field; suspicion is the engine's post-Drop path).
+static void dump_ws_flake_evidence(RealLoop* loop, const rut::u8* acc, rut::u32 have) {
+    fprintf(stderr, "[ws-flake] client accumulator: %u bytes:", have);
+    for (rut::u32 i = 0; i < have && i < 32; i++) fprintf(stderr, " %02x", acc[i]);
+    fprintf(stderr, "\n");
+    for (rut::u32 i = 0; i < RealLoop::kMaxConns; i++) {
+        const auto& c = loop->conns[i];
+        if (c.fd < 0 && c.upstream_fd < 0) continue;
+        char buf[512];
+        rut::format_conn_debug_snapshot(rut::make_conn_debug_snapshot(c), buf, sizeof(buf));
+        fprintf(stderr,
+                "[ws-flake] conn %u ws_term=%d recv_armed=%d: %s\n",
+                i,
+                c.is_ws_terminate ? 1 : 0,
+                c.recv_armed ? 1 : 0,
+                buf);
+    }
+}
+
 TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
     // Repro for the recurring CI flake in terminate_inspects_forwards_and_drops:
     // on a loaded runner the server thread can be descheduled long enough for
@@ -10766,7 +10789,9 @@ TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
     };
     u8 pl[256];
     u32 pn = 0;
-    CHECK(recv_text(pl, &pn));
+    const bool got_pong = recv_text(pl, &pn);
+    if (!got_pong) dump_ws_flake_evidence(loop, racc, rhave);
+    CHECK(got_pong);
     CHECK(pn == 4 && memcmp(pl, "PONG", 4) == 0);
 
     close(c);
@@ -10857,7 +10882,9 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     send_text("DROP", 4);
     usleep(50000);
     send_text("PONG", 4);
-    CHECK(recv_text(pl, &pn));
+    const bool got_pong = recv_text(pl, &pn);
+    if (!got_pong) dump_ws_flake_evidence(loop, racc, rhave);
+    CHECK(got_pong);
     CHECK(pn == 4 && memcmp(pl, "PONG", 4) == 0);
 
     // Close handshake: the handler returns Close on "BYE". Terminate must send a Close frame
