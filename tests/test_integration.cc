@@ -1321,12 +1321,29 @@ TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
     CHECK_EQ(hir_owned->routes.len, 4u);
 }
 
-// Sub-second intervals are rejected honestly: the firing path is the 1s
-// keepalive tick, and pulling it forward would also advance the idle/probe
-// timer wheel. Lift when timers get a dedicated precise wakeup.
-TEST(timer_dsl, rejects_sub_second_interval) {
+// Non-whole-second intervals are rejected honestly: the firing path is the
+// 1s keepalive tick (a 1500ms timer would silently fire every ~2s), and
+// pulling the tick forward would also advance the idle/probe timer wheel.
+// Lift when timers get a dedicated precise wakeup.
+TEST(timer_dsl, rejects_non_whole_second_intervals) {
     using namespace rut;
-    const char* src = "timer t, every: 500ms { }\n";
+    for (const char* src : {"timer t, every: 500ms { }\n", "timer t, every: 1500ms { }\n"}) {
+        auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(!hir);
+        CHECK(hir.error().detail.len != 0);
+    }
+}
+
+// A selector outside the process shard range (kMaxShards) would compile into
+// a timer that never fires on any shard — rejected instead.
+TEST(timer_dsl, rejects_shard_selector_beyond_max_shards) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s, shard: 64 { }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());

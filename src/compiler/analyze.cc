@@ -1,5 +1,6 @@
 #include "rut/compiler/analyze.h"
 
+#include "rut/common/shard_limits.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/route_method.h"
@@ -16627,12 +16628,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // timer wheel, so honest rejection beats silently drifting a
             // sub-second interval to 1s. Lift when timers get a dedicated
             // precise wakeup (TODO.md).
-            if (item.timer.interval_ms < 1000)
+            if (item.timer.interval_ms < 1000 || item.timer.interval_ms % 1000 != 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     item.timer.span,
-                    lit_str("timer intervals have 1s granularity today; use every: "
-                            "1s or coarser"));
+                    lit_str("timer intervals have 1s granularity today; use a whole "
+                            "number of seconds (every: 1s or coarser)"));
+            // A selector outside the process shard range would compile into a
+            // timer that never fires on any shard.
+            if (item.timer.shard >= static_cast<i32>(kMaxShards))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    item.timer.span,
+                    lit_str("shard selector exceeds the supported shard range (0..63)"));
             timer_route_view.span = item.timer.span;
             timer_route_view.body_span = item.timer.body_span;
             timer_route_view.path = item.timer.name;  // timer name (not an HTTP path)

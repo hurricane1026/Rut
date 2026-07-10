@@ -1,3 +1,4 @@
+#include "rut/common/shard_limits.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
@@ -19,7 +20,8 @@
 
 using namespace rut;
 
-static constexpr u32 kMaxShards = 64;
+// kMaxShards moved to rut/common/shard_limits.h (shared with the
+// compiler front-end, which validates `shard:` selectors against it).
 static constexpr u32 kDefaultDrainSecs = 30;
 static constexpr u16 kDefaultPort = 8080;
 
