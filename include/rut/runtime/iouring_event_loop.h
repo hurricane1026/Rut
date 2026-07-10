@@ -43,7 +43,7 @@ namespace rut {
 struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     IoUringBackend backend;
     TimerWheel timer;
-    u32 shard_id;
+    u32 shard_id = 0;
     // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.

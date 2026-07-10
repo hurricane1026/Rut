@@ -160,7 +160,7 @@ struct EpollEventLoop : EventLoopCRTP<EpollEventLoop> {
     // 0 means disarmed. Used to avoid redundant timerfd_settime syscalls
     // when a new push does not change the heap's top.
     u64 yield_timer_armed_ns = 0;
-    u32 shard_id;
+    u32 shard_id = 0;
     // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.

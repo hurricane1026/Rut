@@ -16622,6 +16622,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (timer_count >= HirModule::kMaxTimers)
                 return frontend_error(FrontendError::TooManyItems, item.timer.span);
             timer_count++;
+            // The firing path is the shard keepalive tick (1s granularity);
+            // pulling that tick forward would also advance the idle/probe
+            // timer wheel, so honest rejection beats silently drifting a
+            // sub-second interval to 1s. Lift when timers get a dedicated
+            // precise wakeup (TODO.md).
+            if (item.timer.interval_ms < 1000)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    item.timer.span,
+                    lit_str("timer intervals have 1s granularity today; use every: "
+                            "1s or coarser"));
             timer_route_view.span = item.timer.span;
             timer_route_view.body_span = item.timer.body_span;
             timer_route_view.path = item.timer.name;  // timer name (not an HTTP path)
@@ -16641,6 +16652,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
             route.is_timer = true;
             route.timer_interval_ms = item.timer.interval_ms;
+            route.timer_shard = item.timer.shard;
             route.control.kind = HirControlKind::Direct;
             route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
             route.control.direct_term.source_kind = HirTerminatorSourceKind::Literal;
@@ -16658,7 +16670,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.method == 0)
             return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
         route.is_timer = is_timer_item;
-        if (is_timer_item) route.timer_interval_ms = item.timer.interval_ms;
+        if (is_timer_item) {
+            route.timer_interval_ms = item.timer.interval_ms;
+            route.timer_shard = item.timer.shard;
+        }
 
         auto analyze_chain_step_arg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
             if (arg.kind == AstExprKind::Ident && arg.name.eq({"req", 3})) {

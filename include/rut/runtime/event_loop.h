@@ -199,6 +199,11 @@ public:
         const u32 n =
             cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
         for (u32 i = 0; i < n; i++) {
+            // `shard: N` pins the timer to one shard (singleton tasks); the
+            // default -1 runs a copy on every shard.
+            if (cfg->timers[i].shard >= 0 &&
+                static_cast<u32>(cfg->timers[i].shard) != self().shard_id)
+                continue;
             if (now < timer_deadline_ns[i]) continue;
             jit::HandlerCtx ctx{};
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
@@ -351,7 +356,7 @@ template <typename Backend>
 struct EventLoop : EventLoopCRTP<EventLoop<Backend>> {
     Backend backend;
     TimerWheel timer;
-    u32 shard_id;
+    u32 shard_id = 0;
     // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.

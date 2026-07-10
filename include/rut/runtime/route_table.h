@@ -242,11 +242,14 @@ struct RouteConfig {
         u32 name_len = 0;
         jit::HandlerFn fn = nullptr;
         u32 interval_ms = 0;
+        // `shard: N` — fire on that shard only; -1 = every shard (default).
+        i32 shard = -1;
     };
     TimerEntry timers[kMaxTimers];
     u32 timer_count = 0;
 
-    bool add_timer(const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn) {
+    bool add_timer(
+        const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn, i32 shard = -1) {
         if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
         TimerEntry& t = timers[timer_count];
         const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
@@ -255,6 +258,7 @@ struct RouteConfig {
         t.name_len = kN;
         t.fn = fn;
         t.interval_ms = interval_ms;
+        t.shard = shard;
         timer_count++;
         return true;
     }
