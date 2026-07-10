@@ -1140,9 +1140,10 @@ TEST(timer_dsl, registration_idempotent_for_timer_only) {
 }
 #endif  // RUT_ENABLE_JIT_TESTS
 
-// A non-empty timer body is rejected for now (executing it needs the route-body
-// analysis factored out — slice 1 only schedules the no-op handler).
-TEST(timer_dsl, rejects_non_empty_body) {
+// A non-empty timer body must end in an explicit terminal statement, exactly
+// like a route body (a body that never returns has nothing observable to do
+// until side-effecting statements exist).
+TEST(timer_dsl, rejects_body_without_terminal) {
     using namespace rut;
     const char* src = "timer t, every: 1s { let x = 1 }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
@@ -1151,7 +1152,173 @@ TEST(timer_dsl, rejects_non_empty_body) {
     REQUIRE(ast);
     std::unique_ptr<AstFile> ast_owned(ast.value());
     auto hir = analyze_file(*ast_owned);
-    CHECK(!hir);  // analyze rejects a non-empty timer body
+    CHECK(!hir);
+}
+
+// Timers run outside any request: req access / forward in a timer body are
+// rejected with a fix-it after the shared route-body analysis.
+TEST(timer_dsl, rejects_req_access_in_body) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s { let p = req.path return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.eq(
+        Str{"timers run outside a request; req access and forward are not available "
+            "in a timer body",
+            86}));
+}
+
+// wait needs a Connection to yield/resume on; the timer invocation has none.
+TEST(timer_dsl, rejects_wait_in_body) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s { wait(500) return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.len != 0);
+}
+
+#if RUT_ENABLE_JIT_TESTS
+// A timer body analyzes through the shared route path and compiles to a real
+// executable handler: locals, guards, and branches run; the returned status
+// reflects the body's control flow (the firing path ignores it, but it proves
+// the body executed).
+TEST(timer_dsl, body_compiles_to_executable_handler) {
+    using namespace rut;
+    const char* src =
+        "timer t, every: 1s { let a = bitwise.and(6, 3) guard a == 2 else { return 500 } "
+        "if a == 2 { return 201 } else { return 502 } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(rir.module.functions[0].is_timer);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+    // Same no-request invocation shape the timer firing path uses.
+    jit::HandlerCtx ctx{};
+    auto r = jit::HandlerResult::unpack(handler_fn(nullptr, &ctx, nullptr, 0, nullptr));
+    CHECK(r.action == jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 201u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+// The guard's else path executes too (else exits the tick with that status).
+TEST(timer_dsl, body_guard_else_path_executes) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s { guard 1 == 2 else { return 500 } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+    jit::HandlerCtx ctx{};
+    auto r = jit::HandlerResult::unpack(handler_fn(nullptr, &ctx, nullptr, 0, nullptr));
+    CHECK(r.action == jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+#endif  // RUT_ENABLE_JIT_TESTS
+
+// `guard match` fail arms live in mod.guard_match_arms; a `=> forward u` arm
+// must be rejected in a timer body like any other forward (PR #171 review).
+TEST(timer_dsl, rejects_guard_match_forward_in_body) {
+    using namespace rut;
+    const char* src =
+        "upstream api at \"10.0.0.1:8080\"\n"
+        "timer t, every: 1s { let failed = error(.timeout) guard match failed else { "
+        ".timeout => return forward(api) _ => return 500 } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.len != 0);
+}
+
+#if RUT_ENABLE_WEBSOCKET
+// A websocket terminator needs a live client connection; MIR also skips
+// ws-terminate routes entirely, which would silently drop the timer
+// (PR #171 review).
+TEST(timer_dsl, rejects_websocket_terminate_in_body) {
+    using namespace rut;
+    const char* src =
+        "upstream ws at \"10.0.0.1:8080\"\n"
+        "timer t, every: 1s { return websocket(ws) { frame.forward() } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+// A timer declared BEFORE HTTP routes must not consume HTTP-route capacity:
+// mod.routes holds both, so the cap has to count HTTP routes separately
+// (PR #171 review).
+TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
+    using namespace rut;
+    std::string src = "timer t, every: 1s { }\n";
+    for (int i = 0; i < 3; i++) src += "route GET \"/r" + std::to_string(i) + "\" { return 200 }\n";
+    auto lexed = lex(Str{src.c_str(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    // 1 timer + 3 HTTP routes all present.
+    CHECK_EQ(hir_owned->routes.len, 4u);
 }
 
 // Timers don't consume HTTP-route capacity: the routes vector is sized

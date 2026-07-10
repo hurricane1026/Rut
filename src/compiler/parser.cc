@@ -3341,11 +3341,12 @@ struct Parser {
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-            // Parse (to consume + syntax-check the tokens) but don't store — slice 1
-            // rejects any non-empty body in analyze; only the count is needed.
             auto stmt = parse_stmt();
             if (!stmt) return core::make_unexpected(stmt.error());
-            item.timer.statement_count++;
+            auto stmt_ptr = alloc_stmt(stmt.value());
+            if (!stmt_ptr) return core::make_unexpected(stmt_ptr.error());
+            if (!item.timer.statements.push(stmt_ptr.value()))
+                return frontend_error(FrontendError::TooManyItems, span_from(cur()));
         }
         auto rbrace = expect(TokenType::RBrace);
         if (!rbrace) return core::make_unexpected(rbrace.error());
