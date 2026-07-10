@@ -13208,9 +13208,15 @@ static bool hir_expr_uses_request(const HirExpr& e) {
     return false;
 }
 
-static FrontendResult<void> validate_timer_route(const HirRoute& route, Span body_span) {
+static FrontendResult<void> validate_timer_route(const HirRoute& route,
+                                                 const HirModule& mod,
+                                                 Span body_span) {
     if (route.waits.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerWaitDetail);
+    // A websocket terminator needs a live client connection; MIR also skips
+    // ws-terminate routes entirely, which would silently drop the timer.
+    if (route.is_ws_terminate)
+        return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
     auto check_expr = [&](const HirExpr& e) -> FrontendResult<void> {
         if (hir_expr_uses_request(e))
             return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
@@ -13241,6 +13247,17 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route, Span bod
         if (!match_ok) return match_ok;
         auto term_ok = check_term(g.fail_term);
         if (!term_ok) return term_ok;
+        // `guard match ... else` fail arms live in mod.guard_match_arms
+        // (fail_match_start/count), not inside HirGuard.
+        for (u32 mi = 0; mi < g.fail_match_count; mi++) {
+            const u32 idx = g.fail_match_start + mi;
+            if (idx >= mod.guard_match_arms.len) break;
+            const auto& arm = mod.guard_match_arms[idx];
+            auto pattern_ok = check_expr(arm.pattern);
+            if (!pattern_ok) return pattern_ok;
+            auto arm_term_ok = check_term(arm.direct_term);
+            if (!arm_term_ok) return arm_term_ok;
+        }
         return check_guard_body(g.fail_body);
     };
     // The exprs pool holds every sub-expression the analysis materialized;
@@ -16588,6 +16605,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     }
 
     u32 timer_count = 0;
+    u32 http_route_count = 0;
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Route && item.kind != AstItemKind::Timer) continue;
@@ -17600,13 +17618,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
 
         if (route.is_timer) {
-            auto timer_ok = validate_timer_route(route, route_decl.body_span);
+            auto timer_ok = validate_timer_route(route, mod, route_decl.body_span);
             if (!timer_ok) return core::make_unexpected(timer_ok.error());
         }
         // Cap HTTP routes at kMaxRoutes even though the routes vector reserves extra
-        // slots for synthesized timers — a timer must never consume HTTP capacity.
-        if (!route.is_timer && mod.routes.len >= HirModule::kMaxRoutes)
+        // slots for synthesized timers — a timer must never consume HTTP capacity
+        // (and mod.routes.len counts both, so track HTTP routes separately).
+        if (!route.is_timer && http_route_count >= HirModule::kMaxRoutes)
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        if (!route.is_timer) http_route_count++;
         if (!mod.routes.push(route))
             return frontend_error(FrontendError::TooManyItems, route_decl.span);
     }

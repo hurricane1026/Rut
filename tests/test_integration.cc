@@ -1265,6 +1265,62 @@ TEST(timer_dsl, body_guard_else_path_executes) {
 }
 #endif  // RUT_ENABLE_JIT_TESTS
 
+// `guard match` fail arms live in mod.guard_match_arms; a `=> forward u` arm
+// must be rejected in a timer body like any other forward (PR #171 review).
+TEST(timer_dsl, rejects_guard_match_forward_in_body) {
+    using namespace rut;
+    const char* src =
+        "upstream api at \"10.0.0.1:8080\"\n"
+        "timer t, every: 1s { let failed = error(.timeout) guard match failed else { "
+        ".timeout => return forward(api) _ => return 500 } return 200 }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.len != 0);
+}
+
+#if RUT_ENABLE_WEBSOCKET
+// A websocket terminator needs a live client connection; MIR also skips
+// ws-terminate routes entirely, which would silently drop the timer
+// (PR #171 review).
+TEST(timer_dsl, rejects_websocket_terminate_in_body) {
+    using namespace rut;
+    const char* src =
+        "upstream ws at \"10.0.0.1:8080\"\n"
+        "timer t, every: 1s { return websocket(ws) { frame.forward() } }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+// A timer declared BEFORE HTTP routes must not consume HTTP-route capacity:
+// mod.routes holds both, so the cap has to count HTTP routes separately
+// (PR #171 review).
+TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
+    using namespace rut;
+    std::string src = "timer t, every: 1s { }\n";
+    for (int i = 0; i < 3; i++) src += "route GET \"/r" + std::to_string(i) + "\" { return 200 }\n";
+    auto lexed = lex(Str{src.c_str(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    // 1 timer + 3 HTTP routes all present.
+    CHECK_EQ(hir_owned->routes.len, 4u);
+}
+
 // Timers don't consume HTTP-route capacity: the routes vector is sized
 // kMaxRoutes + kMaxTimers, and analyze.cc caps HTTP routes at kMaxRoutes
 // independently of timers. A full-route-table boundary test isn't expressible in
