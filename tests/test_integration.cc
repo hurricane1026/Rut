@@ -10682,6 +10682,9 @@ TEST(websocket_e2e, passthrough_tunnel_iouring) {
 struct WsFrameEchoServer {
     i32 listen_fd = -1;
     u16 port = 0;
+    // Per-frame echo delay: holds each echo back so the gateway's c2u send /
+    // u2c receive interleave with later client frames (flake repro harness).
+    u32 echo_delay_us = 0;
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -10747,6 +10750,7 @@ struct WsFrameEchoServer {
                     rut::u32 hl =
                         rut::ws_write_header(out, h.opcode, true, false, key, h.payload_len);
                     for (rut::u64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
+                    if (s->echo_delay_us != 0) usleep(s->echo_delay_us);
                     (void)send_all(client,
                                    reinterpret_cast<char*>(out),
                                    hl + static_cast<rut::u32>(h.payload_len));
@@ -10915,6 +10919,104 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
             dump_ws_flake_evidence(loop, racc, rhave);
         }
         CHECK(got);
+        close(c);
+    }
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Interleaving sweep: PING is sent first and its echo is DELAYED by the
+// backend, so the gateway's c2u/u2c slots are busy when the split DROP+PONG
+// bytes arrive — the re-inspect-after-send paths get exercised under residue.
+// Sweeps every split point of the PING+DROP+PONG stream.
+TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    backend.echo_delay_us = 30000;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
+    lt.start();
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 stream[96];
+    u32 total = 0;
+    for (const char* msg : {"PING", "DROP", "PONG"}) {
+        u32 hl = ws_write_header(stream + total, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + total + hl, msg, 4);
+        ws_unmask(stream + total + hl, 4, kKey);
+        total += hl + 4;
+    }
+
+    for (u32 split = 1; split < total; split++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        const char kUpgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+        char buf[1024];
+        u32 n = recv_http_headers(c, buf, sizeof(buf));
+        REQUIRE(n > 0 && buf_contains(buf, n, "101", 3));
+
+        // Split the whole three-frame stream; the delayed PING echo lands
+        // while the later bytes are being inspected.
+        REQUIRE(send_all(c, reinterpret_cast<char*>(stream), split));
+        usleep(10000);
+        REQUIRE(send_all(c, reinterpret_cast<char*>(stream + split), total - split));
+
+        // Expect PING then PONG echoes.
+        u8 racc[512];
+        u32 rhave = 0;
+        u32 got_frames = 0;
+        bool ok = true;
+        for (int tries = 0; tries < 60 && got_frames < 2; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                const char* want = got_frames == 0 ? "PING" : "PONG";
+                ok = ok && h.payload_len == 4 && memcmp(racc + h.header_len, want, 4) == 0;
+                const u32 ftotal = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = ftotal; i < rhave; i++) racc[i - ftotal] = racc[i];
+                rhave -= ftotal;
+                got_frames++;
+                continue;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 5000);
+            if (m <= 0) break;
+            rhave += static_cast<u32>(m);
+        }
+        if (got_frames != 2 || !ok) {
+            fprintf(stderr,
+                    "[ws-flake] interleave split=%u/%u got %u/2 frames ok=%d\n",
+                    split,
+                    total,
+                    got_frames,
+                    ok ? 1 : 0);
+            dump_ws_flake_evidence(loop, racc, rhave);
+        }
+        CHECK(got_frames == 2);
+        CHECK(ok);
         close(c);
     }
 
