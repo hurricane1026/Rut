@@ -1477,6 +1477,696 @@ TEST(frontend, parse_return_response_status_only) {
     CHECK_EQ(hir_route.control.direct_term.status_code, 200);
 }
 
+TEST(frontend, parse_respond_status_with_body) {
+    const char* src = "route GET \"/x\" { respond 401, \"denied\" }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const AstStatement& stmt = *ast->items[0].route.statements[0];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::RespondStatus));
+    CHECK_EQ(stmt.status_code, 401u);
+    CHECK(stmt.has_response_body);
+    CHECK(stmt.response_body.eq(lit("denied")));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(term.status_code, 401);
+    CHECK(term.response_body.eq(lit("denied")));
+}
+
+TEST(frontend, respond_is_contextual_keyword_outside_statements) {
+    auto single = lex(lit("respond"));
+    REQUIRE(single);
+    REQUIRE_GE(single->tokens.len, 1u);
+    CHECK_EQ(static_cast<u8>(single->tokens[0].type), static_cast<u8>(TokenType::Ident));
+
+    const auto src = R"rut(
+struct Box { respond: i32 }
+func respond(value: i32) -> i32 => value
+func wrap(value: i32) -> i32 => respond(value)
+func tail() -> i32 { let respond = 1 respond }
+func use(box: Box) -> i32 => box.respond
+route GET "/x" {
+    let respond = respond(1)
+    let value = use(Box(respond: respond))
+    let wrapped = wrap(2)
+    let tailed = tail()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK(hir->routes[0].locals[0].name.eq(lit("respond")));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_in_conditional_match_pattern) {
+    const auto src = R"rut(
+func pat(ok: bool) -> bool { guard ok else { respond 401 } true }
+func outer(use: bool, ok: bool, flag: bool) -> i32 {
+    if use {
+        match flag {
+            pat(ok) => 1
+            _ => 2
+        }
+    } else {
+        3
+    }
+}
+route GET "/x" { let code = outer(false, false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_in_top_level_match_pattern) {
+    const auto src = R"rut(
+func pat(ok: bool) -> i32 { guard ok else { respond 401 } 1 }
+func outer(ok: bool, value: i32) -> i32 {
+    match value {
+        0 => 1
+        pat(ok) => 2
+        _ => 3
+    }
+}
+route GET "/x" { let code = outer(false, 0) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_guard_after_value_guard_continuation) {
+    const auto src = R"rut(
+func outer(use: bool, ok: bool) -> i32 {
+    guard use else { 2 }
+    guard ok else { respond 401 }
+    1
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_status_outside_http_range) {
+    const auto src = R"rut(
+func outer(ok: bool) -> i32 {
+    guard ok else { respond 700 }
+    1
+}
+route GET "/x" { let code = outer(false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::InvalidStatusCode));
+}
+
+TEST(frontend, analyze_function_guard_respond_injects_route_guard) {
+    const char* src =
+        "func require(ok: bool) -> i32 { guard ok else { respond 401, \"denied\" } 7 }\n"
+        "route GET \"/x\" { let code = require(req.http11) if code == 7 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    CHECK_EQ(hir->functions[0].respond_guards.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(route.guards[0].fail_kind), static_cast<u8>(HirGuard::FailKind::Term));
+    CHECK_EQ(static_cast<u8>(route.guards[0].fail_term.kind),
+             static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(route.guards[0].fail_term.status_code, 401);
+    CHECK(route.guards[0].fail_term.response_body.eq(lit("denied")));
+    REQUIRE_EQ(route.locals.len, 1u);
+    CHECK(route.locals[0].name.eq(lit("code")));
+}
+
+TEST(frontend, analyze_function_guard_respond_uses_call_site_span) {
+    const char* src =
+        "func require(ok: bool) -> i32 { guard ok else { respond 401 } 7 }\n"
+        "route GET \"/x\" { guard req.http11 else { return 400 } let code = require(req.http11) "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].respond_guards.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 2u);
+    REQUIRE_EQ(route.locals.len, 1u);
+    CHECK(route.guards[1].span.start > route.guards[0].span.start);
+    CHECK(route.guards[1].span.start > hir->functions[0].respond_guards[0].span.start);
+    CHECK(route.guards[1].span.start >= route.locals[0].span.start);
+    CHECK(route.guards[1].span.start <= route.locals[0].span.end);
+}
+
+TEST(frontend, analyze_function_guard_respond_rejects_conditional_context) {
+    const char* src =
+        "func require(ok: bool, use: bool) -> i32 { match use { true => { guard ok else { respond "
+        "401 } 1 } false => 2 } }\n"
+        "route GET \"/x\" { let code = require(false, false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_function_guard_respond_rejects_lazy_bool_context) {
+    const char* src =
+        "func reject(ok: bool) -> bool { guard ok else { respond 401 } true }\n"
+        "route GET \"/x\" { let ok = true || reject(false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, import_relative_file_refreshes_respond_guard_condition_shapes) {
+    const std::string dir = "/tmp/rut_import_respond_guard_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Box { value: i32 }\n";
+        out << "func require_box(box: Box) -> i32 {\n";
+        out << "    guard box.value == 7 else { respond 401 }\n";
+        out << "    7\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+struct Local { value: i32 }
+import "proto.rut"
+route GET "/x" {
+    let code = require_box(Box(value: 7))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    const HirFunction* imported_fn = nullptr;
+    for (u32 i = 0; i < hir->functions.len; i++) {
+        if (hir->functions[i].name.eq(lit("require_box"))) {
+            imported_fn = &hir->functions[i];
+            break;
+        }
+    }
+    REQUIRE(imported_fn != nullptr);
+    REQUIRE_EQ(imported_fn->respond_guards.len, 1u);
+    if (imported_fn->respond_guards[0].cond.shape_index != 0xffffffffu)
+        CHECK(imported_fn->respond_guards[0].cond.shape_index < hir->type_shapes.len);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
+TEST(frontend, analyze_rejects_protocol_dispatched_respond_capable_method) {
+    const auto src = R"rut(
+protocol Auth {
+    func code() -> i32
+}
+struct Box { value: i32 }
+Box impl Auth {
+    func code(self: Box) -> i32 {
+        guard false else { respond 401 }
+        self.value
+    }
+}
+func run<T: Auth>(x: T) -> i32 => x.code()
+route GET "/x" {
+    let code = run(Box(value: 7))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_or_receiver_rejects_fallible_respond_helper) {
+    const char* src =
+        "func maybe(ok: bool) -> i32 { guard ok else { respond 401 } if ok { 7 } else { nil } }\n"
+        "route GET \"/x\" { let code = maybe(req.http11).or(0) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_variant_method_probe_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+variant Wrap { some(i32), none }
+protocol Pick {
+    func some(value: str) -> i32
+}
+struct Box { value: str }
+Box impl Pick {
+    func some(self: Box, value: str) -> i32 => 7
+}
+func reject(ok: bool) -> str { guard ok else { respond 401 } "x" }
+route GET "/x" {
+    let Wrap = Box(value: "box")
+    let code = Wrap.some(reject(req.http11))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_or_receiver_probe_preserves_respond_capable_receiver_shape) {
+    const auto src = R"rut(
+protocol Fallback {
+    func or(alt: i32) -> i32
+}
+struct Box { value: i32 }
+Box impl Fallback {
+    func or(self: Box, alt: i32) -> i32 => self.value
+}
+func make(ok: bool) -> Box { guard ok else { respond 401 } Box(value: 7) }
+route GET "/x" {
+    let code = make(req.http11).or(2)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_method_receiver_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+protocol Access {
+    func id() -> i32
+}
+struct Box { value: i32 }
+Box impl Access {
+    func id(self: Box) -> i32 => self.value
+}
+func make(ok: bool) -> Box { guard ok else { respond 401 } Box(value: 7) }
+route GET "/x" {
+    let code = make(req.http11).id()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_default_protocol_method_receiver_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+protocol Access {
+    func id() -> i32 => 7
+}
+struct Box { value: i32 }
+Box impl Access {}
+func make(ok: bool) -> Box { guard ok else { respond 401 } Box(value: 7) }
+route GET "/x" {
+    let code = make(req.http11).id()
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_helper_wrapper_propagates_respond_guard) {
+    const char* src =
+        "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }\n"
+        "func outer(ok: bool) -> i32 { let value = inner(ok) value }\n"
+        "route GET \"/x\" { let code = outer(req.http11) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[0].respond_guards.len, 1u);
+    CHECK_EQ(hir->functions[1].respond_guards.len, 1u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_rejects_respond_helper_call_in_conditional_branch) {
+    const char* src =
+        "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }\n"
+        "func outer(use: bool, ok: bool) -> i32 { if use { inner(ok) } else { 2 } }\n"
+        "route GET \"/x\" { let code = outer(false, false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_block_let_in_conditional_branch) {
+    const auto src = R"rut(
+func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+func outer(use: bool, ok: bool) -> i32 {
+    match use {
+        true => { let value = inner(ok) value }
+        false => 2
+    }
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_in_conditional_if_condition) {
+    const auto src = R"rut(
+func inner(ok: bool) -> bool { guard ok else { respond 401 } true }
+func outer(use: bool, ok: bool) -> i32 {
+    if use {
+        if inner(ok) { 1 } else { 2 }
+    } else {
+        3
+    }
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_in_conditional_match_subject) {
+    const auto src = R"rut(
+func inner(ok: bool) -> bool { guard ok else { respond 401 } true }
+func outer(use: bool, ok: bool) -> i32 {
+    if use {
+        match inner(ok) {
+            true => 1
+            false => 2
+        }
+    } else {
+        3
+    }
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_respond_helper_in_match_arm_guard) {
+    const auto src = R"rut(
+func inner(ok: bool) -> bool { guard ok else { respond 401 } true }
+func outer(flag: bool, ok: bool) -> i32 {
+    match flag {
+        true if inner(ok) => 1
+        _ => 2
+    }
+}
+route GET "/x" { let code = outer(false, false) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_guard_let_respond_helper_initializer_injects_once) {
+    const auto src = R"rut(
+func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+func outer(ok: bool) -> i32 {
+    guard let value = inner(ok) else { respond 402 }
+    value
+}
+route GET "/x" { let code = outer(req.http11) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[1].respond_guards.len, 2u);
+}
+
+TEST(frontend, analyze_const_match_selected_arm_propagates_respond_helper) {
+    const auto src = R"rut(
+func inner(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+func outer(ok: bool) -> i32 {
+    match const true {
+        true => inner(ok)
+        _ => 2
+    }
+}
+route GET "/x" { let code = outer(req.http11) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[1].respond_guards.len, 1u);
+}
+
+TEST(frontend, analyze_rejects_respond_helper_with_fallible_body) {
+    const char* src =
+        "func require(ok: bool) -> i32 { guard ok else { respond 401 } error(7) }\n"
+        "route GET \"/x\" { let code = require(false) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_generic_struct_inference_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+struct Box<T> { value: T }
+func require(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+route GET "/x" {
+    let box = Box(value: require(req.http11))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_generic_struct_inference_rolls_back_respond_probe_exprs) {
+    const auto inferred_src = R"rut(
+struct Box<T> { value: T }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let box = Box(value: require(req.http11))
+    return 200
+}
+)rut";
+    const auto explicit_src = R"rut(
+struct Box<T> { value: T }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let box = Box<i32>(value: require(req.http11))
+    return 200
+}
+)rut";
+    auto inferred_lexed = lex(lit(inferred_src));
+    REQUIRE(inferred_lexed);
+    auto inferred_ast = parse_file_heap(inferred_lexed.value());
+    REQUIRE(inferred_ast);
+    auto inferred_hir = analyze_file_heap(inferred_ast.value());
+    REQUIRE(inferred_hir);
+    auto explicit_lexed = lex(lit(explicit_src));
+    REQUIRE(explicit_lexed);
+    auto explicit_ast = parse_file_heap(explicit_lexed.value());
+    REQUIRE(explicit_ast);
+    auto explicit_hir = analyze_file_heap(explicit_ast.value());
+    REQUIRE(explicit_hir);
+    REQUIRE_EQ(inferred_hir->routes.len, 1u);
+    REQUIRE_EQ(explicit_hir->routes.len, 1u);
+    CHECK_EQ(inferred_hir->routes[0].guards.len, explicit_hir->routes[0].guards.len);
+    CHECK_EQ(inferred_hir->routes[0].exprs.len, explicit_hir->routes[0].exprs.len);
+}
+
+TEST(frontend, analyze_generic_variant_inference_does_not_duplicate_respond_guard) {
+    const auto src = R"rut(
+variant Wrap<T> { some(T), none }
+func require(ok: bool) -> i32 { guard ok else { respond 401 } 7 }
+route GET "/x" {
+    let state = Wrap.some(require(req.http11))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    CHECK_EQ(hir->routes[0].guards.len, 1u);
+}
+
+TEST(frontend, analyze_generic_variant_inference_rolls_back_respond_probe_exprs) {
+    const auto inferred_src = R"rut(
+variant Wrap<T> { some(T), none }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let state = Wrap.some(require(req.http11))
+    return 200
+}
+)rut";
+    const auto explicit_src = R"rut(
+variant Wrap<T> { some(T), none }
+func require(ok: bool) -> i32 { guard ok == true else { respond 401 } 7 }
+route GET "/x" {
+    let state = Wrap<i32>.some(require(req.http11))
+    return 200
+}
+)rut";
+    auto inferred_lexed = lex(lit(inferred_src));
+    REQUIRE(inferred_lexed);
+    auto inferred_ast = parse_file_heap(inferred_lexed.value());
+    REQUIRE(inferred_ast);
+    auto inferred_hir = analyze_file_heap(inferred_ast.value());
+    REQUIRE(inferred_hir);
+    auto explicit_lexed = lex(lit(explicit_src));
+    REQUIRE(explicit_lexed);
+    auto explicit_ast = parse_file_heap(explicit_lexed.value());
+    REQUIRE(explicit_ast);
+    auto explicit_hir = analyze_file_heap(explicit_ast.value());
+    REQUIRE(explicit_hir);
+    REQUIRE_EQ(inferred_hir->routes.len, 1u);
+    REQUIRE_EQ(explicit_hir->routes.len, 1u);
+    CHECK_EQ(inferred_hir->routes[0].guards.len, explicit_hir->routes[0].guards.len);
+    CHECK_EQ(inferred_hir->routes[0].exprs.len, explicit_hir->routes[0].exprs.len);
+}
+
+TEST(frontend, analyze_nested_respond_calls_order_argument_guard_first) {
+    const char* src =
+        "func inner(ok: bool) -> i32 { guard ok else { respond 401 } 1 }\n"
+        "func outer(ok: bool, value: i32) -> i32 { guard ok else { respond 402 } value }\n"
+        "route GET \"/x\" { let code = outer(false, inner(false)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.guards.len, 2u);
+    CHECK_EQ(route.guards[0].fail_term.status_code, 401);
+    CHECK_EQ(route.guards[1].fail_term.status_code, 402);
+    CHECK(route.guards[0].span.start <= route.guards[1].span.start);
+}
+
 TEST(frontend, parse_return_response_with_body) {
     // Covers the body: "..." kwarg through the compile-side pipeline:
     // parser → AST.response_body, analyze → HirTerminator.response_body,
@@ -4141,6 +4831,29 @@ route {
     CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].cond.kind),
              static_cast<u8>(HirExprKind::IfElse));
+}
+
+TEST(frontend, analyze_rejects_chain_before_respond_capable_helper) {
+    const char* src = R"rut(
+func require_auth(_ req: i32) -> bool {
+    guard false else { respond 401 }
+    true
+}
+chain secure {
+    before require_auth(req) else 403
+}
+route GET "/users" use chain secure {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("require_auth")));
 }
 
 TEST(frontend, analyze_unused_chain_does_not_mark_callee_as_magic_request) {
@@ -19572,6 +20285,24 @@ route GET "/users" { return 200 }
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("guard match arms do not support if guards")));
 }
+TEST(frontend, parse_rejects_function_guard_match_arm_respond) {
+    const auto src = R"(
+func maybefail(ok: bool) -> i32 {
+    if ok { 200 } else { error(.timeout) }
+}
+func wrap(ok: bool) -> i32 {
+    let y = maybefail(ok)
+    guard match y else { .timeout => respond 401 _ => 500 }
+    200
+}
+route GET "/users" { return 200 }
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
 TEST(frontend, analyze_rejects_function_block_guard_match_without_wildcard) {
     const auto src = R"(
 func maybefail(ok: bool) -> i32 {
@@ -20255,6 +20986,34 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
+
+TEST(frontend, analyze_rejects_conditional_pipe_respond_capable_method_stage) {
+    const auto src = R"(
+protocol Ident { func id() -> i32 }
+struct Box { value: i32 }
+Box impl Ident {
+    func id(self: Box) -> i32 {
+        guard false else { respond 401 }
+        self.value
+    }
+}
+func maybeBox(ok: bool) -> Box {
+    if ok { Box(value: 200) } else { nil }
+}
+route GET "/users" {
+    let code = maybeBox(req.http11) | _.id()
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, source_pipe_placeholder_free_runtime_optional_lhs_flows_via_any) {
     const auto src = R"(
 func id(x: str) -> str => x
@@ -20278,6 +21037,28 @@ route GET "/users" {
     CHECK_FALSE(hir->routes[0].locals[1].may_nil);
     CHECK_FALSE(hir->routes[0].locals[1].may_error);
 }
+
+TEST(frontend, analyze_rejects_conditional_pipe_respond_capable_stage_argument) {
+    const auto src = R"(
+func reject(ok: bool) -> i32 {
+    guard ok else { respond 401 }
+    1
+}
+func pass(x: str, code: i32) -> str => x
+route GET "/users" {
+    let host = req.header("Host") | pass(_, reject(false))
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
 TEST(frontend, source_pipe_method_stage_reuses_analyzed_lhs_receiver) {
     const auto src = R"(
 struct Box { value: i32 }

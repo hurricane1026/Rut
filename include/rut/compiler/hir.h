@@ -481,6 +481,20 @@ struct HirFunction {
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
     FixedVec<ParamDecl, kMaxParams> params;
     FixedVec<HirExpr, kMaxExprs> exprs;
+    struct RespondHeader {
+        Str key{};
+        Str value{};
+    };
+    struct RespondGuard {
+        Span span{};
+        HirExpr cond{};
+        i32 status_code = 0;
+        Str response_body{};
+        static constexpr u32 kMaxHeaders = 16;
+        FixedVec<RespondHeader, kMaxHeaders> response_headers;
+    };
+    static constexpr u32 kMaxRespondGuards = 4;
+    FixedVec<RespondGuard, kMaxRespondGuards> respond_guards;
     HirExpr body{};
 
     HirFunction() = default;
@@ -500,6 +514,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
@@ -536,6 +551,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
         return *this;
@@ -556,6 +572,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
@@ -592,6 +609,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
         return *this;
@@ -618,8 +636,13 @@ private:
         }
     }
 
+    void rebase_respond_guard(RespondGuard& guard, const HirFunction& other) {
+        rebase_expr(guard.cond, other);
+    }
+
     void rebase_from(const HirFunction& other) {
         for (u32 i = 0; i < exprs.len; i++) rebase_expr(exprs[i], other);
+        for (u32 i = 0; i < respond_guards.len; i++) rebase_respond_guard(respond_guards[i], other);
         rebase_expr(body, other);
     }
 };
@@ -1003,6 +1026,7 @@ struct HirRoute {
     FixedVec<Wait, kMaxWaits> waits;
     FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
+    bool allow_respond_effects = false;
     u32 error_variant_index = 0xffffffffu;
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
     // Flows to the RIR Function and on to RouteConfig rate-limit setup.
@@ -1035,6 +1059,7 @@ struct HirRoute {
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
+          allow_respond_effects(other.allow_respond_effects),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
@@ -1057,6 +1082,7 @@ struct HirRoute {
         waits = other.waits;
         for_loops = other.for_loops;
         control = other.control;
+        allow_respond_effects = other.allow_respond_effects;
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
@@ -1079,6 +1105,7 @@ struct HirRoute {
           waits(other.waits),
           for_loops(other.for_loops),
           control(other.control),
+          allow_respond_effects(other.allow_respond_effects),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
@@ -1101,6 +1128,7 @@ struct HirRoute {
         waits = other.waits;
         for_loops = other.for_loops;
         control = other.control;
+        allow_respond_effects = other.allow_respond_effects;
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;

@@ -270,6 +270,8 @@ struct Parser {
                 auto arm_stmt = parse_func_body_stmt();
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
+                if (arm_stmt->kind == AstStmtKind::RespondStatus)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm_stmt->span);
                 auto arm_ptr = alloc_stmt(arm_stmt.value());
                 if (!arm_ptr) return core::make_unexpected(arm_ptr.error());
                 arm.stmt = arm_ptr.value();
@@ -1128,6 +1130,7 @@ struct Parser {
                     arm_body_stops_cross_line_dot = saved_dot_stop;
                     if (!arm_stmt) return core::make_unexpected(arm_stmt.error());
                     if (arm_stmt->kind != AstStmtKind::ReturnStatus &&
+                        arm_stmt->kind != AstStmtKind::RespondStatus &&
                         arm_stmt->kind != AstStmtKind::ForwardUpstream) {
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                     }
@@ -1151,6 +1154,39 @@ struct Parser {
                 if (!else_ptr) return core::make_unexpected(else_ptr.error());
                 stmt.else_stmt = else_ptr.value();
                 stmt.span = Span{start.start, else_stmt->span.end, start.line, start.col};
+            }
+            return stmt;
+        }
+        if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
+            peek().type == TokenType::IntLit) {
+            pos++;
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::RespondStatus;
+
+            auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
+                i32 value = 0;
+                for (u32 i = 0; i < tok.text.len; i++) {
+                    const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
+                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(tok), tok.text);
+                    value = value * 10 + static_cast<i32>(digit);
+                }
+                return value;
+            };
+
+            auto status = expect(TokenType::IntLit);
+            if (!status) return core::make_unexpected(status.error());
+            auto parsed = parse_status_i32(*status.value());
+            if (!parsed) return core::make_unexpected(parsed.error());
+            stmt.status_code = parsed.value();
+            stmt.span = Span{start.start, status.value()->end, start.line, start.col};
+            if (take(TokenType::Comma)) {
+                auto body_tok = expect(TokenType::StringLit);
+                if (!body_tok) return core::make_unexpected(body_tok.error());
+                stmt.response_body = body_tok.value()->text;
+                stmt.has_response_body = true;
+                stmt.span.end = body_tok.value()->end;
             }
             return stmt;
         }
@@ -2025,6 +2061,10 @@ struct Parser {
     FrontendResult<AstStatement> parse_func_body_stmt() {
         if (take(TokenType::KwGuard)) {
             return parse_func_guard_stmt(prev());
+        }
+        if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
+            peek().type == TokenType::IntLit) {
+            return parse_stmt();
         }
         if (take(TokenType::KwIf)) {
             // `if let name = expr { ... } else { ... }` — value-binding form,

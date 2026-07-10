@@ -26,6 +26,7 @@ enum class AstStmtKind : u8 {
     Let,
     Guard,
     ReturnStatus,
+    RespondStatus,
     ForwardUpstream,
     // `websocket(<upstream>) { <frame-handler> }` — terminate mode (vs the bare
     // `websocket(x)` passthrough, which stays ForwardUpstream). `name` = upstream

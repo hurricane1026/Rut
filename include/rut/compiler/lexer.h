@@ -37,6 +37,7 @@ enum class TokenType : u8 {
     KwFor,
     KwIn,
     KwReturn,
+    KwRespond,
     KwUpstream,
     KwDownstream,
     KwListen,
