@@ -1067,16 +1067,33 @@ struct LoopThread {
     RealLoop* loop;
     pthread_t thread;
     i32 max_iters;
+    // When set, the max_iters hang-guard only takes effect after this many
+    // wall-clock milliseconds. An LT-ready fd (e.g. an idle EPOLLOUT
+    // registration) can make backend.wait return immediately every call and
+    // burn max_iters in milliseconds, killing the loop under the test's feet
+    // mid-scenario — the WS terminate CI flake family. Tests whose client
+    // drives a multi-round-trip conversation should set this to cover the
+    // whole conversation; stop() remains the normal exit.
+    i64 min_run_ms = 0;
+    static i64 mono_ms() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+    }
     static void* run(void* arg) {
         auto* lt = static_cast<LoopThread*>(arg);
         auto* lp = lt->loop;
         lp->backend.add_accept();
         IoEvent events[256];
         i32 iters = 0;
+        const i64 deadline = lt->min_run_ms > 0 ? mono_ms() + lt->min_run_ms : 0;
         while (lp->is_running()) {
             u32 n = lp->backend.wait(events, 256, lp->conns, RealLoop::kMaxConns);
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
-            if (++iters >= lt->max_iters) break;
+            if (++iters >= lt->max_iters) {
+                if (deadline == 0 || mono_ms() >= deadline) break;
+                iters = 0;  // event storm burned the cap early; keep serving
+            }
         }
         return nullptr;
     }
