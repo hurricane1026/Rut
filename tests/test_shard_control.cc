@@ -224,6 +224,25 @@ TEST_F(ShardF, init_wiring) {
     CHECK(self.shard.loop->jit_code_ptr == &self.shard.jit_code);
 }
 
+// The checked reload API refuses a config whose shard-pinned timer can never
+// fire with this process's shard count (same fail-fast main.cc applies to the
+// startup config) — hot-reload callers cannot skip the validation.
+TEST(shard_control, reload_config_refuses_out_of_range_timer_shard) {
+    using namespace rut;
+    static RouteConfig cfg{};
+    REQUIRE(cfg.add_timer(
+        "t",
+        1,
+        /*interval_ms=*/1000,
+        [](void*, jit::HandlerCtx*, const u8*, u32, void*) -> u64 { return 0; },
+        /*shard=*/5));
+    Shard<EpollEventLoop> shard{};
+    CHECK(!shard.reload_config(&cfg, /*shard_count=*/2));  // dead pin refused
+    CHECK(shard.active_config == nullptr);                 // nothing installed
+    CHECK(shard.reload_config(&cfg, /*shard_count=*/8));   // in range: installs
+    CHECK(shard.active_config == &cfg);
+}
+
 TEST(shard_control, shard_reload_config) {
     // Spawn a real shard, send ReloadConfig, verify active_config changes.
     auto lfd_result = create_listen_socket(0);
@@ -245,7 +264,7 @@ TEST(shard_control, shard_reload_config) {
     auto* cfg = new (cfg_mem) RouteConfig();
     cfg->route_count = 99;
 
-    shard.reload_config(cfg);
+    shard.reload_config_unchecked(cfg);
 
     // Give the shard thread time to process the command.
     // Poll until active_config is updated or timeout after ~100ms.
@@ -515,7 +534,7 @@ TEST(shard_control, command_processed_within_timer_tick) {
     auto* cfg = new (cfg_mem) RouteConfig();
     cfg->route_count = 123;
 
-    shard.reload_config(cfg);
+    shard.reload_config_unchecked(cfg);
 
     // Sleep 1.5s — shard processes on next timer tick (~1s interval).
     struct timespec ts = {1, 500000000L};
@@ -566,7 +585,7 @@ TEST_F(RealLoopF, poll_command_without_jit_ptr) {
 TEST_F(ShardF, reload_before_spawn_applies_directly) {
     REQUIRE(self.ok);
     RouteConfig cfg;
-    self.shard.reload_config(&cfg);
+    self.shard.reload_config_unchecked(&cfg);
     CHECK_EQ(self.shard.active_config, &cfg);
 }
 
@@ -591,7 +610,7 @@ TEST(shard_control, reload_after_stop_applies_directly) {
     s.join();
 
     RouteConfig cfg;
-    s.reload_config(&cfg);  // must not hang
+    s.reload_config_unchecked(&cfg);  // must not hang
     CHECK_EQ(s.active_config, &cfg);
 
     s.shutdown();
@@ -648,7 +667,7 @@ TEST(shard_control, reload_after_stop_before_join) {
 
     RouteConfig new_cfg;
     new_cfg.route_count = 99;
-    s.reload_config(&new_cfg);  // must not deadlock
+    s.reload_config_unchecked(&new_cfg);  // must not deadlock
 
     s.join();
 
@@ -674,13 +693,13 @@ TEST(shard_control, join_clears_stale_pending_without_overwrite) {
 
     RouteConfig old_cfg;
     old_cfg.route_count = 77;
-    s.reload_config(&old_cfg);  // queue via control block (thread_spawned=true)
+    s.reload_config_unchecked(&old_cfg);  // queue via control block (thread_spawned=true)
     s.stop();
 
     // thread_spawned is still true, so this overwrites old_cfg in pending_config.
     RouteConfig new_cfg;
     new_cfg.route_count = 99;
-    s.reload_config(&new_cfg);
+    s.reload_config_unchecked(&new_cfg);
 
     s.join();  // applies whatever is pending (new_cfg, since it overwrote old_cfg)
 
@@ -710,7 +729,7 @@ TEST_F(ShardF, reload_before_spawn_drains_idle_pool) {
     CHECK_EQ(self.shard.upstream->idle_count, 1u);
 
     RouteConfig cfg;
-    self.shard.reload_config(&cfg);  // not-running direct-apply path
+    self.shard.reload_config_unchecked(&cfg);  // not-running direct-apply path
     CHECK_EQ(self.shard.active_config, &cfg);
     CHECK_EQ(self.shard.upstream->idle_count, 0u);  // drained (fd closed by drain())
 }
@@ -764,7 +783,7 @@ TEST(shard_control, reload_after_join_drains_idle_pool) {
 
     RouteConfig cfg;
     cfg.route_count = 7;
-    s.reload_config(&cfg);  // direct apply (not running)
+    s.reload_config_unchecked(&cfg);  // direct apply (not running)
     CHECK_EQ(s.active_config, &cfg);
     CHECK_EQ(s.upstream->idle_count, 0u);  // drained
 
@@ -796,7 +815,7 @@ TEST(shard_control, join_applies_pending_reload_drains_idle_pool) {
 
     RouteConfig new_cfg;
     new_cfg.route_count = 99;
-    s.reload_config(&new_cfg);  // thread_spawned still true → queues to pending_config
+    s.reload_config_unchecked(&new_cfg);  // thread_spawned still true → queues to pending_config
 
     s.join();  // applies new_cfg AND drains the pool
     CHECK_EQ(s.active_config, &new_cfg);
@@ -1005,7 +1024,7 @@ TEST(shard_control, reload_after_join_applies_directly) {
     // After join, thread_spawned=false. reload should apply directly.
     RouteConfig cfg;
     cfg.route_count = 88;
-    s.reload_config(&cfg);
+    s.reload_config_unchecked(&cfg);
     CHECK_EQ(s.active_config, &cfg);
 
     s.shutdown();
@@ -1054,7 +1073,7 @@ TEST(shard_control, real_shard_simultaneous_config_and_jit) {
     i32 fake_jit = 99;
 
     // Fire both simultaneously.
-    shard.reload_config(cfg);
+    shard.reload_config_unchecked(cfg);
     shard.swap_jit(&fake_jit);
 
     // Poll until both applied (up to 2s).

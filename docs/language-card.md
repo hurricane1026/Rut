@@ -29,7 +29,8 @@ let limits = Counter<IP>(capacity: 100000, window: 1m)   // state (per-shard)
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
-timer cleanup, every: 1m { ... }  // background tasks
+timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no req/forward/wait)
+timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
 init { ... }    shutdown { ... }  // lifecycle hooks
 route { ... }                     // exactly one route block
 ```

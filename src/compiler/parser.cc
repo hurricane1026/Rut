@@ -3338,6 +3338,24 @@ struct Parser {
         if (kInterval == 0)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*dur.value()), dur.value()->text);
+        // Optional `, shard: N` selector — pin the timer to one shard.
+        if (take(TokenType::Comma)) {
+            auto shard_kw = expect(TokenType::Ident);
+            if (!shard_kw || !shard_kw.value()->text.eq({"shard", 5}))
+                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+            if (!expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+            auto shard_lit = expect(TokenType::IntLit);
+            if (!shard_lit) return core::make_unexpected(shard_lit.error());
+            i64 shard_value = 0;
+            for (u32 ci = 0; ci < shard_lit.value()->text.len && shard_value <= 0xffff; ci++)
+                shard_value = shard_value * 10 + (shard_lit.value()->text.ptr[ci] - '0');
+            if (shard_value > 0xffff)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*shard_lit.value()),
+                                      shard_lit.value()->text);
+            item.timer.shard = static_cast<i32>(shard_value);
+        }
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
