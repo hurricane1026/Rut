@@ -13161,6 +13161,193 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
     return for_index;
 }
 
+// ── Timer body validation ────────────────────────────────────────────────
+// Timers run outside any request/connection, so a timer body must not read
+// the request, forward, or wait (the timer invocation carries no Connection
+// to yield/resume on). The body is analyzed by the shared route path, then
+// rejected here if any request-coupled construct survived.
+constexpr Str kTimerReqDetail = lit_str(
+    "timers run outside a request; req access and forward are not available "
+    "in a timer body");
+constexpr Str kTimerWaitDetail = lit_str(
+    "timers cannot wait yet (no connection to resume on); waits in timer "
+    "bodies are pending");
+
+static bool hir_expr_uses_request(const HirExpr& e) {
+    switch (e.kind) {
+        case HirExprKind::ReqHeader:
+        case HirExprKind::ReqParam:
+        case HirExprKind::ReqCookie:
+        case HirExprKind::ReqQuery:
+        case HirExprKind::ReqQueryString:
+        case HirExprKind::ReqPath:
+        case HirExprKind::ReqPathOnly:
+        case HirExprKind::ReqBody:
+        case HirExprKind::ReqKeepAlive:
+        case HirExprKind::ReqChunked:
+        case HirExprKind::ReqHasContentLength:
+        case HirExprKind::ReqHttp10:
+        case HirExprKind::ReqHttp11:
+        case HirExprKind::ReqHttpVersion:
+        case HirExprKind::ReqContentLength:
+        case HirExprKind::ReqRemoteAddr:
+        case HirExprKind::ReqMethod:
+            return true;
+        default:
+            break;
+    }
+    if (e.lhs != nullptr && hir_expr_uses_request(*e.lhs)) return true;
+    if (e.rhs != nullptr && hir_expr_uses_request(*e.rhs)) return true;
+    for (u32 i = 0; i < e.args.len; i++) {
+        if (e.args[i] != nullptr && hir_expr_uses_request(*e.args[i])) return true;
+    }
+    for (u32 i = 0; i < e.field_inits.len; i++) {
+        if (e.field_inits[i].value != nullptr && hir_expr_uses_request(*e.field_inits[i].value))
+            return true;
+    }
+    return false;
+}
+
+static FrontendResult<void> validate_timer_route(const HirRoute& route, Span body_span) {
+    if (route.waits.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerWaitDetail);
+    auto check_expr = [&](const HirExpr& e) -> FrontendResult<void> {
+        if (hir_expr_uses_request(e))
+            return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
+        return {};
+    };
+    auto check_term = [&](const HirTerminator& t) -> FrontendResult<void> {
+        if (t.kind == HirTerminatorKind::ForwardUpstream)
+            return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
+        return {};
+    };
+    auto check_guard_body = [&](const HirGuardBody& body) -> FrontendResult<void> {
+        for (u32 li = 0; li < body.locals.len; li++) {
+            auto ok = check_expr(body.locals[li].init);
+            if (!ok) return ok;
+        }
+        auto cond_ok = check_expr(body.cond);
+        if (!cond_ok) return cond_ok;
+        auto then_ok = check_term(body.then_term);
+        if (!then_ok) return then_ok;
+        auto else_ok = check_term(body.else_term);
+        if (!else_ok) return else_ok;
+        return check_term(body.direct_term);
+    };
+    auto check_guard = [&](const HirGuard& g) -> FrontendResult<void> {
+        auto cond_ok = check_expr(g.cond);
+        if (!cond_ok) return cond_ok;
+        auto match_ok = check_expr(g.fail_match_expr);
+        if (!match_ok) return match_ok;
+        auto term_ok = check_term(g.fail_term);
+        if (!term_ok) return term_ok;
+        return check_guard_body(g.fail_body);
+    };
+    // The exprs pool holds every sub-expression the analysis materialized;
+    // the inline top-level exprs (local inits, guard conds, match arms) are
+    // walked explicitly on top of it.
+    for (u32 i = 0; i < route.exprs.len; i++) {
+        auto ok = check_expr(route.exprs[i]);
+        if (!ok) return ok;
+    }
+    for (u32 i = 0; i < route.locals.len; i++) {
+        auto ok = check_expr(route.locals[i].init);
+        if (!ok) return ok;
+    }
+    for (u32 i = 0; i < route.guards.len; i++) {
+        auto ok = check_guard(route.guards[i]);
+        if (!ok) return ok;
+    }
+    const auto& control = route.control;
+    {
+        auto cond_ok = check_expr(control.cond);
+        if (!cond_ok) return cond_ok;
+        auto match_ok = check_expr(control.match_expr);
+        if (!match_ok) return match_ok;
+        auto then_ok = check_term(control.then_term);
+        if (!then_ok) return then_ok;
+        auto else_ok = check_term(control.else_term);
+        if (!else_ok) return else_ok;
+        auto direct_ok = check_term(control.direct_term);
+        if (!direct_ok) return direct_ok;
+    }
+    for (u32 ai = 0; ai < control.match_arms.len; ai++) {
+        const auto& arm = control.match_arms[ai];
+        auto pattern_ok = check_expr(arm.pattern);
+        if (!pattern_ok) return pattern_ok;
+        auto guard_ok = check_expr(arm.arm_guard);
+        if (!guard_ok) return guard_ok;
+        auto cond_ok = check_expr(arm.cond);
+        if (!cond_ok) return cond_ok;
+        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+            auto g_ok = check_guard(arm.guards[gi]);
+            if (!g_ok) return g_ok;
+        }
+        auto then_ok = check_term(arm.then_term);
+        if (!then_ok) return then_ok;
+        auto else_ok = check_term(arm.else_term);
+        if (!else_ok) return else_ok;
+        auto direct_ok = check_term(arm.direct_term);
+        if (!direct_ok) return direct_ok;
+    }
+    auto check_for_arm = [&](const HirForLoopMatchArm& arm) -> FrontendResult<void> {
+        auto pattern_ok = check_expr(arm.pattern);
+        if (!pattern_ok) return pattern_ok;
+        auto guard_ok = check_expr(arm.arm_guard);
+        if (!guard_ok) return guard_ok;
+        auto cond_ok = check_expr(arm.cond);
+        if (!cond_ok) return cond_ok;
+        for (u32 li = 0; li < arm.locals.len; li++) {
+            auto l_ok = check_expr(arm.locals[li].init);
+            if (!l_ok) return l_ok;
+        }
+        for (u32 gi = 0; gi < arm.guards.len; gi++) {
+            auto g_ok = check_guard(arm.guards[gi]);
+            if (!g_ok) return g_ok;
+        }
+        auto then_ok = check_term(arm.then_term);
+        if (!then_ok) return then_ok;
+        auto else_ok = check_term(arm.else_term);
+        if (!else_ok) return else_ok;
+        return check_term(arm.direct_term);
+    };
+    for (u32 fi = 0; fi < route.for_loops.len; fi++) {
+        const auto& loop = route.for_loops[fi];
+        auto iter_ok = check_expr(loop.iter_expr);
+        if (!iter_ok) return iter_ok;
+        const auto& body = loop.body;
+        for (u32 li = 0; li < body.locals.len; li++) {
+            auto l_ok = check_expr(body.locals[li].init);
+            if (!l_ok) return l_ok;
+        }
+        for (u32 gi = 0; gi < body.guards.len; gi++) {
+            auto g_ok = check_guard(body.guards[gi]);
+            if (!g_ok) return g_ok;
+        }
+        for (u32 ii = 0; ii < body.ifs.len; ii++) {
+            auto c_ok = check_expr(body.ifs[ii].cond);
+            if (!c_ok) return c_ok;
+            auto t_ok = check_term(body.ifs[ii].then_term);
+            if (!t_ok) return t_ok;
+            auto e_ok = check_term(body.ifs[ii].else_term);
+            if (!e_ok) return e_ok;
+        }
+        for (u32 mi = 0; mi < body.matches.len; mi++) {
+            auto m_ok = check_expr(body.matches[mi].match_expr);
+            if (!m_ok) return m_ok;
+            for (u32 ai = 0; ai < body.matches[mi].arms.len; ai++) {
+                auto a_ok = check_for_arm(body.matches[mi].arms[ai]);
+                if (!a_ok) return a_ok;
+            }
+        }
+        if (body.has_term) {
+            auto t_ok = check_term(body.term);
+            if (!t_ok) return t_ok;
+        }
+    }
+    return {};
+}
+
 static FrontendResult<HirModule*> analyze_file_internal(
     const AstFile& file,
     Str source_path,
@@ -16400,16 +16587,60 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
     }
 
+    u32 timer_count = 0;
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
-        if (item.kind != AstItemKind::Route) continue;
+        if (item.kind != AstItemKind::Route && item.kind != AstItemKind::Timer) continue;
+        const bool is_timer_item = item.kind == AstItemKind::Timer;
+        // A timer body analyzes exactly like a route body (same statement
+        // surface, same lowering to a JIT handler) — normalize the timer decl
+        // into a route-decl view so the shared analysis below has one shape.
+        // Timers run outside any request, so request access / forward / wait
+        // are rejected after analysis (validate_timer_route). Bound the timer
+        // count here (deterministic DSL capacity error) rather than letting
+        // RouteConfig::add_timer reject the surplus at load time.
+        AstRouteDecl timer_route_view{};
+        if (is_timer_item) {
+            if (timer_count >= HirModule::kMaxTimers)
+                return frontend_error(FrontendError::TooManyItems, item.timer.span);
+            timer_count++;
+            timer_route_view.span = item.timer.span;
+            timer_route_view.body_span = item.timer.body_span;
+            timer_route_view.path = item.timer.name;  // timer name (not an HTTP path)
+            timer_route_view.method = static_cast<u8>(TokenType::KwGet);
+            for (u32 si = 0; si < item.timer.statements.len; si++) {
+                if (!timer_route_view.statements.push(item.timer.statements[si]))
+                    return frontend_error(FrontendError::TooManyItems, item.timer.span);
+            }
+        }
+        // An empty timer body keeps the slice-1 no-op shape: a handler that
+        // returns 200 (the timer path ignores the status). Non-empty bodies
+        // must end in an explicit terminal statement, like a route body.
+        if (is_timer_item && item.timer.statements.len == 0) {
+            HirRoute route{};
+            route.span = item.timer.span;
+            route.path = item.timer.name;
+            route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
+            route.is_timer = true;
+            route.timer_interval_ms = item.timer.interval_ms;
+            route.control.kind = HirControlKind::Direct;
+            route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
+            route.control.direct_term.source_kind = HirTerminatorSourceKind::Literal;
+            route.control.direct_term.status_code = 200;
+            if (!mod.routes.push(route))
+                return frontend_error(FrontendError::TooManyItems, item.timer.span);
+            continue;
+        }
+        const AstRouteDecl& route_decl = is_timer_item ? timer_route_view : item.route;
 
         HirRoute route{};
-        route.span = item.route.span;
-        route.path = item.route.path;
-        route.method = route_method_key_from_token(item.route.method);
+        route.span = route_decl.span;
+        route.path = route_decl.path;
+        route.method = route_method_key_from_token(route_decl.method);
         if (route.method == 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+            return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
+        route.is_timer = is_timer_item;
+        if (is_timer_item) route.timer_interval_ms = item.timer.interval_ms;
 
         auto analyze_chain_step_arg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
             if (arg.kind == AstExprKind::Ident && arg.name.eq({"req", 3})) {
@@ -16473,8 +16704,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return {};
         };
 
-        for (u32 ci = 0; ci < item.route.chains.len; ci++) {
-            const auto& chain_use = item.route.chains[ci];
+        for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
+            const auto& chain_use = route_decl.chains[ci];
             const AstChainDecl* chain = find_chain_decl(file, chain_use.name);
             if (chain == nullptr)
                 return frontend_error(
@@ -16525,8 +16756,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
-        for (u32 si = 0; si < item.route.statements.len; si++) {
-            const AstStatement& stmt = *item.route.statements[si];
+        for (u32 si = 0; si < route_decl.statements.len; si++) {
+            const AstStatement& stmt = *route_decl.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {
                 if (seen_for)
                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -16583,8 +16814,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 };
                 auto can_be_used_for_iter =
                     [&](const auto& self, const Str& target_name, u32 start_idx) -> bool {
-                    for (u32 fi = start_idx; fi < item.route.statements.len; fi++) {
-                        const AstStatement& future = *item.route.statements[fi];
+                    for (u32 fi = start_idx; fi < route_decl.statements.len; fi++) {
+                        const AstStatement& future = *route_decl.statements[fi];
                         if (stmt_uses_iter(stmt_uses_iter, future, target_name)) return true;
                         if (future.kind == AstStmtKind::Let &&
                             future.expr.kind == AstExprKind::Ident &&
@@ -16688,7 +16919,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 continue;
             }
             if (stmt.kind == AstStmtKind::Guard) {
-                if (si + 1 >= item.route.statements.len)
+                if (si + 1 >= route_decl.statements.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 HirGuard guard{};
                 guard.span = stmt.span;
@@ -16796,9 +17027,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto wait_any = analyze_wait_any_stmt_control(stmt, route, mod);
                 if (!wait_any) return core::make_unexpected(wait_any.error());
                 seen_wait = true;
-                if (si + 1 != item.route.statements.len)
+                if (si + 1 != route_decl.statements.len)
                     return frontend_error(FrontendError::UnsupportedSyntax,
-                                          item.route.statements[si + 1]->span);
+                                          route_decl.statements[si + 1]->span);
                 break;
             }
             if (stmt.kind == AstStmtKind::For) {
@@ -16813,9 +17044,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             auto control = analyze_control_stmt(stmt, &route, mod, nullptr);
             if (!control) return core::make_unexpected(control.error());
-            if (si + 1 != item.route.statements.len)
+            if (si + 1 != route_decl.statements.len)
                 return frontend_error(FrontendError::UnsupportedSyntax,
-                                      item.route.statements[si + 1]->span);
+                                      route_decl.statements[si + 1]->span);
             break;
         }
 
@@ -16823,7 +17054,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // direct_term is expected — don't flag it as a missing terminator.
         if (!route.is_ws_terminate && route.control.kind == HirControlKind::Direct &&
             route.control.direct_term.span.end == 0 && route.control.direct_term.span.start == 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+            return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
 
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> named_error_cases;
         for (u32 li = 0; li < route.locals.len; li++) {
@@ -16978,16 +17209,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (named_error_cases.len != 0) {
             HirVariant error_variant{};
-            error_variant.span = item.route.span;
+            error_variant.span = route_decl.span;
             error_variant.name = {"__error_route", 13};
             for (u32 ci = 0; ci < named_error_cases.len; ci++) {
                 HirVariant::CaseDecl case_decl{};
                 case_decl.name = named_error_cases[ci].name;
                 if (!error_variant.cases.push(case_decl))
-                    return frontend_error(FrontendError::TooManyItems, item.route.span);
+                    return frontend_error(FrontendError::TooManyItems, route_decl.span);
             }
             if (!mod.variants.push(error_variant))
-                return frontend_error(FrontendError::TooManyItems, item.route.span);
+                return frontend_error(FrontendError::TooManyItems, route_decl.span);
             route.error_variant_index = mod.variants.len - 1;
             for (u32 li = 0; li < route.locals.len; li++) {
                 patch_named_error_variant(
@@ -17218,8 +17449,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // local's runtime value (HirTerminatorSourceKind::LocalRef).
         const u32 user_local_count_before_decorators = route.locals.len;
         const u32 first_decorator_guard_index = route.guards.len;
-        for (u32 di = 0; di < item.route.decorators.len; di++) {
-            const auto& ast_deco = item.route.decorators[di];
+        for (u32 di = 0; di < route_decl.decorators.len; di++) {
+            const auto& ast_deco = route_decl.decorators[di];
             // Official built-in decorators are recognized here and lowered to
             // route metadata, not resolved to user functions. @rateLimit sets
             // the per-route fixed-window limit (enforced in the runtime).
@@ -17345,7 +17576,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 }
             }
             if (route.control.kind != HirControlKind::Direct || route.for_loops.len != 0) {
-                return frontend_error(FrontendError::UnsupportedSyntax, item.route.span);
+                return frontend_error(FrontendError::UnsupportedSyntax, route_decl.span);
             }
             for (u32 gi = route.decorator_guard_count; gi < route.guards.len; gi++) {
                 const HirGuard& guard = route.guards[gi];
@@ -17368,43 +17599,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
 
+        if (route.is_timer) {
+            auto timer_ok = validate_timer_route(route, route_decl.body_span);
+            if (!timer_ok) return core::make_unexpected(timer_ok.error());
+        }
         // Cap HTTP routes at kMaxRoutes even though the routes vector reserves extra
         // slots for synthesized timers — a timer must never consume HTTP capacity.
-        if (mod.routes.len >= HirModule::kMaxRoutes)
-            return frontend_error(FrontendError::TooManyItems, item.route.span);
+        if (!route.is_timer && mod.routes.len >= HirModule::kMaxRoutes)
+            return frontend_error(FrontendError::TooManyItems, route_decl.span);
         if (!mod.routes.push(route))
-            return frontend_error(FrontendError::TooManyItems, item.route.span);
-    }
-
-    // Timers: `timer name, every: D { body }`. A timer compiles to a handler the
-    // shard event loop fires periodically (registered into RouteConfig.timers[],
-    // not routes[]). Slice 1 emits a no-op handler (returns 200, which the timer
-    // path ignores); executing the body needs the route-body analysis factored
-    // out, so a non-empty body is rejected for now rather than silently dropped.
-    u32 timer_count = 0;
-    for (u32 i = 0; i < file.items.len; i++) {
-        const auto& item = file.items[i];
-        if (item.kind != AstItemKind::Timer) continue;
-        if (item.timer.statement_count != 0)
-            return frontend_error(FrontendError::UnsupportedSyntax, item.timer.body_span);
-        // Bound the timer count in the frontend (deterministic DSL capacity error)
-        // rather than letting RouteConfig::add_timer reject the surplus at load time
-        // (a generic runtime failure). kMaxTimers mirrors RouteConfig::kMaxTimers.
-        if (timer_count >= HirModule::kMaxTimers)
-            return frontend_error(FrontendError::TooManyItems, item.timer.span);
-        timer_count++;
-        HirRoute route{};
-        route.span = item.timer.span;
-        route.path = item.timer.name;  // timer name (not an HTTP path)
-        route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
-        route.is_timer = true;
-        route.timer_interval_ms = item.timer.interval_ms;
-        route.control.kind = HirControlKind::Direct;
-        route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
-        route.control.direct_term.source_kind = HirTerminatorSourceKind::Literal;
-        route.control.direct_term.status_code = 200;
-        if (!mod.routes.push(route))
-            return frontend_error(FrontendError::TooManyItems, item.timer.span);
+            return frontend_error(FrontendError::TooManyItems, route_decl.span);
     }
 
     if (source_path.len != 0 && !import_stack.empty()) import_stack.pop_back();
