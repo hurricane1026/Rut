@@ -4833,7 +4833,9 @@ route {
              static_cast<u8>(HirExprKind::IfElse));
 }
 
-TEST(frontend, analyze_rejects_chain_before_respond_capable_helper) {
+// A respond-capable helper carries its own status; adding `else <status>`
+// would be a second competing rejection channel.
+TEST(frontend, analyze_rejects_else_on_respond_capable_chain_step) {
     const char* src = R"rut(
 func require_auth(_ req: i32) -> bool {
     guard false else { respond 401 }
@@ -4853,7 +4855,67 @@ route GET "/users" use chain secure {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(lit("require_auth")));
+    CHECK(hir.error().detail.eq(
+        lit("respond-capable chain steps carry their own status via respond; drop the "
+            "`else <status>`")));
+}
+
+// The unified middleware surface (DESIGN "middleware = ordinary functions"):
+// a respond-capable helper as a chain step, no else — its respond guards
+// expand at the chain position.
+TEST(frontend, chain_before_respond_capable_step_expands_respond_guards) {
+    const char* src = R"rut(
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 401, "denied" }
+    7
+}
+chain auth {
+    before check(req)
+}
+route {
+    use chain auth
+    GET "/x" { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
+    CHECK(hir->routes[0].guards[0].fail_term.response_body.eq(lit("denied")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+// Bool predicates keep the explicit `else <status>` requirement — it is the
+// only rejection channel they have.
+TEST(frontend, analyze_rejects_bool_chain_step_without_else) {
+    const char* src = R"rut(
+func ok(_ req: i32) -> bool { req.http11 }
+chain auth {
+    before ok(req)
+}
+route GET "/x" use chain auth {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("bool chain steps need `else <status>`; only respond-capable helpers may omit it")));
 }
 
 TEST(frontend, analyze_unused_chain_does_not_mark_callee_as_magic_request) {

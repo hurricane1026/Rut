@@ -16681,10 +16681,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, step.call.span, step.call.name);
             const auto& fn = mod.functions[fn_index];
-            if (fn.return_type != HirTypeKind::Bool)
-                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
-            if (fn.respond_guards.len != 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
             if (fn.type_params.len != 0)
                 return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
             if (step.call.args.len != fn.params.len)
@@ -16700,6 +16696,39 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         FrontendError::UnsupportedSyntax, step.call.args[ai]->span, fn.name);
                 args[ai] = arg.value();
             }
+
+            // A respond-capable helper carries its own short-circuit status(es)
+            // via `respond` — the DESIGN "middleware = ordinary functions"
+            // surface. Expand its respond guards at this chain position; an
+            // `else <status>` would be a second competing rejection channel,
+            // so it is rejected. The helper's normal return value is ignored
+            // in chain position (pass-through).
+            if (fn.respond_guards.len != 0) {
+                if (step.has_else)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        step.span,
+                        lit_str("respond-capable chain steps carry their own status via "
+                                "respond; drop the `else <status>`"));
+                const bool saved_allow = route.allow_respond_effects;
+                route.allow_respond_effects = true;
+                auto expanded = instantiate_function_respond_guards(
+                    fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
+                route.allow_respond_effects = saved_allow;
+                if (!expanded) return core::make_unexpected(expanded.error());
+                return {};
+            }
+
+            // Bool predicate: `else <status>` is the only rejection channel,
+            // so it is required.
+            if (fn.return_type != HirTypeKind::Bool)
+                return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, fn.name);
+            if (!step.has_else)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    step.span,
+                    lit_str("bool chain steps need `else <status>`; only respond-capable "
+                            "helpers may omit it"));
 
             auto cond = instantiate_function_expr(
                 fn.body, &route, mod, args, step.call.args.len, nullptr, 0);
