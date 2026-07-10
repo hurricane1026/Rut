@@ -18588,6 +18588,59 @@ TEST(jit, ws_handler_close_returns_close) {
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
+TEST(jit, chain_respond_capable_step_short_circuits) {
+    // The unified middleware surface: a chain step whose helper responds
+    // short-circuits the request at runtime with the helper's status/body;
+    // a passing request falls through to the handler.
+    const char* src =
+        "func check(_ req: i32) -> i32 { guard req.http11 else { respond 401, \"denied\" } 7 }\n"
+        "chain auth { before check(req) }\n"
+        "route {\n"
+        " use chain auth\n"
+        " GET \"/version\" { return 200 }\n"
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // HTTP/1.1 -> check passes -> handler runs, 200.
+    static const char http11[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http11), sizeof(http11) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    // HTTP/1.0 -> check responds -> 401 short-circuit, handler never runs.
+    static const char http10[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http10), sizeof(http10) - 1, nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
     // Spec 3.3.7: guard let binds the usable value or takes else at RUNTIME.
     // The guard's HasValue cond consumes the error, so the state-0 error

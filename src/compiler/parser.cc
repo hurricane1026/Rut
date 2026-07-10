@@ -3202,9 +3202,7 @@ struct Parser {
             auto call = parse_expr();
             if (!call) return core::make_unexpected(call.error());
             step.call = call.value();
-            if (step.kind == AstChainStepKind::Before) {
-                auto kw_else = expect(TokenType::KwElse);
-                if (!kw_else) return core::make_unexpected(kw_else.error());
+            if (step.kind == AstChainStepKind::Before && take(TokenType::KwElse)) {
                 auto status = expect(TokenType::IntLit);
                 if (!status) return core::make_unexpected(status.error());
                 u32 parsed_status = 0;
@@ -3215,6 +3213,7 @@ struct Parser {
                                               span_from(*status.value()));
                     parsed_status = parsed_status * 10 + digit;
                 }
+                step.has_else = true;
                 step.else_status = parsed_status;
                 step.span = Span{start.start, status.value()->end, start.line, start.col};
             } else {

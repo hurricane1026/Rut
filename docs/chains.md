@@ -99,7 +99,12 @@ review, replay, and generated code do not need an extra execution model.
 Rut Core should keep chains intentionally narrow:
 
 - `before` is the only implemented route-level extension point.
-- A `before` step must be a direct call and must declare `else <status>`.
+- A `before` step must be a direct call. A bool predicate must declare
+  `else <status>` (its only rejection channel); a respond-capable helper
+  (one whose body uses `guard ... else { respond <status>[, body] }`) must
+  NOT — it carries its own status, and its respond guards expand at the
+  chain position. This is the DESIGN "middleware = ordinary functions"
+  surface: `respond` short-circuits, `return` passes through.
 - `after` is reserved; until lowering exists, chains containing it are rejected.
 - Chain order is source order only; there is no priority or phase dispatch.
 - A route entry should attach at most one entry chain.

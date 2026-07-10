@@ -468,6 +468,10 @@ struct AstChainDecl {
         AstChainStepKind kind = AstChainStepKind::Before;
         Span span{};
         AstExpr call{};
+        // `before f(req) else <status>` — required for bool predicates (the
+        // status is the only rejection channel), disallowed for
+        // respond-capable helpers (they carry their own status via respond).
+        bool has_else = false;
         u32 else_status = 0;
     };
 
