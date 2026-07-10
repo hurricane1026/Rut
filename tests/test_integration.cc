@@ -10682,6 +10682,9 @@ TEST(websocket_e2e, passthrough_tunnel_iouring) {
 struct WsFrameEchoServer {
     i32 listen_fd = -1;
     u16 port = 0;
+    // Per-frame echo delay: holds each echo back so the gateway's c2u send /
+    // u2c receive interleave with later client frames (flake repro harness).
+    u32 echo_delay_us = 0;
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -10747,6 +10750,7 @@ struct WsFrameEchoServer {
                     rut::u32 hl =
                         rut::ws_write_header(out, h.opcode, true, false, key, h.payload_len);
                     for (rut::u64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
+                    if (s->echo_delay_us != 0) usleep(s->echo_delay_us);
                     (void)send_all(client,
                                    reinterpret_cast<char*>(out),
                                    hl + static_cast<rut::u32>(h.payload_len));
@@ -10834,6 +10838,249 @@ static void dump_ws_flake_evidence(RealLoop* loop, const rut::u8* acc, rut::u32 
                 c.recv_buf.len(),
                 c.send_buf.len());
     }
+}
+
+// Deterministic sweep over TCP segmentation of a DROP+PONG byte stream: the
+// CI flake family fails only under runner-dependent recv segmentation, so
+// enumerate EVERY split point (client sends bytes [0,k) then [k,total) with a
+// pause in between, forcing the server to see two recv batches). Any split
+// that loses the PONG reproduces the flake deterministically.
+TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
+    lt.start();
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 stream[64];
+    u32 total = 0;
+    {
+        u32 hl = ws_write_header(stream, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + hl, "DROP", 4);
+        ws_unmask(stream + hl, 4, kKey);
+        total = hl + 4;
+        hl = ws_write_header(stream + total, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + total + hl, "PONG", 4);
+        ws_unmask(stream + total + hl, 4, kKey);
+        total += hl + 4;
+    }
+
+    // No REQUIRE inside the loop: a bare return would leak the running
+    // LoopThread (it holds a pointer to stack state). On any failure stop the
+    // loop FIRST — that also makes the evidence dump race-free — then CHECK.
+    bool setup_failed = false;
+    bool lost_pong = false;
+    u32 failed_split = 0;
+    u8 racc[512];
+    u32 rhave = 0;
+    // Representative split points instead of the full sweep: frame boundaries
+    // +/-1, mid-header, mid-payload. A full 19-connection enumeration ran long
+    // enough on loaded CI to starve the tests that follow in this binary.
+    const u32 kSplits[] = {1, 5, 9, 10, 11, 15, 19};
+    for (u32 si = 0; si < sizeof(kSplits) / sizeof(kSplits[0]) && !setup_failed && !lost_pong;
+         si++) {
+        const u32 split = kSplits[si];
+        if (split >= total) continue;
+        i32 c = connect_to(port);
+        if (c < 0) {
+            setup_failed = true;
+            break;
+        }
+        const char kUpgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        char buf[1024];
+        u32 n = 0;
+        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
+            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
+            !send_all(c, reinterpret_cast<char*>(stream), split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+        // Best-effort segmentation: the pause usually lets the gateway drain
+        // segment 1 alone; on a loaded machine some splits may still coalesce
+        // (redundant coverage, never a false positive).
+        usleep(30000);
+        if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+
+        // Expect the PONG echo back regardless of where the stream was cut.
+        rhave = 0;
+        bool got = false;
+        for (int tries = 0; tries < 40 && !got; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                got = h.payload_len == 4 && memcmp(racc + h.header_len, "PONG", 4) == 0;
+                break;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 5000);
+            if (m <= 0) break;
+            rhave += static_cast<u32>(m);
+        }
+        if (!got) {
+            lost_pong = true;
+            failed_split = split;
+        }
+        close(c);
+    }
+
+    lt.stop();  // join the loop thread before asserting/dumping (no data race)
+    if (lost_pong) {
+        fprintf(stderr, "[ws-flake] segmentation split=%u/%u LOST the PONG\n", failed_split, total);
+        dump_ws_flake_evidence(loop, racc, rhave);
+    }
+    CHECK(!setup_failed);
+    CHECK(!lost_pong);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// Interleaving sweep: PING is sent first and its echo is DELAYED by the
+// backend, so the gateway's c2u/u2c slots are busy when the split DROP+PONG
+// bytes arrive — the re-inspect-after-send paths get exercised under residue.
+// Sweeps every split point of the PING+DROP+PONG stream.
+TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    backend.echo_delay_us = 30000;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
+    lt.start();
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 stream[96];
+    u32 total = 0;
+    for (const char* msg : {"PING", "DROP", "PONG"}) {
+        u32 hl = ws_write_header(stream + total, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + total + hl, msg, 4);
+        ws_unmask(stream + total + hl, 4, kKey);
+        total += hl + 4;
+    }
+
+    // Same failure discipline as the split sweep above: no REQUIRE while the
+    // LoopThread runs; stop the loop before dumping/asserting.
+    bool setup_failed = false;
+    bool echo_failed = false;
+    u32 failed_split = 0;
+    u32 failed_frames = 0;
+    u8 racc[512];
+    u32 rhave = 0;
+    // Representative splits (see the sweep above): each frame boundary +/-1
+    // plus mid-frame points, not the full 29-connection enumeration.
+    const u32 kSplits[] = {1, 9, 10, 11, 15, 19, 20, 21, 25, 29};
+    for (u32 si = 0; si < sizeof(kSplits) / sizeof(kSplits[0]) && !setup_failed && !echo_failed;
+         si++) {
+        const u32 split = kSplits[si];
+        if (split >= total) continue;
+        i32 c = connect_to(port);
+        if (c < 0) {
+            setup_failed = true;
+            break;
+        }
+        const char kUpgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        char buf[1024];
+        u32 n = 0;
+        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
+            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
+            !send_all(c, reinterpret_cast<char*>(stream), split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+        usleep(10000);  // best-effort split; coalescing is redundant coverage
+        if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+
+        // Expect PING then PONG echoes.
+        rhave = 0;
+        u32 got_frames = 0;
+        bool ok = true;
+        for (int tries = 0; tries < 60 && got_frames < 2; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                const char* want = got_frames == 0 ? "PING" : "PONG";
+                ok = ok && h.payload_len == 4 && memcmp(racc + h.header_len, want, 4) == 0;
+                const u32 ftotal = h.header_len + static_cast<u32>(h.payload_len);
+                for (u32 i = ftotal; i < rhave; i++) racc[i - ftotal] = racc[i];
+                rhave -= ftotal;
+                got_frames++;
+                continue;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 5000);
+            if (m <= 0) break;
+            rhave += static_cast<u32>(m);
+        }
+        if (got_frames != 2 || !ok) {
+            echo_failed = true;
+            failed_split = split;
+            failed_frames = got_frames;
+        }
+        close(c);
+    }
+
+    lt.stop();  // join before asserting/dumping (race-free evidence)
+    if (echo_failed) {
+        fprintf(stderr,
+                "[ws-flake] interleave split=%u/%u got %u/2 frames\n",
+                failed_split,
+                total,
+                failed_frames);
+        dump_ws_flake_evidence(loop, racc, rhave);
+    }
+    CHECK(!setup_failed);
+    CHECK(!echo_failed);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
 }
 
 TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
