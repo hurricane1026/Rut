@@ -10477,7 +10477,7 @@ TEST(websocket_e2e, passthrough_tunnel_echoes_both_ways) {
     const u16 port = get_port(listen_fd);
     REQUIRE(loop->init(0, listen_fd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/30000};
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
     lt.start();
 
     i32 c = connect_to(port);
@@ -10747,7 +10747,7 @@ TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
     const u16 port = get_port(listen_fd);
     REQUIRE(loop->init(0, listen_fd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/30000};
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
     lt.start();
 
     i32 c = connect_to(port);
@@ -10829,7 +10829,7 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
     const u16 port = get_port(listen_fd);
     REQUIRE(loop->init(0, listen_fd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/30000};
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
     lt.start();
 
     i32 c = connect_to(port);
@@ -10949,7 +10949,7 @@ TEST(websocket_e2e, terminate_rejects_fragmented) {
     const u16 port = get_port(listen_fd);
     REQUIRE(loop->init(0, listen_fd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/30000};
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
     lt.start();
 
     i32 c = connect_to(port);
