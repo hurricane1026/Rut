@@ -10836,6 +10836,94 @@ static void dump_ws_flake_evidence(RealLoop* loop, const rut::u8* acc, rut::u32 
     }
 }
 
+// Deterministic sweep over TCP segmentation of a DROP+PONG byte stream: the
+// CI flake family fails only under runner-dependent recv segmentation, so
+// enumerate EVERY split point (client sends bytes [0,k) then [k,total) with a
+// pause in between, forcing the server to see two recv batches). Any split
+// that loses the PONG reproduces the flake deterministically.
+TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
+    using namespace rut;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
+    lt.start();
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 stream[64];
+    u32 total = 0;
+    {
+        u32 hl = ws_write_header(stream, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + hl, "DROP", 4);
+        ws_unmask(stream + hl, 4, kKey);
+        total = hl + 4;
+        hl = ws_write_header(stream + total, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + total + hl, "PONG", 4);
+        ws_unmask(stream + total + hl, 4, kKey);
+        total += hl + 4;
+    }
+
+    for (u32 split = 1; split < total; split++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        const char kUpgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
+        char buf[1024];
+        u32 n = recv_http_headers(c, buf, sizeof(buf));
+        REQUIRE(n > 0 && buf_contains(buf, n, "101", 3));
+
+        REQUIRE(send_all(c, reinterpret_cast<char*>(stream), split));
+        usleep(30000);  // let the server drain segment 1 alone
+        REQUIRE(send_all(c, reinterpret_cast<char*>(stream + split), total - split));
+
+        // Expect the PONG echo back regardless of where the stream was cut.
+        u8 racc[512];
+        u32 rhave = 0;
+        bool got = false;
+        for (int tries = 0; tries < 40 && !got; tries++) {
+            WsFrameHeader h;
+            if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                rhave >= h.header_len + h.payload_len) {
+                got = h.payload_len == 4 && memcmp(racc + h.header_len, "PONG", 4) == 0;
+                break;
+            }
+            i32 m = recv_timeout(c,
+                                 reinterpret_cast<char*>(racc + rhave),
+                                 static_cast<i32>(sizeof(racc) - rhave),
+                                 5000);
+            if (m <= 0) break;
+            rhave += static_cast<u32>(m);
+        }
+        if (!got) {
+            fprintf(stderr, "[ws-flake] segmentation split=%u/%u LOST the PONG\n", split, total);
+            dump_ws_flake_evidence(loop, racc, rhave);
+        }
+        CHECK(got);
+        close(c);
+    }
+
+    lt.stop();
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
 TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
     // Repro for the recurring CI flake in terminate_inspects_forwards_and_drops:
     // on a loaded runner the server thread can be descheduled long enough for
