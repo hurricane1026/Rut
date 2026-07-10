@@ -277,7 +277,17 @@ struct Shard {
     // Send a config reload to the shard (fire-and-forget).
     // If the shard is running, writes to control block.
     // If stopped/not spawned, applies directly (no thread to race with).
-    void reload_config(const RouteConfig* cfg) {
+    // shard_count gates shard-pinned timers: a config carrying a `shard: N`
+    // selector that no shard in this process can match is REFUSED (returns
+    // false, nothing installed) — the same fail-fast main.cc applies to the
+    // startup config, enforced here so hot-reload callers cannot skip it.
+    [[nodiscard]] bool reload_config(const RouteConfig* cfg, u32 shard_count) {
+        if (cfg != nullptr && cfg->first_out_of_range_timer_shard(shard_count) >= 0) return false;
+        reload_config_unchecked(cfg);
+        return true;
+    }
+
+    void reload_config_unchecked(const RouteConfig* cfg) {
         if (!thread_spawned) {
             // No thread — direct apply. The running path's poll_command() drains
             // the idle pool on every config adopt; this not-running path must do
