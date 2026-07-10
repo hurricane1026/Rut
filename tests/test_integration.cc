@@ -10881,24 +10881,44 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
         total += hl + 4;
     }
 
-    for (u32 split = 1; split < total; split++) {
+    // No REQUIRE inside the loop: a bare return would leak the running
+    // LoopThread (it holds a pointer to stack state). On any failure stop the
+    // loop FIRST — that also makes the evidence dump race-free — then CHECK.
+    bool setup_failed = false;
+    bool lost_pong = false;
+    u32 failed_split = 0;
+    u8 racc[512];
+    u32 rhave = 0;
+    for (u32 split = 1; split < total && !setup_failed && !lost_pong; split++) {
         i32 c = connect_to(port);
-        REQUIRE(c >= 0);
+        if (c < 0) {
+            setup_failed = true;
+            break;
+        }
         const char kUpgrade[] =
             "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
         char buf[1024];
-        u32 n = recv_http_headers(c, buf, sizeof(buf));
-        REQUIRE(n > 0 && buf_contains(buf, n, "101", 3));
-
-        REQUIRE(send_all(c, reinterpret_cast<char*>(stream), split));
-        usleep(30000);  // let the server drain segment 1 alone
-        REQUIRE(send_all(c, reinterpret_cast<char*>(stream + split), total - split));
+        u32 n = 0;
+        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
+            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
+            !send_all(c, reinterpret_cast<char*>(stream), split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+        // Best-effort segmentation: the pause usually lets the gateway drain
+        // segment 1 alone; on a loaded machine some splits may still coalesce
+        // (redundant coverage, never a false positive).
+        usleep(30000);
+        if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
 
         // Expect the PONG echo back regardless of where the stream was cut.
-        u8 racc[512];
-        u32 rhave = 0;
+        rhave = 0;
         bool got = false;
         for (int tries = 0; tries < 40 && !got; tries++) {
             WsFrameHeader h;
@@ -10915,14 +10935,19 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
             rhave += static_cast<u32>(m);
         }
         if (!got) {
-            fprintf(stderr, "[ws-flake] segmentation split=%u/%u LOST the PONG\n", split, total);
-            dump_ws_flake_evidence(loop, racc, rhave);
+            lost_pong = true;
+            failed_split = split;
         }
-        CHECK(got);
         close(c);
     }
 
-    lt.stop();
+    lt.stop();  // join the loop thread before asserting/dumping (no data race)
+    if (lost_pong) {
+        fprintf(stderr, "[ws-flake] segmentation split=%u/%u LOST the PONG\n", failed_split, total);
+        dump_ws_flake_evidence(loop, racc, rhave);
+    }
+    CHECK(!setup_failed);
+    CHECK(!lost_pong);
     loop->shutdown();
     close(listen_fd);
     destroy_real_loop(loop);
@@ -10965,26 +10990,41 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
         total += hl + 4;
     }
 
-    for (u32 split = 1; split < total; split++) {
+    // Same failure discipline as the split sweep above: no REQUIRE while the
+    // LoopThread runs; stop the loop before dumping/asserting.
+    bool setup_failed = false;
+    bool echo_failed = false;
+    u32 failed_split = 0;
+    u32 failed_frames = 0;
+    u8 racc[512];
+    u32 rhave = 0;
+    for (u32 split = 1; split < total && !setup_failed && !echo_failed; split++) {
         i32 c = connect_to(port);
-        REQUIRE(c >= 0);
+        if (c < 0) {
+            setup_failed = true;
+            break;
+        }
         const char kUpgrade[] =
             "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        REQUIRE(send_all(c, kUpgrade, sizeof(kUpgrade) - 1));
         char buf[1024];
-        u32 n = recv_http_headers(c, buf, sizeof(buf));
-        REQUIRE(n > 0 && buf_contains(buf, n, "101", 3));
-
-        // Split the whole three-frame stream; the delayed PING echo lands
-        // while the later bytes are being inspected.
-        REQUIRE(send_all(c, reinterpret_cast<char*>(stream), split));
-        usleep(10000);
-        REQUIRE(send_all(c, reinterpret_cast<char*>(stream + split), total - split));
+        u32 n = 0;
+        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
+            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
+            !send_all(c, reinterpret_cast<char*>(stream), split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+        usleep(10000);  // best-effort split; coalescing is redundant coverage
+        if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
 
         // Expect PING then PONG echoes.
-        u8 racc[512];
-        u32 rhave = 0;
+        rhave = 0;
         u32 got_frames = 0;
         bool ok = true;
         for (int tries = 0; tries < 60 && got_frames < 2; tries++) {
@@ -11007,20 +11047,24 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
             rhave += static_cast<u32>(m);
         }
         if (got_frames != 2 || !ok) {
-            fprintf(stderr,
-                    "[ws-flake] interleave split=%u/%u got %u/2 frames ok=%d\n",
-                    split,
-                    total,
-                    got_frames,
-                    ok ? 1 : 0);
-            dump_ws_flake_evidence(loop, racc, rhave);
+            echo_failed = true;
+            failed_split = split;
+            failed_frames = got_frames;
         }
-        CHECK(got_frames == 2);
-        CHECK(ok);
         close(c);
     }
 
-    lt.stop();
+    lt.stop();  // join before asserting/dumping (race-free evidence)
+    if (echo_failed) {
+        fprintf(stderr,
+                "[ws-flake] interleave split=%u/%u got %u/2 frames\n",
+                failed_split,
+                total,
+                failed_frames);
+        dump_ws_flake_evidence(loop, racc, rhave);
+    }
+    CHECK(!setup_failed);
+    CHECK(!echo_failed);
     loop->shutdown();
     close(listen_fd);
     destroy_real_loop(loop);
