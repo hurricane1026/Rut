@@ -512,6 +512,9 @@ struct AstTimerDecl {
     // AstRouteDecl — storing AstStatement inline here overflowed the parser's
     // per-item stack frames on the recursive-import path (see AstRouteDecl).
     FixedVec<AstStatement*, AstRouteDecl::kMaxStatements> statements;
+    // `shard: N` selector — run on shard N only (singleton tasks like a global
+    // metrics push). -1 (default, no selector) = every shard runs its own copy.
+    i32 shard = -1;
 };
 
 struct AstItem {

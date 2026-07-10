@@ -1045,6 +1045,8 @@ struct HirRoute {
     // the shard event loop instead of matched against requests.
     bool is_timer = false;
     u32 timer_interval_ms = 0;
+    // `shard: N` — fire on that shard only; -1 = every shard (default).
+    i32 timer_shard = -1;
 
     HirRoute() = default;
     HirRoute(const HirRoute& other)
@@ -1066,7 +1068,8 @@ struct HirRoute {
           is_ws_terminate(other.is_ws_terminate),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
-          timer_interval_ms(other.timer_interval_ms) {
+          timer_interval_ms(other.timer_interval_ms),
+          timer_shard(other.timer_shard) {
         rebase_from(other);
     }
     HirRoute& operator=(const HirRoute& other) {
@@ -1090,6 +1093,7 @@ struct HirRoute {
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
+        timer_shard = other.timer_shard;
         rebase_from(other);
         return *this;
     }
@@ -1112,7 +1116,8 @@ struct HirRoute {
           is_ws_terminate(other.is_ws_terminate),
           ws_handler(other.ws_handler),
           is_timer(other.is_timer),
-          timer_interval_ms(other.timer_interval_ms) {
+          timer_interval_ms(other.timer_interval_ms),
+          timer_shard(other.timer_shard) {
         rebase_from(other);
     }
     HirRoute& operator=(HirRoute&& other) noexcept {
@@ -1136,6 +1141,7 @@ struct HirRoute {
         ws_handler = other.ws_handler;
         is_timer = other.is_timer;
         timer_interval_ms = other.timer_interval_ms;
+        timer_shard = other.timer_shard;
         rebase_from(other);
         return *this;
     }

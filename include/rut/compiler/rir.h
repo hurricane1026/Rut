@@ -365,6 +365,7 @@ struct Function {
     // and the shard event loop fires it every timer_interval_ms.
     bool is_timer = false;
     u32 timer_interval_ms = 0;
+    i32 timer_shard = -1;
 
     // Blocks: arena-allocated array. blocks[0] is always entry.
     Block* blocks;

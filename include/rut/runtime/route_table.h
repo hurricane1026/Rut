@@ -242,11 +242,27 @@ struct RouteConfig {
         u32 name_len = 0;
         jit::HandlerFn fn = nullptr;
         u32 interval_ms = 0;
+        // `shard: N` — fire on that shard only; -1 = every shard (default).
+        i32 shard = -1;
     };
     TimerEntry timers[kMaxTimers];
     u32 timer_count = 0;
 
-    bool add_timer(const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn) {
+    // A shard-pinned timer whose selector is >= the configured shard count can
+    // never fire (fire_due_timers only matches selector == shard_id). Called at
+    // startup so a dead singleton fails fast instead of serving silently.
+    // Returns the offending timer index, or -1 if all selectors are in range.
+    i32 first_out_of_range_timer_shard(u32 shard_count) const {
+        const u32 n = timer_count < kMaxTimers ? timer_count : kMaxTimers;
+        for (u32 i = 0; i < n; i++) {
+            if (timers[i].shard >= 0 && static_cast<u32>(timers[i].shard) >= shard_count)
+                return static_cast<i32>(i);
+        }
+        return -1;
+    }
+
+    bool add_timer(
+        const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn, i32 shard = -1) {
         if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
         TimerEntry& t = timers[timer_count];
         const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
@@ -255,6 +271,7 @@ struct RouteConfig {
         t.name_len = kN;
         t.fn = fn;
         t.interval_ms = interval_ms;
+        t.shard = shard;
         timer_count++;
         return true;
     }

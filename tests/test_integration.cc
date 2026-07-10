@@ -1321,6 +1321,83 @@ TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
     CHECK_EQ(hir_owned->routes.len, 4u);
 }
 
+// Non-whole-second intervals are rejected honestly: the firing path is the
+// 1s keepalive tick (a 1500ms timer would silently fire every ~2s), and
+// pulling the tick forward would also advance the idle/probe timer wheel.
+// Lift when timers get a dedicated precise wakeup.
+TEST(timer_dsl, rejects_non_whole_second_intervals) {
+    using namespace rut;
+    for (const char* src : {"timer t, every: 500ms { }\n", "timer t, every: 1500ms { }\n"}) {
+        auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(!hir);
+        CHECK(hir.error().detail.len != 0);
+    }
+}
+
+// A selector outside the process shard range (kMaxShards) would compile into
+// a timer that never fires on any shard — rejected instead.
+TEST(timer_dsl, rejects_shard_selector_beyond_max_shards) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s, shard: 64 { }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.len != 0);
+}
+
+// `shard: N` pins the timer to one shard; the value threads HIR->MIR->RIR.
+TEST(timer_dsl, shard_selector_threads_to_rir) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s, shard: 2 { }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(rir.module.functions[0].is_timer);
+    CHECK_EQ(rir.module.functions[0].timer_shard, 2);
+    rir.destroy();
+}
+
+TEST(timer_dsl, no_shard_selector_defaults_to_every_shard) {
+    using namespace rut;
+    const char* src = "timer t, every: 1s { }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK_EQ(rir.module.functions[0].timer_shard, -1);
+    rir.destroy();
+}
+
 // Timers don't consume HTTP-route capacity: the routes vector is sized
 // kMaxRoutes + kMaxTimers, and analyze.cc caps HTTP routes at kMaxRoutes
 // independently of timers. A full-route-table boundary test isn't expressible in
@@ -1362,6 +1439,42 @@ static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut
 
 // The event loop fires a registered timer once its interval elapses, invoking the
 // compiled handler with no Connection/Request and bumping the per-timer count.
+// A shard selector within the compile-time range can still exceed the
+// RUNTIME --shards value; startup validation catches it (fail fast instead
+// of a silently dead timer). PR #172 review round 2.
+TEST(timer_dsl, out_of_range_shard_selector_detected_at_startup) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("a", 1, /*interval_ms=*/1000, &timer_probe_fn, /*shard=*/-1));
+    REQUIRE(cfg.add_timer("b", 1, /*interval_ms=*/1000, &timer_probe_fn, /*shard=*/5));
+    CHECK_EQ(cfg.first_out_of_range_timer_shard(/*shard_count=*/8), -1);
+    CHECK_EQ(cfg.first_out_of_range_timer_shard(/*shard_count=*/5), 1);  // 'b' dead
+    CHECK_EQ(cfg.first_out_of_range_timer_shard(/*shard_count=*/1), 1);
+}
+
+// Runtime filter: a shard-pinned timer fires only on the matching shard's loop.
+TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_probe_fn, /*shard=*/1));
+
+    auto loop0 = std::make_unique<EpollEventLoop>();
+    auto loop1 = std::make_unique<EpollEventLoop>();
+    loop0->shard_id = 0;
+    loop1->shard_id = 1;
+    const RouteConfig* active = &cfg;
+    loop0->config_ptr = &active;
+    loop1->config_ptr = &active;
+
+    loop0->fire_due_timers();  // arm
+    loop1->fire_due_timers();  // arm
+    usleep(5000);
+    loop0->fire_due_timers();
+    loop1->fire_due_timers();
+    CHECK_EQ(loop0->timer_fire_count[0], 0u);  // wrong shard: never fires
+    CHECK_GE(loop1->timer_fire_count[0], 1u);  // pinned shard fires
+}
+
 TEST(timer, event_loop_fires_due_timer) {
     using namespace rut;
     RouteConfig cfg{};

@@ -114,8 +114,11 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
         // against requests: register it into the timer table (route_pattern holds
         // the timer name) and skip route registration.
         if (fn.is_timer) {
-            if (!cfg.add_timer(
-                    fn.route_pattern.ptr, fn.route_pattern.len, fn.timer_interval_ms, handler))
+            if (!cfg.add_timer(fn.route_pattern.ptr,
+                               fn.route_pattern.len,
+                               fn.timer_interval_ms,
+                               handler,
+                               fn.timer_shard))
                 return false;
             continue;
         }
