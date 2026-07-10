@@ -12,7 +12,6 @@
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/compile_to_config.h"
-#include "rut/runtime/debug.h"
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_conn.h"
@@ -10697,20 +10696,30 @@ static rut::WsFrameAction terminate_test_handler(
 // snapshot, so a CI-only strike carries evidence (PR #175 — the iteration-cap
 // theory was falsified in the field; suspicion is the engine's post-Drop path).
 static void dump_ws_flake_evidence(RealLoop* loop, const rut::u8* acc, rut::u32 have) {
+    // Plain field prints (not runtime/debug.h formatters): the dump only runs
+    // on the failure path, and pulling debug.h's inline formatters into this
+    // TU adds never-executed lines to the runtime coverage gate.
     fprintf(stderr, "[ws-flake] client accumulator: %u bytes:", have);
     for (rut::u32 i = 0; i < have && i < 32; i++) fprintf(stderr, " %02x", acc[i]);
     fprintf(stderr, "\n");
     for (rut::u32 i = 0; i < RealLoop::kMaxConns; i++) {
         const auto& c = loop->conns[i];
         if (c.fd < 0 && c.upstream_fd < 0) continue;
-        char buf[512];
-        rut::format_conn_debug_snapshot(rut::make_conn_debug_snapshot(c), buf, sizeof(buf));
         fprintf(stderr,
-                "[ws-flake] conn %u ws_term=%d recv_armed=%d: %s\n",
+                "[ws-flake] conn %u fd=%d ufd=%d state=%u ws_term=%d recv_armed=%d "
+                "cb[recv=%d send=%d urecv=%d usend=%d] recv_len=%u send_len=%u\n",
                 i,
+                c.fd,
+                c.upstream_fd,
+                static_cast<unsigned>(c.state),
                 c.is_ws_terminate ? 1 : 0,
                 c.recv_armed ? 1 : 0,
-                buf);
+                c.on_recv != nullptr ? 1 : 0,
+                c.on_send != nullptr ? 1 : 0,
+                c.on_upstream_recv != nullptr ? 1 : 0,
+                c.on_upstream_send != nullptr ? 1 : 0,
+                c.recv_buf.len(),
+                c.send_buf.len());
     }
 }
 
