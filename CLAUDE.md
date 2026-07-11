@@ -101,16 +101,16 @@ LLM-facing surface contract).
 
 ### Key syntax patterns:
 - **Swift-exact or absent**: anything that looks like Swift behaves exactly like Swift; near-miss variants don't exist
-- `respond <status>[, body]` / `respond resp` — short-circuit the request from middleware (⏳ pending — `respond` is not a parser keyword yet); `return` has ONE meaning everywhere (produce the function's/handler's value; a handler's value is its response, so handlers use `return 200`)
+- `respond <status>[, body]` — short-circuit the request from middleware / respond-capable helpers (status is a literal int, body a string literal; `respond resp` with a Response value is ⏳ pending); `return` has ONE meaning everywhere (produce the function's/handler's value; a handler's value is its response, so handlers use `return 200`)
 - `guard <bool> else { respond 401 }` (middleware) / `guard ... else { return 401 }` (handler); `guard let x = expr else { }` binds a usable value (nil and error handled uniformly; Swift-identical incl. `guard let x` shorthand). `if let x = expr { } else { }` binds the usable value in the then-branch only (error-capable AND pure-optional exprs like `req.query`/`req.header` both work, same as guard let)
-- Route captures live in `req.params` — `req.params.id` is ⏳ pending (analyzer rejects `params` today); never shadow built-ins like `req.path`. Query: `req.query(k) -> str?` works; `req.queryAll(k) -> [str]` is ⏳ pending
+- Route captures live in `req.params` — `req.params.id` works; never shadow built-ins like `req.path`. Query: `req.query(k) -> str?` works; `req.queryAll(k) -> [str]` is ⏳ pending
 - `=> expr` — single expression, implicit return. `{ stmts }` — block, explicit `return`
 - Named parameters: `auth(req, role: "user")`
 - UFCS: `req.auth(role: "user")` rewrites to `auth(req, role: "user")` — blessed form when value flows into the first parameter
 - Pipeline: `a | f(_, ...)` — shell-style `|`; in expressions `|` means pipeline ONLY; RHS must be a call with an explicit `_`/`_N` placeholder; use when value lands in a non-first position
 - Bitwise ops are functions in the built-in `bitwise` namespace, not symbols: `bitwise.and`/`bitwise.or`/`bitwise.xor`/`bitwise.flip`/`bitwise.shiftLeft`/`bitwise.shiftRight` — implemented end-to-end (i32 only; shift amounts outside 0..31 saturate; `flip(a)` desugars to `xor(a, -1)`; literal operands fold at analyze time; the removed `&`/`~`/`<<` symbols emit a fix-it)
 - `match` with `=>` (expression) or `{}` (block); no `case` keyword. `if` always uses `{}`
-- Header access is function-style: `req.header("X-Request-ID")`, `req.set(...)`, `resp.set(...)`, `resp.remove(...)` — hyphenated property access does not exist (would parse as subtraction)
+- Header access is function-style: `req.header("X-Request-ID")`, `req.set(...)`, `resp.set(...)`, `resp.remove(...)` — hyphenated property access does not exist (would parse as subtraction). Only `req.header` is wired today; the mutators are ⏳ pending (request-header injection exists via `forward(set_header:)`)
 - `@decorator` for middleware — `@func` on routes/groups, `@func pattern` for bindings
 - Pre/post middleware inferred from signature: `Request` → pre, `Response` → post
 
