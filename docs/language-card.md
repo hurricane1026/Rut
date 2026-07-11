@@ -112,13 +112,14 @@ Nil/error handling — pick by situation, nothing else exists:
 There is NO `x?` postfix, NO `?.`, NO `??`, NO force-unwrap `!x`/`x!`, no
 exceptions, no try/catch. `!` is logical not only.
 
-## return vs respond — the one asymmetry to remember ⏳ (`respond` keyword pending)
+## return vs respond — the one asymmetry to remember
 
 - **Handler** (route entry body): its value IS the response → `return 200`,
   `return 200, body`, `return resp`, `return forward(x)`.
 - **Middleware/helper func**: `return` only produces the function's normal
   value (or passes through); to end the whole request immediately use
-  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
+  **`respond`**: `respond 401` / `respond 401, "expired"` (⏳ `respond resp`
+  with a Response value is pending — status must be a literal int today).
 
 ```swift
 func auth(_ req: Request, role: str) -> User {
