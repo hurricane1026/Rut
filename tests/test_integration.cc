@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "fault_injection.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -11074,6 +11075,147 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
                 failed_split,
                 total,
                 failed_frames);
+        dump_ws_flake_evidence(loop, racc, rhave);
+    }
+    CHECK(!setup_failed);
+    CHECK(!echo_failed);
+    loop->shutdown();
+    close(listen_fd);
+    destroy_real_loop(loop);
+}
+
+// EAGAIN injection: force the gateway's c2u send into the partial-send /
+// EPOLLOUT-retry path exactly when later client frames arrive — the
+// sent-callback re-inspect branches run with residue on the client side while
+// the upstream echo is in flight, which client-side segmentation alone cannot
+// time precisely. Sweeps how many EAGAINs the send absorbs before completing.
+TEST(websocket_e2e, terminate_survives_send_eagain_windows) {
+    using namespace rut;
+    using rut::test_fault::io_fault_for_fd;
+    using rut::test_fault::ScopedIoFault;
+    WsFrameEchoServer backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_ws_terminate("/ws", 0, id.value(), terminate_test_handler, 65536));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd = create_listen_socket(0);
+    REQUIRE(lfd.has_value());
+    const i32 listen_fd = lfd.value();
+    const u16 port = get_port(listen_fd);
+    REQUIRE(loop->init(0, listen_fd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 5000, /*max_run_ms=*/90000};
+    lt.start();
+
+    const u8 kKey[4] = {0x12, 0x34, 0x56, 0x78};
+    u8 stream[96];
+    u32 total = 0;
+    for (const char* msg : {"PING", "DROP", "PONG"}) {
+        u32 hl = ws_write_header(stream + total, WsOpcode::Text, true, true, kKey, 4);
+        memcpy(stream + total + hl, msg, 4);
+        ws_unmask(stream + total + hl, 4, kKey);
+        total += hl + 4;
+    }
+
+    bool setup_failed = false;
+    bool echo_failed = false;
+    i32 failed_eagains = -1;
+    u32 failed_frames = 0;
+    u8 racc[512];
+    u32 rhave = 0;
+    for (i32 eagains = 1; eagains <= 3 && !setup_failed && !echo_failed; eagains++) {
+        i32 c = connect_to(port);
+        if (c < 0) {
+            setup_failed = true;
+            break;
+        }
+        const char kUpgrade[] =
+            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        char buf[1024];
+        u32 n = 0;
+        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
+            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3)) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+
+        // Locate the gateway-side upstream fd for THIS tunnel (the only live
+        // terminate conn). The upgrade reply means the tunnel is armed.
+        i32 up_fd = -1;
+        for (u32 tries = 0; tries < 100 && up_fd < 0; tries++) {
+            for (u32 i = 0; i < RealLoop::kMaxConns; i++) {
+                const auto& cn = loop->conns[i];
+                if (cn.is_ws_terminate && cn.fd >= 0 && cn.upstream_fd >= 0) {
+                    up_fd = cn.upstream_fd;
+                    break;
+                }
+            }
+            if (up_fd < 0) usleep(1000);
+        }
+        if (up_fd < 0) {
+            setup_failed = true;
+            close(c);
+            break;
+        }
+
+        {
+            // The gateway's next c2u send(s) hit EAGAIN and fall back to the
+            // EPOLLOUT retry path while DROP+PONG land in recv_buf behind it.
+            auto fault_cfg = io_fault_for_fd(up_fd);
+            fault_cfg.send_eagains = eagains;
+            ScopedIoFault fault(fault_cfg);
+            if (!send_all(c, reinterpret_cast<char*>(stream), total)) {
+                setup_failed = true;
+                close(c);
+                break;
+            }
+
+            // Expect PING then PONG echoes despite the injected send stalls.
+            rhave = 0;
+            u32 got_frames = 0;
+            bool ok = true;
+            for (int tries = 0; tries < 60 && got_frames < 2; tries++) {
+                WsFrameHeader h;
+                if (rhave >= 2 &&
+                    ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
+                    rhave >= h.header_len + h.payload_len) {
+                    const char* want = got_frames == 0 ? "PING" : "PONG";
+                    ok = ok && h.payload_len == 4 && memcmp(racc + h.header_len, want, 4) == 0;
+                    const u32 ftotal = h.header_len + static_cast<u32>(h.payload_len);
+                    for (u32 i = ftotal; i < rhave; i++) racc[i - ftotal] = racc[i];
+                    rhave -= ftotal;
+                    got_frames++;
+                    continue;
+                }
+                i32 m = recv_timeout(c,
+                                     reinterpret_cast<char*>(racc + rhave),
+                                     static_cast<i32>(sizeof(racc) - rhave),
+                                     5000);
+                if (m <= 0) break;
+                rhave += static_cast<u32>(m);
+            }
+            if (got_frames != 2 || !ok) {
+                echo_failed = true;
+                failed_eagains = eagains;
+                failed_frames = got_frames;
+            }
+        }
+        close(c);
+        usleep(20000);  // let the gateway finish tearing down this tunnel
+    }
+
+    lt.stop();
+    if (echo_failed) {
+        fprintf(
+            stderr, "[ws-flake] send-eagain=%d got %u/2 frames\n", failed_eagains, failed_frames);
         dump_ws_flake_evidence(loop, racc, rhave);
     }
     CHECK(!setup_failed);

@@ -44,6 +44,7 @@ add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_
 add_executable(test_integration
     test_integration.cc
     epoll_tls_test_hooks.cc
+    ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
 target_link_libraries(test_integration
     rut_runtime
