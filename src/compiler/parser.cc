@@ -982,9 +982,15 @@ struct Parser {
         if (!lhs) return core::make_unexpected(lhs.error());
         while (true) {
             AstExprKind kind = AstExprKind::Ident;
+            // A line-initial `-` ends the arm body ONLY when it actually
+            // starts the next arm's pattern — a negative int literal
+            // followed by `=>` (or an `if` arm guard). A line-wrapped
+            // subtraction before anything else (`a\n- b`) keeps parsing.
             if (arm_body_stops_cross_line_dot && arm_body_dot_stop_depth == 0 &&
-                cur().type == TokenType::Minus && pos > 0 && cur().line != prev().line) {
-                break;  // new-line `-N` starts the next match arm's pattern
+                cur().type == TokenType::Minus && pos > 0 && cur().line != prev().line &&
+                peek(1).type == TokenType::IntLit &&
+                (peek(2).type == TokenType::Arrow || peek(2).type == TokenType::KwIf)) {
+                break;
             }
             if (take(TokenType::Plus))
                 kind = AstExprKind::Add;

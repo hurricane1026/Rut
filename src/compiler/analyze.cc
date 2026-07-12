@@ -3451,11 +3451,34 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
     return out;
 }
 
-// Arithmetic operators `+ - * / %` — binary i32 ops. The literal fold below
-// must match the runtime semantics compiled in codegen.cc (Opcode::Add..Mod):
-// overflow wraps two's-complement, x / 0 and x % 0 are 0, INT_MIN / -1 is
-// INT_MIN, INT_MIN % -1 is 0. Folding uses u32 arithmetic so the compiler
-// itself never hits signed-overflow UB.
+// Compile-time evaluation of one arithmetic op. Must match the runtime
+// semantics compiled in codegen.cc (Opcode::Add..Mod): overflow wraps
+// two's-complement, x / 0 and x % 0 are 0, INT_MIN / -1 is INT_MIN,
+// INT_MIN % -1 is 0. Uses u32 arithmetic so the compiler itself never hits
+// signed-overflow UB. Shared by the analyze-time literal fold and
+// const_eval_expr so the two can't drift apart.
+static i32 fold_arith_i32(HirExprKind kind, i32 a, i32 b) {
+    const bool ovf = a == static_cast<i32>(0x80000000u) && b == -1;
+    switch (kind) {
+        case HirExprKind::Add:
+            return static_cast<i32>(static_cast<u32>(a) + static_cast<u32>(b));
+        case HirExprKind::Sub:
+            return static_cast<i32>(static_cast<u32>(a) - static_cast<u32>(b));
+        case HirExprKind::Mul:
+            return static_cast<i32>(static_cast<u32>(a) * static_cast<u32>(b));
+        case HirExprKind::Div:
+            if (b == 0) return 0;
+            return ovf ? static_cast<i32>(0x80000000u) : a / b;
+        case HirExprKind::Mod:
+            if (b == 0) return 0;
+            return ovf ? 0 : a % b;
+        default:
+            return 0;
+    }
+}
+
+// Arithmetic operators `+ - * / %` — binary i32 ops (semantics: see
+// fold_arith_i32 above).
 static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
                                                   HirRoute* route,
                                                   const HirModule& mod,
@@ -3497,34 +3520,12 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
         return frontend_error(
             FrontendError::UnsupportedSyntax, expr.rhs->span, kArithDivZeroDetail);
     if (lhs->kind == HirExprKind::IntLit && rhs->kind == HirExprKind::IntLit) {
-        const i32 a = static_cast<i32>(lhs->int_value);
-        const i32 b = static_cast<i32>(rhs->int_value);
-        const bool ovf = a == static_cast<i32>(0x80000000u) && b == -1;
-        i32 folded = 0;
-        switch (arith_kind) {
-            case HirExprKind::Add:
-                folded = static_cast<i32>(static_cast<u32>(a) + static_cast<u32>(b));
-                break;
-            case HirExprKind::Sub:
-                folded = static_cast<i32>(static_cast<u32>(a) - static_cast<u32>(b));
-                break;
-            case HirExprKind::Mul:
-                folded = static_cast<i32>(static_cast<u32>(a) * static_cast<u32>(b));
-                break;
-            case HirExprKind::Div:
-                folded = ovf ? static_cast<i32>(0x80000000u) : a / b;
-                break;
-            case HirExprKind::Mod:
-                folded = ovf ? 0 : a % b;
-                break;
-            default:
-                break;
-        }
         HirExpr out{};
         out.kind = HirExprKind::IntLit;
         out.type = HirTypeKind::I32;
         out.span = expr.span;
-        out.int_value = folded;
+        out.int_value = fold_arith_i32(
+            arith_kind, static_cast<i32>(lhs->int_value), static_cast<i32>(rhs->int_value));
         return out;
     }
     HirExpr out{};
@@ -9186,6 +9187,25 @@ static bool const_eval_expr(
     }
     if (expr.kind == HirExprKind::LocalRef && expr.local_index < local_count) {
         return const_eval_expr(locals[expr.local_index].init, locals, local_count, out, depth + 1);
+    }
+    if ((expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
+         expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
+         expr.kind == HirExprKind::Mod) &&
+        expr.lhs != nullptr && expr.rhs != nullptr) {
+        // Arithmetic over compile-time values (e.g. `if const n + 1 == 2`
+        // with a const local n). fold_arith_i32 keeps the semantics
+        // identical to the analyze fold and the compiled code; a const 0
+        // divisor takes the defined-0 path (the literal-0 compile error in
+        // analyze_arith_expr only covers a directly spelled `/ 0`).
+        ConstValue lhs{};
+        ConstValue rhs{};
+        if (!const_eval_expr(*expr.lhs, locals, local_count, &lhs, depth + 1)) return false;
+        if (!const_eval_expr(*expr.rhs, locals, local_count, &rhs, depth + 1)) return false;
+        if (lhs.type != HirTypeKind::I32 || rhs.type != HirTypeKind::I32) return false;
+        out->type = HirTypeKind::I32;
+        out->int_value = fold_arith_i32(
+            expr.kind, static_cast<i32>(lhs.int_value), static_cast<i32>(rhs.int_value));
+        return true;
     }
     if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
          expr.kind == HirExprKind::Gt) &&

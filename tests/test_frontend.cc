@@ -1526,6 +1526,92 @@ route GET "/x" {
     REQUIRE(hir);
 }
 
+TEST(frontend, const_if_folds_arithmetic_over_const_locals) {
+    // `if const` evaluates arithmetic over compile-time locals via
+    // const_eval_expr (fold_arith_i32 keeps semantics identical to the
+    // analyze fold / compiled code). A const 0 divisor takes the
+    // defined-0 path — only a directly spelled `/ 0` is a compile error.
+    const auto src = R"rut(
+route GET "/x" {
+    let n = 1
+    if const n + 1 == 2 { return 200 } else { return 500 }
+}
+route GET "/y" {
+    let z = 0
+    if const 7 / z == 0 && 7 % z == 0 { return 204 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bare_match_arm_body_keeps_line_wrapped_subtraction) {
+    // A line-initial `-` in a bare-expression arm body only ends the arm
+    // when it is an actual negative-literal pattern boundary
+    // (`- IntLit =>` / `- IntLit if`). Here the wrapped `- 1` IS
+    // Minus+IntLit but is followed by `_`, not `=>`, so the 3-token
+    // lookahead keeps it as the subtraction `a - 1`.
+    const auto src = R"rut(
+func pick(_ a: i32) -> i32 {
+    match a {
+        5 => a
+            - 1
+        _ => 0
+    }
+}
+route GET "/x" { if pick(5) == 4 { return 204 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bare_match_arm_negative_pattern_after_value_body) {
+    // The boundary DOES fire for a real negative-literal pattern after a
+    // bare value body: `5 => a` newline `-1 => 99` splits into two arms.
+    const auto src = R"rut(
+func pick(_ a: i32) -> i32 {
+    match a {
+        5 => a
+        -1 => 99
+        _ => 0
+    }
+}
+route GET "/x" { if pick(0 - 1) == 99 { return 204 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, braced_match_arm_body_keeps_cross_line_subtraction) {
     // Inside a braced arm body the arm-boundary rule is suspended (same as
     // for the newline-dot rule), so a cross-line `- 1` continues the
