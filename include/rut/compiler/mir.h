@@ -79,6 +79,7 @@ enum class MirTypeKind : u8 {
     Unknown,
     Bool,
     I32,
+    I64,
     Str,
     Variant,
     Tuple,

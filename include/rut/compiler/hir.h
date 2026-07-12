@@ -164,6 +164,10 @@ enum class HirTypeKind : u8 {
     Unknown,
     Bool,
     I32,
+    // 64-bit signed integer. Produced by the `i64(x)` conversion builtin and
+    // by int literals that don't fit i32; arithmetic/comparisons are
+    // same-type ({I32,I64}) — no implicit mixing.
+    I64,
     Str,
     Generic,
     Associated,
