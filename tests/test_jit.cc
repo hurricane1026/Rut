@@ -566,6 +566,46 @@ TEST(jit, frontend_arith_div_mod_guards_execute) {
     rir.destroy();
 }
 
+TEST(jit, frontend_match_negative_pattern_executes) {
+    const char* src =
+        "route GET \"/users\" { let a = 0 - 1 match a { -1 => return 204 _ => return 500 } "
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_arith_overflow_wraps_executes) {
     const char* src =
         "route GET \"/users\" { let big = 2147483647 let one = 1 "

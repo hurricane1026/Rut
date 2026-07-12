@@ -250,7 +250,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -845,10 +845,10 @@ struct Parser {
 
     // An arm body that starts with a statement keyword (or a brace) is
     // self-delimiting — only bare-expression bodies (and `return <expr>`
-    // tails) need the newline-dot arm boundary. Arithmetic operators need
-    // no handling here: patterns parse via parse_primary_expr and can never
-    // begin with `+ - * / %`, so a line-initial `-` inside an arm body is
-    // always a continuation of the previous expression.
+    // tails) need the newline-dot arm boundary. Of the arithmetic operators
+    // only `-` can begin a pattern (a negative int literal), so
+    // parse_add_expr mirrors the newline-dot rule for a line-initial `-`;
+    // `+ * / %` always continue the previous expression.
     bool arm_body_needs_dot_stop() const {
         const TokenType t = cur().type;
         if (t == TokenType::LBrace) return false;
@@ -873,6 +873,40 @@ struct Parser {
         return true;
     }
 
+    // `-<intlit>` fusion shared by unary parsing and match-arm patterns. The
+    // caller has consumed the `-`; cur() must be the IntLit. The magnitude
+    // accumulates in u32 with cap 2^31 so INT_MIN is representable;
+    // `(i32)(0u - mag)` wraps correctly for mag == 2^31.
+    FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
+        const Token tok = cur();
+        pos++;
+        u32 mag = 0;
+        for (u32 i = 0; i < tok.text.len; i++) {
+            const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
+            if (mag > (2147483648u - digit) / 10u)
+                return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
+            mag = mag * 10u + digit;
+        }
+        AstExpr lit{};
+        lit.kind = AstExprKind::IntLit;
+        lit.int_value = static_cast<i32>(0u - mag);
+        lit.span = Span{minus.start, tok.end, minus.line, minus.col};
+        return lit;
+    }
+
+    // Match-arm pattern position: a negative int literal (`-1 => ...`) is a
+    // valid pattern; anything else parses as a primary expression. Kept
+    // separate from parse_unary_expr so patterns never grow full unary
+    // parsing (`- -x`, `!x`) by accident.
+    FrontendResult<AstExpr> parse_arm_pattern_expr() {
+        if (cur().type == TokenType::Minus && peek().type == TokenType::IntLit) {
+            const Token minus = cur();
+            pos++;
+            return parse_fused_negative_int_lit(minus);
+        }
+        return parse_primary_expr();
+    }
+
     // Prefix `!` — Swift-identical logical not, binds tighter than comparisons.
     // Prefix `-` — either fuses with an immediately following int literal
     // (`-2147483648` is a valid literal; the positive-path cap in
@@ -893,24 +927,7 @@ struct Parser {
         }
         const Token* minus = take(TokenType::Minus);
         if (!minus) return parse_primary_expr();
-        if (cur().type == TokenType::IntLit) {
-            const Token tok = cur();
-            pos++;
-            // Accumulate the magnitude in u32 with cap 2^31 so INT_MIN is
-            // representable; `(i32)(0u - mag)` wraps correctly for mag == 2^31.
-            u32 mag = 0;
-            for (u32 i = 0; i < tok.text.len; i++) {
-                const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
-                if (mag > (2147483648u - digit) / 10u)
-                    return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
-                mag = mag * 10u + digit;
-            }
-            AstExpr lit{};
-            lit.kind = AstExprKind::IntLit;
-            lit.int_value = static_cast<i32>(0u - mag);
-            lit.span = Span{minus->start, tok.end, minus->line, minus->col};
-            return lit;
-        }
+        if (cur().type == TokenType::IntLit) return parse_fused_negative_int_lit(*minus);
         auto operand = parse_unary_expr();
         if (!operand) return core::make_unexpected(operand.error());
         AstExpr zero{};
@@ -965,6 +982,10 @@ struct Parser {
         if (!lhs) return core::make_unexpected(lhs.error());
         while (true) {
             AstExprKind kind = AstExprKind::Ident;
+            if (arm_body_stops_cross_line_dot && arm_body_dot_stop_depth == 0 &&
+                cur().type == TokenType::Minus && pos > 0 && cur().line != prev().line) {
+                break;  // new-line `-N` starts the next match arm's pattern
+            }
             if (take(TokenType::Plus))
                 kind = AstExprKind::Add;
             else if (take(TokenType::Minus))
@@ -1211,7 +1232,7 @@ struct Parser {
                     if (take(TokenType::Underscore)) {
                         arm.is_wildcard = true;
                     } else {
-                        auto pattern = parse_primary_expr();
+                        auto pattern = parse_arm_pattern_expr();
                         if (!pattern) return core::make_unexpected(pattern.error());
                         auto pattern_ptr = alloc_expr(pattern.value());
                         if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -1830,7 +1851,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -2233,7 +2254,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());

@@ -1498,6 +1498,65 @@ TEST(frontend, arith_expr_as_pipe_lhs_and_call_arg) {
     rir.destroy();
 }
 
+TEST(frontend, match_arm_negative_int_literal_patterns) {
+    // Negative int literals are valid arm patterns, and a line-initial `-`
+    // after a bare-expression/`return <expr>` arm body starts the next
+    // arm's pattern instead of continuing as subtraction (the newline-dot
+    // arm-boundary rule, mirrored for minus).
+    const auto src = R"rut(
+route GET "/x" {
+    let code = -1
+    match code {
+        200 => return 200
+        -1 => return 204
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1]->match_arms.len, 3u);
+    REQUIRE(route.statements[1]->match_arms[1].pattern != nullptr);
+    CHECK_EQ(route.statements[1]->match_arms[1].pattern->int_value, -1);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, braced_match_arm_body_keeps_cross_line_subtraction) {
+    // Inside a braced arm body the arm-boundary rule is suspended (same as
+    // for the newline-dot rule), so a cross-line `- 1` continues the
+    // previous expression as subtraction.
+    const auto src = R"rut(
+route GET "/x" {
+    let a = 5
+    match a {
+        5 => {
+            let v = a
+                - 1
+            if v == 4 { return 204 } else { return 500 }
+        }
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, arith_in_guard_if_and_match_scrutinee) {
     // A match nested inside an if branch is an unsupported route-control
     // shape independent of arithmetic, so match gets its own route.
