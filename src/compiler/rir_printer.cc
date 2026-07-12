@@ -244,6 +244,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::Mod:
             buf.put_cstr("arith.mod");
             break;
+        case Opcode::SextI64:
+            buf.put_cstr("sext.i64");
+            break;
         case Opcode::BitShl:
             buf.put_cstr("bit.shl");
             break;
@@ -566,6 +569,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[0]);
             break;
         case Opcode::ReqSetPath:
+        case Opcode::SextI64:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;

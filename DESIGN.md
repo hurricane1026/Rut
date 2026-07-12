@@ -242,13 +242,28 @@ bitwise.and(a, b)    bitwise.or(a, b)    bitwise.xor(a, b)    bitwise.flip(a)
 bitwise.shiftLeft(a, n)    bitwise.shiftRight(a, n)
 ```
 
-Arithmetic is i32-only and total: overflow wraps two's-complement, and `x / 0` /
-`x % 0` evaluate to `0` — no traps, no undefined behavior (a SIGFPE would take
-down the whole shard; totality is the eBPF-style boundary the runtime needs).
-`INT_MIN / -1` wraps to `INT_MIN`; `INT_MIN % -1` is `0`. A literal zero divisor
-is a compile-time error. Unary minus is ordinary negation (`-x` is `0 - x`);
-`-2147483648` is a valid literal. Duration/ByteSize arithmetic (§3.3) is a
-separate, later surface.
+Arithmetic is total over `i32` and `i64`: overflow wraps two's-complement, and
+`x / 0` / `x % 0` evaluate to `0` — no traps, no undefined behavior (a SIGFPE
+would take down the whole shard; totality is the eBPF-style boundary the
+runtime needs). `INT_MIN / -1` wraps to `INT_MIN`; `INT_MIN % -1` is `0` (same
+at 64 bits). A literal zero divisor is a compile-time error. Unary minus is
+ordinary negation (`-x` is `0 - x`); `-2147483648` is a valid literal.
+
+The two integer widths never mix implicitly:
+
+- An int literal types as `i32` when it fits, else `i64` (`60000000000` just
+  works); beyond the i64 range it is a compile error.
+- `i64(x)` is the conversion (Swift-initializer style): it widens an i32
+  value, folds on literals, and is identity on i64. A user function named
+  `i64` shadows the builtin. There is no narrowing conversion yet.
+- Arithmetic and comparisons require same-width operands; mixing a non-literal
+  i32 with an i64 is a compile error with an `i64(x)` fix-it. A bare int
+  literal adopts the i64 side (`i64(x) + 1` works).
+- `i64` is deliberately unnameable in type position (like ByteSize): no
+  annotations, no struct fields, no function parameters. `match` on an i64
+  subject and `bitwise.*` over i64 are rejected for now.
+
+Duration/ByteSize arithmetic (§3.3) is a separate, later surface.
 
 Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
 force-unwrap. Use named fallback and explicit binding instead:

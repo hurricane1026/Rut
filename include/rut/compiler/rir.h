@@ -197,11 +197,12 @@ enum class Opcode : u8 {
     BitShr,  // %r = bit.shr %a, %n  → i32 (arithmetic; n outside 0..31 → sign fill)
 
     // ── Arithmetic (i32; overflow wraps two's-complement) ──
-    Add,  // %r = arith.add %a, %b → i32
-    Sub,  // %r = arith.sub %a, %b → i32
-    Mul,  // %r = arith.mul %a, %b → i32
-    Div,  // %r = arith.div %a, %b → i32 (b == 0 → 0; INT_MIN / -1 → INT_MIN)
-    Mod,  // %r = arith.mod %a, %b → i32 (b == 0 → 0; INT_MIN % -1 → 0)
+    Add,      // %r = arith.add %a, %b → i32
+    Sub,      // %r = arith.sub %a, %b → i32
+    Mul,      // %r = arith.mul %a, %b → i32
+    Div,      // %r = arith.div %a, %b → i32 (b == 0 → 0; INT_MIN / -1 → INT_MIN)
+    Mod,      // %r = arith.mod %a, %b → i32 (b == 0 → 0; INT_MIN % -1 → 0)
+    SextI64,  // %r = sext.i64 %a → i64 (sign-extend i32; the `i64(x)` builtin)
 
     // ── Domain operations ──
     TimeNow,         // %r = time.now               → Time

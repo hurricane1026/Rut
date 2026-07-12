@@ -1351,20 +1351,278 @@ TEST(frontend, parse_negative_int_literals_and_unary_minus) {
     CHECK_EQ(hir->routes[0].locals[2].init.int_value, 5);
 }
 
-TEST(frontend, parse_rejects_int_literal_overflow_still) {
-    const char* over = "route GET \"/x\" { let x = 2147483648 return 200 }\n";
-    auto lexed = lex(lit(over));
+TEST(frontend, int_literal_widening_thresholds) {
+    // Literal auto-widening: fits i32 → I32; fits i64 → I64; beyond → error.
+    const char* widen =
+        "route GET \"/x\" { let a = 2147483647 let b = 2147483648 let c = "
+        "9223372036854775807 let d = -2147483648 let e = -2147483649 let f = "
+        "-9223372036854775808 return 200 }\n";
+    auto lexed = lex(lit(widen));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 6u);
+    const HirTypeKind expected_types[6] = {HirTypeKind::I32,
+                                           HirTypeKind::I64,
+                                           HirTypeKind::I64,
+                                           HirTypeKind::I32,
+                                           HirTypeKind::I64,
+                                           HirTypeKind::I64};
+    const i64 expected_values[6] = {2147483647LL,
+                                    2147483648LL,
+                                    9223372036854775807LL,
+                                    -2147483648LL,
+                                    -2147483649LL,
+                                    static_cast<i64>(0x8000000000000000ull)};
+    for (u32 i = 0; i < 6; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(expected_types[i]));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected_values[i]);
+    }
+
+    const char* over = "route GET \"/x\" { let x = 9223372036854775808 return 200 }\n";
+    lexed = lex(lit(over));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
 
-    const char* under = "route GET \"/x\" { let x = -2147483649 return 200 }\n";
+    const char* under = "route GET \"/x\" { let x = -9223372036854775809 return 200 }\n";
     lexed = lex(lit(under));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+}
+
+TEST(frontend, analyze_i64_builtin_folds_literals_and_identity) {
+    const char* src =
+        "route GET \"/x\" { let a = i64(5) let b = i64(-3) let c = i64(i64(7)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    const i64 expected[3] = {5, -3, 7};
+    for (u32 i = 0; i < 3; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(HirTypeKind::I64));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_i64_builtin_widens_runtime_i32_through_pipeline) {
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) if w == i64(5) { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_user_func_named_i64_shadows_builtin) {
+    // A user function named i64 wins over the conversion builtin — the call
+    // resolves to the function (wrong arg type here → its own error, not
+    // the builtin's kI64ArgDetail path succeeding).
+    const char* src =
+        "func i64(_ s: str) -> i32 => 1\n"
+        "route GET \"/x\" { let v = i64(\"a\") if v == 1 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_i64_arith_folds_at_boundaries) {
+    const char* src =
+        "route GET \"/x\" { let a = 9223372036854775807 + 1 let b = -9223372036854775808 - 1 "
+        "let d = -9223372036854775808 / -1 let m = -9223372036854775808 % -1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, static_cast<i64>(0x8000000000000000ull));
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 9223372036854775807LL);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, static_cast<i64>(0x8000000000000000ull));
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 0);
+
+    const char* div_zero = "route GET \"/x\" { let v = i64(7) / 0 return 200 }\n";
+    lexed = lex(lit(div_zero));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_arith_literal_adopts_i64_operand) {
+    // A bare i32-typed int literal next to an i64 operand adopts I64 —
+    // required for `-i64(x)` (parser desugars to Sub(0, x)) and `i64(x) + 1`.
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) let p = w + 1 let q = 1 + w let n = -w "
+        "if p == i64(6) && q == i64(6) && n == -5 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_mixed_width_arith_and_cmp) {
+    const char* arith = "route GET \"/x\" { let a = 5 let w = i64(9) let v = a + w return 200 }\n";
+    auto lexed = lex(lit(arith));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+
+    const char* cmp =
+        "route GET \"/x\" { let a = 5 let w = i64(9) if a < w { return 200 } "
+        "else { return 500 } }\n";
+    lexed = lex(lit(cmp));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, const_eval_i64_in_if_const) {
+    const char* src =
+        "route GET \"/x\" { let n = 2147483648 if const n + 2 == 2147483650 { return 200 } "
+        "else { return 500 } }\n"
+        "route GET \"/y\" { let w = i64(2) if const w + 2147483648 == 2147483650 { return 204 "
+        "} else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_match_on_i64_subject) {
+    // Route control match.
+    const char* route_match = "route GET \"/x\" { let w = i64(5) match w { _ => return 500 } }\n";
+    auto lexed = lex(lit(route_match));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Function-body match.
+    const char* func_match =
+        "func pick(_ a: i32) -> i32 { match i64(a) { _ => 0 } }\n"
+        "route GET \"/x\" { if pick(5) == 0 { return 200 } else { return 500 } }\n";
+    lexed = lex(lit(func_match));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Const match.
+    const char* const_match =
+        "route GET \"/x\" { let w = i64(5) match const w { _ => return 500 } }\n";
+    lexed = lex(lit(const_match));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_rejects_bitwise_i64_operand) {
+    const char* src = "route GET \"/x\" { let v = bitwise.and(i64(1), 2) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_rejects_i64_type_annotation) {
+    // i64 is deliberately unnameable in type position (like ByteSize) —
+    // the only surfaces are literals and i64(x).
+    const char* func_param =
+        "func f(_ x: i64) -> i32 => 1\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(func_param));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_i64_tuple_element_and_pipe_placeholder) {
+    const char* src =
+        "route GET \"/x\" { let a = 5 let t = (i64(1), 2) let w = a | i64(_) if w == i64(5) { "
+        "return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {
+    const char* src = "route GET \"/x\" { wait(timer(4294967296)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, analyze_folds_int_min_div_and_mod_guards) {

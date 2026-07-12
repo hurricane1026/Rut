@@ -545,6 +545,11 @@ static FrontendResult<const rir::Type*> rir_type_for_shape(
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
         return ty.value();
     }
+    if (type == MirTypeKind::I64) {
+        auto ty = b.make_type(rir::TypeKind::I64);
+        if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
+        return ty.value();
+    }
     if (type == MirTypeKind::Str) {
         auto ty = b.make_type(rir::TypeKind::Str);
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
@@ -708,8 +713,9 @@ static FrontendResult<rir::ValueId> emit_eq_for_shape(MirTypeKind type,
                                                       const rir::StructDef* const* user_struct_defs,
                                                       rir::Builder& b,
                                                       Span span) {
-    if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::Str ||
-        type == MirTypeKind::Method || type == MirTypeKind::ByteSize || type == MirTypeKind::IP) {
+    if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::I64 ||
+        type == MirTypeKind::Str || type == MirTypeKind::Method || type == MirTypeKind::ByteSize ||
+        type == MirTypeKind::IP) {
         auto cmp = b.emit_cmp(rir::Opcode::CmpEq, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
         return cmp.value();
@@ -942,7 +948,7 @@ static FrontendResult<rir::ValueId> emit_ord_for_shape(
     rir::Builder& b,
     Span span,
     bool less_than) {
-    if (type == MirTypeKind::I32 || type == MirTypeKind::Str) {
+    if (type == MirTypeKind::I32 || type == MirTypeKind::I64 || type == MirTypeKind::Str) {
         auto op = less_than ? rir::Opcode::CmpLt : rir::Opcode::CmpGt;
         auto cmp = b.emit_cmp(op, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
@@ -1200,7 +1206,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::IntConst) {
-        auto v = b.emit_const_i32(value.int_value, {span.line, span.col});
+        auto v = value.type == MirTypeKind::I64
+                     ? b.emit_const_i64(value.int_value, {span.line, span.col})
+                     : b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
@@ -1317,11 +1325,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             }
         }
         if (!has_any_payload && variant_infos[variant_index].struct_type == nullptr) {
-            auto v = b.emit_const_i32(value.int_value, {span.line, span.col});
+            auto v = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
             if (!v) return frontend_error(FrontendError::OutOfMemory, span);
             return v.value();
         }
-        auto tag = b.emit_const_i32(value.int_value, {span.line, span.col});
+        auto tag = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!tag) return frontend_error(FrontendError::OutOfMemory, span);
         rir::ValueId payload_bool{};
         rir::ValueId payload_i32{};
@@ -1612,7 +1620,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::Error) {
-        auto v = b.emit_const_i32(value.int_value, {span.line, span.col});
+        auto v = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
@@ -1844,7 +1852,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                     if (branch.kind != MirValueKind::Error) return branch_id;
                     const i32 tag_value = branch.error_variant_index != 0xffffffffu
                                               ? static_cast<i32>(branch.error_case_index)
-                                              : branch.int_value;
+                                              : static_cast<i32>(branch.int_value);
                     auto code = b.emit_const_i32(tag_value, {span.line, span.col});
                     if (!code) return frontend_error(FrontendError::OutOfMemory, span);
                     auto msg = b.emit_const_str(branch.msg, {span.line, span.col});
@@ -2276,6 +2284,25 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
+    if (value.kind == MirValueKind::WidenI64) {
+        auto operand = materialize_value(*value.lhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+        if (!operand) return core::make_unexpected(operand.error());
+        auto out = b.emit_sext_i64(operand.value(), {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::Eq || value.kind == MirValueKind::Lt ||
         value.kind == MirValueKind::Gt) {
         const MirValue& lhs_expr = *value.lhs;
@@ -2426,7 +2453,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
         if (local.init.kind == MirValueKind::Error) {
             const i32 tag_value = local.init.error_variant_index != 0xffffffffu
                                       ? static_cast<i32>(local.init.error_case_index)
-                                      : local.init.int_value;
+                                      : static_cast<i32>(local.init.int_value);
             auto code = b.emit_const_i32(tag_value, {local.span.line, local.span.col});
             if (!code) return frontend_error(FrontendError::OutOfMemory, local.span);
             auto msg = b.emit_const_str(local.init.msg, {local.span.line, local.span.col});

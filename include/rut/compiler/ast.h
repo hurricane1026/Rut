@@ -175,7 +175,7 @@ struct AstExpr {
     AstExprKind kind = AstExprKind::BoolLit;
     Span span{};
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     Str msg{};
     Str name{};

@@ -506,12 +506,14 @@ struct Parser {
         if (cur().type == TokenType::IntLit) {
             const Token tok = cur();
             pos++;
-            i32 value = 0;
+            // Literals accumulate to i64 (cap INT64_MAX); analyze types the
+            // result I32 when it fits i32, else I64 (oversized auto-widening).
+            i64 value = 0;
             for (u32 i = 0; i < tok.text.len; i++) {
-                const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
-                if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
+                const i64 digit = static_cast<i64>(tok.text.ptr[i] - '0');
+                if (value > (static_cast<i64>(0x7fffffffffffffff) - digit) / 10)
                     return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
-                value = value * 10 + static_cast<i32>(digit);
+                value = value * 10 + digit;
             }
             expr.kind = AstExprKind::IntLit;
             expr.int_value = value;
@@ -875,21 +877,21 @@ struct Parser {
 
     // `-<intlit>` fusion shared by unary parsing and match-arm patterns. The
     // caller has consumed the `-`; cur() must be the IntLit. The magnitude
-    // accumulates in u32 with cap 2^31 so INT_MIN is representable;
-    // `(i32)(0u - mag)` wraps correctly for mag == 2^31.
+    // accumulates in u64 with cap 2^63 so INT64_MIN is representable;
+    // `(i64)(0ull - mag)` wraps correctly for mag == 2^63.
     FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
         const Token tok = cur();
         pos++;
-        u32 mag = 0;
+        u64 mag = 0;
         for (u32 i = 0; i < tok.text.len; i++) {
-            const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
-            if (mag > (2147483648u - digit) / 10u)
+            const u64 digit = static_cast<u64>(tok.text.ptr[i] - '0');
+            if (mag > (9223372036854775808ull - digit) / 10ull)
                 return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
-            mag = mag * 10u + digit;
+            mag = mag * 10ull + digit;
         }
         AstExpr lit{};
         lit.kind = AstExprKind::IntLit;
-        lit.int_value = static_cast<i32>(0u - mag);
+        lit.int_value = static_cast<i64>(0ull - mag);
         lit.span = Span{minus.start, tok.end, minus.line, minus.col};
         return lit;
     }

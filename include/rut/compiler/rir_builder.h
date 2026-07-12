@@ -728,13 +728,24 @@ struct Builder {
     Result<ValueId> emit_arith(Opcode arith_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
         if (!is_arith_opcode(arith_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
-        if (!val_has_type(lhs, TypeKind::I32) || !val_has_type(rhs, TypeKind::I32))
-            return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
+        // Same-width integer operands only: both i32 or both i64.
+        const bool both_i32 = val_has_type(lhs, TypeKind::I32) && val_has_type(rhs, TypeKind::I32);
+        const bool both_i64 = val_has_type(lhs, TypeKind::I64) && val_has_type(rhs, TypeKind::I64);
+        if (!both_i32 && !both_i64) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
         auto [inst, vid] = TRY(emit(arith_op, ty, loc));
         inst->operands[0] = lhs;
         inst->operands[1] = rhs;
         inst->operand_count = 2;
+        return vid;
+    }
+
+    Result<ValueId> emit_sext_i64(ValueId v, SourceLoc loc = {}) {
+        if (!valid_val(v) || !val_has_type(v, TypeKind::I32)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I64));
+        auto [inst, vid] = TRY(emit(Opcode::SextI64, ty, loc));
+        inst->operands[0] = v;
+        inst->operand_count = 1;
         return vid;
     }
 

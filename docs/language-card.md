@@ -55,8 +55,12 @@ json({ users: [], total: 0 })           // ⏳ object literal (no object-literal
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
 |                                       // pipeline ONLY (see below)
-+  -  *  /  %                           // arithmetic (i32; wraps on overflow; x / 0 == 0,
-                                        // x % 0 == 0; literal / 0 is a compile error; -x OK)
++  -  *  /  %                           // arithmetic (i32/i64, same-width operands; wraps on
+                                        // overflow; x / 0 == 0, x % 0 == 0; literal / 0 is a
+                                        // compile error; -x OK)
+i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
+                                        // don't fit i32 are i64 automatically; no i64 type
+                                        // annotations, no narrowing, no match on i64)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type

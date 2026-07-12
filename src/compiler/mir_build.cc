@@ -48,6 +48,7 @@ static Str match_default_label() {
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
     return kind == HirTypeKind::Bool       ? MirTypeKind::Bool
            : kind == HirTypeKind::I32      ? MirTypeKind::I32
+           : kind == HirTypeKind::I64      ? MirTypeKind::I64
            : kind == HirTypeKind::Str      ? MirTypeKind::Str
            : kind == HirTypeKind::Method   ? MirTypeKind::Method
            : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
@@ -249,7 +250,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     }
     if (expr.kind == HirExprKind::IntLit) {
         v.kind = MirValueKind::IntConst;
-        v.type = MirTypeKind::I32;
+        v.type = mir_type_kind(expr.type);  // I32 or I64
         v.int_value = expr.int_value;
         return v;
     }
@@ -556,10 +557,21 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         const bool is_cmp = expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
                             expr.kind == HirExprKind::Gt;
-        v.type = is_cmp ? MirTypeKind::Bool : MirTypeKind::I32;
+        // Bit ops stay I32; arith carries the operand width (I32 or I64).
+        v.type = is_cmp ? MirTypeKind::Bool : mir_type_kind(expr.type);
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
         v.error_variant_index = expr.error_variant_index;
+        return v;
+    }
+    if (expr.kind == HirExprKind::WidenI64) {
+        auto operand = mir_value(*expr.lhs, module, fn, ctx);
+        if (!operand) return core::make_unexpected(operand.error());
+        if (!fn->values.push(operand.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::WidenI64;
+        v.type = MirTypeKind::I64;
+        v.lhs = &fn->values[fn->values.len - 1];
         return v;
     }
     if (expr.kind == HirExprKind::IfElse) {

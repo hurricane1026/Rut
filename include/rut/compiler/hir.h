@@ -148,6 +148,9 @@ enum class HirExprKind : u8 {
     Mul,
     Div,
     Mod,
+    // Sign-extend a runtime i32 to i64 — produced only by the `i64(x)`
+    // builtin (literals fold at analyze time). Operand in lhs; result I64.
+    WidenI64,
     Or,
     NoError,
     HasValue,
@@ -382,7 +385,7 @@ struct HirExpr {
     bool may_nil = false;
     bool may_error = false;
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     Str msg{};
     u32 local_index = 0;

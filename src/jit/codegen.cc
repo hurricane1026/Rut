@@ -1143,13 +1143,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::Div:
         case rir::Opcode::Mod: {
             // sdiv/srem are poison for b == 0 and INT_MIN / -1; feed them a
-            // safe divisor and select the defined results instead.
+            // safe divisor and select the defined results instead. Guard
+            // constants follow the operand width (i32 or i64).
             LLVMValueRef a = c.get_value(inst.operands[0]);
             LLVMValueRef b = c.get_value(inst.operands[1]);
-            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
-            LLVMValueRef int_min = LLVMConstInt(c.i32_ty, static_cast<u64>(0x80000000u), 0);
-            LLVMValueRef neg_one =
-                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(-1)), 0);
+            const rir::Type* lhs_ty = c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap
+                                          ? c.cur_fn->values[inst.operands[0].id].type
+                                          : nullptr;
+            const bool is64 = lhs_ty && lhs_ty->kind == rir::TypeKind::I64;
+            LLVMTypeRef w = is64 ? c.i64_ty : c.i32_ty;
+            LLVMValueRef zero = LLVMConstInt(w, 0, 0);
+            LLVMValueRef int_min =
+                LLVMConstInt(w, is64 ? 0x8000000000000000ull : static_cast<u64>(0x80000000u), 0);
+            LLVMValueRef neg_one = LLVMConstAllOnes(w);
             LLVMValueRef is_zero = LLVMBuildICmp(c.builder, LLVMIntEQ, b, zero, "arith.div.zero");
             LLVMValueRef is_min = LLVMBuildICmp(c.builder, LLVMIntEQ, a, int_min, "arith.div.min");
             LLVMValueRef is_neg1 =
@@ -1157,7 +1163,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef ovf = LLVMBuildAnd(c.builder, is_min, is_neg1, "arith.div.ovf");
             LLVMValueRef bad = LLVMBuildOr(c.builder, is_zero, ovf, "arith.div.bad");
             LLVMValueRef safe_b =
-                LLVMBuildSelect(c.builder, bad, LLVMConstInt(c.i32_ty, 1, 0), b, "arith.div.safeb");
+                LLVMBuildSelect(c.builder, bad, LLVMConstInt(w, 1, 0), b, "arith.div.safeb");
             if (inst.op == rir::Opcode::Div) {
                 LLVMValueRef raw = LLVMBuildSDiv(c.builder, a, safe_b, "arith.div.raw");
                 LLVMValueRef ovf_val =
@@ -1170,6 +1176,13 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMValueRef r = LLVMBuildSelect(c.builder, bad, zero, raw, "arith.mod");
                 c.set_value(inst.result, r);
             }
+            break;
+        }
+
+        case rir::Opcode::SextI64: {
+            LLVMValueRef v =
+                LLVMBuildSExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "sext.i64");
+            c.set_value(inst.result, v);
             break;
         }
 
