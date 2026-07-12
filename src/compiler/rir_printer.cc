@@ -229,6 +229,21 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BitXor:
             buf.put_cstr("bit.xor");
             break;
+        case Opcode::Add:
+            buf.put_cstr("arith.add");
+            break;
+        case Opcode::Sub:
+            buf.put_cstr("arith.sub");
+            break;
+        case Opcode::Mul:
+            buf.put_cstr("arith.mul");
+            break;
+        case Opcode::Div:
+            buf.put_cstr("arith.div");
+            break;
+        case Opcode::Mod:
+            buf.put_cstr("arith.mod");
+            break;
         case Opcode::BitShl:
             buf.put_cstr("bit.shl");
             break;
@@ -573,6 +588,11 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::BitXor:
         case Opcode::BitShl:
         case Opcode::BitShr:
+        case Opcode::Add:
+        case Opcode::Sub:
+        case Opcode::Mul:
+        case Opcode::Div:
+        case Opcode::Mod:
         case Opcode::TimeDiff:
             // Binary: %a, %b
             buf.put(' ');

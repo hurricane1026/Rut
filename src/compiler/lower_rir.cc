@@ -2220,7 +2220,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::BitAnd || value.kind == MirValueKind::BitOr ||
         value.kind == MirValueKind::BitXor || value.kind == MirValueKind::BitShl ||
-        value.kind == MirValueKind::BitShr) {
+        value.kind == MirValueKind::BitShr || value.kind == MirValueKind::Add ||
+        value.kind == MirValueKind::Sub || value.kind == MirValueKind::Mul ||
+        value.kind == MirValueKind::Div || value.kind == MirValueKind::Mod) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
                                      variant_infos,
@@ -2258,7 +2260,19 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             op = rir::Opcode::BitShl;
         else if (value.kind == MirValueKind::BitShr)
             op = rir::Opcode::BitShr;
-        auto out = b.emit_bit(op, lhs.value(), rhs.value(), {span.line, span.col});
+        else if (value.kind == MirValueKind::Add)
+            op = rir::Opcode::Add;
+        else if (value.kind == MirValueKind::Sub)
+            op = rir::Opcode::Sub;
+        else if (value.kind == MirValueKind::Mul)
+            op = rir::Opcode::Mul;
+        else if (value.kind == MirValueKind::Div)
+            op = rir::Opcode::Div;
+        else if (value.kind == MirValueKind::Mod)
+            op = rir::Opcode::Mod;
+        auto out = rir::Builder::is_arith_opcode(op)
+                       ? b.emit_arith(op, lhs.value(), rhs.value(), {span.line, span.col})
+                       : b.emit_bit(op, lhs.value(), rhs.value(), {span.line, span.col});
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }

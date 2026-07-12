@@ -710,6 +710,34 @@ struct Builder {
         return vid;
     }
 
+    // ── Arithmetic ──────────────────────────────────────────────────
+
+    static bool is_arith_opcode(Opcode op) {
+        switch (op) {
+            case Opcode::Add:
+            case Opcode::Sub:
+            case Opcode::Mul:
+            case Opcode::Div:
+            case Opcode::Mod:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    Result<ValueId> emit_arith(Opcode arith_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
+        if (!is_arith_opcode(arith_op) || !valid_val(lhs) || !valid_val(rhs))
+            return err(RirError::InvalidState);
+        if (!val_has_type(lhs, TypeKind::I32) || !val_has_type(rhs, TypeKind::I32))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(arith_op, ty, loc));
+        inst->operands[0] = lhs;
+        inst->operands[1] = rhs;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     // ── Domain operations ───────────────────────────────────────────
 
     Result<ValueId> emit_time_now(SourceLoc loc = {}) {
