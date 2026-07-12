@@ -610,19 +610,38 @@ call arguments (see §3.2.1), not as response construction.
 
 #### 3.3.6 State Types
 
+> **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is
+> restructured around "algorithms in Rut, primitives in the runtime".
+> `Counter<K>` is deleted — token bucket / sliding window are `.rut`
+> library code over `Cache` (see `examples/ratelimit.rut`). Gauge-style
+> in-flight counting will get an exact Array-style table, not lossy slots.
+
 All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
-**Hash<K, V>** — general key-value store.
+**Cache<K, i64>** — lossy per-key state slots (✅ shipped as `Cache<IP, i64>`).
 
 ```swift
-let sessions = Hash<string, Session>(capacity: 50000, ttl: 30m)
+let buckets = Cache<IP, i64>(capacity: 100000)
 
-sessions.set(sid, user)
-let user = sessions.get(sid)       // V?
-sessions.delete(sid)
-sessions.contains(sid)             // bool
+buckets.get(key)      // i64? — nil means "never seen OR evicted"; the two
+                      // are indistinguishable by design — always handle it
+                      // (blessed idiom: .or(0))
+buckets.set(key, v)   // bare statement, before any guard/wait; a colliding
+                      // set may evict a neighbor at any occupancy
 ```
+
+Under fixed capacity there is no third option: when capacity or a collision
+budget is exceeded, either the write fails visibly or old data dies (eBPF's
+`HASH` vs `LRU_HASH` split). `Cache` evicts — so **never store anything in
+a `Cache` whose absence yields a wrong answer** (sessions, in-flight
+counts). Multi-field algorithm state packs into the single i64 with
+`bitwise.*`; expiry is lazy (window index in the value), there is no `ttl:`.
+The name `Hash` is **reserved** for a future strict, visible-failure table:
+"hash map" carries a lossless prior this structure does not honor. (The
+former `Hash<string, Session>` example is retired for a second reason:
+per-shard KV gives wrong answers for cross-connection sessions; that use
+case needs `consistent:`/`backend:` machinery.)
 
 **LRU<K, V>** — key-value with LRU eviction when full.
 
@@ -670,24 +689,10 @@ blacklist.remove(ip)
 Compiler picks implementation by element type: `Set<IP>` / `Set<string>` → hash set,
 `Set<CIDR>` → LPM trie (longest prefix match tree).
 
-**Counter\<K>** — rate limiting counters. Two algorithms:
-
-```swift
-// Sliding window (default) — "max N requests per window"
-let apiLimits = Counter<IP>(capacity: 100000, window: 1m)
-apiLimits.incr(req.remoteAddr)         // +1, returns current count in window
-apiLimits.get(req.remoteAddr)          // current count in window
-guard apiLimits.get(req.remoteAddr) <= 1000 else { return 429 }
-
-// Token bucket — "rate N/min, allow burst of B"
-let burstLimits = Counter<IP>(capacity: 100000, rate: 100, burst: 20)
-guard burstLimits.take(req.remoteAddr) else { return 429 }
-// take: consume 1 token, returns false if empty
-// refills at 100/min, max 20 tokens accumulated
-```
-
-Compiler detects algorithm by parameters: `window:` → sliding window,
-`rate:` + `burst:` → token bucket.
+**Rate limiting** is not a state type: GCRA token buckets and packed
+sliding windows are ordinary `.rut` code over `Cache<K, i64>` (the blessed
+implementations live in `examples/ratelimit.rut`; the real-socket e2e test
+pins their admission sequence against the `@rateLimit` decorator).
 
 **Bloom\<T>** — probabilistic set, memory-efficient for large cardinalities.
 No false negatives; possible false positives.
@@ -719,14 +724,13 @@ Use cases: feature flags, upstream health status, compact boolean arrays.
 | Parameter | Applies to | Description |
 |-----------|-----------|-------------|
 | `capacity:` | all (required) | Max entries, compile-time bound |
-| `ttl:` | Hash, LRU, Counter | Entry expiry time; Counter's ttl is the sliding window |
-| `window:` | Counter (required) | Alias for ttl, preferred for Counter |
+| `ttl:` | LRU | Entry expiry time (Cache has no ttl — expiry is lazy, packed into the value) |
 | `errorRate:` | Bloom (required) | False positive rate, determines memory usage |
 | `size:` | Bitmap (required) | Number of bits |
 | `persist: true` | all | Preserve data across hot reload; compile error if struct layout changed |
-| `consistent: true` | Hash, Set, Counter | Route ops to owner shard by key hash; strong consistency, SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
+| `consistent: true` | Cache, Set | Route ops to owner shard by key hash; strong consistency, SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
 | `coalesce: true` | LRU | Request coalescing — on cache miss with in-flight request for same key, suspend and wait instead of sending duplicate upstream request |
-| `backend: .redis(addr)` | Hash, Counter, Set | Cross-node state sync via external storage; per-shard state becomes a local cache with Redis as source of truth |
+| `backend: .redis(addr)` | Cache, Set | Cross-node state sync via external storage; per-shard state becomes a local cache with Redis as source of truth |
 
 **All state is per-shard by default.** Each shard owns an independent copy, single-threaded access,
 zero locking. Per-shard counters are approximate (effective limit ≈ `limit × shard_count`).
@@ -769,12 +773,12 @@ processed sequentially — no locks, just SPSC message round-trip.
 
 ```swift
 // rut:allow(consistent)
-let exactLimits = Counter<IP>(capacity: 100000, window: 1m, consistent: true)
+let exactBuckets = Cache<IP, i64>(capacity: 100000, consistent: true)
 
 get /api/*path {
     // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
-    exactLimits.incr(req.remoteAddr)
-    guard exactLimits.get(req.remoteAddr) <= 1000 else { return 429 }
+    let tat = exactBuckets.get(req.remoteAddr).or(0)
+    // ... GCRA over tat (examples/ratelimit.rut), exact across shards
     return forward(userService)
 }
 ```
@@ -802,13 +806,10 @@ use `backend:` to sync via external storage:
 
 ```swift
 // Per-process only (default) — fast, approximate
-let limits = Counter<IP>(capacity: 100000, window: 1m)
+let buckets = Cache<IP, i64>(capacity: 100000)
 
-// Cross-node via Redis — exact cluster-wide counting
-let globalLimits = Counter<IP>(capacity: 100000, window: 1m, backend: .redis("redis:6379"))
-
-// Cross-node session store
-let sessions = Hash<string, Session>(capacity: 100000, ttl: 30m, backend: .redis("redis:6379"))
+// Cross-node via Redis — exact cluster-wide buckets
+let globalBuckets = Cache<IP, i64>(capacity: 100000, backend: .redis("redis:6379"))
 ```
 
 With `backend:`, per-shard state acts as a local cache. Writes go to both
