@@ -56,6 +56,22 @@ constexpr Str kI64FallibleDetail = lit_str(
 constexpr Str kI64ArgDetail = lit_str(
     "i64() expects exactly one plain i32 or i64 value; bind optional or "
     "fallible values first with guard let / if let / .or(default)");
+// Cache<K, i64> state declarations and ops (docs/state-types.md §4).
+constexpr Str kStateDeclDetail = lit_str(
+    "top-level let declares state; only Cache<IP, i64>(capacity: N) is "
+    "supported");
+constexpr Str kCacheCapacityDetail = lit_str(
+    "Cache capacity must be a positive int literal (slot count, rounded up "
+    "to a power of two; capacity is capped at 4194304 slots)");
+constexpr Str kCacheDupNameDetail = lit_str("duplicate Cache declaration name");
+constexpr Str kCacheGetDetail =
+    lit_str("cache.get(key) expects exactly one plain IP key (e.g. req.remoteAddr)");
+constexpr Str kCacheSetDetail = lit_str(
+    "cache.set(key, value) expects a plain IP key and a plain i64 value "
+    "(wrap an i32 in i64(x); int literals adopt i64)");
+constexpr Str kCacheStmtDetail = lit_str(
+    "only cache state writes may stand alone as statements, and only before "
+    "any guard/wait/for (state writes run at handler entry)");
 constexpr Str kMatchI64Detail =
     lit_str("match on an i64 subject is not supported yet; compare with if/guard instead");
 
@@ -3656,6 +3672,72 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         !user_bound_ident_name(mod, locals, local_count, binding, {"bitwise", 7})) {
         return analyze_bitwise_namespace_call(
             expr, route, mod, locals, local_count, binding, nullptr);
+    }
+
+    // Cache<K, i64> instance receiver (docs/state-types.md §4/§5): an Ident
+    // matching a declared cache, unless shadowed by a user binding (same
+    // precedence rule as the bitwise namespace). Handlers get exactly
+    // get/set — the data-plane surface; no iteration, no dumps.
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.lhs->name)) {
+        u32 cache_index = 0xffffffffu;
+        for (u32 ci = 0; ci < mod.caches.len; ci++) {
+            if (mod.caches[ci].name.eq(expr.lhs->name)) {
+                cache_index = ci;
+                break;
+            }
+        }
+        if (cache_index != 0xffffffffu) {
+            const bool is_get = expr.name.eq({"get", 3});
+            const bool is_set = expr.name.eq({"set", 3});
+            if (!is_get && !is_set)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kCacheGetDetail);
+            if (is_get) {
+                if (expr.args.len != 1 || expr.args[0] == nullptr)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, expr.span, kCacheGetDetail);
+                auto key = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+                if (!key) return core::make_unexpected(key.error());
+                if (key->type != HirTypeKind::IP || key->may_nil || key->may_error)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, expr.span, kCacheGetDetail);
+                HirExpr out{};
+                out.kind = HirExprKind::CacheGet;
+                out.type = HirTypeKind::I64;
+                out.may_nil = true;
+                out.span = expr.span;
+                out.cache_index = cache_index;
+                if (!route->exprs.push(key.value()))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                out.lhs = &route->exprs[route->exprs.len - 1];
+                return out;
+            }
+            if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kCacheSetDetail);
+            auto key = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!key) return core::make_unexpected(key.error());
+            auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+            if (!value) return core::make_unexpected(value.error());
+            // A bare int literal value adopts i64 (`set(k, 0)` works); a
+            // runtime i32 needs the explicit i64(x).
+            if (value->kind == HirExprKind::IntLit && value->type == HirTypeKind::I32)
+                value->type = HirTypeKind::I64;
+            if (key->type != HirTypeKind::IP || key->may_nil || key->may_error ||
+                value->type != HirTypeKind::I64 || value->may_nil || value->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kCacheSetDetail);
+            HirExpr out{};
+            out.kind = HirExprKind::CacheSet;
+            out.type = HirTypeKind::I64;  // echoes the stored value
+            out.span = expr.span;
+            out.cache_index = cache_index;
+            if (!route->exprs.push(key.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            if (!route->exprs.push(value.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
     }
 
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
@@ -8020,6 +8102,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         HirExpr* rhs = &rhs_value;
         if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+        // A bare int-literal fallback adopts an i64 carrier's width, so
+        // `cache.get(k).or(0)` works without spelling i64(0).
+        adopt_int_literal_type(lhs, rhs);
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
             !same_hir_type_shape(mod, *lhs, *rhs)) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -8148,6 +8233,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         HirExpr* rhs = &rhs_value;
         if (rhs->may_nil) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+        // A bare int-literal fallback adopts an i64 carrier's width, so
+        // `cache.get(k).or(0)` works without spelling i64(0).
+        adopt_int_literal_type(lhs, rhs);
         if (lhs->type != HirTypeKind::Unknown && rhs->type != HirTypeKind::Unknown &&
             !same_hir_type_shape(mod, *lhs, *rhs)) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -13716,6 +13804,43 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
+        if (item.kind != AstItemKind::State) continue;
+        const AstExpr* init = item.state.init;
+        if (init == nullptr || init->kind != AstExprKind::StructInit ||
+            !init->name.eq({"Cache", 5}))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.state.span, kStateDeclDetail);
+        // This slice supports exactly Cache<IP, i64>.
+        const bool args_ok =
+            init->type_args.len == 2 && init->type_args[0].namespace_name.len == 0 &&
+            init->type_args[0].name.eq({"IP", 2}) && init->type_args[1].namespace_name.len == 0 &&
+            init->type_args[1].name.eq({"i64", 3});
+        if (!args_ok)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.state.span, kStateDeclDetail);
+        constexpr i64 kMaxCacheCapacity = 1 << 22;  // 4M slots = 64 MB/instance/shard
+        if (init->field_inits.len != 1 || !init->field_inits[0].name.eq({"capacity", 8}) ||
+            init->field_inits[0].value == nullptr ||
+            init->field_inits[0].value->kind != AstExprKind::IntLit ||
+            init->field_inits[0].value->int_value <= 0 ||
+            init->field_inits[0].value->int_value > kMaxCacheCapacity)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.state.span, kCacheCapacityDetail);
+        for (u32 j = 0; j < mod.caches.len; j++) {
+            if (mod.caches[j].name.eq(item.state.name))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.state.span, kCacheDupNameDetail);
+        }
+        HirCacheDecl decl{};
+        decl.span = item.state.span;
+        decl.name = item.state.name;
+        decl.capacity = static_cast<u32>(init->field_inits[0].value->int_value);
+        if (!mod.caches.push(decl))
+            return frontend_error(FrontendError::TooManyItems, item.state.span);
+    }
+
+    for (u32 i = 0; i < file.items.len; i++) {
+        const auto& item = file.items[i];
         if (item.kind != AstItemKind::Upstream) continue;
         for (u32 j = 0; j < mod.upstreams.len; j++) {
             if (mod.upstreams[j].name.eq(item.upstream.name))
@@ -17122,8 +17247,38 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
+        bool seen_guard = false;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
+            if (stmt.kind == AstStmtKind::Expr) {
+                // Bare `cache.set(k, v)` statement — the only standalone
+                // expression form. Locals (which carry the write) all
+                // materialize in the entry block, so a set after any
+                // guard/wait/for would still run on rejected paths; restrict
+                // it to the leading let-region ("state writes run at handler
+                // entry", docs/state-types.md §5).
+                if (seen_wait || seen_for || seen_guard)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.span, kCacheStmtDetail);
+                auto value = analyze_expr(
+                    stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                if (!value) return core::make_unexpected(value.error());
+                if (value->kind != HirExprKind::CacheSet)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.span, kCacheStmtDetail);
+                // Reuse the local-materialization pipeline via a synthetic,
+                // unnameable local (empty name never matches an Ident lookup).
+                HirLocal local{};
+                local.span = stmt.span;
+                local.name = Str{};
+                local.ref_index = next_local_ref_index(&route, route.locals.data, route.locals.len);
+                local.type = value->type;
+                local.shape_index = value->shape_index;
+                local.init = value.value();
+                if (!route.locals.push(local))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                continue;
+            }
             if (stmt.kind == AstStmtKind::Wait) {
                 if (seen_for)
                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -17285,6 +17440,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 continue;
             }
             if (stmt.kind == AstStmtKind::Guard) {
+                seen_guard = true;
                 if (si + 1 >= route_decl.statements.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 HirGuard guard{};

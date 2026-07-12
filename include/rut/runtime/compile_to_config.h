@@ -56,6 +56,9 @@ namespace rut {
 // RouteConfig::add_timer would still reject the overflow at load time.
 static_assert(HirModule::kMaxTimers <= RouteConfig::kMaxTimers,
               "frontend timer cap must not exceed the runtime timer table");
+// Same containment rule for Cache instance declarations.
+static_assert(HirModule::kMaxCaches <= RouteConfig::kMaxCacheInstances,
+              "frontend cache cap must not exceed the runtime cache table");
 
 inline bool rir_function_needs_req_body(const rir::Function& fn) {
     if (fn.blocks == nullptr) return false;
@@ -305,6 +308,17 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count);
         if (idx == 0) return false;
         if (idx != i + 1) return false;
+    }
+
+    // Cache instance descriptors — declaration order defines the instance
+    // index compiled into CacheGet/CacheSet, so the copy must be exact and
+    // the target table empty.
+    if (cfg.cache_instance_count != 0) return false;
+    if (mod.cache_instance_count > RouteConfig::kMaxCacheInstances) return false;
+    for (u32 i = 0; i < mod.cache_instance_count; i++) {
+        const auto& ci = mod.cache_instances[i];
+        if (ci.name.len > 0 && ci.name.ptr == nullptr) return false;
+        if (!cfg.add_cache_instance(ci.name.ptr, ci.name.len, ci.capacity)) return false;
     }
     return true;
 }

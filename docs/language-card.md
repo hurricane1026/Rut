@@ -323,6 +323,26 @@ init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
 
+## Cache state (per-key counters/timestamps — docs/state-types.md)
+
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots
+
+route GET "/api" {
+    let prev = buckets.get(req.remoteAddr).or(0) // i64? — a MISS IS NORMAL
+    buckets.set(req.remoteAddr, prev + 1)        // bare set: ONLY before guards/waits
+    if prev + 1 > 100 { return 429 } else { return 200 }
+}
+```
+
+- `get -> i64?`: nil means never-seen OR evicted — the two are indistinguishable
+  by design; `.or(default)` / `guard let` are the only ways to consume it.
+- Entries may be evicted by colliding writes at any occupancy: never store
+  anything whose absence gives a wrong answer. Capacity = slot count (rounded
+  up to a power of two); provision ~2× your expected key count.
+- State writes run at handler entry, so a bare `set` after a guard/wait is a
+  compile error. Per-shard state: effective limits ≈ limit × shard count.
+
 ## Built-ins (call them, never reimplement)
 
 ```

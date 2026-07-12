@@ -211,8 +211,9 @@ enum class Opcode : u8 {
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes
     BytesHex,        // %r = bytes.hex %b            → str
 
-    // ── Counter ──
-    CounterIncr,  // %r = counter.incr %key, window → i32
+    // ── Cache state (per-shard lossy slot tables; docs/state-types.md §4) ──
+    CacheGet,  // %r = cache.get %key, inst=N        → Optional(i64)  (imm.i32_val = instance)
+    CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
     // ── Struct operations ──
     StructField,   // %r = struct.field %s, "name"  → T
@@ -481,6 +482,17 @@ struct Module {
     static constexpr u32 kMaxUpstreams = 32;
     Upstream upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Cache<K, i64> instance descriptors (top-level `let x = Cache<IP,
+    // i64>(capacity: N)`); the compile→config helper copies these into
+    // RouteConfig::cache_instances.
+    static constexpr u32 kMaxCacheInstances = 8;
+    struct CacheInstance {
+        Str name;
+        u32 capacity = 0;
+    };
+    CacheInstance cache_instances[kMaxCacheInstances];
+    u32 cache_instance_count = 0;
 
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;

@@ -161,6 +161,12 @@ enum class HirExprKind : u8 {
     ProtocolCall,
     WaitResult,
     WaitField,
+    // Cache<K, i64> state ops (docs/state-types.md §4). cache_index selects
+    // the declared instance; key operand in lhs. CacheGet → I64 with
+    // may_nil=true (miss covers never-seen AND evicted); CacheSet carries
+    // the value in rhs and echoes it (type I64).
+    CacheGet,
+    CacheSet,
 };
 
 enum class HirTypeKind : u8 {
@@ -413,6 +419,8 @@ struct HirExpr {
     // For HirExprKind::ArrayLit: compile-time-known element count. Elements
     // themselves live in `args`. For non-Array exprs: 0.
     u32 array_len = 0;
+    // CacheGet/CacheSet: index into HirModule::caches.
+    u32 cache_index = 0xffffffffu;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     bool is_pipe_conditional = false;
@@ -1269,6 +1277,12 @@ struct HirImpl {
     FixedVec<HirImplMethod, kMaxMethods> methods;
 };
 
+struct HirCacheDecl {
+    Span span{};
+    Str name{};
+    u32 capacity = 0;
+};
+
 struct HirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxImports = 64;
@@ -1290,8 +1304,12 @@ struct HirModule {
     static constexpr u32 kMaxTimers = 16;
     static constexpr u32 kMaxGuardMatchArms = 64;
     static constexpr u32 kMaxTypeShapes = 512;
+    // Must not exceed RouteConfig::kMaxCacheInstances (static_assert in
+    // compile_to_config.h).
+    static constexpr u32 kMaxCaches = 8;
 
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<HirCacheDecl, kMaxCaches> caches;
     FixedVec<HirImport, kMaxImports> imports;
     FixedVec<HirAlias, kMaxAliases> aliases;
     std::deque<AstTypeRef> type_ref_storage;
@@ -1314,6 +1332,7 @@ struct HirModule {
     HirModule() = default;
     HirModule(const HirModule& other)
         : upstreams(other.upstreams),
+          caches(other.caches),
           imports(other.imports),
           aliases(other.aliases),
           type_ref_storage(other.type_ref_storage),
@@ -1336,6 +1355,7 @@ struct HirModule {
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        caches = other.caches;
         imports = other.imports;
         aliases = other.aliases;
         type_ref_storage = other.type_ref_storage;

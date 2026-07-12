@@ -904,15 +904,29 @@ struct Builder {
         return vid;
     }
 
-    // ── Counter ─────────────────────────────────────────────────────
+    // ── Cache state ─────────────────────────────────────────────────
 
-    Result<ValueId> emit_counter_incr(ValueId key, i64 window_seconds, SourceLoc loc = {}) {
-        if (!valid_val(key)) return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
-        auto [inst, vid] = TRY(emit(Opcode::CounterIncr, ty, loc));
+    Result<ValueId> emit_cache_get(u32 instance, ValueId key, SourceLoc loc = {}) {
+        if (!valid_val(key) || !val_has_type(key, TypeKind::IP)) return err(RirError::InvalidState);
+        auto* inner = TRY(make_type(TypeKind::I64));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::CacheGet, ty, loc));
         inst->operands[0] = key;
         inst->operand_count = 1;
-        inst->imm.i64_val = window_seconds;
+        inst->imm.i32_val = static_cast<i32>(instance);
+        return vid;
+    }
+
+    Result<ValueId> emit_cache_set(u32 instance, ValueId key, ValueId value, SourceLoc loc = {}) {
+        if (!valid_val(key) || !val_has_type(key, TypeKind::IP) || !valid_val(value) ||
+            !val_has_type(value, TypeKind::I64))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I64));
+        auto [inst, vid] = TRY(emit(Opcode::CacheSet, ty, loc));
+        inst->operands[0] = key;
+        inst->operands[1] = value;
+        inst->operand_count = 2;
+        inst->imm.i32_val = static_cast<i32>(instance);
         return vid;
     }
 

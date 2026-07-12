@@ -613,16 +613,23 @@ call arguments (see §3.2.1), not as response construction.
 All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
-**Hash<K, V>** — general key-value store.
+**Cache\<K, i64>** — lossy per-key state slots (implemented; the substrate for
+rate-limit algorithms written in Rut, see docs/state-types.md §4).
 
 ```swift
-let sessions = Hash<string, Session>(capacity: 50000, ttl: 30m)
+let buckets = Cache<IP, i64>(capacity: 100000)
 
-sessions.set(sid, user)
-let user = sessions.get(sid)       // V?
-sessions.delete(sid)
-sessions.contains(sid)             // bool
+let prev = buckets.get(req.remoteAddr).or(0)   // i64? — a miss is normal
+buckets.set(req.remoteAddr, prev + 1)          // may evict a colliding neighbor
 ```
+
+Per-shard 4-way set-associative slot table, min-value victim, per-process
+seeded hashing. An entry can be evicted at any occupancy, so never store
+anything whose absence yields a wrong answer. The name `Hash` is reserved
+for a future strict (visible-failure) table; the old
+`Hash<string, Session>` session-store example is retired — per-shard KV
+gives wrong answers for cross-connection sessions (that use case needs
+`consistent:` / `backend:`).
 
 **LRU<K, V>** — key-value with LRU eviction when full.
 

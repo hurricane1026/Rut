@@ -74,6 +74,8 @@ enum class MirValueKind : u8 {
     VariantTag,
     WaitResult,
     WaitField,
+    CacheGet,
+    CacheSet,
 };
 
 enum class MirTypeKind : u8 {
@@ -183,6 +185,8 @@ struct MirValue {
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
     u32 error_case_index = 0xffffffffu;
+    // CacheGet/CacheSet: index into MirModule::caches.
+    u32 cache_index = 0xffffffffu;
     MirValue* lhs = nullptr;
     MirValue* rhs = nullptr;
     bool is_pipe_conditional = false;
@@ -453,8 +457,15 @@ struct MirUpstream {
     u16 hc_expected_status = 200;
 };
 
+struct MirCacheInstance {
+    Span span{};
+    Str name{};
+    u32 capacity = 0;
+};
+
 struct MirModule {
     static constexpr u32 kMaxUpstreams = 32;
+    static constexpr u32 kMaxCaches = 8;
     static constexpr u32 kMaxStructs = 64;
     static constexpr u32 kMaxVariants = 32;
     // One MirFunction per HIR route, INCLUDING synthesized timer routes, so this
@@ -465,6 +476,7 @@ struct MirModule {
     static constexpr u32 kMaxTypeShapes = 256;
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
     FixedVec<MirVariant, kMaxVariants> variants;
     FixedVec<MirFunction, kMaxFunctions> functions;
@@ -473,6 +485,7 @@ struct MirModule {
     MirModule() = default;
     MirModule(const MirModule& other)
         : upstreams(other.upstreams),
+          caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
@@ -480,6 +493,7 @@ struct MirModule {
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        caches = other.caches;
         structs = other.structs;
         variants = other.variants;
         functions = other.functions;
@@ -488,6 +502,7 @@ struct MirModule {
     }
     MirModule(MirModule&& other) noexcept
         : upstreams(other.upstreams),
+          caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
@@ -495,6 +510,7 @@ struct MirModule {
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        caches = other.caches;
         structs = other.structs;
         variants = other.variants;
         functions = other.functions;

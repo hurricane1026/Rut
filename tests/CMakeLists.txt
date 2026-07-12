@@ -183,6 +183,14 @@ target_include_directories(test_buffer PRIVATE
 add_test(NAME test_buffer COMMAND test_buffer)
 set_tests_properties(test_buffer PROPERTIES LABELS "unit")
 
+add_executable(test_cache_table test_cache_table.cc)
+target_include_directories(test_cache_table PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_cache_table COMMAND test_cache_table)
+set_tests_properties(test_cache_table PROPERTIES LABELS "unit")
+
 add_executable(test_types test_types.cc)
 target_include_directories(test_types PRIVATE
     ${PROJECT_SOURCE_DIR}/include

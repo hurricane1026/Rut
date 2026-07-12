@@ -1,5 +1,6 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
 #include <unordered_map>
@@ -446,6 +447,46 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return 0;
     return pc.req.has_content_length ? pc.req.content_length : 0;
+}
+
+// ── Cache state ────────────────────────────────────────────────────
+// One thread == one shard, so `thread_local` gives per-shard tables that
+// both backends and direct-call tests reach without touching the handler
+// ABI (the RateLimiter precedent). Tables (re)build lazily against the
+// process registry: first touch allocates; a hot-reload capacity change is
+// detected by the rounded-capacity compare and resets that instance's state
+// (documented); an unchanged capacity persists across config swaps because
+// the swap never touches thread-locals.
+namespace {
+rut::CacheTable* cache_table_for(rut::u32 instance) {
+    static thread_local rut::CacheTable t_tables[rut::CacheRegistry::kMaxInstances];
+    auto& reg = rut::cache_registry();
+    if (instance >= reg.count.load(std::memory_order_relaxed)) return nullptr;
+    const rut::u32 cap = reg.capacities[instance].load(std::memory_order_relaxed);
+    if (cap == 0) return nullptr;
+    rut::CacheTable& t = t_tables[instance];
+    if (t.slot_count != rut::CacheTable::round_capacity(cap)) {
+        if (!t.init(cap, reg.seed.load(std::memory_order_relaxed))) return nullptr;
+    }
+    return &t;
+}
+}  // namespace
+
+void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
+    rut::CacheTable* t = cache_table_for(instance);
+    i64 v = 0;
+    if (t != nullptr && t->get(key_ip, &v)) {
+        *out_has = 1;
+        *out_val = v;
+        return;
+    }
+    *out_has = 0;
+    *out_val = 0;
+}
+
+void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
+    rut::CacheTable* t = cache_table_for(instance);
+    if (t != nullptr) t->set(key_ip, val);
 }
 
 // ── String Operations ──────────────────────────────────────────────
