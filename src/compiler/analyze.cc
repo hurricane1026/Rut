@@ -8863,6 +8863,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     auto return_typed = apply_return_type(inlined.value(), "direct");
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
+    // Same rule as the any/all gates: a fallible i64 has no error carrier
+    // yet, and an annotation-less helper body like
+    // `if ok { 2147483648 } else { error(500) }` infers exactly that.
+    if (inlined->type == HirTypeKind::I64 && inlined->may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
     return inlined.value();
 }
 
