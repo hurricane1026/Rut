@@ -7230,7 +7230,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         if (expr.rhs->kind == AstExprKind::MethodCall && expr.rhs->lhs != nullptr &&
             expr.rhs->lhs->kind == AstExprKind::Placeholder && expr.rhs->lhs->int_value != 1) {
-            const i32 slot = expr.rhs->lhs->int_value;
+            const i32 slot = static_cast<i32>(expr.rhs->lhs->int_value);
             if (slot <= 0 || slot > 10)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.rhs->lhs->span,
@@ -8807,8 +8807,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     return frontend_error(FrontendError::TooManyItems, expr.span);
                 placeholder_source = &route->exprs[route->exprs.len - 1];
             }
-            auto slot_expr =
-                placeholder_slot_expr(*placeholder_source, arg_expr.int_value, arg_expr.span);
+            auto slot_expr = placeholder_slot_expr(
+                *placeholder_source, static_cast<i32>(arg_expr.int_value), arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
@@ -10805,7 +10805,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 // (ws_valid_close_code): 1000–1003, 1007–1014, 3000–4999; rejects the reserved
                 // 1016–2999 range and the local-only codes too. (c<0 wraps to a huge u32 →
                 // rejected.)
-                const i32 c = cv.int_value;
+                const i32 c = static_cast<i32>(cv.int_value);
                 if (c < 0 || !ws_valid_close_code(static_cast<u32>(c)))
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
                 route->ws_handler.close_code = static_cast<u16>(c);
