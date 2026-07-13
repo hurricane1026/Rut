@@ -2897,6 +2897,12 @@ static bool bind_generic_shape(GenericBinding* generic_bindings,
                                const HirExpr& actual) {
     if (generic_index >= generic_binding_count) return false;
     if (actual.type == HirTypeKind::Associated) return false;
+    // i64 is unnameable in type position, so it cannot bind a generic type
+    // parameter either — the MIR/RIR generic-carrier paths have no i64
+    // fields/payloads yet. Rejecting here (the single binding choke point)
+    // keeps Box(value: 2147483648) a clear analyze error instead of a
+    // confusing lowering failure.
+    if (actual.type == HirTypeKind::I64) return false;
     auto& binding = generic_bindings[generic_index];
     if (!binding.bound) {
         binding.bound = true;
@@ -6978,6 +6984,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.lhs->kind == AstExprKind::IntLit) {
+            // Error codes lower as i32 — an oversized literal would silently
+            // truncate in Error.code, so reject it here.
+            if (expr.lhs->int_value < -2147483648LL || expr.lhs->int_value > 2147483647LL)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.lhs->span,
+                                      lit_str("numeric error codes must fit i32"));
             out.int_value = expr.lhs->int_value;
             return out;
         }

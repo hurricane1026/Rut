@@ -1615,6 +1615,37 @@ TEST(frontend, analyze_i64_tuple_element_and_pipe_placeholder) {
     rir.destroy();
 }
 
+TEST(frontend, analyze_rejects_i64_generic_binding) {
+    // i64 is unnameable in type position, so it cannot bind a generic type
+    // parameter either (the generic carrier paths have no i64 payloads) —
+    // rejected at analysis, not as a confusing lowering failure.
+    const char* src =
+        "struct Box<T> { value: T }\n"
+        "route GET \"/x\" { let b = Box(value: 2147483648) if b.value > 0 { return 200 } "
+        "else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_rejects_oversized_error_code) {
+    // Error codes lower as i32; an oversized literal must not silently
+    // truncate in Error.code.
+    const char* src =
+        "route GET \"/x\" { let e = error(4294967296) guard let v = e else { return 400 } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
 TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {
     const char* src = "route GET \"/x\" { wait(timer(4294967296)) return 200 }\n";
     auto lexed = lex(lit(src));

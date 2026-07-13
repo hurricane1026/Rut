@@ -694,6 +694,60 @@ TEST(jit, frontend_i64_div_mod_guards_and_wrap_execute) {
     rir.destroy();
 }
 
+TEST(jit, frontend_i64_runtime_widen_across_wait_executes) {
+    // A RUNTIME-widened i64 (WidenI64/sext, not a folded literal) used
+    // after a wait. MIR substitutes LocalRefs with the local's init tree at
+    // each use site and lowering re-materializes that tree inside the block
+    // that uses it, so the resume block re-executes the sext locally —
+    // there is no cross-block SSA reference back into the entry block.
+    const auto src = R"rut(
+route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
+    ctx.state = 0;
+    ctx.handler_idx = 0;
+
+    auto r0 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r0.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(r0.next_state, 1);
+
+    ctx.state = 1;
+    auto r1 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r1.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r1.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_i64_local_across_wait_executes) {
     // Locals re-materialize fresh in resume states (no ctx slots involved),
     // so an i64 local crosses a wait exactly like an i32 — this pins the
