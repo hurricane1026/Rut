@@ -50,6 +50,9 @@ constexpr Str kArithDivZeroDetail = lit_str(
 constexpr Str kArithMixedWidthDetail = lit_str(
     "arithmetic and comparison operands must be the same integer type; wrap "
     "the i32 side in i64(x)");
+constexpr Str kI64FallibleDetail = lit_str(
+    "a fallible i64 value has no error carrier yet; handle the error inside "
+    "the fallback (e.g. any(x, <plain default>)) or keep the value i32");
 constexpr Str kI64ArgDetail = lit_str(
     "i64() expects exactly one plain i32 or i64 value; bind optional or "
     "fallible values first with guard let / if let / .or(default)");
@@ -8088,6 +8091,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.error_struct_index = rhs->error_struct_index;
             out.error_variant_index = rhs->error_variant_index;
             out.is_eager_fallback = true;
+            if (out.type == HirTypeKind::I64 && out.may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
             return out;
         }
 
@@ -8128,6 +8134,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.may_error = rhs->may_error;
         out.error_struct_index = rhs->error_struct_index;
         out.error_variant_index = rhs->error_variant_index;
+        if (out.type == HirTypeKind::I64 && out.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
         return out;
     }
 
@@ -8204,6 +8212,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.error_struct_index = rhs->error_struct_index;
             out.error_variant_index = rhs->error_variant_index;
             out.is_eager_fallback = true;
+            if (out.type == HirTypeKind::I64 && out.may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
             return out;
         }
 
@@ -8248,6 +8259,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
         out.error_variant_index =
             rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
+        // The scalar error carrier's payload is Optional<i32>; a fallible
+        // i64 result would fail deep in lowering (mis-reported as OOM).
+        // Reject here until the i64 error carrier exists.
+        if (out.type == HirTypeKind::I64 && out.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
         return out;
     }
 

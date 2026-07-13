@@ -1666,6 +1666,56 @@ TEST(frontend, analyze_rejects_nested_match_on_i64_subject) {
     CHECK(hir.error().detail.len != 0);
 }
 
+TEST(frontend, analyze_rejects_fallible_i64_from_eager_fallbacks) {
+    // any/all with an error-typed fallback keep may_error on the result;
+    // a fallible i64 has no error carrier yet, so this must be a clear
+    // analysis error (it used to crash lowering, mis-reported as OOM).
+    const char* any_src =
+        "route GET \"/x\" { let x = any(2147483648, error(500)) guard let v = x else { "
+        "return 400 } if v > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(any_src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* all_src =
+        "route GET \"/x\" { let x = all(2147483648, error(500)) guard let v = x else { "
+        "return 400 } if v > 0 { return 200 } else { return 500 } }\n";
+    lexed = lex(lit(all_src));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, i64_tuple_element_binds_generic_and_lowers) {
+    // Pinning test: a generic bound to a TUPLE containing an i64 element
+    // works end-to-end — tuple elements funnel through rir_type_for_shape,
+    // which admits I64 (unlike a bare T = i64 binding, which stays
+    // rejected at bind_generic_shape).
+    const char* src =
+        "struct Box<T> { value: T }\n"
+        "route GET \"/x\" { let b = Box(value: (2147483648, 1)) let t = b.value "
+        "if req.http11 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, analyze_rejects_oversized_error_code) {
     // Error codes lower as i32; an oversized literal must not silently
     // truncate in Error.code.
