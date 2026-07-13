@@ -233,7 +233,7 @@ let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ 
 let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
-notify(key) counters.incr(key)    // to owner shard by key hash
+notify(key) buckets.set(key, v)   // to owner shard by key hash
 // strong consistency: declare state with consistent: true (+ // rut:allow(consistent))
 // cross-node: backend: .redis("redis:6379")
 ```

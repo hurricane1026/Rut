@@ -636,7 +636,8 @@ budget is exceeded, either the write fails visibly or old data dies (eBPF's
 `HASH` vs `LRU_HASH` split). `Cache` evicts — so **never store anything in
 a `Cache` whose absence yields a wrong answer** (sessions, in-flight
 counts). Multi-field algorithm state packs into the single i64 with
-`bitwise.*`; expiry is lazy (window index in the value), there is no `ttl:`.
+`bitwise.*` (the i64 relaxation of `bitwise.*` lands with PR #182, same
+stack); expiry is lazy (window index in the value), there is no `ttl:`.
 The name `Hash` is **reserved** for a future strict, visible-failure table:
 "hash map" carries a lossless prior this structure does not honor. (The
 former `Hash<string, Session>` example is retired for a second reason:
@@ -765,11 +766,13 @@ contention (head and tail on separate cache lines).
 Cost: `notify all` = N-1 relaxed writes. `notify(key)` = 1 relaxed write.
 Propagation latency is one event loop tick (~microseconds).
 
-**Strong consistency: `consistent: true`**
+**Single-owner state: `consistent: true`**
 
-For exact global rate limiting or other strongly consistent state, declare with
-`consistent: true`. Operations route to the owner shard (determined by key hash),
-processed sequentially — no locks, just SPSC message round-trip.
+To remove per-shard divergence (all shards see one copy of the state),
+declare with `consistent: true`. Operations route to the owner shard
+(determined by key hash), processed sequentially — no locks, just SPSC
+message round-trip. On a `Cache` this is single-owner but still
+approximate (see below); exact global limiting is future work.
 
 ```swift
 // rut:allow(consistent)
@@ -802,7 +805,7 @@ Compiler emits a warning — user must acknowledge with `// rut:allow(consistent
 | per-shard | default | zero | approximate |
 | notify all | `notify all expr` | N-1 SPSC writes | eventual |
 | notify(key) | `notify(key) expr` | 1 SPSC write | eventual, targeted |
-| consistent | `consistent: true` | 1 SPSC round-trip | strong |
+| consistent | `consistent: true` | 1 SPSC round-trip | single-owner (lossy containers stay approximate) |
 
 All three use SPSC message passing with minimal atomics (relaxed stores +
 release/acquire on queue tail pointer). No mutexes, no STM, no contended locks.
@@ -810,8 +813,10 @@ release/acquire on queue tail pointer). No mutexes, no STM, no contended locks.
 **Cross-node state: `backend:` parameter**
 
 Per-shard and cross-shard state only works within a single Rut process. When
-multiple Rut instances need shared state (e.g., cluster-wide rate limiting),
-use `backend:` to sync via external storage:
+multiple Rut instances need to SHARE state (e.g., cluster-wide rate
+limiting), `backend:` syncs it via external storage — approximately:
+reads are local-first, so instances can act on stale values. It reduces
+cross-instance drift; it does not provide cluster-wide exactness:
 
 ```swift
 // Per-process only (default) — fast, approximate
