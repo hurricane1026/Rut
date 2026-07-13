@@ -244,6 +244,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::Mod:
             buf.put_cstr("arith.mod");
             break;
+        case Opcode::MaxInt:
+            buf.put_cstr("arith.max");
+            break;
+        case Opcode::MinInt:
+            buf.put_cstr("arith.min");
+            break;
         case Opcode::SextI64:
             buf.put_cstr("sext.i64");
             break;
@@ -271,11 +277,8 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CmpGe:
             buf.put_cstr("cmp.ge");
             break;
-        case Opcode::TimeNow:
-            buf.put_cstr("time.now");
-            break;
-        case Opcode::TimeDiff:
-            buf.put_cstr("time.diff");
+        case Opcode::TimeNowMicros:
+            buf.put_cstr("time.now_micros");
             break;
         case Opcode::IpInCidr:
             buf.put_cstr("ip.in_cidr");
@@ -559,7 +562,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
-        case Opcode::TimeNow:
+        case Opcode::TimeNowMicros:
             // No operands.
             break;
         case Opcode::ReqSetHeader:
@@ -597,7 +600,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::Mul:
         case Opcode::Div:
         case Opcode::Mod:
-        case Opcode::TimeDiff:
+        case Opcode::MaxInt:
+        case Opcode::MinInt:
             // Binary: %a, %b
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);

@@ -748,6 +748,58 @@ route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return
     rir.destroy();
 }
 
+TEST(jit, frontend_time_minmax_gcra_shape_executes) {
+    // The full GCRA expression shape at runtime: latched now, i64
+    // arithmetic, max() over (stored tat, now). Pins the per-invocation
+    // time latch: every use of a now-bound local sees the SAME value
+    // (without the latch, init-tree re-materialization would re-read the
+    // clock per use).
+    const char* src =
+        "route GET \"/a\" { let t1 = time.nowMicros() let t2 = time.nowMicros() "
+        "if t2 == t1 { return 200 } else { return 500 } }\n"
+        "route GET \"/b\" { let t1 = time.nowMicros() "
+        "if t1 > 0 { return 200 } else { return 500 } }\n"
+        "route GET \"/c\" { let t1 = time.nowMicros() let tat = max(t1 + 5, t1) "
+        "if tat - t1 == 5 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto call_route = [&](const char* sym) {
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(sym));
+        if (handler == nullptr) return 0u;
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        return static_cast<u32>(r.status_code);
+    };
+    CHECK_EQ(call_route("handler_route_0"), 200u);  // t2 == t1 (latched now)
+    CHECK_EQ(call_route("handler_route_1"), 200u);  // t1 > 0
+    CHECK_EQ(call_route("handler_route_2"), 200u);  // max/sub shape
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_i64_local_across_wait_executes) {
     // Locals re-materialize fresh in resume states (no ctx slots involved),
     // so an i64 local crosses a wait exactly like an i32 — this pins the

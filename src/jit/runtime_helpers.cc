@@ -1,5 +1,6 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
 #include <unordered_map>
@@ -43,6 +44,18 @@ struct ParseCache {
 
 thread_local ParseCache t_parse_cache;
 
+// `time.nowMicros()` is latched per handler invocation: MIR substitutes a
+// local's init tree at every use site, so without the latch each use of a
+// now-bound local would re-read the clock and see a different value —
+// silently wrong for GCRA-style code. The latch resets at parse_prime
+// (one per invocation, emitted at handler entry) so "now" is stable
+// within a request and fresh across requests.
+struct TimeCache {
+    i64 value = 0;
+    bool valid = false;
+};
+thread_local TimeCache t_time_cache;
+
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
 // pc.primed untouched — callers set it.
 void parse_into(ParseCache& pc, const u8* data, u32 len) {
@@ -75,6 +88,7 @@ const ParseCache& parse_cached(const u8* data, u32 len) {
 }  // namespace
 
 void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
+    t_time_cache.valid = false;  // fresh "now" per invocation
     // Parse once for this invocation and mark the cache primed so the
     // following req_* helper calls reuse it.
     ParseCache& pc = t_parse_cache;
@@ -83,6 +97,7 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
 }
 
 void rut_helper_parse_unprime() {
+    t_time_cache.valid = false;
     // Called at handler exit so the primed parse never outlives the
     // invocation that created it. Without this, a direct caller of
     // rut_helper_req_* on the same thread that happens to reuse the
@@ -440,6 +455,15 @@ void rut_helper_req_param(
 u32 rut_helper_req_remote_addr(void* conn) {
     auto* c = static_cast<Connection*>(conn);
     return c->peer_addr;
+}
+
+i64 rut_helper_time_now_micros() {
+    TimeCache& tc = t_time_cache;
+    if (!tc.valid) {
+        tc.value = static_cast<i64>(rut::monotonic_us());
+        tc.valid = true;
+    }
+    return tc.value;
 }
 
 u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {

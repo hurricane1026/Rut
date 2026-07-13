@@ -95,6 +95,7 @@ struct Ctx {
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
+    LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
 
@@ -349,6 +350,15 @@ struct Ctx {
             fn_req_remote_addr = LLVMAddFunction(llvm_mod, "rut_helper_req_remote_addr", ft);
         }
         return fn_req_remote_addr;
+    }
+
+    // i64 rut_helper_time_now_micros()
+    LLVMValueRef get_time_now_micros() {
+        if (!fn_time_now_micros) {
+            LLVMTypeRef ft = LLVMFunctionType(i64_ty, nullptr, 0, 0);
+            fn_time_now_micros = LLVMAddFunction(llvm_mod, "rut_helper_time_now_micros", ft);
+        }
+        return fn_time_now_micros;
     }
 
     // u64 rut_helper_req_content_length(ptr, i32)
@@ -1179,6 +1189,33 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::TimeNowMicros: {
+            LLVMValueRef v = LLVMBuildCall2(c.builder,
+                                            LLVMGlobalGetValueType(c.get_time_now_micros()),
+                                            c.get_time_now_micros(),
+                                            nullptr,
+                                            0,
+                                            "time.now_micros");
+            c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::MaxInt:
+        case rir::Opcode::MinInt: {
+            // Signed select at the operand width — single evaluation of both
+            // operands (max/min are NOT an IfElse desugar: that would clone
+            // the operand trees and re-execute any effectful expression).
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            LLVMValueRef cond =
+                LLVMBuildICmp(c.builder,
+                              inst.op == rir::Opcode::MaxInt ? LLVMIntSGT : LLVMIntSLT,
+                              a,
+                              b,
+                              "minmax.cmp");
+            LLVMValueRef r = LLVMBuildSelect(c.builder, cond, a, b, "minmax");
+            c.set_value(inst.result, r);
+            break;
+        }
         case rir::Opcode::SextI64: {
             LLVMValueRef v =
                 LLVMBuildSExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "sext.i64");
@@ -1744,6 +1781,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
+    c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
     c.fn_str_has_prefix = nullptr;

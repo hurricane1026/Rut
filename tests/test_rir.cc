@@ -1507,12 +1507,14 @@ TEST(RirBuilder, DomainOps) {
     auto entry = V(b.create_block(fn, lit("entry")));
     b.set_insert_point(fn, entry);
 
-    auto now = V(b.emit_time_now());
-    CHECK_EQ(static_cast<u8>(fn->values[now.id].type->kind), static_cast<u8>(TypeKind::Time));
+    auto now = V(b.emit_time_now_micros());
+    CHECK_EQ(static_cast<u8>(fn->values[now.id].type->kind), static_cast<u8>(TypeKind::I64));
 
-    auto prev = V(b.emit_time_now());
-    auto diff = V(b.emit_time_diff(now, prev));
-    CHECK_EQ(static_cast<u8>(fn->values[diff.id].type->kind), static_cast<u8>(TypeKind::Duration));
+    auto prev = V(b.emit_time_now_micros());
+    auto diff = V(b.emit_arith(Opcode::Sub, now, prev));
+    CHECK_EQ(static_cast<u8>(fn->values[diff.id].type->kind), static_cast<u8>(TypeKind::I64));
+    auto biggest = V(b.emit_arith(Opcode::MaxInt, now, prev));
+    CHECK_EQ(static_cast<u8>(fn->values[biggest.id].type->kind), static_cast<u8>(TypeKind::I64));
 
     auto ip = V(b.emit_req_remote_addr());
     auto in_cidr = V(b.emit_ip_in_cidr(ip, lit("10.0.0.0/8")));

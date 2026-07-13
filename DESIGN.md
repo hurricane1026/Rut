@@ -263,7 +263,13 @@ The two integer widths never mix implicitly:
   annotations, no struct fields, no function parameters. `match` on an i64
   subject and `bitwise.*` over i64 are rejected for now.
 
-Duration/ByteSize arithmetic (§3.3) is a separate, later surface.
+`time.nowMicros()` returns monotonic microseconds as i64, latched per
+handler invocation (all uses within one request observe the same value —
+required for correctness of rate-limit algorithms, and a consequence of
+the compiler re-materializing local initializers at use sites).
+`max(a, b)` / `min(a, b)` are same-width integer builtins with single
+evaluation. Duration/ByteSize arithmetic (§3.3) is a separate, later
+surface.
 
 Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
 force-unwrap. Use named fallback and explicit binding instead:

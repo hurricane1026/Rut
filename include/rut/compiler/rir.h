@@ -202,11 +202,12 @@ enum class Opcode : u8 {
     Mul,      // %r = arith.mul %a, %b → i32
     Div,      // %r = arith.div %a, %b → i32 (b == 0 → 0; INT_MIN / -1 → INT_MIN)
     Mod,      // %r = arith.mod %a, %b → i32 (b == 0 → 0; INT_MIN % -1 → 0)
+    MaxInt,   // %r = arith.max %a, %b → operand width (signed)
+    MinInt,   // %r = arith.min %a, %b → operand width (signed)
     SextI64,  // %r = sext.i64 %a → i64 (sign-extend i32; the `i64(x)` builtin)
 
     // ── Domain operations ──
-    TimeNow,         // %r = time.now               → Time
-    TimeDiff,        // %r = time.diff %a, %b       → Duration
+    TimeNowMicros,   // %r = time.now_micros        → i64 (monotonic µs; fresh clock read)
     IpInCidr,        // %r = ip.in_cidr %ip, cidr   → bool
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes
     BytesHex,        // %r = bytes.hex %b            → str

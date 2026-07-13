@@ -1760,6 +1760,89 @@ TEST(frontend, analyze_rejects_oversized_error_code) {
     CHECK(hir.error().detail.len != 0);
 }
 
+TEST(frontend, analyze_time_now_micros_and_minmax) {
+    // time.nowMicros() types I64 plain; max/min fold at both widths and
+    // adopt bare literals next to an i64 side.
+    const char* src =
+        "route GET \"/x\" { let t = time.nowMicros() let a = max(3, 5) let b = min(3, 5) "
+        "let c = max(i64(7), 2) let d = min(2147483648, 4) if t > 0 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::TimeNowMicros));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 5);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 3);
+    // max(i64(7), 2): both sides fold to literals → the whole call folds.
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 7);
+    CHECK_EQ(hir->routes[0].locals[4].init.int_value, 4);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[4].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_time_and_minmax_gates_and_shadowing) {
+    // Unknown time member gets the fix-it.
+    const char* bad_member = "route GET \"/x\" { let t = time.now() return 200 }\n";
+    auto lexed = lex(lit(bad_member));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Mixed non-literal widths rejected.
+    const char* mixed =
+        "route GET \"/x\" { let a = 5 let w = i64(9) let v = max(a, w) return 200 }\n";
+    lexed = lex(lit(mixed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // A user func named max shadows the builtin (arity 1 — the builtin
+    // would reject it; the user function resolves instead).
+    const char* shadowed =
+        "func max(_ s: str) -> i32 => 1\n"
+        "route GET \"/x\" { let v = max(\"a\") if v == 1 { return 200 } else "
+        "{ return 500 } }\n";
+    lexed = lex(lit(shadowed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    // A local named time shadows the namespace.
+    const char* time_shadow =
+        "route GET \"/x\" { let time = 1 let t = time.nowMicros() return 200 }\n";
+    lexed = lex(lit(time_shadow));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {
     const char* src = "route GET \"/x\" { wait(timer(4294967296)) return 200 }\n";
     auto lexed = lex(lit(src));

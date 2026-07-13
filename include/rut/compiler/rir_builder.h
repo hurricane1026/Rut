@@ -719,6 +719,8 @@ struct Builder {
             case Opcode::Mul:
             case Opcode::Div:
             case Opcode::Mod:
+            case Opcode::MaxInt:
+            case Opcode::MinInt:
                 return true;
             default:
                 return false;
@@ -751,20 +753,9 @@ struct Builder {
 
     // ── Domain operations ───────────────────────────────────────────
 
-    Result<ValueId> emit_time_now(SourceLoc loc = {}) {
-        auto* ty = TRY(make_type(TypeKind::Time));
-        return TRY(emit(Opcode::TimeNow, ty, loc)).vid;
-    }
-
-    Result<ValueId> emit_time_diff(ValueId a, ValueId b, SourceLoc loc = {}) {
-        if (!val_has_type(a, TypeKind::Time) || !val_has_type(b, TypeKind::Time))
-            return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::Duration));
-        auto [inst, vid] = TRY(emit(Opcode::TimeDiff, ty, loc));
-        inst->operands[0] = a;
-        inst->operands[1] = b;
-        inst->operand_count = 2;
-        return vid;
+    Result<ValueId> emit_time_now_micros(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::I64));
+        return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;
     }
 
     Result<ValueId> emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {

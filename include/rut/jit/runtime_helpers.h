@@ -160,4 +160,9 @@ void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 
+// ── Time ──
+// Monotonic microseconds (fresh clock_gettime with a thread-local clamp).
+// Backs the `time.nowMicros()` builtin.
+rut::i64 rut_helper_time_now_micros();
+
 }  // extern "C"

@@ -151,6 +151,12 @@ enum class HirExprKind : u8 {
     // Sign-extend a runtime i32 to i64 — produced only by the `i64(x)`
     // builtin (literals fold at analyze time). Operand in lhs; result I64.
     WidenI64,
+    // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
+    TimeNowMicros,
+    // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
+    // signed; single evaluation (real opcodes, not an IfElse desugar).
+    MaxInt,
+    MinInt,
     Or,
     NoError,
     HasValue,
