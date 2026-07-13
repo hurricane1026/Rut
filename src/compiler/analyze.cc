@@ -17231,7 +17231,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // statement is analyzed so pre-wait bindings are caught too.
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
-            if (s.kind == AstStmtKind::Wait ||
+            if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
                 (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
                 route.time_ops_blocked = true;
                 break;
@@ -17529,6 +17529,31 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       route_decl.statements[si + 1]->span);
             break;
+        }
+
+        // Wait×time backstop: the creation-time gate (kTimeWaitDetail above)
+        // catches direct spellings with a precise span, but not
+        // TimeNowMicros trees inlined from helper bodies (analyzed against
+        // a scratch route where the flag is off). route.waits is complete
+        // here — including wait-any arms — so scan every analyzed node:
+        // children live in the route.exprs arena; by-value roots are the
+        // local inits (route + guard fail bodies).
+        if (route.waits.len > 0) {
+            const HirExpr* found = nullptr;
+            for (u32 i = 0; i < route.exprs.len && found == nullptr; i++)
+                if (route.exprs[i].kind == HirExprKind::TimeNowMicros) found = &route.exprs[i];
+            for (u32 i = 0; i < route.locals.len && found == nullptr; i++)
+                if (route.locals[i].init.kind == HirExprKind::TimeNowMicros)
+                    found = &route.locals[i].init;
+            for (u32 g = 0; g < route.guards.len && found == nullptr; g++)
+                for (u32 li = 0; li < route.guards[g].fail_body.locals.len && found == nullptr;
+                     li++)
+                    if (route.guards[g].fail_body.locals[li].init.kind ==
+                        HirExprKind::TimeNowMicros)
+                        found = &route.guards[g].fail_body.locals[li].init;
+            if (found != nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, found->span, kTimeWaitDetail);
         }
 
         // A ws-terminate route carries a HirWsHandler, not a direct_term, so its empty

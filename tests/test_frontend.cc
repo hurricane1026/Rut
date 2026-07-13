@@ -1867,6 +1867,31 @@ TEST(frontend, analyze_time_rejected_in_wait_routes) {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+
+    // A helper body is analyzed against a scratch route (flag off) and
+    // inlined as an already-built TimeNowMicros tree — the post-analysis
+    // scan must still reject it in a wait route.
+    const char* via_helper =
+        "func now(_ x: i32) => time.nowMicros()\n"
+        "route GET \"/x\" { let start = now(1) wait(1000) "
+        "if start > 0 { return 200 } else { return 500 } }\n";
+    lexed = lex(lit(via_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // wait any populates route.waits like a plain wait — also rejected.
+    const char* wait_any =
+        "route GET \"/x\" { let start = time.nowMicros() "
+        "wait any { timer(1000) => { return 200 } } }\n";
+    lexed = lex(lit(wait_any));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, analyze_minmax_pipe_stage_requires_placeholder) {
