@@ -1892,6 +1892,20 @@ TEST(frontend, analyze_time_rejected_in_wait_routes) {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+
+    // A time-returning helper bound inside a terminal match arm's block —
+    // the inlined tree's nodes land in storage the backstop scan reaches.
+    const char* arm_helper =
+        "func now(_ x: i32) => time.nowMicros()\n"
+        "route GET \"/x\" { wait(1000) match req.http11 { true => { let t = now(1) "
+        "if t > 0 { return 200 } else { return 500 } } _ => return 404 } }\n";
+    lexed = lex(lit(arm_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
 }
 
 TEST(frontend, analyze_minmax_pipe_stage_requires_placeholder) {
