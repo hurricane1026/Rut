@@ -64,6 +64,7 @@ enum class MirValueKind : u8 {
     Mul,
     Div,
     Mod,
+    WidenI64,
     Or,
     NoError,
     HasValue,
@@ -79,6 +80,7 @@ enum class MirTypeKind : u8 {
     Unknown,
     Bool,
     I32,
+    I64,
     Str,
     Variant,
     Tuple,
@@ -167,7 +169,7 @@ struct MirValue {
     bool may_nil = false;
     bool may_error = false;
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     Str msg{};
     u32 local_index = 0;

@@ -47,6 +47,17 @@ constexpr Str kArithOperandDetail = lit_str(
 constexpr Str kArithDivZeroDetail = lit_str(
     "divisor is the literal 0; x / 0 and x % 0 evaluate to 0 at runtime — "
     "compute the divisor in a let binding if that is intended");
+constexpr Str kArithMixedWidthDetail = lit_str(
+    "arithmetic and comparison operands must be the same integer type; wrap "
+    "the i32 side in i64(x)");
+constexpr Str kI64FallibleDetail = lit_str(
+    "a fallible i64 value has no error carrier yet; handle the error inside "
+    "the fallback (e.g. any(x, <plain default>)) or keep the value i32");
+constexpr Str kI64ArgDetail = lit_str(
+    "i64() expects exactly one plain i32 or i64 value; bind optional or "
+    "fallible values first with guard let / if let / .or(default)");
+constexpr Str kMatchI64Detail =
+    lit_str("match on an i64 subject is not supported yet; compare with if/guard instead");
 
 static std::string str_to_std_string(Str s) {
     return std::string(s.ptr, s.len);
@@ -172,8 +183,9 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
     shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
-                        type == HirTypeKind::Str || type == HirTypeKind::Method ||
-                        type == HirTypeKind::ByteSize || type == HirTypeKind::IP;
+                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
+                        type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
+                        type == HirTypeKind::IP;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -261,7 +273,7 @@ struct RouteNamedErrorCase {
 struct ConstValue {
     HirTypeKind type = HirTypeKind::Unknown;
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     u32 variant_index = 0;
     u32 case_index = 0;
@@ -383,6 +395,7 @@ static bool hir_type_shape_satisfies_eq_constraint(const HirModule& mod,
             return false;
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
+        case HirTypeKind::I64:
         case HirTypeKind::Str:
         case HirTypeKind::Method:
         case HirTypeKind::ByteSize:
@@ -490,6 +503,7 @@ static bool hir_type_shape_satisfies_ord_constraint(const HirModule& mod,
         case HirTypeKind::Generic:
             return false;
         case HirTypeKind::I32:
+        case HirTypeKind::I64:
         case HirTypeKind::Str:
             return true;
         case HirTypeKind::Tuple:
@@ -2886,6 +2900,12 @@ static bool bind_generic_shape(GenericBinding* generic_bindings,
                                const HirExpr& actual) {
     if (generic_index >= generic_binding_count) return false;
     if (actual.type == HirTypeKind::Associated) return false;
+    // i64 is unnameable in type position, so it cannot bind a generic type
+    // parameter either — the MIR/RIR generic-carrier paths have no i64
+    // fields/payloads yet. Rejecting here (the single binding choke point)
+    // keeps Box(value: 2147483648) a clear analyze error instead of a
+    // confusing lowering failure.
+    if (actual.type == HirTypeKind::I64) return false;
     auto& binding = generic_bindings[generic_index];
     if (!binding.bound) {
         binding.bound = true;
@@ -3477,6 +3497,41 @@ static i32 fold_arith_i32(HirExprKind kind, i32 a, i32 b) {
     }
 }
 
+// 64-bit twin of fold_arith_i32, same total semantics at i64 width.
+static i64 fold_arith_i64(HirExprKind kind, i64 a, i64 b) {
+    const bool ovf = a == static_cast<i64>(0x8000000000000000ull) && b == -1;
+    switch (kind) {
+        case HirExprKind::Add:
+            return static_cast<i64>(static_cast<u64>(a) + static_cast<u64>(b));
+        case HirExprKind::Sub:
+            return static_cast<i64>(static_cast<u64>(a) - static_cast<u64>(b));
+        case HirExprKind::Mul:
+            return static_cast<i64>(static_cast<u64>(a) * static_cast<u64>(b));
+        case HirExprKind::Div:
+            if (b == 0) return 0;
+            return ovf ? static_cast<i64>(0x8000000000000000ull) : a / b;
+        case HirExprKind::Mod:
+            if (b == 0) return 0;
+            return ovf ? 0 : a % b;
+        default:
+            return 0;
+    }
+}
+
+// Literal adoption: a bare int literal next to an i64 operand retypes to I64
+// (always lossless — int_value is 64-bit). Required so the parser's unary
+// minus desugar `Sub(IntLit 0, x)` and spellings like `i64(x) + 1` work
+// without an explicit i64() on the literal. Mixed NON-literal widths stay an
+// error (kArithMixedWidthDetail).
+static void adopt_int_literal_type(HirExpr* a, HirExpr* b) {
+    if (a->type == HirTypeKind::I64 && b->kind == HirExprKind::IntLit &&
+        b->type == HirTypeKind::I32)
+        b->type = HirTypeKind::I64;
+    if (b->type == HirTypeKind::I64 && a->kind == HirExprKind::IntLit &&
+        a->type == HirTypeKind::I32)
+        a->type = HirTypeKind::I64;
+}
+
 // Arithmetic operators `+ - * / %` — binary i32 ops (semantics: see
 // fold_arith_i32 above).
 static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
@@ -3509,9 +3564,14 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     if (!lhs) return core::make_unexpected(lhs.error());
     auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
     if (!rhs) return core::make_unexpected(rhs.error());
-    if (lhs->type != HirTypeKind::I32 || rhs->type != HirTypeKind::I32 || lhs->may_nil ||
-        lhs->may_error || rhs->may_nil || rhs->may_error)
+    adopt_int_literal_type(&lhs.value(), &rhs.value());
+    const bool int_typed = (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
+                           (rhs->type == HirTypeKind::I32 || rhs->type == HirTypeKind::I64);
+    if (!int_typed || lhs->may_nil || lhs->may_error || rhs->may_nil || rhs->may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kArithOperandDetail);
+    if (lhs->type != rhs->type)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kArithMixedWidthDetail);
+    const bool is_i64 = lhs->type == HirTypeKind::I64;
     const bool is_div_or_mod = arith_kind == HirExprKind::Div || arith_kind == HirExprKind::Mod;
     // A literal zero divisor is a compile-time error even when the dividend
     // is a runtime value — x / 0 is almost certainly a bug, not a request
@@ -3522,15 +3582,17 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     if (lhs->kind == HirExprKind::IntLit && rhs->kind == HirExprKind::IntLit) {
         HirExpr out{};
         out.kind = HirExprKind::IntLit;
-        out.type = HirTypeKind::I32;
+        out.type = lhs->type;
         out.span = expr.span;
-        out.int_value = fold_arith_i32(
-            arith_kind, static_cast<i32>(lhs->int_value), static_cast<i32>(rhs->int_value));
+        out.int_value = is_i64 ? fold_arith_i64(arith_kind, lhs->int_value, rhs->int_value)
+                               : static_cast<i64>(fold_arith_i32(arith_kind,
+                                                                 static_cast<i32>(lhs->int_value),
+                                                                 static_cast<i32>(rhs->int_value)));
         return out;
     }
     HirExpr out{};
     out.kind = arith_kind;
-    out.type = HirTypeKind::I32;
+    out.type = lhs->type;
     out.span = expr.span;
     if (!route->exprs.push(lhs.value()))
         return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -3800,6 +3862,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         if (!rhs) return core::make_unexpected(rhs.error());
         if (rhs->may_nil || rhs->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        adopt_int_literal_type(&recv, &rhs.value());
         if (!same_hir_type_shape(mod, recv, *rhs))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (is_eq_family) {
@@ -5160,6 +5223,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     if (stmt.kind == AstStmtKind::Match && stmt.is_const) {
         auto subject = analyze_function_expr(stmt.expr, locals, local_count, nullptr);
         if (!subject) return core::make_unexpected(subject.error());
+        if (subject->type == HirTypeKind::I64)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
         ConstValue subject_value{};
         if (!const_eval_expr(subject.value(), locals, local_count, &subject_value, 0))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
@@ -5232,6 +5298,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         if (!subject) return core::make_unexpected(subject.error());
         if (subject->may_nil || subject->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+        if (subject->type == HirTypeKind::I64)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
 
         if (!scratch->exprs.push(subject.value()))
             return frontend_error(FrontendError::TooManyItems, stmt.span);
@@ -5788,7 +5857,9 @@ static FrontendResult<WsLenGuard> analyze_frame_len_cond(const AstExpr& cond, Ws
     } else {
         return frontend_error(FrontendError::UnsupportedSyntax, cond.span);
     }
-    if (num->int_value < 0) return frontend_error(FrontendError::UnsupportedSyntax, num->span);
+    // Bound must fit the runtime's u32 guard field (int_value is i64 now).
+    if (num->int_value < 0 || num->int_value > 0xffffffffLL)
+        return frontend_error(FrontendError::UnsupportedSyntax, num->span);
     using Cmp = WsLenGuard::Cmp;
     Cmp cmp;
     switch (cond.kind) {  // mirror the operator when frame.len is on the right
@@ -5954,9 +6025,10 @@ static FrontendResult<WaitSpec> analyze_wait_io_op_spec(const AstExpr& op, const
 }
 
 static bool wait_timer_call_ms(const AstExpr& op, u32& ms) {
+    // The upper bound keeps the i64 literal inside the u32 yield payload.
     if (op.kind != AstExprKind::Call || !op.name.eq({"timer", 5}) || op.args.len != 1 ||
         op.args[0] == nullptr || op.args[0]->kind != AstExprKind::IntLit ||
-        op.args[0]->int_value <= 0) {
+        op.args[0]->int_value <= 0 || op.args[0]->int_value > 0xffffffffLL) {
         return false;
     }
     ms = static_cast<u32>(op.args[0]->int_value);
@@ -6027,7 +6099,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     }
     if (expr.kind == AstExprKind::IntLit) {
         out.kind = HirExprKind::IntLit;
-        out.type = HirTypeKind::I32;
+        // Literal auto-widening: fits i32 → I32, else I64 (the parser caps
+        // the magnitude at the i64 range).
+        out.type = (expr.int_value >= -2147483648LL && expr.int_value <= 2147483647LL)
+                       ? HirTypeKind::I32
+                       : HirTypeKind::I64;
         out.int_value = expr.int_value;
         return out;
     }
@@ -6912,6 +6988,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.lhs->kind == AstExprKind::IntLit) {
+            // Error codes lower as i32 — an oversized literal would silently
+            // truncate in Error.code, so reject it here.
+            if (expr.lhs->int_value < -2147483648LL || expr.lhs->int_value > 2147483647LL)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.lhs->span,
+                                      lit_str("numeric error codes must fit i32"));
             out.int_value = expr.lhs->int_value;
             return out;
         }
@@ -7151,7 +7233,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         if (expr.rhs->kind == AstExprKind::MethodCall && expr.rhs->lhs != nullptr &&
             expr.rhs->lhs->kind == AstExprKind::Placeholder && expr.rhs->lhs->int_value != 1) {
-            const i32 slot = expr.rhs->lhs->int_value;
+            const i32 slot = static_cast<i32>(expr.rhs->lhs->int_value);
             if (slot <= 0 || slot > 10)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.rhs->lhs->span,
@@ -7455,12 +7537,19 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        adopt_int_literal_type(&lhs.value(), &rhs.value());
         const bool lhs_maybe_missing = lhs->may_nil || lhs->may_error;
         const bool rhs_maybe_missing = rhs->may_nil || rhs->may_error;
         if (expr.kind != AstExprKind::Eq && (lhs_maybe_missing || rhs_maybe_missing))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        if (lhs->type != rhs->type)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        if (lhs->type != rhs->type) {
+            const bool mixed_int =
+                (lhs->type == HirTypeKind::I32 && rhs->type == HirTypeKind::I64) ||
+                (lhs->type == HirTypeKind::I64 && rhs->type == HirTypeKind::I32);
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  mixed_int ? kArithMixedWidthDetail : Str{});
+        }
         if (expr.kind == AstExprKind::Eq) {
             if (lhs->type == HirTypeKind::Generic && !lhs->generic_has_eq_constraint)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -8002,6 +8091,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.error_struct_index = rhs->error_struct_index;
             out.error_variant_index = rhs->error_variant_index;
             out.is_eager_fallback = true;
+            if (out.type == HirTypeKind::I64 && out.may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
             return out;
         }
 
@@ -8042,6 +8134,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.may_error = rhs->may_error;
         out.error_struct_index = rhs->error_struct_index;
         out.error_variant_index = rhs->error_variant_index;
+        if (out.type == HirTypeKind::I64 && out.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
         return out;
     }
 
@@ -8118,6 +8212,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.error_struct_index = rhs->error_struct_index;
             out.error_variant_index = rhs->error_variant_index;
             out.is_eager_fallback = true;
+            if (out.type == HirTypeKind::I64 && out.may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
             return out;
         }
 
@@ -8162,6 +8259,42 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         out.error_struct_index = rhs->may_error ? rhs->error_struct_index : lhs->error_struct_index;
         out.error_variant_index =
             rhs->may_error ? rhs->error_variant_index : lhs->error_variant_index;
+        // The scalar error carrier's payload is Optional<i32>; a fallible
+        // i64 result would fail deep in lowering (mis-reported as OOM).
+        // Reject here until the i64 error carrier exists.
+        if (out.type == HirTypeKind::I64 && out.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
+        return out;
+    }
+
+    // `i64(x)` — Swift-initializer-style conversion builtin. A user binding
+    // or function named `i64` shadows it (same rule as the bitwise
+    // namespace). Identity on i64, fold on literals, WidenI64 (sign-extend)
+    // on runtime i32 values.
+    if (expr.name.eq({"i64", 3}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"i64", 3})) {
+        if (expr.args.len != 1 || expr.args[0] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64ArgDetail);
+        auto arg = analyze_builtin_arg(*expr.args[0]);
+        if (!arg) return core::make_unexpected(arg.error());
+        if (arg->may_nil || arg->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64ArgDetail);
+        if (arg->type == HirTypeKind::I64) return arg.value();
+        if (arg->type != HirTypeKind::I32)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64ArgDetail);
+        if (arg->kind == HirExprKind::IntLit) {
+            HirExpr out = arg.value();
+            out.type = HirTypeKind::I64;
+            out.span = expr.span;
+            return out;
+        }
+        HirExpr out{};
+        out.kind = HirExprKind::WidenI64;
+        out.type = HirTypeKind::I64;
+        out.span = expr.span;
+        if (!route->exprs.push(arg.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
 
@@ -8690,8 +8823,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     return frontend_error(FrontendError::TooManyItems, expr.span);
                 placeholder_source = &route->exprs[route->exprs.len - 1];
             }
-            auto slot_expr =
-                placeholder_slot_expr(*placeholder_source, arg_expr.int_value, arg_expr.span);
+            auto slot_expr = placeholder_slot_expr(
+                *placeholder_source, static_cast<i32>(arg_expr.int_value), arg_expr.span);
             if (!slot_expr) return core::make_unexpected(slot_expr.error());
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
@@ -8730,6 +8863,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     auto return_typed = apply_return_type(inlined.value(), "direct");
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
+    // Same rule as the any/all gates: a fallible i64 has no error carrier
+    // yet, and an annotation-less helper body like
+    // `if ok { 2147483648 } else { error(500) }` infers exactly that.
+    if (inlined->type == HirTypeKind::I64 && inlined->may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
     return inlined.value();
 }
 
@@ -9070,7 +9208,7 @@ static FrontendResult<void> analyze_guard_match_arms(
 
 static FrontendResult<void> record_seen_literal_match_case(
     const HirExpr& pattern,
-    FixedVec<i32, AstStatement::kMaxMatchArms>& seen_int_cases,
+    FixedVec<i64, AstStatement::kMaxMatchArms>& seen_int_cases,
     FixedVec<Str, AstStatement::kMaxMatchArms>& seen_str_cases,
     Span span) {
     if (pattern.kind == HirExprKind::IntLit) {
@@ -9163,7 +9301,7 @@ static bool const_eval_expr(
         return true;
     }
     if (expr.kind == HirExprKind::IntLit) {
-        out->type = HirTypeKind::I32;
+        out->type = expr.type;  // I32 or I64 (literal auto-widening)
         out->int_value = expr.int_value;
         return true;
     }
@@ -9188,6 +9326,12 @@ static bool const_eval_expr(
     if (expr.kind == HirExprKind::LocalRef && expr.local_index < local_count) {
         return const_eval_expr(locals[expr.local_index].init, locals, local_count, out, depth + 1);
     }
+    if (expr.kind == HirExprKind::WidenI64 && expr.lhs != nullptr) {
+        if (!const_eval_expr(*expr.lhs, locals, local_count, out, depth + 1)) return false;
+        if (out->type != HirTypeKind::I32) return false;
+        out->type = HirTypeKind::I64;  // same int_value, wider type
+        return true;
+    }
     if ((expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
          expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
          expr.kind == HirExprKind::Mod) &&
@@ -9201,10 +9345,14 @@ static bool const_eval_expr(
         ConstValue rhs{};
         if (!const_eval_expr(*expr.lhs, locals, local_count, &lhs, depth + 1)) return false;
         if (!const_eval_expr(*expr.rhs, locals, local_count, &rhs, depth + 1)) return false;
-        if (lhs.type != HirTypeKind::I32 || rhs.type != HirTypeKind::I32) return false;
-        out->type = HirTypeKind::I32;
-        out->int_value = fold_arith_i32(
-            expr.kind, static_cast<i32>(lhs.int_value), static_cast<i32>(rhs.int_value));
+        if (lhs.type != rhs.type) return false;
+        if (lhs.type != HirTypeKind::I32 && lhs.type != HirTypeKind::I64) return false;
+        out->type = lhs.type;
+        out->int_value =
+            lhs.type == HirTypeKind::I64
+                ? fold_arith_i64(expr.kind, lhs.int_value, rhs.int_value)
+                : static_cast<i64>(fold_arith_i32(
+                      expr.kind, static_cast<i32>(lhs.int_value), static_cast<i32>(rhs.int_value)));
         return true;
     }
     if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
@@ -9221,7 +9369,8 @@ static bool const_eval_expr(
                 out->bool_value = lhs.bool_value == rhs.bool_value;
                 return true;
             }
-            if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::Method) {
+            if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64 ||
+                lhs.type == HirTypeKind::Method) {
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }
@@ -9236,7 +9385,7 @@ static bool const_eval_expr(
             }
             return false;
         }
-        if (lhs.type == HirTypeKind::I32) {
+        if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64) {
             out->bool_value = expr.kind == HirExprKind::Lt ? (lhs.int_value < rhs.int_value)
                                                            : (lhs.int_value > rhs.int_value);
             return true;
@@ -9346,6 +9495,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     if (stmt.kind == AstStmtKind::Match && stmt.is_const) {
         auto subject = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
         if (!subject) return core::make_unexpected(subject.error());
+        if (subject->type == HirTypeKind::I64)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
         ConstValue subject_value{};
         if (!const_eval_expr(subject.value(), locals, local_count, &subject_value, 0))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
@@ -9778,6 +9930,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     if (stmt.kind == AstStmtKind::Match && stmt.is_const) {
         auto subject = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
         if (!subject) return core::make_unexpected(subject.error());
+        if (subject->type == HirTypeKind::I64)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
         ConstValue subject_value{};
         if (!const_eval_expr(subject.value(), locals, local_count, &subject_value, 0))
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
@@ -10050,6 +10205,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     if (stmt.kind == AstStmtKind::Match) {
         auto subject = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
         if (!subject) return core::make_unexpected(subject.error());
+        if (subject->type == HirTypeKind::I64)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, stmt.expr.span, kMatchI64Detail);
         const auto state = known_value_state(subject.value(), locals, local_count, 0);
         const auto err_name = known_error_name(subject.value(), locals, local_count, 0);
         const bool subject_is_error_kind = subject->type != HirTypeKind::Variant &&
@@ -10247,10 +10405,14 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 if (inner_subject->may_nil || inner_subject->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           nested_match_stmt->expr.span);
+                if (inner_subject->type == HirTypeKind::I64)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          nested_match_stmt->expr.span,
+                                          kMatchI64Detail);
                 bool inner_seen_wildcard = false;
                 bool inner_seen_bool_true = false;
                 bool inner_seen_bool_false = false;
-                FixedVec<i32, AstStatement::kMaxMatchArms> inner_seen_int_cases;
+                FixedVec<i64, AstStatement::kMaxMatchArms> inner_seen_int_cases;
                 FixedVec<Str, AstStatement::kMaxMatchArms> inner_seen_str_cases;
                 bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
                 u32 inner_seen_variant_case_count = 0;
@@ -10664,7 +10826,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 // (ws_valid_close_code): 1000–1003, 1007–1014, 3000–4999; rejects the reserved
                 // 1016–2999 range and the local-only codes too. (c<0 wraps to a huge u32 →
                 // rejected.)
-                const i32 c = cv.int_value;
+                const i32 c = static_cast<i32>(cv.int_value);
                 if (c < 0 || !ws_valid_close_code(static_cast<u32>(c)))
                     return frontend_error(FrontendError::UnsupportedSyntax, call.args[0]->span);
                 route->ws_handler.close_code = static_cast<u16>(c);
@@ -12417,6 +12579,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             if (!subject) return core::make_unexpected(subject.error());
             if (subject->may_nil || subject->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
+            if (subject->type == HirTypeKind::I64)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, bstmt.expr.span, kMatchI64Detail);
             body_match.match_expr = subject.value();
             if (!route->exprs.push(subject.value()))
                 return frontend_error(FrontendError::TooManyItems, bstmt.expr.span);
@@ -12521,6 +12686,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span);
+                    if (inner_subject->type == HirTypeKind::I64)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              nested_match_stmt->expr.span,
+                                              kMatchI64Detail);
                     if (!route->exprs.push(inner_subject.value()))
                         return frontend_error(FrontendError::TooManyItems,
                                               nested_match_stmt->expr.span);
@@ -12528,7 +12697,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bool inner_seen_wildcard = false;
                     bool inner_seen_bool_true = false;
                     bool inner_seen_bool_false = false;
-                    FixedVec<i32, AstStatement::kMaxMatchArms> inner_seen_int_cases;
+                    FixedVec<i64, AstStatement::kMaxMatchArms> inner_seen_int_cases;
                     FixedVec<Str, AstStatement::kMaxMatchArms> inner_seen_str_cases;
                     bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
                     for (u32 iai = 0; iai < nested_match_stmt->match_arms.len; iai++) {
@@ -12998,13 +13167,20 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               arm_stmt->expr.span);
+                    // Same i64-subject gate as the other nested-match paths.
+                    // Currently unreachable from the surface (the parser
+                    // rejects `for` wholesale), but this expansion path must
+                    // not become the bypass when for-loops are enabled.
+                    if (inner_subject->type == HirTypeKind::I64)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, arm_stmt->expr.span, kMatchI64Detail);
                     if (!route->exprs.push(inner_subject.value()))
                         return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
                     bool inner_seen_wildcard = false;
                     bool inner_seen_bool_true = false;
                     bool inner_seen_bool_false = false;
-                    FixedVec<i32, AstStatement::kMaxMatchArms> inner_seen_int_cases;
+                    FixedVec<i64, AstStatement::kMaxMatchArms> inner_seen_int_cases;
                     FixedVec<Str, AstStatement::kMaxMatchArms> inner_seen_str_cases;
                     bool inner_seen_variant_cases[HirVariant::kMaxCases]{};
                     for (u32 iai = 0; iai < arm_stmt->match_arms.len; iai++) {
