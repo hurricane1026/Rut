@@ -1030,13 +1030,31 @@ inline bool send_all(i32 fd, const char* d, u32 len) {
     return true;
 }
 
+inline i64 test_mono_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+}
+
 inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
-    struct timeval tv;
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = static_cast<long>(ms % 1000) * 1000L;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ssize_t n = recv(fd, buf, len, 0);
-    return static_cast<i32>(n < 0 ? -errno : n);
+    // SO_RCVTIMEO makes recv() non-restartable (man 7 signal): a stop/cont
+    // cycle on a loaded CI runner interrupts it with EINTR even though no
+    // handler exists. Field evidence (PR #186 dump): step=recv-101-nothing
+    // errno=4. Retry with the remaining budget instead of surfacing a
+    // spurious failure; a genuinely expired budget still returns -EAGAIN.
+    const i64 deadline = test_mono_ms() + ms;
+    for (;;) {
+        i64 left = deadline - test_mono_ms();
+        if (left < 1) left = 1;
+        struct timeval tv;
+        tv.tv_sec = left / 1000;
+        tv.tv_usec = static_cast<long>(left % 1000) * 1000L;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, buf, len, 0);
+        if (n >= 0) return static_cast<i32>(n);
+        if (errno != EINTR) return -errno;
+        if (test_mono_ms() >= deadline) return -EAGAIN;
+    }
 }
 
 inline bool has_200(const char* buf, i32 n) {
