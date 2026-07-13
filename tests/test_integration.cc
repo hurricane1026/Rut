@@ -11453,7 +11453,10 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     u16 port = get_port(lfd);
     REQUIRE(loop->init(0, lfd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 100};
+    // Time-based hang-guard, not an iteration cap: under a loaded CI runner
+    // spurious wakeups can burn a 100-iteration cap before the request even
+    // lands (the #175 flake class), killing the loop mid-scenario.
+    LoopThread lt = {loop, {}, 0, 15000};
     lt.start();
 
     i32 c = connect_to(port);
