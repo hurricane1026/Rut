@@ -277,7 +277,7 @@ struct RouteConfig {
     }
 
     // Cache<K, i64> instance descriptors from top-level `let x = Cache<IP,
-    // i64>(capacity: N)` declarations (docs/state-types.md §4). Declarative
+    // i64>(capacity: N)` declarations (docs/state-types.md). Declarative
     // only — the per-shard slot tables live in thread_local storage inside
     // the cache helpers; the loader publishes these descriptors to the
     // process CacheRegistry after the config compiles.

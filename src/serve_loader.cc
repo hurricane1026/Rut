@@ -262,7 +262,7 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
 
     // Publish Cache instance descriptors to the process registry — shard
     // threads lazily (re)build their thread_local tables against these on
-    // first touch (docs/state-types.md §4). LAST fallible-free step of the
+    // first touch (docs/state-types.md). LAST fallible-free step of the
     // load: publishing earlier would mutate the process registry even when
     // a later registration step fails and the old program stays live.
     cache_registry_publish_config(out.config);
