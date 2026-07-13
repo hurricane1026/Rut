@@ -3366,6 +3366,8 @@ static bool bitwise_namespace_receiver(const AstExpr& lhs) {
 // hardware-dependent masking. Callers check namespace shadowing. pipe_lhs,
 // when non-null, substitutes `_`/`_N` placeholder arguments (pipeline stage
 // form: `mask | bitwise.and(_, 3)`).
+static void adopt_int_literal_type(HirExpr* a, HirExpr* b);
+
 static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& expr,
                                                               HirRoute* route,
                                                               const HirModule& mod,
@@ -3457,44 +3459,58 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         if (!rhs) return core::make_unexpected(rhs.error());
         rhs_expr = rhs.value();
     }
-    if (lhs->type != HirTypeKind::I32 || rhs_expr.type != HirTypeKind::I32 || lhs->may_nil ||
-        lhs->may_error || rhs_expr.may_nil || rhs_expr.may_error)
+    // Same-width rule as arithmetic: both operands i32 or both i64, with a
+    // bare int literal adopting the i64 side (this also widens flip's
+    // synthesized -1 next to an i64 operand). Shift amounts share the
+    // operand width; out-of-range amounts saturate at that width.
+    adopt_int_literal_type(&lhs.value(), &rhs_expr);
+    const bool int_typed = (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
+                           (rhs_expr.type == HirTypeKind::I32 || rhs_expr.type == HirTypeKind::I64);
+    if (!int_typed || lhs->may_nil || lhs->may_error || rhs_expr.may_nil || rhs_expr.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kBitwiseOperandDetail);
+    if (lhs->type != rhs_expr.type)
+        return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kArithMixedWidthDetail);
+    const bool is64 = lhs->type == HirTypeKind::I64;
     if (lhs->kind == HirExprKind::IntLit && rhs_expr.kind == HirExprKind::IntLit) {
-        const i32 a = static_cast<i32>(lhs->int_value);
-        const i32 n = static_cast<i32>(rhs_expr.int_value);
-        i32 folded = 0;
+        const i64 a = lhs->int_value;
+        const i64 n = rhs_expr.int_value;
+        const u64 width = is64 ? 64u : 32u;
+        i64 folded = 0;
         switch (bit_kind) {
             case HirExprKind::BitAnd:
-                folded = static_cast<i32>(static_cast<u32>(a) & static_cast<u32>(n));
+                folded = static_cast<i64>(static_cast<u64>(a) & static_cast<u64>(n));
                 break;
             case HirExprKind::BitOr:
-                folded = static_cast<i32>(static_cast<u32>(a) | static_cast<u32>(n));
+                folded = static_cast<i64>(static_cast<u64>(a) | static_cast<u64>(n));
                 break;
             case HirExprKind::BitXor:
-                folded = static_cast<i32>(static_cast<u32>(a) ^ static_cast<u32>(n));
+                folded = static_cast<i64>(static_cast<u64>(a) ^ static_cast<u64>(n));
                 break;
             case HirExprKind::BitShl:
-                folded = static_cast<u32>(n) >= 32u
+                folded = static_cast<u64>(n) >= width
                              ? 0
-                             : static_cast<i32>(static_cast<u32>(a) << static_cast<u32>(n));
+                             : (is64 ? static_cast<i64>(static_cast<u64>(a) << n)
+                                     : static_cast<i64>(static_cast<i32>(static_cast<u32>(a)
+                                                                         << static_cast<u32>(n))));
                 break;
             case HirExprKind::BitShr:
-                folded = static_cast<u32>(n) >= 32u ? (a < 0 ? -1 : 0) : static_cast<i32>(a >> n);
+                // Arithmetic shift at the operand width; i32 values stored in
+                // i64 shift identically for n < 32.
+                folded = static_cast<u64>(n) >= width ? (a < 0 ? -1 : 0) : (a >> n);
                 break;
             default:
                 break;
         }
         HirExpr out{};
         out.kind = HirExprKind::IntLit;
-        out.type = HirTypeKind::I32;
+        out.type = lhs->type;
         out.span = expr.span;
         out.int_value = folded;
         return out;
     }
     HirExpr out{};
     out.kind = bit_kind;
-    out.type = HirTypeKind::I32;
+    out.type = lhs->type;
     out.span = expr.span;
     if (!route->exprs.push(lhs.value()))
         return frontend_error(FrontendError::TooManyItems, expr.span);

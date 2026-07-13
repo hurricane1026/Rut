@@ -261,7 +261,10 @@ The two integer widths never mix implicitly:
   literal adopts the i64 side (`i64(x) + 1` works).
 - `i64` is deliberately unnameable in type position (like ByteSize): no
   annotations, no struct fields, no function parameters. `match` on an i64
-  subject and `bitwise.*` over i64 are rejected for now.
+  subject is rejected for now. `bitwise.*` follows the same same-width rule
+  as arithmetic (shift amounts share the operand width and saturate out of
+  range) — the substrate for packing multi-field algorithm state into one
+  i64 slot (docs/state-types.md §4.2).
 
 Duration/ByteSize arithmetic (§3.3) is a separate, later surface.
 
