@@ -773,15 +773,24 @@ processed sequentially — no locks, just SPSC message round-trip.
 
 ```swift
 // rut:allow(consistent)
-let exactBuckets = Cache<IP, i64>(capacity: 100000, consistent: true)
+let ownerBuckets = Cache<IP, i64>(capacity: 100000, consistent: true)
 
 get /api/*path {
     // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
-    let tat = exactBuckets.get(req.remoteAddr).or(0)
-    // ... GCRA over tat (examples/ratelimit.rut), exact across shards
+    let tat = ownerBuckets.get(req.remoteAddr).or(0)
+    // ... GCRA over tat (examples/ratelimit.rut)
     return forward(userService)
 }
 ```
+
+`consistent: true` on a `Cache` removes per-shard divergence (one owner
+shard holds the state) — it does NOT make the state exact: the slot table
+stays lossy (a colliding `set` can still evict a bucket, and `.or(0)`
+restarts it), and a read-modify-write built from separate `get`/`set`
+round-trips can interleave between shards, losing updates. Exact global
+limiting needs a strict (visible-failure) table plus an owner-shard atomic
+update primitive — both future work; until then `consistent:` Cache is
+"single-owner, still lossy".
 
 Cost: 1 SPSC round-trip when current shard != owner shard (local ops are free).
 Compiler emits a warning — user must acknowledge with `// rut:allow(consistent)`.
@@ -808,7 +817,8 @@ use `backend:` to sync via external storage:
 // Per-process only (default) — fast, approximate
 let buckets = Cache<IP, i64>(capacity: 100000)
 
-// Cross-node via Redis — exact cluster-wide buckets
+// Cross-node via Redis — shared cluster-wide buckets (approximate: reads
+// hit the local cache first, so instances can act on stale values)
 let globalBuckets = Cache<IP, i64>(capacity: 100000, backend: .redis("redis:6379"))
 ```
 

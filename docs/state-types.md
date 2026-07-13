@@ -1,7 +1,9 @@
 # State Types — Decision Record
 
-Status: **accepted** (2026-07-13); slices 1–6 shipped (#178, #179, #181,
-#182, #183, #184). This file records the *decisions* and their reasons —
+Status: **accepted** (2026-07-13). Implementation: slices 1–2 merged
+(#178, #179); slices 3–6 — the `Cache` substrate, i64 bitwise, time/max,
+and `examples/ratelimit.rut` — are in flight as PRs #181/#182/#183/#184,
+which this doc's file references land with. This file records the *decisions* and their reasons —
 mechanics live as comments next to the code they describe
 (`include/rut/runtime/cache_table.h`, `src/compiler/analyze.cc`), and the
 user-facing semantics live in DESIGN.md §3.3.6 and docs/language-card.md.

@@ -25,7 +25,7 @@ tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
-let limits = Counter<IP>(capacity: 100000, window: 1m)   // state (per-shard)
+let buckets = Cache<IP, i64>(capacity: 100000)     // state (per-shard, lossy slots)
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
@@ -218,17 +218,19 @@ return resp
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let sessions  = Hash<str, Session>(capacity: 50000, ttl: 30m)
-let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)
-let blacklist = Set<IP>(capacity: 100000)          // Set<CIDR> = LPM trie
-let limits    = Counter<IP>(capacity: 100000, window: 1m)      // sliding window
-let bursts    = Counter<IP>(capacity: 100000, rate: 100, burst: 20) // token bucket
-let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)
-let flags     = Bitmap(size: 256)
+let buckets = Cache<IP, i64>(capacity: 100000)   // ✅ shipped — lossy per-key slots
+let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
+buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait;
+                                                 // may evict a colliding neighbor
+// Never store anything whose absence yields a wrong answer (sessions,
+// in-flight counts). Rate limiting = plain Rut over Cache (examples/ratelimit.rut);
+// Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
+// Cache ops are rejected in routes containing wait, and set is not an expression.
 
-sessions.set(k, v)  sessions.get(k) /*V?*/  sessions.delete(k)  sessions.contains(k)
-limits.incr(key)    limits.get(key)         bursts.take(key) /*bool*/
-guard limits.incr(req.remoteAddr) <= 1000 else { return 429 }
+let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)  // ⏳ pending
+let blacklist = Set<IP>(capacity: 100000)          // ⏳ pending (Set<CIDR> = LPM trie)
+let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ pending
+let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
 notify(key) counters.incr(key)    // to owner shard by key hash
@@ -364,14 +366,10 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ```swift
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
-let limits = Counter<IP>(capacity: 100000, window: 1m)
-
-func rateLimit(_ req: Request, max: i32) {
-    guard limits.incr(req.remoteAddr) <= max else { respond 429 }
-}
+let buckets = Cache<IP, i64>(capacity: 100000)   // GCRA state: examples/ratelimit.rut
 
 route {
-    @rateLimit(max: 1000) *
+    @rateLimit(limit: 1000, window: 1m) *
     get /health => 200
     get /users/:id(i64) => forward(users)
     post /users {
