@@ -67,6 +67,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_str_regex_match", reinterpret_cast<void*>(&rut_helper_str_regex_match)},
     {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
     {"rut_helper_time_now_micros", reinterpret_cast<void*>(&rut_helper_time_now_micros)},
+    {"rut_helper_time_unlatch", reinterpret_cast<void*>(&rut_helper_time_unlatch)},
     {nullptr, nullptr},
 };
 

@@ -800,6 +800,54 @@ TEST(jit, frontend_time_minmax_gcra_shape_executes) {
     rir.destroy();
 }
 
+TEST(jit, frontend_time_latch_resets_per_invocation_without_parse) {
+    // A handler that samples time.nowMicros() but never reads the request
+    // gets no parse_prime (the usual latch reset), so it needs the dedicated
+    // prologue unlatch — without it the thread's clock freezes at the first
+    // sampled value and GCRA-style buckets never observe elapsed time.
+    // Observed via the helper: after each invocation the latch still holds
+    // that invocation's value, so two spaced invocations must differ.
+    const char* src =
+        "route GET \"/t\" { let t1 = time.nowMicros() "
+        "if t1 > 0 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto invoke = [&] {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        CHECK_EQ(r.status_code, 200);
+        return rut_helper_time_now_micros();  // latch still holds this invocation's value
+    };
+    const i64 first = invoke();
+    usleep(2000);
+    const i64 second = invoke();
+    CHECK_GT(second, first);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_i64_local_across_wait_executes) {
     // Locals re-materialize fresh in resume states (no ctx slots involved),
     // so an i64 local crosses a wait exactly like an i32 — this pins the

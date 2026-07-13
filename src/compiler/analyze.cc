@@ -8294,6 +8294,19 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         const bool is_min = expr.name.eq({"min", 3});
         if ((is_max || is_min) &&
             !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+            // As a pipe stage the piped value must land in an explicit
+            // placeholder — `x | max(1, 2)` would otherwise silently drop x.
+            if (pipe_lhs != nullptr) {
+                u32 placeholders = 0;
+                for (u32 i = 0; i < expr.args.len; i++) {
+                    if (expr.args[i] != nullptr && expr.args[i]->kind == AstExprKind::Placeholder)
+                        placeholders++;
+                }
+                if (placeholders == 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.span,
+                                          lit_str("pipe call missing placeholder"));
+            }
             if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kMinMaxDetail);
             auto lhs = analyze_builtin_arg(*expr.args[0]);
@@ -9417,6 +9430,22 @@ static bool const_eval_expr(
                 ? fold_arith_i64(expr.kind, lhs.int_value, rhs.int_value)
                 : static_cast<i64>(fold_arith_i32(
                       expr.kind, static_cast<i32>(lhs.int_value), static_cast<i32>(rhs.int_value)));
+        return true;
+    }
+    if ((expr.kind == HirExprKind::MaxInt || expr.kind == HirExprKind::MinInt) &&
+        expr.lhs != nullptr && expr.rhs != nullptr) {
+        // max/min over compile-time values — same-width rule as the analyze
+        // fold; i32 operands compare identically at the stored i64 width.
+        ConstValue lhs{};
+        ConstValue rhs{};
+        if (!const_eval_expr(*expr.lhs, locals, local_count, &lhs, depth + 1)) return false;
+        if (!const_eval_expr(*expr.rhs, locals, local_count, &rhs, depth + 1)) return false;
+        if (lhs.type != rhs.type) return false;
+        if (lhs.type != HirTypeKind::I32 && lhs.type != HirTypeKind::I64) return false;
+        out->type = lhs.type;
+        out->int_value = expr.kind == HirExprKind::MaxInt
+                             ? (lhs.int_value > rhs.int_value ? lhs.int_value : rhs.int_value)
+                             : (lhs.int_value < rhs.int_value ? lhs.int_value : rhs.int_value);
         return true;
     }
     if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||

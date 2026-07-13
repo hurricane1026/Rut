@@ -1843,6 +1843,54 @@ TEST(frontend, analyze_time_and_minmax_gates_and_shadowing) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, analyze_minmax_pipe_stage_requires_placeholder) {
+    // `x | max(1, 2)` must not silently drop x — a builtin pipe stage needs
+    // an explicit placeholder, same rule as ordinary pipe calls.
+    const char* dropped = "route GET \"/x\" { let a = 5 let v = a | max(1, 2) return 200 }\n";
+    auto lexed = lex(lit(dropped));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // With the placeholder the piped value participates normally.
+    const char* piped =
+        "route GET \"/x\" { let a = 5 let v = a | max(_, 3) if v == 5 { return 200 } else { "
+        "return 500 } }\n";
+    lexed = lex(lit(piped));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_minmax_const_evals_over_const_locals) {
+    // max/min over compile-time locals participate in `if const`, matching
+    // the arithmetic operators.
+    const char* src =
+        "route GET \"/x\" { let a = 3 let b = 5 if const max(a, b) == 5 { return 200 } "
+        "else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char* min_src =
+        "route GET \"/x\" { let a = 3 if const min(a, 7) == 3 { return 200 } "
+        "else { return 500 } }\n";
+    lexed = lex(lit(min_src));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {
     const char* src = "route GET \"/x\" { wait(timer(4294967296)) return 200 }\n";
     auto lexed = lex(lit(src));

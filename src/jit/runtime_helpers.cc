@@ -466,6 +466,10 @@ i64 rut_helper_time_now_micros() {
     return tc.value;
 }
 
+void rut_helper_time_unlatch() {
+    t_time_cache.valid = false;
+}
+
 u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return 0;
