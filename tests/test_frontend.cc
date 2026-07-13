@@ -1631,6 +1631,41 @@ TEST(frontend, analyze_rejects_i64_generic_binding) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, analyze_i64_eq_method_adopts_literal) {
+    // The Eq/Ord method family must adopt bare int literals like the
+    // operator forms do: i64(a).eq(5) == (i64(a) == 5).
+    const char* src =
+        "route GET \"/x\" { let a = 5 if i64(a).eq(5) && i64(a).lt(10) { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_nested_match_on_i64_subject) {
+    // The nested-match expansion paths must apply the same i64-subject gate
+    // as the top-level sites — with i64-typed patterns nothing else stops it.
+    const char* src =
+        "route GET \"/x\" { match true { true => match i64(5) { 2147483648 => return 500 _ "
+        "=> return 200 } _ => return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
 TEST(frontend, analyze_rejects_oversized_error_code) {
     // Error codes lower as i32; an oversized literal must not silently
     // truncate in Error.code.

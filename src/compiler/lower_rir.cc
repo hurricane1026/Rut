@@ -2417,10 +2417,15 @@ static FrontendResult<rir::ValueId> materialize_local_init(
     };
 
     if (local.may_error) {
+        // I64 is deliberately NOT admitted here: the __error_unknown scalar
+        // carrier's payload field is Optional<i32>, so a fallible i64 local
+        // would fail deep in emit_struct_create. No expression can produce
+        // one yet; when a fallible i64 source appears, add an i64 error
+        // carrier alongside this whitelist entry. (may_nil I64 below IS
+        // supported — the Optional carrier is width-generic.)
         if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
-            local_shape.type != MirTypeKind::I64 && local_shape.type != MirTypeKind::Str &&
-            local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct &&
-            local_shape.type != MirTypeKind::Unknown)
+            local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
+            local_shape.type != MirTypeKind::Struct && local_shape.type != MirTypeKind::Unknown)
             return frontend_error(FrontendError::UnsupportedSyntax, local.span);
         auto inner = make_inner_type(local_shape, local.span);
         if (!inner) return core::make_unexpected(inner.error());

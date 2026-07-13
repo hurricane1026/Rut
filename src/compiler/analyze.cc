@@ -3859,6 +3859,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         if (!rhs) return core::make_unexpected(rhs.error());
         if (rhs->may_nil || rhs->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        adopt_int_literal_type(&recv, &rhs.value());
         if (!same_hir_type_shape(mod, recv, *rhs))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (is_eq_family) {
@@ -10383,6 +10384,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 if (inner_subject->may_nil || inner_subject->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           nested_match_stmt->expr.span);
+                if (inner_subject->type == HirTypeKind::I64)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          nested_match_stmt->expr.span,
+                                          kMatchI64Detail);
                 bool inner_seen_wildcard = false;
                 bool inner_seen_bool_true = false;
                 bool inner_seen_bool_false = false;
@@ -12660,6 +12665,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span);
+                    if (inner_subject->type == HirTypeKind::I64)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              nested_match_stmt->expr.span,
+                                              kMatchI64Detail);
                     if (!route->exprs.push(inner_subject.value()))
                         return frontend_error(FrontendError::TooManyItems,
                                               nested_match_stmt->expr.span);
