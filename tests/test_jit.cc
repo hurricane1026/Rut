@@ -1081,6 +1081,37 @@ TEST(jit, cache_helpers_miss_and_out_of_range) {
     rut_helper_cache_set(7, 0x7F000001u, 1);
 }
 
+TEST(jit, cache_get_optionals_from_two_instances_merge_and_verify) {
+    // Two cache instances' Optional<I64> results flowing through nested .or
+    // fallbacks must produce ONE LLVM carrier type — pins the canonical
+    // Optional<I64> in emit_cache_get (and that LLVM literal-struct
+    // uniquing keeps the select well-typed under JIT verification).
+    const char* src =
+        "let a = Cache<IP, i64>(capacity: 64)\n"
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { "
+        "let n = a.get(req.remoteAddr).or(b.get(req.remoteAddr).or(0)) "
+        "if n > 0 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));  // JIT verification passes
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, cache_registry_identity_governs_persistence_across_publish) {
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {64};

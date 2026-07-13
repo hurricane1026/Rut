@@ -906,10 +906,19 @@ struct Builder {
 
     // ── Cache state ─────────────────────────────────────────────────
 
+    // One canonical Optional<I64> for every cache.get result: LLVM literal
+    // structs are structurally uniqued so fresh types WOULD map to one LLVM
+    // type, but a single rir::Type* keeps identity-based comparisons (and
+    // the codegen type cache) trivially correct as well.
+    const Type* opt_i64_cache = nullptr;
+
     Result<ValueId> emit_cache_get(u32 instance, ValueId key, SourceLoc loc = {}) {
         if (!valid_val(key) || !val_has_type(key, TypeKind::IP)) return err(RirError::InvalidState);
-        auto* inner = TRY(make_type(TypeKind::I64));
-        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        if (opt_i64_cache == nullptr) {
+            auto* inner = TRY(make_type(TypeKind::I64));
+            opt_i64_cache = TRY(make_type(TypeKind::Optional, inner));
+        }
+        auto* ty = opt_i64_cache;
         auto [inst, vid] = TRY(emit(Opcode::CacheGet, ty, loc));
         inst->operands[0] = key;
         inst->operand_count = 1;
