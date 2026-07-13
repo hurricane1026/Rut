@@ -492,10 +492,30 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
     static thread_local rut::u32 t_generation = 0;
     static thread_local bool t_alloc_failed_logged[rut::CacheRegistry::kMaxInstances];
     auto& reg = rut::cache_registry();
-    // Acquire pairs with publish's release generation bump — after this
-    // load, the seed/identities/capacities of that generation are visible.
-    const rut::u32 gen = reg.generation.load(std::memory_order_acquire);
-    if (gen == 0) return nullptr;  // nothing published yet
+    // Seqlock-style snapshot: the acquire on `generation` orders the
+    // descriptor loads AFTER the bump we observed, but a publish running
+    // concurrently could still overwrite them before we read — so re-check
+    // the generation after reading and retry. Without this, a reader could
+    // pair the old generation with the NEXT publish's half-written
+    // descriptors (e.g. observe count == 0 mid-publish and degrade a live
+    // handler to miss/no-op, or build a table against a future capacity).
+    rut::u32 gen = 0;
+    rut::u32 live_count = 0;
+    rut::u64 snap_seed = 0;
+    rut::u32 snap_caps[rut::CacheRegistry::kMaxInstances];
+    rut::u64 snap_idents[rut::CacheRegistry::kMaxInstances];
+    for (int tries = 0;; tries++) {
+        gen = reg.generation.load(std::memory_order_acquire);
+        if (gen == 0) return nullptr;  // nothing published yet
+        live_count = reg.count.load(std::memory_order_relaxed);
+        snap_seed = reg.seed.load(std::memory_order_relaxed);
+        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+            snap_caps[i] = reg.capacities[i].load(std::memory_order_relaxed);
+            snap_idents[i] = reg.identities[i].load(std::memory_order_relaxed);
+        }
+        if (reg.generation.load(std::memory_order_acquire) == gen) break;
+        if (tries >= 8) return nullptr;  // publish storm — treat as miss
+    }
     if (gen != t_generation) {
         // A publish happened since this shard last looked. Drop tables
         // whose instance disappeared, moved (identity change from a
@@ -503,14 +523,11 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
         // logical cache's entries; keeping stale ones would leak the mmap.
         // Identical declarations keep their table (state persists across
         // reloads, documented).
-        const rut::u32 live_count = reg.count.load(std::memory_order_relaxed);
         for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
             if (t_tables[i].slots == nullptr) continue;
             const bool live =
-                i < live_count &&
-                reg.identities[i].load(std::memory_order_relaxed) == t_identities[i] &&
-                rut::CacheTable::round_capacity(
-                    reg.capacities[i].load(std::memory_order_relaxed)) == t_tables[i].slot_count;
+                i < live_count && snap_idents[i] == t_identities[i] &&
+                rut::CacheTable::round_capacity(snap_caps[i]) == t_tables[i].slot_count;
             if (!live) {
                 t_tables[i].destroy();
                 t_identities[i] = 0;
@@ -518,12 +535,12 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
         }
         t_generation = gen;
     }
-    if (instance >= reg.count.load(std::memory_order_relaxed)) return nullptr;
-    const rut::u32 cap = reg.capacities[instance].load(std::memory_order_relaxed);
+    if (instance >= live_count) return nullptr;
+    const rut::u32 cap = snap_caps[instance];
     if (cap == 0) return nullptr;
     rut::CacheTable& t = t_tables[instance];
     if (t.slot_count != rut::CacheTable::round_capacity(cap)) {
-        if (!t.init(cap, reg.seed.load(std::memory_order_relaxed))) {
+        if (!t.init(cap, snap_seed)) {
             // Fail VISIBLY (fixed-capacity axiom): a silent nullptr would
             // degrade every cache op on this shard to miss/no-op — for a
             // rate limit that silently admits all traffic. Fail-closed
@@ -538,7 +555,7 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
             }
             return nullptr;
         }
-        t_identities[instance] = reg.identities[instance].load(std::memory_order_relaxed);
+        t_identities[instance] = snap_idents[instance];
         t_alloc_failed_logged[instance] = false;
     }
     return &t;
