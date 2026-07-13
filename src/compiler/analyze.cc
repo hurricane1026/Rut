@@ -38,8 +38,9 @@ constexpr Str kBitwiseMemberDetail = lit_str(
     "bitwise.xor(a, b) / bitwise.flip(a) / bitwise.shiftLeft(a, n) / "
     "bitwise.shiftRight(a, n)");
 constexpr Str kBitwiseOperandDetail = lit_str(
-    "bitwise operands must be plain i32 values; bind optional or fallible "
-    "values first with guard let / if let / .or(default)");
+    "bitwise operands must be plain same-width integers (i32 or i64; wrap "
+    "an i32 side in i64(x)); bind optional or fallible values first with "
+    "guard let / if let / .or(default)");
 // Fix-it details for the arithmetic operators (DESIGN.md §3.2.1).
 constexpr Str kArithOperandDetail = lit_str(
     "arithmetic operands must be plain i32 values; bind optional or fallible "
