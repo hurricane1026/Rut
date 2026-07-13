@@ -17,7 +17,7 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
-import { rateLimit } from "stdlib/ratelimit.rut"   // selective import
+import { tokenBucket } from "examples/ratelimit.rut" // selective import
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
 listen :443                       // ⏳ ports (no top-level listen yet)
@@ -225,7 +225,9 @@ buckets.set(req.remoteAddr, v)                   // bare statement, before any g
 // Never store anything whose absence yields a wrong answer (sessions,
 // in-flight counts). Rate limiting = plain Rut over Cache (examples/ratelimit.rut);
 // Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
-// Cache ops are rejected in routes containing wait, and set is not an expression.
+// Cache ops are rejected in routes containing wait (timer/event suspension);
+// `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
+// forward proxy pattern composes fine. set is not an expression.
 
 let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)  // ⏳ pending
 let blacklist = Set<IP>(capacity: 100000)          // ⏳ pending (Set<CIDR> = LPM trie)
@@ -233,7 +235,8 @@ let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ 
 let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
-notify(key) buckets.set(key, v)   // to owner shard by key hash
+notify(key) blacklist.add(key)    // to owner shard by key hash (expr form;
+                                  // bare-statement cache.set does not nest)
 // strong consistency: declare state with consistent: true (+ // rut:allow(consistent))
 // cross-node: backend: .redis("redis:6379")
 ```

@@ -729,7 +729,7 @@ Use cases: feature flags, upstream health status, compact boolean arrays.
 | `errorRate:` | Bloom (required) | False positive rate, determines memory usage |
 | `size:` | Bitmap (required) | Number of bits |
 | `persist: true` | all | Preserve data across hot reload; compile error if struct layout changed |
-| `consistent: true` | Cache, Set | Route ops to owner shard by key hash; strong consistency, SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
+| `consistent: true` | Cache, Set | Single-owner routing by key hash (removes shard divergence; lossy containers stay approximate); SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
 | `coalesce: true` | LRU | Request coalescing — on cache miss with in-flight request for same key, suspend and wait instead of sending duplicate upstream request |
 | `backend: .redis(addr)` | Cache, Set | Cross-node state sync via external storage; per-shard state becomes a local cache with Redis as source of truth |
 
@@ -1418,10 +1418,9 @@ func auth(_ req: Request, role: string) -> User {
     return User(id: claims.sub, role: claims.role)
 }
 
-func rateLimit(_ req: Request, limits: Counter<IP>, max: i32) {
-    let count = limits.incr(req.remoteAddr)
-    guard count <= max else { respond 429 }
-}
+// Rate limiting: use the official @rateLimit decorator, or write GCRA in
+// Rut over Cache<IP, i64> (examples/ratelimit.rut) — Counter is deleted
+// (§3.3.6).
 
 func requestId(_ req: Request) {
     if req.header("X-Request-ID") == nil {
@@ -1469,9 +1468,9 @@ func maxBody(_ req: Request, limit: ByteSize) {
     guard req.contentLength <= limit else { respond 413 }
 }
 
-func concurrencyLimit(_ req: Request, active: Counter<IP>, limit: i32) {
-    guard active.get(req.remoteAddr) < limit else { respond 503, "overloaded" }
-}
+// In-flight concurrency limiting needs the exact gauge table (§3.3.6 /
+// docs/state-types.md D3) — NOT Cache (an evicted incr leaks the count).
+// Upstream max-inflight → 503 exists today as a proxy feature.
 
 // --- Response middleware (takes both Request and Response) ---
 
@@ -1486,10 +1485,9 @@ func securityHeaders(_ req: Request, _ resp: Response) {
 
 // --- Security middleware examples ---
 
-func antiFlood(_ req: Request, perIP: Counter<IP>, global: Counter<string>) {
-    guard perIP.incr(req.remoteAddr) <= 50 else { respond 429 }
-    guard global.incr("total") <= 10000 else { respond 503 }
-}
+// Flood control is the same GCRA-over-Cache pattern as rate limiting
+// (examples/ratelimit.rut), keyed per-IP; a global limiter uses the
+// exact gauge table when it lands (§3.3.6).
 
 func waf(_ req: Request) {
     let path = req.path
@@ -1855,7 +1853,7 @@ resp.upstream                 // string — which target served this ("10.0.0.1:
 `resp.cookie()` and `resp.upstream` enable session persistence "learn" mode:
 
 ```swift
-let sessionMap = Hash<string, string>(capacity: 100000, ttl: 1h)
+let sessionMap = Hash<string, string>(capacity: 100000, ttl: 1h)  // ⚠ future strict Hash (§3.3.6 — not a Rut name today)
 
 get /api/*path {
     // Sticky session — route to previously learned upstream
@@ -2670,7 +2668,7 @@ stdlib/
 ```
 
 ```swift
-import { rateLimit } from "stdlib/ratelimit.rut"
+import { tokenBucket } from "examples/ratelimit.rut"
 import { cors, securityHeaders } from "stdlib/security.rut"
 ```
 
@@ -2883,10 +2881,11 @@ tcp(addr) -> TcpConn          // TCP connection (Redis, custom protocols)
 udp() -> UdpSock              // UDP socket (StatsD, syslog, DNS)
 
 // --- State (per-shard by default, all bounded) ---
-Hash<K,V>(capacity:, ttl:)    // key-value store
+Cache<K, i64>(capacity:)      // lossy per-key state slots (shipped; §3.3.6)
+Hash<K,V>(capacity:, ttl:)    // ⚠ reserved name — future strict table (§3.3.6)
 LRU<K,V>(capacity:, ttl:)     // key-value with LRU eviction
 Set<T>(capacity:)              // membership testing (CIDR → auto LPM trie)
-Counter<K>(capacity:, window:) // sliding window counters
+// Counter<K> is deleted — rate limiting is Rut code over Cache (§3.3.6)
 Bloom<T>(capacity:, errorRate:) // probabilistic set, memory-efficient
 Bitmap(size:)                  // fixed-size bit array
 
@@ -3063,14 +3062,12 @@ bitwise.shiftRight(a, n)      // a >> n
 | Regex capture | `m[3]` but pattern has 2 groups | "regex has 2 capture groups, index 3 out of range" |
 | Recursion | `func foo() { foo() }` | "recursive call detected: foo → foo" |
 | While loop | `while cond { }` | "while loops not supported, use for...in" |
-| Consistent cost | `Counter<IP>(..., consistent: true)` | warning: "cross-shard round-trip on every op, suppress with // rut:allow(consistent)" |
-| Consistent unnecessary | `Counter<IP>(window: 10s, consistent: true)` | warning: "window >= 1s, per-shard approximation error < 10%, consider removing consistent" |
+| Consistent cost | `Cache<IP, i64>(..., consistent: true)` | warning: "cross-shard round-trip on every op, suppress with // rut:allow(consistent)" |
 | Consistent read-only | `Set<IP>(..., consistent: true)` with only `.contains()` | warning: "reads are local, consistent only affects writes, use notify all for rare writes" |
 | Broadcast in handler | `notify` inside a route handler | warning: "executes on every request, did you mean to put this in an admin endpoint?" |
 | Post-middleware + zero-copy | `@addSecurityHeaders *` bound to `=> forward(x)` | warning: "post-middleware forces buffered mode, zero-copy disabled" |
-| State key type | `Hash<Order, string>` | "Hash key must be scalar type" |
-| State no capacity | `Hash<string, User>()` | "capacity is required" |
-| Counter no window | `Counter<IP>(capacity: N)` | "Counter requires window" |
+| State key type | `Cache<Order, i64>` | "Cache key must be scalar type" |
+| State no capacity | `Cache<IP, i64>()` | "capacity is required" |
 | Persist layout change | hot reload + struct field changed | "persistent state 'sessions': layout changed" |
 
 ### 3.7 Async Transparency
@@ -3135,7 +3132,7 @@ removed from the language instead of documented as a variation.
 ```swift
 // production.rut
 
-import { rateLimit } from "stdlib/ratelimit.rut"
+import { tokenBucket } from "examples/ratelimit.rut"
 import { cors, securityHeaders, ipAllow, waf } from "stdlib/security.rut"
 import { requestId } from "stdlib/request.rut"
 
@@ -3198,7 +3195,7 @@ struct OrderItem {
 
 // ---------- State ----------
 
-let apiLimits = Counter<IP>(capacity: 100000, window: 1m)
+let apiLimits = Cache<IP, i64>(capacity: 100000)  // GCRA state (examples/ratelimit.rut)
 let blacklist = Set<IP>(capacity: 100000)
 let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 
@@ -3339,7 +3336,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | IP restriction | `req.remoteAddr.in(CIDR)` native |
 | UA restriction | `req.userAgent.contains()` |
 | CORS | `guard` + header assignment |
-| Rate limiting | `Counter<K>` state type (sliding window) |
+| Rate limiting | Rut GCRA over `Cache<K, i64>` (examples/ratelimit.rut) |
 | Request size limiting | `req.contentLength` comparison |
 | Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
@@ -3475,7 +3472,7 @@ For any crash the compiler cannot prevent (bug in codegen, hardware fault):
 
 **State mutation on crash:**
 
-State operations (Hash.set, Counter.incr, Set.add) executed before the crash are
+State operations (Cache.set, Set.add) executed before the crash are
 **not rolled back**. This is by design:
 - Rate limit counter slightly off → self-corrects in next window
 - Cache entry from partial result → TTL expires it
@@ -4702,13 +4699,13 @@ if (!(mask & (1 << upstream_id))) skip_upstream();
 
 ### 8.6 Language-Level Exposure
 
-All state types (Hash, LRU, Set, Counter, Bloom, Bitmap) are per-shard. No shared
+All state types (Cache, LRU, Set, Bloom, Bitmap) are per-shard. No shared
 mutable state. Cross-shard communication uses `notify` — the only primitive:
 
 ```swift
 // All state is per-shard, single-threaded, zero locking
 let blacklist = Set<IP>(capacity: 100000)
-let limits = Counter<IP>(capacity: 100000, window: 1m)
+let buckets = Cache<IP, i64>(capacity: 100000)    // GCRA state (examples/ratelimit.rut)
 
 // Per-shard mutation — immediate, no cross-core cost
 blacklist.add(ip)
@@ -6921,7 +6918,7 @@ native code is distributed to sidecars. Sidecars contain no compiler.
 | io_uring / epoll runtime | ✅ | ✅ |
 | HTTP Parser (SIMD) | ✅ | ✅ |
 | Memory allocators (Arena/Slab/Slice) | ✅ | ✅ |
-| State types (Hash/LRU/Counter...) | ✅ | ✅ |
+| State types (Cache/LRU/Set...) | ✅ | ✅ |
 | TLS (BoringSSL) | ✅ | ✅ |
 | Compression (zstd/brotli/libdeflate) | ✅ | ✅ |
 | Vectorscan (regex) | ✅ | ✅ |
@@ -7054,7 +7051,7 @@ firewall {
 
 **Compiler constraints — `firewall` block can only:**
 - Access `src` / `dst` / `packet` fields
-- Use `Set<IP>`, `Set<CIDR>`, `Counter<IP>`, `Set<string>` state types
+- Use `Set<IP>`, `Set<CIDR>`, `Cache<IP, i64>`, `Set<string>` state types
 - `guard ... else { drop }` or `pass`
 - No HTTP operations (`req`, `forward`, `auth`, regex)
 - Violation → compile error: "packet block cannot access HTTP-level data"
@@ -7086,7 +7083,7 @@ Without:        NIC → TCP → accept → HTTP parse → guard → 403
 |-----------|-----|--------|
 | IP blacklist | `Set<IP>` → hash map | Known bad actors |
 | CIDR filtering | `Set<CIDR>` → LPM trie | Network ranges, GeoIP |
-| SYN flood | `Counter<IP>` on SYN packets | Connection exhaustion |
+| SYN flood | `Cache<IP, i64>` GCRA on SYN packets | Connection exhaustion |
 | Port filtering | `dst.port` check | Port scanning |
 | SNI filtering | Parse ClientHello, check domain | Unknown domains (saves TLS CPU) |
 | JA3 fingerprint | Hash ClientHello fields | Malware, scanners, bots |
@@ -7100,7 +7097,7 @@ is correct either way.
 
 **Degradation principle:** silent fallback is allowed ONLY when a higher layer
 provides equivalent protection (firewall → L7 guards, SO_MAX_PACING_RATE →
-token bucket). State operations (notify, consistent:true, Hash/Counter writes)
+token bucket). State operations (notify, consistent:true, Cache writes)
 must never silently fail — they return errors that the caller must handle.
 
 ### 16.6 Mesh Three-Component Architecture
