@@ -60,14 +60,16 @@ json({ users: [], total: 0 })           // ⏳ object literal (no object-literal
                                         // compile error; -x OK)
 i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
                                         // don't fit i32 are i64 automatically; no i64 type
-                                        // annotations, no narrowing, no match on i64)
+                                        // annotations, no narrowing, no match on i64;
+                                        // bitwise.* works at both widths)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
 @                                       // decorator
 
-// Bitwise = named functions, never symbols (all i32; shift amounts
-// outside 0..31 saturate: shiftLeft → 0, shiftRight → sign fill)
+// Bitwise = named functions, never symbols (i32/i64 same-width, bare
+// literals adopt the i64 side; shift amounts share the operand width and
+// saturate out of range: shiftLeft → 0, shiftRight → sign fill)
 bitwise.and(a, b)  bitwise.or(a, b)  bitwise.xor(a, b)
 bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 ```

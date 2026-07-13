@@ -1572,15 +1572,63 @@ TEST(frontend, analyze_rejects_match_on_i64_subject) {
     REQUIRE_FALSE(hir.has_value());
 }
 
-TEST(frontend, analyze_rejects_bitwise_i64_operand) {
-    const char* src = "route GET \"/x\" { let v = bitwise.and(i64(1), 2) return 200 }\n";
+TEST(frontend, analyze_bitwise_i64_folds_and_adopts_literals) {
+    // Same-width rule over {i32, i64}: bare literals adopt the i64 side
+    // (incl. flip's synthesized -1); folds run at 64-bit width. The packed
+    // sliding-window shape (window_index << 32 | counts) is the motivating
+    // use (docs/state-types.md §4.2).
+    const char* src =
+        "route GET \"/x\" { let a = bitwise.and(i64(6), 3) let s = "
+        "bitwise.shiftLeft(i64(1), 40) let f = bitwise.flip(i64(0)) let p = "
+        "bitwise.or(bitwise.shiftLeft(i64(7), 32), 9) let r = "
+        "bitwise.shiftRight(bitwise.flip(i64(0)), 70) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    const i64 expected[5] = {2, 1099511627776LL, -1, (7LL << 32) | 9, -1 /* shr >= 64 sign fill */};
+    for (u32 i = 0; i < 5; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(HirTypeKind::I64));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_bitwise_i64_runtime_operands_lower) {
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) let v = bitwise.or("
+        "bitwise.shiftLeft(w, 32), 1) if v > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_bitwise_mixed_width) {
+    // Mixed non-literal widths keep the arithmetic fix-it.
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(9) let v = bitwise.and(a, w) return 200 "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
 }
 
 TEST(frontend, analyze_rejects_i64_type_annotation) {
