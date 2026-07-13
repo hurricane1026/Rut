@@ -13167,6 +13167,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               arm_stmt->expr.span);
+                    // Same i64-subject gate as the other nested-match paths.
+                    // Currently unreachable from the surface (the parser
+                    // rejects `for` wholesale), but this expansion path must
+                    // not become the bypass when for-loops are enabled.
+                    if (inner_subject->type == HirTypeKind::I64)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, arm_stmt->expr.span, kMatchI64Detail);
                     if (!route->exprs.push(inner_subject.value()))
                         return frontend_error(FrontendError::TooManyItems, arm_stmt->expr.span);
                     HirExpr* inner_subject_ptr = &route->exprs[route->exprs.len - 1];
