@@ -242,6 +242,14 @@ bitwise.and(a, b)    bitwise.or(a, b)    bitwise.xor(a, b)    bitwise.flip(a)
 bitwise.shiftLeft(a, n)    bitwise.shiftRight(a, n)
 ```
 
+Arithmetic is i32-only and total: overflow wraps two's-complement, and `x / 0` /
+`x % 0` evaluate to `0` — no traps, no undefined behavior (a SIGFPE would take
+down the whole shard; totality is the eBPF-style boundary the runtime needs).
+`INT_MIN / -1` wraps to `INT_MIN`; `INT_MIN % -1` is `0`. A literal zero divisor
+is a compile-time error. Unary minus is ordinary negation (`-x` is `0 - x`);
+`-2147483648` is a valid literal. Duration/ByteSize arithmetic (§3.3) is a
+separate, later surface.
+
 Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
 force-unwrap. Use named fallback and explicit binding instead:
 
@@ -955,8 +963,10 @@ let name = user.profileName.or("guest")
 
 **Runtime bugs**
 
-Division by zero, out-of-bounds access, and similar programming bugs are not modeled
-as ordinary `error(...)` values. They remain runtime faults.
+Out-of-bounds access and similar programming bugs are not modeled as ordinary
+`error(...)` values. They remain runtime faults. Integer division by zero is the
+exception: it has a defined result (`0`, see §3.2.1) because a hardware fault
+would kill the whole shard process.
 
 #### 3.3.8 Compile-Time Constants
 

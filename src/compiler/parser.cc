@@ -250,7 +250,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -845,7 +845,10 @@ struct Parser {
 
     // An arm body that starts with a statement keyword (or a brace) is
     // self-delimiting — only bare-expression bodies (and `return <expr>`
-    // tails) need the newline-dot arm boundary.
+    // tails) need the newline-dot arm boundary. Of the arithmetic operators
+    // only `-` can begin a pattern (a negative int literal), so
+    // parse_add_expr mirrors the newline-dot rule for a line-initial `-`;
+    // `+ * / %` always continue the previous expression.
     bool arm_body_needs_dot_stop() const {
         const TokenType t = cur().type;
         if (t == TokenType::LBrace) return false;
@@ -870,23 +873,149 @@ struct Parser {
         return true;
     }
 
+    // `-<intlit>` fusion shared by unary parsing and match-arm patterns. The
+    // caller has consumed the `-`; cur() must be the IntLit. The magnitude
+    // accumulates in u32 with cap 2^31 so INT_MIN is representable;
+    // `(i32)(0u - mag)` wraps correctly for mag == 2^31.
+    FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
+        const Token tok = cur();
+        pos++;
+        u32 mag = 0;
+        for (u32 i = 0; i < tok.text.len; i++) {
+            const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
+            if (mag > (2147483648u - digit) / 10u)
+                return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
+            mag = mag * 10u + digit;
+        }
+        AstExpr lit{};
+        lit.kind = AstExprKind::IntLit;
+        lit.int_value = static_cast<i32>(0u - mag);
+        lit.span = Span{minus.start, tok.end, minus.line, minus.col};
+        return lit;
+    }
+
+    // Match-arm pattern position: a negative int literal (`-1 => ...`) is a
+    // valid pattern; anything else parses as a primary expression. Kept
+    // separate from parse_unary_expr so patterns never grow full unary
+    // parsing (`- -x`, `!x`) by accident.
+    FrontendResult<AstExpr> parse_arm_pattern_expr() {
+        if (cur().type == TokenType::Minus && peek().type == TokenType::IntLit) {
+            const Token minus = cur();
+            pos++;
+            return parse_fused_negative_int_lit(minus);
+        }
+        return parse_primary_expr();
+    }
+
     // Prefix `!` — Swift-identical logical not, binds tighter than comparisons.
+    // Prefix `-` — either fuses with an immediately following int literal
+    // (`-2147483648` is a valid literal; the positive-path cap in
+    // parse_primary_atom rejects 2147483648 on its own) or desugars to
+    // `Sub(IntLit 0, operand)` so MIR/RIR/codegen only see five binary ops.
     FrontendResult<AstExpr> parse_unary_expr() {
         auto word_check = reject_word_operator_operand();
         if (!word_check) return core::make_unexpected(word_check.error());
         const Token* bang = take(TokenType::Bang);
-        if (!bang) return parse_primary_expr();
+        if (bang) {
+            auto operand = parse_unary_expr();
+            if (!operand) return core::make_unexpected(operand.error());
+            auto expr = make_eq_false(operand.value());
+            if (!expr) return core::make_unexpected(expr.error());
+            AstExpr out = expr.value();
+            out.span = Span{bang->start, operand->span.end, bang->line, bang->col};
+            return out;
+        }
+        const Token* minus = take(TokenType::Minus);
+        if (!minus) return parse_primary_expr();
+        if (cur().type == TokenType::IntLit) return parse_fused_negative_int_lit(*minus);
         auto operand = parse_unary_expr();
         if (!operand) return core::make_unexpected(operand.error());
-        auto expr = make_eq_false(operand.value());
-        if (!expr) return core::make_unexpected(expr.error());
-        AstExpr out = expr.value();
-        out.span = Span{bang->start, operand->span.end, bang->line, bang->col};
-        return out;
+        AstExpr zero{};
+        zero.kind = AstExprKind::IntLit;
+        zero.int_value = 0;
+        zero.span = span_from(*minus);
+        auto zero_ptr = alloc_expr(zero);
+        if (!zero_ptr) return core::make_unexpected(zero_ptr.error());
+        auto operand_ptr = alloc_expr(operand.value());
+        if (!operand_ptr) return core::make_unexpected(operand_ptr.error());
+        AstExpr expr{};
+        expr.kind = AstExprKind::Sub;
+        expr.lhs = zero_ptr.value();
+        expr.rhs = operand_ptr.value();
+        expr.span = Span{minus->start, operand->span.end, minus->line, minus->col};
+        return expr;
+    }
+
+    // `* / %` — left-associative, binds tighter than `+ -`.
+    FrontendResult<AstExpr> parse_mul_expr() {
+        auto lhs = parse_unary_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (true) {
+            AstExprKind kind = AstExprKind::Ident;
+            if (take(TokenType::Star))
+                kind = AstExprKind::Mul;
+            else if (take(TokenType::Slash))
+                kind = AstExprKind::Div;
+            else if (take(TokenType::Percent))
+                kind = AstExprKind::Mod;
+            else
+                break;
+            auto rhs = parse_unary_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = kind;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
+    }
+
+    // `+ -` — left-associative, binds tighter than comparisons.
+    FrontendResult<AstExpr> parse_add_expr() {
+        auto lhs = parse_mul_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (true) {
+            AstExprKind kind = AstExprKind::Ident;
+            // A line-initial `-` ends the arm body ONLY when it actually
+            // starts the next arm's pattern — a negative int literal
+            // followed by `=>` (or an `if` arm guard). A line-wrapped
+            // subtraction before anything else (`a\n- b`) keeps parsing.
+            if (arm_body_stops_cross_line_dot && arm_body_dot_stop_depth == 0 &&
+                cur().type == TokenType::Minus && pos > 0 && cur().line != prev().line &&
+                peek(1).type == TokenType::IntLit &&
+                (peek(2).type == TokenType::Arrow || peek(2).type == TokenType::KwIf)) {
+                break;
+            }
+            if (take(TokenType::Plus))
+                kind = AstExprKind::Add;
+            else if (take(TokenType::Minus))
+                kind = AstExprKind::Sub;
+            else
+                break;
+            auto rhs = parse_mul_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = kind;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
     }
 
     FrontendResult<AstExpr> parse_eq_expr() {
-        auto lhs = parse_unary_expr();
+        auto lhs = parse_add_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         TokenType op = TokenType::Error;
         if (take(TokenType::EqEq))
@@ -903,7 +1032,7 @@ struct Parser {
             op = TokenType::Gt;
         else
             return lhs.value();
-        auto rhs = parse_unary_expr();
+        auto rhs = parse_add_expr();
         if (!rhs) return core::make_unexpected(rhs.error());
         auto lhs_ptr = alloc_expr(lhs.value());
         if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
@@ -1109,7 +1238,7 @@ struct Parser {
                     if (take(TokenType::Underscore)) {
                         arm.is_wildcard = true;
                     } else {
-                        auto pattern = parse_primary_expr();
+                        auto pattern = parse_arm_pattern_expr();
                         if (!pattern) return core::make_unexpected(pattern.error());
                         auto pattern_ptr = alloc_expr(pattern.value());
                         if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -1728,7 +1857,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -2131,7 +2260,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());

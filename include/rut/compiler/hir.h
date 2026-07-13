@@ -139,6 +139,15 @@ enum class HirExprKind : u8 {
     BitXor,
     BitShl,
     BitShr,
+    // Arithmetic operators — binary i32 ops on lhs/rhs. Overflow wraps
+    // two's-complement; x / 0 and x % 0 are 0; INT_MIN / -1 is INT_MIN and
+    // INT_MIN % -1 is 0 (analyze fold and codegen agree by construction).
+    // Unary minus is Sub(IntLit 0, x) from the parser.
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
     Or,
     NoError,
     HasValue,

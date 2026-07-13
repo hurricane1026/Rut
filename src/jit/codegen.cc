@@ -1122,6 +1122,57 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        // ── Arithmetic ──
+        // Semantics must match the analyze-time literal fold in
+        // analyze_arith_expr (analyze.cc): overflow wraps two's-complement,
+        // x / 0 and x % 0 are 0, INT_MIN / -1 is INT_MIN, INT_MIN % -1 is 0.
+        case rir::Opcode::Add:
+        case rir::Opcode::Sub:
+        case rir::Opcode::Mul: {
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            // Plain wrap forms — deliberately NOT the NSW variants.
+            LLVMValueRef r =
+                inst.op == rir::Opcode::Add
+                    ? LLVMBuildAdd(c.builder, a, b, "arith.add")
+                    : (inst.op == rir::Opcode::Sub ? LLVMBuildSub(c.builder, a, b, "arith.sub")
+                                                   : LLVMBuildMul(c.builder, a, b, "arith.mul"));
+            c.set_value(inst.result, r);
+            break;
+        }
+        case rir::Opcode::Div:
+        case rir::Opcode::Mod: {
+            // sdiv/srem are poison for b == 0 and INT_MIN / -1; feed them a
+            // safe divisor and select the defined results instead.
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMValueRef int_min = LLVMConstInt(c.i32_ty, static_cast<u64>(0x80000000u), 0);
+            LLVMValueRef neg_one =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(-1)), 0);
+            LLVMValueRef is_zero = LLVMBuildICmp(c.builder, LLVMIntEQ, b, zero, "arith.div.zero");
+            LLVMValueRef is_min = LLVMBuildICmp(c.builder, LLVMIntEQ, a, int_min, "arith.div.min");
+            LLVMValueRef is_neg1 =
+                LLVMBuildICmp(c.builder, LLVMIntEQ, b, neg_one, "arith.div.negone");
+            LLVMValueRef ovf = LLVMBuildAnd(c.builder, is_min, is_neg1, "arith.div.ovf");
+            LLVMValueRef bad = LLVMBuildOr(c.builder, is_zero, ovf, "arith.div.bad");
+            LLVMValueRef safe_b =
+                LLVMBuildSelect(c.builder, bad, LLVMConstInt(c.i32_ty, 1, 0), b, "arith.div.safeb");
+            if (inst.op == rir::Opcode::Div) {
+                LLVMValueRef raw = LLVMBuildSDiv(c.builder, a, safe_b, "arith.div.raw");
+                LLVMValueRef ovf_val =
+                    LLVMBuildSelect(c.builder, ovf, int_min, raw, "arith.div.ovfval");
+                LLVMValueRef r = LLVMBuildSelect(c.builder, is_zero, zero, ovf_val, "arith.div");
+                c.set_value(inst.result, r);
+            } else {
+                LLVMValueRef raw = LLVMBuildSRem(c.builder, a, safe_b, "arith.mod.raw");
+                // Both guarded cases (b == 0 and INT_MIN % -1) yield 0.
+                LLVMValueRef r = LLVMBuildSelect(c.builder, bad, zero, raw, "arith.mod");
+                c.set_value(inst.result, r);
+            }
+            break;
+        }
+
         // ── Comparisons ──
         case rir::Opcode::CmpEq:
         case rir::Opcode::CmpNe:

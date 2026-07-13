@@ -1301,6 +1301,369 @@ TEST(frontend, user_binding_named_bitwise_shadows_builtin_namespace) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, analyze_constant_folds_arith_literals) {
+    const char* src =
+        "route GET \"/x\" { let a = 2 + 3 let s = 2 - 5 let m = 6 * 7 let d = 7 / 2 let r = "
+        "7 % 2 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    const i64 expected[5] = {5, -3, 42, 3, 1};
+    for (u32 i = 0; i < 5; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_arith_fold_wraps_on_overflow) {
+    const char* src =
+        "route GET \"/x\" { let a = 2147483647 + 1 let b = -2147483648 - 1 let c = 65536 * "
+        "65536 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, -2147483648);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 2147483647);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 0);
+}
+
+TEST(frontend, parse_negative_int_literals_and_unary_minus) {
+    const char* src =
+        "route GET \"/x\" { let x = -2147483648 let y = - -5 let z = 2 - -3 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, -2147483648);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 5);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 5);
+}
+
+TEST(frontend, parse_rejects_int_literal_overflow_still) {
+    const char* over = "route GET \"/x\" { let x = 2147483648 return 200 }\n";
+    auto lexed = lex(lit(over));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+
+    const char* under = "route GET \"/x\" { let x = -2147483649 return 200 }\n";
+    lexed = lex(lit(under));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+}
+
+TEST(frontend, analyze_folds_int_min_div_and_mod_guards) {
+    const char* src =
+        "route GET \"/x\" { let d = -2147483648 / -1 let m = -2147483648 % -1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, -2147483648);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 0);
+}
+
+TEST(frontend, analyze_rejects_literal_zero_divisor_with_fixit) {
+    const char* div = "route GET \"/x\" { let a = 6 let v = a / 0 return 200 }\n";
+    auto lexed = lex(lit(div));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+
+    const char* mod = "route GET \"/x\" { let v = 7 % 0 return 200 }\n";
+    lexed = lex(lit(mod));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, parse_precedence_mul_over_add_over_cmp) {
+    const char* src =
+        "route GET \"/x\" { let p = 2 + 3 * 4 let q = 2 * 3 + 4 guard 1 + 2 < 4 else { "
+        "return 500 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 14);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 10);
+}
+
+TEST(frontend, analyze_arith_runtime_operands_lower_through_pipeline) {
+    const char* src =
+        "route GET \"/x\" { let a = 6 let v = a * 7 - 2 if v == 40 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_arith_non_i32_operand) {
+    const char* src = "route GET \"/x\" { let v = \"a\" + 1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_rejects_arith_optional_operand) {
+    const char* src = "route GET \"/x\" { let h = req.header(\"X-N\") let v = h + 1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, parse_rejects_duration_literal_arith) {
+    const char* src = "route GET \"/x\" { let x = 5s - 1s return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+}
+
+TEST(frontend, lex_minus_vs_thin_arrow_and_slash_vs_comment) {
+    const char* src =
+        "func dec(_ a: i32) -> i32 => a - 1\n"
+        "route GET \"/x\" { let x = 6 / 3 // half\n return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 2);
+}
+
+TEST(frontend, arith_expr_as_pipe_lhs_and_call_arg) {
+    const char* src =
+        "route GET \"/x\" { let a = 6 let v = a + 1 | bitwise.and(_, 3) let w = "
+        "bitwise.and(a + 1, 3) if v == 3 && w == 3 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, match_arm_negative_int_literal_patterns) {
+    // Negative int literals are valid arm patterns, and a line-initial `-`
+    // after a bare-expression/`return <expr>` arm body starts the next
+    // arm's pattern instead of continuing as subtraction (the newline-dot
+    // arm-boundary rule, mirrored for minus).
+    const auto src = R"rut(
+route GET "/x" {
+    let code = -1
+    match code {
+        200 => return 200
+        -1 => return 204
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1]->match_arms.len, 3u);
+    REQUIRE(route.statements[1]->match_arms[1].pattern != nullptr);
+    CHECK_EQ(route.statements[1]->match_arms[1].pattern->int_value, -1);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, const_if_folds_arithmetic_over_const_locals) {
+    // `if const` evaluates arithmetic over compile-time locals via
+    // const_eval_expr (fold_arith_i32 keeps semantics identical to the
+    // analyze fold / compiled code). A const 0 divisor takes the
+    // defined-0 path — only a directly spelled `/ 0` is a compile error.
+    const auto src = R"rut(
+route GET "/x" {
+    let n = 1
+    if const n + 1 == 2 { return 200 } else { return 500 }
+}
+route GET "/y" {
+    let z = 0
+    if const 7 / z == 0 && 7 % z == 0 { return 204 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bare_match_arm_body_keeps_line_wrapped_subtraction) {
+    // A line-initial `-` in a bare-expression arm body only ends the arm
+    // when it is an actual negative-literal pattern boundary
+    // (`- IntLit =>` / `- IntLit if`). Here the wrapped `- 1` IS
+    // Minus+IntLit but is followed by `_`, not `=>`, so the 3-token
+    // lookahead keeps it as the subtraction `a - 1`.
+    const auto src = R"rut(
+func pick(_ a: i32) -> i32 {
+    match a {
+        5 => a
+            - 1
+        _ => 0
+    }
+}
+route GET "/x" { if pick(5) == 4 { return 204 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bare_match_arm_negative_pattern_after_value_body) {
+    // The boundary DOES fire for a real negative-literal pattern after a
+    // bare value body: `5 => a` newline `-1 => 99` splits into two arms.
+    const auto src = R"rut(
+func pick(_ a: i32) -> i32 {
+    match a {
+        5 => a
+        -1 => 99
+        _ => 0
+    }
+}
+route GET "/x" { if pick(0 - 1) == 99 { return 204 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, braced_match_arm_body_keeps_cross_line_subtraction) {
+    // Inside a braced arm body the arm-boundary rule is suspended (same as
+    // for the newline-dot rule), so a cross-line `- 1` continues the
+    // previous expression as subtraction.
+    const auto src = R"rut(
+route GET "/x" {
+    let a = 5
+    match a {
+        5 => {
+            let v = a
+                - 1
+            if v == 4 { return 204 } else { return 500 }
+        }
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, arith_in_guard_if_and_match_scrutinee) {
+    // A match nested inside an if branch is an unsupported route-control
+    // shape independent of arithmetic, so match gets its own route.
+    const char* src =
+        "route GET \"/x\" { let a = 5 guard a - 1 > 0 else { return 400 } match a % 3 { 2 "
+        "=> return 204 _ => return 500 } }\n"
+        "route GET \"/y\" { let b = 5 if b % 2 == 1 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, nil_presence_test_on_optional_header_lowers) {
     const char* src =
         "route GET \"/x\" { let h = req.header(\"X-N\") if h == nil { return 404 } else { "

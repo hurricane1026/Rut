@@ -109,6 +109,7 @@ LLM-facing surface contract).
 - UFCS: `req.auth(role: "user")` rewrites to `auth(req, role: "user")` — blessed form when value flows into the first parameter
 - Pipeline: `a | f(_, ...)` — shell-style `|`; in expressions `|` means pipeline ONLY; RHS must be a call with an explicit `_`/`_N` placeholder; use when value lands in a non-first position
 - Bitwise ops are functions in the built-in `bitwise` namespace, not symbols: `bitwise.and`/`bitwise.or`/`bitwise.xor`/`bitwise.flip`/`bitwise.shiftLeft`/`bitwise.shiftRight` — implemented end-to-end (i32 only; shift amounts outside 0..31 saturate; `flip(a)` desugars to `xor(a, -1)`; literal operands fold at analyze time; the removed `&`/`~`/`<<` symbols emit a fix-it)
+- Arithmetic `+ - * / %` and unary minus — implemented end-to-end (i32 only; two's-complement wrap on overflow; `x / 0` and `x % 0` evaluate to 0; `INT_MIN / -1` → `INT_MIN`, `INT_MIN % -1` → 0; literal `/ 0` is a compile error; literal operands fold at analyze time; `-2147483648` is a valid literal)
 - `match` with `=>` (expression) or `{}` (block); no `case` keyword. `if` always uses `{}`
 - Header access is function-style: `req.header("X-Request-ID")`, `req.set(...)`, `resp.set(...)`, `resp.remove(...)` — hyphenated property access does not exist (would parse as subtraction). Only `req.header` is wired today; the mutators are ⏳ pending (request-header injection exists via `forward(set_header:)`)
 - `@decorator` for middleware — `@func` on routes/groups, `@func pattern` for bindings

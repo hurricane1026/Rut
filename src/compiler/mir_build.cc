@@ -499,7 +499,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
         expr.kind == HirExprKind::Gt || expr.kind == HirExprKind::BitAnd ||
         expr.kind == HirExprKind::BitOr || expr.kind == HirExprKind::BitXor ||
-        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr) {
+        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr ||
+        expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
+        expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
+        expr.kind == HirExprKind::Mod) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
@@ -532,13 +535,28 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             case HirExprKind::BitShl:
                 v.kind = MirValueKind::BitShl;
                 break;
-            default:
+            case HirExprKind::BitShr:
                 v.kind = MirValueKind::BitShr;
                 break;
+            case HirExprKind::Add:
+                v.kind = MirValueKind::Add;
+                break;
+            case HirExprKind::Sub:
+                v.kind = MirValueKind::Sub;
+                break;
+            case HirExprKind::Mul:
+                v.kind = MirValueKind::Mul;
+                break;
+            case HirExprKind::Div:
+                v.kind = MirValueKind::Div;
+                break;
+            default:
+                v.kind = MirValueKind::Mod;
+                break;
         }
-        const bool is_bit = expr.kind != HirExprKind::Eq && expr.kind != HirExprKind::Lt &&
-                            expr.kind != HirExprKind::Gt;
-        v.type = is_bit ? MirTypeKind::I32 : MirTypeKind::Bool;
+        const bool is_cmp = expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
+                            expr.kind == HirExprKind::Gt;
+        v.type = is_cmp ? MirTypeKind::Bool : MirTypeKind::I32;
         v.lhs = lhs_ptr;
         v.rhs = rhs_ptr;
         v.error_variant_index = expr.error_variant_index;

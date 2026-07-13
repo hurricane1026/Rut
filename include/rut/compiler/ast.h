@@ -138,6 +138,14 @@ enum class AstExprKind : u8 {
     Eq,
     Lt,
     Gt,
+    // Arithmetic operators — binary, lhs/rhs operands. Unary minus never
+    // reaches the AST: the parser fuses `-<intlit>` into a negative IntLit
+    // and desugars other `-x` to Sub(IntLit 0, x).
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
     And,
     Or,
     Pipe,

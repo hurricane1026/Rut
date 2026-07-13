@@ -372,6 +372,21 @@ LexResult lex(Str source) {
             case '*':
                 tok.type = TokenType::Star;
                 break;
+            // Arithmetic operators. `->` is consumed as ThinArrow above, so a
+            // bare `-` here is unambiguous; `//` comments are consumed in the
+            // skip loop, so a bare `/` here is division.
+            case '+':
+                tok.type = TokenType::Plus;
+                break;
+            case '-':
+                tok.type = TokenType::Minus;
+                break;
+            case '/':
+                tok.type = TokenType::Slash;
+                break;
+            case '%':
+                tok.type = TokenType::Percent;
+                break;
             case '|':
                 tok.type = TokenType::Pipe;
                 break;
