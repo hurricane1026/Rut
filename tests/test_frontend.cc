@@ -1997,6 +1997,33 @@ TEST(frontend, cache_ops_rejected_in_wait_routes) {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+
+    // A helper body is analyzed against a scratch route (flag off) and
+    // inlined as an already-built CacheGet tree — the post-analysis scan
+    // must still reject it in a wait route.
+    const char* via_helper =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func peek(_ k: IP) => b.get(k).or(0)\n"
+        "route GET \"/x\" { let p = peek(req.remoteAddr) wait(1000) "
+        "if p > 0 { return 200 } else { return 204 } }\n";
+    lexed = lex(lit(via_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // wait any populates route.waits like a plain wait — also rejected.
+    const char* wait_any =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let p = b.get(req.remoteAddr).or(0) "
+        "wait any { timer(1000) => { return 200 } } }\n";
+    lexed = lex(lit(wait_any));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, cache_bare_set_rejected_on_pre_guarded_routes) {
