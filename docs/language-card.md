@@ -325,6 +325,25 @@ init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
 
+## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
+
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)
+
+route GET "/api" {                                   // GCRA token bucket
+    let now = time.nowMicros()                       // latched per request
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    buckets.set(req.remoteAddr, tat + 600000)        // emit = 600ms/token
+    if tat - now <= 600000 { return 200 } else { return 429 }  // tau = emit
+}
+```
+
+Same admission behavior as `@rateLimit` for equivalent configs (verified by
+e2e); this form is for CUSTOM policies (per-tier limits, composite
+conditions). Note: state writes run at handler entry, so this variant meters
+every request — over-limit clients push their own release time out. See
+examples/ratelimit.rut for the packed sliding-window variant.
+
 ## Cache state (per-key counters/timestamps — docs/state-types.md)
 
 ```swift

@@ -1,7 +1,7 @@
 #include "rut/jit/runtime_helpers.h"
 
-#include "rut/runtime/cache_table.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
 #include <unordered_map>
