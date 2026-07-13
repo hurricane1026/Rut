@@ -292,6 +292,11 @@ struct RouteConfig {
 
     bool add_cache_instance(const char* name, u32 name_len, u32 capacity) {
         if (cache_instance_count >= kMaxCacheInstances || capacity == 0) return false;
+        // The stored name is the hot-reload identity (hashed by
+        // cache_registry_publish_config) — reject rather than truncate, or
+        // two names sharing the first 31 bytes would silently share state.
+        // The frontend enforces the same bound; this guards direct callers.
+        if (name_len >= sizeof(CacheInstanceEntry{}.name)) return false;
         for (u32 i = 0; i < cache_instance_count; i++) {
             const CacheInstanceEntry& e = cache_instances[i];
             if (e.name_len == name_len) {

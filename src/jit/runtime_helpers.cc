@@ -458,11 +458,27 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
 // (documented); an unchanged capacity persists across config swaps because
 // the swap never touches thread-locals.
 namespace {
+// Owns the per-shard tables so thread exit unmaps them — a bare
+// thread_local CacheTable array has a trivial destructor and would leak
+// the mmaps on shard stop/join/restart flows.
+struct ShardCacheTables {
+    rut::CacheTable tables[rut::CacheRegistry::kMaxInstances];
+    rut::u64 identities[rut::CacheRegistry::kMaxInstances] = {};
+    rut::u32 birth_generations[rut::CacheRegistry::kMaxInstances] = {};
+    rut::u32 generation = 0;
+    bool alloc_failed_logged[rut::CacheRegistry::kMaxInstances] = {};
+    ~ShardCacheTables() {
+        for (auto& t : tables) t.destroy();
+    }
+};
+
 rut::CacheTable* cache_table_for(rut::u32 instance) {
-    static thread_local rut::CacheTable t_tables[rut::CacheRegistry::kMaxInstances];
-    static thread_local rut::u64 t_identities[rut::CacheRegistry::kMaxInstances];
-    static thread_local rut::u32 t_generation = 0;
-    static thread_local bool t_alloc_failed_logged[rut::CacheRegistry::kMaxInstances];
+    static thread_local ShardCacheTables t_state;
+    auto* t_tables = t_state.tables;
+    auto* t_identities = t_state.identities;
+    auto* t_birth_generations = t_state.birth_generations;
+    rut::u32& t_generation = t_state.generation;
+    auto* t_alloc_failed_logged = t_state.alloc_failed_logged;
     auto& reg = rut::cache_registry();
     // Seqlock-style snapshot: the acquire on `generation` orders the
     // descriptor loads AFTER the bump we observed, but a publish running
@@ -476,16 +492,20 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
     rut::u64 snap_seed = 0;
     rut::u32 snap_caps[rut::CacheRegistry::kMaxInstances];
     rut::u64 snap_idents[rut::CacheRegistry::kMaxInstances];
+    rut::u32 snap_births[rut::CacheRegistry::kMaxInstances];
     for (int tries = 0;; tries++) {
         gen = reg.generation.load(std::memory_order_acquire);
         if (gen == 0) return nullptr;  // nothing published yet
-        live_count = reg.count.load(std::memory_order_relaxed);
-        snap_seed = reg.seed.load(std::memory_order_relaxed);
-        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
-            snap_caps[i] = reg.capacities[i].load(std::memory_order_relaxed);
-            snap_idents[i] = reg.identities[i].load(std::memory_order_relaxed);
+        if ((gen & 1u) == 0) {         // odd = publish in progress, retry
+            live_count = reg.count.load(std::memory_order_relaxed);
+            snap_seed = reg.seed.load(std::memory_order_relaxed);
+            for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+                snap_caps[i] = reg.capacities[i].load(std::memory_order_relaxed);
+                snap_idents[i] = reg.identities[i].load(std::memory_order_relaxed);
+                snap_births[i] = reg.birth_generations[i].load(std::memory_order_relaxed);
+            }
+            if (reg.generation.load(std::memory_order_acquire) == gen) break;
         }
-        if (reg.generation.load(std::memory_order_acquire) == gen) break;
         if (tries >= 8) return nullptr;  // publish storm — treat as miss
     }
     if (gen != t_generation) {
@@ -497,12 +517,18 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
         // reloads, documented).
         for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
             if (t_tables[i].slots == nullptr) continue;
+            // Birth-generation compare closes the skipped-generation hole:
+            // if the instance was removed and re-added while this shard was
+            // idle (A→B→C), C's birth differs from the birth this table was
+            // built under, even though identity and capacity match A's.
             const bool live =
                 i < live_count && snap_idents[i] == t_identities[i] &&
+                snap_births[i] == t_birth_generations[i] &&
                 rut::CacheTable::round_capacity(snap_caps[i]) == t_tables[i].slot_count;
             if (!live) {
                 t_tables[i].destroy();
                 t_identities[i] = 0;
+                t_birth_generations[i] = 0;
             }
         }
         t_generation = gen;
@@ -528,6 +554,7 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
             return nullptr;
         }
         t_identities[instance] = snap_idents[instance];
+        t_birth_generations[instance] = snap_births[instance];
         t_alloc_failed_logged[instance] = false;
     }
     return &t;

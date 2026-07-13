@@ -139,11 +139,22 @@ struct CacheTable {
 // identical, and stale tables are unmapped instead of leaking.
 struct CacheRegistry {
     static constexpr u32 kMaxInstances = 8;
-    std::atomic<u32> generation{0};  // 0 = never published
+    // Seqlock protocol: publish makes generation ODD (in progress) before
+    // touching any descriptor, EVEN when done. Readers retry while odd or
+    // while it changed across their descriptor reads — a reader can never
+    // pair a generation with another publish's half-written descriptors.
+    std::atomic<u32> generation{0};  // 0 = never published; odd = publishing
     std::atomic<u32> count{0};
     std::atomic<u32> capacities[kMaxInstances]{};
     std::atomic<u64> identities[kMaxInstances]{};  // FNV-1a of the decl name
-    std::atomic<u64> seed{0};                      // 0 = unseeded sentinel
+    // Generation at which this slot's (identity, capacity) pair FIRST
+    // appeared in an unbroken run of publishes. A shard that skipped
+    // intermediate generations (idle during A→B→C where B removed the
+    // instance) compares birth generations, so state never survives an
+    // interval in which the declaration was absent — while identical
+    // redeclarations keep their birth and therefore their state.
+    std::atomic<u32> birth_generations[kMaxInstances]{};
+    std::atomic<u64> seed{0};  // 0 = unseeded sentinel
 };
 
 inline CacheRegistry& cache_registry() {
@@ -190,13 +201,26 @@ inline void cache_registry_publish(const u32* capacities, const u64* identities,
         }
         reg.seed.store(s, std::memory_order_relaxed);
     }
+    // Enter the odd (in-progress) state BEFORE touching descriptors, so a
+    // reader that raced past the previous even generation sees odd (or a
+    // different even) on its validation re-read and retries.
+    const u32 prev_gen = reg.generation.load(std::memory_order_relaxed);
+    reg.generation.store(prev_gen + 1, std::memory_order_release);  // odd
+    const u32 old_count = reg.count.load(std::memory_order_relaxed);
     for (u32 i = 0; i < count; i++) {
+        // Same (identity, capacity) as the currently-published slot keeps
+        // its birth generation (state persistence); anything else is born
+        // at this publish.
+        const bool same = i < old_count &&
+                          reg.identities[i].load(std::memory_order_relaxed) == identities[i] &&
+                          reg.capacities[i].load(std::memory_order_relaxed) == capacities[i];
+        if (!same) reg.birth_generations[i].store(prev_gen + 2, std::memory_order_relaxed);
         reg.capacities[i].store(capacities[i], std::memory_order_relaxed);
         reg.identities[i].store(identities[i], std::memory_order_relaxed);
     }
     reg.count.store(count, std::memory_order_relaxed);
-    // Release-publish: pairs with the acquire load in cache_table_for.
-    reg.generation.fetch_add(1, std::memory_order_release);
+    // Leave the odd state: even generation = descriptors consistent.
+    reg.generation.store(prev_gen + 2, std::memory_order_release);
 }
 
 }  // namespace rut

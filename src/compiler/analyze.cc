@@ -17324,7 +17324,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // ahead of user guards — either way the route body runs behind a
         // guard, so a leading bare cache.set would still write on rejected
         // requests. Start the gate as already-guarded in both cases.
-        bool seen_guard = route.guards.len > 0 || route_decl.decorators.len > 0;
+        // @rateLimit and @throttle do NOT count: the runtime enforces them
+        // before/after the handler (a limited request never executes the
+        // write), so they compose with cache-backed handlers.
+        bool has_guarding_decorator = false;
+        for (u32 di = 0; di < route_decl.decorators.len; di++) {
+            const Str dn = route_decl.decorators[di].name;
+            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8})) {
+                has_guarding_decorator = true;
+                break;
+            }
+        }
+        bool seen_guard = route.guards.len > 0 || has_guarding_decorator;
         // Wait routes re-materialize locals on resume (the initial call
         // yields without running the entry block), so any cache op would
         // execute after the wait regardless of source position. Pre-scan so
@@ -18255,6 +18266,29 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       route.control.direct_term.span);
             }
+        }
+        // Repeat the wait×cache backstop AFTER decorator inlining: decorator
+        // helpers add synthetic locals/guards past the earlier scan. User
+        // decorators are parser-unreachable today (official whitelist), so
+        // this is defensive — but a future decorator carrying a CacheGet
+        // into a wait route must not resurrect the re-materialization bug.
+        if (route.waits.len > 0) {
+            auto is_cache_op = [](const HirExpr& e) {
+                return e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet;
+            };
+            const HirExpr* found = nullptr;
+            for (u32 i = 0; i < route.exprs.len && found == nullptr; i++)
+                if (is_cache_op(route.exprs[i])) found = &route.exprs[i];
+            for (u32 i = 0; i < route.locals.len && found == nullptr; i++)
+                if (is_cache_op(route.locals[i].init)) found = &route.locals[i].init;
+            for (u32 g = 0; g < route.guards.len && found == nullptr; g++)
+                for (u32 li = 0; li < route.guards[g].fail_body.locals.len && found == nullptr;
+                     li++)
+                    if (is_cache_op(route.guards[g].fail_body.locals[li].init))
+                        found = &route.guards[g].fail_body.locals[li].init;
+            if (found != nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, found->span, kCacheWaitDetail);
         }
 
         if (route.is_timer) {

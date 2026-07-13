@@ -2046,19 +2046,9 @@ TEST(frontend, cache_bare_set_rejected_on_pre_guarded_routes) {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.len != 0);
 
-    // Decorated routes (official decorators are the only parseable form)
-    // are treated as pre-guarded too — conservative, keeps "state writes
-    // run at handler entry" independent of decorator semantics.
-    const char* decorated =
-        "let b = Cache<IP, i64>(capacity: 64)\n"
-        "@rateLimit(limit: 2, window: 1m)\n"
-        "route GET \"/x\" { b.set(req.remoteAddr, 1) return 200 }\n";
-    lexed = lex(lit(decorated));
-    REQUIRE(lexed);
-    ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
+    // (@rateLimit/@throttle routes are NOT treated as guarded — the runtime
+    // enforces them outside the handler; see
+    // cache_bare_set_allowed_on_ratelimit_throttle_routes.)
 }
 
 TEST(frontend, cache_bare_set_rejected_after_fallible_local) {
@@ -2146,6 +2136,23 @@ TEST(frontend, cache_bare_set_rejected_after_helper_appended_guards) {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_allowed_on_ratelimit_throttle_routes) {
+    // @rateLimit is enforced by the runtime BEFORE the handler runs (a
+    // limited request never executes the write) and @throttle shapes the
+    // response — neither guards inside the handler, so cache-backed
+    // handlers compose with both.
+    const char* rate_limited =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "@rateLimit(limit: 2, window: 1m)\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, 1) return 200 }\n";
+    auto lexed = lex(lit(rate_limited));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
 }
 
 TEST(frontend, cache_decl_rejects_overlong_name) {
