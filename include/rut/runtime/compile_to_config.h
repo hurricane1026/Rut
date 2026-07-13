@@ -14,6 +14,13 @@
 //      header sets
 //   4. register_jit_routes(cfg, rir.module, engine) to select the
 //      correct dispatcher and add every route handler
+//   5. If the module declares Cache state (cfg.cache_instance_count != 0):
+//      cache_registry_publish_config(cfg) AFTER every fallible step
+//      succeeded. The cache helpers read the process-global registry, not
+//      the RouteConfig — without this step every cache.get misses and
+//      every cache.set no-ops (or worse, ops hit a previous program's
+//      instances). Publishing after all failures keeps a failed load from
+//      mutating the registry the live program is using.
 //
 // Two supported preconditions on `cfg`:
 //
@@ -47,6 +54,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
@@ -152,6 +160,24 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
     }
 
     return true;
+}
+
+// Step 5 of the documented flow (file docstring): publish the config's Cache
+// instance descriptors to the process-global registry the cache helpers
+// read. Call ONLY after every fallible registration step succeeded — the
+// registry is shared with whatever program is currently live.
+inline void cache_registry_publish_config(const RouteConfig& cfg) {
+    u32 caps[RouteConfig::kMaxCacheInstances] = {};
+    u64 idents[RouteConfig::kMaxCacheInstances] = {};
+    const u32 n = cfg.cache_instance_count < RouteConfig::kMaxCacheInstances
+                      ? cfg.cache_instance_count
+                      : RouteConfig::kMaxCacheInstances;
+    for (u32 i = 0; i < n; i++) {
+        caps[i] = cfg.cache_instances[i].capacity;
+        idents[i] =
+            cache_instance_identity(cfg.cache_instances[i].name, cfg.cache_instances[i].name_len);
+    }
+    cache_registry_publish(caps, idents, n);
 }
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {

@@ -72,6 +72,23 @@ constexpr Str kCacheSetDetail = lit_str(
 constexpr Str kCacheStmtDetail = lit_str(
     "only cache state writes may stand alone as statements, and only before "
     "any guard/wait/for (state writes run at handler entry)");
+constexpr Str kCacheSetStmtOnlyDetail = lit_str(
+    "cache.set is a statement, not an expression — its result cannot be "
+    "consumed (a set inside .or()/if arms/let would also run on the "
+    "non-taken path)");
+constexpr Str kCacheWaitDetail = lit_str(
+    "cache ops in routes containing wait are not supported yet — locals "
+    "re-materialize on resume, so the op would run after the wait instead "
+    "of at its source position");
+constexpr Str kCacheNameCollisionDetail = lit_str(
+    "Cache declaration name collides with another binding or a builtin "
+    "receiver (req/resp/time/bitwise) — the cache would be unreachable");
+constexpr Str kCacheImportDetail =
+    lit_str("state declarations in imported modules are not supported yet");
+constexpr Str kCacheFallibleOrderDetail = lit_str(
+    "state writes must precede fallible bindings — locals materialize "
+    "before the error prelude, so the write would also run on the error "
+    "path");
 constexpr Str kMatchI64Detail =
     lit_str("match on an i64 subject is not supported yet; compare with if/guard instead");
 
@@ -3692,6 +3709,23 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             const bool is_set = expr.name.eq({"set", 3});
             if (!is_get && !is_set)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kCacheGetDetail);
+            // Wait routes re-materialize locals on resume: the op would run
+            // after the wait, not at its source position — reject until
+            // state ops persist in handler slots.
+            if (route->cache_ops_blocked)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kCacheWaitDetail);
+            if (is_set) {
+                // One-shot permission from the bare-statement path; consumed
+                // here so a nested set (inside this set's own arguments, an
+                // .or() fallback, an if arm, or a let initializer) is
+                // rejected — those positions lower eagerly and would run the
+                // write on non-taken paths too.
+                if (!route->cache_set_stmt_ok)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, expr.span, kCacheSetStmtOnlyDetail);
+                route->cache_set_stmt_ok = false;
+            }
             if (is_get) {
                 if (expr.args.len != 1 || expr.args[0] == nullptr)
                     return frontend_error(
@@ -13806,8 +13840,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::State) continue;
         const AstExpr* init = item.state.init;
+        // lhs != nullptr is a qualified spelling (`foo.Cache<...>`): the
+        // qualifier must not be silently discarded — it either names an
+        // imported constructor (unsupported as state) or is a typo.
         if (init == nullptr || init->kind != AstExprKind::StructInit ||
-            !init->name.eq({"Cache", 5}))
+            !init->name.eq({"Cache", 5}) || init->lhs != nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.state.span, kStateDeclDetail);
         // This slice supports exactly Cache<IP, i64>.
@@ -14698,6 +14735,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (!mod.aliases.push(alias))
             return frontend_error(FrontendError::TooManyItems, item.using_decl.span);
+    }
+
+    // Imported modules must not declare state: their function bodies carry
+    // cache_index values assigned against the SOURCE module's cache list,
+    // and nothing remaps them into this module — a copied helper would read
+    // an unrelated cache (or none) at the same index. Reject until imported
+    // caches are merged and remapped alongside imported functions.
+    for (u32 ii = 0; ii < imported_modules.len; ii++) {
+        const auto& imp = imported_modules[ii];
+        if (imp.module != nullptr && imp.module->caches.len > 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, imp.span, kCacheImportDetail);
     }
 
     auto imported = merge_imported_functions(&mod, imported_modules);
@@ -17026,6 +17074,20 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
     }
 
+    // Cache names vs everything else: receiver resolution consults user
+    // bindings BEFORE cache lookup (and the bitwise/time/req/resp receivers
+    // before that), so a colliding name silently shadows the cache — reject
+    // at declaration instead. Runs here, after functions/types/aliases/
+    // imports are all registered, so late-in-file bindings are seen too.
+    for (u32 ci = 0; ci < mod.caches.len; ci++) {
+        const Str name = mod.caches[ci].name;
+        const bool reserved = name.eq({"bitwise", 7}) || name.eq({"time", 4}) ||
+                              name.eq({"req", 3}) || name.eq({"resp", 4});
+        if (reserved || user_bound_ident_name(mod, nullptr, 0, nullptr, name))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, mod.caches[ci].span, kCacheNameCollisionDetail);
+    }
+
     u32 timer_count = 0;
     u32 http_route_count = 0;
     for (u32 i = 0; i < file.items.len; i++) {
@@ -17247,7 +17309,24 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
-        bool seen_guard = false;
+        // Chain `before` steps have already appended guards to route.guards,
+        // and decorator guards are appended after body analysis then rotated
+        // ahead of user guards — either way the route body runs behind a
+        // guard, so a leading bare cache.set would still write on rejected
+        // requests. Start the gate as already-guarded in both cases.
+        bool seen_guard = route.guards.len > 0 || route_decl.decorators.len > 0;
+        // Wait routes re-materialize locals on resume (the initial call
+        // yields without running the entry block), so any cache op would
+        // execute after the wait regardless of source position. Pre-scan so
+        // ops BEFORE the first wait are rejected too.
+        for (u32 si = 0; si < route_decl.statements.len; si++) {
+            const AstStatement& s = *route_decl.statements[si];
+            if (s.kind == AstStmtKind::Wait ||
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
+                route.cache_ops_blocked = true;
+                break;
+            }
+        }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
             if (stmt.kind == AstStmtKind::Expr) {
@@ -17260,8 +17339,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (seen_wait || seen_for || seen_guard)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.span, kCacheStmtDetail);
+                // Locals also materialize before the automatic error prelude,
+                // so a write following a fallible binding would run on the
+                // error path too.
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    if (route.locals[li].init.may_error)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, stmt.span, kCacheFallibleOrderDetail);
+                }
+                route.cache_set_stmt_ok = true;  // one-shot; consumed by the receiver
                 auto value = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                route.cache_set_stmt_ok = false;
                 if (!value) return core::make_unexpected(value.error());
                 if (value->kind != HirExprKind::CacheSet)
                     return frontend_error(

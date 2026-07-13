@@ -1015,6 +1015,14 @@ struct HirRoute {
     // concrete attached route. NOT the same as a concrete route whose path
     // happens to be empty (PR #164 round 7).
     bool is_helper_scratch = false;
+    // Analysis-only flags (never serialized). cache_ops_blocked: the route
+    // body contains a wait, so CacheGet/CacheSet are rejected (locals
+    // re-materialize on resume — the op would run after the wait).
+    // cache_set_stmt_ok: one-shot permission set by the bare-statement path
+    // and consumed by the cache.set receiver — everywhere else a set is an
+    // error (its eager-lowered value position would run on non-taken paths).
+    bool cache_ops_blocked = false;
+    bool cache_set_stmt_ok = false;
     struct DecoratorRef {
         Span span{};
         Str name{};

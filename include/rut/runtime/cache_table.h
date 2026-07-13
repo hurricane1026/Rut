@@ -5,6 +5,7 @@
 
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <time.h>
 
 // Cache<K, i64> substrate — per-shard lossy per-key state slots
 // (docs/state-types.md §4). This is deliberately NOT a general hash map:
@@ -125,16 +126,24 @@ struct CacheTable {
 
 // Process-global descriptors for the declared Cache instances. Published by
 // the loader after a config compiles; each shard thread lazily (re)builds
-// its thread_local tables against these on first touch (and after a
-// capacity change — which resets that instance's state, documented).
-// Relaxed atomics: the reload thread's publish races benignly with shard
-// reads (a shard sees either the old or the new capacity, never a torn
-// value).
+// its thread_local tables against these on first touch.
+//
+// Ordering contract: publish stores seed, identities, capacities and count
+// first, then release-stores `generation`; readers acquire-load `generation`
+// FIRST, so a reader that observes a generation observes every descriptor
+// published with it (never a nonzero count with a zero seed or a stale
+// capacity). The generation also gives thread-local tables an invalidation
+// signal: on a new generation each shard drops tables whose instance
+// disappeared, changed identity (rename/reorder), or changed capacity —
+// state persists across reloads only for declarations that stayed
+// identical, and stale tables are unmapped instead of leaking.
 struct CacheRegistry {
     static constexpr u32 kMaxInstances = 8;
+    std::atomic<u32> generation{0};  // 0 = never published
     std::atomic<u32> count{0};
     std::atomic<u32> capacities[kMaxInstances]{};
-    std::atomic<u64> seed{0};  // 0 = unseeded sentinel
+    std::atomic<u64> identities[kMaxInstances]{};  // FNV-1a of the decl name
+    std::atomic<u64> seed{0};                      // 0 = unseeded sentinel
 };
 
 inline CacheRegistry& cache_registry() {
@@ -142,23 +151,52 @@ inline CacheRegistry& cache_registry() {
     return reg;
 }
 
+// FNV-1a of the declaration name — the instance's identity across reloads.
+// Never returns 0 (0 marks an empty thread-local identity slot).
+inline u64 cache_instance_identity(const char* name, u32 name_len) {
+    u64 h = 0xCBF29CE484222325ull;
+    for (u32 i = 0; i < name_len; i++) {
+        h ^= static_cast<u8>(name[i]);
+        h *= 0x100000001B3ull;
+    }
+    return h == 0 ? 1 : h;
+}
+
 // Test hook — must run before any shard touches its tables.
 inline void cache_registry_set_seed(u64 seed) {
     cache_registry().seed.store(seed, std::memory_order_relaxed);
 }
 
-inline void cache_registry_publish(const u32* capacities, u32 count) {
+inline void cache_registry_publish(const u32* capacities, const u64* identities, u32 count) {
     auto& reg = cache_registry();
     if (count > CacheRegistry::kMaxInstances) count = CacheRegistry::kMaxInstances;
-    for (u32 i = 0; i < count; i++)
-        reg.capacities[i].store(capacities[i], std::memory_order_relaxed);
-    reg.count.store(count, std::memory_order_relaxed);
     if (reg.seed.load(std::memory_order_relaxed) == 0) {
+        // getrandom can be interrupted (EINTR) — retry; it only blocks
+        // pre-entropy-pool-init on ancient boots. If it still fails, mix
+        // ASLR'd addresses with the clock rather than publishing a public
+        // constant (a fixed seed would let colliding key sets be
+        // precomputed against Cache-backed rate limits).
         u64 s = 0;
-        if (::getrandom(&s, sizeof(s), 0) != static_cast<long>(sizeof(s)) || s == 0)
-            s = 0x9E3779B97F4A7C15ull;  // degraded but functional fallback
+        for (int tries = 0; tries < 16 && s == 0; tries++) {
+            if (::getrandom(&s, sizeof(s), 0) != static_cast<long>(sizeof(s))) s = 0;
+        }
+        if (s == 0) {
+            struct timespec ts{};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const u64 a = reinterpret_cast<u64>(&reg);
+            const u64 b = reinterpret_cast<u64>(&reg.seed);
+            s = CacheTable::mix(static_cast<u32>(a ^ (a >> 32)),
+                                b ^ (static_cast<u64>(ts.tv_nsec) * 0x9E3779B97F4A7C15ull));
+        }
         reg.seed.store(s, std::memory_order_relaxed);
     }
+    for (u32 i = 0; i < count; i++) {
+        reg.capacities[i].store(capacities[i], std::memory_order_relaxed);
+        reg.identities[i].store(identities[i], std::memory_order_relaxed);
+    }
+    reg.count.store(count, std::memory_order_relaxed);
+    // Release-publish: pairs with the acquire load in cache_table_for.
+    reg.generation.fetch_add(1, std::memory_order_release);
 }
 
 }  // namespace rut

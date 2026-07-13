@@ -1021,7 +1021,8 @@ route GET "/users" {
     // rebuild fresh even if another test touched the registry.
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {1024};
-    cache_registry_publish(caps, 1);
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
 
     Connection conn;
     conn.reset();
@@ -1060,7 +1061,8 @@ route GET "/users" {
 TEST(jit, cache_helpers_miss_and_out_of_range) {
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {64};
-    cache_registry_publish(caps, 1);
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
 
     u8 has = 0xff;
     i64 val = -1;
@@ -1077,6 +1079,34 @@ TEST(jit, cache_helpers_miss_and_out_of_range) {
     rut_helper_cache_get(7, 0x7F000001u, &has, &val);
     CHECK_EQ(has, 0);
     rut_helper_cache_set(7, 0x7F000001u, 1);
+}
+
+TEST(jit, cache_registry_identity_governs_persistence_across_publish) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {64};
+    const u64 ident_a[1] = {cache_instance_identity("alpha", 5)};
+    const u64 ident_b[1] = {cache_instance_identity("beta", 4)};
+    cache_registry_publish(caps, ident_a, 1);
+    rut_helper_cache_set(0, 0x01020304u, 42);
+    u8 has = 0;
+    i64 val = 0;
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 42);
+
+    // Identical re-publish (same name, same capacity) → state persists
+    // across the config swap (documented).
+    cache_registry_publish(caps, ident_a, 1);
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 42);
+
+    // Same capacity but a different declaration at this index (rename /
+    // reorder) → different logical cache: the old entries must NOT bleed
+    // through; the shard drops and rebuilds the table.
+    cache_registry_publish(caps, ident_b, 1);
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 0);
 }
 
 TEST(jit, frontend_req_route_param_field_guard) {

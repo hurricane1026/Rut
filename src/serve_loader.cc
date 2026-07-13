@@ -226,18 +226,6 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     if (!populate_route_config(out.config, out.rir.module)) return false;
     if (!register_jit_routes(out.config, out.rir.module, out.engine)) return false;
 
-    // Publish Cache instance descriptors to the process registry — shard
-    // threads lazily (re)build their thread_local tables against these on
-    // first touch (docs/state-types.md §4).
-    {
-        u32 caps[RouteConfig::kMaxCacheInstances] = {};
-        const u32 n = out.config.cache_instance_count < RouteConfig::kMaxCacheInstances
-                          ? out.config.cache_instance_count
-                          : RouteConfig::kMaxCacheInstances;
-        for (u32 i = 0; i < n; i++) caps[i] = out.config.cache_instances[i].capacity;
-        cache_registry_publish(caps, n);
-    }
-
 #if RUT_ENABLE_WEBSOCKET
     // Register each terminate route: look up its compiled verdict fn and publish a proxy +
     // frame-handler route. The `maxMessageSize:` kwarg sets the cap when given; otherwise it
@@ -271,6 +259,13 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
         }
     }
 #endif
+
+    // Publish Cache instance descriptors to the process registry — shard
+    // threads lazily (re)build their thread_local tables against these on
+    // first touch (docs/state-types.md §4). LAST fallible-free step of the
+    // load: publishing earlier would mutate the process registry even when
+    // a later registration step fails and the old program stays live.
+    cache_registry_publish_config(out.config);
 
     return true;
 }

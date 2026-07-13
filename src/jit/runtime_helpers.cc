@@ -460,13 +460,58 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
 namespace {
 rut::CacheTable* cache_table_for(rut::u32 instance) {
     static thread_local rut::CacheTable t_tables[rut::CacheRegistry::kMaxInstances];
+    static thread_local rut::u64 t_identities[rut::CacheRegistry::kMaxInstances];
+    static thread_local rut::u32 t_generation = 0;
+    static thread_local bool t_alloc_failed_logged[rut::CacheRegistry::kMaxInstances];
     auto& reg = rut::cache_registry();
+    // Acquire pairs with publish's release generation bump — after this
+    // load, the seed/identities/capacities of that generation are visible.
+    const rut::u32 gen = reg.generation.load(std::memory_order_acquire);
+    if (gen == 0) return nullptr;  // nothing published yet
+    if (gen != t_generation) {
+        // A publish happened since this shard last looked. Drop tables
+        // whose instance disappeared, moved (identity change from a
+        // rename/reorder), or resized — reusing them would read another
+        // logical cache's entries; keeping stale ones would leak the mmap.
+        // Identical declarations keep their table (state persists across
+        // reloads, documented).
+        const rut::u32 live_count = reg.count.load(std::memory_order_relaxed);
+        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+            if (t_tables[i].slots == nullptr) continue;
+            const bool live =
+                i < live_count &&
+                reg.identities[i].load(std::memory_order_relaxed) == t_identities[i] &&
+                rut::CacheTable::round_capacity(
+                    reg.capacities[i].load(std::memory_order_relaxed)) == t_tables[i].slot_count;
+            if (!live) {
+                t_tables[i].destroy();
+                t_identities[i] = 0;
+            }
+        }
+        t_generation = gen;
+    }
     if (instance >= reg.count.load(std::memory_order_relaxed)) return nullptr;
     const rut::u32 cap = reg.capacities[instance].load(std::memory_order_relaxed);
     if (cap == 0) return nullptr;
     rut::CacheTable& t = t_tables[instance];
     if (t.slot_count != rut::CacheTable::round_capacity(cap)) {
-        if (!t.init(cap, reg.seed.load(std::memory_order_relaxed))) return nullptr;
+        if (!t.init(cap, reg.seed.load(std::memory_order_relaxed))) {
+            // Fail VISIBLY (fixed-capacity axiom): a silent nullptr would
+            // degrade every cache op on this shard to miss/no-op — for a
+            // rate limit that silently admits all traffic. Fail-closed
+            // needs an error path in the handler ABI; recorded follow-up.
+            if (!t_alloc_failed_logged[instance]) {
+                t_alloc_failed_logged[instance] = true;
+                fprintf(stderr,
+                        "rut: cache table mmap failed (instance %u, capacity %u) — cache ops "
+                        "degrade to miss/no-op on this shard\n",
+                        instance,
+                        cap);
+            }
+            return nullptr;
+        }
+        t_identities[instance] = reg.identities[instance].load(std::memory_order_relaxed);
+        t_alloc_failed_logged[instance] = false;
     }
     return &t;
 }

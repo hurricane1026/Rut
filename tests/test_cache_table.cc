@@ -84,7 +84,8 @@ TEST(cache_table, reinit_resets_state) {
 TEST(cache_table, registry_publish_seeds_once) {
     cache_registry_set_seed(0xDEADBEEFu);
     const u32 caps[2] = {64, 128};
-    cache_registry_publish(caps, 2);
+    const u64 idents[2] = {cache_instance_identity("a", 1), cache_instance_identity("b", 1)};
+    cache_registry_publish(caps, idents, 2);
     auto& reg = cache_registry();
     CHECK_EQ(reg.count.load(std::memory_order_relaxed), 2u);
     CHECK_EQ(reg.capacities[0].load(std::memory_order_relaxed), 64u);
