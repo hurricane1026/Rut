@@ -83,6 +83,9 @@ constexpr Str kCacheWaitDetail = lit_str(
 constexpr Str kCacheNameCollisionDetail = lit_str(
     "Cache declaration name collides with another binding or a builtin "
     "receiver (req/resp/time/bitwise) — the cache would be unreachable");
+constexpr Str kCacheNameLenDetail = lit_str(
+    "Cache declaration name is too long (max 31 bytes — the name is the "
+    "state's hot-reload identity)");
 constexpr Str kCacheImportDetail =
     lit_str("state declarations in imported modules are not supported yet");
 constexpr Str kCacheFallibleOrderDetail = lit_str(
@@ -13863,6 +13866,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             init->field_inits[0].value->int_value > kMaxCacheCapacity)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.state.span, kCacheCapacityDetail);
+        // The runtime descriptor stores at most 31 name bytes and the
+        // hot-reload identity hashes the STORED name — two declarations
+        // differing only past byte 31 would silently share identity (and
+        // therefore state) across reloads.
+        if (item.state.name.len > 31)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.state.span, kCacheNameLenDetail);
         for (u32 j = 0; j < mod.caches.len; j++) {
             if (mod.caches[j].name.eq(item.state.name))
                 return frontend_error(
@@ -17336,7 +17346,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 // guard/wait/for would still run on rejected paths; restrict
                 // it to the leading let-region ("state writes run at handler
                 // entry", docs/state-types.md).
-                if (seen_wait || seen_for || seen_guard)
+                // route.guards is consulted LIVE (not just seen_guard):
+                // respond-capable helper calls in preceding lets append
+                // guards during their analysis, after seen_guard was
+                // initialized.
+                if (seen_wait || seen_for || seen_guard || route.guards.len > 0)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.span, kCacheStmtDetail);
                 // Locals also materialize before the automatic error prelude,
@@ -17348,10 +17362,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             FrontendError::UnsupportedSyntax, stmt.span, kCacheFallibleOrderDetail);
                 }
                 route.cache_set_stmt_ok = true;  // one-shot; consumed by the receiver
+                const u32 guards_before_set = route.guards.len;
                 auto value = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 route.cache_set_stmt_ok = false;
                 if (!value) return core::make_unexpected(value.error());
+                // A respond-capable helper inside the set's own arguments
+                // appended a guard mid-analysis — the write would still
+                // materialize before that guard runs.
+                if (route.guards.len > guards_before_set)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.span, kCacheStmtDetail);
                 if (value->kind != HirExprKind::CacheSet)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.span, kCacheStmtDetail);

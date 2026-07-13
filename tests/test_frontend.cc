@@ -2115,6 +2115,54 @@ TEST(frontend, cache_decl_name_collisions_rejected) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, cache_bare_set_rejected_after_helper_appended_guards) {
+    // Respond-capable helpers are chain-step-only today: a direct call from
+    // a route body is rejected at the helper's guard, so a mid-statement
+    // guard append cannot currently reach the bare-set gate from the
+    // surface. The gate still consults route.guards LIVE (and re-checks
+    // after analyzing the set's own arguments) so enabling direct
+    // respond-capable calls later cannot turn this into a write-before-
+    // guard bypass. Both spellings must stay rejected either way.
+    const char* helper_before =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func require(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 1 }\n"
+        "route GET \"/x\" { let code = require(req) b.set(req.remoteAddr, 1) "
+        "if code == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(helper_before));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Same helper inside the set's own arguments.
+    const char* helper_inside =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func require(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 1 }\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, i64(require(req))) return 200 }\n";
+    lexed = lex(lit(helper_inside));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_decl_rejects_overlong_name) {
+    // The runtime descriptor truncates names at 31 bytes and the reload
+    // identity hashes the stored name — overlong names are rejected.
+    const char* overlong =
+        "let abcdefghijklmnopqrstuvwxyz123456 = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(overlong));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
 TEST(frontend, cache_decl_rejects_qualified_constructor) {
     // A qualified spelling must not silently discard the qualifier and
     // create live state.
