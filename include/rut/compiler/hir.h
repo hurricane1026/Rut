@@ -1013,6 +1013,10 @@ struct HirRoute {
     // concrete attached route. NOT the same as a concrete route whose path
     // happens to be empty (PR #164 round 7).
     bool is_helper_scratch = false;
+    // Analysis-only (never serialized): the route body contains a wait, so
+    // time.nowMicros() is rejected — locals re-materialize on resume, and a
+    // pre-wait timestamp binding would sample after the wait.
+    bool time_ops_blocked = false;
     struct DecoratorRef {
         Span span{};
         Str name{};

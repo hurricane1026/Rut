@@ -55,6 +55,10 @@ constexpr Str kI64FallibleDetail = lit_str(
     "the fallback (e.g. any(x, <plain default>)) or keep the value i32");
 constexpr Str kTimeMemberDetail =
     lit_str("unknown time function; use time.nowMicros() (monotonic microseconds, i64)");
+constexpr Str kTimeWaitDetail = lit_str(
+    "time.nowMicros() in routes containing wait is not supported yet — "
+    "locals re-materialize on resume, so a pre-wait timestamp would be "
+    "sampled after the wait");
 constexpr Str kMinMaxDetail = lit_str(
     "max/min expect two plain integer values of the same width (i32 or i64; "
     "wrap an i32 side in i64(x); int literals adopt the i64 side)");
@@ -3670,6 +3674,13 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         !user_bound_ident_name(mod, locals, local_count, binding, {"time", 4})) {
         if (!expr.name.eq({"nowMicros", 9}) || expr.args.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kTimeMemberDetail);
+        // Wait routes re-materialize locals on resume: a pre-wait
+        // `let start = time.nowMicros()` would sample AFTER the wait — the
+        // one shape where a non-idempotent initializer breaks the pure
+        // re-materialization model. Rejected until state ops persist in
+        // handler slots.
+        if (route->time_ops_blocked)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kTimeWaitDetail);
         HirExpr out{};
         out.kind = HirExprKind::TimeNowMicros;
         out.type = HirTypeKind::I64;
@@ -17215,6 +17226,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // and would stall 1s under the wheel fallback.
         bool seen_wait = false;
         bool seen_for = false;
+        // Pre-scan for waits: time.nowMicros() anywhere in a wait route is
+        // rejected (see kTimeWaitDetail) — the flag must be set before any
+        // statement is analyzed so pre-wait bindings are caught too.
+        for (u32 si = 0; si < route_decl.statements.len; si++) {
+            const AstStatement& s = *route_decl.statements[si];
+            if (s.kind == AstStmtKind::Wait ||
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
+                route.time_ops_blocked = true;
+                break;
+            }
+        }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
             if (stmt.kind == AstStmtKind::Wait) {

@@ -1843,6 +1843,32 @@ TEST(frontend, analyze_time_and_minmax_gates_and_shadowing) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, analyze_time_rejected_in_wait_routes) {
+    // Wait routes re-materialize locals on resume — a pre-wait
+    // `let start = time.nowMicros()` would sample after the wait. Rejected
+    // anywhere in a route containing wait.
+    const char* pre_wait =
+        "route GET \"/x\" { let start = time.nowMicros() wait(1000) "
+        "if start > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(pre_wait));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* post_wait =
+        "route GET \"/x\" { wait(1000) if time.nowMicros() > 0 { return 200 } else { "
+        "return 500 } }\n";
+    lexed = lex(lit(post_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, analyze_minmax_pipe_stage_requires_placeholder) {
     // `x | max(1, 2)` must not silently drop x — a builtin pipe stage needs
     // an explicit placeholder, same rule as ordinary pipe calls.
