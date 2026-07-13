@@ -97,8 +97,10 @@ struct Ctx {
     LLVMValueRef fn_req_content_length;
     LLVMValueRef fn_cache_get;
     LLVMValueRef fn_cache_set;
+    LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
+    LLVMValueRef fn_time_unlatch;
 
     // True while emitting a handler that reads the request (and therefore
     // primed the parse cache). Gates the parse-unprime calls at exits.
@@ -206,6 +208,29 @@ struct Ctx {
         LLVMBuildCall2(builder,
                        LLVMGlobalGetValueType(get_parse_unprime()),
                        get_parse_unprime(),
+                       nullptr,
+                       0,
+                       "");
+    }
+
+    // void rut_helper_time_unlatch()
+    LLVMValueRef get_time_unlatch() {
+        if (!fn_time_unlatch) {
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
+            fn_time_unlatch = LLVMAddFunction(llvm_mod, "rut_helper_time_unlatch", ft);
+        }
+        return fn_time_unlatch;
+    }
+
+    // Reset the per-invocation time latch at handler entry. parse_prime
+    // already does this as a side effect, so this dedicated call is only
+    // emitted for handlers that use time.nowMicros() WITHOUT reading the
+    // request — otherwise their thread's latch would stay valid across
+    // invocations and the clock would freeze at the first sampled value.
+    void emit_time_unlatch() {
+        LLVMBuildCall2(builder,
+                       LLVMGlobalGetValueType(get_time_unlatch()),
+                       get_time_unlatch(),
                        nullptr,
                        0,
                        "");
@@ -371,6 +396,15 @@ struct Ctx {
             fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
         }
         return fn_cache_set;
+    }
+
+    // i64 rut_helper_time_now_micros()
+    LLVMValueRef get_time_now_micros() {
+        if (!fn_time_now_micros) {
+            LLVMTypeRef ft = LLVMFunctionType(i64_ty, nullptr, 0, 0);
+            fn_time_now_micros = LLVMAddFunction(llvm_mod, "rut_helper_time_now_micros", ft);
+        }
+        return fn_time_now_micros;
     }
 
     // u64 rut_helper_req_content_length(ptr, i32)
@@ -1208,6 +1242,33 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::TimeNowMicros: {
+            LLVMValueRef v = LLVMBuildCall2(c.builder,
+                                            LLVMGlobalGetValueType(c.get_time_now_micros()),
+                                            c.get_time_now_micros(),
+                                            nullptr,
+                                            0,
+                                            "time.now_micros");
+            c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::MaxInt:
+        case rir::Opcode::MinInt: {
+            // Signed select at the operand width — single evaluation of both
+            // operands (max/min are NOT an IfElse desugar: that would clone
+            // the operand trees and re-execute any effectful expression).
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            LLVMValueRef cond =
+                LLVMBuildICmp(c.builder,
+                              inst.op == rir::Opcode::MaxInt ? LLVMIntSGT : LLVMIntSLT,
+                              a,
+                              b,
+                              "minmax.cmp");
+            LLVMValueRef r = LLVMBuildSelect(c.builder, cond, a, b, "minmax");
+            c.set_value(inst.result, r);
+            break;
+        }
         case rir::Opcode::SextI64: {
             LLVMValueRef v =
                 LLVMBuildSExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "sext.i64");
@@ -1627,6 +1688,23 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
     return false;
 }
 
+// Whether the handler samples the monotonic clock. Time-using handlers that
+// never read the request get no parse_prime (which is what normally resets
+// the per-invocation time latch), so they need a dedicated latch reset in
+// the prologue — otherwise the thread's first sampled timestamp is returned
+// forever (frozen clock, silently wrong for GCRA-style elapsed-time logic).
+static bool rir_function_uses_time(const rir::Function& fn) {
+    if (!fn.blocks) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        if (!blk.insts) continue;
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            if (blk.insts[ii].op == rir::Opcode::TimeNowMicros) return true;
+        }
+    }
+    return false;
+}
+
 static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
     c.ctx_store_sink = nullptr;
@@ -1677,6 +1755,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // calls at the handler's returns.
     const bool kNeedsParse = rir_function_uses_parse(fn);
     c.cur_fn_needs_parse = kNeedsParse;
+    // Time-only handlers still need their per-invocation latch reset; when
+    // kNeedsParse is true, parse_prime already resets it (skip the extra call).
+    const bool kNeedsTimeUnlatch = !kNeedsParse && rir_function_uses_time(fn);
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
@@ -1713,6 +1794,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // so every req_* helper in this invocation shares one parse. Skipped
         // for handlers that never read the request (status/forward only).
         if (kNeedsParse) c.emit_parse_prime();
+        if (kNeedsTimeUnlatch) c.emit_time_unlatch();
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
@@ -1769,6 +1851,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // Parse-once: prime the per-thread parse cache at handler entry,
         // unless the handler never reads the request.
         if (kNeedsParse) c.emit_parse_prime();
+        if (kNeedsTimeUnlatch) c.emit_time_unlatch();
     }
 
     // Emit instructions block by block.
@@ -1816,6 +1899,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_content_length = nullptr;
     c.fn_cache_get = nullptr;
     c.fn_cache_set = nullptr;
+    c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
     c.fn_str_has_prefix = nullptr;

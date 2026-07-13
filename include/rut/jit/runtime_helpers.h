@@ -168,5 +168,15 @@ void rut_helper_req_set_header(
 // a no-op (defensive; analyze bounds the index at compile time).
 void rut_helper_cache_get(rut::u32 instance, rut::u32 key_ip, rut::u8* out_has, rut::i64* out_val);
 void rut_helper_cache_set(rut::u32 instance, rut::u32 key_ip, rut::i64 val);
+// ── Time ──
+// Monotonic microseconds (fresh clock_gettime with a thread-local clamp).
+// Backs the `time.nowMicros()` builtin.
+rut::i64 rut_helper_time_now_micros();
+
+// Reset the per-invocation time latch. Normally a side effect of
+// parse_prime/unprime; the JIT emits this at the prologue of handlers that
+// sample time.nowMicros() without reading the request, so their clock does
+// not freeze at the thread's first sampled value.
+void rut_helper_time_unlatch();
 
 }  // extern "C"

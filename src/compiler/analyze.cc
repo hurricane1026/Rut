@@ -53,6 +53,15 @@ constexpr Str kArithMixedWidthDetail = lit_str(
 constexpr Str kI64FallibleDetail = lit_str(
     "a fallible i64 value has no error carrier yet; handle the error inside "
     "the fallback (e.g. any(x, <plain default>)) or keep the value i32");
+constexpr Str kTimeMemberDetail =
+    lit_str("unknown time function; use time.nowMicros() (monotonic microseconds, i64)");
+constexpr Str kTimeWaitDetail = lit_str(
+    "time.nowMicros() in routes containing wait is not supported yet — "
+    "locals re-materialize on resume, so a pre-wait timestamp would be "
+    "sampled after the wait");
+constexpr Str kMinMaxDetail = lit_str(
+    "max/min expect two plain integer values of the same width (i32 or i64; "
+    "wrap an i32 side in i64(x); int literals adopt the i64 side)");
 constexpr Str kI64ArgDetail = lit_str(
     "i64() expects exactly one plain i32 or i64 value; bind optional or "
     "fallible values first with guard let / if let / .or(default)");
@@ -3788,6 +3797,27 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.rhs = &route->exprs[route->exprs.len - 1];
             return out;
         }
+    }
+
+    // Builtin `time` namespace — nowMicros() only. Same shadowing rule as
+    // `bitwise`: any user binding named `time` wins.
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq({"time", 4}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"time", 4})) {
+        if (!expr.name.eq({"nowMicros", 9}) || expr.args.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kTimeMemberDetail);
+        // Wait routes re-materialize locals on resume: a pre-wait
+        // `let start = time.nowMicros()` would sample AFTER the wait — the
+        // one shape where a non-idempotent initializer breaks the pure
+        // re-materialization model. Rejected until state ops persist in
+        // handler slots.
+        if (route->time_ops_blocked)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kTimeWaitDetail);
+        HirExpr out{};
+        out.kind = HirExprKind::TimeNowMicros;
+        out.type = HirTypeKind::I64;
+        out.span = expr.span;
+        return out;
     }
 
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
@@ -8405,6 +8435,64 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    // `max(a, b)` / `min(a, b)` — same-width integer builtins (signed).
+    // Real opcodes, not an IfElse desugar: the operands are evaluated once.
+    // A user binding or function named max/min shadows the builtin.
+    {
+        const bool is_max = expr.name.eq({"max", 3});
+        const bool is_min = expr.name.eq({"min", 3});
+        if ((is_max || is_min) &&
+            !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+            // As a pipe stage the piped value must land in an explicit
+            // placeholder — `x | max(1, 2)` would otherwise silently drop x.
+            if (pipe_lhs != nullptr) {
+                u32 placeholders = 0;
+                for (u32 i = 0; i < expr.args.len; i++) {
+                    if (expr.args[i] != nullptr && expr.args[i]->kind == AstExprKind::Placeholder)
+                        placeholders++;
+                }
+                if (placeholders == 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.span,
+                                          lit_str("pipe call missing placeholder"));
+            }
+            if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kMinMaxDetail);
+            auto lhs = analyze_builtin_arg(*expr.args[0]);
+            if (!lhs) return core::make_unexpected(lhs.error());
+            auto rhs = analyze_builtin_arg(*expr.args[1]);
+            if (!rhs) return core::make_unexpected(rhs.error());
+            adopt_int_literal_type(&lhs.value(), &rhs.value());
+            const bool int_typed =
+                (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
+                (rhs->type == HirTypeKind::I32 || rhs->type == HirTypeKind::I64);
+            if (!int_typed || lhs->may_nil || lhs->may_error || rhs->may_nil || rhs->may_error ||
+                lhs->type != rhs->type)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kMinMaxDetail);
+            if (lhs->kind == HirExprKind::IntLit && rhs->kind == HirExprKind::IntLit) {
+                HirExpr out{};
+                out.kind = HirExprKind::IntLit;
+                out.type = lhs->type;
+                out.span = expr.span;
+                const i64 a = lhs->int_value;
+                const i64 b = rhs->int_value;
+                out.int_value = is_max ? (a > b ? a : b) : (a < b ? a : b);
+                return out;
+            }
+            HirExpr out{};
+            out.kind = is_max ? HirExprKind::MaxInt : HirExprKind::MinInt;
+            out.type = lhs->type;
+            out.span = expr.span;
+            if (!route->exprs.push(lhs.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            if (!route->exprs.push(rhs.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+    }
+
     // `i64(x)` — Swift-initializer-style conversion builtin. A user binding
     // or function named `i64` shadows it (same rule as the bitwise
     // namespace). Identity on i64, fold on literals, WidenI64 (sign-extend)
@@ -9491,6 +9579,22 @@ static bool const_eval_expr(
                 ? fold_arith_i64(expr.kind, lhs.int_value, rhs.int_value)
                 : static_cast<i64>(fold_arith_i32(
                       expr.kind, static_cast<i32>(lhs.int_value), static_cast<i32>(rhs.int_value)));
+        return true;
+    }
+    if ((expr.kind == HirExprKind::MaxInt || expr.kind == HirExprKind::MinInt) &&
+        expr.lhs != nullptr && expr.rhs != nullptr) {
+        // max/min over compile-time values — same-width rule as the analyze
+        // fold; i32 operands compare identically at the stored i64 width.
+        ConstValue lhs{};
+        ConstValue rhs{};
+        if (!const_eval_expr(*expr.lhs, locals, local_count, &lhs, depth + 1)) return false;
+        if (!const_eval_expr(*expr.rhs, locals, local_count, &rhs, depth + 1)) return false;
+        if (lhs.type != rhs.type) return false;
+        if (lhs.type != HirTypeKind::I32 && lhs.type != HirTypeKind::I64) return false;
+        out->type = lhs.type;
+        out->int_value = expr.kind == HirExprKind::MaxInt
+                             ? (lhs.int_value > rhs.int_value ? lhs.int_value : rhs.int_value)
+                             : (lhs.int_value < rhs.int_value ? lhs.int_value : rhs.int_value);
         return true;
     }
     if ((expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
@@ -17335,11 +17439,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // yields without running the entry block), so any cache op would
         // execute after the wait regardless of source position. Pre-scan so
         // ops BEFORE the first wait are rejected too.
+        // Pre-scan for waits: time.nowMicros() anywhere in a wait route is
+        // rejected (see kTimeWaitDetail) — the flag must be set before any
+        // statement is analyzed so pre-wait bindings are caught too.
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait ||
                 (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
                 route.cache_ops_blocked = true;
+                route.time_ops_blocked = true;
                 break;
             }
         }

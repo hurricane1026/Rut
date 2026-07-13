@@ -454,6 +454,11 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::ByteSize;
         return v;
     }
+    if (expr.kind == HirExprKind::TimeNowMicros) {
+        v.kind = MirValueKind::TimeNowMicros;
+        v.type = MirTypeKind::I64;
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqRemoteAddr) {
         v.kind = MirValueKind::ReqRemoteAddr;
         v.type = MirTypeKind::IP;
@@ -503,7 +508,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr ||
         expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
         expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
-        expr.kind == HirExprKind::Mod) {
+        expr.kind == HirExprKind::Mod || expr.kind == HirExprKind::MaxInt ||
+        expr.kind == HirExprKind::MinInt) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
@@ -550,6 +556,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                 break;
             case HirExprKind::Div:
                 v.kind = MirValueKind::Div;
+                break;
+            case HirExprKind::MaxInt:
+                v.kind = MirValueKind::MaxInt;
+                break;
+            case HirExprKind::MinInt:
+                v.kind = MirValueKind::MinInt;
                 break;
             default:
                 v.kind = MirValueKind::Mod;

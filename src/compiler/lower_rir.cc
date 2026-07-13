@@ -1515,6 +1515,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::TimeNowMicros) {
+        auto out = b.emit_time_now_micros({span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::ReqRemoteAddr) {
         auto v = b.emit_req_remote_addr({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
@@ -2230,7 +2235,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         value.kind == MirValueKind::BitXor || value.kind == MirValueKind::BitShl ||
         value.kind == MirValueKind::BitShr || value.kind == MirValueKind::Add ||
         value.kind == MirValueKind::Sub || value.kind == MirValueKind::Mul ||
-        value.kind == MirValueKind::Div || value.kind == MirValueKind::Mod) {
+        value.kind == MirValueKind::Div || value.kind == MirValueKind::Mod ||
+        value.kind == MirValueKind::MaxInt || value.kind == MirValueKind::MinInt) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
                                      variant_infos,
@@ -2278,6 +2284,10 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             op = rir::Opcode::Div;
         else if (value.kind == MirValueKind::Mod)
             op = rir::Opcode::Mod;
+        else if (value.kind == MirValueKind::MaxInt)
+            op = rir::Opcode::MaxInt;
+        else if (value.kind == MirValueKind::MinInt)
+            op = rir::Opcode::MinInt;
         auto out = rir::Builder::is_arith_opcode(op)
                        ? b.emit_arith(op, lhs.value(), rhs.value(), {span.line, span.col})
                        : b.emit_bit(op, lhs.value(), rhs.value(), {span.line, span.col});
