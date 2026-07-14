@@ -613,13 +613,13 @@ call arguments (see §3.2.1), not as response construction.
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is
 > restructured around "algorithms in Rut, primitives in the runtime".
 > `Counter<K>` is deleted — token bucket / sliding window are `.rut`
-> library code over `Cache` (see `examples/ratelimit.rut`). Gauge-style
+> library code over `Cache` (planned in PR #184's `examples/ratelimit.rut`). Gauge-style
 > in-flight counting will get an exact Array-style table, not lossy slots.
 
 All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
-**Cache<K, i64>** — lossy per-key state slots (✅ shipped as `Cache<IP, i64>`).
+**Cache<K, i64>** — lossy per-key state slots (⏳ pending; substrate PR #181).
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
@@ -635,9 +635,9 @@ Under fixed capacity there is no third option: when capacity or a collision
 budget is exceeded, either the write fails visibly or old data dies (eBPF's
 `HASH` vs `LRU_HASH` split). `Cache` evicts — so **never store anything in
 a `Cache` whose absence yields a wrong answer** (sessions, in-flight
-counts). Multi-field algorithm state packs into the single i64 with
-`bitwise.*` (the i64 relaxation of `bitwise.*` lands with PR #182, same
-stack); expiry is lazy (window index in the value), there is no `ttl:`.
+counts). Once PR #182's i64 `bitwise.*` support lands, multi-field algorithm
+state can pack into the single i64; until then the packing examples are also
+pending. Expiry is lazy (window index in the value), there is no `ttl:`.
 The name `Hash` is **reserved** for a future strict, visible-failure table:
 "hash map" carries a lossless prior this structure does not honor. (The
 former `Hash<string, Session>` example is retired for a second reason:
@@ -691,9 +691,9 @@ Compiler picks implementation by element type: `Set<IP>` / `Set<string>` → has
 `Set<CIDR>` → LPM trie (longest prefix match tree).
 
 **Rate limiting** is not a state type: GCRA token buckets and packed
-sliding windows are ordinary `.rut` code over `Cache<K, i64>` (the blessed
-implementations live in `examples/ratelimit.rut`; the real-socket e2e test
-pins their admission sequence against the `@rateLimit` decorator).
+sliding windows are ordinary `.rut` code over `Cache<K, i64>`. The planned
+examples and their real-socket parity test land with PR #184; until the Cache
+and i64-bitwise slices land, `@rateLimit` is the shipped form.
 
 **Bloom\<T>** — probabilistic set, memory-efficient for large cardinalities.
 No false negatives; possible false positives.
@@ -731,7 +731,7 @@ Use cases: feature flags, upstream health status, compact boolean arrays.
 | `persist: true` | all | Preserve data across hot reload; compile error if struct layout changed |
 | `consistent: true` | Cache, Set | Single-owner routing by key hash (removes shard divergence; lossy containers stay approximate); SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
 | `coalesce: true` | LRU | Request coalescing — on cache miss with in-flight request for same key, suspend and wait instead of sending duplicate upstream request |
-| `backend: .redis(addr)` | Cache, Set | Cross-node state sync via external storage; per-shard state becomes a local cache with Redis as source of truth |
+| `backend: .redis(addr)` | Cache, Set | ⏳ Future: cross-node storage; no Cache form is specified until reads have an explicit freshness/refresh contract |
 
 **All state is per-shard by default.** Each shard owns an independent copy, single-threaded access,
 zero locking. Per-shard counters are approximate (effective limit ≈ `limit × shard_count`).
@@ -781,7 +781,7 @@ let ownerBuckets = Cache<IP, i64>(capacity: 100000, consistent: true)
 get /api/*path {
     // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
     let tat = ownerBuckets.get(req.remoteAddr).or(0)
-    // ... GCRA over tat (examples/ratelimit.rut)
+    // ... GCRA over tat (pending PR #184 example)
     return forward(userService)
 }
 ```
@@ -810,29 +810,14 @@ Compiler emits a warning — user must acknowledge with `// rut:allow(consistent
 All three use SPSC message passing with minimal atomics (relaxed stores +
 release/acquire on queue tail pointer). No mutexes, no STM, no contended locks.
 
-**Cross-node state: `backend:` parameter**
+**Cross-node state: `backend:` parameter (⏳ future)**
 
-Per-shard and cross-shard state only works within a single Rut process. When
-multiple Rut instances need to SHARE state (e.g., cluster-wide rate
-limiting), `backend:` syncs it via external storage — approximately:
-reads are local-first, so instances can act on stale values. It reduces
-cross-instance drift; it does not provide cluster-wide exactness:
-
-```swift
-// Per-process only (default) — fast, approximate
-let buckets = Cache<IP, i64>(capacity: 100000)
-
-// Cross-node via Redis — shared cluster-wide buckets (approximate: reads
-// hit the local cache first, so instances can act on stale values)
-let globalBuckets = Cache<IP, i64>(capacity: 100000, backend: .redis("redis:6379"))
-```
-
-With `backend:`, per-shard state acts as a local cache. Writes go to both
-local state and Redis (async via TCP). Reads check local first, fall back
-to Redis on miss. The runtime handles connection pooling and serialization.
-
-Cost: ~100μs per Redis round-trip vs ~10ns for local state. Use only when
-cluster-wide consistency is required.
+Per-shard and cross-shard state only works within a single Rut process.
+`backend:` is reserved for a future external-storage design; it is not a
+blessed Cache declaration today. In particular, a local-first Redis cache
+without a TTL, invalidation, or refresh bound could serve stale limiter state
+indefinitely. The syntax and cost model stay unspecified until that freshness
+contract and the required atomic read-modify-write behavior are defined.
 
 ##### 3.3.6.1 State Failure and Ordering Semantics
 
@@ -860,8 +845,8 @@ clear but the contract is underspecified.
 **External backends**
 
 - `backend:` changes the consistency model from purely in-process semantics to backend-mediated semantics
-- Default contract for `backend: .redis(...)`: write-through intent with backend failure surfaced to the request unless the API explicitly documents degraded-local mode
-- Reads may be satisfied from local cache only when the cache entry is still valid under the declared TTL / freshness rules
+- Any future `backend: .redis(...)` contract must surface write-through failure to the request unless it explicitly documents degraded-local mode
+- Reads may be satisfied from local cache only while an explicit TTL, invalidation, or refresh rule proves the entry fresh; because Cache has no such rule today, no backend Cache form is currently valid
 
 **Reload / shutdown**
 
@@ -1418,9 +1403,9 @@ func auth(_ req: Request, role: string) -> User {
     return User(id: claims.sub, role: claims.role)
 }
 
-// Rate limiting: use the official @rateLimit decorator, or write GCRA in
-// Rut over Cache<IP, i64> (examples/ratelimit.rut) — Counter is deleted
-// (§3.3.6).
+// Rate limiting: use the official @rateLimit decorator today. GCRA in Rut
+// over Cache<IP, i64> lands with the pending state/library stack; Counter is
+// deleted (§3.3.6).
 
 func requestId(_ req: Request) {
     if req.header("X-Request-ID") == nil {
@@ -1485,9 +1470,10 @@ func securityHeaders(_ req: Request, _ resp: Response) {
 
 // --- Security middleware examples ---
 
-// Flood control is the same GCRA-over-Cache pattern as rate limiting
-// (examples/ratelimit.rut), keyed per-IP; a global limiter uses the
-// exact gauge table when it lands (§3.3.6).
+// Flood control is the same GCRA pattern as rate limiting, keyed per-IP.
+// Exact global request-rate limiting needs a strict table plus an atomic
+// owner-shard GCRA update (§3.3.6). A gauge measures in-flight concurrency,
+// not request rate, and cannot replace a window/refill algorithm.
 
 func waf(_ req: Request) {
     let path = req.path
@@ -1524,7 +1510,7 @@ req.auth(role: "user")
 // Chaining reads naturally:
 req.requestId()
 req.auth(role: "user")
-req.rateLimit(limits: apiLimits, max: 1000)
+req.maxBody(limit: 10mb)
 
 // Works for any type, not just Request:
 let clean = req.path.replace(re"/+", "/")    // replace(req.path, re"/+", "/")
@@ -1850,26 +1836,11 @@ resp.cookie("session")        // string? — read a Set-Cookie value by name
 resp.upstream                 // string — which target served this ("10.0.0.1:8080")
 ```
 
-`resp.cookie()` and `resp.upstream` enable session persistence "learn" mode:
-
-```swift
-let sessionMap = Hash<string, string>(capacity: 100000, ttl: 1h)  // ⚠ future strict Hash (§3.3.6 — not a Rut name today)
-
-get /api/*path {
-    // Sticky session — route to previously learned upstream
-    if let sid = req.cookie("session") {
-        if let target = sessionMap.get(sid) {
-            return forward(target)
-        }
-    }
-    // First request — forward normally, learn the session
-    let resp = forward(userService, buffered: true)
-    if let newSid = resp.cookie("session") {
-        sessionMap.set(newSid, resp.upstream)
-    }
-    return resp
-}
-```
+`resp.cookie()` and `resp.upstream` provide the observations needed for a
+future sticky-session "learn" mode. Rut cannot express that mode today:
+`Hash` is reserved for the future strict table (§3.3.6), and lossy `Cache`
+must not hold sessions. No copyable declaration is specified until the strict
+table and its cross-connection consistency contract exist.
 
 #### 3.4.6 Response Caching
 
@@ -2668,7 +2639,7 @@ stdlib/
 ```
 
 ```swift
-import { tokenBucket } from "examples/ratelimit.rut"
+// PR #184 adds standalone rate-limit examples, not an importable tokenBucket helper.
 import { cors, securityHeaders } from "stdlib/security.rut"
 ```
 
@@ -2881,7 +2852,7 @@ tcp(addr) -> TcpConn          // TCP connection (Redis, custom protocols)
 udp() -> UdpSock              // UDP socket (StatsD, syslog, DNS)
 
 // --- State (per-shard by default, all bounded) ---
-Cache<K, i64>(capacity:)      // lossy per-key state slots (shipped; §3.3.6)
+Cache<K, i64>(capacity:)      // ⏳ lossy per-key state slots (pending PR #181; §3.3.6)
 Hash<K,V>(capacity:, ttl:)    // ⚠ reserved name — future strict table (§3.3.6)
 LRU<K,V>(capacity:, ttl:)     // key-value with LRU eviction
 Set<T>(capacity:)              // membership testing (CIDR → auto LPM trie)
@@ -3132,7 +3103,6 @@ removed from the language instead of documented as a variation.
 ```swift
 // production.rut
 
-import { tokenBucket } from "examples/ratelimit.rut"
 import { cors, securityHeaders, ipAllow, waf } from "stdlib/security.rut"
 import { requestId } from "stdlib/request.rut"
 
@@ -3195,7 +3165,6 @@ struct OrderItem {
 
 // ---------- State ----------
 
-let apiLimits = Cache<IP, i64>(capacity: 100000)  // GCRA state (examples/ratelimit.rut)
 let blacklist = Set<IP>(capacity: 100000)
 let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 
@@ -3248,7 +3217,7 @@ route {
     @cors *
 
     @auth(role: "user") api.example.com
-    @rateLimit(limits: apiLimits, max: 1000) api.example.com
+    @rateLimit(limit: 1000, window: 1m) api.example.com
     @ipAllow(cidrs: [10.0.0.0/8, 172.16.0.0/12]) admin.example.com
     @auth(role: "admin") admin.example.com
 
@@ -3336,7 +3305,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | IP restriction | `req.remoteAddr.in(CIDR)` native |
 | UA restriction | `req.userAgent.contains()` |
 | CORS | `guard` + header assignment |
-| Rate limiting | Rut GCRA over `Cache<K, i64>` (examples/ratelimit.rut) |
+| Rate limiting | `@rateLimit` today; Rut GCRA over `Cache<K, i64>` after PRs #181/#182/#184 |
 | Request size limiting | `req.contentLength` comparison |
 | Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
@@ -4705,11 +4674,13 @@ mutable state. Cross-shard communication uses `notify` — the only primitive:
 ```swift
 // All state is per-shard, single-threaded, zero locking
 let blacklist = Set<IP>(capacity: 100000)
-let buckets = Cache<IP, i64>(capacity: 100000)    // GCRA state (examples/ratelimit.rut)
+let buckets = Cache<IP, i64>(capacity: 100000)    // ⏳ pending GCRA substrate
 
 // Per-shard mutation — immediate, no cross-core cost
 blacklist.add(ip)
-limits.incr(req.remoteAddr)
+let now = time.nowMicros()
+let tat = max(buckets.get(req.remoteAddr).or(0), now)
+buckets.set(req.remoteAddr, tat + 600000)          // packed GCRA update
 
 // Cross-shard propagation — via SPSC queues, eventual consistency
 notify all blacklist.add(ip)    // N-1 relaxed writes, microsecond propagation
@@ -7015,10 +6986,9 @@ firewall {
     // Port whitelist — only allow declared listen ports
     guard dst.port == 443 || dst.port == 80 else { drop }
 
-    // SYN flood protection — rate limit new connections per IP
-    if src.isSYN {
-        guard synRate.incr(src.ip) <= 100 else { drop }
-    }
+    // SYN flood protection needs an XDP-compatible GCRA primitive. The
+    // removed Counter.incr form is not replaced with Cache here: Cache has
+    // only get/set, and no supported atomic firewall rate-update surface yet.
 
     // TLS fingerprinting — block known malware/scanner clients
     if src.isTLS {
@@ -7051,7 +7021,7 @@ firewall {
 
 **Compiler constraints — `firewall` block can only:**
 - Access `src` / `dst` / `packet` fields
-- Use `Set<IP>`, `Set<CIDR>`, `Cache<IP, i64>`, `Set<string>` state types
+- Use `Set<IP>`, `Set<CIDR>`, `Set<string>` state types
 - `guard ... else { drop }` or `pass`
 - No HTTP operations (`req`, `forward`, `auth`, regex)
 - Violation → compile error: "packet block cannot access HTTP-level data"
@@ -7083,7 +7053,7 @@ Without:        NIC → TCP → accept → HTTP parse → guard → 403
 |-----------|-----|--------|
 | IP blacklist | `Set<IP>` → hash map | Known bad actors |
 | CIDR filtering | `Set<CIDR>` → LPM trie | Network ranges, GeoIP |
-| SYN flood | `Cache<IP, i64>` GCRA on SYN packets | Connection exhaustion |
+| SYN flood | ⏳ Future strict atomic GCRA update in the XDP target | Connection exhaustion |
 | Port filtering | `dst.port` check | Port scanning |
 | SNI filtering | Parse ClientHello, check domain | Unknown domains (saves TLS CPU) |
 | JA3 fingerprint | Hash ClientHello fields | Malware, scanners, bots |

@@ -17,7 +17,7 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
-import { tokenBucket } from "examples/ratelimit.rut" // selective import
+// PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
 listen :443                       // ⏳ ports (no top-level listen yet)
@@ -25,7 +25,7 @@ tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
-let buckets = Cache<IP, i64>(capacity: 100000)     // state (per-shard, lossy slots)
+let buckets = Cache<IP, i64>(capacity: 100000)     // ⏳ state (PR #181)
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
@@ -218,12 +218,12 @@ return resp
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let buckets = Cache<IP, i64>(capacity: 100000)   // ✅ shipped — lossy per-key slots
+let buckets = Cache<IP, i64>(capacity: 100000)   // ⏳ pending PR #181 — lossy per-key slots
 let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
 buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait;
                                                  // may evict a colliding neighbor
 // Never store anything whose absence yields a wrong answer (sessions,
-// in-flight counts). Rate limiting = plain Rut over Cache (examples/ratelimit.rut);
+// in-flight counts). Rate limiting over Cache is pending PRs #181/#182/#184;
 // Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
 // Cache ops are rejected in routes containing wait (timer/event suspension);
 // `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
@@ -238,7 +238,7 @@ notify all blacklist.add(ip)      // fan-out to all shards (eventual)
 notify(key) blacklist.add(key)    // to owner shard by key hash (expr form;
                                   // bare-statement cache.set does not nest)
 // strong consistency: declare state with consistent: true (+ // rut:allow(consistent))
-// cross-node: backend: .redis("redis:6379")
+// ⏳ cross-node backend is unspecified until Cache has a freshness contract.
 ```
 
 ## Routing
@@ -369,7 +369,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ```swift
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
-let buckets = Cache<IP, i64>(capacity: 100000)   // GCRA state: examples/ratelimit.rut
+// ⏳ The Cache/GCRA version lands with PRs #181/#182/#184.
 
 route {
     @rateLimit(limit: 1000, window: 1m) *

@@ -20,7 +20,7 @@ out of scope until a strict table + owner-shard atomic update exist
 (DESIGN.md §3.3.6). Therefore the runtime keeps only irreducible substrate
 (keyed state slots, LPM tries, bloom bit math, coalescing); token bucket,
 sliding window, and gauge logic are `.rut` library code
-(`examples/ratelimit.rut`). `Counter<K>` is deleted from the taxonomy;
+(`examples/ratelimit.rut`, pending PR #184). `Counter<K>` is deleted from the taxonomy;
 `@rateLimit`/`@throttle` stay, and can later re-sugar over the library.
 
 ## D2. The fixed-capacity axiom, and why the type is named `Cache`
