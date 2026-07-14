@@ -163,6 +163,13 @@ TEST(route_config, post_put_patch_are_distinct_on_art_dispatch) {
     CHECK_EQ(patch->status_code, 203u);
 }
 
+TEST(route_config, cache_capacity_matches_frontend_limit) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_cache_instance("max", 3, RouteConfig::kMaxCacheCapacity));
+    CHECK_FALSE(cfg.add_cache_instance("too_big", 7, RouteConfig::kMaxCacheCapacity + 1));
+    CHECK_FALSE(cfg.add_cache_instance("wrap", 4, 0xffffffffu));
+}
+
 TEST(route_art, first_insert_wins_on_dup_method_slot) {
     ArtTrie t;
     REQUIRE(t.insert(S("/x"), 'G', 0));

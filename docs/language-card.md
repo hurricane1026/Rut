@@ -344,7 +344,7 @@ conditions). Note: state writes run at handler entry, so this variant meters
 every request — over-limit clients push their own release time out. See
 examples/ratelimit.rut for the packed sliding-window variant.
 
-## Cache state (per-key counters/timestamps — docs/state-types.md)
+## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots

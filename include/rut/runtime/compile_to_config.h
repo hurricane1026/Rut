@@ -14,13 +14,11 @@
 //      header sets
 //   4. register_jit_routes(cfg, rir.module, engine) to select the
 //      correct dispatcher and add every route handler
-//   5. If the module declares Cache state (cfg.cache_instance_count != 0):
-//      cache_registry_publish_config(cfg) AFTER every fallible step
-//      succeeded. The cache helpers read the process-global registry, not
-//      the RouteConfig — without this step every cache.get misses and
-//      every cache.set no-ops (or worse, ops hit a previous program's
-//      instances). Publishing after all failures keeps a failed load from
-//      mutating the registry the live program is using.
+//   5. At the RouteConfig ACTIVATION boundary (not merely after compiling):
+//      cache_registry_publish_config(cfg). The cache helpers read the
+//      process-global registry, so preparing a replacement config must not
+//      publish early and perturb the still-live program. The production
+//      loader exposes activate_rut_program() for this step.
 //
 // Two supported preconditions on `cfg`:
 //
@@ -164,8 +162,8 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
 
 // Step 5 of the documented flow (file docstring): publish the config's Cache
 // instance descriptors to the process-global registry the cache helpers
-// read. Call ONLY after every fallible registration step succeeded — the
-// registry is shared with whatever program is currently live.
+// read. Call at the RouteConfig activation boundary, after every fallible
+// registration step succeeded — never while merely preparing a replacement.
 inline void cache_registry_publish_config(const RouteConfig& cfg) {
     u32 caps[RouteConfig::kMaxCacheInstances] = {};
     u64 idents[RouteConfig::kMaxCacheInstances] = {};

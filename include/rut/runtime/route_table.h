@@ -280,8 +280,9 @@ struct RouteConfig {
     // i64>(capacity: N)` declarations (docs/state-types.md). Declarative
     // only — the per-shard slot tables live in thread_local storage inside
     // the cache helpers; the loader publishes these descriptors to the
-    // process CacheRegistry after the config compiles.
+    // process CacheRegistry when the config is activated.
     static constexpr u32 kMaxCacheInstances = 8;
+    static constexpr u32 kMaxCacheCapacity = 1u << 22;
     struct CacheInstanceEntry {
         char name[32];
         u32 name_len = 0;
@@ -291,7 +292,9 @@ struct RouteConfig {
     u32 cache_instance_count = 0;
 
     bool add_cache_instance(const char* name, u32 name_len, u32 capacity) {
-        if (cache_instance_count >= kMaxCacheInstances || capacity == 0) return false;
+        if (cache_instance_count >= kMaxCacheInstances || capacity == 0 ||
+            capacity > kMaxCacheCapacity)
+            return false;
         // The stored name is the hot-reload identity (hashed by
         // cache_registry_publish_config) — reject rather than truncate, or
         // two names sharing the first 31 bytes would silently share state.
