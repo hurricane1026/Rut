@@ -574,6 +574,35 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.lhs = &fn->values[fn->values.len - 1];
         return v;
     }
+    if (expr.kind == HirExprKind::CacheGet) {
+        auto key = mir_value(*expr.lhs, module, fn, ctx);
+        if (!key) return core::make_unexpected(key.error());
+        if (!fn->values.push(key.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::CacheGet;
+        v.type = MirTypeKind::I64;
+        v.may_nil = true;
+        v.cache_index = expr.cache_index;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::CacheSet) {
+        auto key = mir_value(*expr.lhs, module, fn, ctx);
+        if (!key) return core::make_unexpected(key.error());
+        auto value = mir_value(*expr.rhs, module, fn, ctx);
+        if (!value) return core::make_unexpected(value.error());
+        if (!fn->values.push(key.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        MirValue* key_ptr = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(value.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::CacheSet;
+        v.type = MirTypeKind::I64;
+        v.cache_index = expr.cache_index;
+        v.lhs = key_ptr;
+        v.rhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::IfElse) {
         auto cond = mir_value(*expr.lhs, module, fn, ctx);
         if (!cond) return core::make_unexpected(cond.error());
@@ -775,6 +804,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         }
         if (!mir->type_shapes.push(shape)) return frontend_error(FrontendError::TooManyItems, {});
     }
+    for (u32 i = 0; i < module.caches.len; i++) {
+        MirCacheInstance ci{};
+        ci.span = module.caches[i].span;
+        ci.name = module.caches[i].name;
+        ci.capacity = module.caches[i].capacity;
+        if (!mir->caches.push(ci)) return frontend_error(FrontendError::TooManyItems, {});
+    }
     for (u32 i = 0; i < module.upstreams.len; i++) {
         MirUpstream up{};
         up.span = module.upstreams[i].span;
@@ -965,7 +1001,13 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // materialize_local_init would resolve it to ValueId{0} since
             // the slot is still being initialized, turning any future
             // substitution regression into a silent miscompile.
-            if (module.routes[i].locals[li].name.len == 0) continue;
+            //
+            // EXCEPT the bare-cache-set statement's carrier: it is also
+            // name-cleared (unnameable by design) but its init is the side
+            // effect itself — dropping it would silently delete the write.
+            if (module.routes[i].locals[li].name.len == 0 &&
+                module.routes[i].locals[li].init.kind != HirExprKind::CacheSet)
+                continue;
             if (module.routes[i].locals[li].is_wait_result) continue;
             MirLocal local{};
             local.span = module.routes[i].locals[li].span;

@@ -84,6 +84,14 @@ bool load_rut_program(const char* path,
                       LoadError& err,
                       jit::OptLevel opt = jit::OptLevel::O2);
 
+// Publish the program's Cache descriptors as part of installing its
+// RouteConfig. Compilation alone never mutates the live Cache registry;
+// callers must invoke this at the config activation boundary. The current
+// server calls it before spawning shards. A future live-reload owner must
+// pair it with the RouteConfig swap and retain the old program until its RCU
+// grace period ends.
+void activate_rut_program(const LoadedProgram& program);
+
 // Render a one-line, human-readable description of a load failure into
 // `buf` (NUL-terminated, no allocation). Returns bytes written
 // excluding the terminator.

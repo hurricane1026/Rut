@@ -1760,6 +1760,430 @@ TEST(frontend, analyze_rejects_oversized_error_code) {
     CHECK(hir.error().detail.len != 0);
 }
 
+TEST(frontend, cache_decl_and_ops_analyze_and_lower) {
+    // Happy path: declaration registered (surviving the heap pipeline —
+    // HirModule's hand-written ctors must copy `caches`), get/set analyze
+    // with the right types, .or(0) adopts i64, whole program lowers.
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 1024)
+
+route GET "/x" {
+    let prev = buckets.get(req.remoteAddr).or(0)
+    buckets.set(req.remoteAddr, prev + 1)
+    if prev + 1 > 2 { return 429 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->caches.len, 1u);
+    CHECK(hir->caches[0].name.eq(lit("buckets")));
+    CHECK_EQ(hir->caches[0].capacity, 1024u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->caches.len, 1u);
+    CHECK_EQ(mir->caches[0].capacity, 1024u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    CHECK_EQ(rir.module.cache_instance_count, 1u);
+    CHECK_EQ(rir.module.cache_instances[0].capacity, 1024u);
+    rir.destroy();
+}
+
+TEST(frontend, cache_get_feeds_guard_let_and_nil_test) {
+    const auto src = R"rut(
+let seen = Cache<IP, i64>(capacity: 64)
+
+route GET "/a" {
+    guard let n = seen.get(req.remoteAddr) else { return 404 }
+    if n > 0 { return 200 } else { return 204 }
+}
+route GET "/b" {
+    let n = seen.get(req.remoteAddr)
+    if n == nil { return 404 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, cache_decl_validation_errors) {
+    const char* cases[] = {
+        "let b = Cache<str, i64>(capacity: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i32>(capacity: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP>(capacity: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>()\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(capacity: 0)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(capacity: 8388608)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(size: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let x = 1\nroute GET \"/x\" { return 200 }\n",
+        ("let b = Cache<IP, i64>(capacity: 64)\nlet b = Cache<IP, i64>(capacity: 64)\n"
+         "route GET \"/x\" { return 200 }\n"),
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.len != 0);
+    }
+}
+
+TEST(frontend, cache_op_gates_and_shadowing) {
+    // Wrong key type.
+    const char* bad_key =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let n = b.get(1).or(0) if n > 0 { return 200 } else { return 204 } "
+        "}\n";
+    auto lexed = lex(lit(bad_key));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Runtime i32 value needs i64(x).
+    const char* bad_val =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let v = 1 b.set(req.remoteAddr, v) return 200 }\n";
+    lexed = lex(lit(bad_val));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Unknown method.
+    const char* bad_method =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { b.incr(req.remoteAddr) return 200 }\n";
+    lexed = lex(lit(bad_method));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // (`delete` is the HTTP-method keyword, so `b.delete(...)` is a parse
+    // error rather than an analyze rejection — `incr` covers the
+    // unknown-method analyze path above.)
+    // A local named like the instance shadows it — `.get` then resolves as
+    // an unknown method on i32 and is rejected.
+    const char* shadowed =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let b = 1 let n = b.get(req.remoteAddr).or(0) if n > 0 { return "
+        "200 } else { return 204 } }\n";
+    lexed = lex(lit(shadowed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_statement_rules) {
+    // Accepted in the leading let-region (covered by the happy-path test);
+    // rejected after a guard (state writes run at handler entry).
+    const char* after_guard =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { guard req.http11 else { return 505 } b.set(req.remoteAddr, 1) "
+        "return 200 }\n";
+    auto lexed = lex(lit(after_guard));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // A bare get (no side effect) is not a statement.
+    const char* bare_get =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { b.get(req.remoteAddr) return 200 }\n";
+    lexed = lex(lit(bare_get));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A bare non-cache method call is not a statement either.
+    const char* bare_other = "route GET \"/x\" { req.header(\"Host\") return 200 }\n";
+    lexed = lex(lit(bare_other));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_set_is_statement_only_no_expression_escape) {
+    // `let _ = b.set(...)` after a guard would materialize at handler entry
+    // and write on rejected requests — set is not an expression anywhere.
+    const char* let_escape =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { guard req.http11 else { return 505 } "
+        "let w = b.set(req.remoteAddr, 1) if w == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(let_escape));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // .or() lowers its fallback eagerly — a set inside would run on hits too.
+    const char* or_escape =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let n = b.get(req.remoteAddr).or(b.set(req.remoteAddr, 1)) "
+        "if n > 0 { return 200 } else { return 204 } }\n";
+    lexed = lex(lit(or_escape));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Even in the leading statement region a let-bound set is rejected.
+    const char* leading_let =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let w = b.set(req.remoteAddr, 1) return 200 }\n";
+    lexed = lex(lit(leading_let));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_ops_rejected_in_wait_routes) {
+    // Wait routes re-materialize locals on resume — a pre-wait get would
+    // read post-wait state, and a pre-wait bare set would write after the
+    // wait. Both rejected while the route contains any wait.
+    const char* get_before_wait =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let p = b.get(req.remoteAddr).or(0) wait(1000) "
+        "if p > 0 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(get_before_wait));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* set_before_wait =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, 1) wait(1000) return 200 }\n";
+    lexed = lex(lit(set_before_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A helper body is analyzed against a scratch route (flag off) and
+    // inlined as an already-built CacheGet tree — the post-analysis scan
+    // must still reject it in a wait route.
+    const char* via_helper =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func peek(_ k: IP) => b.get(k).or(0)\n"
+        "route GET \"/x\" { let p = peek(req.remoteAddr) wait(1000) "
+        "if p > 0 { return 200 } else { return 204 } }\n";
+    lexed = lex(lit(via_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // wait any populates route.waits like a plain wait — also rejected.
+    const char* wait_any =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let p = b.get(req.remoteAddr).or(0) "
+        "wait any { timer(1000) => { return 200 } } }\n";
+    lexed = lex(lit(wait_any));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_rejected_on_pre_guarded_routes) {
+    // A chain `before` step has already appended its guard to route.guards
+    // before the body statements are analyzed — a leading bare set would
+    // still write on requests the chain rejects.
+    const char* chained =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func check(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 0 }\n"
+        "chain auth { before check(req) }\n"
+        "route {\n"
+        " use chain auth\n"
+        " GET \"/x\" { b.set(req.remoteAddr, 1) return 200 }\n"
+        "}\n";
+    auto lexed = lex(lit(chained));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // (@rateLimit/@throttle routes are NOT treated as guarded — the runtime
+    // enforces them outside the handler; see
+    // cache_bare_set_allowed_on_ratelimit_throttle_routes.)
+}
+
+TEST(frontend, cache_bare_set_rejected_after_fallible_local) {
+    // Locals materialize before the automatic error prelude — a set after a
+    // fallible binding would also run on the error path.
+    const char* fallible_then_set =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let x = any(1, error(500)) "
+        "b.set(req.remoteAddr, 1) guard let v = x else { return 400 } "
+        "if v == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(fallible_then_set));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, cache_decl_name_collisions_rejected) {
+    // Collides with a function declared later in the file.
+    const char* vs_func =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func buckets(_ a: i32) -> i32 => a\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(vs_func));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Collides with a builtin receiver — the cache would be unreachable
+    // (bitwise namespace resolution runs before cache lookup).
+    const char* vs_bitwise =
+        "let bitwise = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    lexed = lex(lit(vs_bitwise));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    const char* vs_req =
+        "let req = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    lexed = lex(lit(vs_req));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_rejected_after_helper_appended_guards) {
+    // Respond-capable helpers are chain-step-only today: a direct call from
+    // a route body is rejected at the helper's guard, so a mid-statement
+    // guard append cannot currently reach the bare-set gate from the
+    // surface. The gate still consults route.guards LIVE (and re-checks
+    // after analyzing the set's own arguments) so enabling direct
+    // respond-capable calls later cannot turn this into a write-before-
+    // guard bypass. Both spellings must stay rejected either way.
+    const char* helper_before =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func require(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 1 }\n"
+        "route GET \"/x\" { let code = require(req) b.set(req.remoteAddr, 1) "
+        "if code == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(helper_before));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Same helper inside the set's own arguments.
+    const char* helper_inside =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func require(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 1 }\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, i64(require(req))) return 200 }\n";
+    lexed = lex(lit(helper_inside));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_allowed_on_ratelimit_throttle_routes) {
+    // @rateLimit is enforced by the runtime BEFORE the handler runs (a
+    // limited request never executes the write) and @throttle shapes the
+    // response — neither guards inside the handler, so cache-backed
+    // handlers compose with both.
+    const char* rate_limited =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "@rateLimit(limit: 2, window: 1m)\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, 1) return 200 }\n";
+    auto lexed = lex(lit(rate_limited));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, cache_decl_rejects_overlong_name) {
+    // The runtime descriptor truncates names at 31 bytes and the reload
+    // identity hashes the stored name — overlong names are rejected.
+    const char* overlong =
+        "let abcdefghijklmnopqrstuvwxyz123456 = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(overlong));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, cache_decl_rejects_qualified_constructor) {
+    // A qualified spelling must not silently discard the qualifier and
+    // create live state.
+    const char* qualified =
+        "let b = foo.Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(qualified));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {
     const char* src = "route GET \"/x\" { wait(timer(4294967296)) return 200 }\n";
     auto lexed = lex(lit(src));

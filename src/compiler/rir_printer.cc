@@ -286,8 +286,11 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BytesHex:
             buf.put_cstr("bytes.hex");
             break;
-        case Opcode::CounterIncr:
-            buf.put_cstr("counter.incr");
+        case Opcode::CacheGet:
+            buf.put_cstr("cache.get");
+            break;
+        case Opcode::CacheSet:
+            buf.put_cstr("cache.set");
             break;
         case Opcode::StructField:
             buf.put_cstr("struct.field");
@@ -663,12 +666,16 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_type(buf, inst.imm.struct_ref.type);
             break;
-        case Opcode::CounterIncr:
+        case Opcode::CacheGet:
+        case Opcode::CacheSet:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
-            buf.put_cstr(", ");
-            buf.put_i64(inst.imm.i64_val);
-            buf.put('s');
+            if (inst.op == Opcode::CacheSet) {
+                buf.put_cstr(", ");
+                print_value_ref(buf, inst.operands[1]);
+            }
+            buf.put_cstr(", inst=");
+            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             break;
         case Opcode::HashHmacSha256:
             buf.put(' ');

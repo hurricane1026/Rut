@@ -14,6 +14,11 @@
 //      header sets
 //   4. register_jit_routes(cfg, rir.module, engine) to select the
 //      correct dispatcher and add every route handler
+//   5. At the RouteConfig ACTIVATION boundary (not merely after compiling):
+//      cache_registry_publish_config(cfg). The cache helpers read the
+//      process-global registry, so preparing a replacement config must not
+//      publish early and perturb the still-live program. The production
+//      loader exposes activate_rut_program() for this step.
 //
 // Two supported preconditions on `cfg`:
 //
@@ -47,6 +52,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/route_table.h"
 
 namespace rut {
@@ -56,6 +62,9 @@ namespace rut {
 // RouteConfig::add_timer would still reject the overflow at load time.
 static_assert(HirModule::kMaxTimers <= RouteConfig::kMaxTimers,
               "frontend timer cap must not exceed the runtime timer table");
+// Same containment rule for Cache instance declarations.
+static_assert(HirModule::kMaxCaches <= RouteConfig::kMaxCacheInstances,
+              "frontend cache cap must not exceed the runtime cache table");
 
 inline bool rir_function_needs_req_body(const rir::Function& fn) {
     if (fn.blocks == nullptr) return false;
@@ -149,6 +158,24 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
     }
 
     return true;
+}
+
+// Step 5 of the documented flow (file docstring): publish the config's Cache
+// instance descriptors to the process-global registry the cache helpers
+// read. Call at the RouteConfig activation boundary, after every fallible
+// registration step succeeded — never while merely preparing a replacement.
+inline void cache_registry_publish_config(const RouteConfig& cfg) {
+    u32 caps[RouteConfig::kMaxCacheInstances] = {};
+    u64 idents[RouteConfig::kMaxCacheInstances] = {};
+    const u32 n = cfg.cache_instance_count < RouteConfig::kMaxCacheInstances
+                      ? cfg.cache_instance_count
+                      : RouteConfig::kMaxCacheInstances;
+    for (u32 i = 0; i < n; i++) {
+        caps[i] = cfg.cache_instances[i].capacity;
+        idents[i] =
+            cache_instance_identity(cfg.cache_instances[i].name, cfg.cache_instances[i].name_len);
+    }
+    cache_registry_publish(caps, idents, n);
 }
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
@@ -305,6 +332,17 @@ inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {
         u16 idx = cfg.add_response_header_set(keys, key_lens, vals, val_lens, ref.count);
         if (idx == 0) return false;
         if (idx != i + 1) return false;
+    }
+
+    // Cache instance descriptors — declaration order defines the instance
+    // index compiled into CacheGet/CacheSet, so the copy must be exact and
+    // the target table empty.
+    if (cfg.cache_instance_count != 0) return false;
+    if (mod.cache_instance_count > RouteConfig::kMaxCacheInstances) return false;
+    for (u32 i = 0; i < mod.cache_instance_count; i++) {
+        const auto& ci = mod.cache_instances[i];
+        if (ci.name.len > 0 && ci.name.ptr == nullptr) return false;
+        if (!cfg.add_cache_instance(ci.name.ptr, ci.name.len, ci.capacity)) return false;
     }
     return true;
 }

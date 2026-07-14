@@ -95,6 +95,8 @@ struct Ctx {
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
+    LLVMValueRef fn_cache_get;
+    LLVMValueRef fn_cache_set;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
 
@@ -349,6 +351,26 @@ struct Ctx {
             fn_req_remote_addr = LLVMAddFunction(llvm_mod, "rut_helper_req_remote_addr", ft);
         }
         return fn_req_remote_addr;
+    }
+
+    // void rut_helper_cache_get(i32, i32, ptr, ptr)
+    LLVMValueRef get_cache_get() {
+        if (!fn_cache_get) {
+            LLVMTypeRef params[] = {i32_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get", ft);
+        }
+        return fn_cache_get;
+    }
+
+    // void rut_helper_cache_set(i32, i32, i64)
+    LLVMValueRef get_cache_set() {
+        if (!fn_cache_set) {
+            LLVMTypeRef params[] = {i32_ty, i32_ty, i64_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
+            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
+        }
+        return fn_cache_set;
     }
 
     // u64 rut_helper_req_content_length(ptr, i32)
@@ -1186,6 +1208,47 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        // ── Cache state ──
+        case rir::Opcode::CacheGet: {
+            LLVMValueRef instance =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "cache.has");
+            LLVMValueRef out_val = LLVMBuildAlloca(c.builder, c.i64_ty, "cache.val");
+            LLVMValueRef args[] = {instance, key, out_has, out_val};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_cache_get()),
+                           c.get_cache_get(),
+                           args,
+                           4,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cache.h");
+            LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i64_ty, out_val, "cache.v");
+            // Optional(i64) uses map_type's generic {i8, payload} layout.
+            LLVMTypeRef opt_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            LLVMValueRef opt = LLVMGetUndef(opt_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "cache.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, v, 1, "cache.opt.val");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::CacheSet: {
+            LLVMValueRef instance =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef val = c.get_value(inst.operands[1]);
+            LLVMValueRef args[] = {instance, key, val};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_cache_set()),
+                           c.get_cache_set(),
+                           args,
+                           3,
+                           "");
+            // The instruction's value echoes the stored i64.
+            c.set_value(inst.result, val);
+            break;
+        }
+
         // ── Comparisons ──
         case rir::Opcode::CmpEq:
         case rir::Opcode::CmpNe:
@@ -1744,6 +1807,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
+    c.fn_cache_get = nullptr;
+    c.fn_cache_set = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
     c.fn_str_has_prefix = nullptr;
