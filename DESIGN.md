@@ -266,7 +266,11 @@ The two integer widths never mix implicitly:
   legal. `match` on an i64 subject and `bitwise.*` over i64 are rejected for
   now.
 
-Duration/ByteSize arithmetic (§3.3) is a separate, later surface.
+`time.nowMicros()` (⏳ pending PR #183) returns monotonic microseconds as i64,
+latched per handler invocation: every use in one request observes the same
+value. `max(a, b)` / `min(a, b)` in that slice are same-width integer builtins
+with single evaluation. Duration/ByteSize arithmetic (§3.3) is a separate,
+later surface.
 
 Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
 force-unwrap. Use named fallback and explicit binding instead:
@@ -2634,7 +2638,6 @@ All are regular `.rut` files — users can read, modify, or replace them. No mag
 
 ```
 stdlib/
-├── ratelimit.rut      // rateLimit, rateLimitByKey
 ├── auth.rut           // basicAuth, jwtAuth, apiKeyAuth
 ├── security.rut       // cors, securityHeaders, ipAllow, waf
 ├── request.rut        // requestId, maxBody

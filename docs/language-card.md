@@ -240,7 +240,7 @@ let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ 
 let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
-notify(key) blacklist.add(key)    // to owner shard by key hash (expr form;
+notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
                                   // bare-statement cache.set does not nest)
 // single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
 // remains lossy and separate get/set operations are not an atomic update.
