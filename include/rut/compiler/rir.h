@@ -212,7 +212,7 @@ enum class Opcode : u8 {
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes
     BytesHex,        // %r = bytes.hex %b            → str
 
-    // ── Cache state (per-shard lossy slot tables; docs/state-types.md) ──
+    // ── Cache state (per-shard lossy slot tables; DESIGN.md §3.3.6) ──
     CacheGet,  // %r = cache.get %key, inst=N        → Optional(i64)  (imm.i32_val = instance)
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 

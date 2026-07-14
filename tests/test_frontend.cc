@@ -2016,7 +2016,7 @@ TEST(frontend, analyze_bitwise_i64_folds_and_adopts_literals) {
     // Same-width rule over {i32, i64}: bare literals adopt the i64 side
     // (incl. flip's synthesized -1); folds run at 64-bit width. The packed
     // sliding-window shape (window_index << 32 | counts) is the motivating
-    // use (docs/state-types.md §4.2).
+    // use (DESIGN.md §3.3.6).
     const char* src =
         "route GET \"/x\" { let a = bitwise.and(i64(6), 3) let s = "
         "bitwise.shiftLeft(i64(1), 40) let f = bitwise.flip(i64(0)) let p = "

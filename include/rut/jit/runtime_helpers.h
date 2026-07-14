@@ -160,7 +160,7 @@ void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 
-// ── Cache state (docs/state-types.md) ──
+// ── Cache state (DESIGN.md §3.3.6) ──
 // Per-shard lossy slot tables; `instance` indexes the process CacheRegistry
 // published by the loader. get: *out_has = 1 and *out_val on hit, *out_has =
 // 0 on miss (never-seen and evicted are indistinguishable by design). set

@@ -1,4 +1,4 @@
-// Rate limiting written in Rut — the blessed patterns (docs/state-types.md).
+// Rate limiting written in Rut — the blessed patterns (DESIGN.md §3.3.6).
 //
 // These are ordinary language constructs, not built-ins: per-key state lives
 // in a Cache slot, the algorithm is inline arithmetic. The compiler inlines

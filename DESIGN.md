@@ -264,7 +264,7 @@ The two integer widths never mix implicitly:
   subject is rejected for now. `bitwise.*` follows the same same-width rule
   as arithmetic (shift amounts share the operand width and saturate out of
   range) — the substrate for packing multi-field algorithm state into one
-  i64 slot (docs/state-types.md §4.2).
+  i64 slot (§3.3.6).
 
 `time.nowMicros()` returns monotonic microseconds as i64, latched per
 handler invocation (all uses within one request observe the same value —
@@ -623,7 +623,7 @@ All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
 **Cache\<K, i64>** — lossy per-key state slots (implemented; the substrate for
-rate-limit algorithms written in Rut, see docs/state-types.md §4).
+rate-limit algorithms written in Rut, see `examples/ratelimit.rut`).
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)

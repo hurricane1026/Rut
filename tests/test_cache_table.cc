@@ -1,5 +1,5 @@
 // Tests for runtime/cache_table.h: the Cache<K, i64> per-shard slot table
-// (docs/state-types.md) — 4-way set-associative, min-value victim,
+// (DESIGN.md §3.3.6) — 4-way set-associative, min-value victim,
 // seeded mix, mmap'd fixed capacity.
 #include "rut/runtime/cache_table.h"
 #include "test.h"
