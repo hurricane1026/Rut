@@ -25,7 +25,7 @@ tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
-let buckets = Cache<IP, i64>(capacity: 100000)     // ⏳ state (PR #181)
+let buckets = Cache<IP, i64>(capacity: 100000)     // implemented lossy state
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
@@ -62,14 +62,16 @@ i64(x)                                  // widen i32 → i64 (the ONLY conversio
                                         // don't fit i32 are i64 automatically; no user i64
                                         // annotations; Cache<K,i64> is fixed built-in grammar;
                                         // typed route captures such as :id(i64) are ⏳;
-                                        // no narrowing or match on i64)
+                                        // no narrowing or match on i64; bitwise.* works at
+                                        // both widths)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
 @                                       // decorator
 
-// Bitwise = named functions, never symbols (all i32; shift amounts
-// outside 0..31 saturate: shiftLeft → 0, shiftRight → sign fill)
+// Bitwise = named functions, never symbols (i32/i64 same-width, bare
+// literals adopt the i64 side; shift amounts share the operand width and
+// saturate out of range: shiftLeft → 0, shiftRight → sign fill)
 bitwise.and(a, b)  bitwise.or(a, b)  bitwise.xor(a, b)
 bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 ```
@@ -220,12 +222,12 @@ return resp
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let buckets = Cache<IP, i64>(capacity: 100000)   // ⏳ pending PR #181 — lossy per-key slots
+let buckets = Cache<IP, i64>(capacity: 100000)   // implemented — lossy per-key slots
 let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
 buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait/for;
                                                  // may evict a colliding neighbor
 // Never store anything whose absence yields a wrong answer (sessions,
-// in-flight counts). Rate limiting over Cache is pending PRs #181/#182/#184;
+// in-flight counts). Rate limiting over Cache is pending PRs #183/#184;
 // Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
 // Cache ops are rejected in routes containing wait (timer/event suspension);
 // the current lowering also requires set before guard/for because writes are
@@ -325,6 +327,29 @@ init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
 
+## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
+
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots
+
+route GET "/api" {
+    let prev = buckets.get(req.remoteAddr).or(0) // i64? — a MISS IS NORMAL
+    buckets.set(req.remoteAddr, prev + 1)        // bare set: before guards/for;
+                                                 // ALL cache ops reject wait routes
+    if prev + 1 > 100 { return 429 } else { return 200 }
+}
+```
+
+- `get -> i64?`: nil means never-seen OR evicted — the two are indistinguishable
+  by design; `.or(default)` / `guard let` are the only ways to consume it.
+- Entries may be evicted by colliding writes at any occupancy: never store
+  anything whose absence gives a wrong answer. Capacity = slot count (rounded
+  up to a power of two); provision ~2× your expected key count.
+- State writes run at handler entry, so a bare `set` after a guard/for is a
+  compile error. Routes containing `wait`/`wait any` reject every cache op,
+  including ops textually before the wait. Per-shard state: effective limits
+  ≈ limit × shard count.
+
 ## Built-ins (call them, never reimplement)
 
 ```
@@ -368,7 +393,8 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ```swift
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
-// ⏳ The Cache/GCRA version lands with PRs #181/#182/#184.
+// ⏳ Cache and i64 bitwise are implemented; the complete GCRA example needs
+// PRs #183/#184.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
 // is no shipped top-level catch-all syntax yet. Configure the surrounding
 // listener/proxy to return 404 for traffic outside these declared routes.

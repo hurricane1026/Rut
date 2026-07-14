@@ -189,12 +189,12 @@ enum class Opcode : u8 {
     CmpLe,  // %r = cmp.le %a, %b  → bool
     CmpGe,  // %r = cmp.ge %a, %b  → bool
 
-    // ── Bitwise (the `bitwise` builtin namespace) ──
-    BitAnd,  // %r = bit.and %a, %b  → i32
-    BitOr,   // %r = bit.or  %a, %b  → i32
-    BitXor,  // %r = bit.xor %a, %b  → i32
-    BitShl,  // %r = bit.shl %a, %n  → i32 (n outside 0..31 saturates to 0)
-    BitShr,  // %r = bit.shr %a, %n  → i32 (arithmetic; n outside 0..31 → sign fill)
+    // ── Bitwise (the `bitwise` builtin namespace; i32 or i64, same-width) ──
+    BitAnd,  // %r = bit.and %a, %b  → operand width
+    BitOr,   // %r = bit.or  %a, %b  → operand width
+    BitXor,  // %r = bit.xor %a, %b  → operand width
+    BitShl,  // %r = bit.shl %a, %n  → operand width (n outside 0..width-1 saturates to 0)
+    BitShr,  // %r = bit.shr %a, %n  → operand width (arithmetic; out-of-range → sign fill)
 
     // ── Arithmetic (i32; overflow wraps two's-complement) ──
     Add,      // %r = arith.add %a, %b → i32
@@ -212,8 +212,9 @@ enum class Opcode : u8 {
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes
     BytesHex,        // %r = bytes.hex %b            → str
 
-    // ── Counter ──
-    CounterIncr,  // %r = counter.incr %key, window → i32
+    // ── Cache state (per-shard lossy slots; docs/language-card.md, Cache section) ──
+    CacheGet,  // %r = cache.get %key, inst=N        → Optional(i64)  (imm.i32_val = instance)
+    CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
     // ── Struct operations ──
     StructField,   // %r = struct.field %s, "name"  → T
@@ -482,6 +483,17 @@ struct Module {
     static constexpr u32 kMaxUpstreams = 32;
     Upstream upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
+
+    // Cache<K, i64> instance descriptors (top-level `let x = Cache<IP,
+    // i64>(capacity: N)`); the compile→config helper copies these into
+    // RouteConfig::cache_instances.
+    static constexpr u32 kMaxCacheInstances = 8;
+    struct CacheInstance {
+        Str name;
+        u32 capacity = 0;
+    };
+    CacheInstance cache_instances[kMaxCacheInstances];
+    u32 cache_instance_count = 0;
 
     // Arena that owns all IR memory (mmap-backed, compiler use).
     MmapArena* arena;

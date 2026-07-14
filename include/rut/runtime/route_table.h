@@ -276,6 +276,53 @@ struct RouteConfig {
         return true;
     }
 
+    // Cache<K, i64> instance descriptors from top-level `let x = Cache<IP,
+    // i64>(capacity: N)` declarations (docs/language-card.md, Cache section). Declarative
+    // only — the per-shard slot tables live in thread_local storage inside
+    // the cache helpers; the loader publishes these descriptors to the
+    // process CacheRegistry when the config is activated.
+    static constexpr u32 kMaxCacheInstances = 8;
+    static constexpr u32 kMaxCacheCapacity = 1u << 22;
+    struct CacheInstanceEntry {
+        char name[32];
+        u32 name_len = 0;
+        u32 capacity = 0;
+    };
+    CacheInstanceEntry cache_instances[kMaxCacheInstances];
+    u32 cache_instance_count = 0;
+
+    bool add_cache_instance(const char* name, u32 name_len, u32 capacity) {
+        if (cache_instance_count >= kMaxCacheInstances || capacity == 0 ||
+            capacity > kMaxCacheCapacity)
+            return false;
+        // The stored name is the hot-reload identity (hashed by
+        // cache_registry_publish_config) — reject rather than truncate, or
+        // two names sharing the first 31 bytes would silently share state.
+        // The frontend enforces the same bound; this guards direct callers.
+        if (name_len >= sizeof(CacheInstanceEntry{}.name)) return false;
+        for (u32 i = 0; i < cache_instance_count; i++) {
+            const CacheInstanceEntry& e = cache_instances[i];
+            if (e.name_len == name_len) {
+                bool same = true;
+                for (u32 c = 0; c < name_len; c++) {
+                    if (e.name[c] != name[c]) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) return false;  // duplicate name
+            }
+        }
+        CacheInstanceEntry& e = cache_instances[cache_instance_count];
+        const u32 kN = name_len < sizeof(e.name) - 1 ? name_len : sizeof(e.name) - 1;
+        for (u32 i = 0; i < kN; i++) e.name[i] = name[i];
+        e.name[kN] = '\0';
+        e.name_len = kN;
+        e.capacity = capacity;
+        cache_instance_count++;
+        return true;
+    }
+
     // Firewall rules support source IPv4 exact, CIDR, inclusive range, and
     // source-port checks. IP values are packed host-order u32:
     //   ip = (a << 24) | (b << 16) | (c << 8) | d  for a.b.c.d

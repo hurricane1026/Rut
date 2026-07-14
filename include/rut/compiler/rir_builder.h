@@ -71,6 +71,7 @@ struct Builder {
         cur_func = nullptr;
         cur_block_id = kNoBlock;
         cur_block = nullptr;
+        opt_i64_cache = nullptr;
         for (u32 i = 0; i < kTypeKindCount; i++) type_cache[i] = nullptr;
     }
 
@@ -700,9 +701,12 @@ struct Builder {
     Result<ValueId> emit_bit(Opcode bit_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
         if (!is_bit_opcode(bit_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
-        if (!val_has_type(lhs, TypeKind::I32) || !val_has_type(rhs, TypeKind::I32))
-            return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
+        // Same-width integer operands only: both i32 or both i64 (shift
+        // amounts share the operand width).
+        const bool both_i32 = val_has_type(lhs, TypeKind::I32) && val_has_type(rhs, TypeKind::I32);
+        const bool both_i64 = val_has_type(lhs, TypeKind::I64) && val_has_type(rhs, TypeKind::I64);
+        if (!both_i32 && !both_i64) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
         auto [inst, vid] = TRY(emit(bit_op, ty, loc));
         inst->operands[0] = lhs;
         inst->operands[1] = rhs;
@@ -895,15 +899,38 @@ struct Builder {
         return vid;
     }
 
-    // ── Counter ─────────────────────────────────────────────────────
+    // ── Cache state ─────────────────────────────────────────────────
 
-    Result<ValueId> emit_counter_incr(ValueId key, i64 window_seconds, SourceLoc loc = {}) {
-        if (!valid_val(key)) return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
-        auto [inst, vid] = TRY(emit(Opcode::CounterIncr, ty, loc));
+    // One canonical Optional<I64> for every cache.get result: LLVM literal
+    // structs are structurally uniqued so fresh types WOULD map to one LLVM
+    // type, but a single rir::Type* keeps identity-based comparisons (and
+    // the codegen type cache) trivially correct as well.
+    const Type* opt_i64_cache = nullptr;
+
+    Result<ValueId> emit_cache_get(u32 instance, ValueId key, SourceLoc loc = {}) {
+        if (!valid_val(key) || !val_has_type(key, TypeKind::IP)) return err(RirError::InvalidState);
+        if (opt_i64_cache == nullptr) {
+            auto* inner = TRY(make_type(TypeKind::I64));
+            opt_i64_cache = TRY(make_type(TypeKind::Optional, inner));
+        }
+        auto* ty = opt_i64_cache;
+        auto [inst, vid] = TRY(emit(Opcode::CacheGet, ty, loc));
         inst->operands[0] = key;
         inst->operand_count = 1;
-        inst->imm.i64_val = window_seconds;
+        inst->imm.i32_val = static_cast<i32>(instance);
+        return vid;
+    }
+
+    Result<ValueId> emit_cache_set(u32 instance, ValueId key, ValueId value, SourceLoc loc = {}) {
+        if (!valid_val(key) || !val_has_type(key, TypeKind::IP) || !valid_val(value) ||
+            !val_has_type(value, TypeKind::I64))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I64));
+        auto [inst, vid] = TRY(emit(Opcode::CacheSet, ty, loc));
+        inst->operands[0] = key;
+        inst->operands[1] = value;
+        inst->operand_count = 2;
+        inst->imm.i32_val = static_cast<i32>(instance);
         return vid;
     }
 

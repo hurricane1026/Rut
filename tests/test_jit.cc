@@ -9,6 +9,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -748,6 +749,54 @@ route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return
     rir.destroy();
 }
 
+TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
+    // The packed sliding-window shape end-to-end at runtime: pack a window
+    // index and a count into one i64, unpack both, and check 64-bit shift
+    // saturation with a runtime amount.
+    const char* src =
+        "route GET \"/users\" { let a = 7 let win = i64(a) let cnt = i64(9) "
+        "let packed = bitwise.or(bitwise.shiftLeft(win, 32), cnt) "
+        "let win2 = bitwise.shiftRight(packed, 32) "
+        "let cnt2 = bitwise.and(packed, 4294967295) "
+        "let big = i64(70) "
+        "if win2 == win && cnt2 == cnt && bitwise.shiftLeft(win, big) == i64(0) "
+        "{ return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_time_minmax_gcra_shape_executes) {
     // The full GCRA expression shape at runtime: latched now, i64
     // arithmetic, max() over (stored tat, now). Pins the per-invocation
@@ -1079,6 +1128,164 @@ TEST(jit, frontend_req_remote_addr_read) {
 
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, frontend_cache_counter_pattern_executes) {
+    // The first real algorithm-in-Rut: a per-IP request counter. Three
+    // invocations of the same handler → 200, 200, 429; a different IP
+    // starts its own count. Exercises CacheGet miss → .or(0), literal
+    // adoption in prev + 1, the bare CacheSet statement, and the
+    // thread_local table publish/rebuild path.
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 1024)
+
+route GET "/users" {
+    let prev = buckets.get(req.remoteAddr).or(0)
+    buckets.set(req.remoteAddr, prev + 1)
+    if prev + 1 > 2 { return 429 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // Publish the instance descriptors (the loader's job in production) with
+    // a deterministic seed and a distinct capacity so this test's tables
+    // rebuild fresh even if another test touched the registry.
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {1024};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0A00002A;  // 10.0.0.42
+
+    auto call = [&]() {
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(kGetApiRequest),
+                                             sizeof(kGetApiRequest) - 1,
+                                             nullptr));
+    };
+    auto r1 = call();
+    CHECK(r1.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r1.status_code, 200);
+    // Probe the table directly: call 1 must have stored count 1.
+    u8 probe_has = 0;
+    i64 probe_val = 0;
+    rut_helper_cache_get(0, 0x0A00002A, &probe_has, &probe_val);
+    CHECK_EQ(probe_has, 1);
+    CHECK_EQ(probe_val, 1);
+    auto r2 = call();
+    CHECK_EQ(r2.status_code, 200);
+    auto r3 = call();
+    CHECK_EQ(r3.status_code, 429);
+
+    // A different IP has independent state.
+    conn.peer_addr = 0x0A000001;
+    auto other = call();
+    CHECK_EQ(other.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, cache_helpers_miss_and_out_of_range) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {64};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+
+    u8 has = 0xff;
+    i64 val = -1;
+    rut_helper_cache_get(0, 0x7F000001u, &has, &val);
+    CHECK_EQ(has, 0);
+    CHECK_EQ(val, 0);
+
+    rut_helper_cache_set(0, 0x7F000001u, 77);
+    rut_helper_cache_get(0, 0x7F000001u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 77);
+
+    // Out-of-range instance: get misses, set is a no-op.
+    rut_helper_cache_get(7, 0x7F000001u, &has, &val);
+    CHECK_EQ(has, 0);
+    rut_helper_cache_set(7, 0x7F000001u, 1);
+}
+
+TEST(jit, cache_get_optionals_from_two_instances_merge_and_verify) {
+    // Two cache instances' Optional<I64> results flowing through nested .or
+    // fallbacks must produce ONE LLVM carrier type — pins the canonical
+    // Optional<I64> in emit_cache_get (and that LLVM literal-struct
+    // uniquing keeps the select well-typed under JIT verification).
+    const char* src =
+        "let a = Cache<IP, i64>(capacity: 64)\n"
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { "
+        "let n = a.get(req.remoteAddr).or(b.get(req.remoteAddr).or(0)) "
+        "if n > 0 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));  // JIT verification passes
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, cache_registry_identity_governs_persistence_across_publish) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {64};
+    const u64 ident_a[1] = {cache_instance_identity("alpha", 5)};
+    const u64 ident_b[1] = {cache_instance_identity("beta", 4)};
+    cache_registry_publish(caps, ident_a, 1);
+    rut_helper_cache_set(0, 0x01020304u, 42);
+    u8 has = 0;
+    i64 val = 0;
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 42);
+
+    // Identical re-publish (same name, same capacity) → state persists
+    // across the config swap (documented).
+    cache_registry_publish(caps, ident_a, 1);
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 42);
+
+    // Same capacity but a different declaration at this index (rename /
+    // reorder) → different logical cache: the old entries must NOT bleed
+    // through; the shard drops and rebuilds the table.
+    cache_registry_publish(caps, ident_b, 1);
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 0);
 }
 
 TEST(jit, frontend_req_route_param_field_guard) {

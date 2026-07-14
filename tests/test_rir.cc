@@ -200,6 +200,35 @@ TEST(RirBuilder, RequestAccess) {
     ctx.destroy();
 }
 
+TEST(RirBuilder, InitClearsCachedCacheGetOptionalType) {
+    TestContext first;
+    TestContext second;
+    REQUIRE(first.init());
+    REQUIRE(second.init());
+
+    Builder b;
+    b.init(&first.mod);
+    auto* first_fn = V(b.create_function(lit("first"), lit("/first"), 1));
+    auto first_entry = V(b.create_block(first_fn, lit("entry")));
+    b.set_insert_point(first_fn, first_entry);
+    auto first_get = V(b.emit_cache_get(0, V(b.emit_req_remote_addr())));
+    const Type* first_type = first_fn->values[first_get.id].type;
+
+    b.init(&second.mod);
+    auto* second_fn = V(b.create_function(lit("second"), lit("/second"), 1));
+    auto second_entry = V(b.create_block(second_fn, lit("entry")));
+    b.set_insert_point(second_fn, second_entry);
+    auto second_get = V(b.emit_cache_get(0, V(b.emit_req_remote_addr())));
+    const Type* second_type = second_fn->values[second_get.id].type;
+
+    CHECK(first_type != second_type);
+    CHECK_EQ(static_cast<u8>(second_type->kind), static_cast<u8>(TypeKind::Optional));
+    CHECK_EQ(static_cast<u8>(second_type->inner->kind), static_cast<u8>(TypeKind::I64));
+
+    first.destroy();
+    second.destroy();
+}
+
 TEST(RirBuilder, BinaryOperations) {
     TestContext ctx;
     REQUIRE(ctx.init());
@@ -371,9 +400,13 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     auto sub = V(b.emit_const_str(lit("user-123")));
     VOK(b.emit_req_set_header(lit("X-User-ID"), sub));
     auto remote_addr = V(b.emit_req_remote_addr());
-    auto count = V(b.emit_counter_incr(remote_addr, 60));
-    auto limit = V(b.emit_const_i32(100));
-    auto over = V(b.emit_cmp(Opcode::CmpGt, count, limit));
+    auto* t_i64 = V(b.make_type(TypeKind::I64));
+    auto prev_opt = V(b.emit_cache_get(0, remote_addr));
+    auto prev = V(b.emit_opt_unwrap(prev_opt, t_i64));
+    auto next = V(b.emit_arith(Opcode::Add, prev, V(b.emit_const_i64(1))));
+    (void)V(b.emit_cache_set(0, remote_addr, next));
+    auto limit = V(b.emit_const_i64(100));
+    auto over = V(b.emit_cmp(Opcode::CmpGt, next, limit));
     VOK(b.emit_br(over, blk_reject_429, blk_proxy));
 
     // block_proxy

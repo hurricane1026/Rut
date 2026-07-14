@@ -19,6 +19,9 @@ enum class AstItemKind : u8 {
     Chain,
     Route,
     Timer,
+    // Top-level `let <name> = <expr>` — state declaration (currently only
+    // `Cache<IP, i64>(capacity: N)` inits are accepted; analyze validates).
+    State,
 };
 
 enum class AstStmtKind : u8 {
@@ -529,9 +532,16 @@ struct AstTimerDecl {
     i32 shard = -1;
 };
 
+struct AstStateDecl {
+    Span span{};
+    Str name{};
+    AstExpr* init = nullptr;  // pooled via alloc_expr
+};
+
 struct AstItem {
     AstItemKind kind = AstItemKind::Upstream;
     Span span{};
+    AstStateDecl state{};
     AstUpstreamDecl upstream{};
     AstImportDecl import_decl{};
     AstFunctionDecl func{};
@@ -760,6 +770,11 @@ private:
                     for (u32 j = 0; j < items[i].timer.statements.len; j++) {
                         rebase_stmt_ptr(other, items[i].timer.statements[j]);
                     }
+                    break;
+                case AstItemKind::State:
+                    // The init expression is pooled (bulk-rebased above);
+                    // only the pointer itself needs relocation.
+                    rebase_expr_ptr(other, items[i].state.init);
                     break;
                 default:
                     break;

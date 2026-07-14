@@ -95,6 +95,8 @@ struct Ctx {
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
+    LLVMValueRef fn_cache_get;
+    LLVMValueRef fn_cache_set;
     LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
@@ -374,6 +376,26 @@ struct Ctx {
             fn_req_remote_addr = LLVMAddFunction(llvm_mod, "rut_helper_req_remote_addr", ft);
         }
         return fn_req_remote_addr;
+    }
+
+    // void rut_helper_cache_get(i32, i32, ptr, ptr)
+    LLVMValueRef get_cache_get() {
+        if (!fn_cache_get) {
+            LLVMTypeRef params[] = {i32_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get", ft);
+        }
+        return fn_cache_get;
+    }
+
+    // void rut_helper_cache_set(i32, i32, i64)
+    LLVMValueRef get_cache_set() {
+        if (!fn_cache_set) {
+            LLVMTypeRef params[] = {i32_ty, i32_ty, i64_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
+            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
+        }
+        return fn_cache_set;
     }
 
     // i64 rut_helper_time_now_micros()
@@ -1131,24 +1153,31 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::BitShl:
         case rir::Opcode::BitShr: {
-            // Shift amounts outside 0..31 saturate (0 for shl, sign fill for
-            // arithmetic shr) instead of leaving LLVM poison / hardware
-            // masking semantics.
+            // Shift amounts outside 0..width-1 saturate (0 for shl, sign
+            // fill for arithmetic shr) instead of leaving LLVM poison /
+            // hardware masking semantics. Width follows the operand type
+            // (i32 or i64).
             LLVMValueRef a = c.get_value(inst.operands[0]);
             LLVMValueRef n = c.get_value(inst.operands[1]);
+            const rir::Type* lhs_ty = c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap
+                                          ? c.cur_fn->values[inst.operands[0].id].type
+                                          : nullptr;
+            const bool is64 = lhs_ty && lhs_ty->kind == rir::TypeKind::I64;
+            LLVMTypeRef w = is64 ? c.i64_ty : c.i32_ty;
+            const u64 width = is64 ? 64 : 32;
             LLVMValueRef in_range = LLVMBuildICmp(
-                c.builder, LLVMIntULT, n, LLVMConstInt(c.i32_ty, 32, 0), "bit.shift.inrange");
+                c.builder, LLVMIntULT, n, LLVMConstInt(w, width, 0), "bit.shift.inrange");
             LLVMValueRef safe_n = LLVMBuildSelect(
-                c.builder, in_range, n, LLVMConstInt(c.i32_ty, 31, 0), "bit.shift.n");
+                c.builder, in_range, n, LLVMConstInt(w, width - 1, 0), "bit.shift.n");
             if (inst.op == rir::Opcode::BitShl) {
                 LLVMValueRef shifted = LLVMBuildShl(c.builder, a, safe_n, "bit.shl.raw");
-                LLVMValueRef r = LLVMBuildSelect(
-                    c.builder, in_range, shifted, LLVMConstInt(c.i32_ty, 0, 0), "bit.shl");
+                LLVMValueRef r =
+                    LLVMBuildSelect(c.builder, in_range, shifted, LLVMConstInt(w, 0, 0), "bit.shl");
                 c.set_value(inst.result, r);
             } else {
                 LLVMValueRef shifted = LLVMBuildAShr(c.builder, a, safe_n, "bit.shr.raw");
                 LLVMValueRef sign_fill =
-                    LLVMBuildAShr(c.builder, a, LLVMConstInt(c.i32_ty, 31, 0), "bit.shr.sign");
+                    LLVMBuildAShr(c.builder, a, LLVMConstInt(w, width - 1, 0), "bit.shr.sign");
                 LLVMValueRef r =
                     LLVMBuildSelect(c.builder, in_range, shifted, sign_fill, "bit.shr");
                 c.set_value(inst.result, r);
@@ -1244,6 +1273,47 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef v =
                 LLVMBuildSExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "sext.i64");
             c.set_value(inst.result, v);
+            break;
+        }
+
+        // ── Cache state ──
+        case rir::Opcode::CacheGet: {
+            LLVMValueRef instance =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "cache.has");
+            LLVMValueRef out_val = LLVMBuildAlloca(c.builder, c.i64_ty, "cache.val");
+            LLVMValueRef args[] = {instance, key, out_has, out_val};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_cache_get()),
+                           c.get_cache_get(),
+                           args,
+                           4,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cache.h");
+            LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i64_ty, out_val, "cache.v");
+            // Optional(i64) uses map_type's generic {i8, payload} layout.
+            LLVMTypeRef opt_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            LLVMValueRef opt = LLVMGetUndef(opt_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "cache.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, v, 1, "cache.opt.val");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::CacheSet: {
+            LLVMValueRef instance =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef val = c.get_value(inst.operands[1]);
+            LLVMValueRef args[] = {instance, key, val};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_cache_set()),
+                           c.get_cache_set(),
+                           args,
+                           3,
+                           "");
+            // The instruction's value echoes the stored i64.
+            c.set_value(inst.result, val);
             break;
         }
 
@@ -1827,6 +1897,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
+    c.fn_cache_get = nullptr;
+    c.fn_cache_set = nullptr;
     c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;

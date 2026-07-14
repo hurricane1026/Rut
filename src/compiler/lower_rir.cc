@@ -2294,6 +2294,45 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
+    if (value.kind == MirValueKind::CacheGet || value.kind == MirValueKind::CacheSet) {
+        auto key = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!key) return core::make_unexpected(key.error());
+        if (value.kind == MirValueKind::CacheGet) {
+            auto out = b.emit_cache_get(value.cache_index, key.value(), {span.line, span.col});
+            if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+            return out.value();
+        }
+        auto val = materialize_value(*value.rhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!val) return core::make_unexpected(val.error());
+        auto out =
+            b.emit_cache_set(value.cache_index, key.value(), val.value(), {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::WidenI64) {
         auto operand = materialize_value(*value.lhs,
                                          mir,
@@ -2429,10 +2468,11 @@ static FrontendResult<rir::ValueId> materialize_local_init(
     if (local.may_error) {
         // I64 is deliberately NOT admitted here: the __error_unknown scalar
         // carrier's payload field is Optional<i32>, so a fallible i64 local
-        // would fail deep in emit_struct_create. No expression can produce
-        // one yet; when a fallible i64 source appears, add an i64 error
-        // carrier alongside this whitelist entry. (may_nil I64 below IS
-        // supported — the Optional carrier is width-generic.)
+        // would fail deep in emit_struct_create. Analysis rejects every
+        // fallible-i64 producer (kI64FallibleDetail); this is the
+        // defense-in-depth backstop — when an i64 error carrier exists, add
+        // I64 back alongside it. (may_nil I64 IS supported — the Optional
+        // carrier is width-generic.)
         if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
             local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
             local_shape.type != MirTypeKind::Struct && local_shape.type != MirTypeKind::Unknown)
@@ -3019,6 +3059,24 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
     }
     out.module.upstream_count = mir.upstreams.len;
+
+    // Cache instance descriptors, names arena-copied like upstream names.
+    if (mir.caches.len > rir::Module::kMaxCacheInstances) {
+        return frontend_error(FrontendError::TooManyItems,
+                              mir.caches.len > 0 ? mir.caches[0].span : Span{});
+    }
+    for (u32 i = 0; i < mir.caches.len; i++) {
+        const Str src_name = mir.caches[i].name;
+        char* name_buf = nullptr;
+        if (src_name.len > 0) {
+            name_buf = out.module.arena->alloc_array<char>(src_name.len);
+            if (!name_buf) return frontend_error(FrontendError::OutOfMemory, mir.caches[i].span);
+            for (u32 k = 0; k < src_name.len; k++) name_buf[k] = src_name.ptr[k];
+        }
+        out.module.cache_instances[i].name = {name_buf, src_name.len};
+        out.module.cache_instances[i].capacity = mir.caches[i].capacity;
+    }
+    out.module.cache_instance_count = mir.caches.len;
 
     VariantLoweringInfo variant_infos[MirModule::kMaxVariants]{};
     TupleLoweringInfo tuple_infos[64]{};
