@@ -60,8 +60,9 @@ json({ users: [], total: 0 })           // ⏳ object literal (no object-literal
                                         // compile error; -x OK)
 i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
                                         // don't fit i32 are i64 automatically; no user i64
-                                        // annotations; Cache<K,i64> and :id(i64) are fixed
-                                        // built-in grammar; no narrowing or match on i64)
+                                        // annotations; Cache<K,i64> is fixed built-in grammar;
+                                        // typed route captures such as :id(i64) are ⏳;
+                                        // no narrowing or match on i64)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
@@ -366,6 +367,9 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
 // ⏳ The Cache/GCRA version lands with PRs #181/#182/#184.
+// ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
+// is no shipped top-level catch-all syntax yet. Configure the surrounding
+// listener/proxy to return 404 for traffic outside these declared routes.
 
 route GET "/health" { return 200 }
 

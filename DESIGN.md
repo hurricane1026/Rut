@@ -261,10 +261,10 @@ The two integer widths never mix implicitly:
   literal adopts the i64 side (`i64(x) + 1` works).
 - `i64` is deliberately unavailable in user-declared type positions (like
   ByteSize): no annotations, struct fields, or function parameters. Built-in
-  grammar may still require it as a fixed marker (`Cache<K, i64>`) or typed
-  route capture (`:id(i64)`); neither form makes arbitrary i64 annotations
-  legal. `match` on an i64 subject and `bitwise.*` over i64 are rejected for
-  now.
+  grammar may still require it as a fixed marker (`Cache<K, i64>`). Planned
+  typed route captures (`:id(i64)`) are ⏳ and likewise will not make arbitrary
+  i64 annotations legal. `match` on an i64 subject and `bitwise.*` over i64
+  are rejected for now.
 
 `time.nowMicros()` (⏳ pending PR #183) returns monotonic microseconds as i64,
 latched per handler invocation: every use in one request observes the same
