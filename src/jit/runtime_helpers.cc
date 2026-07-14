@@ -532,6 +532,12 @@ rut::CacheTable* cache_table_for(rut::u32 instance) {
                 snap_idents[i] = reg.identities[i].load(std::memory_order_relaxed);
                 snap_births[i] = reg.birth_generations[i].load(std::memory_order_relaxed);
             }
+            // A seqlock reader needs a read barrier before validation. The
+            // release half keeps the descriptor reads above the fence; the
+            // acquire half keeps the validation read below it. Otherwise a
+            // weak CPU/compiler may validate the old even generation first
+            // and only then consume descriptors from the next publication.
+            std::atomic_thread_fence(std::memory_order_acq_rel);
             if (reg.generation.load(std::memory_order_acquire) == gen) break;
         }
         if (tries >= 8) return nullptr;  // publish storm — treat as miss
