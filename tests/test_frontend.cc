@@ -1572,242 +1572,6 @@ TEST(frontend, analyze_rejects_match_on_i64_subject) {
     REQUIRE_FALSE(hir.has_value());
 }
 
-TEST(frontend, analyze_bitwise_i64_folds_and_adopts_literals) {
-    // Same-width rule over {i32, i64}: bare literals adopt the i64 side
-    // (incl. flip's synthesized -1); folds run at 64-bit width. The packed
-    // sliding-window shape (window_index << 32 | counts) is the motivating
-    // use (docs/state-types.md §4.2).
-    const char* src =
-        "route GET \"/x\" { let a = bitwise.and(i64(6), 3) let s = "
-        "bitwise.shiftLeft(i64(1), 40) let f = bitwise.flip(i64(0)) let p = "
-        "bitwise.or(bitwise.shiftLeft(i64(7), 32), 9) let r = "
-        "bitwise.shiftRight(bitwise.flip(i64(0)), 70) return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
-    const i64 expected[5] = {2, 1099511627776LL, -1, (7LL << 32) | 9, -1 /* shr >= 64 sign fill */};
-    for (u32 i = 0; i < 5; i++) {
-        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
-                 static_cast<u8>(HirExprKind::IntLit));
-        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
-                 static_cast<u8>(HirTypeKind::I64));
-        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
-    }
-}
-
-TEST(frontend, analyze_bitwise_i64_runtime_operands_lower) {
-    const char* src =
-        "route GET \"/x\" { let a = 5 let w = i64(a) let v = bitwise.or("
-        "bitwise.shiftLeft(w, 32), 1) if v > 0 { return 200 } else { return 500 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    CHECK(lowered);
-    rir.destroy();
-}
-
-TEST(frontend, analyze_rejects_bitwise_mixed_width) {
-    // Mixed non-literal widths keep the arithmetic fix-it.
-    const char* src =
-        "route GET \"/x\" { let a = 5 let w = i64(9) let v = bitwise.and(a, w) return 200 "
-        "}\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.len != 0);
-}
-
-TEST(frontend, analyze_rejects_i64_type_annotation) {
-    // i64 is deliberately unnameable in type position (like ByteSize) —
-    // the only surfaces are literals and i64(x).
-    const char* func_param =
-        "func f(_ x: i64) -> i32 => 1\n"
-        "route GET \"/x\" { return 200 }\n";
-    auto lexed = lex(lit(func_param));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-}
-
-TEST(frontend, analyze_i64_tuple_element_and_pipe_placeholder) {
-    const char* src =
-        "route GET \"/x\" { let a = 5 let t = (i64(1), 2) let w = a | i64(_) if w == i64(5) { "
-        "return 200 } else { return 500 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    CHECK(lowered);
-    rir.destroy();
-}
-
-TEST(frontend, analyze_rejects_i64_generic_binding) {
-    // i64 is unnameable in type position, so it cannot bind a generic type
-    // parameter either (the generic carrier paths have no i64 payloads) —
-    // rejected at analysis, not as a confusing lowering failure.
-    const char* src =
-        "struct Box<T> { value: T }\n"
-        "route GET \"/x\" { let b = Box(value: 2147483648) if b.value > 0 { return 200 } "
-        "else { return 500 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-}
-
-TEST(frontend, analyze_i64_eq_method_adopts_literal) {
-    // The Eq/Ord method family must adopt bare int literals like the
-    // operator forms do: i64(a).eq(5) == (i64(a) == 5).
-    const char* src =
-        "route GET \"/x\" { let a = 5 if i64(a).eq(5) && i64(a).lt(10) { return 200 } else { "
-        "return 500 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    CHECK(lowered);
-    rir.destroy();
-}
-
-TEST(frontend, analyze_rejects_nested_match_on_i64_subject) {
-    // The nested-match expansion paths must apply the same i64-subject gate
-    // as the top-level sites — with i64-typed patterns nothing else stops it.
-    const char* src =
-        "route GET \"/x\" { match true { true => match i64(5) { 2147483648 => return 500 _ "
-        "=> return 200 } _ => return 404 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.len != 0);
-}
-
-TEST(frontend, analyze_rejects_fallible_i64_from_eager_fallbacks) {
-    // any/all with an error-typed fallback keep may_error on the result;
-    // a fallible i64 has no error carrier yet, so this must be a clear
-    // analysis error (it used to crash lowering, mis-reported as OOM).
-    const char* any_src =
-        "route GET \"/x\" { let x = any(2147483648, error(500)) guard let v = x else { "
-        "return 400 } if v > 0 { return 200 } else { return 500 } }\n";
-    auto lexed = lex(lit(any_src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.len != 0);
-
-    const char* all_src =
-        "route GET \"/x\" { let x = all(2147483648, error(500)) guard let v = x else { "
-        "return 400 } if v > 0 { return 200 } else { return 500 } }\n";
-    lexed = lex(lit(all_src));
-    REQUIRE(lexed);
-    ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.len != 0);
-}
-
-TEST(frontend, analyze_rejects_fallible_i64_helper_return) {
-    // An annotation-less helper body infers its type; `if ok { 2147483648 }
-    // else { error(500) }` infers a fallible i64, which has no error
-    // carrier — must be the clear analysis error, not a lowering crash.
-    // The i32 twin stays accepted.
-    const char* bad =
-        "func pick(ok: bool) { if ok { 2147483648 } else { error(500) } }\n"
-        "route GET \"/x\" { guard let v = pick(req.http11) else { return 400 } if v > 0 { "
-        "return 200 } else { return 500 } }\n";
-    auto lexed = lex(lit(bad));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.len != 0);
-
-    const char* good =
-        "func pick(ok: bool) { if ok { 5 } else { error(500) } }\n"
-        "route GET \"/x\" { guard let v = pick(req.http11) else { return 400 } if v > 0 { "
-        "return 200 } else { return 500 } }\n";
-    lexed = lex(lit(good));
-    REQUIRE(lexed);
-    ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-}
-
-TEST(frontend, i64_tuple_element_binds_generic_and_lowers) {
-    // Pinning test: a generic bound to a TUPLE containing an i64 element
-    // works end-to-end — tuple elements funnel through rir_type_for_shape,
-    // which admits I64 (unlike a bare T = i64 binding, which stays
-    // rejected at bind_generic_shape).
-    const char* src =
-        "struct Box<T> { value: T }\n"
-        "route GET \"/x\" { let b = Box(value: (2147483648, 1)) let t = b.value "
-        "if req.http11 { return 200 } else { return 500 } }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    auto mir = build_mir_heap(hir.value());
-    REQUIRE(mir);
-    FrontendRirModule rir{};
-    auto lowered = lower_to_rir(mir.value(), rir);
-    REQUIRE(lowered);
-    rir.destroy();
-}
-
-TEST(frontend, analyze_rejects_oversized_error_code) {
-    // Error codes lower as i32; an oversized literal must not silently
-    // truncate in Error.code.
-    const char* src =
-        "route GET \"/x\" { let e = error(4294967296) guard let v = e else { return 400 } "
-        "return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.len != 0);
-}
-
 TEST(frontend, cache_decl_and_ops_analyze_and_lower) {
     // Happy path: declaration registered (surviving the heap pipeline —
     // HirModule's hand-written ctors must copy `caches`), get/set analyze
@@ -2072,6 +1836,22 @@ TEST(frontend, cache_ops_rejected_in_wait_routes) {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+
+    // Match-arm block lets are stored in route.locals, so the same scan must
+    // catch helper-inlined cache reads there too.
+    const char* arm_helper =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func peek(_ k: IP) => b.get(k).or(0)\n"
+        "route GET \"/x\" { wait(1000) match req.http11 { true => { let p = "
+        "peek(req.remoteAddr) if p > 0 { return 200 } else { return 204 } } "
+        "_ => return 404 } }\n";
+    lexed = lex(lit(arm_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
 }
 
 TEST(frontend, cache_bare_set_rejected_on_pre_guarded_routes) {
@@ -2230,6 +2010,261 @@ TEST(frontend, cache_decl_rejects_qualified_constructor) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_bitwise_i64_folds_and_adopts_literals) {
+    // Same-width rule over {i32, i64}: bare literals adopt the i64 side
+    // (incl. flip's synthesized -1); folds run at 64-bit width. The packed
+    // sliding-window shape (window_index << 32 | counts) is the motivating
+    // use (DESIGN.md §3.3.6).
+    const char* src =
+        "route GET \"/x\" { let a = bitwise.and(i64(6), 3) let s = "
+        "bitwise.shiftLeft(i64(1), 40) let f = bitwise.flip(i64(0)) let p = "
+        "bitwise.or(bitwise.shiftLeft(i64(7), 32), 9) let r = "
+        "bitwise.shiftRight(bitwise.flip(i64(0)), 70) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    const i64 expected[5] = {2, 1099511627776LL, -1, (7LL << 32) | 9, -1 /* shr >= 64 sign fill */};
+    for (u32 i = 0; i < 5; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(HirTypeKind::I64));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_bitwise_i64_runtime_operands_lower) {
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) let v = bitwise.or("
+        "bitwise.shiftLeft(w, 32), 1) if v > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_bitwise_mixed_width) {
+    // Mixed non-literal widths keep the arithmetic fix-it.
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(9) let v = bitwise.and(a, w) return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_time_now_micros_and_minmax) {
+    // time.nowMicros() types I64 plain; max/min fold at both widths and
+    // adopt bare literals next to an i64 side.
+    const char* src =
+        "route GET \"/x\" { let t = time.nowMicros() let a = max(3, 5) let b = min(3, 5) "
+        "let c = max(i64(7), 2) let d = min(2147483648, 4) if t > 0 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::TimeNowMicros));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 5);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 3);
+    // max(i64(7), 2): both sides fold to literals → the whole call folds.
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 7);
+    CHECK_EQ(hir->routes[0].locals[4].init.int_value, 4);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[4].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_time_and_minmax_gates_and_shadowing) {
+    // Unknown time member gets the fix-it.
+    const char* bad_member = "route GET \"/x\" { let t = time.now() return 200 }\n";
+    auto lexed = lex(lit(bad_member));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Mixed non-literal widths rejected.
+    const char* mixed =
+        "route GET \"/x\" { let a = 5 let w = i64(9) let v = max(a, w) return 200 }\n";
+    lexed = lex(lit(mixed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // A user func named max shadows the builtin (arity 1 — the builtin
+    // would reject it; the user function resolves instead).
+    const char* shadowed =
+        "func max(_ s: str) -> i32 => 1\n"
+        "route GET \"/x\" { let v = max(\"a\") if v == 1 { return 200 } else "
+        "{ return 500 } }\n";
+    lexed = lex(lit(shadowed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    // A local named time shadows the namespace.
+    const char* time_shadow =
+        "route GET \"/x\" { let time = 1 let t = time.nowMicros() return 200 }\n";
+    lexed = lex(lit(time_shadow));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_time_rejected_in_wait_routes) {
+    // Wait routes re-materialize locals on resume — a pre-wait
+    // `let start = time.nowMicros()` would sample after the wait. Rejected
+    // anywhere in a route containing wait.
+    const char* pre_wait =
+        "route GET \"/x\" { let start = time.nowMicros() wait(1000) "
+        "if start > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(pre_wait));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* post_wait =
+        "route GET \"/x\" { wait(1000) if time.nowMicros() > 0 { return 200 } else { "
+        "return 500 } }\n";
+    lexed = lex(lit(post_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A helper body is analyzed against a scratch route (flag off) and
+    // inlined as an already-built TimeNowMicros tree — the post-analysis
+    // scan must still reject it in a wait route.
+    const char* via_helper =
+        "func now(_ x: i32) => time.nowMicros()\n"
+        "route GET \"/x\" { let start = now(1) wait(1000) "
+        "if start > 0 { return 200 } else { return 500 } }\n";
+    lexed = lex(lit(via_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // wait any populates route.waits like a plain wait — also rejected.
+    const char* wait_any =
+        "route GET \"/x\" { let start = time.nowMicros() "
+        "wait any { timer(1000) => { return 200 } } }\n";
+    lexed = lex(lit(wait_any));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A time-returning helper bound inside a terminal match arm's block —
+    // the inlined tree's nodes land in storage the backstop scan reaches.
+    const char* arm_helper =
+        "func now(_ x: i32) => time.nowMicros()\n"
+        "route GET \"/x\" { wait(1000) match req.http11 { true => { let t = now(1) "
+        "if t > 0 { return 200 } else { return 500 } } _ => return 404 } }\n";
+    lexed = lex(lit(arm_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_minmax_pipe_stage_requires_placeholder) {
+    // `x | max(1, 2)` must not silently drop x — a builtin pipe stage needs
+    // an explicit placeholder, same rule as ordinary pipe calls.
+    const char* dropped = "route GET \"/x\" { let a = 5 let v = a | max(1, 2) return 200 }\n";
+    auto lexed = lex(lit(dropped));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // With the placeholder the piped value participates normally.
+    const char* piped =
+        "route GET \"/x\" { let a = 5 let v = a | max(_, 3) if v == 5 { return 200 } else { "
+        "return 500 } }\n";
+    lexed = lex(lit(piped));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_minmax_const_evals_over_const_locals) {
+    // max/min over compile-time locals participate in `if const`, matching
+    // the arithmetic operators.
+    const char* src =
+        "route GET \"/x\" { let a = 3 let b = 5 if const max(a, b) == 5 { return 200 } "
+        "else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char* min_src =
+        "route GET \"/x\" { let a = 3 if const min(a, 7) == 3 { return 200 } "
+        "else { return 500 } }\n";
+    lexed = lex(lit(min_src));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
 }
 
 TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {

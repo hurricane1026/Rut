@@ -359,7 +359,9 @@ hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
 jwt:     jwtDecode(tok, secret:|publicKey:) jwtEncode(claims, ..., alg: .HS256)
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
-time:    now() time(s) — Time/Duration arithmetic: now() - t > 1h
+time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
+         uses in one request see the same value)  max(a, b)  min(a, b)
+         — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
 ```

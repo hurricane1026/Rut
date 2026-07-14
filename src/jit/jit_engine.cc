@@ -68,6 +68,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
     {"rut_helper_cache_get", reinterpret_cast<void*>(&rut_helper_cache_get)},
     {"rut_helper_cache_set", reinterpret_cast<void*>(&rut_helper_cache_set)},
+    {"rut_helper_time_now_micros", reinterpret_cast<void*>(&rut_helper_time_now_micros)},
+    {"rut_helper_time_unlatch", reinterpret_cast<void*>(&rut_helper_time_unlatch)},
     {nullptr, nullptr},
 };
 

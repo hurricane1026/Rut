@@ -268,11 +268,13 @@ The two integer widths never mix implicitly:
   amounts share the operand width and saturate out of range), providing the
   substrate for packing multi-field algorithm state into one i64 slot.
 
-`time.nowMicros()` (⏳ pending PR #183) returns monotonic microseconds as i64,
-latched per handler invocation: every use in one request observes the same
-value. `max(a, b)` / `min(a, b)` in that slice are same-width integer builtins
-with single evaluation. Duration/ByteSize arithmetic (§3.3) is a separate,
-later surface.
+`time.nowMicros()` returns monotonic microseconds as i64, latched per
+handler invocation (all uses within one request observe the same value —
+required for correctness of rate-limit algorithms, and a consequence of
+the compiler re-materializing local initializers at use sites).
+`max(a, b)` / `min(a, b)` are same-width integer builtins with single
+evaluation. Duration/ByteSize arithmetic (§3.3) is a separate, later
+surface.
 
 Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
 force-unwrap. Use named fallback and explicit binding instead:
@@ -4694,8 +4696,7 @@ mutable state. Cross-shard communication uses `notify` — the only primitive:
 let blacklist = Set<IP>(capacity: 100000)
 let buckets = Cache<IP, i64>(capacity: 100000)    // implemented Cache substrate
 
-// ⏳ The complete Cache/time/max sequence requires PR #183.
-// Per-shard mutation — immediate, no cross-core cost once those slices land
+// Per-shard mutation — immediate, no cross-core cost
 blacklist.add(ip)
 let now = time.nowMicros()
 let tat = max(buckets.get(req.remoteAddr).or(0), now)
