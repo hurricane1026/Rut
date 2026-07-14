@@ -3443,10 +3443,14 @@ For any crash the compiler cannot prevent (bug in codegen, hardware fault):
 
 State operations (Cache.set, Set.add) executed before the crash are
 **not rolled back**. This is by design:
-- Rate limit counter slightly off → self-corrects in next window
-- Cache entry from partial result → TTL expires it
-- Blacklist entry added → intended effect, no harm
-- Session written → client retries on 500, no corruption
+- A packed GCRA successor already written to Cache may throttle conservatively
+  until wall time catches up; it does not rely on a deleted Counter or Cache TTL
+- Any other Cache value remains until overwritten or evicted, which is why Cache
+  is restricted to algorithms where a miss/eviction is a safe reset
+- An idempotent Set.add (for example, an administrator-requested blacklist fact)
+  remains applied; callers must not use it as an intermediate transaction step
+- Session-like state is never valid in lossy Cache and awaits the future strict
+  table, so the runtime promises no rollback semantics for that unsupported form
 
 Transactional rollback would require write-ahead logging on every state operation —
 unacceptable overhead on the hot path. State operations are best-effort, idempotent
@@ -4676,7 +4680,8 @@ mutable state. Cross-shard communication uses `notify` — the only primitive:
 let blacklist = Set<IP>(capacity: 100000)
 let buckets = Cache<IP, i64>(capacity: 100000)    // ⏳ pending GCRA substrate
 
-// Per-shard mutation — immediate, no cross-core cost
+// ⏳ The Cache/time/max sequence requires PRs #181 and #183.
+// Per-shard mutation — immediate, no cross-core cost once those slices land
 blacklist.add(ip)
 let now = time.nowMicros()
 let tat = max(buckets.get(req.remoteAddr).or(0), now)

@@ -220,12 +220,16 @@ return resp
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)   // ⏳ pending PR #181 — lossy per-key slots
 let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
-buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait;
+buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait/for;
                                                  // may evict a colliding neighbor
 // Never store anything whose absence yields a wrong answer (sessions,
 // in-flight counts). Rate limiting over Cache is pending PRs #181/#182/#184;
 // Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
 // Cache ops are rejected in routes containing wait (timer/event suspension);
+// the current lowering also requires set before guard/for because writes are
+// materialized in the entry prelude. Rejected requests are therefore metered
+// by the pending GCRA example; conditional commit needs future branch-local
+// write lowering.
 // `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
 // forward proxy pattern composes fine. set is not an expression.
 
@@ -237,7 +241,8 @@ let flags     = Bitmap(size: 256)                                        // ⏳ 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
 notify(key) blacklist.add(key)    // to owner shard by key hash (expr form;
                                   // bare-statement cache.set does not nest)
-// strong consistency: declare state with consistent: true (+ // rut:allow(consistent))
+// single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
+// remains lossy and separate get/set operations are not an atomic update.
 // ⏳ cross-node backend is unspecified until Cache has a freshness contract.
 ```
 
