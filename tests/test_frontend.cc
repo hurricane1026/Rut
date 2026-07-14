@@ -1836,6 +1836,22 @@ TEST(frontend, cache_ops_rejected_in_wait_routes) {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+
+    // Match-arm block lets are stored in route.locals, so the same scan must
+    // catch helper-inlined cache reads there too.
+    const char* arm_helper =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func peek(_ k: IP) => b.get(k).or(0)\n"
+        "route GET \"/x\" { wait(1000) match req.http11 { true => { let p = "
+        "peek(req.remoteAddr) if p > 0 { return 200 } else { return 204 } } "
+        "_ => return 404 } }\n";
+    lexed = lex(lit(arm_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
 }
 
 TEST(frontend, cache_bare_set_rejected_on_pre_guarded_routes) {

@@ -17824,8 +17824,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // bodies (analyzed against a scratch route where the flags are
         // off). route.waits is complete here — including wait-any arms —
         // so scan every analyzed node: children live in the route.exprs
-        // arena; by-value roots are the local inits (route + guard fail
-        // bodies).
+        // arena; by-value roots are the local inits. Match-arm block lets
+        // are assigned route-wide ref indices and appended to route.locals
+        // by analyze_match_arm_body(); guard fail-body locals are separate.
         if (route.waits.len > 0) {
             auto blocked_kind = [](const HirExpr& e) -> Str {
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
