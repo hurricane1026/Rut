@@ -2,6 +2,7 @@
 // compiles a source file end to end (lex -> parse -> analyze -> MIR -> RIR ->
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
+#include "rut/runtime/cache_table.h"
 #include "rut/serve_loader.h"
 #include "test.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -357,6 +358,33 @@ TEST(serve_loader, empty_program_loads_routeless) {
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     CHECK_EQ(program.config.route_count, 0u);
+    program.destroy();
+}
+
+TEST(serve_loader, cache_registry_changes_only_at_activation) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 old_caps[1] = {64};
+    const u64 old_ids[1] = {cache_instance_identity("old", 3)};
+    cache_registry_publish(old_caps, old_ids, 1);
+
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_cache_activation",
+                   "app.rut",
+                   "let buckets = Cache<IP, i64>(capacity: 128)\n"
+                   "route GET \"/\" { let n = buckets.get(req.remoteAddr).or(0) "
+                   "buckets.set(req.remoteAddr, n + 1) return 200 }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    auto& reg = cache_registry();
+    CHECK_EQ(reg.capacities[0].load(std::memory_order_relaxed), 64u);
+    CHECK_EQ(reg.identities[0].load(std::memory_order_relaxed), old_ids[0]);
+
+    activate_rut_program(program);
+    CHECK_EQ(reg.capacities[0].load(std::memory_order_relaxed), 128u);
+    CHECK_EQ(reg.identities[0].load(std::memory_order_relaxed),
+             cache_instance_identity("buckets", 7));
     program.destroy();
 }
 

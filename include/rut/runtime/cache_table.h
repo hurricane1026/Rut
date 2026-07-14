@@ -204,8 +204,11 @@ inline void cache_registry_publish(const u32* capacities, const u64* identities,
     // Enter the odd (in-progress) state BEFORE touching descriptors, so a
     // reader that raced past the previous even generation sees odd (or a
     // different even) on its validation re-read and retries.
-    const u32 prev_gen = reg.generation.load(std::memory_order_relaxed);
-    reg.generation.store(prev_gen + 1, std::memory_order_release);  // odd
+    // acq_rel on the RMW matters on weakly ordered CPUs: the acquire half
+    // keeps every following descriptor store after publication of the odd
+    // state. A release-only store would order earlier writes, not these
+    // later ones, and could expose a mixed snapshot under reordering.
+    const u32 prev_gen = reg.generation.fetch_add(1, std::memory_order_acq_rel);  // odd
     const u32 old_count = reg.count.load(std::memory_order_relaxed);
     for (u32 i = 0; i < count; i++) {
         // Same (identity, capacity) as the currently-published slot keeps

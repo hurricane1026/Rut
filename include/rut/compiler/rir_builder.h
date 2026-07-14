@@ -71,6 +71,7 @@ struct Builder {
         cur_func = nullptr;
         cur_block_id = kNoBlock;
         cur_block = nullptr;
+        opt_i64_cache = nullptr;
         for (u32 i = 0; i < kTypeKindCount; i++) type_cache[i] = nullptr;
     }
 

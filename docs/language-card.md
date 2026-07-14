@@ -323,7 +323,7 @@ init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
 
-## Cache state (per-key counters/timestamps — docs/state-types.md)
+## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots
