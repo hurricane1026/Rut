@@ -701,9 +701,12 @@ struct Builder {
     Result<ValueId> emit_bit(Opcode bit_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
         if (!is_bit_opcode(bit_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
-        if (!val_has_type(lhs, TypeKind::I32) || !val_has_type(rhs, TypeKind::I32))
-            return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
+        // Same-width integer operands only: both i32 or both i64 (shift
+        // amounts share the operand width).
+        const bool both_i32 = val_has_type(lhs, TypeKind::I32) && val_has_type(rhs, TypeKind::I32);
+        const bool both_i64 = val_has_type(lhs, TypeKind::I64) && val_has_type(rhs, TypeKind::I64);
+        if (!both_i32 && !both_i64) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
         auto [inst, vid] = TRY(emit(bit_op, ty, loc));
         inst->operands[0] = lhs;
         inst->operands[1] = rhs;

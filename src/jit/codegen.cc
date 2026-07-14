@@ -1119,24 +1119,31 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::BitShl:
         case rir::Opcode::BitShr: {
-            // Shift amounts outside 0..31 saturate (0 for shl, sign fill for
-            // arithmetic shr) instead of leaving LLVM poison / hardware
-            // masking semantics.
+            // Shift amounts outside 0..width-1 saturate (0 for shl, sign
+            // fill for arithmetic shr) instead of leaving LLVM poison /
+            // hardware masking semantics. Width follows the operand type
+            // (i32 or i64).
             LLVMValueRef a = c.get_value(inst.operands[0]);
             LLVMValueRef n = c.get_value(inst.operands[1]);
+            const rir::Type* lhs_ty = c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap
+                                          ? c.cur_fn->values[inst.operands[0].id].type
+                                          : nullptr;
+            const bool is64 = lhs_ty && lhs_ty->kind == rir::TypeKind::I64;
+            LLVMTypeRef w = is64 ? c.i64_ty : c.i32_ty;
+            const u64 width = is64 ? 64 : 32;
             LLVMValueRef in_range = LLVMBuildICmp(
-                c.builder, LLVMIntULT, n, LLVMConstInt(c.i32_ty, 32, 0), "bit.shift.inrange");
+                c.builder, LLVMIntULT, n, LLVMConstInt(w, width, 0), "bit.shift.inrange");
             LLVMValueRef safe_n = LLVMBuildSelect(
-                c.builder, in_range, n, LLVMConstInt(c.i32_ty, 31, 0), "bit.shift.n");
+                c.builder, in_range, n, LLVMConstInt(w, width - 1, 0), "bit.shift.n");
             if (inst.op == rir::Opcode::BitShl) {
                 LLVMValueRef shifted = LLVMBuildShl(c.builder, a, safe_n, "bit.shl.raw");
-                LLVMValueRef r = LLVMBuildSelect(
-                    c.builder, in_range, shifted, LLVMConstInt(c.i32_ty, 0, 0), "bit.shl");
+                LLVMValueRef r =
+                    LLVMBuildSelect(c.builder, in_range, shifted, LLVMConstInt(w, 0, 0), "bit.shl");
                 c.set_value(inst.result, r);
             } else {
                 LLVMValueRef shifted = LLVMBuildAShr(c.builder, a, safe_n, "bit.shr.raw");
                 LLVMValueRef sign_fill =
-                    LLVMBuildAShr(c.builder, a, LLVMConstInt(c.i32_ty, 31, 0), "bit.shr.sign");
+                    LLVMBuildAShr(c.builder, a, LLVMConstInt(w, width - 1, 0), "bit.shr.sign");
                 LLVMValueRef r =
                     LLVMBuildSelect(c.builder, in_range, shifted, sign_fill, "bit.shr");
                 c.set_value(inst.result, r);

@@ -263,8 +263,10 @@ The two integer widths never mix implicitly:
   ByteSize): no annotations, struct fields, or function parameters. Built-in
   grammar may still require it as a fixed marker (`Cache<K, i64>`). Planned
   typed route captures (`:id(i64)`) are ⏳ and likewise will not make arbitrary
-  i64 annotations legal. `match` on an i64 subject and `bitwise.*` over i64
-  are rejected for now.
+  i64 annotations legal. `match` on an i64 subject is rejected for now.
+  `bitwise.*` follows arithmetic's same-width rule at both widths (shift
+  amounts share the operand width and saturate out of range), providing the
+  substrate for packing multi-field algorithm state into one i64 slot.
 
 `time.nowMicros()` (⏳ pending PR #183) returns monotonic microseconds as i64,
 latched per handler invocation: every use in one request observes the same
@@ -644,9 +646,9 @@ Under fixed capacity there is no third option: when capacity or a collision
 budget is exceeded, either the write fails visibly or old data dies (eBPF's
 `HASH` vs `LRU_HASH` split). `Cache` evicts — so **never store anything in
 a `Cache` whose absence yields a wrong answer** (sessions, in-flight
-counts). Once PR #182's i64 `bitwise.*` support lands, multi-field algorithm
-state can pack into the single i64; until then the packing examples are also
-pending. Expiry is lazy (window index in the value), there is no `ttl:`.
+counts). PR #182's i64 `bitwise.*` support lets multi-field algorithm state
+pack into the single i64. Expiry is lazy (window index in the value), there is
+no `ttl:`.
 The name `Hash` is **reserved** for a future strict, visible-failure table:
 "hash map" carries a lossless prior this structure does not honor. (The
 former `Hash<string, Session>` example is retired for a second reason:
@@ -3317,7 +3319,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | IP restriction | `req.remoteAddr.in(CIDR)` native |
 | UA restriction | `req.userAgent.contains()` |
 | CORS | `guard` + header assignment |
-| Rate limiting | `@rateLimit` today; Rut GCRA over `Cache<K, i64>` after PRs #182/#183/#184 |
+| Rate limiting | `@rateLimit` today; Rut GCRA over `Cache<K, i64>` after PRs #183/#184 |
 | Request size limiting | `req.contentLength` comparison |
 | Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |

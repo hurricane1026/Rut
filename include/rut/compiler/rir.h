@@ -189,12 +189,12 @@ enum class Opcode : u8 {
     CmpLe,  // %r = cmp.le %a, %b  → bool
     CmpGe,  // %r = cmp.ge %a, %b  → bool
 
-    // ── Bitwise (the `bitwise` builtin namespace) ──
-    BitAnd,  // %r = bit.and %a, %b  → i32
-    BitOr,   // %r = bit.or  %a, %b  → i32
-    BitXor,  // %r = bit.xor %a, %b  → i32
-    BitShl,  // %r = bit.shl %a, %n  → i32 (n outside 0..31 saturates to 0)
-    BitShr,  // %r = bit.shr %a, %n  → i32 (arithmetic; n outside 0..31 → sign fill)
+    // ── Bitwise (the `bitwise` builtin namespace; i32 or i64, same-width) ──
+    BitAnd,  // %r = bit.and %a, %b  → operand width
+    BitOr,   // %r = bit.or  %a, %b  → operand width
+    BitXor,  // %r = bit.xor %a, %b  → operand width
+    BitShl,  // %r = bit.shl %a, %n  → operand width (n outside 0..width-1 saturates to 0)
+    BitShr,  // %r = bit.shr %a, %n  → operand width (arithmetic; out-of-range → sign fill)
 
     // ── Arithmetic (i32; overflow wraps two's-complement) ──
     Add,      // %r = arith.add %a, %b → i32

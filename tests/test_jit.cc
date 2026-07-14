@@ -749,6 +749,54 @@ route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return
     rir.destroy();
 }
 
+TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
+    // The packed sliding-window shape end-to-end at runtime: pack a window
+    // index and a count into one i64, unpack both, and check 64-bit shift
+    // saturation with a runtime amount.
+    const char* src =
+        "route GET \"/users\" { let a = 7 let win = i64(a) let cnt = i64(9) "
+        "let packed = bitwise.or(bitwise.shiftLeft(win, 32), cnt) "
+        "let win2 = bitwise.shiftRight(packed, 32) "
+        "let cnt2 = bitwise.and(packed, 4294967295) "
+        "let big = i64(70) "
+        "if win2 == win && cnt2 == cnt && bitwise.shiftLeft(win, big) == i64(0) "
+        "{ return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_i64_local_across_wait_executes) {
     // Locals re-materialize fresh in resume states (no ctx slots involved),
     // so an i64 local crosses a wait exactly like an i32 — this pins the
