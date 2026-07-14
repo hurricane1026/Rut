@@ -639,8 +639,8 @@ let buckets = Cache<IP, i64>(capacity: 100000)
 buckets.get(key)      // i64? — nil means "never seen OR evicted"; the two
                       // are indistinguishable by design — always handle it
                       // (blessed idiom: .or(0))
-buckets.set(key, v)   // bare statement, before any guard/wait; a colliding
-                      // set may evict a neighbor at any occupancy
+buckets.set(key, v)   // bare statement, before any guard/for; a colliding set
+                      // may evict a neighbor; wait routes reject all cache ops
 ```
 
 Under fixed capacity there is no third option: when capacity or a collision
