@@ -716,7 +716,9 @@ struct Parser {
             // so the WebSocket frame verdict can be spelled `frame.forward()` even though
             // `forward` is the proxy-terminator keyword (the `frame.` receiver disambiguates).
             if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc ||
-                cur().type == TokenType::KwForward) {
+                cur().type == TokenType::KwForward || cur().type == TokenType::KwGet) {
+                // KwGet: `get` doubles as the HTTP-method keyword, but after
+                // `.` it is unambiguously a member name (`buckets.get(k)`).
                 field_name = &cur();
                 pos++;
             } else {
@@ -1905,7 +1907,45 @@ struct Parser {
         // explicit and consistent with `return response(...)`.
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        // Bare method-call statement (`buckets.set(k, v)`): the only
+        // expression form accepted in statement position. Analyze restricts
+        // it further (cache state writes only, before guards/waits).
+        if (cur().type == TokenType::Ident) {
+            const Token start_tok = cur();
+            auto expr = parse_expr();
+            if (!expr) return core::make_unexpected(expr.error());
+            if (expr->kind == AstExprKind::MethodCall) {
+                AstStatement stmt{};
+                stmt.kind = AstStmtKind::Expr;
+                stmt.expr = expr.value();
+                stmt.span = expr->span;
+                return stmt;
+            }
+            return frontend_error(
+                FrontendError::UnexpectedToken, span_from(start_tok), start_tok.text);
+        }
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+    }
+
+    FrontendResult<AstItem> parse_state_decl() {
+        auto kw = expect(TokenType::KwLet);
+        if (!kw) return core::make_unexpected(kw.error());
+        auto name = expect(TokenType::Ident);
+        if (!name) return core::make_unexpected(name.error());
+        auto eq = expect(TokenType::Eq);
+        if (!eq) return core::make_unexpected(eq.error());
+        auto init = parse_expr();
+        if (!init) return core::make_unexpected(init.error());
+        auto init_ptr = alloc_expr(init.value());
+        if (!init_ptr) return core::make_unexpected(init_ptr.error());
+        AstItem item{};
+        item.kind = AstItemKind::State;
+        item.state.name = name.value()->text;
+        item.state.init = init_ptr.value();
+        item.state.span =
+            Span{kw.value()->start, init->span.end, kw.value()->line, kw.value()->col};
+        item.span = item.state.span;
+        return item;
     }
 
     FrontendResult<AstItem> parse_upstream() {
@@ -3396,7 +3436,8 @@ struct Parser {
             if (!item.route.statements.push(stmt_ptr.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
             if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
-                stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For)
+                stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For &&
+                stmt->kind != AstStmtKind::Expr)
                 break;
         }
         auto rbrace = expect(TokenType::RBrace);
@@ -3641,6 +3682,9 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 break;
             case TokenType::KwVariant:
                 item = p.parse_variant();
+                break;
+            case TokenType::KwLet:
+                item = p.parse_state_decl();
                 break;
             case TokenType::KwRoute:
                 if (p.peek().type == TokenType::LBrace) {

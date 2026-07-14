@@ -160,4 +160,13 @@ void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 
+// ── Cache state (docs/language-card.md, Cache section) ──
+// Per-shard lossy slot tables; `instance` indexes the process CacheRegistry
+// published by the loader. get: *out_has = 1 and *out_val on hit, *out_has =
+// 0 on miss (never-seen and evicted are indistinguishable by design). set
+// may evict a colliding neighbor. Out-of-range instances: get misses, set is
+// a no-op (defensive; analyze bounds the index at compile time).
+void rut_helper_cache_get(rut::u32 instance, rut::u32 key_ip, rut::u8* out_has, rut::i64* out_val);
+void rut_helper_cache_set(rut::u32 instance, rut::u32 key_ip, rut::i64 val);
+
 }  // extern "C"

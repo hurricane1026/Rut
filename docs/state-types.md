@@ -1,12 +1,13 @@
 # State Types — Decision Record
 
 Status: **accepted** (2026-07-13). Implementation: slices 1–2 merged
-(#178, #179); slice 4, i64 bitwise, is implemented by PR #182. Slice 3 and
-slices 5–6 — the `Cache` substrate, time/max, and `examples/ratelimit.rut` —
-remain in flight as PRs #181/#183/#184. This file records the *decisions* and
-their reasons. User-facing semantics live in DESIGN.md §3.3.6 and
-docs/language-card.md; when the remaining slices land, implementation mechanics
-will live beside their code.
+(#178, #179); slices 3–4, the `Cache` substrate and i64 bitwise, are
+implemented by PRs #181/#182. Slices 5–6 — time/max and
+`examples/ratelimit.rut` — remain in flight as PRs #183/#184. This file
+records the *decisions* and their reasons. User-facing semantics live in
+DESIGN.md §3.3.6 and docs/language-card.md; implementation mechanics live
+beside their code, including `include/rut/runtime/cache_table.h` and
+`src/compiler/analyze.cc`.
 
 ## D1. The layering principle
 

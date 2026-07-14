@@ -628,7 +628,9 @@ call arguments (see §3.2.1), not as response construction.
 All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
-**Cache<K, i64>** — lossy per-key state slots (⏳ pending; substrate PR #181).
+**Cache<K, i64>** — lossy per-key state slots (implemented; the substrate for
+rate-limit algorithms written in Rut; see `docs/state-types.md` and the Cache
+section in `docs/language-card.md`).
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
@@ -636,8 +638,8 @@ let buckets = Cache<IP, i64>(capacity: 100000)
 buckets.get(key)      // i64? — nil means "never seen OR evicted"; the two
                       // are indistinguishable by design — always handle it
                       // (blessed idiom: .or(0))
-buckets.set(key, v)   // bare statement, before any guard/wait; a colliding
-                      // set may evict a neighbor at any occupancy
+buckets.set(key, v)   // bare statement, before any guard/for; a colliding set
+                      // may evict a neighbor; wait routes reject all cache ops
 ```
 
 Under fixed capacity there is no third option: when capacity or a collision
@@ -2860,7 +2862,7 @@ tcp(addr) -> TcpConn          // TCP connection (Redis, custom protocols)
 udp() -> UdpSock              // UDP socket (StatsD, syslog, DNS)
 
 // --- State (per-shard by default, all bounded) ---
-Cache<K, i64>(capacity:)      // ⏳ lossy per-key state slots (pending PR #181; §3.3.6)
+Cache<K, i64>(capacity:)      // implemented lossy per-key state slots (§3.3.6)
 LRU<K,V>(capacity:, ttl:)     // key-value with LRU eviction
 Set<T>(capacity:)              // membership testing (CIDR → auto LPM trie)
 // Counter<K> is deleted — rate limiting is Rut code over Cache (§3.3.6)
@@ -3317,7 +3319,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | IP restriction | `req.remoteAddr.in(CIDR)` native |
 | UA restriction | `req.userAgent.contains()` |
 | CORS | `guard` + header assignment |
-| Rate limiting | `@rateLimit` today; Rut GCRA over `Cache<K, i64>` after PRs #181/#183/#184 |
+| Rate limiting | `@rateLimit` today; Rut GCRA over `Cache<K, i64>` after PRs #183/#184 |
 | Request size limiting | `req.contentLength` comparison |
 | Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
@@ -4690,9 +4692,9 @@ mutable state. Cross-shard communication uses `notify` — the only primitive:
 ```swift
 // All state is per-shard, single-threaded, zero locking
 let blacklist = Set<IP>(capacity: 100000)
-let buckets = Cache<IP, i64>(capacity: 100000)    // ⏳ pending GCRA substrate
+let buckets = Cache<IP, i64>(capacity: 100000)    // implemented Cache substrate
 
-// ⏳ The Cache/time/max sequence requires PRs #181 and #183.
+// ⏳ The complete Cache/time/max sequence requires PR #183.
 // Per-shard mutation — immediate, no cross-core cost once those slices land
 blacklist.add(ip)
 let now = time.nowMicros()

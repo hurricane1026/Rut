@@ -8,6 +8,7 @@
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
 #include "rut/jit/codegen.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/slice_pool.h"    // SlicePool::kSliceSize (terminate cap)
@@ -260,6 +261,15 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
 #endif
 
     return true;
+}
+
+void activate_rut_program(const LoadedProgram& program) {
+    // Activation is deliberately separate from compilation. A replacement
+    // program may be prepared while the old RouteConfig is still serving;
+    // publishing here lets the owner pair descriptor publication with the
+    // config installation instead of mutating live Cache semantics merely
+    // because load_rut_program() succeeded.
+    cache_registry_publish_config(program.config);
 }
 
 namespace {

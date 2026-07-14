@@ -1,5 +1,6 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
 #include <unordered_map>
@@ -446,6 +447,141 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return 0;
     return pc.req.has_content_length ? pc.req.content_length : 0;
+}
+
+// ── Cache state ────────────────────────────────────────────────────
+// One thread == one shard, so `thread_local` gives per-shard tables that
+// both backends and direct-call tests reach without touching the handler
+// ABI (the RateLimiter precedent). Tables (re)build lazily against the
+// process registry: first touch allocates; a hot-reload capacity change is
+// detected by the rounded-capacity compare and resets that instance's state
+// (documented); an unchanged capacity persists across config swaps because
+// the swap never touches thread-locals.
+namespace {
+// Owns the per-shard tables so thread exit unmaps them — a bare
+// thread_local CacheTable array has a trivial destructor and would leak
+// the mmaps on shard stop/join/restart flows.
+struct ShardCacheTables {
+    rut::CacheTable tables[rut::CacheRegistry::kMaxInstances];
+    rut::u64 identities[rut::CacheRegistry::kMaxInstances] = {};
+    rut::u32 birth_generations[rut::CacheRegistry::kMaxInstances] = {};
+    rut::u32 generation = 0;
+    bool alloc_failed_logged[rut::CacheRegistry::kMaxInstances] = {};
+    ~ShardCacheTables() {
+        for (auto& t : tables) t.destroy();
+    }
+};
+
+rut::CacheTable* cache_table_for(rut::u32 instance) {
+    static thread_local ShardCacheTables t_state;
+    auto* t_tables = t_state.tables;
+    auto* t_identities = t_state.identities;
+    auto* t_birth_generations = t_state.birth_generations;
+    rut::u32& t_generation = t_state.generation;
+    auto* t_alloc_failed_logged = t_state.alloc_failed_logged;
+    auto& reg = rut::cache_registry();
+    // Seqlock-style snapshot: the acquire on `generation` orders the
+    // descriptor loads AFTER the bump we observed, but a publish running
+    // concurrently could still overwrite them before we read — so re-check
+    // the generation after reading and retry. Without this, a reader could
+    // pair the old generation with the NEXT publish's half-written
+    // descriptors (e.g. observe count == 0 mid-publish and degrade a live
+    // handler to miss/no-op, or build a table against a future capacity).
+    rut::u32 gen = 0;
+    rut::u32 live_count = 0;
+    rut::u64 snap_seed = 0;
+    rut::u32 snap_caps[rut::CacheRegistry::kMaxInstances];
+    rut::u64 snap_idents[rut::CacheRegistry::kMaxInstances];
+    rut::u32 snap_births[rut::CacheRegistry::kMaxInstances];
+    for (int tries = 0;; tries++) {
+        gen = reg.generation.load(std::memory_order_acquire);
+        if (gen == 0) return nullptr;  // nothing published yet
+        if ((gen & 1u) == 0) {         // odd = publish in progress, retry
+            live_count = reg.count.load(std::memory_order_relaxed);
+            snap_seed = reg.seed.load(std::memory_order_relaxed);
+            for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+                snap_caps[i] = reg.capacities[i].load(std::memory_order_relaxed);
+                snap_idents[i] = reg.identities[i].load(std::memory_order_relaxed);
+                snap_births[i] = reg.birth_generations[i].load(std::memory_order_relaxed);
+            }
+            // A seqlock reader needs a read barrier before validation. The
+            // release half keeps the descriptor reads above the fence; the
+            // acquire half keeps the validation read below it. Otherwise a
+            // weak CPU/compiler may validate the old even generation first
+            // and only then consume descriptors from the next publication.
+            std::atomic_thread_fence(std::memory_order_acq_rel);
+            if (reg.generation.load(std::memory_order_acquire) == gen) break;
+        }
+        if (tries >= 8) return nullptr;  // publish storm — treat as miss
+    }
+    if (gen != t_generation) {
+        // A publish happened since this shard last looked. Drop tables
+        // whose instance disappeared, moved (identity change from a
+        // rename/reorder), or resized — reusing them would read another
+        // logical cache's entries; keeping stale ones would leak the mmap.
+        // Identical declarations keep their table (state persists across
+        // reloads, documented).
+        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+            if (t_tables[i].slots == nullptr) continue;
+            // Birth-generation compare closes the skipped-generation hole:
+            // if the instance was removed and re-added while this shard was
+            // idle (A→B→C), C's birth differs from the birth this table was
+            // built under, even though identity and capacity match A's.
+            const bool live =
+                i < live_count && snap_idents[i] == t_identities[i] &&
+                snap_births[i] == t_birth_generations[i] &&
+                rut::CacheTable::round_capacity(snap_caps[i]) == t_tables[i].slot_count;
+            if (!live) {
+                t_tables[i].destroy();
+                t_identities[i] = 0;
+                t_birth_generations[i] = 0;
+            }
+        }
+        t_generation = gen;
+    }
+    if (instance >= live_count) return nullptr;
+    const rut::u32 cap = snap_caps[instance];
+    if (cap == 0) return nullptr;
+    rut::CacheTable& t = t_tables[instance];
+    if (t.slot_count != rut::CacheTable::round_capacity(cap)) {
+        if (!t.init(cap, snap_seed)) {
+            // Fail VISIBLY (fixed-capacity axiom): a silent nullptr would
+            // degrade every cache op on this shard to miss/no-op — for a
+            // rate limit that silently admits all traffic. Fail-closed
+            // needs an error path in the handler ABI; recorded follow-up.
+            if (!t_alloc_failed_logged[instance]) {
+                t_alloc_failed_logged[instance] = true;
+                fprintf(stderr,
+                        "rut: cache table mmap failed (instance %u, capacity %u) — cache ops "
+                        "degrade to miss/no-op on this shard\n",
+                        instance,
+                        cap);
+            }
+            return nullptr;
+        }
+        t_identities[instance] = snap_idents[instance];
+        t_birth_generations[instance] = snap_births[instance];
+        t_alloc_failed_logged[instance] = false;
+    }
+    return &t;
+}
+}  // namespace
+
+void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
+    rut::CacheTable* t = cache_table_for(instance);
+    i64 v = 0;
+    if (t != nullptr && t->get(key_ip, &v)) {
+        *out_has = 1;
+        *out_val = v;
+        return;
+    }
+    *out_has = 0;
+    *out_val = 0;
+}
+
+void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
+    rut::CacheTable* t = cache_table_for(instance);
+    if (t != nullptr) t->set(key_ip, val);
 }
 
 // ── String Operations ──────────────────────────────────────────────
