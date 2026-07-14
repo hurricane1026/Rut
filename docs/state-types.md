@@ -3,10 +3,11 @@
 Status: **accepted** (2026-07-13). Implementation: slices 1–2 merged
 (#178, #179); slices 3–6 — the `Cache` substrate, i64 bitwise, time/max,
 and `examples/ratelimit.rut` — are in flight as PRs #181/#182/#183/#184,
-which this doc's file references land with. This file records the *decisions* and their reasons —
-mechanics live as comments next to the code they describe
-(`include/rut/runtime/cache_table.h`, `src/compiler/analyze.cc`), and the
-user-facing semantics live in DESIGN.md §3.3.6 and docs/language-card.md.
+which this doc's file references land with. This file records the *decisions*
+and their reasons. User-facing semantics live in DESIGN.md §3.3.6 and
+docs/language-card.md; when the in-flight slices land, implementation mechanics
+will live beside their code (including the planned Cache runtime table and
+`src/compiler/analyze.cc`).
 
 ## D1. The layering principle
 
@@ -56,8 +57,9 @@ hashing, no eviction, present-from-creation.
 
 ## D4. Deliberately rejected (with the eBPF precedent that informed each)
 
-- Map TTL (`ttl:`) — lazy expiry via timestamps packed into the value,
-  the eBPF idiom; ten years of eBPF maps never grew a TTL.
+- Cache TTL (`ttl:`) — lazy expiry via timestamps packed into the value,
+  the eBPF idiom; ten years of eBPF maps never grew a TTL. This decision does
+  not remove the separately documented `LRU(..., ttl:)` API.
 - Handler-side iteration/dumps — data-plane gets `get`/`set` only;
   observability belongs to the control plane (eBPF program-side vs
   syscall-side asymmetry).

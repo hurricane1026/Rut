@@ -59,8 +59,9 @@ json({ users: [], total: 0 })           // ⏳ object literal (no object-literal
                                         // overflow; x / 0 == 0, x % 0 == 0; literal / 0 is a
                                         // compile error; -x OK)
 i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
-                                        // don't fit i32 are i64 automatically; no i64 type
-                                        // annotations, no narrowing, no match on i64)
+                                        // don't fit i32 are i64 automatically; no user i64
+                                        // annotations; Cache<K,i64> and :id(i64) are fixed
+                                        // built-in grammar; no narrowing or match on i64)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
@@ -376,15 +377,14 @@ listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
 // ⏳ The Cache/GCRA version lands with PRs #181/#182/#184.
 
-route {
-    @rateLimit(limit: 1000, window: 1m) *
-    get /health => 200
-    get /users/:id(i64) => forward(users)
-    post /users {
-        guard let user = req.body(User) else { return 400 }
-        return forward(users)
-    }
-    _ => 404
+route GET "/health" { return 200 }
+
+@rateLimit(limit: 1000, window: 1m)
+route GET "/users/:id" { return forward(users) }
+
+route POST "/users" {
+    guard let user = req.body(User) else { return 400 }
+    return forward(users)
 }
 
 struct User {

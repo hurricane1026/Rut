@@ -259,9 +259,12 @@ The two integer widths never mix implicitly:
 - Arithmetic and comparisons require same-width operands; mixing a non-literal
   i32 with an i64 is a compile error with an `i64(x)` fix-it. A bare int
   literal adopts the i64 side (`i64(x) + 1` works).
-- `i64` is deliberately unnameable in type position (like ByteSize): no
-  annotations, no struct fields, no function parameters. `match` on an i64
-  subject and `bitwise.*` over i64 are rejected for now.
+- `i64` is deliberately unavailable in user-declared type positions (like
+  ByteSize): no annotations, struct fields, or function parameters. Built-in
+  grammar may still require it as a fixed marker (`Cache<K, i64>`) or typed
+  route capture (`:id(i64)`); neither form makes arbitrary i64 annotations
+  legal. `match` on an i64 subject and `bitwise.*` over i64 are rejected for
+  now.
 
 Duration/ByteSize arithmetic (§3.3) is a separate, later surface.
 
@@ -2853,7 +2856,6 @@ udp() -> UdpSock              // UDP socket (StatsD, syslog, DNS)
 
 // --- State (per-shard by default, all bounded) ---
 Cache<K, i64>(capacity:)      // ⏳ lossy per-key state slots (pending PR #181; §3.3.6)
-Hash<K,V>(capacity:, ttl:)    // ⚠ reserved name — future strict table (§3.3.6)
 LRU<K,V>(capacity:, ttl:)     // key-value with LRU eviction
 Set<T>(capacity:)              // membership testing (CIDR → auto LPM trie)
 // Counter<K> is deleted — rate limiting is Rut code over Cache (§3.3.6)
@@ -3207,6 +3209,8 @@ timer checkHealth, every: 10s, shard: 0 {
 
 // ---------- Routes ----------
 
+// ⏳ Proposed route-block middleware binding syntax. The shipped parser accepts
+// official decorators such as @rateLimit only directly before one route.
 route {
     // Middleware bindings
     @requestId *
@@ -5978,14 +5982,12 @@ RIR instruction set:
   %20 = hash.hmac_sha256 %secret, %13    // → Bytes
   %21 = bytes.hex %20                     // → str
   %22 = jwt.decode %12, %secret            // → Result(Claims) — built-in
-  %23 = counter.incr %8, 1m              // → i32
-
   // --- Struct operations ---
-  %24 = struct.field %user, "role"         // → str
-  %25 = struct.create User { id: %s1, role: %s2 }  // → User
-  %26 = body.parse Order                  // → Order (parse request body)
-  %27 = array.len %items                  // → i32
-  %28 = array.get %items, %idx            // → OrderItem
+  %23 = struct.field %user, "role"         // → str
+  %24 = struct.create User { id: %s1, role: %s2 }  // → User
+  %25 = body.parse Order                  // → Order (parse request body)
+  %26 = array.len %items                  // → i32
+  %27 = array.get %items, %idx            // → OrderItem
 
   // --- Control flow (terminators) ---
   br %cond, block_then, block_else         // conditional branch
@@ -5995,9 +5997,9 @@ RIR instruction set:
   ret.forward %upstream, { timeout: 10s }    // proxy to upstream
 
   // --- I/O (suspend points → state machine boundaries) ---
-  %29 = yield.http_get "http://auth/verify", { Authorization: %token }
-  %30 = yield.http_post "http://svc/create", { Body: %data }
-  %31 = yield.forward %upstream
+  %28 = yield.http_get "http://auth/verify", { Authorization: %token }
+  %29 = yield.http_post "http://svc/create", { Body: %data }
+  %30 = yield.forward %upstream
 
   // --- Debug/instrumentation (inserted by compiler) ---
   trace.func_enter "auth"
@@ -6011,20 +6013,22 @@ RIR instruction set:
 
 #### 11.2.3 Example: auth function after inlining into a route
 
-Source:
+Source (`@rateLimit` is top-level route metadata, not a user helper):
 ```swift
-get /users/:id {
+@rateLimit(limit: 100, window: 1m)
+route GET "/users/:id" {
     let user = auth(req, role: "user")
-    rateLimit(req, limit: 100, window: 1m)
     req.set("X-User-ID", req.params.id)
-    forward(userService)
+    return forward(userService)
 }
 ```
 
 RIR output (after inlining + state machine construction):
 
 ```
-func handle_get_users_id(req: Request) {
+func handle_get_users_id(req: Request)
+  rate_limit = { limit: 100, window: 1m, by: ip, scope: shard }
+{
   entry:
     // -- inlined: auth --
     %token = req.header "Authorization"
@@ -6054,12 +6058,6 @@ func handle_get_users_id(req: Request) {
     req.set_header "X-User-ID", %claims.sub
     req.set_header "X-User-Role", %claims.role
 
-    // -- inlined: rateLimit --
-    %count = counter.incr %req.remote_addr, 1m
-    %over = cmp.gt %count, 100
-    br %over, block_reject_429, block_proxy
-
-  block_proxy:
     // -- remaining handler --
     %id = req.param "id"
     req.set_header "X-User-ID", %id
@@ -6074,15 +6072,14 @@ func handle_get_users_id(req: Request) {
   block_reject_403:
     ret.status 403
 
-  block_reject_429:
-    ret.status 429, { Retry-After: 1m }
 }
 ```
 
 ```
 State machine (derived from yield points):
 
-  This example has no yield (jwt_decode and counter.incr are synchronous).
+  This example has no yield (jwt_decode is synchronous; rate limiting is
+  enforced from Function metadata before handler dispatch).
   If auth called an external HTTP service instead:
 
     %res = yield.http_get "http://auth/verify", { Authorization: %token }
