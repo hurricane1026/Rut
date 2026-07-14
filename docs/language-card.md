@@ -17,7 +17,7 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
-import { rateLimit } from "stdlib/ratelimit.rut"   // selective import
+// PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
 listen :443                       // ⏳ ports (no top-level listen yet)
@@ -25,14 +25,14 @@ tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
-let limits = Counter<IP>(capacity: 100000, window: 1m)   // state (per-shard)
+let buckets = Cache<IP, i64>(capacity: 100000)     // ⏳ state (PR #181)
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
 timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no req/forward/wait)
 timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
 init { ... }    shutdown { ... }  // lifecycle hooks
-route { ... }                     // exactly one route block
+route GET "/health" { return 200 } // zero or more top-level route declarations
 ```
 
 `var` is allowed only inside func/handler bodies — never at top level.
@@ -59,9 +59,11 @@ json({ users: [], total: 0 })           // ⏳ object literal (no object-literal
                                         // overflow; x / 0 == 0, x % 0 == 0; literal / 0 is a
                                         // compile error; -x OK)
 i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
-                                        // don't fit i32 are i64 automatically; no i64 type
-                                        // annotations, no narrowing, no match on i64;
-                                        // bitwise.* works at both widths)
+                                        // don't fit i32 are i64 automatically; no user i64
+                                        // annotations; Cache<K,i64> is fixed built-in grammar;
+                                        // typed route captures such as :id(i64) are ⏳;
+                                        // no narrowing or match on i64; bitwise.* works at
+                                        // both widths)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
@@ -220,50 +222,50 @@ return resp
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let sessions  = Hash<str, Session>(capacity: 50000, ttl: 30m)
-let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)
-let blacklist = Set<IP>(capacity: 100000)          // Set<CIDR> = LPM trie
-let limits    = Counter<IP>(capacity: 100000, window: 1m)      // sliding window
-let bursts    = Counter<IP>(capacity: 100000, rate: 100, burst: 20) // token bucket
-let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)
-let flags     = Bitmap(size: 256)
+let buckets = Cache<IP, i64>(capacity: 100000)   // ⏳ pending PR #181 — lossy per-key slots
+let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
+buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait/for;
+                                                 // may evict a colliding neighbor
+// Never store anything whose absence yields a wrong answer (sessions,
+// in-flight counts). Rate limiting over Cache is pending PRs #181/#183/#184;
+// Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
+// Cache ops are rejected in routes containing wait (timer/event suspension);
+// the current lowering also requires set before guard/for because writes are
+// materialized in the entry prelude. Rejected requests are therefore metered
+// by the pending GCRA example; conditional commit needs future branch-local
+// write lowering.
+// `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
+// forward proxy pattern composes fine. set is not an expression.
 
-sessions.set(k, v)  sessions.get(k) /*V?*/  sessions.delete(k)  sessions.contains(k)
-limits.incr(key)    limits.get(key)         bursts.take(key) /*bool*/
-guard limits.incr(req.remoteAddr) <= 1000 else { return 429 }
+let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)  // ⏳ pending
+let blacklist = Set<IP>(capacity: 100000)          // ⏳ pending (Set<CIDR> = LPM trie)
+let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ pending
+let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
-notify(key) counters.incr(key)    // to owner shard by key hash
-// strong consistency: declare state with consistent: true (+ // rut:allow(consistent))
-// cross-node: backend: .redis("redis:6379")
+notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
+                                  // bare-statement cache.set does not nest)
+// single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
+// remains lossy and separate get/set operations are not an atomic update.
+// ⏳ cross-node backend is unspecified until Cache has a freshness contract.
 ```
 
 ## Routing
 
 ```swift
-route {
-    // 1) middleware bindings first: @func[(args)] pattern   (* = all)
-    @requestId *
-    @waf *
-    @auth(role: "user") api.example.com
-    @if(env("ENABLE_CORS") == "true")     // compile-time conditional binding
-    @cors *
-
-    // 2) entries: method path => expr   |   method path { stmts }
-    get /health => 200
-    get /users/:id(i64) => forward(userService)   // :name(i32|i64|uuid) typed capture
-    get /files/*rest => read(root: "/var/www")    // *rest = catch-all, last segment
-    get|post /form { ... }                        // method union
-
-    api.example.com {                             // host group (nesting ok)
-        /v1 {                                     // path prefix group
-            get /users/:id => forward(usersV1)
-        }
-    }
-
-    _ => 404                                      // catch-all (any method/path)
+route GET "/health" { return 200 }
+route GET "/users/:id" {                         // capture: req.params.id
+    return forward(userService)
 }
+
+@rateLimit(limit: 1000, window: 1m)               // official decorator applies
+route POST "/form" { return 204 }                 // to this one route
 ```
+
+The shipped parser accepts repeated top-level `route METHOD "pattern"`
+declarations. The grouped `route { ... }` surface (middleware pattern
+bindings, host/path groups, method unions, typed captures, expression entries,
+and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
 Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
 Indistinguishable routes are a compile error. Middleware direction is inferred
@@ -366,21 +368,19 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ```swift
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
-let limits = Counter<IP>(capacity: 100000, window: 1m)
+// ⏳ The Cache/GCRA version lands with PRs #181/#183/#184.
+// ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
+// is no shipped top-level catch-all syntax yet. Configure the surrounding
+// listener/proxy to return 404 for traffic outside these declared routes.
 
-func rateLimit(_ req: Request, max: i32) {
-    guard limits.incr(req.remoteAddr) <= max else { respond 429 }
-}
+route GET "/health" { return 200 }
 
-route {
-    @rateLimit(max: 1000) *
-    get /health => 200
-    get /users/:id(i64) => forward(users)
-    post /users {
-        guard let user = req.body(User) else { return 400 }
-        return forward(users)
-    }
-    _ => 404
+@rateLimit(limit: 1000, window: 1m)
+route GET "/users/:id" { return forward(users) }
+
+route POST "/users" {
+    guard let user = req.body(User) else { return 400 }
+    return forward(users)
 }
 
 struct User {
