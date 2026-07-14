@@ -8,7 +8,7 @@
 #include <time.h>
 
 // Cache<K, i64> substrate — per-shard lossy per-key state slots
-// (DESIGN.md §3.3.6). This is deliberately NOT a general hash map:
+// (docs/language-card.md, Cache section). This is deliberately NOT a general hash map:
 // under fixed capacity a colliding `set` may evict a neighbor at any
 // occupancy, so a miss on `get` means "never seen OR evicted" and callers
 // must treat the two identically (the .rut surface enforces this via the
