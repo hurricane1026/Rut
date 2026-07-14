@@ -738,7 +738,7 @@ Use cases: feature flags, upstream health status, compact boolean arrays.
 | `persist: true` | all | Preserve data across hot reload; compile error if struct layout changed |
 | `consistent: true` | Cache, Set | Single-owner routing by key hash (removes shard divergence; lossy containers stay approximate); SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
 | `coalesce: true` | LRU | Request coalescing — on cache miss with in-flight request for same key, suspend and wait instead of sending duplicate upstream request |
-| `backend: .redis(addr)` | Cache, Set | ⏳ Future: cross-node storage; no Cache form is specified until reads have an explicit freshness/refresh contract |
+| `backend: .redis(addr)` | — (reserved) | ⏳ Future cross-node storage; no Cache form is specified until reads have an explicit freshness/refresh contract |
 
 **All state is per-shard by default.** Each shard owns an independent copy, single-threaded access,
 zero locking. Per-shard counters are approximate (effective limit ≈ `limit × shard_count`).
@@ -3212,6 +3212,10 @@ timer checkHealth, every: 10s, shard: 0 {
 
 // ---------- Routes ----------
 
+// Shipped official-decorator form: directly before one top-level route.
+@rateLimit(limit: 1000, window: 1m)
+route GET "/limited" { return 200 }
+
 // ⏳ Proposed route-block middleware binding syntax. The shipped parser accepts
 // official decorators such as @rateLimit only directly before one route.
 route {
@@ -3224,7 +3228,6 @@ route {
     @cors *
 
     @auth(role: "user") api.example.com
-    @rateLimit(limit: 1000, window: 1m) api.example.com
     @ipAllow(cidrs: [10.0.0.0/8, 172.16.0.0/12]) admin.example.com
     @auth(role: "admin") admin.example.com
 
@@ -7072,8 +7075,10 @@ is correct either way.
 
 **Degradation principle:** silent fallback is allowed ONLY when a higher layer
 provides equivalent protection (firewall → L7 guards, SO_MAX_PACING_RATE →
-token bucket). State operations (notify, consistent:true, Cache writes)
-must never silently fail — they return errors that the caller must handle.
+token bucket). Control-plane delivery/synchronization operations (`notify`,
+`consistent: true`, and future strict-table writes) must surface failures for
+the caller to handle. `Cache.set` is deliberately different: it has no error
+channel, and collision eviction is part of its documented lossy semantics.
 
 ### 16.6 Mesh Three-Component Architecture
 
