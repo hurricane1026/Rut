@@ -614,7 +614,8 @@ All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
 **Cache\<K, i64>** — lossy per-key state slots (implemented; the substrate for
-rate-limit algorithms written in Rut, see docs/state-types.md §4).
+rate-limit algorithms written in Rut; see the Cache section in
+`docs/language-card.md`).
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)

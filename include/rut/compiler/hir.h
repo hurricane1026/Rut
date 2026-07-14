@@ -161,7 +161,7 @@ enum class HirExprKind : u8 {
     ProtocolCall,
     WaitResult,
     WaitField,
-    // Cache<K, i64> state ops (docs/state-types.md). cache_index selects
+    // Cache<K, i64> state ops (docs/language-card.md, Cache section). cache_index selects
     // the declared instance; key operand in lhs. CacheGet → I64 with
     // may_nil=true (miss covers never-seen AND evicted); CacheSet carries
     // the value in rhs and echoes it (type I64).

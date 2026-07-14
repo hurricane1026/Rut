@@ -56,7 +56,7 @@ constexpr Str kI64FallibleDetail = lit_str(
 constexpr Str kI64ArgDetail = lit_str(
     "i64() expects exactly one plain i32 or i64 value; bind optional or "
     "fallible values first with guard let / if let / .or(default)");
-// Cache<K, i64> state declarations and ops (docs/state-types.md).
+// Cache<K, i64> state declarations and ops (docs/language-card.md, Cache section).
 constexpr Str kStateDeclDetail = lit_str(
     "top-level let declares state; only Cache<IP, i64>(capacity: N) is "
     "supported");
@@ -3694,7 +3694,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             expr, route, mod, locals, local_count, binding, nullptr);
     }
 
-    // Cache<K, i64> instance receiver (docs/state-types.md): an Ident
+    // Cache<K, i64> instance receiver (docs/language-card.md, Cache section): an Ident
     // matching a declared cache, unless shadowed by a user binding (same
     // precedence rule as the bitwise namespace). Handlers get exactly
     // get/set — the data-plane surface; no iteration, no dumps.
@@ -17356,7 +17356,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 // materialize in the entry block, so a set after any
                 // guard/wait/for would still run on rejected paths; restrict
                 // it to the leading let-region ("state writes run at handler
-                // entry", docs/state-types.md).
+                // entry", docs/language-card.md Cache section).
                 // route.guards is consulted LIVE (not just seen_guard):
                 // respond-capable helper calls in preceding lets append
                 // guards during their analysis, after seen_guard was
