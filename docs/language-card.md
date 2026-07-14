@@ -32,7 +32,7 @@ func auth(_ req: Request, role: str) { ... }     // middleware/helpers
 timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no req/forward/wait)
 timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
 init { ... }    shutdown { ... }  // lifecycle hooks
-route { ... }                     // exactly one route block
+route GET "/health" { return 200 } // zero or more top-level route declarations
 ```
 
 `var` is allowed only inside func/handler bodies — never at top level.
@@ -250,29 +250,19 @@ notify(key) blacklist.add(key)    // to owner shard by key hash (expr form;
 ## Routing
 
 ```swift
-route {
-    // 1) middleware bindings first: @func[(args)] pattern   (* = all)
-    @requestId *
-    @waf *
-    @auth(role: "user") api.example.com
-    @if(env("ENABLE_CORS") == "true")     // compile-time conditional binding
-    @cors *
-
-    // 2) entries: method path => expr   |   method path { stmts }
-    get /health => 200
-    get /users/:id(i64) => forward(userService)   // :name(i32|i64|uuid) typed capture
-    get /files/*rest => read(root: "/var/www")    // *rest = catch-all, last segment
-    get|post /form { ... }                        // method union
-
-    api.example.com {                             // host group (nesting ok)
-        /v1 {                                     // path prefix group
-            get /users/:id => forward(usersV1)
-        }
-    }
-
-    _ => 404                                      // catch-all (any method/path)
+route GET "/health" { return 200 }
+route GET "/users/:id" {                         // capture: req.params.id
+    return forward(userService)
 }
+
+@rateLimit(limit: 1000, window: 1m)               // official decorator applies
+route POST "/form" { return 204 }                 // to this one route
 ```
+
+The shipped parser accepts repeated top-level `route METHOD "pattern"`
+declarations. The grouped `route { ... }` surface (middleware pattern
+bindings, host/path groups, method unions, typed captures, expression entries,
+and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
 Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
 Indistinguishable routes are a compile error. Middleware direction is inferred
