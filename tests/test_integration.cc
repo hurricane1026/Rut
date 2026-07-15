@@ -10841,6 +10841,80 @@ static void dump_ws_flake_evidence(RealLoop* loop, const rut::u8* acc, rut::u32 
     }
 }
 
+// Setup-path evidence for the sweep tests below. Three CI strikes on
+// 2026-07-13 failed `!setup_failed`, which recorded nothing — not even which
+// step died. Capture the step name, errno, and the gateway's HTTP response
+// bytes so the next strike distinguishes connect-refused / handshake-timeout
+// (recv_http_headers already allows 10s per read) / non-101 / send-reset.
+struct WsSweepSetupEvidence {
+    const char* step = "";  // failure site; empty = setup OK
+    rut::i32 err = 0;       // errno captured at the failing call
+    char resp[128] = {};    // gateway HTTP response bytes (upgrade step)
+    rut::u32 resp_len = 0;
+};
+
+// Connect + upgrade + send stream[0,split). Returns the connected fd, or -1
+// (fd already closed) with the failing step recorded in *ev.
+static rut::i32 ws_sweep_open_and_send_seg1(rut::u16 port,
+                                            const rut::u8* stream,
+                                            rut::u32 split,
+                                            WsSweepSetupEvidence* ev) {
+    using namespace rut;
+    errno = 0;
+    i32 c = connect_to(port);
+    if (c < 0) {
+        ev->step = "connect";
+        ev->err = errno;
+        return -1;
+    }
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    errno = 0;
+    if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1)) {
+        ev->step = "send-upgrade";
+        ev->err = errno;
+        close(c);
+        return -1;
+    }
+    char buf[1024];
+    errno = 0;
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    if (n == 0 || !buf_contains(buf, n, "101", 3)) {
+        // errno distinguishes the n == 0 cause: EAGAIN = SO_RCVTIMEO expired,
+        // 0 with an orderly close = gateway hung up before responding.
+        ev->step = n == 0 ? "recv-101-nothing" : "recv-101-not-101";
+        ev->err = errno;
+        ev->resp_len = n < sizeof(ev->resp) ? n : static_cast<u32>(sizeof(ev->resp));
+        memcpy(ev->resp, buf, ev->resp_len);
+        close(c);
+        return -1;
+    }
+    errno = 0;
+    if (!send_all(c, reinterpret_cast<const char*>(stream), split)) {
+        ev->step = "send-seg1";
+        ev->err = errno;
+        close(c);
+        return -1;
+    }
+    return c;
+}
+
+static void dump_ws_setup_evidence(RealLoop* loop, const WsSweepSetupEvidence& ev, rut::u32 split) {
+    fprintf(stderr,
+            "[ws-flake] SETUP failed step=%s split=%u errno=%d resp_len=%u resp:",
+            ev.step,
+            split,
+            ev.err,
+            ev.resp_len);
+    for (rut::u32 i = 0; i < ev.resp_len && i < 64; i++) {
+        const unsigned char ch = static_cast<unsigned char>(ev.resp[i]);
+        fprintf(stderr, ch >= 0x20 && ch < 0x7F ? "%c" : "\\x%02x", ch);
+    }
+    fprintf(stderr, "\n");
+    dump_ws_flake_evidence(loop, reinterpret_cast<const rut::u8*>(ev.resp), 0);
+}
+
 // Deterministic sweep over TCP segmentation of a DROP+PONG byte stream: the
 // CI flake family fails only under runner-dependent recv segmentation, so
 // enumerate EVERY split point (client sends bytes [0,k) then [k,total) with a
@@ -10888,6 +10962,7 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
     bool setup_failed = false;
     bool lost_pong = false;
     u32 failed_split = 0;
+    WsSweepSetupEvidence sev;
     u8 racc[512];
     u32 rhave = 0;
     // Representative split points instead of the full sweep: frame boundaries
@@ -10898,29 +10973,22 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
          si++) {
         const u32 split = kSplits[si];
         if (split >= total) continue;
-        i32 c = connect_to(port);
+        i32 c = ws_sweep_open_and_send_seg1(port, stream, split, &sev);
         if (c < 0) {
             setup_failed = true;
-            break;
-        }
-        const char kUpgrade[] =
-            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        char buf[1024];
-        u32 n = 0;
-        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
-            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
-            !send_all(c, reinterpret_cast<char*>(stream), split)) {
-            setup_failed = true;
-            close(c);
+            failed_split = split;
             break;
         }
         // Best-effort segmentation: the pause usually lets the gateway drain
         // segment 1 alone; on a loaded machine some splits may still coalesce
         // (redundant coverage, never a false positive).
         usleep(30000);
+        errno = 0;
         if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
             setup_failed = true;
+            sev.step = "send-seg2";
+            sev.err = errno;
+            failed_split = split;
             close(c);
             break;
         }
@@ -10950,6 +11018,7 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
     }
 
     lt.stop();  // join the loop thread before asserting/dumping (no data race)
+    if (setup_failed) dump_ws_setup_evidence(loop, sev, failed_split);
     if (lost_pong) {
         fprintf(stderr, "[ws-flake] segmentation split=%u/%u LOST the PONG\n", failed_split, total);
         dump_ws_flake_evidence(loop, racc, rhave);
@@ -11004,6 +11073,7 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
     bool echo_failed = false;
     u32 failed_split = 0;
     u32 failed_frames = 0;
+    WsSweepSetupEvidence sev;
     u8 racc[512];
     u32 rhave = 0;
     // Representative splits (see the sweep above): each frame boundary +/-1
@@ -11013,26 +11083,19 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
          si++) {
         const u32 split = kSplits[si];
         if (split >= total) continue;
-        i32 c = connect_to(port);
+        i32 c = ws_sweep_open_and_send_seg1(port, stream, split, &sev);
         if (c < 0) {
             setup_failed = true;
-            break;
-        }
-        const char kUpgrade[] =
-            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        char buf[1024];
-        u32 n = 0;
-        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
-            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
-            !send_all(c, reinterpret_cast<char*>(stream), split)) {
-            setup_failed = true;
-            close(c);
+            failed_split = split;
             break;
         }
         usleep(10000);  // best-effort split; coalescing is redundant coverage
+        errno = 0;
         if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
             setup_failed = true;
+            sev.step = "send-seg2";
+            sev.err = errno;
+            failed_split = split;
             close(c);
             break;
         }
@@ -11069,6 +11132,7 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
     }
 
     lt.stop();  // join before asserting/dumping (race-free evidence)
+    if (setup_failed) dump_ws_setup_evidence(loop, sev, failed_split);
     if (echo_failed) {
         fprintf(stderr,
                 "[ws-flake] interleave split=%u/%u got %u/2 frames\n",

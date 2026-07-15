@@ -1053,7 +1053,13 @@ inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
         ssize_t n = recv(fd, buf, len, 0);
         if (n >= 0) return static_cast<i32>(n);
         if (errno != EINTR) return -errno;
-        if (test_mono_ms() >= deadline) return -EAGAIN;
+        if (test_mono_ms() >= deadline) {
+            // Leave errno matching the synthetic timeout: callers that
+            // record errno (the ws-flake setup evidence) must see EAGAIN,
+            // not the last EINTR this loop absorbed.
+            errno = EAGAIN;
+            return -EAGAIN;
+        }
     }
 }
 
