@@ -264,9 +264,9 @@ The two integer widths never mix implicitly:
   grammar may still require it as a fixed marker (`Cache<K, i64>`). Planned
   typed route captures (`:id(i64)`) are ⏳ and likewise will not make arbitrary
   i64 annotations legal. `match` on an i64 subject is rejected for now.
-  `bitwise.*` follows arithmetic's same-width rule at both widths (shift
-  amounts share the operand width and saturate out of range), providing the
-  substrate for packing multi-field algorithm state into one i64 slot.
+  `bitwise.*` follows the same same-width rule as arithmetic (shift amounts
+  share the operand width and saturate out of range) — the substrate for
+  packing multi-field algorithm state into one i64 slot (§3.3.6).
 
 `time.nowMicros()` returns monotonic microseconds as i64, latched per
 handler invocation (all uses within one request observe the same value —
@@ -623,16 +623,15 @@ call arguments (see §3.2.1), not as response construction.
 
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is
 > restructured around "algorithms in Rut, primitives in the runtime".
-> `Counter<K>` is deleted — token bucket / sliding window are `.rut`
-> library code over `Cache` (planned in PR #184's `examples/ratelimit.rut`). Gauge-style
+> `Counter<K>` is deleted — token bucket / fixed window are `.rut`
+> library code over `Cache` (see `examples/ratelimit.rut`). Gauge-style
 > in-flight counting will get an exact Array-style table, not lossy slots.
 
 All persistent state is declared as top-level typed containers with compile-time
 capacity bounds. Inspired by eBPF maps: typed, bounded, per-shard by default.
 
-**Cache<K, i64>** — lossy per-key state slots (implemented; the substrate for
-rate-limit algorithms written in Rut; see `docs/state-types.md` and the Cache
-section in `docs/language-card.md`).
+**Cache\<K, i64>** — lossy per-key state slots (implemented; the substrate for
+rate-limit algorithms written in Rut, see `examples/ratelimit.rut`).
 
 ```swift
 let buckets = Cache<IP, i64>(capacity: 100000)
@@ -648,9 +647,8 @@ Under fixed capacity there is no third option: when capacity or a collision
 budget is exceeded, either the write fails visibly or old data dies (eBPF's
 `HASH` vs `LRU_HASH` split). `Cache` evicts — so **never store anything in
 a `Cache` whose absence yields a wrong answer** (sessions, in-flight
-counts). PR #182's i64 `bitwise.*` support lets multi-field algorithm state
-pack into the single i64. Expiry is lazy (window index in the value), there is
-no `ttl:`.
+counts). Multi-field algorithm state can pack into the single i64 using
+`bitwise.*`. Expiry is lazy (window index in the value), there is no `ttl:`.
 The name `Hash` is **reserved** for a future strict, visible-failure table:
 "hash map" carries a lossless prior this structure does not honor. (The
 former `Hash<string, Session>` example is retired for a second reason:
@@ -704,9 +702,9 @@ Compiler picks implementation by element type: `Set<IP>` / `Set<string>` → has
 `Set<CIDR>` → LPM trie (longest prefix match tree).
 
 **Rate limiting** is not a state type: GCRA token buckets and packed
-sliding windows are ordinary `.rut` code over `Cache<K, i64>`. The planned
-examples and their real-socket parity test land with PR #184; until the Cache
-and i64-bitwise slices land, `@rateLimit` is the shipped form.
+fixed windows are ordinary `.rut` code over `Cache<K, i64>`. Working
+examples and their real-socket parity test live in `examples/ratelimit.rut`;
+`@rateLimit` remains the concise built-in form.
 
 **Bloom\<T>** — probabilistic set, memory-efficient for large cardinalities.
 No false negatives; possible false positives.
@@ -794,7 +792,7 @@ let ownerBuckets = Cache<IP, i64>(capacity: 100000, consistent: true)
 get /api/*path {
     // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
     let tat = ownerBuckets.get(req.remoteAddr).or(0)
-    // ... GCRA over tat (pending PR #184 example)
+    // ... GCRA over tat (see examples/ratelimit.rut)
     return forward(userService)
 }
 ```
@@ -2864,7 +2862,7 @@ tcp(addr) -> TcpConn          // TCP connection (Redis, custom protocols)
 udp() -> UdpSock              // UDP socket (StatsD, syslog, DNS)
 
 // --- State (per-shard by default, all bounded) ---
-Cache<K, i64>(capacity:)      // implemented lossy per-key state slots (§3.3.6)
+Cache<K, i64>(capacity:)      // lossy per-key state slots (§3.3.6)
 LRU<K,V>(capacity:, ttl:)     // key-value with LRU eviction
 Set<T>(capacity:)              // membership testing (CIDR → auto LPM trie)
 // Counter<K> is deleted — rate limiting is Rut code over Cache (§3.3.6)
@@ -3321,7 +3319,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | IP restriction | `req.remoteAddr.in(CIDR)` native |
 | UA restriction | `req.userAgent.contains()` |
 | CORS | `guard` + header assignment |
-| Rate limiting | `@rateLimit` today; Rut GCRA over `Cache<K, i64>` after PRs #183/#184 |
+| Rate limiting | `@rateLimit` or Rut GCRA over `Cache<K, i64>` (`examples/ratelimit.rut`) |
 | Request size limiting | `req.contentLength` comparison |
 | Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
@@ -4694,7 +4692,7 @@ mutable state. Cross-shard communication uses `notify` — the only primitive:
 ```swift
 // All state is per-shard, single-threaded, zero locking
 let blacklist = Set<IP>(capacity: 100000)
-let buckets = Cache<IP, i64>(capacity: 100000)    // implemented Cache substrate
+let buckets = Cache<IP, i64>(capacity: 100000)
 
 // Per-shard mutation — immediate, no cross-core cost
 blacklist.add(ip)

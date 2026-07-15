@@ -750,7 +750,7 @@ route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return
 }
 
 TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
-    // The packed sliding-window shape end-to-end at runtime: pack a window
+    // The packed fixed-window shape end-to-end at runtime: pack a window
     // index and a count into one i64, unpack both, and check 64-bit shift
     // saturation with a runtime amount.
     const char* src =
@@ -892,6 +892,70 @@ TEST(jit, frontend_time_latch_resets_per_invocation_without_parse) {
     usleep(2000);
     const i64 second = invoke();
     CHECK_GT(second, first);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_rut_gcra_token_bucket_executes) {
+    // THE capstone: the complete GCRA token bucket from
+    // examples/ratelimit.rut, written entirely in Rut, executing under the
+    // JIT. emit == tau → two conforming requests, third rejected; another
+    // IP has independent state. (Always-update variant: state writes run
+    // at handler entry.)
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 4096)
+
+route GET "/users" {
+    let now = time.nowMicros()
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    buckets.set(req.remoteAddr, tat + 600000000)
+    if tat - now <= 600000000 { return 200 } else { return 429 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    cache_registry_set_seed(0x6CFAu);
+    const u32 caps[1] = {4096};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0A0000FE;
+
+    auto call = [&]() {
+        return static_cast<u32>(
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr))
+                .status_code);
+    };
+    CHECK_EQ(call(), 200u);
+    CHECK_EQ(call(), 200u);
+    CHECK_EQ(call(), 429u);
+
+    conn.peer_addr = 0x0A0000FF;  // fresh IP → fresh bucket
+    CHECK_EQ(call(), 200u);
 
     engine.shutdown();
     rir.destroy();

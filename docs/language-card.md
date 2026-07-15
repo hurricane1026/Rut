@@ -25,7 +25,7 @@ tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
-let buckets = Cache<IP, i64>(capacity: 100000)     // implemented lossy state
+let buckets = Cache<IP, i64>(capacity: 100000)     // lossy per-key state
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
@@ -222,17 +222,18 @@ return resp
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let buckets = Cache<IP, i64>(capacity: 100000)   // implemented — lossy per-key slots
+let buckets = Cache<IP, i64>(capacity: 100000)   // lossy per-key slots
 let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
 buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait/for;
                                                  // may evict a colliding neighbor
 // Never store anything whose absence yields a wrong answer (sessions,
-// in-flight counts). Rate limiting over Cache is pending PRs #183/#184;
+// in-flight counts). Rate limiting over Cache is implemented in
+// examples/ratelimit.rut;
 // Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
 // Cache ops are rejected in routes containing wait (timer/event suspension);
 // the current lowering also requires set before guard/for because writes are
 // materialized in the entry prelude. Rejected requests are therefore metered
-// by the pending GCRA example; conditional commit needs future branch-local
+// by the GCRA example; conditional commit needs future branch-local
 // write lowering.
 // `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
 // forward proxy pattern composes fine. set is not an expression.
@@ -327,6 +328,27 @@ init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
 
+## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
+
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)
+
+route GET "/api" {                                   // GCRA token bucket
+    let now = time.nowMicros()                       // latched per request
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    buckets.set(req.remoteAddr, tat + 600000)        // emit = 600ms/token
+    if tat - now <= 600000 { return 200 } else { return 429 }  // tau = emit
+}
+```
+
+For equivalent parameters, this matches `@rateLimit` through the first
+over-limit decision (verified by e2e). After a rejection the behaviors differ:
+this form writes before deciding, so rejected requests advance TAT and make it
+more punitive; `@rateLimit` does not update its bucket on rejection. This form
+is for CUSTOM policies (per-tier limits, composite conditions). See
+examples/ratelimit.rut for the packed fixed-window variant, which permits
+boundary bursts and is not a sliding-window limit.
+
 ## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
 
 ```swift
@@ -393,8 +415,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ```swift
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
-// ⏳ Cache and i64 bitwise are implemented; the complete GCRA example needs
-// PRs #183/#184.
+// A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
 // is no shipped top-level catch-all syntax yet. Configure the surrounding
 // listener/proxy to return 404 for traffic outside these declared routes.

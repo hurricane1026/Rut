@@ -9,6 +9,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #endif
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/compile_to_config.h"
@@ -13197,6 +13198,9 @@ static bool run_jit_real_socket_status_cases(const char* src,
         rir.destroy();
         return false;
     }
+    // Mirror the production activation boundary: Cache descriptors must
+    // come from the config produced by compilation, not test-side injection.
+    cache_registry_publish_config(cfg);
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -13570,6 +13574,40 @@ TEST(route, req_cookie_all_requires_present_value_real_socket) {
         {kMissingReq, sizeof(kMissingReq) - 1, "401"},
     };
     REQUIRE(run_jit_real_socket_status_cases(src, cases, 3));
+}
+
+TEST(route, rut_gcra_matches_ratelimit_decorator_real_socket) {
+    // Capstone e2e: the Rut-written GCRA (examples/ratelimit.rut pattern)
+    // and the C++ @rateLimit decorator serve side by side over a real
+    // socket and produce the same immediate admission pattern through the
+    // first rejection for an equivalent config (2 back-to-back then reject:
+    // Rut emit == tau; decorator
+    // limit: 2, window: 1m ⇒ emit 30s, burst defaults to limit ⇒
+    // tau (burst-1)·emit = 30s).
+    using namespace rut;
+    cache_registry_set_seed(0x6CFAu);
+
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 4096)\n"
+        "route GET \"/rut\" {\n"
+        "    let now = time.nowMicros()\n"
+        "    let tat = max(buckets.get(req.remoteAddr).or(0), now)\n"
+        "    buckets.set(req.remoteAddr, tat + 30000000)\n"
+        "    if tat - now <= 30000000 { return 200 } else { return 429 }\n"
+        "}\n"
+        "@rateLimit(limit: 2, window: 1m)\n"
+        "route GET \"/deco\" { return 200 }\n";
+    const char kRutReq[] = "GET /rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char kDecoReq[] = "GET /deco HTTP/1.1\r\nHost: x\r\n\r\n";
+    const RealSocketStatusCase cases[] = {
+        {kRutReq, sizeof(kRutReq) - 1, "200"},
+        {kRutReq, sizeof(kRutReq) - 1, "200"},
+        {kRutReq, sizeof(kRutReq) - 1, "429"},
+        {kDecoReq, sizeof(kDecoReq) - 1, "200"},
+        {kDecoReq, sizeof(kDecoReq) - 1, "200"},
+        {kDecoReq, sizeof(kDecoReq) - 1, "429"},
+    };
+    REQUIRE(run_jit_real_socket_status_cases(src, cases, 6));
 }
 
 TEST(route, req_header_all_requires_present_value_real_socket) {

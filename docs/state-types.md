@@ -1,26 +1,26 @@
 # State Types — Decision Record
 
 Status: **accepted** (2026-07-13). Implementation: slices 1–2 merged
-(#178, #179); slices 3–5 — the `Cache` substrate, i64 bitwise, and time/max —
-are implemented by PRs #181/#182/#183. Slice 6, `examples/ratelimit.rut`,
-remains in flight as PR #184. This file records the *decisions* and their
-reasons. User-facing semantics live in DESIGN.md §3.3.6 and
-docs/language-card.md; implementation mechanics live beside their code,
-including `include/rut/runtime/cache_table.h` and `src/compiler/analyze.cc`.
+(#178, #179); slices 3–6 — the `Cache` substrate, i64 bitwise, time/max,
+and `examples/ratelimit.rut` — are implemented across PRs #181–#184.
+This file records the *decisions*
+and their reasons. User-facing semantics live in DESIGN.md §3.3.6 and
+docs/language-card.md; implementation mechanics live beside their code
+(including `include/rut/runtime/cache_table.h` and `src/compiler/analyze.cc`).
 
 ## D1. The layering principle
 
 **An algorithm either can be written by users in Rut, or it does not go
 into the language.** Full inlining + one thread per shard means Rut-written
-GCRA/sliding-window compiles to straight-line arithmetic plus one slot
+GCRA/fixed-window compiles to straight-line arithmetic plus one slot
 access — C++-built-in performance; the read-modify-write is race-free by
 construction WITHIN a shard (single thread, no suspension between get and
 set — wait routes reject cache ops). Cross-shard exactness is explicitly
 out of scope until a strict table + owner-shard atomic update exist
 (DESIGN.md §3.3.6). Therefore the runtime keeps only irreducible substrate
 (keyed state slots, LPM tries, bloom bit math, coalescing); token bucket,
-sliding window, and gauge logic are `.rut` library code
-(`examples/ratelimit.rut`, pending PR #184). `Counter<K>` is deleted from the taxonomy;
+fixed window, and gauge logic are `.rut` library code
+(`examples/ratelimit.rut`). `Counter<K>` is deleted from the taxonomy;
 `@rateLimit`/`@throttle` stay, and can later re-sugar over the library.
 
 ## D2. The fixed-capacity axiom, and why the type is named `Cache`
