@@ -30445,6 +30445,36 @@ TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
     rir.destroy();
 }
 
+TEST(frontend, fail_closed_pre_reject_before_recovery_drops_error_prelude) {
+    // The first guard can reject with 403 before the fallible carrier is
+    // recovered. That exit is fail-closed; every continuing path reaches the
+    // guard-let recovery, so the state-0 500 prelude is unnecessary.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "guard req.http11 else { return 403 } "
+        "wait(1ms) guard let checked = value else { return 401 } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, redirect_pre_exit_before_recovery_keeps_error_prelude) {
+    // A redirect is not fail-closed: without the prelude an unrecovered error
+    // could masquerade as a programmed 302. Only literal 4xx/5xx exits may
+    // satisfy exit-dominance before the later recovery.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "guard req.http11 else { return 302 } "
+        "guard let checked = value else { return 401 } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
 TEST(frontend, if_let_complex_branch_recovers_carrier_drops_error_prelude) {
     // Finding 1: a complex-branch `if let` (then body is itself an `if`) lowers
     // to a Match whose usable-value test lands in the match SUBJECT
@@ -30630,23 +30660,19 @@ TEST(frontend, if_let_folded_false_route_block_else_dead_then_references_binding
     rir.destroy();
 }
 
-TEST(frontend, if_let_folded_false_route_block_else_nested_recovery_lowers) {
-    // Finding 3 + safety: the live Block else itself performs an error recovery
-    // (a nested if-let over a fallible `any(...)` local, else `return 401`). The
-    // folded-false rewrite routes the Block else through the two-arm Match builder,
-    // so the nested recovery lands in a conditionally-reached arm block — NOT
-    // linearly dominated — and its state-0 error prelude is conservatively KEPT.
-    // This matches the non-folded if-let (whose else arm is likewise conditional),
-    // and is the safe over-keep direction (a spurious prelude returns the default
-    // error; it never lets an error masquerade as success). The point of the test
-    // is that the Block else compiles AND lowers rather than being rejected.
+TEST(frontend, if_let_folded_false_route_block_else_nested_recovery_drops_prelude) {
+    // The live Block else performs an error recovery (a nested if-let over a
+    // fallible `any(...)` local, else `return 401`). Its recovery is reached
+    // through one arm of the folded outer match; the other arm terminates with
+    // a literal fail-closed 500. Per-local exit-dominance therefore proves every
+    // path safe and drops the formerly conservative state-0 prelude.
     const char* src =
         "func fallback() -> i32 => error(.timeout)\n"
         "route GET \"/u\" { if let x = error(7) { return 500 } else { let v = any(200, fallback()) "
         "if let y = v { return 200 } else { return 401 } } }\n";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
-    CHECK(rir_has_prelude_block(rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
     rir.destroy();
 }
 

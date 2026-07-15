@@ -3957,16 +3957,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return false;
             }
         };
-        // Blocks reached from the entry block (0) through ONLY unconditional
-        // control transfers: a `wait` yield's linear continuation, or a
-        // degenerate Branch whose two arms coincide. A guard-let / if-let
-        // recovery condition sitting in such a block still dominates every exit
-        // of the local — exactly like a condition in block 0 — so its else/false
-        // arm is guaranteed to intercept the error before it can escape as a
-        // success. A block reached only through a CONDITIONAL branch is NOT
-        // included: a sibling arm could return success without recovering, so
-        // the prelude must stay there (masquerade guard). This set only widens
-        // recovery RECOGNITION; it never on its own suppresses a prelude.
+        // Cheap dominance set for unconditional entry continuations. The full
+        // per-local exit analysis below additionally handles conditional paths
+        // that either recover the carrier or terminate fail-closed.
         bool linearly_dominated[MirFunction::kMaxBlocks]{};
         if (mir.functions[i].blocks.len != 0) {
             linearly_dominated[0] = true;
@@ -3988,18 +3981,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     next = term.then_block;
                     has_next = true;
                 }
-                // NOT extended to single-continuation conditional branches
-                // (one arm terminating, the other continuing): a terminating
-                // sibling arm can return a SUCCESS status while the local
-                // still carries an unrecovered error (see
-                // conditional_guard_keeps_error_prelude_on_unguarded_sibling),
-                // so treating the continuation as dominating would let an
-                // error masquerade as success. Distinguishing a benign
-                // pre-recovery reject (`guard ok else { return 403 }`) from
-                // that masquerade needs real per-local exit-dominance
-                // analysis — tracked in TODO.md. Until then the prelude is
-                // conservatively kept (worst case: generic 500 instead of the
-                // programmed else — never a wrong-direction result).
+                // Single-continuation conditional branches are intentionally
+                // excluded here: their terminating sibling may return success.
+                // The exit-aware walk below distinguishes that case from a
+                // fail-closed pre-reject before a later recovery.
                 if (!has_next || next >= mir.functions[i].blocks.len || linearly_dominated[next])
                     break;
                 linearly_dominated[next] = true;
@@ -4045,15 +4030,14 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             if (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci)) return true;
             return false;
         };
-        // Recovery split across paths: every control path from the entry
-        // evaluates its own recovering branch (a guard/presence condition, or
-        // a condition whose every result path evaluates a presence test —
-        // recovers_on_all_paths). Subsumes the single-dominating-branch rule:
-        // dominance is just the case where one branch covers all paths. A
-        // path that exits (return/forward) before any recovering branch does
-        // NOT recover — the sibling-escape masquerade stays guarded exactly
-        // as before.
-        auto all_paths_recover = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
+        // Per-local exit-dominance: every control path from entry must either
+        // recover the carrier or terminate with a literal fail-closed HTTP
+        // response. A 4xx/5xx pre-reject is safe without observing the carrier;
+        // a 2xx/3xx, dynamic status, forward, or unknown exit is not — accepting
+        // it would let an error masquerade as a successful/redirected request.
+        // This subsumes the single-dominating-branch rule and recognizes split
+        // recovery across sibling paths.
+        auto all_error_paths_safe = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
             i8 memo[MirFunction::kMaxBlocks];
             for (u32 bi = 0; bi < MirFunction::kMaxBlocks; bi++) memo[bi] = -1;
             auto rec = [&](auto&& self, u32 bi) -> bool {
@@ -4078,6 +4062,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         break;
                     }
                 }
+                if (!covered && term.kind == MirTerminatorKind::ReturnStatus &&
+                    term.source_kind == MirTerminatorSourceKind::Literal &&
+                    term.status_code >= 400 && term.status_code <= 599)
+                    covered = true;
                 if (!covered && term.kind == MirTerminatorKind::Branch) {
                     // A match/use_cmp SUBJECT recovers the same way a plain
                     // condition does — directly guard-shaped or covered on
@@ -4113,7 +4101,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 if (RecoveryScan::recovers_on_all_paths(&mir.functions[i].locals[li].init, ci))
                     return true;
             }
-            if (all_paths_recover(ci)) return true;
+            if (all_error_paths_safe(ci)) return true;
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
                 // A top-level guard/if-let condition (plain-branch cond OR match
