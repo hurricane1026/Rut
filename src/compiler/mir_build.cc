@@ -1091,6 +1091,21 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!out->forward_set_headers.push({p.key, p.value})) __builtin_trap();
             }
         };
+        auto set_arm_effects = [&](MirBlock* out, const HirMatchArm& arm) -> FrontendResult<void> {
+            for (u32 ei = 0; ei < arm.effect_expr_indices.len; ei++) {
+                const u32 expr_index = arm.effect_expr_indices[ei];
+                if (expr_index >= module.routes[i].exprs.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
+                auto effect = mir_value(module.routes[i].exprs[expr_index], module, &fn);
+                if (!effect) return core::make_unexpected(effect.error());
+                if (!fn.values.push(effect.value()))
+                    return frontend_error(FrontendError::TooManyItems, arm.span);
+                if (!out->effects.push(
+                        {fn.values.len - 1, module.routes[i].exprs[expr_index].span}))
+                    return frontend_error(FrontendError::TooManyItems, arm.span);
+            }
+            return {};
+        };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;
             if (guard.fail_kind == HirGuard::FailKind::Body)
@@ -1452,6 +1467,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     } else {
                         set_term_from_hir(&case_block.term, arm.direct_term);
                     }
+                    if (!arm.has_arm_guard && arm.guards.len == 0) {
+                        auto effects = set_arm_effects(&case_block, arm);
+                        if (!effects) return core::make_unexpected(effects.error());
+                    }
                     if (!fn.blocks.push(case_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     auto guard_blocks = emit_match_prelude_guard_blocks(arm,
@@ -1474,6 +1493,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         } else {
                             set_term_from_hir(&body_block.term, arm.direct_term);
                         }
+                        auto effects = set_arm_effects(&body_block, arm);
+                        if (!effects) return core::make_unexpected(effects.error());
                         if (!fn.blocks.push(body_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                         for (u32 gi = 0; gi < arm.guards.len; gi++) {
@@ -2786,6 +2807,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     } else {
                         set_term_from_hir(&case_block.term, arm.direct_term);
                     }
+                    if (!arm.has_arm_guard && arm.guards.len == 0) {
+                        auto effects = set_arm_effects(&case_block, arm);
+                        if (!effects) return core::make_unexpected(effects.error());
+                    }
                     if (!fn.blocks.push(case_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     auto guard_blocks = emit_match_prelude_guard_blocks(
@@ -2805,6 +2830,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         } else {
                             set_term_from_hir(&body_block.term, arm.direct_term);
                         }
+                        auto effects = set_arm_effects(&body_block, arm);
+                        if (!effects) return core::make_unexpected(effects.error());
                         if (!fn.blocks.push(body_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                         for (u32 gi = 0; gi < arm.guards.len; gi++) {
@@ -2924,6 +2951,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 } else {
                     set_term_from_hir(&case_block.term, arm.direct_term);
                 }
+                if (!arm.has_arm_guard && arm.guards.len == 0) {
+                    auto effects = set_arm_effects(&case_block, arm);
+                    if (!effects) return core::make_unexpected(effects.error());
+                }
                 if (!fn.blocks.push(case_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
                 auto guard_blocks = emit_match_prelude_guard_blocks(
@@ -2943,6 +2974,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     } else {
                         set_term_from_hir(&body_block.term, arm.direct_term);
                     }
+                    auto effects = set_arm_effects(&body_block, arm);
+                    if (!effects) return core::make_unexpected(effects.error());
                     if (!fn.blocks.push(body_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     for (u32 gi = 0; gi < arm.guards.len; gi++) {
@@ -3011,6 +3044,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     } else {
                         set_term_from_hir(&case_block.term, arm.direct_term);
                     }
+                    if (!arm.has_arm_guard && arm.guards.len == 0) {
+                        auto effects = set_arm_effects(&case_block, arm);
+                        if (!effects) return core::make_unexpected(effects.error());
+                    }
                     if (!fn.blocks.push(case_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     auto guard_blocks = emit_match_prelude_guard_blocks(
@@ -3030,6 +3067,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         } else {
                             set_term_from_hir(&body_block.term, arm.direct_term);
                         }
+                        auto effects = set_arm_effects(&body_block, arm);
+                        if (!effects) return core::make_unexpected(effects.error());
                         if (!fn.blocks.push(body_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                         for (u32 gi = 0; gi < arm.guards.len; gi++) {

@@ -230,11 +230,11 @@ buckets.set(req.remoteAddr, v)                   // bare statement, before any g
 // in-flight counts). Rate limiting over Cache is implemented in
 // examples/ratelimit.rut;
 // Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
-// Cache ops are rejected in routes containing wait (timer/event suspension);
-// the current lowering also requires set before guard/for because writes are
-// materialized in the entry prelude. Rejected requests are therefore metered
-// by the GCRA example; conditional commit needs future branch-local
-// write lowering.
+// A leading set is materialized in the entry prelude and meters every attempt.
+// A set inside a selected if/match branch executes on that branch immediately
+// before its terminal body, enabling meter-on-accept policies. Cache ops are
+// rejected in routes containing wait; branch-local writes are also rejected
+// in static-for routes until their unrolled step graph carries effects.
 // `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
 // forward proxy pattern composes fine. set is not an expression.
 
@@ -336,16 +336,18 @@ let buckets = Cache<IP, i64>(capacity: 100000)
 route GET "/api" {                                   // GCRA token bucket
     let now = time.nowMicros()                       // latched per request
     let tat = max(buckets.get(req.remoteAddr).or(0), now)
-    buckets.set(req.remoteAddr, tat + 600000)        // emit = 600ms/token
-    if tat - now <= 600000 { return 200 } else { return 429 }  // tau = emit
+    if tat - now <= 600000 {                         // tau = emit
+        buckets.set(req.remoteAddr, tat + 600000)    // emit = 600ms/token
+        return 200
+    } else { return 429 }
 }
 ```
 
-For equivalent parameters, this matches `@rateLimit` through the first
-over-limit decision (verified by e2e). After a rejection the behaviors differ:
-this form writes before deciding, so rejected requests advance TAT and make it
-more punitive; `@rateLimit` does not update its bucket on rejection. This form
-is for CUSTOM policies (per-tier limits, composite conditions). See
+For equivalent parameters, this matches `@rateLimit`, including leaving TAT
+unchanged after a rejection (verified by JIT execution tests). Move the set to
+the leading statement region when a deliberately punitive policy should meter
+every attempt. The Rut form also supports custom policies such as per-tier
+limits and composite conditions. See
 examples/ratelimit.rut for the packed fixed-window variant, which permits
 boundary bursts and is not a sliding-window limit.
 
@@ -367,10 +369,12 @@ route GET "/api" {
 - Entries may be evicted by colliding writes at any occupancy: never store
   anything whose absence gives a wrong answer. Capacity = slot count (rounded
   up to a power of two); provision ~2× your expected key count.
-- State writes run at handler entry, so a bare `set` after a guard/for is a
-  compile error. Routes containing `wait`/`wait any` reject every cache op,
-  including ops textually before the wait. Per-shard state: effective limits
-  ≈ limit × shard count.
+- A leading state write runs at handler entry and must precede guards/for. A
+  write inside a selected `if`/`match` branch runs only on that branch, after
+  its local prelude guards and before its terminator. Routes containing
+  `wait`/`wait any` reject every cache op, including ops textually before the
+  wait; branch writes in static-for routes remain unsupported. Per-shard state:
+  effective limits ≈ limit × shard count.
 
 ## Built-ins (call them, never reimplement)
 

@@ -13656,8 +13656,10 @@ TEST(route, rut_gcra_matches_ratelimit_decorator_real_socket) {
         "route GET \"/rut\" {\n"
         "    let now = time.nowMicros()\n"
         "    let tat = max(buckets.get(req.remoteAddr).or(0), now)\n"
-        "    buckets.set(req.remoteAddr, tat + 30000000)\n"
-        "    if tat - now <= 30000000 { return 200 } else { return 429 }\n"
+        "    if tat - now <= 30000000 {\n"
+        "        buckets.set(req.remoteAddr, tat + 30000000)\n"
+        "        return 200\n"
+        "    } else { return 429 }\n"
         "}\n"
         "@rateLimit(limit: 2, window: 1m)\n"
         "route GET \"/deco\" { return 200 }\n";

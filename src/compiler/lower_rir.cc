@@ -4420,6 +4420,30 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     }
                 }
             }
+            for (u32 ei = 0; ei < mir.functions[i].blocks[bi].effects.len; ei++) {
+                const auto& effect = mir.functions[i].blocks[bi].effects[ei];
+                if (effect.value_index >= mir.functions[i].values.len) {
+                    out.destroy();
+                    return frontend_error(FrontendError::UnsupportedSyntax, effect.span);
+                }
+                auto emitted = materialize_value(mir.functions[i].values[effect.value_index],
+                                                 mir,
+                                                 variant_infos,
+                                                 tuple_infos,
+                                                 &tuple_info_count,
+                                                 error_scalar_infos,
+                                                 error_variant_infos,
+                                                 error_struct_infos,
+                                                 user_struct_defs,
+                                                 b,
+                                                 local_vals,
+                                                 MirFunction::kMaxLocals,
+                                                 effect.span);
+                if (!emitted) {
+                    out.destroy();
+                    return core::make_unexpected(emitted.error());
+                }
+            }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,
                                      variant_infos,
