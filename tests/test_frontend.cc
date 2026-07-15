@@ -1745,6 +1745,78 @@ TEST(frontend, cache_bare_set_statement_rules) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, cache_set_is_lowered_on_the_selected_if_branch) {
+    const char* src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    let prev = buckets.get(req.remoteAddr).or(0)
+    if prev < 2 {
+        buckets.set(req.remoteAddr, prev + 1)
+        return 200
+    } else {
+        return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& control = hir->routes[0].control;
+    CHECK_EQ(static_cast<u8>(control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(control.match_arms.len, 2u);
+    REQUIRE_EQ(control.match_arms[0].effect_expr_indices.len, 1u);
+    CHECK_EQ(control.match_arms[1].effect_expr_indices.len, 0u);
+    const u32 effect_index = control.match_arms[0].effect_expr_indices[0];
+    REQUIRE_LT(effect_index, hir->routes[0].exprs.len);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].exprs[effect_index].kind),
+             static_cast<u8>(HirExprKind::CacheSet));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    u32 effect_count = 0;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& block = mir->functions[0].blocks[bi];
+        effect_count += block.effects.len;
+        for (u32 ei = 0; ei < block.effects.len; ei++) {
+            REQUIRE_LT(block.effects[ei].value_index, mir->functions[0].values.len);
+            CHECK_EQ(static_cast<u8>(mir->functions[0].values[block.effects[ei].value_index].kind),
+                     static_cast<u8>(MirValueKind::CacheSet));
+        }
+    }
+    CHECK_EQ(effect_count, 1u);
+}
+
+TEST(frontend, cache_set_is_accepted_in_a_match_arm_body) {
+    const char* src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    match req.http11 {
+        true => {
+            buckets.set(req.remoteAddr, 1)
+            return 200
+        }
+        _ => return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& arms = hir->routes[0].control.match_arms;
+    REQUIRE_EQ(arms.len, 2u);
+    CHECK_EQ(arms[0].effect_expr_indices.len, 1u);
+    CHECK_EQ(arms[1].effect_expr_indices.len, 0u);
+}
+
 TEST(frontend, cache_set_is_statement_only_no_expression_escape) {
     // `let _ = b.set(...)` after a guard would materialize at handler entry
     // and write on rejected requests — set is not an expression anywhere.
@@ -1797,6 +1869,18 @@ TEST(frontend, cache_ops_rejected_in_wait_routes) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* branch_set_after_wait =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { wait(1000) if req.http11 { b.set(req.remoteAddr, 1) return "
+        "200 } else { return 505 } }\n";
+    lexed = lex(lit(branch_set_after_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.len != 0);
 
@@ -30289,6 +30373,38 @@ TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, branch_cache_effects_recover_fallible_local_on_all_paths) {
+    // Branch-local effects are part of error-recovery analysis. Both selected
+    // paths coalesce the fallible carrier before storing it, so the automatic
+    // state-0 500 prelude must not intercept the programmed returns.
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(1, fallback()) "
+        "if req.http11 { buckets.set(req.remoteAddr, i64(value.or(0))) return 200 } "
+        "else { buckets.set(req.remoteAddr, i64(value.or(0))) return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, conditional_branch_cache_recovery_keeps_prelude_for_uncovered_sibling) {
+    // Recovery in only one selected effect is not enough: the sibling can
+    // return success without consuming the carrier's error, so the prelude
+    // remains. This guards the all-control-path requirement.
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(1, fallback()) "
+        "if req.http11 { buckets.set(req.remoteAddr, i64(value.or(0))) return 200 } "
+        "else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
     rir.destroy();
 }
 

@@ -901,16 +901,20 @@ TEST(jit, frontend_rut_gcra_token_bucket_executes) {
     // THE capstone: the complete GCRA token bucket from
     // examples/ratelimit.rut, written entirely in Rut, executing under the
     // JIT. emit == tau → two conforming requests, third rejected; another
-    // IP has independent state. (Always-update variant: state writes run
-    // at handler entry.)
+    // IP has independent state. The successor is committed only in the
+    // conforming branch, matching the built-in limiter on rejection.
     const auto src = R"rut(
 let buckets = Cache<IP, i64>(capacity: 4096)
 
 route GET "/users" {
     let now = time.nowMicros()
     let tat = max(buckets.get(req.remoteAddr).or(0), now)
-    buckets.set(req.remoteAddr, tat + 600000000)
-    if tat - now <= 600000000 { return 200 } else { return 429 }
+    if tat - now <= 600000000 {
+        buckets.set(req.remoteAddr, tat + 600000000)
+        return 200
+    } else {
+        return 429
+    }
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -1265,6 +1269,72 @@ route GET "/users" {
     conn.peer_addr = 0x0A000001;
     auto other = call();
     CHECK_EQ(other.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_cache_branch_write_only_meters_accepted_requests) {
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 1024)
+
+route GET "/users" {
+    guard req.http11 else { return 505 }
+    let prev = buckets.get(req.remoteAddr).or(0)
+    if prev < 2 {
+        guard req.http11 else { return 505 }
+        buckets.set(req.remoteAddr, prev + 1)
+        return 200
+    } else {
+        return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    cache_registry_set_seed(0xB4A4C4u);
+    const u32 caps[1] = {1024};
+    const u64 idents[1] = {cache_instance_identity("branch-buckets", 14)};
+    cache_registry_publish(caps, idents, 1);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0A00002Bu;
+    auto call = [&]() {
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(kGetApiRequest),
+                                             sizeof(kGetApiRequest) - 1,
+                                             nullptr));
+    };
+    CHECK_EQ(call().status_code, 200);
+    CHECK_EQ(call().status_code, 200);
+    CHECK_EQ(call().status_code, 429);
+    CHECK_EQ(call().status_code, 429);
+
+    // Rejected calls do not execute the accepted branch's CacheSet.
+    u8 probe_has = 0;
+    i64 probe_val = 0;
+    rut_helper_cache_get(0, conn.peer_addr, &probe_has, &probe_val);
+    CHECK_EQ(probe_has, 1);
+    CHECK_EQ(probe_val, 2);
 
     engine.shutdown();
     rir.destroy();

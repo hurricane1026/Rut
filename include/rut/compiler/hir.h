@@ -820,6 +820,11 @@ struct HirMatchArm {
     bool has_arm_guard = false;
     HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
+    // Source-ordered side effects that execute after this arm's prelude
+    // guards and immediately before its terminal body. Entries index the
+    // owning HirRoute::exprs pool. CacheSet is the only supported effect.
+    static constexpr u32 kMaxEffects = 2;
+    FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
     HirExpr cond{};
@@ -1024,9 +1029,9 @@ struct HirRoute {
     // Analysis-only flags (never serialized). cache_ops_blocked: the route
     // body contains a wait, so CacheGet/CacheSet are rejected (locals
     // re-materialize on resume — the op would run after the wait).
-    // cache_set_stmt_ok: one-shot permission set by the bare-statement path
-    // and consumed by the cache.set receiver — everywhere else a set is an
-    // error (its eager-lowered value position would run on non-taken paths).
+    // cache_set_stmt_ok: one-shot permission set by a supported bare-statement
+    // path and consumed by the cache.set receiver. A set remains illegal in
+    // value position, where eager lowering could run it on non-taken paths.
     bool cache_ops_blocked = false;
     bool cache_set_stmt_ok = false;
     // Analysis-only (never serialized): the route body contains a wait, so

@@ -10,11 +10,9 @@
 //  - time.nowMicros() is LATCHED per request: every use sees the same value.
 //  - Cache is lossy per-key state: a miss means never-seen OR evicted — the
 //    .or(0) fallback treats both as "fresh key", which is self-healing here.
-//  - State writes (buckets.set) run at handler entry and must appear before
-//    any guard/wait — this variant therefore ALWAYS meters a request, so a
-//    client that keeps hammering while over limit pushes its own release
-//    time further out (a punitive token bucket; conditional "meter only on
-//    accept" needs branch-local writes, a future slice).
+//  - A leading Cache.set meters every attempt. A set in a selected if/match
+//    branch runs only on that branch; both examples below commit only accepted
+//    requests, matching the built-in limiter's rejection behavior.
 //  - Per-shard state: the effective limit is ≈ limit × shard count.
 
 let buckets = Cache<IP, i64>(capacity: 100000)
@@ -25,8 +23,12 @@ let buckets = Cache<IP, i64>(capacity: 100000)
 route GET "/api" {
     let now = time.nowMicros()
     let tat = max(buckets.get(req.remoteAddr).or(0), now)
-    buckets.set(req.remoteAddr, tat + 600000)
-    if tat - now <= 600000 { return 200 } else { return 429 }
+    if tat - now <= 600000 {
+        buckets.set(req.remoteAddr, tat + 600000)
+        return 200
+    } else {
+        return 429
+    }
 }
 
 // Fixed-window counter, packed into one i64 slot:
@@ -41,6 +43,10 @@ route GET "/search" {
     let packed = hits.get(req.remoteAddr).or(0)
     let same = bitwise.shiftRight(packed, 32) - win
     let count = max(bitwise.and(packed, 4294967295) * min(same + 1, 1), 0)
-    hits.set(req.remoteAddr, bitwise.or(bitwise.shiftLeft(win, 32), count + 1))
-    if count + 1 <= 100 { return 200 } else { return 429 }
+    if count + 1 <= 100 {
+        hits.set(req.remoteAddr, bitwise.or(bitwise.shiftLeft(win, 32), count + 1))
+        return 200
+    } else {
+        return 429
+    }
 }

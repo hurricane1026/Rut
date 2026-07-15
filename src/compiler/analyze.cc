@@ -9815,6 +9815,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             const auto& inner = *stmt.block_stmts[si];
             const bool is_last = si + 1 == stmt.block_stmts.len;
             if (inner.kind == AstStmtKind::Let) {
+                if (arm->effect_expr_indices.len != 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 HirLocal local{};
                 local.span = inner.span;
@@ -9862,6 +9864,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 continue;
             }
             if (inner.kind == AstStmtKind::Guard) {
+                if (arm->effect_expr_indices.len != 0)
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 HirGuard guard{};
                 guard.span = inner.span;
@@ -9967,6 +9971,32 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         scoped_locals.len = local.ref_index + 1;
                     scoped_locals[local.ref_index] = local;
                 }
+                continue;
+            }
+            if (inner.kind == AstStmtKind::Expr) {
+                if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                // Unlike route-entry CacheSet carriers, arm effects are kept
+                // on the selected control-flow block and materialized there.
+                // Wait routes still reject Cache operations because resume
+                // rematerialization has no per-state effect model yet; static
+                // for routes use a separate unrolled step graph and are kept
+                // out of this first branch-effect slice as well.
+                if (route->cache_ops_blocked || route->for_loops.len != 0)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
+                route->cache_set_stmt_ok = true;
+                const u32 guards_before_set = route->guards.len;
+                auto value = analyze_expr(
+                    inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
+                route->cache_set_stmt_ok = false;
+                if (!value) return core::make_unexpected(value.error());
+                if (route->guards.len > guards_before_set || value->kind != HirExprKind::CacheSet)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
+                if (!route->exprs.push(value.value()))
+                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                if (!arm->effect_expr_indices.push(route->exprs.len - 1))
+                    return frontend_error(FrontendError::TooManyItems, inner.span);
                 continue;
             }
             if (!is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
