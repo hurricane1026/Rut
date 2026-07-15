@@ -4060,9 +4060,25 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 if (bi >= mir.functions[i].blocks.len) return false;
                 if (memo[bi] != -1) return memo[bi] == 1;
                 memo[bi] = 0;  // revisit-while-computing reads as false
-                const auto& term = mir.functions[i].blocks[bi].term;
+                const auto& block = mir.functions[i].blocks[bi];
+                const auto& term = block.term;
                 bool covered = false;
-                if (term.kind == MirTerminatorKind::Branch) {
+                // Effects execute whenever their owning block is selected. A
+                // recovering effect therefore covers this path before the
+                // terminator; sibling blocks are handled independently by the
+                // recursive all-paths check.
+                for (u32 ei = 0; ei < block.effects.len; ei++) {
+                    const u32 value_index = block.effects[ei].value_index;
+                    if (value_index >= mir.functions[i].values.len) continue;
+                    const auto* effect = &mir.functions[i].values[value_index];
+                    if (RecoveryScan::contains_recovering_use(
+                            effect, ci, /*match_presence=*/true) ||
+                        RecoveryScan::recovers_on_all_paths(effect, ci)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered && term.kind == MirTerminatorKind::Branch) {
                     // A match/use_cmp SUBJECT recovers the same way a plain
                     // condition does — directly guard-shaped or covered on
                     // every evaluation path.
@@ -4073,7 +4089,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         covered = true;
                     else
                         covered = self(self, term.then_block) && self(self, term.else_block);
-                } else if (term.kind == MirTerminatorKind::YieldTimer &&
+                } else if (!covered && term.kind == MirTerminatorKind::YieldTimer &&
                            mir.functions[i].has_explicit_resume_blocks &&
                            term.yield_next_state <= mir.functions[i].waits.len) {
                     covered = self(self, mir.functions[i].resume_blocks[term.yield_next_state]);
@@ -4210,7 +4226,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 if (!error_reachable[bi]) continue;
-                const auto& term = mir.functions[i].blocks[bi].term;
+                const auto& block = mir.functions[i].blocks[bi];
+                for (u32 ei = 0; ei < block.effects.len; ei++) {
+                    const u32 value_index = block.effects[ei].value_index;
+                    if (value_index >= mir.functions[i].values.len) continue;
+                    if (RecoveryScan::contains_non_recovering_use(
+                            &mir.functions[i].values[value_index],
+                            ci,
+                            /*top_level_cond=*/false))
+                        return true;
+                }
+                const auto& term = block.term;
                 // The complex if-let form lowers to a match whose usable-value
                 // test is the match SUBJECT (`use_cmp && term.lhs =
                 // HasValue(local)`). Like a plain guard condition, that subject

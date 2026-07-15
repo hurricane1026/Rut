@@ -30376,6 +30376,38 @@ TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
     rir.destroy();
 }
 
+TEST(frontend, branch_cache_effects_recover_fallible_local_on_all_paths) {
+    // Branch-local effects are part of error-recovery analysis. Both selected
+    // paths coalesce the fallible carrier before storing it, so the automatic
+    // state-0 500 prelude must not intercept the programmed returns.
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(1, fallback()) "
+        "if req.http11 { buckets.set(req.remoteAddr, i64(value.or(0))) return 200 } "
+        "else { buckets.set(req.remoteAddr, i64(value.or(0))) return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, conditional_branch_cache_recovery_keeps_prelude_for_uncovered_sibling) {
+    // Recovery in only one selected effect is not enough: the sibling can
+    // return success without consuming the carrier's error, so the prelude
+    // remains. This guards the all-control-path requirement.
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(1, fallback()) "
+        "if req.http11 { buckets.set(req.remoteAddr, i64(value.or(0))) return 200 } "
+        "else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
 TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_path) {
     // Mixed case: the SAME error-carrier local is guard-let-recovered in one
     // branch but only COMPARED in a sibling branch. The prelude is emitted once
