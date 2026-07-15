@@ -90,7 +90,16 @@ tidy() {
         ! -path '*/simd/neon.cc' \
         ! -path '*/simd/sve.cc' | \
         grep -v third_party)
-    clang-tidy -p "$BUILD_DIR" $src_cc 2>&1 | grep -E "warning:|error:" || echo "No issues found."
+    # Match CI exactly (ci.yml): bugprone-*/performance-* are hard errors and
+    # the exit code must gate `./dev.sh all` — the old grep-only form let
+    # CI-fatal findings pass silently on developer machines.
+    if clang-tidy -p "$BUILD_DIR" --warnings-as-errors='bugprone-*,performance-*' \
+        $src_cc 2>&1 | tee /tmp/rut-tidy.log; then
+        echo "No tidy errors (warnings, if any, are in /tmp/rut-tidy.log)."
+    else
+        echo "clang-tidy FAILED (full log: /tmp/rut-tidy.log)"
+        return 1
+    fi
 }
 
 # ---- clang-format (check) ----
