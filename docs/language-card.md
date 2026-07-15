@@ -341,11 +341,13 @@ route GET "/api" {                                   // GCRA token bucket
 }
 ```
 
-Same admission behavior as `@rateLimit` for equivalent configs (verified by
-e2e); this form is for CUSTOM policies (per-tier limits, composite
-conditions). Note: state writes run at handler entry, so this variant meters
-every request — over-limit clients push their own release time out. See
-examples/ratelimit.rut for the packed sliding-window variant.
+For equivalent parameters, this matches `@rateLimit` through the first
+over-limit decision (verified by e2e). After a rejection the behaviors differ:
+this form writes before deciding, so rejected requests advance TAT and make it
+more punitive; `@rateLimit` does not update its bucket on rejection. This form
+is for CUSTOM policies (per-tier limits, composite conditions). See
+examples/ratelimit.rut for the packed fixed-window variant, which permits
+boundary bursts and is not a sliding-window limit.
 
 ## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
 

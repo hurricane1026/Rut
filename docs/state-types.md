@@ -12,14 +12,14 @@ docs/language-card.md; implementation mechanics live beside their code
 
 **An algorithm either can be written by users in Rut, or it does not go
 into the language.** Full inlining + one thread per shard means Rut-written
-GCRA/sliding-window compiles to straight-line arithmetic plus one slot
+GCRA/fixed-window compiles to straight-line arithmetic plus one slot
 access — C++-built-in performance; the read-modify-write is race-free by
 construction WITHIN a shard (single thread, no suspension between get and
 set — wait routes reject cache ops). Cross-shard exactness is explicitly
 out of scope until a strict table + owner-shard atomic update exist
 (DESIGN.md §3.3.6). Therefore the runtime keeps only irreducible substrate
 (keyed state slots, LPM tries, bloom bit math, coalescing); token bucket,
-sliding window, and gauge logic are `.rut` library code
+fixed window, and gauge logic are `.rut` library code
 (`examples/ratelimit.rut`). `Counter<K>` is deleted from the taxonomy;
 `@rateLimit`/`@throttle` stay, and can later re-sugar over the library.
 

@@ -750,7 +750,7 @@ route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return
 }
 
 TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
-    // The packed sliding-window shape end-to-end at runtime: pack a window
+    // The packed fixed-window shape end-to-end at runtime: pack a window
     // index and a count into one i64, unpack both, and check 64-bit shift
     // saturation with a runtime amount.
     const char* src =

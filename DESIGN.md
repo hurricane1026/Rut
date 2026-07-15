@@ -623,7 +623,7 @@ call arguments (see §3.2.1), not as response construction.
 
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is
 > restructured around "algorithms in Rut, primitives in the runtime".
-> `Counter<K>` is deleted — token bucket / sliding window are `.rut`
+> `Counter<K>` is deleted — token bucket / fixed window are `.rut`
 > library code over `Cache` (see `examples/ratelimit.rut`). Gauge-style
 > in-flight counting will get an exact Array-style table, not lossy slots.
 
@@ -702,7 +702,7 @@ Compiler picks implementation by element type: `Set<IP>` / `Set<string>` → has
 `Set<CIDR>` → LPM trie (longest prefix match tree).
 
 **Rate limiting** is not a state type: GCRA token buckets and packed
-sliding windows are ordinary `.rut` code over `Cache<K, i64>`. Working
+fixed windows are ordinary `.rut` code over `Cache<K, i64>`. Working
 examples and their real-socket parity test live in `examples/ratelimit.rut`;
 `@rateLimit` remains the concise built-in form.
 

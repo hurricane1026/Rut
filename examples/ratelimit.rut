@@ -2,8 +2,9 @@
 //
 // These are ordinary language constructs, not built-ins: per-key state lives
 // in a Cache slot, the algorithm is inline arithmetic. The compiler inlines
-// everything into the route's flat state machine, so this costs the same as
-// the C++ @rateLimit decorator (one hash-slot access + a few instructions).
+// everything into the route's flat state machine. Each request performs a
+// Cache get and set (two hash/probe operations), while the C++ @rateLimit
+// path updates one RateLimiter slot; measure before choosing on a hot path.
 //
 // Semantics to know:
 //  - time.nowMicros() is LATCHED per request: every use sees the same value.
@@ -28,9 +29,10 @@ route GET "/api" {
     if tat - now <= 600000 { return 200 } else { return 429 }
 }
 
-// Sliding-window counter, packed into one i64 slot:
+// Fixed-window counter, packed into one i64 slot:
 // high 32 bits = window index (now / window length), low 32 = count.
-// Window rollover is the lazy-expiry comparison — no TTL machinery.
+// Window rollover is the lazy-expiry comparison — no TTL machinery. This
+// deliberately permits boundary bursts; it is not a sliding-window limit.
 let hits = Cache<IP, i64>(capacity: 100000)
 
 route GET "/search" {
