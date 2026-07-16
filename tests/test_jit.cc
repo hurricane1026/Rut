@@ -19491,6 +19491,54 @@ TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
     rir.destroy();
 }
 
+TEST(jit, fail_closed_pre_reject_runs_before_later_error_recovery) {
+    // The carrier errors whenever X-Pick is absent. HTTP/1.0 takes a benign
+    // 403 pre-reject before recovery; HTTP/1.1 continues to guard-let, which
+    // turns that same error into 401. Neither path may be intercepted by the
+    // automatic state-0 500 prelude.
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.header(\"X-Pick\") == \"ok\")) "
+        "guard req.http11 else { return 403 } "
+        "guard let value else { return 401 } return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char rejected[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(rejected), sizeof(rejected) - 1, nullptr));
+    CHECK_EQ(r.status_code, 403);
+
+    static const char recovered[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(recovered), sizeof(recovered) - 1, nullptr));
+    CHECK_EQ(r.status_code, 401);
+
+    static const char accepted[] = "GET /version HTTP/1.1\r\nHost: localhost\r\nX-Pick: ok\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(accepted), sizeof(accepted) - 1, nullptr));
+    CHECK_EQ(r.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, nil_presence_test_stored_in_local_consumes_runtime_error) {
     // Value-position presence test: `let missing = value == nil` consumes the
     // error the same way the branch-condition form does — the stored bool is

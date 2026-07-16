@@ -49,7 +49,7 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   HasValue(LocalRef) guard condition as a recovering use, so the prelude
   skips locals whose error the guard consumes (e2e: pick(req.http11) ->
   200 / guard else 401).
-- [ ] Error-prelude suppression: upgrade the linear-dominance walk to real
+- [x] Error-prelude suppression: upgrade the linear-dominance walk to real
   per-local exit-dominance so a recovery behind a benign pre-reject
   (`guard ok else { return 403 }` before `wait`/recovery) can suppress the
   prelude WITHOUT letting a terminating sibling that returns success mask
@@ -87,9 +87,9 @@ produce the documented fix-its; `./dev.sh test` green.
 without presenting lossy or per-shard state as exact shared state.
 
 **Work**:
-- Lower `Cache.set` at its branch position instead of only in the route-entry
+- [x] Lower `Cache.set` at its branch position instead of only in the route-entry
   prelude. This enables a Rut limiter to commit the successor only on its
-  accepted branch; the shipped example currently meters every attempt.
+  accepted branch; the shipped example now demonstrates that policy.
 - Design the strict, visible-failure `Hash` table and an owner-shard atomic
   update primitive before offering exact cross-shard rate limiting or state
   whose absence would be incorrect.
@@ -104,6 +104,9 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] Error-prelude exit-dominance now treats literal 4xx/5xx pre-rejects as
+  fail-closed while keeping the prelude for success, redirect, dynamic, and
+  forward exits that do not recover a fallible local.
 - [x] Parser stack-frame slimming moved route statements and match-arm patterns
   into pools, fixing the gcc 16.1 Debug overflow; further slimming is only
   needed if frames grow again (PR #166).
@@ -115,7 +118,7 @@ without presenting lossy or per-shard state as exact shared state.
   arithmetic/bitwise operations and `time.nowMicros()` support Rut-written
   rate-limit algorithms.
 - [x] `examples/ratelimit.rut` demonstrates GCRA and fixed-window limiting over
-  `Cache`; branch-local conditional Cache writes remain a separate follow-up.
+  `Cache`; branch-local conditional writes support meter-on-accept policies.
 - [x] epoll partial-send proactor semantics and recv-buffer integration.
 - [x] io_uring timerfd timeout events and provided-buffer return path.
 - [x] Shard runtime integration: per-core EventLoop, TimerWheel, route table, upstream pool, SlicePool, and SlabPool.
