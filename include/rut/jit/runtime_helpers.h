@@ -184,6 +184,9 @@ void rut_helper_resp_header(void* conn,
 // a no-op (defensive; analyze bounds the index at compile time).
 void rut_helper_cache_get(rut::u32 instance, rut::u32 key_ip, rut::u8* out_has, rut::i64* out_val);
 void rut_helper_cache_set(rut::u32 instance, rut::u32 key_ip, rut::i64 val);
+// Harness/shard-lifecycle hook: destroy every Cache table owned by the current
+// thread. It never mutates the process registry or another shard's state.
+void rut_helper_cache_reset_local_state();
 // ── Time ──
 // Monotonic microseconds (fresh clock_gettime with a thread-local clamp).
 // Backs the `time.nowMicros()` builtin.

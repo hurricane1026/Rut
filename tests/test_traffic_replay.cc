@@ -1,5 +1,6 @@
 // Tests for traffic replay: ReplayReader, replay_one, replay_file.
 #include "fault_injection.h"
+#include "rut/harness/replay_driver.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/traffic_replay.h"
 #include "test.h"
@@ -237,6 +238,68 @@ TEST(replay_one, multiple_sequential) {
     }
 }
 
+TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    SmallLoop matched_loop;
+    matched_loop.setup();
+    const auto matched = harness::drive_replay_one(
+        matched_loop, make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200), 42, spec);
+    CHECK_EQ(matched.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(matched.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(matched.harness.semantic_events, 1u);
+
+    SmallLoop mismatched_loop;
+    mismatched_loop.setup();
+    const auto mismatched = harness::drive_replay_one(
+        mismatched_loop,
+        make_captured_request("GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 404),
+        43,
+        spec);
+    CHECK_EQ(mismatched.harness.outcome, harness::Outcome::Mismatched);
+    CHECK(mismatched.replay.replayed);
+
+    SmallLoop exhausted_loop;
+    exhausted_loop.setup();
+    exhausted_loop.free_top = 0;
+    const auto failed = harness::drive_replay_one(
+        exhausted_loop,
+        make_captured_request("GET /fail HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        44,
+        spec);
+    CHECK_EQ(failed.harness.outcome, harness::Outcome::Failed);
+    CHECK(!failed.replay.replayed);
+    CHECK(!failed.replay.skipped);
+}
+
+static bool reject_replay_observation(void*, const harness::Observation&) {
+    return false;
+}
+
+TEST(harness_replay, enforces_input_limit_and_oracle) {
+    SmallLoop loop;
+    loop.setup();
+    const CaptureEntry entry = make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+
+    harness::HarnessSpec limited_spec{};
+    limited_spec.layer = harness::ExecutionLayer::Connection;
+    limited_spec.limits.max_input_bytes = 1;
+    const auto limited = harness::drive_replay_one(loop, entry, 42, limited_spec);
+    CHECK_EQ(limited.harness.outcome, harness::Outcome::Failed);
+    CHECK(limited.harness.has_reached_limit);
+    CHECK_EQ(limited.harness.reached_limit, harness::LimitKind::InputBytes);
+
+    harness::HarnessSpec oracle_spec{};
+    oracle_spec.layer = harness::ExecutionLayer::Connection;
+    oracle_spec.observations.observe = &reject_replay_observation;
+    const auto rejected = harness::drive_replay_one(loop, entry, 43, oracle_spec);
+    CHECK_EQ(rejected.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(rejected.harness.cleanup, harness::CleanupOutcome::Clean);
+}
+
 // === replay_file ===
 
 TEST(replay_file, full_roundtrip) {
@@ -295,6 +358,30 @@ TEST(replay_file, with_mismatches) {
 
     reader.close();
     tmp.cleanup();
+}
+
+TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
+    CaptureEntry entries[3];
+    entries[0] = make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    entries[2] = make_captured_request("GET /ok2 HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 3));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    SmallLoop loop;
+    loop.setup();
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+
+    const auto result = harness::drive_replay_file(loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(result.harness.semantic_events, 3u);
+    CHECK_EQ(result.replay.total, 3u);
+    CHECK_EQ(result.replay.matched, 2u);
+    CHECK_EQ(result.replay.mismatched, 1u);
+    reader.close();
 }
 
 TEST(replay_file, empty_capture) {
@@ -888,6 +975,15 @@ TEST(replay_gap, replay_one_proxy_route_not_replayed) {
     CHECK_EQ(result.expected_status, 200);
     CHECK_EQ(result.actual_status, 0);
     CHECK(!result.status_match);
+
+    RoutedLoop harness_loop;
+    harness_loop.setup(&cfg);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    const auto adapted = harness::drive_replay_one(harness_loop.loop, entry, 43, spec);
+    CHECK_EQ(adapted.harness.outcome, harness::Outcome::Unsupported);
+    CHECK_EQ(adapted.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(adapted.replay.skipped);
 }
 
 TEST(replay_gap, replay_file_proxy_route_counted_as_skipped) {

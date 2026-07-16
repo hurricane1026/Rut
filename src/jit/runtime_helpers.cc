@@ -569,13 +569,25 @@ struct ShardCacheTables {
     rut::u32 birth_generations[rut::CacheRegistry::kMaxInstances] = {};
     rut::u32 generation = 0;
     bool alloc_failed_logged[rut::CacheRegistry::kMaxInstances] = {};
-    ~ShardCacheTables() {
+    void reset() {
         for (auto& t : tables) t.destroy();
+        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+            identities[i] = 0;
+            birth_generations[i] = 0;
+            alloc_failed_logged[i] = false;
+        }
+        generation = 0;
     }
+    ~ShardCacheTables() { reset(); }
 };
 
+ShardCacheTables& shard_cache_tables() {
+    static thread_local ShardCacheTables state;
+    return state;
+}
+
 rut::CacheTable* cache_table_for(rut::u32 instance) {
-    static thread_local ShardCacheTables t_state;
+    ShardCacheTables& t_state = shard_cache_tables();
     auto* t_tables = t_state.tables;
     auto* t_identities = t_state.identities;
     auto* t_birth_generations = t_state.birth_generations;
@@ -684,6 +696,10 @@ void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
 void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
     rut::CacheTable* t = cache_table_for(instance);
     if (t != nullptr) t->set(key_ip, val);
+}
+
+void rut_helper_cache_reset_local_state() {
+    shard_cache_tables().reset();
 }
 
 // ── String Operations ──────────────────────────────────────────────

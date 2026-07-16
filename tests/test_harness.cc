@@ -1,0 +1,659 @@
+#include "rut/harness/core.h"
+#include "test.h"
+#if RUT_ENABLE_JIT_TESTS
+#include "fault_injection.h"
+#include "rut/harness/connection_execution.h"
+#include "rut/harness/handler_execution.h"
+#include "rut/harness/scenario_driver.h"
+#include "rut/harness/scripted_environment.h"
+#include "rut/harness/source_target.h"
+#endif
+
+#include <cstring>
+
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+using namespace rut;
+
+TEST(harness_core, validates_capabilities_and_limits) {
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+    spec.required_capabilities =
+        harness::Capability::VirtualTime | harness::Capability::SyntheticIo;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto result = harness::validate_spec(spec);
+    CHECK_EQ(result.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.phase, harness::Phase::Complete);
+    CHECK_EQ(result.cleanup, harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_core, reports_missing_capabilities_as_unsupported) {
+    harness::HarnessSpec spec{};
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::IoUring);
+    spec.environment_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+
+    const auto result = harness::validate_spec(spec);
+    CHECK_EQ(result.outcome, harness::Outcome::Unsupported);
+    CHECK_EQ(result.phase, harness::Phase::Prepare);
+    CHECK(result.missing_capabilities.has(harness::Capability::IoUring));
+    CHECK(std::strcmp(result.detail, "environment capability missing") == 0);
+}
+
+TEST(harness_core, rejects_zero_limits) {
+    harness::HarnessSpec spec{};
+    spec.limits.max_handler_resumes = 0;
+
+    const auto result = harness::validate_spec(spec);
+    CHECK_EQ(result.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.phase, harness::Phase::Prepare);
+    CHECK(std::strcmp(result.detail, "run limits must be non-zero") == 0);
+}
+
+TEST(harness_core, stable_names_cover_public_enums) {
+    CHECK(std::strcmp(harness::layer_name(harness::ExecutionLayer::Connection), "connection") == 0);
+    CHECK(std::strcmp(harness::phase_name(harness::Phase::Quiesce), "quiesce") == 0);
+    CHECK(std::strcmp(harness::outcome_name(harness::Outcome::Stalled), "stalled") == 0);
+    CHECK(std::strcmp(harness::capability_name(harness::Capability::ScriptedFaults),
+                      "scripted-faults") == 0);
+    CHECK(std::strcmp(harness::limit_name(harness::LimitKind::HandlerResumes), "handler-resumes") ==
+          0);
+}
+
+#if RUT_ENABLE_JIT_TESTS
+namespace {
+
+u64 immediate_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+u64 timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 25).pack();
+    if (ctx->state == 1 && ctx->resume_event_kind == static_cast<u32>(jit::YieldKind::Timer) &&
+        ctx->resume_event_result == 0)
+        return jit::HandlerResult::make_status(205).pack();
+    return jit::HandlerResult::make_status(500).pack();
+}
+
+u64 recv_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0) return jit::HandlerResult::make_yield(1, jit::YieldKind::Recv).pack();
+    return jit::HandlerResult::make_status(206).pack();
+}
+
+u64 endless_timer_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 1).pack();
+}
+
+u64 targeted_upstream_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::UpstreamConnect, 1).pack();
+    return jit::HandlerResult::make_status(204).pack();
+}
+
+bool reject_yield(void*, const harness::Observation& event) {
+    return event.kind != harness::ObservationKind::HandlerYielded;
+}
+
+struct TempSource {
+    char path[64] = "/tmp/rut_harness_XXXXXX";
+
+    bool write(const char* source) {
+        const int fd = ::mkstemp(path);
+        if (fd < 0) return false;
+        u32 len = 0;
+        while (source[len]) len++;
+        u32 pos = 0;
+        while (pos < len) {
+            const ssize_t n = ::write(fd, source + pos, len - pos);
+            if (n <= 0) {
+                ::close(fd);
+                return false;
+            }
+            pos += static_cast<u32>(n);
+        }
+        return ::close(fd) == 0;
+    }
+
+    ~TempSource() {
+        if (path[0]) (void)::unlink(path);
+    }
+};
+
+}  // namespace
+
+TEST(harness_handler, completes_immediate_handler) {
+    harness::HandlerExecution execution{};
+    execution.init(&immediate_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(result.harness.handler_resumes, 0u);
+}
+
+TEST(harness_handler, advances_virtual_time_for_timer_yield) {
+    harness::HandlerExecution execution{};
+    execution.init(&timer_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 205);
+    CHECK_EQ(result.harness.handler_resumes, 1u);
+    CHECK_EQ(result.harness.virtual_time_us, 25000u);
+}
+
+TEST(harness_handler, stalls_when_yield_has_no_declared_event) {
+    harness::HandlerExecution execution{};
+    execution.init(&recv_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Stalled);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!result.has_terminal);
+}
+
+TEST(harness_handler, enforces_resume_limit) {
+    harness::HandlerExecution execution{};
+    execution.init(&endless_timer_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+    spec.limits.max_handler_resumes = 2;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(result.harness.has_reached_limit);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::HandlerResumes);
+    CHECK_EQ(result.harness.handler_resumes, 2u);
+}
+
+TEST(harness_handler, stops_when_observation_oracle_rejects_event) {
+    harness::HandlerExecution execution{};
+    execution.init(&timer_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+    spec.observations.observe = &reject_yield;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!result.has_terminal);
+    CHECK_EQ(result.harness.handler_resumes, 0u);
+}
+
+TEST(harness_handler, consumes_declared_completion_from_deterministic_environment) {
+    harness::HandlerExecution execution{};
+    execution.init(&recv_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Recv, 17, 100, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 206);
+    CHECK_EQ(result.consumed_events, 1u);
+    CHECK_EQ(result.harness.virtual_time_us, 100u);
+    // A run consumes an isolated copy, not the caller's reusable environment.
+    CHECK_EQ(environment.cursor, 0u);
+    CHECK_EQ(environment.now_us, 0u);
+}
+
+TEST(harness_handler, rejects_ambiguous_or_non_monotonic_completion_schedule) {
+    harness::HandlerExecution execution{};
+    execution.init(&recv_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Recv, 0, 100, 1},
+        {jit::YieldKind::Recv, 0, 100, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 2);
+    CHECK(!environment.schedule_valid);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_handler, stalls_when_script_targets_a_different_upstream) {
+    harness::HandlerExecution execution{};
+    execution.init(&targeted_upstream_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::UpstreamConnect, 0, 1, 1, 2},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Stalled);
+    CHECK_EQ(result.consumed_events, 0u);
+    CHECK_EQ(result.harness.virtual_time_us, 0u);
+}
+
+TEST(harness_connection, reports_and_resets_cleanup_invariants) {
+    harness::ConnectionExecution execution{};
+    execution.reset(0x7f000001u, 8080, 3);
+    CHECK_EQ(execution.invariant_violations(), 0u);
+    execution.connection.pending_ops = 1;
+    execution.connection.yield_armed = true;
+    const u64 violations = execution.invariant_violations();
+    CHECK((violations &
+           harness::invariant_bit(harness::ConnectionInvariant::NoPendingOperations)) != 0);
+    CHECK((violations & harness::invariant_bit(harness::ConnectionInvariant::NoArmedYield)) != 0);
+    execution.destroy();
+    CHECK_EQ(execution.invariant_violations(), 0u);
+}
+
+static harness::HarnessSpec scripted_scenario_harness(bool faults = false) {
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::Capability::SyntheticIo |
+                                 harness::Capability::VirtualTime |
+                                 harness::Capability::ScriptedUpstream;
+    if (faults) spec.required_capabilities.add(harness::Capability::ScriptedFaults);
+    spec.environment_capabilities = spec.required_capabilities;
+    return spec;
+}
+
+TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
+    TempSource source;
+    REQUIRE(
+        source.write("upstream api at \"127.0.0.1:9000\"\n"
+                     "route GET \"/x\" { wait(5) let ev = wait(upstream(api).connect()) if ev.ok { "
+                     "return 204 } else { return 502 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    harness::ScriptedEnvironment environment{};
+    REQUIRE(environment.add_upstream(jit::YieldKind::UpstreamConnect, 1, 0, 10000));
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 204};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(result.harness.virtual_time_us, 10000u);
+    CHECK_EQ(result.harness.handler_resumes, 2u);
+    CHECK_EQ(result.harness.fault_points_reached, 1u);
+    CHECK_EQ(result.harness.faults_injected, 0u);
+    CHECK_EQ(result.connection_invariant_violations, 0u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, scripted_upstream_recv_accounts_owned_data_and_limits) {
+    TempSource source;
+    REQUIRE(source.write(
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "route GET \"/stream\" { let ev = wait(upstream(api).recv()) if ev.result == 4 { "
+        "return 204 } else { return 502 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    harness::ScriptedEnvironment environment{};
+    const u8 response[] = {'p', 'o', 'n', 'g'};
+    REQUIRE(environment.add_upstream_recv(1, response, sizeof(response), 100));
+    const char request[] = "GET /stream HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/stream", 7};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 204};
+    auto spec = scripted_scenario_harness();
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(result.harness.input_bytes, scenario.request_len + sizeof(response));
+    CHECK_EQ(result.harness.backend_completions, 1u);
+    CHECK_EQ(result.harness.virtual_time_us, 100u);
+
+    spec.limits.max_input_bytes = scenario.request_len + sizeof(response) - 1;
+    const auto limited = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(limited.harness.outcome, harness::Outcome::Failed);
+    CHECK(limited.harness.has_reached_limit);
+    CHECK_EQ(limited.harness.reached_limit, harness::LimitKind::InputBytes);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, logical_fault_is_reproducible_after_state_reset) {
+    TempSource source;
+    REQUIRE(source.write(
+        "upstream api at \"127.0.0.1:9000\"\n"
+        "route GET \"/x\" { let ev = wait(upstream(api).connect()) if ev.ok { return 204 } "
+        "else { return 502 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    harness::ScriptedEnvironment environment{};
+    REQUIRE(environment.add_upstream(jit::YieldKind::UpstreamConnect, 1, 0, 10));
+    REQUIRE(environment.inject_fault(jit::YieldKind::UpstreamConnect, 1, -111, 1));
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.environment = &environment;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 502};
+    const auto spec = scripted_scenario_harness(true);
+
+    const auto first = harness::drive_scenario(scenario, spec);
+    const auto second = harness::drive_scenario(scenario, spec);
+    for (const auto* result : {&first, &second}) {
+        REQUIRE_EQ(result->harness.outcome, harness::Outcome::Passed);
+        REQUIRE(result->has_terminal);
+        CHECK_EQ(result->terminal.status_code, 502);
+        CHECK_EQ(result->harness.fault_points_reached, 1u);
+        CHECK_EQ(result->harness.faults_injected, 1u);
+        CHECK_EQ(result->harness.virtual_time_us, 10u);
+    }
+    // The reusable builder retains its definition, while mutable cursor/time
+    // state is rebuilt for each run.
+    CHECK_EQ(environment.runtime.cursor, 0u);
+    CHECK_EQ(environment.runtime.now_us, 0u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, rejects_undeclared_scripted_upstream_capability) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/x\" { return 204 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, real_source_timer_obeys_virtual_duration_limit) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/slow\" { wait(25) return 204 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    const char request[] = "GET /slow HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/slow", 5};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.limits.max_virtual_time_us = 10000;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK(result.harness.has_reached_limit);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::VirtualDuration);
+    CHECK_EQ(result.connection_invariant_violations, 0u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, cache_state_shares_within_group_and_resets_between_groups) {
+    TempSource source;
+    REQUIRE(source.write(
+        "let seen = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/cache\" { let prev = seen.get(req.remoteAddr).or(0) if prev == 0 { "
+        "seen.set(req.remoteAddr, 1) return 201 } else { return 200 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    const char request[] = "GET /cache HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioState state{};
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/cache", 6};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.peer_addr = 0x0a00002au;
+    scenario.state_isolation = harness::StateIsolation::Group;
+    scenario.state_group = 7;
+    scenario.state = &state;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto first = harness::drive_scenario(scenario, spec);
+    const auto second = harness::drive_scenario(scenario, spec);
+    REQUIRE(first.has_terminal);
+    REQUIRE(second.has_terminal);
+    CHECK_EQ(first.terminal.status_code, 201);
+    CHECK_EQ(second.terminal.status_code, 200);
+    CHECK_EQ(first.harness.state_resets, 1u);
+    CHECK_EQ(second.harness.state_resets, 0u);
+
+    scenario.state_group = 8;
+    const auto other_group = harness::drive_scenario(scenario, spec);
+    REQUIRE(other_group.has_terminal);
+    CHECK_EQ(other_group.terminal.status_code, 201);
+    CHECK_EQ(other_group.harness.state_resets, 1u);
+    state.reset();
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, run_isolation_resets_cache_for_every_item) {
+    TempSource source;
+    REQUIRE(source.write(
+        "let seen = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/cache\" { let prev = seen.get(req.remoteAddr).or(0) if prev == 0 { "
+        "seen.set(req.remoteAddr, 1) return 201 } else { return 200 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    const char request[] = "GET /cache HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/cache", 6};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.peer_addr = 0x0a00002au;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto first = harness::drive_scenario(scenario, spec);
+    const auto second = harness::drive_scenario(scenario, spec);
+    REQUIRE(first.has_terminal);
+    REQUIRE(second.has_terminal);
+    CHECK_EQ(first.terminal.status_code, 201);
+    CHECK_EQ(second.terminal.status_code, 201);
+    CHECK_EQ(first.harness.state_resets, 1u);
+    CHECK_EQ(second.harness.state_resets, 1u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, rate_limit_state_obeys_group_and_run_isolation) {
+    TempSource source;
+    REQUIRE(
+        source.write("@rateLimit(limit: 2, window: 1m)\nroute GET \"/limited\" { return 204 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    const char request[] = "GET /limited HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioState state{};
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/limited", 8};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.peer_addr = 0x0a00002au;
+    scenario.now_us = 100;
+    scenario.state_isolation = harness::StateIsolation::Group;
+    scenario.state_group = 1;
+    scenario.state = &state;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto first = harness::drive_scenario(scenario, spec);
+    const auto second = harness::drive_scenario(scenario, spec);
+    const auto third = harness::drive_scenario(scenario, spec);
+    REQUIRE(first.has_terminal);
+    REQUIRE(second.has_terminal);
+    REQUIRE(third.has_terminal);
+    CHECK_EQ(first.terminal.status_code, 204);
+    CHECK_EQ(second.terminal.status_code, 204);
+    CHECK_EQ(third.terminal.status_code, 429);
+
+    scenario.state_isolation = harness::StateIsolation::Run;
+    scenario.state = nullptr;
+    const auto isolated_a = harness::drive_scenario(scenario, spec);
+    const auto isolated_b = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(isolated_a.terminal.status_code, 204);
+    CHECK_EQ(isolated_b.terminal.status_code, 204);
+    state.reset();
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_source_target, prepares_production_loaded_program_and_cleans_up) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/health\" { return 204 }\n"));
+
+    harness::SourceTarget target{};
+    harness::HarnessSpec harness_spec{};
+    harness_spec.layer = harness::ExecutionLayer::Handler;
+    const harness::SourceTargetSpec target_spec{source.path, jit::OptLevel::O0};
+
+    const auto result = target.prepare(target_spec, harness_spec);
+    REQUIRE_EQ(result.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.phase, harness::Phase::Start);
+    CHECK(target.prepared);
+    CHECK(target.program.jit_inited);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+    CHECK(!target.prepared);
+    CHECK(!target.program.jit_inited);
+}
+
+TEST(harness_source_target, preserves_compile_failure_and_remains_destroyable) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/broken\" { return }\n"));
+
+    harness::SourceTarget target{};
+    harness::HarnessSpec harness_spec{};
+    const auto result = target.prepare({source.path, jit::OptLevel::O0}, harness_spec);
+    CHECK_EQ(result.outcome, harness::Outcome::Failed);
+    CHECK_EQ(result.phase, harness::Phase::Prepare);
+    CHECK_EQ(result.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!target.prepared);
+    CHECK(!target.program.jit_inited);
+    CHECK(result.detail[0] != '\0');
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_source_target, enforces_source_limit_before_loading) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/health\" { return 204 }\n"));
+
+    harness::SourceTarget target{};
+    harness::HarnessSpec harness_spec{};
+    harness_spec.limits.max_source_bytes = 1;
+    const auto result = target.prepare({source.path, jit::OptLevel::O0}, harness_spec);
+    CHECK_EQ(result.outcome, harness::Outcome::Failed);
+    CHECK(result.has_reached_limit);
+    CHECK_EQ(result.reached_limit, harness::LimitKind::SourceBytes);
+    CHECK_EQ(result.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!target.prepared);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_source_target, jit_memory_failure_is_reported_and_cleaned) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/health\" { return 204 }\n"));
+
+    harness::SourceTarget target{};
+    harness::HarnessSpec harness_spec{};
+    {
+        test_fault::ScopedMemoryFault fault(0, true);
+        const auto result = target.prepare({source.path, jit::OptLevel::O0}, harness_spec);
+        CHECK_EQ(result.outcome, harness::Outcome::Failed);
+        // ORC may materialize lazily at register-time symbol lookup.
+        CHECK(target.load_error.stage == LoadStage::JitCompile ||
+              target.load_error.stage == LoadStage::Codegen ||
+              target.load_error.stage == LoadStage::Register);
+        CHECK_EQ(result.cleanup, harness::CleanupOutcome::Clean);
+        CHECK(!target.program.jit_inited);
+    }
+    CHECK(!target.prepared);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+    CHECK(!target.program.jit_inited);
+}
+#endif
+
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}
