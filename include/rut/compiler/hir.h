@@ -106,6 +106,21 @@ enum class HirExprKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    // `req.set("Name", value)` statement effect. `str_value` is the validated
+    // literal header name; `lhs` is the plain string value. The expression
+    // echoes the value internally so it can use the existing effect/value
+    // materialization pipeline, but analyze forbids value-position use.
+    ReqSetHeader,
+    // `req.add("Name", "value")`: preserves existing same-named fields and
+    // appends one new field line.
+    ReqAddHeader,
+    // Compile-time Response builder. int_value is the validated status code;
+    // field_inits stores ordered literal response headers.
+    ResponseInit,
+    RespHeader,
+    RespSetHeader,
+    RespAddHeader,
+    RespRemoveHeader,
     ReqParam,
     ReqCookie,
     ReqQuery,
@@ -200,6 +215,9 @@ enum class HirTypeKind : u8 {
     // reference the shape through their existing `shape_index` rather than
     // mirroring inline fields.
     Array,
+    // A bounded response builder local. It is consumed by `return <local>` and
+    // does not have a runtime MIR carrier in the initial literal-only slice.
+    Response,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -436,7 +454,11 @@ struct HirExpr {
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
-    static constexpr u32 kMaxFieldInits = 8;
+    // Struct/object construction is still capped by the AST at 8 fields, but
+    // ResponseInit also uses this storage for its ordered literal header prefix.
+    // Match the language's existing 16-header terminator limit so builder syntax
+    // does not impose a smaller, surprising cap.
+    static constexpr u32 kMaxFieldInits = 16;
     // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
     // sits at ~300 KB on stack and is copied on each recursive
     // analyze_file_internal call (via `HirRoute scratch{}`). A 32-wide cap
@@ -822,7 +844,7 @@ struct HirMatchArm {
     BodyKind body_kind = BodyKind::Direct;
     // Source-ordered side effects that execute after this arm's prelude
     // guards and immediately before its terminal body. Entries index the
-    // owning HirRoute::exprs pool. CacheSet is the only supported effect.
+    // owning HirRoute::exprs pool. CacheSet and request-header mutations are supported.
     static constexpr u32 kMaxEffects = 2;
     FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
@@ -1034,6 +1056,9 @@ struct HirRoute {
     // value position, where eager lowering could run it on non-taken paths.
     bool cache_ops_blocked = false;
     bool cache_set_stmt_ok = false;
+    // One-shot permission for a bare `req.set(...)` statement. Like Cache.set,
+    // request mutation cannot escape into an eager/lazy value expression.
+    bool req_header_mutation_stmt_ok = false;
     // Analysis-only (never serialized): the route body contains a wait, so
     // time.nowMicros() is rejected — locals re-materialize on resume, and a
     // pre-wait timestamp binding would sample after the wait.

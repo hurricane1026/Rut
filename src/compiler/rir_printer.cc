@@ -202,6 +202,21 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqSetHeader:
             buf.put_cstr("req.set_header");
             break;
+        case Opcode::ReqAddHeader:
+            buf.put_cstr("req.add_header");
+            break;
+        case Opcode::RespHeader:
+            buf.put_cstr("resp.header");
+            break;
+        case Opcode::RespSetHeader:
+            buf.put_cstr("resp.set_header");
+            break;
+        case Opcode::RespAddHeader:
+            buf.put_cstr("resp.add_header");
+            break;
+        case Opcode::RespRemoveHeader:
+            buf.put_cstr("resp.remove_header");
+            break;
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
@@ -569,10 +584,18 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             // No operands.
             break;
         case Opcode::ReqSetHeader:
+        case Opcode::ReqAddHeader:
+        case Opcode::RespHeader:
+        case Opcode::RespSetHeader:
+        case Opcode::RespAddHeader:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::RespRemoveHeader:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::ReqSetPath:
         case Opcode::SextI64:

@@ -1695,6 +1695,30 @@ TEST(RirModule, MultipleFunctions) {
     ctx.destroy();
 }
 
+TEST(RirBuilder, ResponseHeaderOperandsRequireStringShapes) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("response_headers"), lit("/x"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+
+    auto integer = V(b.emit_const_i32(42));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_set_header(lit("X-Test"), integer)));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_add_header(lit("X-Test"), integer)));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_header(lit("X-Test"), integer)));
+
+    auto string = V(b.emit_const_str(lit("value")));
+    auto optional_string = V(b.emit_opt_wrap(string));
+    VOK(b.emit_resp_set_header(lit("X-Test"), string));
+    VOK(b.emit_resp_add_header(lit("X-Test"), string));
+    (void)V(b.emit_resp_header(lit("X-Test"), optional_string));
+
+    ctx.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

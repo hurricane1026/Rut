@@ -105,12 +105,12 @@ and turns Rut's strong typing + bounded execution into the product differentiato
 
 A `websocket(<upstream>)` call with **no trailing block** is passthrough (today's behavior,
 unchanged). A **trailing block** turns it into terminate mode — the block is the per-message
-handler. Per DESIGN.md §3.6, the block is a *compile-time construct*, not a closure; the
-current message is the implicit binding `frame`.
+handler. Per DESIGN.md §3.6, the block is a *compile-time construct*, not a closure; it
+explicitly declares the fixed current-message binding with `{ frame in ... }`.
 
 ```swift
 route GET "/ws" {
-    websocket(chat, maxMessageSize: 8kb) {   // ≤ ~16 KB in v1 (one slice; see §1.1)
+    websocket(chat, maxMessageSize: 8kb) { frame in   // ≤ ~16 KB in v1 (one slice; see §1.1)
         // runs once per (single-frame) Text/Binary message, both directions
         guard let text = frame.text else { return drop }   // .text is error-capable: not-Text → drop
         guard frame.len <= 4096 else { return close }      // bytes (see frame.len note in §4)
@@ -118,16 +118,13 @@ route GET "/ws" {
     }
 }
 ```
-(Route form: `route GET "/path" { … }` — a method is required. **Grammar note:** today main
-parses only `return websocket(<ident>)` (no block); the *proposed* Slice A (PR #144, not yet
-merged) adds the `return websocket(x) { … }` block form, where the terminator must be the
-route's last statement. The bare `websocket(x) { … }` shown here is the target spelling,
-pending the decision in §10.6.)
+(Route form: `route GET "/path" { … }` — a method is required. The implemented terminate form is
+`return websocket(x) { frame in … }`, and the terminator must be the route's last statement.)
 
 Direction-aware (one handler, distinguished by `frame.fromClient` — needs the §8 ABI bump):
 
 ```swift
-websocket(chat) {
+websocket(chat) { frame in
     if frame.fromClient {
         guard let _ = frame.text else { return drop }   // only police client→upstream
     }
@@ -138,7 +135,7 @@ websocket(chat) {
 Opcode dispatch via `match` (the unambiguous form — `frame.opcode` is only `.text`/`.binary`):
 
 ```swift
-websocket(chat) {
+websocket(chat) { frame in
     match frame.opcode {
         .text   => return forward
         .binary => return drop      // this app is text-only
@@ -154,7 +151,7 @@ websocket(chat, frame: => match frame.opcode { .text => forward, .binary => drop
 ```
 
 ### `maxMessageSize`
-**Implemented (optional kwarg).** `websocket(x, maxMessageSize: 8kb) { … }` parses the
+**Implemented (optional kwarg).** `websocket(x, maxMessageSize: 8kb) { frame in … }` parses the
 ByteSize (`IntLit` + a `b`/`kb`/`mb`/`gb` unit Ident, mirroring `@throttle`), carries it on
 `HirWsHandler.max_message_size`, and the loader passes it to `add_ws_terminate`. **Omitting it
 is allowed** — the loader falls back to the engine's single-slice cap (~16 KB), so a terminate
@@ -233,7 +230,7 @@ capability and Rut's mutation idiom already exists for requests (`req.bodyRaw = 
 surface:
 
 ```swift
-websocket(chat) {
+websocket(chat) { frame in
     guard let s = frame.text else { return forward }
     var redacted = s.redact(re"\b\d{16}\b")    // mutable local for the rewrite
     frame.text = redacted                       // rewrite payload before forwarding
@@ -268,7 +265,7 @@ Frame handler ABI:  WsFrameAction (*)(void* ctx, WsOpcode op, const u8* payload,
 No arena, no Response building, no async — the frame handler is a *pure verdict function*, so
 its codegen is a **subset** of the existing handler codegen. Stages:
 
-1. **Parse** — `websocket(<name>, <kwargs>) { <stmts> }` → a `WsTerminate` AST node carrying
+1. **Parse** — `websocket(<name>, <kwargs>) { frame in <stmts> }` → a `WsTerminate` AST node carrying
    a frame-handler statement block. Bare `websocket(<name>)` stays the existing
    `ForwardUpstream` (passthrough).
 2. **Type-check** — bind `frame` to a `Frame` type in the block's scope; allow only
@@ -322,7 +319,7 @@ output buffer lifts `reject_fragmented` without touching the size cap, and vice 
 
 | Slice | Layer | Deliverable | Size | Risk |
 |-------|-------|-------------|------|------|
-| **A** | parser | `websocket(x){…}` block → `WsTerminate` AST; bare form unchanged. (PR #144 — kwargs deferred; `maxMessageSize:` is added with D and must parse via the existing `IntLit + kb/mb` ByteSize path, since `8kb` is two tokens, not a single literal) | S | low |
+| **A** | parser | `websocket(x){ frame in…}` block → `WsTerminate` AST; bare form unchanged. (PR #144 — kwargs deferred; `maxMessageSize:` is added with D and must parse via the existing `IntLit + kb/mb` ByteSize path, since `8kb` is two tokens, not a single literal) | S | low |
 | **B** | type checker | `Frame` type + `frame.*` accessors + `forward`/`drop`/**bare `close`** verdicts + exhaustiveness. NO `close(code)` (needs the §8 runtime change) and NO `frame.fromClient` (needs the §8 ABI bump) in v1 | M | med (new typed object + terminator rules) |
 | **C** | RIR + JIT | frame-handler ABI emission (verdict function); map `frame.opcode/payload/len`→args | M | **highest** (new handler kind through codegen) |
 | **D** | compiler→runtime | emit `add_ws_terminate` with the JIT pointer (+ required `maxMessageSize`); passthrough unchanged | S | low |
@@ -361,7 +358,7 @@ runtime changes A–E deliberately avoid.
    require `frame.text?` / `match frame.opcode` at every site. *Leaning: error-capable — it
    keeps the guard idiom consistent with `req.body(User)`; confirm against the final optional
    semantics in DESIGN.md §3.3.7.*
-6. **`return websocket(x) { … }` vs bare `websocket(x) { … }`?** The current parser requires
+6. **`return websocket(x) { frame in … }` vs bare `websocket(x) { frame in … }`?** The current parser requires
    `return` for terminators and they must be the route body's last statement, so the proposed
    Slice A (PR #144) uses the `return` form. The examples here use the bare form (matching
    DESIGN.md's `websocket { }` sketch), which reads cleaner — only the frame verdicts are
@@ -371,7 +368,7 @@ runtime changes A–E deliberately avoid.
 7. **Pre-upgrade route logic on a terminate route?** `add_ws_terminate` makes a direct Proxy
    route with no HTTP handler, so route-body statements before the `websocket` terminator
    (auth, `guard`s, `@decorator`s) would be dropped. *Leaning: forbid them in v1 — the
-   `websocket(){}` block is the whole terminate route body — and add a JIT-route arm path later
+   `websocket(){ frame in}` block is the whole terminate route body — and add a JIT-route arm path later
    if pre-upgrade logic is needed (§7 Slice D caveat).*
 
 ---
@@ -385,7 +382,7 @@ are tagged with the §8 runtime item they need.
 // Chat moderation: drop profanity client→upstream, pass everything else.
 // (needs the direction slice for fromClient)
 route GET "/chat" {
-    websocket(chatBackend, maxMessageSize: 8kb) {
+    websocket(chatBackend, maxMessageSize: 8kb) { frame in
         guard frame.fromClient else { return forward }
         guard let text = frame.text else { return drop }   // .text errors for Binary → drop
         guard not text.matches(re"(?i)\b(badword|slur)\b") else { return drop }
@@ -396,7 +393,7 @@ route GET "/chat" {
 // API protection: every client message must be valid Order JSON, else close.
 // (needs the direction slice, JSON builtin, and the close(code) slice for the 1007 status)
 route GET "/orders/stream" {
-    websocket(orderService, maxMessageSize: 8kb) {
+    websocket(orderService, maxMessageSize: 8kb) { frame in
         if frame.fromClient {
             guard let order = frame.json else { return close(.invalidData) }  // 1007
             guard validate(order, OrderSchema) else { return close(.invalidData) }
@@ -407,7 +404,7 @@ route GET "/orders/stream" {
 
 // Pure v1 (no runtime changes): text-only, size-bounded, bare close.
 route GET "/echo" {
-    websocket(echoBackend, maxMessageSize: 4kb) {
+    websocket(echoBackend, maxMessageSize: 4kb) { frame in
         guard let _ = frame.text else { return close }   // bare close (forward leg: 1005; echo: 1000)
         return forward
     }

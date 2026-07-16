@@ -159,6 +159,22 @@ void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 // the outbound request later. Bounded per connection.
 void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_req_add_header(
+    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_resp_set_header(
+    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_resp_add_header(
+    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_resp_remove_header(void* conn, const char* name, rut::u32 nlen);
+void rut_helper_resp_header(void* conn,
+                            const char* name,
+                            rut::u32 nlen,
+                            rut::u8 fallback_has,
+                            const char* fallback_ptr,
+                            rut::u32 fallback_len,
+                            rut::u8* out_has,
+                            const char** out_ptr,
+                            rut::u32* out_len);
 
 // ── Cache state (DESIGN.md §3.3.6) ──
 // Per-shard lossy slot tables; `instance` indexes the process CacheRegistry

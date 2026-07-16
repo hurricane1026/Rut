@@ -115,6 +115,34 @@ TEST(set_header, replaces_all_duplicate_client_fields) {
     CHECK(__builtin_memcmp(d + c->req_header_end - 4, "\r\n\r\n", 4) == 0);
 }
 
+// Appending must preserve every client-supplied field and serialize one more
+// field before the terminating blank line.
+TEST(add_header, preserves_duplicate_client_fields_and_appends) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\nX-Tag: a\r\nX-Tag: b\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_header_overrides[0].name = Str{"X-Tag", 5};
+    c->req_header_overrides[0].value = Str{"tail", 4};
+    c->req_header_override_count = 1;
+    c->req_header_append_mask = 1;
+
+    CHECK(rut::apply_request_header_overrides(*c));
+    const u8* d = c->recv_buf.data();
+    const u32 n = c->recv_buf.len();
+    CHECK_EQ(count_occurrences(d, n, "X-Tag:"), 3u);
+    CHECK(buf_has(d, n, "X-Tag: a\r\n"));
+    CHECK(buf_has(d, n, "X-Tag: b\r\n"));
+    CHECK(buf_has(d, n, "X-Tag: tail\r\n\r\n"));
+    REQUIRE(c->req_header_end >= 4 && c->req_header_end <= n);
+    CHECK(__builtin_memcmp(d + c->req_header_end - 4, "\r\n\r\n", 4) == 0);
+}
+
 // Injecting a header absent from the request appends one line before the blank
 // line; a large value is serialized verbatim (no fixed scratch limit).
 TEST(set_header, injects_large_value_without_scratch_limit) {
@@ -15845,6 +15873,47 @@ TEST(async_coverage, early_response_on_proxy) {
     // At this point, body streaming or upstream response paths are active
     // Just verify no crash and state is consistent
     CHECK(conn->state == ConnState::Proxying || conn->state == ConnState::ReadingHeader);
+}
+
+TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
+    RouteConfig cfg{};
+    const char* keys[] = {"X-Base", "X-Keep", "X-Multi"};
+    const u32 key_lens[] = {6, 6, 7};
+    const char* values[] = {"base", "keep", "first"};
+    const u32 value_lens[] = {4, 4, 5};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 3), 1u);
+
+    Connection conn;
+    conn.reset();
+    auto add_mutation = [&](ConnectionBase::RespHeaderMutationMode mode,
+                            const char* name,
+                            u32 name_len,
+                            const char* value,
+                            u32 value_len) {
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, name_len};
+        mutation.value = {value, value_len};
+    };
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Set, "x-base", 6, "new", 3);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Remove, "x-keep", 6, nullptr, 0);
+
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+    REQUIRE_EQ(count, 3u);
+    CHECK((Str{out[0].key_data, out[0].key_len}.eq(Str{"X-Multi", 7})));
+    CHECK((Str{out[0].value_data, out[0].value_len}.eq(Str{"first", 5})));
+    CHECK((Str{out[1].key_data, out[1].key_len}.eq(Str{"x-base", 6})));
+    CHECK((Str{out[1].value_data, out[1].value_len}.eq(Str{"new", 3})));
+    CHECK((Str{out[2].key_data, out[2].key_len}.eq(Str{"X-Multi", 7})));
+    CHECK((Str{out[2].value_data, out[2].value_len}.eq(Str{"second", 6})));
+
+    conn.resp_header_mutation_overflow = true;
+    CHECK_FALSE(collect_effective_response_headers(
+        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
 int main(int argc, char** argv) {

@@ -1031,7 +1031,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
+    conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
+    conn.resp_header_mutation_count = 0;
+    conn.resp_header_mutation_overflow = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
     conn.upstream_keep_alive = false;
@@ -1470,6 +1473,54 @@ void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
     resume_jit_handler<Loop>(loop, conn);
 }
 
+inline bool collect_effective_response_headers(const Connection& conn,
+                                               const RouteConfig* cfg,
+                                               u16 static_set_index,
+                                               ResponseHeaderKV* out,
+                                               u32 capacity,
+                                               u32* out_count) {
+    *out_count = 0;
+    if (conn.resp_header_mutation_overflow) return false;
+    if (static_set_index != 0 && cfg != nullptr &&
+        static_set_index <= cfg->response_header_set_count) {
+        const auto& ref = cfg->response_header_sets[static_set_index - 1];
+        if (ref.count > capacity) return false;
+        for (u16 i = 0; i < ref.count; i++) {
+            out[*out_count] = {cfg->header_keys[ref.offset + i].data,
+                               cfg->header_keys[ref.offset + i].len,
+                               cfg->header_values[ref.offset + i].data,
+                               cfg->header_values[ref.offset + i].len};
+            (*out_count)++;
+        }
+    }
+    for (u32 mi = 0; mi < conn.resp_header_mutation_count; mi++) {
+        const auto& mutation = conn.resp_header_mutations[mi];
+        const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+        if (validate_response_header(mutation.name.ptr,
+                                     mutation.name.len,
+                                     remove ? "" : mutation.value.ptr,
+                                     remove ? 0 : mutation.value.len) != HttpHeaderValidation::Ok)
+            return false;
+        if (mutation.mode != Connection::RespHeaderMutationMode::Add) {
+            for (u32 i = 0; i < *out_count;) {
+                if (!http_header_name_eq_ci(
+                        out[i].key_data, out[i].key_len, mutation.name.ptr, mutation.name.len)) {
+                    i++;
+                    continue;
+                }
+                for (u32 move = i + 1; move < *out_count; move++) out[move - 1] = out[move];
+                (*out_count)--;
+            }
+        }
+        if (!remove) {
+            if (*out_count >= capacity) return false;
+            out[(*out_count)++] = {
+                mutation.name.ptr, mutation.name.len, mutation.value.ptr, mutation.value.len};
+        }
+    }
+    return true;
+}
+
 template <typename Loop>
 void handle_jit_outcome(Loop* loop,
                         Connection& conn,
@@ -1487,8 +1538,23 @@ void handle_jit_outcome(Loop* loop,
             const RouteConfig* cfg = conn.request_config;
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
-            const bool has_headers = outcome.response_headers_idx != 0 && cfg != nullptr &&
-                                     outcome.response_headers_idx <= cfg->response_header_set_count;
+            constexpr u32 kMaxEffectiveHeaders =
+                RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+            ResponseHeaderKV kvs[kMaxEffectiveHeaders];
+            u32 header_count = 0;
+            if (!collect_effective_response_headers(conn,
+                                                    cfg,
+                                                    outcome.response_headers_idx,
+                                                    kvs,
+                                                    kMaxEffectiveHeaders,
+                                                    &header_count)) {
+                conn.resp_status = 500;
+                conn.keep_alive = false;
+                format_static_response(conn, 500, false);
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             // Distinguish "user didn't supply a body" (body_idx == 0)
             // from "user supplied one but it's out of range" (a config
             // mismatch). The latter falls back to the reason-phrase
@@ -1496,20 +1562,7 @@ void handle_jit_outcome(Loop* loop,
             // — matches the no-headers path's documented behavior of
             // falling back rather than rendering garbage.
             const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
-            if (has_headers) {
-                // Materialise the header set into a stack-local KV
-                // array so the formatter takes a uniform view.
-                // RouteConfig::kMaxHeadersPerSet is enforced at
-                // add_response_header_set time, so ref.count can
-                // never exceed our buffer size — no silent truncation.
-                const auto& ref = cfg->response_header_sets[outcome.response_headers_idx - 1];
-                ResponseHeaderKV kvs[RouteConfig::kMaxHeadersPerSet];
-                for (u16 i = 0; i < ref.count; i++) {
-                    kvs[i].key_data = cfg->header_keys[ref.offset + i].data;
-                    kvs[i].key_len = cfg->header_keys[ref.offset + i].len;
-                    kvs[i].value_data = cfg->header_values[ref.offset + i].data;
-                    kvs[i].value_len = cfg->header_values[ref.offset + i].len;
-                }
+            if (header_count != 0) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
                 bool body_is_fallback = false;
@@ -1537,7 +1590,7 @@ void handle_jit_outcome(Loop* loop,
                                                       body_data,
                                                       body_len,
                                                       kvs,
-                                                      ref.count,
+                                                      header_count,
                                                       keep_alive,
                                                       body_is_fallback);
             } else if (has_body) {
@@ -2164,6 +2217,7 @@ inline bool apply_request_header_overrides(Connection& conn) {
     for (u32 oi = 0; oi < conn.req_header_override_count; oi++) {
         const Str name = conn.req_header_overrides[oi].name;
         const Str val = conn.req_header_overrides[oi].value;
+        const bool append = (conn.req_header_append_mask & (1u << oi)) != 0;
         // Validate at the choke point before any byte reaches the wire. The DSL
         // parser already validates literals at compile time, but overrides recorded
         // directly through RIR are otherwise unchecked — an empty/non-tchar name, a
@@ -2184,6 +2238,11 @@ inline bool apply_request_header_overrides(Connection& conn) {
 
         const u32 line_len = name.len + 2 + val.len + 2;
         u32 fs = 0, fe = 0, search_from = 0;
+        if (append) {
+            const u32 hbody = conn.req_header_end - 2;
+            if (!splice(hbody, 0, name, val, /*write_line=*/true)) return false;
+            continue;
+        }
         if (find_field(name, 0, &fs, &fe)) {
             if (!splice(fs, fe - fs, name, val, /*write_line=*/true)) return false;
             search_from = fs + line_len;  // skip the line we just wrote

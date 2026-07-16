@@ -1,5 +1,6 @@
 #include "rut/compiler/analyze.h"
 
+#include "rut/common/http_header_validation.h"
 #include "rut/common/shard_limits.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
@@ -32,6 +33,27 @@ static Str intern_generated_name(const std::string& value) {
 // Fix-it detail for bare guards on non-bool values (DESIGN.md §3.6).
 constexpr Str kGuardBoolDetail =
     lit_str("guard condition must be bool; to bind a value use `guard let x = ...`");
+constexpr Str kPipePlaceholderDetail = lit_str(
+    "right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
+    "where the value lands");
+constexpr Str kReqHeaderMutationDetail = lit_str(
+    "req.set/add expect literal safe header name and value strings, and may only be used as a "
+    "statement");
+constexpr Str kReqHeaderMutationOrderDetail = lit_str(
+    "req.set/add are currently supported only before guards/waits/for loops, or inside a "
+    "selected match arm");
+
+static bool pipe_stage_has_placeholder(const AstExpr& stage) {
+    if (stage.kind != AstExprKind::Call && stage.kind != AstExprKind::MethodCall) return false;
+    if (stage.kind == AstExprKind::MethodCall && stage.lhs != nullptr &&
+        stage.lhs->kind == AstExprKind::Placeholder)
+        return true;
+    for (u32 i = 0; i < stage.args.len; i++) {
+        if (stage.args[i] != nullptr && stage.args[i]->kind == AstExprKind::Placeholder)
+            return true;
+    }
+    return false;
+}
 // Fix-it details for the `bitwise` builtin namespace (DESIGN.md §3.2.1).
 constexpr Str kBitwiseMemberDetail = lit_str(
     "unknown bitwise function; use bitwise.and(a, b) / bitwise.or(a, b) / "
@@ -3824,6 +3846,97 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         return out;
     }
 
+    // Handle the two-argument request mutator before the generic
+    // `Type.case(payload)` probe below: that probe deliberately rejects more
+    // than one argument and would otherwise hide this contextual builtin.
+    if (receiver_override == nullptr &&
+        magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
+        (expr.name.eq({"set", 3}) || expr.name.eq({"add", 3}))) {
+        const bool is_add = expr.name.eq({"add", 3});
+        if (!route->req_header_mutation_stmt_ok || expr.args.len != 2 || expr.args[0] == nullptr ||
+            expr.args[1] == nullptr || expr.args[0]->kind != AstExprKind::StrLit ||
+            expr.args[1]->kind != AstExprKind::StrLit)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kReqHeaderMutationDetail);
+        const Str header_name = expr.args[0]->str_value;
+        const Str header_value = expr.args[1]->str_value;
+        if (validate_response_header(
+                header_name.ptr, header_name.len, header_value.ptr, header_value.len) !=
+            HttpHeaderValidation::Ok)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.args[0]->span, kReqHeaderMutationDetail);
+        auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!value) return core::make_unexpected(value.error());
+        if (!route->exprs.push(value.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr out{};
+        out.kind = is_add ? HirExprKind::ReqAddHeader : HirExprKind::ReqSetHeader;
+        out.type = HirTypeKind::Str;
+        out.span = expr.span;
+        out.str_value = header_name;
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
+    // Compile-time read from a literal Response builder. Mutators are handled
+    // in route statement order above; this observes the first live field with
+    // the requested name, matching the single-value `header` contract.
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
+        const HirLocal* response = nullptr;
+        for (u32 li = local_count; li > 0; li--) {
+            if (!locals[li - 1].name.eq(expr.lhs->name)) continue;
+            if (locals[li - 1].init.kind == HirExprKind::ResponseInit) response = &locals[li - 1];
+            break;
+        }
+        if (response != nullptr) {
+            if (!expr.name.eq({"header", 6}) || expr.args.len != 1 || expr.args[0] == nullptr ||
+                expr.args[0]->kind != AstExprKind::StrLit)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("Response.header expects one literal header name; mutations are "
+                            "statement-only"));
+            const Str name = expr.args[0]->str_value;
+            const HirExpr* fallback = nullptr;
+            for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
+                const auto& field = response->init.field_inits[fi];
+                if (field.value != nullptr &&
+                    http_header_name_eq_ci(field.name.ptr, field.name.len, name.ptr, name.len)) {
+                    fallback = field.value;
+                    break;
+                }
+            }
+            if (!response->init.bool_value) {
+                if (fallback != nullptr) return *fallback;
+                HirExpr out{};
+                out.kind = HirExprKind::Nil;
+                out.type = HirTypeKind::Str;
+                out.may_nil = true;
+                out.span = expr.span;
+                return out;
+            }
+            HirExpr fallback_value{};
+            if (fallback != nullptr) {
+                fallback_value = *fallback;
+            } else {
+                fallback_value.kind = HirExprKind::Nil;
+                fallback_value.type = HirTypeKind::Str;
+                fallback_value.may_nil = true;
+                fallback_value.span = expr.span;
+            }
+            if (!route->exprs.push(fallback_value))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr out{};
+            out.kind = HirExprKind::RespHeader;
+            out.type = HirTypeKind::Str;
+            out.may_nil = true;
+            out.span = expr.span;
+            out.str_value = name;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+    }
+
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
         const u32 probe_saved_exprs = route->exprs.len;
         const u32 probe_saved_guards = route->guards.len;
@@ -6279,6 +6392,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.str_value = expr.str_value;
         return out;
     }
+    if (expr.kind == AstExprKind::ObjectLit) {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("object literals are currently supported only as parsed call arguments; "
+                    "object value lowering is pending"));
+    }
     if (expr.kind == AstExprKind::RegexLit) {
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     }
@@ -7395,6 +7515,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     if (expr.kind == AstExprKind::Pipe) {
         if (expr.lhs == nullptr || expr.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        if (expr.rhs->kind != AstExprKind::Call && expr.rhs->kind != AstExprKind::MethodCall)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("pipe rhs must be a call stage or _.method(...) stage"));
+        if (!pipe_stage_has_placeholder(*expr.rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.rhs->span, kPipePlaceholderDetail);
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (expr.rhs->kind == AstExprKind::MethodCall && expr.rhs->lhs != nullptr &&
@@ -8177,6 +8304,25 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return {};
     };
 
+    // A response builder is a compile-time-only value in this first slice.
+    // Header mutators update its bounded literal field list and `return resp`
+    // folds the result into the existing ReturnStatus metadata path.
+    if (expr.name.eq({"response", 8}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"response", 8})) {
+        if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
+            expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::IntLit ||
+            expr.args[0]->int_value < 100 || expr.args[0]->int_value > 599)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("response expects one literal status in 100...599"));
+        HirExpr out{};
+        out.kind = HirExprKind::ResponseInit;
+        out.type = HirTypeKind::Response;
+        out.span = expr.span;
+        out.int_value = expr.args[0]->int_value;
+        return out;
+    }
+
     if (expr.name.eq({"any", 3})) {
         HirExpr lhs_value{};
         HirExpr rhs_value{};
@@ -8552,11 +8698,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             if (expr.args[i]->kind == AstExprKind::Placeholder) pipe_placeholder_count++;
         }
     }
-    const bool pipe_inject_lhs =
-        pipe_lhs != nullptr && pipe_placeholder_count == 0 && fn.params.len == expr.args.len + 1;
-    if (pipe_lhs != nullptr && pipe_placeholder_count == 0 && !pipe_inject_lhs)
+    if (pipe_lhs != nullptr && pipe_placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
-    const u32 effective_arg_count = expr.args.len + (pipe_inject_lhs ? 1u : 0u);
+    const u32 effective_arg_count = expr.args.len;
     if (effective_arg_count != fn.params.len)
         return fail_with_name(expr.span, "argument count mismatch");
     if (expr.type_args.len != 0 && expr.type_args.len != fn.type_params.len)
@@ -8883,7 +9027,6 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             unwrapped.lhs = lhs_ptr;
 
             HirExpr analyzed_args[AstExpr::kMaxArgs]{};
-            u32 arg_offset = 0;
             const auto analyze_conditional_pipe_stage_arg =
                 [&](const AstExpr& arg_expr) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
@@ -8892,15 +9035,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 route->allow_respond_effects = saved_allow_respond_effects;
                 return result;
             };
-            if (pipe_inject_lhs) {
-                analyzed_args[0] = unwrapped;
-                auto checked = check_call_arg(0, analyzed_args[0], expr.span);
-                if (!checked) return core::make_unexpected(checked.error());
-                arg_offset = 1;
-            }
             for (u32 i = 0; i < expr.args.len; i++) {
                 const auto& arg_expr = *expr.args[i];
-                const u32 param_index = i + arg_offset;
+                const u32 param_index = i;
                 if (arg_expr.kind == AstExprKind::Placeholder) {
                     analyzed_args[param_index] = unwrapped;
                 } else {
@@ -8914,7 +9051,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     check_call_arg(param_index, analyzed_args[param_index], expr.args[i]->span);
                 if (!checked) return core::make_unexpected(checked.error());
             }
-            if (!pipe_inject_lhs && placeholder_count != 1)
+            if (placeholder_count != 1)
                 return fail_call(expr.span, "placeholder pipe count mismatch", nullptr);
 
             auto ret = concrete_return_expr();
@@ -9025,17 +9162,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     HirExpr analyzed_args[AstExpr::kMaxArgs]{};
     u32 placeholder_count = 0;
     const HirExpr* placeholder_source = pipe_lhs;
-    u32 arg_offset = 0;
     Span respond_guard_span = expr.span;
-    if (pipe_inject_lhs) {
-        if (!route->exprs.push(*pipe_lhs))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        placeholder_source = &route->exprs[route->exprs.len - 1];
-        analyzed_args[0] = *placeholder_source;
-        auto checked = check_call_arg(0, analyzed_args[0], expr.span);
-        if (!checked) return core::make_unexpected(checked.error());
-        arg_offset = 1;
-    }
     for (u32 i = 0; i < expr.args.len; i++) {
         const auto& arg_expr = *expr.args[i];
         if (arg_expr.span.end > respond_guard_span.start) {
@@ -9043,7 +9170,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             if (respond_guard_span.end < respond_guard_span.start)
                 respond_guard_span.end = respond_guard_span.start;
         }
-        const u32 param_index = i + arg_offset;
+        const u32 param_index = i;
         if (arg_expr.kind == AstExprKind::Placeholder) {
             if (pipe_lhs == nullptr)
                 return fail_call(arg_expr.span, "placeholder outside pipe", nullptr);
@@ -9069,7 +9196,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         auto checked = check_call_arg(param_index, analyzed_args[param_index], expr.args[i]->span);
         if (!checked) return core::make_unexpected(checked.error());
     }
-    if (pipe_lhs != nullptr && !pipe_inject_lhs && placeholder_count == 0)
+    if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
     auto respond_guards = instantiate_function_respond_guards(fn,
                                                               route,
@@ -9262,6 +9389,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
+        if (stmt.returns_response_local)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("returning a Response local is currently supported only as the direct "
+                        "route terminator"));
         if (stmt.status_code < 100 || stmt.status_code > 599)
             return frontend_error(FrontendError::InvalidStatusCode, stmt.span);
         term.kind = HirTerminatorKind::ReturnStatus;
@@ -9975,22 +10108,34 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             }
             if (inner.kind == AstStmtKind::Expr) {
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
-                // Unlike route-entry CacheSet carriers, arm effects are kept
+                // Unlike route-entry synthetic effect carriers, arm effects are kept
                 // on the selected control-flow block and materialized there.
                 // Wait routes still reject Cache operations because resume
                 // rematerialization has no per-state effect model yet; static
                 // for routes use a separate unrolled step graph and are kept
                 // out of this first branch-effect slice as well.
+                const bool req_mutation_syntax =
+                    inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
+                    inner.expr.lhs->kind == AstExprKind::Ident &&
+                    inner.expr.lhs->name.eq({"req", 3}) &&
+                    (inner.expr.name.eq({"set", 3}) || inner.expr.name.eq({"add", 3}));
                 if (route->cache_ops_blocked || route->for_loops.len != 0)
                     return frontend_error(
-                        FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
-                route->cache_set_stmt_ok = true;
+                        FrontendError::UnsupportedSyntax,
+                        inner.span,
+                        req_mutation_syntax ? kReqHeaderMutationOrderDetail : kCacheStmtDetail);
+                route->cache_set_stmt_ok = !req_mutation_syntax;
+                route->req_header_mutation_stmt_ok = req_mutation_syntax;
                 const u32 guards_before_set = route->guards.len;
                 auto value = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 route->cache_set_stmt_ok = false;
+                route->req_header_mutation_stmt_ok = false;
                 if (!value) return core::make_unexpected(value.error());
-                if (route->guards.len > guards_before_set || value->kind != HirExprKind::CacheSet)
+                const bool supported_effect = value->kind == HirExprKind::CacheSet ||
+                                              value->kind == HirExprKind::ReqSetHeader ||
+                                              value->kind == HirExprKind::ReqAddHeader;
+                if (route->guards.len > guards_before_set || !supported_effect)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
                 if (!route->exprs.push(value.value()))
@@ -11115,6 +11260,33 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 #endif
 
     route->control.kind = HirControlKind::Direct;
+    if (stmt.kind == AstStmtKind::ReturnStatus && stmt.returns_response_local) {
+        const HirLocal* response = nullptr;
+        for (u32 li = route->locals.len; li > 0; li--) {
+            if (route->locals[li - 1].name.eq(stmt.name)) {
+                response = &route->locals[li - 1];
+                break;
+            }
+        }
+        if (response == nullptr || response->init.kind != HirExprKind::ResponseInit)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("return identifier must name a Response builder"));
+        HirTerminator term{};
+        term.kind = HirTerminatorKind::ReturnStatus;
+        term.source_kind = HirTerminatorSourceKind::Literal;
+        term.span = stmt.span;
+        term.status_code = static_cast<i32>(response->init.int_value);
+        for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
+            const auto& field = response->init.field_inits[fi];
+            if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
+                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+            if (!term.response_headers.push({field.name, field.value->str_value}))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+        route->control.direct_term = term;
+        return {};
+    }
     auto term = analyze_term(stmt, mod);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
@@ -13765,6 +13937,8 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqContentLength:
         case HirExprKind::ReqRemoteAddr:
         case HirExprKind::ReqMethod:
+        case HirExprKind::ReqSetHeader:
+        case HirExprKind::ReqAddHeader:
             return true;
         default:
             break;
@@ -17494,18 +17668,190 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Pre-scan for waits: time.nowMicros() anywhere in a wait route is
         // rejected (see kTimeWaitDetail) — the flag must be set before any
         // statement is analyzed so pre-wait bindings are caught too.
+        bool response_runtime_mutation_blocked = seen_guard;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
                 (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
                 route.cache_ops_blocked = true;
                 route.time_ops_blocked = true;
-                break;
             }
+            if (s.kind == AstStmtKind::Guard || s.kind == AstStmtKind::Wait ||
+                s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For ||
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
+                response_runtime_mutation_blocked = true;
         }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
             if (stmt.kind == AstStmtKind::Expr) {
+                // Response builder mutation. Literal-only prefixes fold into
+                // the terminator's static header set. At the first dynamic
+                // value, this and every subsequent mutation becomes an ordered
+                // runtime effect so source ordering stays exact.
+                if (stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
+                    stmt.expr.lhs->kind == AstExprKind::Ident) {
+                    u32 response_local = route.locals.len;
+                    for (u32 li = route.locals.len; li > 0; li--) {
+                        if (!route.locals[li - 1].name.eq(stmt.expr.lhs->name)) continue;
+                        if (route.locals[li - 1].init.kind == HirExprKind::ResponseInit)
+                            response_local = li - 1;
+                        break;
+                    }
+                    if (response_local != route.locals.len) {
+                        const bool is_set = stmt.expr.name.eq({"set", 3});
+                        const bool is_add = stmt.expr.name.eq({"add", 3});
+                        const bool is_remove = stmt.expr.name.eq({"remove", 6});
+                        if (!is_set && !is_add && !is_remove)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  stmt.span,
+                                                  lit_str("Response supports set/add/remove"));
+                        const u32 want_args = is_remove ? 1u : 2u;
+                        if (stmt.expr.args.len != want_args || stmt.expr.args[0] == nullptr ||
+                            stmt.expr.args[0]->kind != AstExprKind::StrLit ||
+                            (!is_remove && stmt.expr.args[1] == nullptr))
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.span,
+                                lit_str("response header names must be string literals"));
+                        const Str name = stmt.expr.args[0]->str_value;
+                        if (validate_response_header(name.ptr, name.len, "", 0) !=
+                            HttpHeaderValidation::Ok)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  stmt.expr.args[0]->span,
+                                                  lit_str("invalid or reserved response header"));
+
+                        HirExpr value{};
+                        if (!is_remove) {
+                            auto analyzed = analyze_expr(*stmt.expr.args[1],
+                                                         &route,
+                                                         mod,
+                                                         route.locals.data,
+                                                         route.locals.len,
+                                                         nullptr);
+                            if (!analyzed) return core::make_unexpected(analyzed.error());
+                            if (analyzed->type != HirTypeKind::Str || analyzed->may_nil ||
+                                analyzed->may_error)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    stmt.expr.args[1]->span,
+                                    lit_str("response header values must be plain strings"));
+                            value = analyzed.value();
+                            if (value.kind == HirExprKind::StrLit &&
+                                validate_response_header(
+                                    name.ptr, name.len, value.str_value.ptr, value.str_value.len) !=
+                                    HttpHeaderValidation::Ok)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      stmt.expr.args[1]->span,
+                                                      lit_str("invalid response header value"));
+                        }
+
+                        auto& response_init = route.locals[response_local].init;
+                        const bool runtime = response_init.bool_value ||
+                                             (!is_remove && value.kind != HirExprKind::StrLit);
+                        if (runtime) {
+                            if (response_runtime_mutation_blocked)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    stmt.span,
+                                    lit_str("dynamic response header mutations cannot be combined "
+                                            "with guards/waits/for loops yet"));
+                            u32 response_builder_count = 0;
+                            for (u32 li = 0; li < route.locals.len; li++) {
+                                if (route.locals[li].init.kind == HirExprKind::ResponseInit)
+                                    response_builder_count++;
+                            }
+                            if (response_builder_count != 1)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    stmt.span,
+                                    lit_str("dynamic response headers require exactly one Response "
+                                            "builder in the route"));
+                            response_init.bool_value = true;
+                            HirExpr effect{};
+                            effect.kind = is_remove ? HirExprKind::RespRemoveHeader
+                                          : is_add  ? HirExprKind::RespAddHeader
+                                                    : HirExprKind::RespSetHeader;
+                            effect.type = HirTypeKind::Str;
+                            effect.span = stmt.span;
+                            effect.str_value = name;
+                            if (!is_remove) {
+                                if (!route.exprs.push(value))
+                                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                                effect.lhs = &route.exprs[route.exprs.len - 1];
+                            }
+                            HirLocal carrier{};
+                            carrier.span = stmt.span;
+                            carrier.ref_index =
+                                next_local_ref_index(&route, route.locals.data, route.locals.len);
+                            carrier.type = HirTypeKind::Str;
+                            carrier.init = effect;
+                            if (!route.locals.push(carrier))
+                                return frontend_error(FrontendError::TooManyItems, stmt.span);
+                            continue;
+                        }
+
+                        auto& fields = response_init.field_inits;
+                        if (is_set || is_remove) {
+                            for (u32 fi = 0; fi < fields.len;) {
+                                if (!http_header_name_eq_ci(fields[fi].name.ptr,
+                                                            fields[fi].name.len,
+                                                            name.ptr,
+                                                            name.len)) {
+                                    fi++;
+                                    continue;
+                                }
+                                for (u32 move = fi + 1; move < fields.len; move++)
+                                    fields[move - 1] = fields[move];
+                                fields.len--;
+                            }
+                        }
+                        if (!is_remove) {
+                            HirExpr literal{};
+                            literal.kind = HirExprKind::StrLit;
+                            literal.type = HirTypeKind::Str;
+                            literal.span = value.span;
+                            literal.str_value = value.str_value;
+                            if (!route.exprs.push(literal))
+                                return frontend_error(FrontendError::TooManyItems, stmt.span);
+                            if (!fields.push({name, &route.exprs[route.exprs.len - 1]}))
+                                return frontend_error(FrontendError::TooManyItems, stmt.span);
+                        }
+                        continue;
+                    }
+                }
+                const bool req_mutation_syntax =
+                    stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
+                    stmt.expr.lhs->kind == AstExprKind::Ident &&
+                    stmt.expr.lhs->name.eq({"req", 3}) &&
+                    (stmt.expr.name.eq({"set", 3}) || stmt.expr.name.eq({"add", 3}));
+                if (req_mutation_syntax) {
+                    if (seen_wait || seen_for || seen_guard || route.guards.len > 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              stmt.span,
+                                              kReqHeaderMutationOrderDetail);
+                    const u32 guards_before_set = route.guards.len;
+                    route.req_header_mutation_stmt_ok = true;
+                    auto value = analyze_expr(
+                        stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                    route.req_header_mutation_stmt_ok = false;
+                    if (!value) return core::make_unexpected(value.error());
+                    if (route.guards.len > guards_before_set ||
+                        (value->kind != HirExprKind::ReqSetHeader &&
+                         value->kind != HirExprKind::ReqAddHeader))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              stmt.span,
+                                              kReqHeaderMutationOrderDetail);
+                    HirLocal local{};
+                    local.span = stmt.span;
+                    local.name = Str{};
+                    local.ref_index =
+                        next_local_ref_index(&route, route.locals.data, route.locals.len);
+                    local.type = value->type;
+                    local.init = value.value();
+                    if (!route.locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, stmt.span);
+                    continue;
+                }
                 // Bare `cache.set(k, v)` statement — the only standalone
                 // expression form. Locals (which carry the write) all
                 // materialize in the entry block, so a set after any
@@ -17683,6 +18029,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 }
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, stmt);
                 if (!typed) return core::make_unexpected(typed.error());
+                if (init->type == HirTypeKind::Response && init->kind != HirExprKind::ResponseInit)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.expr.span,
+                        lit_str("Response builders cannot be copied or aliased in this slice"));
+                if (init->kind == HirExprKind::ResponseInit) {
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
+                            route.locals[li].init.bool_value)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.expr.span,
+                                lit_str("dynamic response headers require exactly one Response "
+                                        "builder in the route"));
+                    }
+                }
                 local.type = init->type;
                 local.is_wait_result = init->is_wait_result;
                 local.wait_event_kind = init->wait_event_kind;
@@ -17839,6 +18201,37 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());
                 continue;
+            }
+            const HirLocal* dynamic_response = nullptr;
+            for (u32 li = 0; li < route.locals.len; li++) {
+                if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
+                    route.locals[li].init.bool_value) {
+                    dynamic_response = &route.locals[li];
+                    break;
+                }
+            }
+            if (dynamic_response != nullptr) {
+                if (stmt.kind != AstStmtKind::ReturnStatus || !stmt.returns_response_local ||
+                    !stmt.name.eq(dynamic_response->name))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.span,
+                        lit_str(
+                            "a dynamically mutated Response builder must be returned directly"));
+                if (route.guards.len != 0)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.span,
+                        lit_str(
+                            "dynamic response header mutations cannot be combined with guards"));
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    if (route.locals[li].init.may_error)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            route.locals[li].span,
+                            lit_str("dynamic response header mutations cannot follow fallible "
+                                    "bindings yet"));
+                }
             }
             auto control = analyze_control_stmt(stmt, &route, mod, nullptr);
             if (!control) return core::make_unexpected(control.error());

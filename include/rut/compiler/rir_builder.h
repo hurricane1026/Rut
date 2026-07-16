@@ -581,6 +581,53 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_add_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqAddHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    Result<ValueId> emit_resp_header(Str name, ValueId fallback, SourceLoc loc = {}) {
+        if (!val_has_type(fallback, TypeKind::Optional) ||
+            cur_func->values[fallback.id].type->inner == nullptr ||
+            cur_func->values[fallback.id].type->inner->kind != TypeKind::Str)
+            return err(RirError::InvalidState);
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto r = TRY(emit(Opcode::RespHeader, ty, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = fallback;
+        r.inst->operand_count = 1;
+        return r.vid;
+    }
+
+    VoidResult emit_resp_set_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_resp_add_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespAddHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_resp_remove_header(Str name, SourceLoc loc = {}) {
+        auto r = TRY(emit(Opcode::RespRemoveHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        return {};
+    }
+
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));

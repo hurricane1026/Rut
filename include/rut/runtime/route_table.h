@@ -769,8 +769,10 @@ struct RouteConfig {
     //   - validation failure: key fails the HTTP tchar grammar, value
     //     contains control chars, or key names a reserved framing
     //     header (Content-Length / Transfer-Encoding / Connection)
-    //   - duplicate: two keys in the set compare equal under ASCII
-    //     case folding (parity with the DSL parser's dup-reject)
+    // Duplicate names are allowed so Response.add can represent fields such
+    // as Set-Cookie. The map-literal parser still rejects duplicates because
+    // that syntax describes singleton entries; ordered Response builders do
+    // not.
     u16 add_response_header_set(const char* const* keys,
                                 const u32* key_lens,
                                 const char* const* values,
@@ -803,15 +805,6 @@ struct RouteConfig {
             if (validate_response_header(keys[i], key_lens[i], values[i], value_lens[i]) !=
                 HttpHeaderValidation::Ok) {
                 return 0;
-            }
-            // Case-insensitive duplicate-key check — parity with the
-            // DSL parser. Two singletons with the same field name
-            // (any case) would make the wire response ambiguous, so
-            // we reject before allocating.
-            for (u32 j = 0; j < i; j++) {
-                if (http_header_name_eq_ci(keys[i], key_lens[i], keys[j], key_lens[j])) {
-                    return 0;
-                }
             }
             // Guard each add individually against u32 overflow.
             if (key_lens[i] > 0xffffffffu - total_bytes) return 0;

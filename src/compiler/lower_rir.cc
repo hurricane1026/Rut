@@ -2333,6 +2333,94 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
+    if (value.kind == MirValueKind::ReqSetHeader || value.kind == MirValueKind::ReqAddHeader) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto val = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!val) return core::make_unexpected(val.error());
+        const bool emitted = value.kind == MirValueKind::ReqAddHeader
+                                 ? static_cast<bool>(b.emit_req_add_header(
+                                       value.str_value, val.value(), {span.line, span.col}))
+                                 : static_cast<bool>(b.emit_req_set_header(
+                                       value.str_value, val.value(), {span.line, span.col}));
+        if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);
+        return val.value();
+    }
+    if (value.kind == MirValueKind::RespHeader) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto str_ty_result = b.make_type(rir::TypeKind::Str);
+        if (!str_ty_result) return frontend_error(FrontendError::OutOfMemory, span);
+        auto* str_ty = str_ty_result.value();
+        rir::ValueId fallback{};
+        if (value.lhs->kind == MirValueKind::Nil) {
+            auto nil = b.emit_opt_nil(str_ty, {span.line, span.col});
+            if (!nil) return frontend_error(FrontendError::OutOfMemory, span);
+            fallback = nil.value();
+        } else {
+            auto raw = materialize_value(*value.lhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+            if (!raw) return core::make_unexpected(raw.error());
+            auto wrapped = b.emit_opt_wrap(raw.value(), {span.line, span.col});
+            if (!wrapped) return frontend_error(FrontendError::OutOfMemory, span);
+            fallback = wrapped.value();
+        }
+        auto out = b.emit_resp_header(value.str_value, fallback, {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
+    if (value.kind == MirValueKind::RespSetHeader || value.kind == MirValueKind::RespAddHeader) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto val = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!val) return core::make_unexpected(val.error());
+        const bool emitted = value.kind == MirValueKind::RespAddHeader
+                                 ? static_cast<bool>(b.emit_resp_add_header(
+                                       value.str_value, val.value(), {span.line, span.col}))
+                                 : static_cast<bool>(b.emit_resp_set_header(
+                                       value.str_value, val.value(), {span.line, span.col}));
+        if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);
+        return val.value();
+    }
+    if (value.kind == MirValueKind::RespRemoveHeader) {
+        if (!b.emit_resp_remove_header(value.str_value, {span.line, span.col}))
+            return frontend_error(FrontendError::OutOfMemory, span);
+        auto zero = b.emit_const_str({"", 0}, {span.line, span.col});
+        if (!zero) return frontend_error(FrontendError::OutOfMemory, span);
+        return zero.value();
+    }
     if (value.kind == MirValueKind::WidenI64) {
         auto operand = materialize_value(*value.lhs,
                                          mir,

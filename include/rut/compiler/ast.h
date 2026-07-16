@@ -119,6 +119,11 @@ enum class AstExprKind : u8 {
     // errors.  Surface `[T]` type syntax desugars to
     // `AstTypeRef{name="Array", type_args=[T]}` in parse_func_type_ref.
     ArrayLit,
+    // Anonymous object literal `{ key: value, ... }`. The parser creates this
+    // kind only through a call's argument parser; it is deliberately absent
+    // from the general primary-expression grammar so a bare `{ ... }` always
+    // remains a statement block. Fields are stored in `field_inits`.
+    ObjectLit,
     StructInit,
     Placeholder,
     VariantCase,
@@ -228,6 +233,10 @@ struct AstStatement {
     // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
     bool has_response_body = false;
+    // `return <ident>` where the identifier names a local created by
+    // `response(status)`. Kept distinct from the literal-status form while
+    // reusing ReturnStatus as the control-flow terminator kind.
+    bool returns_response_local = false;
     // Response headers from `response(N, headers: { "K": "V", ... })`.
     // Inline-stored (no external pool) so analyze/lowering don't need
     // the AstFile handle. `response_headers.len == 0` means "no kwarg";
@@ -502,7 +511,10 @@ struct AstRouteDecl {
     Span body_span{};
     u8 method = 0;
     Str path{};
-    static constexpr u32 kMaxStatements = 16;
+    // A Response builder may need one declaration, 16 header mutations, and
+    // its final return. Keep a little headroom above that established header
+    // limit so statement capacity does not become the accidental lower cap.
+    static constexpr u32 kMaxStatements = 20;
     // Statements live in AstFile::stmt_pool (alloc_stmt) — storing them
     // inline made sizeof(AstItem) ~485KB (AstStatement is ~23KB) and the
     // recursive-descent parser's by-value AstItem frames overflowed the 8MB
@@ -563,7 +575,7 @@ struct AstFile {
     // stored them inline (512 fully-loaded match statements at kMaxMatchArms).
     static constexpr u32 kMaxExprPool = 4096;
     // Route statements moved out of AstRouteDecl into this pool; sized to keep
-    // the pre-pool capacity of kMaxItems routes at kMaxStatements each (2048)
+    // the pre-pool capacity of kMaxItems routes at kMaxStatements each (2560)
     // plus nested block bodies. AstFile is heap-only (parse_file_heap), so the
     // pools cost heap, not stack.
     static constexpr u32 kMaxStmtPool = 4096;
