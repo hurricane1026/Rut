@@ -97,6 +97,10 @@ bool reject_yield(void*, const harness::Observation& event) {
     return event.kind != harness::ObservationKind::HandlerYielded;
 }
 
+bool reject_all_observations(void*, const harness::Observation&) {
+    return false;
+}
+
 struct TempSource {
     char path[64] = "/tmp/rut_harness_XXXXXX";
 
@@ -151,6 +155,37 @@ TEST(harness_handler, advances_virtual_time_for_timer_yield) {
     CHECK_EQ(result.terminal.status_code, 205);
     CHECK_EQ(result.harness.handler_resumes, 1u);
     CHECK_EQ(result.harness.virtual_time_us, 25000u);
+}
+
+TEST(harness_handler, rejects_wrong_execution_layer) {
+    harness::HandlerExecution execution{};
+    execution.init(&immediate_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!result.has_terminal);
+}
+
+TEST(harness_handler, rejects_timer_completion_before_requested_delay) {
+    harness::HandlerExecution execution{};
+    execution.init(&timer_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Timer, 0, 100, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.virtual_time_us, 0u);
+    CHECK_EQ(result.consumed_events, 0u);
 }
 
 TEST(harness_handler, stalls_when_yield_has_no_declared_event) {
@@ -317,6 +352,29 @@ TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
     CHECK_EQ(result.harness.fault_points_reached, 1u);
     CHECK_EQ(result.harness.faults_injected, 0u);
     CHECK_EQ(result.connection_invariant_violations, 0u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_static("/static", kRouteMethodGet, 204));
+    target.prepared = true;
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/static", 7};
+    scenario.method = kRouteMethodGet;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations.observe = &reject_all_observations;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.semantic_events, 1u);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
@@ -597,6 +655,23 @@ TEST(harness_source_target, prepares_production_loaded_program_and_cleans_up) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
     CHECK(!target.prepared);
     CHECK(!target.program.jit_inited);
+}
+
+TEST(harness_source_target, can_prepare_again_after_successful_load) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/health\" { return 204 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto first = target.prepare({source.path, jit::OptLevel::O0}, spec);
+    REQUIRE_EQ(first.outcome, harness::Outcome::Passed);
+    CHECK_EQ(target.program.config.route_count, 1u);
+    const auto second = target.prepare({source.path, jit::OptLevel::O0}, spec);
+    REQUIRE_EQ(second.outcome, harness::Outcome::Passed);
+    CHECK_EQ(target.program.config.route_count, 1u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+    CHECK_EQ(target.program.config.route_count, 0u);
 }
 
 TEST(harness_source_target, preserves_compile_failure_and_remains_destroyable) {

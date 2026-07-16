@@ -34,6 +34,8 @@ void LoadedProgram::destroy() {
         src_map = nullptr;
         src_map_len = 0;
     }
+    config.~RouteConfig();
+    new (&config) RouteConfig();
 }
 
 namespace {

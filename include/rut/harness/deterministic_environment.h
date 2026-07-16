@@ -26,6 +26,7 @@ enum class CompletionStatus : u8 {
     Empty,
     KindMismatch,
     TargetMismatch,
+    TooEarly,
     InvalidSchedule,
     TimeLimit,
 };
@@ -41,6 +42,7 @@ struct DeterministicEnvironment {
 
     CompletionStatus next(jit::YieldKind yielded,
                           u32 yielded_target,
+                          u64 earliest_at_us,
                           u64 max_virtual_time_us,
                           DeterministicCompletion& completion);
 

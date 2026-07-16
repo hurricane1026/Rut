@@ -92,6 +92,13 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         ~CleanupMarker() { result.cleanup = CleanupOutcome::Clean; }
     } cleanup{out.harness};
 
+    if (harness.layer != ExecutionLayer::Handler) {
+        out.harness.outcome = Outcome::Invalid;
+        copy_detail(out.harness.detail,
+                    sizeof(out.harness.detail),
+                    "handler driver requires handler layer");
+        return out;
+    }
     if (driver.execution.handler == nullptr) {
         out.harness.outcome = Outcome::Invalid;
         copy_detail(out.harness.detail, sizeof(out.harness.detail), "handler is null");
@@ -141,10 +148,21 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         }
 
         DeterministicCompletion event{};
-        CompletionStatus completion = environment.next(result.yield_kind,
-                                                       result.yield_payload_u32(),
-                                                       harness.limits.max_virtual_time_us,
-                                                       event);
+        u64 earliest_at_us = environment.now_us;
+        CompletionStatus completion = CompletionStatus::Ready;
+        if (result.yield_kind == jit::YieldKind::Timer) {
+            const u64 delay_us = static_cast<u64>(result.yield_payload_u32()) * 1000u;
+            if (delay_us > harness.limits.max_virtual_time_us - environment.now_us)
+                completion = CompletionStatus::TimeLimit;
+            else
+                earliest_at_us += delay_us;
+        }
+        if (completion == CompletionStatus::Ready)
+            completion = environment.next(result.yield_kind,
+                                          result.yield_payload_u32(),
+                                          earliest_at_us,
+                                          harness.limits.max_virtual_time_us,
+                                          event);
         if ((completion == CompletionStatus::Empty ||
              completion == CompletionStatus::KindMismatch) &&
             driver.auto_complete_timers && result.yield_kind == jit::YieldKind::Timer) {
@@ -169,6 +187,13 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             copy_detail(out.harness.detail,
                         sizeof(out.harness.detail),
                         "deterministic completion schedule is invalid");
+            return out;
+        }
+        if (completion == CompletionStatus::TooEarly) {
+            out.harness.outcome = Outcome::Invalid;
+            copy_detail(out.harness.detail,
+                        sizeof(out.harness.detail),
+                        "completion is scheduled before the operation can finish");
             return out;
         }
         if (completion == CompletionStatus::TimeLimit) {

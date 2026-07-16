@@ -38,6 +38,35 @@ u32 request_header_end(const u8* data, u32 len) {
     return len;
 }
 
+bool publish_terminal(const HarnessSpec& spec,
+                      HarnessResult& result,
+                      const jit::HandlerResult& terminal,
+                      u64 timestamp_us) {
+    if (result.semantic_events >= spec.limits.max_semantic_events) {
+        result.outcome = Outcome::Failed;
+        result.has_reached_limit = true;
+        result.reached_limit = LimitKind::SemanticEvents;
+        copy_detail(result, "semantic-events limit reached");
+        return false;
+    }
+
+    Observation event{};
+    event.kind = terminal.action == jit::HandlerAction::ReturnStatus
+                     ? ObservationKind::ResponseProduced
+                     : ObservationKind::UpstreamSelected;
+    event.phase = Phase::Observe;
+    event.sequence = result.semantic_events;
+    event.timestamp_us = timestamp_us;
+    event.value0 = terminal.action == jit::HandlerAction::ReturnStatus ? terminal.status_code
+                                                                       : terminal.upstream_id;
+    result.semantic_events++;
+    if (spec.observations.publish(event)) return true;
+
+    result.outcome = Outcome::Mismatched;
+    copy_detail(result, "observation rejected by oracle");
+    return false;
+}
+
 }  // namespace
 
 ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& harness) {
@@ -168,21 +197,25 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
                                                          scenario.now_us);
     }
 
+    bool needs_terminal_observation = false;
     if (rate_limited) {
         out.terminal = jit::HandlerResult::make_status(429);
         out.has_terminal = true;
+        needs_terminal_observation = true;
         out.harness.outcome = Outcome::Passed;
         out.harness.phase = Phase::Observe;
         out.harness.cleanup = CleanupOutcome::Clean;
     } else if (route->action == RouteAction::Static) {
         out.terminal = jit::HandlerResult::make_status(route->status_code);
         out.has_terminal = true;
+        needs_terminal_observation = true;
         out.harness.outcome = Outcome::Passed;
         out.harness.phase = Phase::Observe;
         out.harness.cleanup = CleanupOutcome::Clean;
     } else if (route->action == RouteAction::Proxy) {
         out.terminal = jit::HandlerResult::make_forward(route->upstream_id);
         out.has_terminal = true;
+        needs_terminal_observation = true;
         out.harness.outcome = Outcome::Passed;
         out.harness.phase = Phase::Observe;
         out.harness.cleanup = CleanupOutcome::Clean;
@@ -214,13 +247,19 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         driver.execution = execution;
         driver.environment = runtime_environment;
         driver.auto_complete_timers = scenario.auto_complete_timers;
-        const HandlerExecutionResult driven = drive_handler_deterministically(driver, harness);
+        HarnessSpec handler_harness = harness;
+        handler_harness.layer = ExecutionLayer::Handler;
+        const HandlerExecutionResult driven =
+            drive_handler_deterministically(driver, handler_harness);
         const u32 state_resets = out.harness.state_resets;
         out.harness = driven.harness;
         out.harness.state_resets += state_resets;
         out.terminal = driven.terminal;
         out.has_terminal = driven.has_terminal;
     }
+
+    if (needs_terminal_observation)
+        (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
 
     if (out.has_terminal && !expectation_matches(scenario.expected, out.terminal)) {
         out.harness.outcome = Outcome::Mismatched;

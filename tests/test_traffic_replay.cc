@@ -246,11 +246,13 @@ TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
 
     SmallLoop matched_loop;
     matched_loop.setup();
-    const auto matched = harness::drive_replay_one(
-        matched_loop, make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200), 42, spec);
+    const CaptureEntry matched_entry =
+        make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    const auto matched = harness::drive_replay_one(matched_loop, matched_entry, 42, spec);
     CHECK_EQ(matched.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(matched.harness.cleanup, harness::CleanupOutcome::Clean);
     CHECK_EQ(matched.harness.semantic_events, 1u);
+    CHECK_EQ(matched.harness.input_bytes, matched_entry.raw_header_len);
 
     SmallLoop mismatched_loop;
     mismatched_loop.setup();
@@ -378,6 +380,9 @@ TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
     CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
     CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
     CHECK_EQ(result.harness.semantic_events, 3u);
+    CHECK_EQ(result.harness.input_bytes,
+             static_cast<u64>(entries[0].raw_header_len) + entries[1].raw_header_len +
+                 entries[2].raw_header_len);
     CHECK_EQ(result.replay.total, 3u);
     CHECK_EQ(result.replay.matched, 2u);
     CHECK_EQ(result.replay.mismatched, 1u);

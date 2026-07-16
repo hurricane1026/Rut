@@ -100,6 +100,7 @@ ReplayItemResult drive_replay_one(Loop& loop,
         detail::set_detail(out.harness, "input-bytes limit reached");
         return out;
     }
+    out.harness.input_bytes = entry.raw_header_len;
 
     out.replay = replay_one(loop, entry, fake_fd);
     out.harness.outcome = detail::replay_outcome(out.replay);
@@ -142,6 +143,7 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
             break;
         }
         input_bytes += entry.raw_header_len;
+        out.harness.input_bytes = input_bytes;
 
         const ReplayResult replay = replay_one(loop, entry, fake_fd++);
         const Outcome item_outcome = detail::replay_outcome(replay);
