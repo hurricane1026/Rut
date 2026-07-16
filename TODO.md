@@ -57,17 +57,23 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   conditional_guard_keeps_error_prelude_on_unguarded_sibling — the two
   shapes are structurally identical to a single-continuation walk; only
   exit-dominance separates them). Until then: conservative over-keep.
-- [ ] websocket trailing block `{ frame in }`; object literal only in
-  call-argument position; pipeline RHS placeholder validation.
+- [x] WebSocket terminate trailing blocks require the explicit
+  `{ frame in ... }` binding; the legacy implicit-frame block is rejected.
+- [x] Object literal syntax is accepted only in call-argument position and
+  represented explicitly in the AST; bare/general-expression use is rejected.
+  Still pending: `json()` lowering and runtime serialization.
+- [x] Pipeline RHS validation requires a call stage with an explicit `_` / `_N`
+  placeholder and reports the canonical placement fix-it before call analysis.
 - Checker/builtins: [x] `.or(default)` (sugar for eager `any(value, default)`);
   [x] `req.params.*` capture namespace (flat `req.<capture>` is an error with a
   fix-it); [x] `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace
   (end-to-end: analyze fold + HIR/MIR/RIR Bit* ops + LLVM codegen; i32/i64
   same-width operands, shifts saturate outside the width, `flip` desugars to
   `xor(a, -1)`; user bindings named `bitwise` shadow the namespace). Still
-  pending: `req.set/add`
-  + `resp.set/remove/add/header` write paths (resp needs a runtime mutable
-  response-header store — today response headers are compile-time const sets);
+  [x] `Response` locals with ordered `set/remove/add/header`: literal prefixes
+  fold into response-header sets and dynamic string values lower through a
+  bounded per-request mutation log for direct routes. Still pending:
+  buffered/post-middleware mutation (needs a stream-owned runtime Response);
   `req.queryAll` (needs a runtime [str] value type — none exists); `respond`
   legality (middleware only) vs status-`return` (handler only);
   `stats()/metrics()/reload()/upstream.mark()` declarations.
@@ -114,6 +120,21 @@ without presenting lossy or per-shard state as exact shared state.
 - [x] `Cache<IP, i64>` provides bounded, lossy, per-shard state slots; i64
   arithmetic/bitwise operations and `time.nowMicros()` support Rut-written
   rate-limit algorithms.
+- [x] `req.set("Name", "value")` and `req.add("Name", "value")` lower through
+  HIR/MIR/RIR to the bounded request-header override runtime. `set` replaces and
+  deduplicates existing fields; `add` preserves them and appends a new field.
+  Both are statement-only, validate literal safe header names and values,
+  support leading route statements and selected match-arm effects, and fail
+  closed at runtime.
+- [x] `let resp = response(status)` creates a compile-time Response builder;
+  literal `resp.set/add/remove` mutations and `resp.header` reads fold in source
+  order, `return resp` reuses the existing response-header-set ABI, and ordered
+  duplicate names preserve multi-value fields such as `Set-Cookie`.
+- [x] Dynamic `str` values in `resp.set/add` and ordered dynamic
+  `resp.remove/header` lower through HIR/MIR/RIR/JIT into a bounded per-request
+  mutation log. HTTP/1 and HTTP/2 merge it with the literal header prefix;
+  invalid/overflowing mutations fail closed. Direct routes with guards,
+  decorators, `wait`, or `for` remain rejected until mutations are stream-owned.
 - [x] `examples/ratelimit.rut` demonstrates GCRA and fixed-window limiting over
   `Cache`; branch-local conditional Cache writes remain a separate follow-up.
 - [x] epoll partial-send proactor semantics and recv-buffer integration.
@@ -166,8 +187,9 @@ canonical spelling for common gateway tasks.
   before/after handler middleware model.
 - Keep pipe in core, but document generated code around direct function stages:
   `value | fn(_, arg)`.
-- Keep method-stage pipe syntax, placeholder-free pipe stages, and tuple-slot
-  pipe placeholders out of core examples unless compatibility requires them.
+- Keep method-stage pipe syntax and tuple-slot pipe placeholders out of core
+  examples unless compatibility requires them; placeholder-free stages are
+  rejected by the stable grammar.
 - Revisit protocol/impl exposure so protocol methods do not read like general
   structure member functions in generated Rut code.
 - Audit `match` and generic examples for constructs that should be core,

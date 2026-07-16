@@ -50,7 +50,7 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
-json({ users: [], total: 0 })           // ⏳ object literal (no object-literal production yet)
+json({ users: [], total: 0 })           // object literal syntax ✅; json() lowering/runtime ⏳
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
@@ -197,7 +197,9 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 
 // Raw headers — function access ONLY (never req.X-Foo property syntax)
 req.header("X-Request-ID")   // str?
-req.set("X-User-ID", "123")  req.add("X-Tag", "a")   req.getAll("Accept")   // ⏳ only req.header is wired up
+req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
+req.add("X-Tag", "a")        // ✅ preserve existing fields and append
+req.getAll("Accept")         // ⏳ [str]
 
 // Route captures / query / cookies / body
 req.params.id                // from :id — captures NEVER shadow built-ins
@@ -209,15 +211,22 @@ req.bodyRaw                  // str, error-capable; assignable before forward
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
 
-// Response construction — ⏳ only `return response(...)` works today; locals + mutators pending
-let resp = response(429)          // ⏳ (no general response() builder; see note above)
-resp.set("Retry-After", "60")     // set/replace header
-resp.remove("Server")             // delete header
-resp.add("Set-Cookie", "a=1")     // append multi-value
+// Response construction — names are literal; values may be runtime strings
+let resp = response(429)          // ✅ literal status
+resp.set("Retry-After", "60")     // ✅ literal replace/dedupe
+resp.set("X-Request-Path", req.path) // ✅ dynamic value
+resp.remove("Server")             // ✅ literal delete
+resp.add("Set-Cookie", "a=1")     // ✅ literal append/multi-value
+resp.header("Retry-After")        // ✅ str?; observes prior set/add/remove mutations
 resp.body = json(data)            // body
 resp.status                       // StatusCode, read/write
 return resp
 ```
+
+Dynamic Response header mutations currently require a direct route with no
+guards, decorators, `wait`, or `for`, and the builder must be returned directly.
+Those restrictions keep mutation state request-local until buffered Response and
+post-middleware execution have their own runtime Response object.
 
 ## State types (top-level, per-shard, bounded)
 

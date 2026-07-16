@@ -262,7 +262,8 @@ void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
     c->req_path_override = Str{path, len};
 }
 
-void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+static void record_req_header(
+    void* conn, const char* name, u32 nlen, const char* val, u32 vlen, bool append) {
     auto* c = static_cast<ConnectionBase*>(conn);
     // Bounded record. The DSL frontend caps + dedupes entries so overflow is
     // unreachable from compiled .rut, but a direct-RIR route can emit more than the
@@ -272,9 +273,23 @@ void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const cha
         c->req_header_override_overflow = true;
         return;
     }
-    auto& o = c->req_header_overrides[c->req_header_override_count++];
+    const u8 index = c->req_header_override_count++;
+    auto& o = c->req_header_overrides[index];
     o.name = Str{name, nlen};
     o.value = Str{val, vlen};
+    const u16 bit = static_cast<u16>(1u << index);
+    if (append)
+        c->req_header_append_mask |= bit;
+    else
+        c->req_header_append_mask &= static_cast<u16>(~bit);
+}
+
+void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_req_header(conn, name, nlen, val, vlen, false);
+}
+
+void rut_helper_req_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_req_header(conn, name, nlen, val, vlen, true);
 }
 
 static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
@@ -287,6 +302,65 @@ static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
         if (a != b) return false;
     }
     return true;
+}
+
+static void record_resp_header(void* conn,
+                               const char* name,
+                               u32 nlen,
+                               const char* val,
+                               u32 vlen,
+                               Connection::RespHeaderMutationMode mode) {
+    if (conn == nullptr) return;
+    auto* c = static_cast<Connection*>(conn);
+    if (c->resp_header_mutation_count >= Connection::kMaxRespHeaderMutations) {
+        c->resp_header_mutation_overflow = true;
+        return;
+    }
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.name = {name, nlen};
+    mutation.value = {val, vlen};
+    mutation.mode = mode;
+}
+
+void rut_helper_resp_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Set);
+}
+
+void rut_helper_resp_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Add);
+}
+
+void rut_helper_resp_remove_header(void* conn, const char* name, u32 nlen) {
+    record_resp_header(conn, name, nlen, nullptr, 0, Connection::RespHeaderMutationMode::Remove);
+}
+
+void rut_helper_resp_header(void* conn,
+                            const char* name,
+                            u32 nlen,
+                            u8 fallback_has,
+                            const char* fallback_ptr,
+                            u32 fallback_len,
+                            u8* out_has,
+                            const char** out_ptr,
+                            u32* out_len) {
+    *out_has = fallback_has;
+    *out_ptr = fallback_has ? fallback_ptr : nullptr;
+    *out_len = fallback_has ? fallback_len : 0;
+    if (conn == nullptr) return;
+    auto* c = static_cast<Connection*>(conn);
+    for (u32 i = 0; i < c->resp_header_mutation_count; i++) {
+        const auto& mutation = c->resp_header_mutations[i];
+        if (!ascii_header_name_eq(mutation.name, name, nlen)) continue;
+        if (mutation.mode == Connection::RespHeaderMutationMode::Remove) {
+            *out_has = 0;
+            *out_ptr = nullptr;
+            *out_len = 0;
+        } else if (mutation.mode == Connection::RespHeaderMutationMode::Set || !*out_has) {
+            *out_has = 1;
+            *out_ptr = mutation.value.ptr;
+            *out_len = mutation.value.len;
+        }
+    }
 }
 
 void rut_helper_req_cookie(const u8* req_data,

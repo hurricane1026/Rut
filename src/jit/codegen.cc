@@ -328,6 +328,55 @@ struct Ctx {
         return fn_req_set_header;
     }
 
+    // void rut_helper_req_add_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
+    LLVMValueRef fn_req_add_header = nullptr;
+    LLVMValueRef get_req_add_header() {
+        if (!fn_req_add_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_req_add_header = LLVMAddFunction(llvm_mod, "rut_helper_req_add_header", ft);
+        }
+        return fn_req_add_header;
+    }
+
+    LLVMValueRef fn_resp_set_header = nullptr;
+    LLVMValueRef fn_resp_add_header = nullptr;
+    LLVMValueRef fn_resp_remove_header = nullptr;
+    LLVMValueRef fn_resp_header = nullptr;
+    LLVMValueRef get_resp_set_header() {
+        if (!fn_resp_set_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_resp_set_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_set_header", LLVMFunctionType(void_ty, params, 5, 0));
+        }
+        return fn_resp_set_header;
+    }
+    LLVMValueRef get_resp_add_header() {
+        if (!fn_resp_add_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_resp_add_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_add_header", LLVMFunctionType(void_ty, params, 5, 0));
+        }
+        return fn_resp_add_header;
+    }
+    LLVMValueRef get_resp_remove_header() {
+        if (!fn_resp_remove_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            fn_resp_remove_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_remove_header", LLVMFunctionType(void_ty, params, 3, 0));
+        }
+        return fn_resp_remove_header;
+    }
+    LLVMValueRef get_resp_header() {
+        if (!fn_resp_header) {
+            LLVMTypeRef params[] = {
+                ptr_ty, ptr_ty, i32_ty, i8_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            fn_resp_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_header", LLVMFunctionType(void_ty, params, 9, 0));
+        }
+        return fn_resp_header;
+    }
+
     // void rut_helper_req_cookie(ptr, i32, ptr, i32, ptr, ptr, ptr)
     LLVMValueRef get_req_cookie() {
         if (!fn_req_cookie) {
@@ -960,6 +1009,88 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            args,
                            5,
                            "");
+            break;
+        }
+        case rir::Opcode::ReqAddHeader: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "addheader.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "addheader.vptr");
+            LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "addheader.vlen");
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_add_header()),
+                           c.get_req_add_header(),
+                           args,
+                           5,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespSetHeader:
+        case rir::Opcode::RespAddHeader: {
+            const bool add = inst.op == rir::Opcode::RespAddHeader;
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, add ? "respadd.name" : "respset.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "resp.vptr");
+            LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "resp.vlen");
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
+            LLVMValueRef helper = add ? c.get_resp_add_header() : c.get_resp_set_header();
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 5, "");
+            break;
+        }
+        case rir::Opcode::RespRemoveHeader: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "respremove.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_remove_header()),
+                           c.get_resp_remove_header(),
+                           args,
+                           3,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespHeader: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "respheader.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef fallback = c.get_value(inst.operands[0]);
+            LLVMValueRef fallback_has =
+                LLVMBuildExtractValue(c.builder, fallback, 0, "resp.fb.has");
+            LLVMValueRef fallback_ptr =
+                LLVMBuildExtractValue(c.builder, fallback, 1, "resp.fb.ptr");
+            LLVMValueRef fallback_len =
+                LLVMBuildExtractValue(c.builder, fallback, 2, "resp.fb.len");
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "resp.hdr.has");
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "resp.hdr.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "resp.hdr.len");
+            LLVMValueRef args[] = {c.param_conn,
+                                   name_ptr,
+                                   name_len,
+                                   fallback_has,
+                                   fallback_ptr,
+                                   fallback_len,
+                                   out_has,
+                                   out_ptr,
+                                   out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_header()),
+                           c.get_resp_header(),
+                           args,
+                           9,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "resp.h");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "resp.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "resp.l");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "resp.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "resp.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "resp.opt.len");
+            c.set_value(inst.result, opt);
             break;
         }
         case rir::Opcode::ReqParam: {

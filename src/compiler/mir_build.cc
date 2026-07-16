@@ -378,6 +378,50 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
+    if (expr.kind == HirExprKind::ReqSetHeader || expr.kind == HirExprKind::ReqAddHeader) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto value = mir_value(*expr.lhs, module, fn, ctx);
+        if (!value) return core::make_unexpected(value.error());
+        if (!fn->values.push(value.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = expr.kind == HirExprKind::ReqAddHeader ? MirValueKind::ReqAddHeader
+                                                        : MirValueKind::ReqSetHeader;
+        v.type = MirTypeKind::Str;
+        v.str_value = expr.str_value;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::RespHeader) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto fallback = mir_value(*expr.lhs, module, fn, ctx);
+        if (!fallback) return core::make_unexpected(fallback.error());
+        if (!fn->values.push(fallback.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::RespHeader;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        v.str_value = expr.str_value;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::RespSetHeader || expr.kind == HirExprKind::RespAddHeader ||
+        expr.kind == HirExprKind::RespRemoveHeader) {
+        v.kind = expr.kind == HirExprKind::RespSetHeader   ? MirValueKind::RespSetHeader
+                 : expr.kind == HirExprKind::RespAddHeader ? MirValueKind::RespAddHeader
+                                                           : MirValueKind::RespRemoveHeader;
+        v.type = MirTypeKind::Str;
+        v.str_value = expr.str_value;
+        if (expr.kind != HirExprKind::RespRemoveHeader) {
+            if (expr.lhs == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            auto value = mir_value(*expr.lhs, module, fn, ctx);
+            if (!value) return core::make_unexpected(value.error());
+            if (!fn->values.push(value.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            v.lhs = &fn->values[fn->values.len - 1];
+        }
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqParam) {
         v.kind = MirValueKind::ReqParam;
         v.type = MirTypeKind::Str;
@@ -1001,7 +1045,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // Array locals are compile-time constants for for-loop unroll
             // only. They have no runtime MirValue carrier yet, so do not
             // emit a MIR local for them.
-            if (module.routes[i].locals[li].type == HirTypeKind::Array) continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Array ||
+                module.routes[i].locals[li].type == HirTypeKind::Response)
+                continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
             // a stable ref_index, then blanks the name for scope-hiding
@@ -1014,11 +1060,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // the slot is still being initialized, turning any future
             // substitution regression into a silent miscompile.
             //
-            // EXCEPT the bare-cache-set statement's carrier: it is also
-            // name-cleared (unnameable by design) but its init is the side
-            // effect itself — dropping it would silently delete the write.
+            // EXCEPT bare statement-effect carriers: they are also name-cleared
+            // (unnameable by design) but their init is the side effect itself —
+            // dropping one would silently delete the write.
             if (module.routes[i].locals[li].name.len == 0 &&
-                module.routes[i].locals[li].init.kind != HirExprKind::CacheSet)
+                module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
+                module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::RespSetHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::RespAddHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader)
                 continue;
             if (module.routes[i].locals[li].is_wait_result) continue;
             MirLocal local{};

@@ -119,6 +119,11 @@ enum class AstExprKind : u8 {
     // errors.  Surface `[T]` type syntax desugars to
     // `AstTypeRef{name="Array", type_args=[T]}` in parse_func_type_ref.
     ArrayLit,
+    // Anonymous object literal `{ key: value, ... }`. The parser creates this
+    // kind only through a call's argument parser; it is deliberately absent
+    // from the general primary-expression grammar so a bare `{ ... }` always
+    // remains a statement block. Fields are stored in `field_inits`.
+    ObjectLit,
     StructInit,
     Placeholder,
     VariantCase,
@@ -228,6 +233,10 @@ struct AstStatement {
     // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
     bool has_response_body = false;
+    // `return <ident>` where the identifier names a local created by
+    // `response(status)`. Kept distinct from the literal-status form while
+    // reusing ReturnStatus as the control-flow terminator kind.
+    bool returns_response_local = false;
     // Response headers from `response(N, headers: { "K": "V", ... })`.
     // Inline-stored (no external pool) so analyze/lowering don't need
     // the AstFile handle. `response_headers.len == 0` means "no kwarg";

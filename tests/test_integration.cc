@@ -1292,7 +1292,7 @@ TEST(timer_dsl, rejects_websocket_terminate_in_body) {
     using namespace rut;
     const char* src =
         "upstream ws at \"10.0.0.1:8080\"\n"
-        "timer t, every: 1s { return websocket(ws) { frame.forward() } }\n";
+        "timer t, every: 1s { return websocket(ws) { frame in frame.forward() } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -12110,19 +12110,18 @@ TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
         1u);
 }
 
-TEST(route, add_response_header_set_rejects_case_insensitive_duplicate) {
+TEST(route, add_response_header_set_preserves_case_insensitive_duplicate) {
     using namespace rut;
-    // Manual RouteConfig path must reject duplicate names the same
-    // way the DSL parser does, case-insensitively. Two entries with
-    // "X-Foo" / "x-foo" would produce ambiguous singleton headers on
-    // the wire, so registration fails up front.
+    // Ordered response builders use duplicates for multi-value fields such as
+    // Set-Cookie. Map-literal syntax continues to reject duplicates earlier.
     RouteConfig cfg{};
     const char* keys[2] = {"X-Foo", "x-foo"};
     u32 key_lens[2] = {5, 5};
     const char* vals[2] = {"1", "2"};
     u32 val_lens[2] = {1, 1};
-    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 2), 0u);
-    CHECK_EQ(cfg.response_header_set_count, 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 2), 1u);
+    CHECK_EQ(cfg.response_header_set_count, 1u);
+    CHECK_EQ(cfg.response_header_sets[0].count, 2u);
 }
 
 TEST(route, add_response_header_set_rejects_malformed_headers) {
@@ -12533,14 +12532,21 @@ TEST(route, dsl_response_headers_real_socket) {
     rir.destroy();
 }
 
-// Redirect-style: headers without body. Verify Content-Length: 0,
-// the Location header is emitted, and no body bytes follow.
+// Redirect-style Response local: set replacement, add multi-value fields, and
+// return the builder through the real HTTP/1 socket path.
 TEST(route, dsl_response_headers_only_real_socket) {
     using namespace rut;
 
-    const char* src =
-        "route GET \"/old\" { return response(301, headers: "
-        "{ \"Location\": \"/new\" }) }\n";
+    const char* src = R"rut(
+route GET "/old" {
+    let resp = response(301)
+    resp.set("Location", "/first")
+    resp.set("location", "/new")
+    resp.add("Set-Cookie", "a=1")
+    resp.add("Set-Cookie", "b=2")
+    return resp
+}
+)rut";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -12607,7 +12613,10 @@ TEST(route, dsl_response_headers_only_real_socket) {
     };
     CHECK(has("301 ", 4));
     CHECK(has("Content-Length: 0\r\n", 19));
-    CHECK(has("Location: /new\r\n", 16));
+    CHECK(has("location: /new\r\n", 16));
+    CHECK(!has("Location: /first\r\n", 18));
+    CHECK(has("Set-Cookie: a=1\r\n", 17));
+    CHECK(has("Set-Cookie: b=2\r\n", 17));
     // Response must terminate exactly at the blank line — the last
     // four bytes must be "\r\n\r\n" and nothing else should follow.
     // Substring-containment alone wouldn't catch a stray body payload

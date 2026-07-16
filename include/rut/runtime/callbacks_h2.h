@@ -380,7 +380,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
-    hpack::Header hdrs[RouteConfig::kMaxHeadersPerSet];
+    constexpr u32 kMaxEffectiveHeaders =
+        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+    hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
@@ -397,6 +399,41 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             hdrs[nhdrs].name = {kn, kl};
             hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
                                  cfg->header_values[ref.offset + i].len};
+            nhdrs++;
+        }
+    }
+    if (d.conn->resp_header_mutation_overflow) {
+        h2_emit_status(d, stream_id, 500);
+        return;
+    }
+    for (u32 mi = 0; mi < d.conn->resp_header_mutation_count; mi++) {
+        const auto& mutation = d.conn->resp_header_mutations[mi];
+        const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+        if (validate_response_header(mutation.name.ptr,
+                                     mutation.name.len,
+                                     remove ? "" : mutation.value.ptr,
+                                     remove ? 0 : mutation.value.len) != HttpHeaderValidation::Ok) {
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        if (mutation.mode != Connection::RespHeaderMutationMode::Add) {
+            for (u32 i = 0; i < nhdrs;) {
+                if (!http_header_name_eq_ci(
+                        hdrs[i].name.ptr, hdrs[i].name.len, mutation.name.ptr, mutation.name.len)) {
+                    i++;
+                    continue;
+                }
+                for (u32 move = i + 1; move < nhdrs; move++) hdrs[move - 1] = hdrs[move];
+                nhdrs--;
+            }
+        }
+        if (!remove && !h2_is_prohibited_response_header(mutation.name.ptr, mutation.name.len)) {
+            if (nhdrs >= kMaxEffectiveHeaders) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            hdrs[nhdrs].name = mutation.name;
+            hdrs[nhdrs].value = mutation.value;
             nhdrs++;
         }
     }
@@ -524,6 +561,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const u8* synth,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
+    d.conn->resp_header_mutation_count = 0;
+    d.conn->resp_header_mutation_overflow = false;
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;

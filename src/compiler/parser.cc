@@ -13,6 +13,9 @@ constexpr Str kGuardMatchArmIfDetail = lit_str("guard match arms do not support 
 constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
 constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
+constexpr Str kWsTrailingBlockDetail =
+    lit_str("websocket trailing blocks require `{ frame in ... }`");
+constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
 constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
@@ -130,7 +133,7 @@ struct Parser {
     }
 
 #if RUT_ENABLE_WEBSOCKET
-    // Parse a WebSocket terminate-mode frame-handler body `{ ... }`. Distinct from
+    // Parse a WebSocket terminate-mode frame-handler body after `{ frame in`. Distinct from
     // parse_braced_stmt_body because frame verdicts are **bare method-call statements**
     // (`frame.forward()`), which the general statement parser (parse_stmt) deliberately
     // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
@@ -297,9 +300,54 @@ struct Parser {
         return stmt;
     }
 
+    FrontendResult<AstExpr> parse_object_call_arg() {
+        const Token start = cur();
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        NestedDelimiterGuard nested(this);
+
+        AstExpr object{};
+        object.kind = AstExprKind::ObjectLit;
+        object.span = span_from(start);
+        if (take(TokenType::RBrace)) {
+            object.span.end = prev().end;
+            return object;
+        }
+
+        while (true) {
+            auto field_name = expect_field_name();
+            if (!field_name) return core::make_unexpected(field_name.error());
+            auto colon = expect(TokenType::Colon);
+            if (!colon) return core::make_unexpected(colon.error());
+            auto field_value = parse_expr();
+            if (!field_value) return core::make_unexpected(field_value.error());
+            auto field_value_ptr = alloc_expr(field_value.value());
+            if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
+            AstExpr::FieldInit field_init{};
+            field_init.name = field_name.value()->text;
+            field_init.value = field_value_ptr.value();
+            if (!object.field_inits.push(field_init))
+                return frontend_error(FrontendError::TooManyItems, field_value->span);
+            if (take(TokenType::RBrace)) break;
+            auto comma = expect(TokenType::Comma);
+            if (!comma) return core::make_unexpected(comma.error());
+            if (take(TokenType::RBrace)) break;
+        }
+        object.span.end = prev().end;
+        return object;
+    }
+
+    FrontendResult<AstExpr> parse_call_arg() {
+        if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        return parse_expr();
+    }
+
     FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
+        if (cur().type == TokenType::LBrace)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(cur()), kObjectCallArgDetail);
         if (take(TokenType::LBracket)) {
             NestedDelimiterGuard nested(this);
             AstExpr arr{};
@@ -666,7 +714,7 @@ struct Parser {
                         if (!field_name) return core::make_unexpected(field_name.error());
                         auto colon = expect(TokenType::Colon);
                         if (!colon) return core::make_unexpected(colon.error());
-                        auto field_value = parse_expr();
+                        auto field_value = parse_call_arg();
                         if (!field_value) return core::make_unexpected(field_value.error());
                         auto field_value_ptr = alloc_expr(field_value.value());
                         if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -689,7 +737,7 @@ struct Parser {
                     call.span = expr.span;
                     if (prev().type != TokenType::RParen) {
                         while (true) {
-                            auto arg = parse_expr();
+                            auto arg = parse_call_arg();
                             if (!arg) return core::make_unexpected(arg.error());
                             auto arg_ptr = alloc_expr(arg.value());
                             if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
@@ -782,7 +830,7 @@ struct Parser {
                         if (!field_name) return core::make_unexpected(field_name.error());
                         auto colon = expect(TokenType::Colon);
                         if (!colon) return core::make_unexpected(colon.error());
-                        auto field_value = parse_expr();
+                        auto field_value = parse_call_arg();
                         if (!field_value) return core::make_unexpected(field_value.error());
                         auto field_value_ptr = alloc_expr(field_value.value());
                         if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -806,7 +854,7 @@ struct Parser {
                     method.span = field.span;
                     if (!take(TokenType::RParen)) {
                         while (true) {
-                            auto arg = parse_expr();
+                            auto arg = parse_call_arg();
                             if (!arg) return core::make_unexpected(arg.error());
                             auto arg_ptr = alloc_expr(arg.value());
                             if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
@@ -1453,8 +1501,8 @@ struct Parser {
             // ForwardUpstream terminator as `forward`: the runtime auto-establishes the
             // full-duplex passthrough tunnel when the client requested an Upgrade and the
             // upstream answers 101 (a non-upgrade request just proxies normally, so the
-            // route is safe with no edge guard). Per-frame `{ frame ... }`, subprotocol/
-            // maxMessageSize kwargs, and a typed `req.upgrade` guard are later phases.
+            // route is safe with no edge guard). Terminate mode uses the contextual
+            // `{ frame in ... }` trailing block parsed below.
             // NOTE: for now `websocket(x)` is indistinguishable from `forward(x)` after
             // parse — the keyword is intent/documentation only. A distinct WS-only route
             // marker is a later phase if "a forward that must NOT tunnel" is ever needed.
@@ -1511,7 +1559,7 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.name = name.value()->text;
                 stmt.ws_max_message_size = ws_max_size;
-                // A trailing `{ ... }` block makes this TERMINATE mode (the gateway
+                // A trailing `{ frame in ... }` block makes this TERMINATE mode (the gateway
                 // parses/inspects each message); a bare `websocket(x)` stays the passthrough
                 // ForwardUpstream tunnel. The block is the per-message frame handler; its
                 // body is stored on then_stmt (reused like For), parsed by the general
@@ -1519,6 +1567,16 @@ struct Parser {
                 if (cur().type == TokenType::LBrace) {
                     auto lbrace = expect(TokenType::LBrace);
                     if (!lbrace) return core::make_unexpected(lbrace.error());
+                    if (cur().type != TokenType::Ident || !cur().text.eq({"frame", 5}))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(cur()),
+                                              kWsTrailingBlockDetail);
+                    pos++;  // consume the fixed frame-handler binding
+                    if (cur().type != TokenType::KwIn)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(cur()),
+                                              kWsTrailingBlockDetail);
+                    pos++;  // consume `in`
                     auto body = parse_ws_frame_body(*lbrace.value());
                     if (!body) return core::make_unexpected(body.error());
                     auto body_ptr = alloc_stmt(body.value());
@@ -1658,6 +1716,18 @@ struct Parser {
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
+
+            // Response builder local: `return resp`. Analyze verifies that the
+            // identifier was initialized by `response(status)` and folds its
+            // bounded header mutations into the ReturnStatus terminator.
+            if (cur().type == TokenType::Ident) {
+                const Token response_local = cur();
+                pos++;
+                stmt.name = response_local.text;
+                stmt.returns_response_local = true;
+                stmt.span = Span{start.start, response_local.end, start.line, start.col};
                 return stmt;
             }
 

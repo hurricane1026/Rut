@@ -1340,6 +1340,116 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_req_set_and_add_record_request_header_modes) {
+    const auto src = R"rut(
+route GET "/users" {
+    req.set("X-Mode", "replace")
+    req.add("X-Tag", "tail")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+    REQUIRE_EQ(conn.req_header_override_count, 2u);
+    CHECK(conn.req_header_overrides[0].name.eq(lit("X-Mode")));
+    CHECK(conn.req_header_overrides[0].value.eq(lit("replace")));
+    CHECK(conn.req_header_overrides[1].name.eq(lit("X-Tag")));
+    CHECK(conn.req_header_overrides[1].value.eq(lit("tail")));
+    CHECK_EQ(conn.req_header_append_mask, 2u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    let resp = response(200)
+    resp.add("X-Base", "static")
+    resp.set("X-Path", req.path)
+    resp.add("X-Path", "tail")
+    let observed = resp.header("X-Path").or("missing")
+    resp.set("X-Observed", observed)
+    resp.remove("X-Base")
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 4u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("tail")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[2].name.eq(lit("X-Observed")));
+    CHECK(conn.resp_header_mutations[2].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[3].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[3].name.eq(lit("X-Base")));
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    conn.reset();
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, cache_helpers_miss_and_out_of_range) {
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {64};
@@ -19343,9 +19453,9 @@ TEST(jit_dispatch, null_handler_returns_error_outcome) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
-// Compile a `websocket(x){ frame.<verdict>() }` program end-to-end through the constant-verdict
-// frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL), and return
-// the verdict the compiled function actually produces. Returns 255 on any failure.
+// Compile a `websocket(x){ frame in frame.<verdict>() }` program end-to-end through the
+// constant-verdict frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL),
+// and return the verdict the compiled function actually produces. Returns 255 on any failure.
 static WsFrameAction jit_ws_verdict(const char* src) {
     constexpr auto kFail = static_cast<WsFrameAction>(255);
     auto lexed = lex(lit(src));
@@ -19369,21 +19479,18 @@ static WsFrameAction jit_ws_verdict(const char* src) {
 
 TEST(jit, ws_handler_forward_returns_forward) {
     // frame.forward() compiles to a verdict function that, when called, returns Forward.
-    CHECK(jit_ws_verdict(
-              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n") ==
-          WsFrameAction::Forward);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
+                         "frame.forward() } }\n") == WsFrameAction::Forward);
 }
 
 TEST(jit, ws_handler_drop_returns_drop) {
-    CHECK(jit_ws_verdict(
-              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop() } }\n") ==
-          WsFrameAction::Drop);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
+                         "frame.drop() } }\n") == WsFrameAction::Drop);
 }
 
 TEST(jit, ws_handler_close_returns_close) {
-    CHECK(jit_ws_verdict(
-              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close() } }\n") ==
-          WsFrameAction::Close);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
+                         "frame.close() } }\n") == WsFrameAction::Close);
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
