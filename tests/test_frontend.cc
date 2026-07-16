@@ -31236,6 +31236,23 @@ TEST(frontend, parse_rejects_object_literal_as_general_expression) {
     CHECK(ast.error().detail.eq(lit("object literals are only allowed as call arguments")));
 }
 
+TEST(frontend, analyze_rejects_object_literal_after_empty_name_effect_local) {
+    const char* src = R"rut(
+func accept(value: str) -> str => value
+route GET "/x" {
+    req.set("X-Mode", "replace")
+    let payload = accept({ value: 1 })
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
     const char* src =
         "route GET \"/x\" { req.set(\"X-Mode\", \"replace\") req.add(\"X-Tag\", \"a\") "
@@ -31450,6 +31467,24 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, response_header_lookup_respects_nearest_shadowing_local) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    r.set("X-Mode", "builder")
+    let r = "shadow"
+    let seen = r.header("X-Mode")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, response_local_mutators_validate_literal_and_direct_return_limits) {
     const char* cases[] = {
         "route GET \"/x\" { let r = response(99) return r }\n",
@@ -31472,6 +31507,22 @@ TEST(frontend, dynamic_response_headers_reject_multiple_response_builders) {
         "a.set(\"X\", req.path) return a }\n",
         "route GET \"/x\" { let a = response(200) a.set(\"X\", req.path) "
         "let b = response(201) return b }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
+    const char* cases[] = {
+        "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) return 204 }\n",
+        "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) "
+        "return response(204) }\n",
     };
     for (const char* src : cases) {
         auto lexed = lex(lit(src));

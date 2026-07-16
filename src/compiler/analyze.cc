@@ -3884,11 +3884,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
         const HirLocal* response = nullptr;
         for (u32 li = local_count; li > 0; li--) {
-            if (locals[li - 1].name.eq(expr.lhs->name) &&
-                locals[li - 1].init.kind == HirExprKind::ResponseInit) {
-                response = &locals[li - 1];
-                break;
-            }
+            if (!locals[li - 1].name.eq(expr.lhs->name)) continue;
+            if (locals[li - 1].init.kind == HirExprKind::ResponseInit) response = &locals[li - 1];
+            break;
         }
         if (response != nullptr) {
             if (!expr.name.eq({"header", 6}) || expr.args.len != 1 || expr.args[0] == nullptr ||
@@ -6393,6 +6391,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.type = HirTypeKind::Str;
         out.str_value = expr.str_value;
         return out;
+    }
+    if (expr.kind == AstExprKind::ObjectLit) {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("object literals are currently supported only as parsed call arguments; "
+                    "object value lowering is pending"));
     }
     if (expr.kind == AstExprKind::RegexLit) {
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -13932,6 +13937,8 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqContentLength:
         case HirExprKind::ReqRemoteAddr:
         case HirExprKind::ReqMethod:
+        case HirExprKind::ReqSetHeader:
+        case HirExprKind::ReqAddHeader:
             return true;
         default:
             break;
@@ -18194,6 +18201,37 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());
                 continue;
+            }
+            const HirLocal* dynamic_response = nullptr;
+            for (u32 li = 0; li < route.locals.len; li++) {
+                if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
+                    route.locals[li].init.bool_value) {
+                    dynamic_response = &route.locals[li];
+                    break;
+                }
+            }
+            if (dynamic_response != nullptr) {
+                if (stmt.kind != AstStmtKind::ReturnStatus || !stmt.returns_response_local ||
+                    !stmt.name.eq(dynamic_response->name))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.span,
+                        lit_str(
+                            "a dynamically mutated Response builder must be returned directly"));
+                if (route.guards.len != 0)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.span,
+                        lit_str(
+                            "dynamic response header mutations cannot be combined with guards"));
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    if (route.locals[li].init.may_error)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            route.locals[li].span,
+                            lit_str("dynamic response header mutations cannot follow fallible "
+                                    "bindings yet"));
+                }
             }
             auto control = analyze_control_stmt(stmt, &route, mod, nullptr);
             if (!control) return core::make_unexpected(control.error());

@@ -1174,6 +1174,25 @@ TEST(timer_dsl, rejects_req_access_in_body) {
             86}));
 }
 
+TEST(timer_dsl, rejects_req_header_mutation_in_body) {
+    using namespace rut;
+    for (const char* method : {"set", "add"}) {
+        const std::string src = std::string("timer t, every: 1s { req.") + method +
+                                "(\"X-Timer\", \"v\") return 200 }\n";
+        auto lexed = lex(Str{src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(!hir);
+        CHECK(hir.error().detail.eq(
+            Str{"timers run outside a request; req access and forward are not available "
+                "in a timer body",
+                86}));
+    }
+}
+
 // wait needs a Connection to yield/resume on; the timer invocation has none.
 TEST(timer_dsl, rejects_wait_in_body) {
     using namespace rut;

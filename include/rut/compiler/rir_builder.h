@@ -591,6 +591,10 @@ struct Builder {
     }
 
     Result<ValueId> emit_resp_header(Str name, ValueId fallback, SourceLoc loc = {}) {
+        if (!val_has_type(fallback, TypeKind::Optional) ||
+            cur_func->values[fallback.id].type->inner == nullptr ||
+            cur_func->values[fallback.id].type->inner->kind != TypeKind::Str)
+            return err(RirError::InvalidState);
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
         auto r = TRY(emit(Opcode::RespHeader, ty, loc));
@@ -601,6 +605,7 @@ struct Builder {
     }
 
     VoidResult emit_resp_set_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
         r.inst->imm.str_val = name;
         r.inst->operands[0] = val;
@@ -609,6 +614,7 @@ struct Builder {
     }
 
     VoidResult emit_resp_add_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RespAddHeader, nullptr, loc));
         r.inst->imm.str_val = name;
         r.inst->operands[0] = val;
