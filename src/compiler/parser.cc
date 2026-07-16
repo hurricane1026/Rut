@@ -1605,8 +1605,10 @@ struct Parser {
             // Peek for the response builder. We recognise `response`
             // by the literal identifier text; no dedicated keyword yet
             // because `response` is also a valid identifier elsewhere.
-            const Token& peek = cur();
-            const bool is_builder = peek.type == TokenType::Ident && peek.text.eq({"response", 8});
+            const Token& candidate = cur();
+            const bool is_builder = candidate.type == TokenType::Ident &&
+                                    candidate.text.eq({"response", 8}) &&
+                                    peek().type == TokenType::LParen;
             if (is_builder) {
                 pos++;  // consume `response`
                 auto lparen = expect(TokenType::LParen);

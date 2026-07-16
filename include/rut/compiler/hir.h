@@ -454,7 +454,11 @@ struct HirExpr {
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
-    static constexpr u32 kMaxFieldInits = 8;
+    // Struct/object construction is still capped by the AST at 8 fields, but
+    // ResponseInit also uses this storage for its ordered literal header prefix.
+    // Match the language's existing 16-header terminator limit so builder syntax
+    // does not impose a smaller, surprising cap.
+    static constexpr u32 kMaxFieldInits = 16;
     // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
     // sits at ~300 KB on stack and is copied on each recursive
     // analyze_file_internal call (via `HirRoute scratch{}`). A 32-wide cap

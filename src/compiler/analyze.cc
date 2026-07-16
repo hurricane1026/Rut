@@ -17677,7 +17677,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.time_ops_blocked = true;
             }
             if (s.kind == AstStmtKind::Guard || s.kind == AstStmtKind::Wait ||
-                s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For)
+                s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For ||
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
                 response_runtime_mutation_blocked = true;
         }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
@@ -17691,11 +17692,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     stmt.expr.lhs->kind == AstExprKind::Ident) {
                     u32 response_local = route.locals.len;
                     for (u32 li = route.locals.len; li > 0; li--) {
-                        if (route.locals[li - 1].name.eq(stmt.expr.lhs->name) &&
-                            route.locals[li - 1].init.kind == HirExprKind::ResponseInit) {
+                        if (!route.locals[li - 1].name.eq(stmt.expr.lhs->name)) continue;
+                        if (route.locals[li - 1].init.kind == HirExprKind::ResponseInit)
                             response_local = li - 1;
-                            break;
-                        }
+                        break;
                     }
                     if (response_local != route.locals.len) {
                         const bool is_set = stmt.expr.name.eq({"set", 3});

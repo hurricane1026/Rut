@@ -31406,6 +31406,54 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, response_local_named_response_can_be_returned) {
+    const char* src = R"rut(
+route GET "/x" {
+    let response = response(201)
+    response.set("X-Mode", "builder")
+    return response
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
+    const auto& returned = *ast->items[0].route.statements[2];
+    CHECK(returned.returns_response_local);
+    CHECK(returned.name.eq(lit("response")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 201);
+    REQUIRE_EQ(hir->routes[0].control.direct_term.response_headers.len, 1u);
+}
+
+TEST(frontend, response_literal_builder_accepts_existing_sixteen_header_limit) {
+    auto source_with_headers = [](u32 count) {
+        std::string src = "route GET \"/x\" { let r = response(200) ";
+        for (u32 i = 0; i < count; i++) src += "r.add(\"X-" + std::to_string(i) + "\", \"v\") ";
+        src += "return r }\n";
+        return src;
+    };
+
+    const std::string accepted = source_with_headers(16);
+    auto accepted_lexed = lex(Str{accepted.data(), static_cast<u32>(accepted.size())});
+    REQUIRE(accepted_lexed);
+    auto accepted_ast = parse_file_heap(accepted_lexed.value());
+    REQUIRE(accepted_ast);
+    auto accepted_hir = analyze_file_heap(accepted_ast.value());
+    REQUIRE(accepted_hir);
+    CHECK_EQ(accepted_hir->routes[0].control.direct_term.response_headers.len, 16u);
+
+    const std::string rejected = source_with_headers(17);
+    auto rejected_lexed = lex(Str{rejected.data(), static_cast<u32>(rejected.size())});
+    REQUIRE(rejected_lexed);
+    auto rejected_ast = parse_file_heap(rejected_lexed.value());
+    REQUIRE(rejected_ast);
+    auto rejected_hir = analyze_file_heap(rejected_ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+}
+
 TEST(frontend, response_local_dynamic_header_mutations_lower_to_runtime_ops) {
     const char* src = R"rut(
 route GET "/x" {
@@ -31485,6 +31533,23 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, response_mutator_lookup_respects_nearest_shadowing_local) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    let r = "shadow"
+    r.set("X-Mode", "builder")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, response_local_mutators_validate_literal_and_direct_return_limits) {
     const char* cases[] = {
         "route GET \"/x\" { let r = response(99) return r }\n",
@@ -31532,6 +31597,23 @@ TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
     }
+}
+
+TEST(frontend, dynamic_response_headers_reject_bound_wait_routes) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    r.set("X-Path", req.path)
+    let ev = wait(timer(1000))
+    return r
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 int main(int argc, char** argv) {
