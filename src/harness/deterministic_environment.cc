@@ -37,15 +37,15 @@ CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
     // Production arms a real timer alongside the other operations for
     // `wait any`. If the next scripted I/O completion is later than that
     // deadline, the timer wins without consuming the later event.
-    if (yielded == jit::YieldKind::Any && earliest_timer_at_us > now_us &&
-        candidate.at_us > earliest_timer_at_us) {
+    if ((yielded == jit::YieldKind::Any || yielded == jit::YieldKind::Timer) &&
+        earliest_timer_at_us > now_us && candidate.at_us > earliest_timer_at_us) {
         completion = {};
         completion.kind = jit::YieldKind::Timer;
         completion.at_us = earliest_timer_at_us;
         now_us = earliest_timer_at_us;
         return CompletionStatus::Ready;
     }
-    if (yielded != jit::YieldKind::Any &&
+    if (yielded != jit::YieldKind::Any && yielded != jit::YieldKind::Timer &&
         candidate.target_id != DeterministicCompletion::kAnyTarget &&
         candidate.target_id != yielded_target)
         return CompletionStatus::TargetMismatch;

@@ -243,6 +243,50 @@ TEST(harness_handler, rejects_timer_completion_before_requested_delay) {
     CHECK_EQ(result.consumed_events, 0u);
 }
 
+TEST(harness_handler, timer_completion_ignores_explicit_target_id) {
+    harness::HandlerExecution execution{};
+    execution.init(&timer_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Timer, 0, 25000, 1, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 205);
+    CHECK_EQ(result.harness.virtual_time_us, 25000u);
+    CHECK_EQ(result.consumed_events, 1u);
+}
+
+TEST(harness_handler, direct_timer_deadline_wins_over_late_scripted_timer) {
+    harness::HandlerExecution execution{};
+    execution.init(&timer_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Timer, 0, 50000, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 205);
+    CHECK_EQ(result.harness.virtual_time_us, 25000u);
+    CHECK_EQ(result.consumed_events, 0u);
+}
+
 TEST(harness_handler, rejects_wait_any_timer_before_timeout) {
     harness::HandlerExecution execution{};
     execution.init(&any_timer_handler, nullptr, nullptr, 0);

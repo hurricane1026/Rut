@@ -172,7 +172,8 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 earliest_timer_at_us += delay_us;
         }
         if (completion == CompletionStatus::Ready) {
-            const u32 yielded_target = result.yield_kind == jit::YieldKind::Any
+            const u32 yielded_target = result.yield_kind == jit::YieldKind::Any ||
+                                               result.yield_kind == jit::YieldKind::Timer
                                            ? DeterministicCompletion::kAnyTarget
                                            : result.yield_payload_u32();
             completion = environment.next(result.yield_kind,
