@@ -2859,6 +2859,91 @@ TEST(frontend, parse_respond_status_with_body) {
     CHECK(term.response_body.eq(lit("denied")));
 }
 
+TEST(frontend, respond_response_local_folds_to_status) {
+    const char* src = "route GET \"/x\" { let resp = response(418) respond resp }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
+    const AstStatement& stmt = *ast->items[0].route.statements[1];
+    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::RespondStatus));
+    CHECK(stmt.returns_response_local);
+    CHECK(stmt.name.eq(lit("resp")));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
+    CHECK_EQ(term.status_code, 418);
+}
+
+TEST(frontend, helper_respond_response_local_propagates_guard) {
+    const char* src = R"rut(
+func check(ok: bool) -> i32 {
+    let resp = response(401)
+    resp.set("X-Discard", "first")
+    resp.add("X-Discard", "second")
+    resp.remove("X-Discard")
+    resp.set("X-Reason", "auth")
+    guard ok else { respond resp }
+    7
+}
+route GET "/x" { let value = check(req.http11) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].respond_guards.len, 1u);
+    CHECK_EQ(hir->functions[0].respond_guards[0].status_code, 401);
+    REQUIRE_EQ(hir->functions[0].respond_guards[0].response_headers.len, 1u);
+    CHECK(hir->functions[0].respond_guards[0].response_headers[0].key.eq(lit("X-Reason")));
+    CHECK(hir->functions[0].respond_guards[0].response_headers[0].value.eq(lit("auth")));
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
+    REQUIRE_EQ(hir->routes[0].guards[0].fail_term.response_headers.len, 1u);
+    CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].key.eq(lit("X-Reason")));
+}
+
+TEST(frontend, respond_identifier_must_name_response_builder) {
+    const char* src =
+        "func check(ok: bool) -> i32 { let value = 401 guard ok else { respond value } 7 }\n"
+        "route GET \"/x\" { let value = check(req.http11) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(static_cast<u16>(hir.error().code),
+             static_cast<u16>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("identifier must name a Response builder")));
+}
+
+TEST(frontend, helper_respond_response_rejects_dynamic_mutation) {
+    const char* src =
+        "func check(ok: bool, reason: str) -> i32 { let resp = response(401) "
+        "resp.set(\"X-Reason\", reason) guard ok else { respond resp } 7 }\n"
+        "route GET \"/x\" { let value = check(req.http11, \"auth\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(static_cast<u16>(hir.error().code),
+             static_cast<u16>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("middleware Response mutations require literal names and values")));
+}
+
 TEST(frontend, respond_is_contextual_keyword_outside_statements) {
     auto single = lex(lit("respond"));
     REQUIRE(single);

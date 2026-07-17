@@ -30,8 +30,10 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   lowering item below.
 - [x] `respond status[, body]` statement — contextual parsing, literal-status
   validation, HIR `ReturnStatus`, helper propagation, and respond-capable
-  `chain before` steps are implemented. Still pending: `respond resp` with a
-  Response value; status must be a literal int today.
+  `chain before` steps are implemented. `respond resp` accepts a Response
+  builder and preserves its ordered literal `set`/`add`/`remove` header prefix
+  through helper propagation. Dynamic middleware Response mutations remain
+  pending because they need effects owned by the short-circuit branch.
 - [x] `guard` condition bool-only check + fix-it; guard-let usable-value
   semantics: known nil/error inits fold the condition to false (else always
   runs, binding skipped for known error); runtime error-capable inits lower

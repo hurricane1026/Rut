@@ -233,9 +233,9 @@ struct AstStatement {
     // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
     bool has_response_body = false;
-    // `return <ident>` where the identifier names a local created by
-    // `response(status)`. Kept distinct from the literal-status form while
-    // reusing ReturnStatus as the control-flow terminator kind.
+    // `return <ident>` / `respond <ident>` where the identifier names a local
+    // created by `response(status)`. Kept distinct from the literal-status
+    // form while reusing ReturnStatus as the control-flow terminator kind.
     bool returns_response_local = false;
     // Response headers from `response(N, headers: { "K": "V", ... })`.
     // Inline-stored (no external pool) so analyze/lowering don't need
