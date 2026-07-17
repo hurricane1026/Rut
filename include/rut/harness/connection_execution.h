@@ -16,6 +16,7 @@ enum class ConnectionInvariant : u8 {
 struct ConnectionExecution {
     Connection connection{};
 
+    ConnectionExecution();
     void reset(u32 peer_addr = 0, u16 peer_port = 0, u32 shard_id = 0);
     u64 invariant_violations() const;
     void destroy();

@@ -42,7 +42,8 @@ CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
         now_us = earliest_timer_at_us;
         return CompletionStatus::Ready;
     }
-    if (candidate.target_id != DeterministicCompletion::kAnyTarget &&
+    if (yielded != jit::YieldKind::Any &&
+        candidate.target_id != DeterministicCompletion::kAnyTarget &&
         candidate.target_id != yielded_target)
         return CompletionStatus::TargetMismatch;
     if (candidate.kind == jit::YieldKind::Timer && candidate.at_us < earliest_timer_at_us)

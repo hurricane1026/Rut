@@ -144,6 +144,12 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         copy_detail(out.harness, "shared state isolation requires an explicit ScenarioState");
         return out;
     }
+    if (scenario.shard_id >= kMaxShards) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "scenario shard id is out of range");
+        return out;
+    }
     if (scenario.path.ptr == nullptr || scenario.path.len == 0 ||
         scenario.path.len >= Connection::kMaxReqPathLen) {
         out.harness.outcome = Outcome::Invalid;
@@ -206,7 +212,10 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     activate_rut_program(scenario.target->program);
     ScenarioState local_state{};
     ScenarioState* state = scenario.state != nullptr ? scenario.state : &local_state;
-    if (state->prepare(scenario.state_isolation, scenario.state_group, &scenario.target->program))
+    if (state->prepare(scenario.state_isolation,
+                       scenario.state_group,
+                       scenario.target,
+                       scenario.target->generation))
         out.harness.state_resets++;
     struct StateFinish {
         ScenarioState* state;
@@ -216,6 +225,14 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
 
     bool rate_limited = false;
     if (route->rate_limit.count != 0) {
+        RateLimiter* rate_limiter = state->rate_limiter_for_shard(scenario.shard_id);
+        if (rate_limiter == nullptr) {
+            out.harness.outcome = Outcome::Invalid;
+            out.harness.cleanup = CleanupOutcome::Clean;
+            copy_detail(out.harness, "scenario shard id is out of range");
+            connection.destroy();
+            return out;
+        }
         RateLimitKeyInput key_input{};
         key_input.peer_addr = scenario.peer_addr;
         key_input.req_buf = scenario.request_data;
@@ -224,7 +241,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         key_input.path_len = scenario.path.len;
         key_input.params = route_params;
         key_input.param_count = route_param_count;
-        rate_limited = rate_limit_exceeded_with_limiters(state->rate_limiter,
+        rate_limited = rate_limit_exceeded_with_limiters(*rate_limiter,
                                                          &state->global_rate_limiter,
                                                          route->rate_limit,
                                                          out.route_index,
@@ -281,6 +298,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         DeterministicHandlerSpec driver{};
         driver.execution = execution;
         driver.environment = runtime_environment;
+        driver.initial_semantic_events = out.harness.semantic_events;
         driver.auto_complete_timers = scenario.auto_complete_timers;
         HarnessSpec handler_harness = harness;
         handler_harness.layer = ExecutionLayer::Handler;
@@ -296,7 +314,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     if (needs_terminal_observation)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
 
-    if (out.has_terminal && !expectation_matches(scenario.expected, out.terminal)) {
+    if (out.harness.outcome == Outcome::Passed && out.has_terminal &&
+        !expectation_matches(scenario.expected, out.terminal)) {
         out.harness.outcome = Outcome::Mismatched;
         out.harness.phase = Phase::Observe;
         copy_detail(out.harness, "scenario terminal result did not match expectation");

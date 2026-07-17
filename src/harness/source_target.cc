@@ -92,6 +92,8 @@ HarnessResult SourceTarget::prepare(const SourceTargetSpec& target, const Harnes
     }
 
     prepared = true;
+    generation++;
+    if (generation == 0) generation++;
     result.outcome = Outcome::Passed;
     result.phase = Phase::Start;
     return result;

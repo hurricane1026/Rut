@@ -1,8 +1,30 @@
 #include "rut/harness/connection_execution.h"
 
+#include <unistd.h>
+
 namespace rut::harness {
+namespace {
+
+void close_owned_descriptors(Connection& connection) {
+    const i32 descriptors[] = {connection.fd, connection.upstream_fd, connection.idle_return_fd};
+    for (u32 i = 0; i < 3; i++) {
+        if (descriptors[i] < 0) continue;
+        bool duplicate = false;
+        for (u32 j = 0; j < i; j++) {
+            if (descriptors[j] == descriptors[i]) duplicate = true;
+        }
+        if (!duplicate) (void)::close(descriptors[i]);
+    }
+}
+
+}  // namespace
+
+ConnectionExecution::ConnectionExecution() {
+    connection.reset();
+}
 
 void ConnectionExecution::reset(u32 peer_addr, u16 peer_port, u32 shard_id) {
+    close_owned_descriptors(connection);
     connection.reset();
     connection.peer_addr = peer_addr;
     connection.peer_port = peer_port;
@@ -26,6 +48,7 @@ u64 ConnectionExecution::invariant_violations() const {
 }
 
 void ConnectionExecution::destroy() {
+    close_owned_descriptors(connection);
     connection.reset();
 }
 

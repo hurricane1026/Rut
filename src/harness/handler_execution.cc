@@ -16,7 +16,6 @@ void copy_detail(char* dst, u32 cap, const char* src) {
 struct EventPublisher {
     const HarnessSpec& spec;
     HarnessResult& result;
-    u32 sequence = 0;
 
     bool emit(ObservationKind kind, u64 value0 = 0, u64 value1 = 0, Str label = {}) {
         if (result.semantic_events >= spec.limits.max_semantic_events) {
@@ -29,7 +28,7 @@ struct EventPublisher {
         Observation event{};
         event.kind = kind;
         event.phase = Phase::Drive;
-        event.sequence = sequence++;
+        event.sequence = result.semantic_events;
         event.timestamp_us = result.virtual_time_us;
         event.value0 = value0;
         event.value1 = value1;
@@ -87,6 +86,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     if (out.harness.outcome != Outcome::Passed) return out;
     out.harness.phase = Phase::Drive;
     out.harness.cleanup = CleanupOutcome::NotRun;
+    out.harness.semantic_events = driver.initial_semantic_events;
     struct CleanupMarker {
         HarnessResult& result;
         ~CleanupMarker() { result.cleanup = CleanupOutcome::Clean; }
@@ -158,12 +158,16 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             else
                 earliest_timer_at_us += delay_us;
         }
-        if (completion == CompletionStatus::Ready)
+        if (completion == CompletionStatus::Ready) {
+            const u32 yielded_target = result.yield_kind == jit::YieldKind::Any
+                                           ? DeterministicCompletion::kAnyTarget
+                                           : result.yield_payload_u32();
             completion = environment.next(result.yield_kind,
-                                          result.yield_payload_u32(),
+                                          yielded_target,
                                           earliest_timer_at_us,
                                           harness.limits.max_virtual_time_us,
                                           event);
+        }
         if ((completion == CompletionStatus::Empty ||
              completion == CompletionStatus::KindMismatch) &&
             driver.auto_complete_timers && result.yield_kind == jit::YieldKind::Timer) {

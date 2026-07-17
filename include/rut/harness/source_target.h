@@ -16,6 +16,7 @@ struct SourceTargetSpec {
 struct SourceTarget {
     LoadedProgram program{};
     LoadError load_error{};
+    u64 generation = 0;
     bool prepared = false;
 
     HarnessResult prepare(const SourceTargetSpec& target, const HarnessSpec& harness);

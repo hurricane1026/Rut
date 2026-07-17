@@ -159,6 +159,9 @@ struct CacheRegistry {
     // their own descriptors; an older target must not clear a newer target's
     // publication when teardown order differs from activation order.
     std::atomic<const void*> owner{nullptr};
+    // Seqlocks require a single writer. Publication and owner-conditional
+    // withdrawal share this lock so the owner check cannot race a replacement.
+    std::atomic_flag writer_lock = ATOMIC_FLAG_INIT;
 };
 
 inline CacheRegistry& cache_registry() {
@@ -182,11 +185,20 @@ inline void cache_registry_set_seed(u64 seed) {
     cache_registry().seed.store(seed, std::memory_order_relaxed);
 }
 
-inline void cache_registry_publish(const u32* capacities,
-                                   const u64* identities,
-                                   u32 count,
-                                   const void* owner = nullptr) {
-    auto& reg = cache_registry();
+inline void cache_registry_lock_writer(CacheRegistry& reg) {
+    while (reg.writer_lock.test_and_set(std::memory_order_acquire)) {
+    }
+}
+
+inline void cache_registry_unlock_writer(CacheRegistry& reg) {
+    reg.writer_lock.clear(std::memory_order_release);
+}
+
+inline void cache_registry_publish_locked(CacheRegistry& reg,
+                                          const u32* capacities,
+                                          const u64* identities,
+                                          u32 count,
+                                          const void* owner) {
     if (count > CacheRegistry::kMaxInstances) count = CacheRegistry::kMaxInstances;
     if (reg.seed.load(std::memory_order_relaxed) == 0) {
         // getrandom can be interrupted (EINTR) — retry; it only blocks
@@ -234,10 +246,26 @@ inline void cache_registry_publish(const u32* capacities,
     reg.generation.store(prev_gen + 2, std::memory_order_release);
 }
 
+inline void cache_registry_publish(const u32* capacities,
+                                   const u64* identities,
+                                   u32 count,
+                                   const void* owner = nullptr) {
+    auto& reg = cache_registry();
+    cache_registry_lock_writer(reg);
+    cache_registry_publish_locked(reg, capacities, identities, count, owner);
+    cache_registry_unlock_writer(reg);
+}
+
 inline bool cache_registry_unpublish_if_owner(const void* owner) {
-    if (owner == nullptr || cache_registry().owner.load(std::memory_order_acquire) != owner)
+    if (owner == nullptr) return false;
+    auto& reg = cache_registry();
+    cache_registry_lock_writer(reg);
+    if (reg.owner.load(std::memory_order_relaxed) != owner) {
+        cache_registry_unlock_writer(reg);
         return false;
-    cache_registry_publish(nullptr, nullptr, 0, nullptr);
+    }
+    cache_registry_publish_locked(reg, nullptr, nullptr, 0, nullptr);
+    cache_registry_unlock_writer(reg);
     return true;
 }
 
