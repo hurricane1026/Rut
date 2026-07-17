@@ -31,6 +31,7 @@ ConnectionExecution::ConnectionExecution() {
 void ConnectionExecution::reset(u32 peer_addr, u16 peer_port, u32 shard_id) {
     close_owned_descriptors(connection);
     connection.reset();
+    connection.send_buf.bind(send_storage, sizeof(send_storage));
     connection.peer_addr = peer_addr;
     connection.peer_port = peer_port;
     connection.shard_id = shard_id;

@@ -94,6 +94,12 @@ ReplayItemResult drive_replay_one(Loop& loop,
         detail::set_detail(out.harness, "replay requires connection or event-loop layer");
         return out;
     }
+    if (!spec.required_capabilities.has(Capability::SyntheticIo)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        detail::set_detail(out.harness, "mock replay must declare synthetic-io");
+        return out;
+    }
     if (entry.raw_header_len > spec.limits.max_input_bytes) {
         out.harness.outcome = Outcome::Failed;
         out.harness.cleanup = CleanupOutcome::Clean;
@@ -128,6 +134,12 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
         out.harness.outcome = Outcome::Invalid;
         out.harness.cleanup = CleanupOutcome::Clean;
         detail::set_detail(out.harness, "replay requires connection or event-loop layer");
+        return out;
+    }
+    if (!spec.required_capabilities.has(Capability::SyntheticIo)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        detail::set_detail(out.harness, "mock replay must declare synthetic-io");
         return out;
     }
     if (reader.fd < 0) {

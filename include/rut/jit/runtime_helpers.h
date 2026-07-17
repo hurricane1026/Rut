@@ -2,6 +2,10 @@
 
 #include "rut/common/types.h"
 
+namespace rut {
+struct CacheLocalState;
+}
+
 // Runtime helper functions callable from JIT'd code.
 // All use extern "C" linkage with rut_helper_ prefix to avoid
 // C++ name mangling. The JIT engine registers these via a custom
@@ -187,6 +191,13 @@ void rut_helper_cache_set(rut::u32 instance, rut::u32 key_ip, rut::i64 val);
 // Harness hook for multiplexing logical shards on one thread. Production shard
 // threads leave the default shard selected. Returns the previously selected shard.
 rut::u32 rut_helper_cache_select_local_shard(rut::u32 shard_id);
+// Harness hook for selecting an independently owned Cache context. A null
+// context selects the production thread-local state. The returned pointer is
+// the previously selected context (null means production state).
+rut::CacheLocalState* rut_helper_cache_select_local_state(rut::CacheLocalState* state);
+rut::CacheLocalState* rut_helper_cache_create_local_state();
+void rut_helper_cache_destroy_local_state(rut::CacheLocalState* state);
+void rut_helper_cache_reset_state(rut::CacheLocalState* state);
 // Harness/shard-lifecycle hook: destroy every logical-shard Cache table owned by
 // the current thread. It never mutates the process registry or another thread's state.
 void rut_helper_cache_reset_local_state();

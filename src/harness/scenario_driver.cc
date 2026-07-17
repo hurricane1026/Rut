@@ -1,6 +1,7 @@
 #include "rut/harness/scenario_driver.h"
 
 #include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_canon.h"
@@ -103,6 +104,60 @@ bool publish_route_selected(const HarnessSpec& spec,
     result.outcome = Outcome::Mismatched;
     result.phase = Phase::Observe;
     copy_detail(result, "observation rejected by oracle");
+    return false;
+}
+
+bool account_terminal_output(const HarnessSpec& spec,
+                             HarnessResult& result,
+                             Connection& connection,
+                             const jit::HandlerResult& terminal) {
+    if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
+
+    const RouteConfig* config = connection.request_config;
+    const bool has_body = terminal.upstream_id != 0 && config != nullptr &&
+                          terminal.upstream_id <= config->response_body_count;
+    constexpr u32 kMaxHeaders =
+        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+    ResponseHeaderKV headers[kMaxHeaders];
+    u32 header_count = 0;
+    if (!collect_effective_response_headers(
+            connection, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
+        format_static_response(connection, 500, false);
+    } else if (header_count != 0) {
+        const char* body_data = nullptr;
+        u32 body_len = 0;
+        bool fallback_body = false;
+        if (has_body) {
+            const auto& body = config->response_bodies[terminal.upstream_id - 1];
+            body_data = body.data;
+            body_len = body.len;
+        } else if (terminal.upstream_id != 0) {
+            body_data = status_reason(terminal.status_code);
+            while (body_data[body_len] != '\0') body_len++;
+            fallback_body = true;
+        }
+        format_response_with_body_and_headers(connection,
+                                              terminal.status_code,
+                                              body_data,
+                                              body_len,
+                                              headers,
+                                              header_count,
+                                              connection.keep_alive,
+                                              fallback_body);
+    } else if (has_body) {
+        const auto& body = config->response_bodies[terminal.upstream_id - 1];
+        format_response_with_body(
+            connection, terminal.status_code, body.data, body.len, connection.keep_alive);
+    } else {
+        format_static_response(connection, terminal.status_code, connection.keep_alive);
+    }
+
+    result.output_bytes = connection.send_buf.len();
+    if (result.output_bytes <= spec.limits.max_output_bytes) return true;
+    result.outcome = Outcome::Failed;
+    result.has_reached_limit = true;
+    result.reached_limit = LimitKind::OutputBytes;
+    copy_detail(result, "output-bytes limit reached");
     return false;
 }
 
@@ -211,12 +266,6 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         routing_method = static_cast<u8>(parsed_request.method) + kRouteMethodGet;
     }
 
-    const u32 previous_cache_shard = rut_helper_cache_select_local_shard(scenario.shard_id);
-    struct CacheShardRestore {
-        u32 previous;
-        ~CacheShardRestore() { (void)rut_helper_cache_select_local_shard(previous); }
-    } cache_shard_restore{previous_cache_shard};
-
     ConnectionExecution connection{};
     connection.reset(scenario.peer_addr, scenario.peer_port, scenario.shard_id);
     for (u32 i = 0; i < routing_path.len; i++)
@@ -229,6 +278,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
             ? routing_method - 1
             : static_cast<u8>(LogHttpMethod::Other);
     connection.connection.req_size = scenario.request_len;
+    connection.connection.keep_alive = scenario.request_len == 0 || parsed_request.keep_alive;
     connection.connection.request_config = &scenario.target->program.config;
 
     RouteParam route_params[kMaxRouteParams]{};
@@ -274,11 +324,28 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     activate_rut_program(scenario.target->program);
     ScenarioState local_state{};
     ScenarioState* state = scenario.state != nullptr ? scenario.state : &local_state;
+    if (!state->ensure_cache_state()) {
+        out.harness.outcome = Outcome::Failed;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "scenario cache state allocation failed");
+        connection.destroy();
+        return out;
+    }
     if (state->prepare(scenario.state_isolation,
                        scenario.state_group,
                        scenario.target,
                        scenario.target->generation))
         out.harness.state_resets++;
+    CacheLocalState* previous_cache_state = rut_helper_cache_select_local_state(state->cache_state);
+    const u32 previous_cache_shard = rut_helper_cache_select_local_shard(scenario.shard_id);
+    struct CacheStateRestore {
+        CacheLocalState* previous_state;
+        u32 previous_shard;
+        ~CacheStateRestore() {
+            (void)rut_helper_cache_select_local_shard(previous_shard);
+            (void)rut_helper_cache_select_local_state(previous_state);
+        }
+    } cache_state_restore{previous_cache_state, previous_cache_shard};
     struct StateFinish {
         ScenarioState* state;
         StateIsolation isolation;
@@ -374,7 +441,10 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         out.has_terminal = driven.has_terminal;
     }
 
-    if (needs_terminal_observation)
+    if (out.harness.outcome == Outcome::Passed && out.has_terminal)
+        (void)account_terminal_output(harness, out.harness, connection.connection, out.terminal);
+
+    if (needs_terminal_observation && out.harness.outcome == Outcome::Passed)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal &&

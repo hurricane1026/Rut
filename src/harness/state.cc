@@ -4,12 +4,21 @@
 
 namespace rut::harness {
 
+ScenarioState::~ScenarioState() {
+    rut_helper_cache_destroy_local_state(cache_state);
+}
+
+bool ScenarioState::ensure_cache_state() {
+    if (cache_state == nullptr) cache_state = rut_helper_cache_create_local_state();
+    return cache_state != nullptr;
+}
+
 void ScenarioState::reset() {
     for (auto& rate_limiter : rate_limiters) {
         if (rate_limiter) rate_limiter->reset();
     }
     global_rate_limiter.reset();
-    rut_helper_cache_reset_local_state();
+    rut_helper_cache_reset_state(cache_state);
     initialized = false;
     active_group = 0;
     active_target = nullptr;

@@ -610,6 +610,29 @@ TEST(harness_scenario, terminal_observation_limit_precedes_expectation_mismatch)
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, terminal_response_enforces_output_budget) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_static("/output", kRouteMethodGet, 204));
+    target.prepared = true;
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/output", 7};
+    scenario.method = kRouteMethodGet;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.limits.max_output_bytes = 1;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK(result.harness.has_reached_limit);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::OutputBytes);
+    CHECK(result.harness.output_bytes > spec.limits.max_output_bytes);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, scripted_upstream_recv_accounts_owned_data_and_limits) {
     TempSource source;
     REQUIRE(source.write(
@@ -648,6 +671,15 @@ TEST(harness_scenario, scripted_upstream_recv_accounts_owned_data_and_limits) {
     CHECK_EQ(limited.harness.outcome, harness::Outcome::Failed);
     CHECK(limited.harness.has_reached_limit);
     CHECK_EQ(limited.harness.reached_limit, harness::LimitKind::InputBytes);
+
+    REQUIRE(environment.inject_fault(jit::YieldKind::UpstreamRecv, 1, -1, 1));
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 502};
+    const auto faulted = harness::drive_scenario(scenario, scripted_scenario_harness(true));
+    REQUIRE_EQ(faulted.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(faulted.has_terminal);
+    CHECK_EQ(faulted.terminal.status_code, 502);
+    CHECK_EQ(faulted.harness.input_bytes, scenario.request_len);
+    CHECK_EQ(faulted.harness.faults_injected, 1u);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
@@ -911,6 +943,49 @@ TEST(harness_scenario, run_isolation_resets_cache_for_every_item) {
     CHECK_EQ(second.terminal.status_code, 201);
     CHECK_EQ(first.harness.state_resets, 1u);
     CHECK_EQ(second.harness.state_resets, 1u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, run_cache_isolation_preserves_process_state) {
+    TempSource source;
+    REQUIRE(source.write(
+        "let seen = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/cache\" { let prev = seen.get(req.remoteAddr).or(0) if prev == 0 { "
+        "seen.set(req.remoteAddr, 1) return 201 } else { return 200 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    harness::ScenarioState process_state{};
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/cache", 6};
+    scenario.method = kRouteMethodGet;
+    scenario.peer_addr = 0x0a00002au;
+    scenario.state_isolation = harness::StateIsolation::Process;
+    scenario.state = &process_state;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto process_first = harness::drive_scenario(scenario, spec);
+    scenario.state_isolation = harness::StateIsolation::Run;
+    scenario.state = nullptr;
+    scenario.peer_addr++;
+    const auto unrelated_run = harness::drive_scenario(scenario, spec);
+    scenario.state_isolation = harness::StateIsolation::Process;
+    scenario.state = &process_state;
+    scenario.peer_addr--;
+    const auto process_second = harness::drive_scenario(scenario, spec);
+
+    REQUIRE(process_first.has_terminal);
+    REQUIRE(unrelated_run.has_terminal);
+    REQUIRE(process_second.has_terminal);
+    CHECK_EQ(process_first.terminal.status_code, 201);
+    CHECK_EQ(unrelated_run.terminal.status_code, 201);
+    CHECK_EQ(process_second.terminal.status_code, 200);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

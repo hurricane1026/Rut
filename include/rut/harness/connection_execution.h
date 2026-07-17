@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/slice_pool.h"
 
 namespace rut::harness {
 
@@ -15,6 +16,7 @@ enum class ConnectionInvariant : u8 {
 
 struct ConnectionExecution {
     Connection connection{};
+    u8 send_storage[SlicePool::kSliceSize]{};
 
     ConnectionExecution();
     void reset(u32 peer_addr = 0, u16 peer_port = 0, u32 shard_id = 0);

@@ -78,6 +78,10 @@ bool ScriptedEnvironment::prepare_run() {
             occurrence++;
             if (occurrence != fault.occurrence) continue;
             completion.result = fault.result;
+            if (fault.result < 0) {
+                completion.data = nullptr;
+                completion.data_len = 0;
+            }
             completion.injected_fault = true;
             break;
         }

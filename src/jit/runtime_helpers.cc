@@ -5,6 +5,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include <new>
 #include <unordered_map>
 
 #include <hs.h>
@@ -569,37 +570,45 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
 // detected by the rounded-capacity compare and resets that instance's state
 // (documented); an unchanged capacity persists across config swaps because
 // the swap never touches thread-locals.
-namespace {
 // Owns the per-shard tables so thread exit unmaps them — a bare
 // thread_local CacheTable array has a trivial destructor and would leak
 // the mmaps on shard stop/join/restart flows.
-struct ShardCacheTables {
-    rut::CacheTable tables[rut::CacheRegistry::kMaxInstances];
-    rut::u64 identities[rut::CacheRegistry::kMaxInstances] = {};
-    rut::u32 birth_generations[rut::CacheRegistry::kMaxInstances] = {};
-    rut::u32 generation = 0;
-    bool alloc_failed_logged[rut::CacheRegistry::kMaxInstances] = {};
-    void reset() {
-        for (auto& t : tables) t.destroy();
-        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
-            identities[i] = 0;
-            birth_generations[i] = 0;
-            alloc_failed_logged[i] = false;
+namespace rut {
+struct CacheLocalState {
+    struct ShardTables {
+        CacheTable tables[CacheRegistry::kMaxInstances];
+        u64 identities[CacheRegistry::kMaxInstances] = {};
+        u32 birth_generations[CacheRegistry::kMaxInstances] = {};
+        u32 generation = 0;
+        bool alloc_failed_logged[CacheRegistry::kMaxInstances] = {};
+        void reset() {
+            for (auto& t : tables) t.destroy();
+            for (u32 i = 0; i < CacheRegistry::kMaxInstances; i++) {
+                identities[i] = 0;
+                birth_generations[i] = 0;
+                alloc_failed_logged[i] = false;
+            }
+            generation = 0;
         }
-        generation = 0;
-    }
-    ~ShardCacheTables() { reset(); }
-};
+        ~ShardTables() { reset(); }
+    };
 
-thread_local ShardCacheTables t_shard_cache_tables[rut::kMaxShards];
+    ShardTables shards[kMaxShards];
+};
+}  // namespace rut
+
+namespace {
+
+thread_local rut::CacheLocalState t_default_cache_state;
+thread_local rut::CacheLocalState* t_active_cache_state = &t_default_cache_state;
 thread_local rut::u32 t_active_cache_shard = 0;
 
-ShardCacheTables& shard_cache_tables() {
-    return t_shard_cache_tables[t_active_cache_shard];
+rut::CacheLocalState::ShardTables& shard_cache_tables() {
+    return t_active_cache_state->shards[t_active_cache_shard];
 }
 
 rut::CacheTable* cache_table_for(rut::u32 instance) {
-    ShardCacheTables& t_state = shard_cache_tables();
+    rut::CacheLocalState::ShardTables& t_state = shard_cache_tables();
     auto* t_tables = t_state.tables;
     auto* t_identities = t_state.identities;
     auto* t_birth_generations = t_state.birth_generations;
@@ -716,8 +725,30 @@ u32 rut_helper_cache_select_local_shard(u32 shard_id) {
     return previous;
 }
 
+rut::CacheLocalState* rut_helper_cache_select_local_state(rut::CacheLocalState* state) {
+    rut::CacheLocalState* previous =
+        t_active_cache_state == &t_default_cache_state ? nullptr : t_active_cache_state;
+    t_active_cache_state = state != nullptr ? state : &t_default_cache_state;
+    return previous;
+}
+
+rut::CacheLocalState* rut_helper_cache_create_local_state() {
+    return new (std::nothrow) rut::CacheLocalState{};
+}
+
+void rut_helper_cache_destroy_local_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    if (t_active_cache_state == state) t_active_cache_state = &t_default_cache_state;
+    delete state;
+}
+
+void rut_helper_cache_reset_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    for (auto& shard : state->shards) shard.reset();
+}
+
 void rut_helper_cache_reset_local_state() {
-    for (auto& state : t_shard_cache_tables) state.reset();
+    for (auto& state : t_active_cache_state->shards) state.reset();
 }
 
 // ── String Operations ──────────────────────────────────────────────
