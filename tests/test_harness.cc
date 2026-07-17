@@ -7,6 +7,7 @@
 #include "rut/harness/scenario_driver.h"
 #include "rut/harness/scripted_environment.h"
 #include "rut/harness/source_target.h"
+#include "rut/runtime/cache_table.h"
 #endif
 
 #include <cstring>
@@ -93,6 +94,14 @@ u64 targeted_upstream_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*
     return jit::HandlerResult::make_status(204).pack();
 }
 
+u64 any_timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Any, 25).pack();
+    if (ctx->resume_event_kind == static_cast<u32>(jit::YieldKind::Timer))
+        return jit::HandlerResult::make_status(208).pack();
+    return jit::HandlerResult::make_status(500).pack();
+}
+
 bool reject_yield(void*, const harness::Observation& event) {
     return event.kind != harness::ObservationKind::HandlerYielded;
 }
@@ -171,6 +180,26 @@ TEST(harness_handler, rejects_wrong_execution_layer) {
 TEST(harness_handler, rejects_timer_completion_before_requested_delay) {
     harness::HandlerExecution execution{};
     execution.init(&timer_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Timer, 0, 100, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.virtual_time_us, 0u);
+    CHECK_EQ(result.consumed_events, 0u);
+}
+
+TEST(harness_handler, rejects_wait_any_timer_before_timeout) {
+    harness::HandlerExecution execution{};
+    execution.init(&any_timer_handler, nullptr, nullptr, 0);
     const harness::DeterministicCompletion completions[] = {
         {jit::YieldKind::Timer, 0, 100, 1},
     };
@@ -363,6 +392,9 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     scenario.target = &target;
     scenario.path = {"/static", 7};
     scenario.method = kRouteMethodGet;
+    const char request[] = "GET /static HTTP/1.1\r\nHost: test\r\n\r\n";
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
     harness::HarnessSpec spec{};
     spec.layer = harness::ExecutionLayer::Connection;
     spec.required_capabilities =
@@ -373,6 +405,7 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     const auto result = harness::drive_scenario(scenario, spec);
     CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
     CHECK_EQ(result.harness.semantic_events, 1u);
+    CHECK_EQ(result.harness.input_bytes, scenario.request_len);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 204);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
@@ -554,6 +587,7 @@ TEST(harness_scenario, cache_state_shares_within_group_and_resets_between_groups
     CHECK_EQ(other_group.harness.state_resets, 1u);
     state.reset();
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+    CHECK_EQ(cache_registry().count.load(std::memory_order_acquire), 0u);
 }
 
 TEST(harness_scenario, run_isolation_resets_cache_for_every_item) {

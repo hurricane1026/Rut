@@ -62,10 +62,10 @@ inline Outcome replay_outcome(const ReplayResult& replay) {
 inline void merge_outcome(Outcome item, Outcome& aggregate) {
     if (item == Outcome::Failed || item == Outcome::Invalid || item == Outcome::Stalled) {
         aggregate = item;
-    } else if (item == Outcome::Unsupported && aggregate != Outcome::Failed &&
-               aggregate != Outcome::Invalid && aggregate != Outcome::Stalled) {
+    } else if (item == Outcome::Mismatched &&
+               (aggregate == Outcome::Passed || aggregate == Outcome::Unsupported)) {
         aggregate = item;
-    } else if (item == Outcome::Mismatched && aggregate == Outcome::Passed) {
+    } else if (item == Outcome::Unsupported && aggregate == Outcome::Passed) {
         aggregate = item;
     }
 }
@@ -134,7 +134,6 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
     u64 input_bytes = 0;
     bool stopped_by_observer = false;
     while (reader.next(entry) == 0) {
-        out.replay.total++;
         if (entry.raw_header_len > spec.limits.max_input_bytes - input_bytes) {
             out.harness.outcome = Outcome::Failed;
             out.harness.has_reached_limit = true;
@@ -142,6 +141,7 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
             detail::set_detail(out.harness, "input-bytes limit reached");
             break;
         }
+        out.replay.total++;
         input_bytes += entry.raw_header_len;
         out.harness.input_bytes = input_bytes;
 

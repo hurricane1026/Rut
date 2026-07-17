@@ -135,6 +135,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
                                                            : "scenario request data is null");
         return out;
     }
+    out.harness.input_bytes = scenario.request_len;
 
     ConnectionExecution connection{};
     connection.reset(scenario.peer_addr, scenario.peer_port, scenario.shard_id);

@@ -164,7 +164,7 @@ inline bool register_jit_routes(RouteConfig& cfg, const rir::Module& mod, jit::J
 // instance descriptors to the process-global registry the cache helpers
 // read. Call at the RouteConfig activation boundary, after every fallible
 // registration step succeeded — never while merely preparing a replacement.
-inline void cache_registry_publish_config(const RouteConfig& cfg) {
+inline void cache_registry_publish_config(const RouteConfig& cfg, const void* owner = nullptr) {
     u32 caps[RouteConfig::kMaxCacheInstances] = {};
     u64 idents[RouteConfig::kMaxCacheInstances] = {};
     const u32 n = cfg.cache_instance_count < RouteConfig::kMaxCacheInstances
@@ -175,7 +175,7 @@ inline void cache_registry_publish_config(const RouteConfig& cfg) {
         idents[i] =
             cache_instance_identity(cfg.cache_instances[i].name, cfg.cache_instances[i].name_len);
     }
-    cache_registry_publish(caps, idents, n);
+    cache_registry_publish(caps, idents, n, owner);
 }
 
 inline bool populate_route_config(RouteConfig& cfg, const rir::Module& mod) {

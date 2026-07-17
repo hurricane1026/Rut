@@ -148,19 +148,20 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         }
 
         DeterministicCompletion event{};
-        u64 earliest_at_us = environment.now_us;
+        u64 earliest_timer_at_us = environment.now_us;
         CompletionStatus completion = CompletionStatus::Ready;
-        if (result.yield_kind == jit::YieldKind::Timer) {
+        if (result.yield_kind == jit::YieldKind::Timer ||
+            (result.yield_kind == jit::YieldKind::Any && result.yield_payload_u32() != 0)) {
             const u64 delay_us = static_cast<u64>(result.yield_payload_u32()) * 1000u;
             if (delay_us > harness.limits.max_virtual_time_us - environment.now_us)
                 completion = CompletionStatus::TimeLimit;
             else
-                earliest_at_us += delay_us;
+                earliest_timer_at_us += delay_us;
         }
         if (completion == CompletionStatus::Ready)
             completion = environment.next(result.yield_kind,
                                           result.yield_payload_u32(),
-                                          earliest_at_us,
+                                          earliest_timer_at_us,
                                           harness.limits.max_virtual_time_us,
                                           event);
         if ((completion == CompletionStatus::Empty ||

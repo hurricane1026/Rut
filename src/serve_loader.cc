@@ -24,6 +24,7 @@
 namespace rut {
 
 void LoadedProgram::destroy() {
+    (void)cache_registry_unpublish_if_owner(this);
     if (jit_inited) {
         engine.shutdown();
         jit_inited = false;
@@ -271,7 +272,7 @@ void activate_rut_program(const LoadedProgram& program) {
     // publishing here lets the owner pair descriptor publication with the
     // config installation instead of mutating live Cache semantics merely
     // because load_rut_program() succeeded.
-    cache_registry_publish_config(program.config);
+    cache_registry_publish_config(program.config, &program);
 }
 
 namespace {

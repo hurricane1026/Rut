@@ -281,6 +281,18 @@ static bool reject_replay_observation(void*, const harness::Observation&) {
     return false;
 }
 
+TEST(harness_replay, mismatch_takes_precedence_over_unsupported) {
+    harness::Outcome aggregate = harness::Outcome::Passed;
+    harness::detail::merge_outcome(harness::Outcome::Mismatched, aggregate);
+    harness::detail::merge_outcome(harness::Outcome::Unsupported, aggregate);
+    CHECK_EQ(aggregate, harness::Outcome::Mismatched);
+
+    aggregate = harness::Outcome::Passed;
+    harness::detail::merge_outcome(harness::Outcome::Unsupported, aggregate);
+    harness::detail::merge_outcome(harness::Outcome::Mismatched, aggregate);
+    CHECK_EQ(aggregate, harness::Outcome::Mismatched);
+}
+
 TEST(harness_replay, enforces_input_limit_and_oracle) {
     SmallLoop loop;
     loop.setup();
@@ -386,6 +398,34 @@ TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
     CHECK_EQ(result.replay.total, 3u);
     CHECK_EQ(result.replay.matched, 2u);
     CHECK_EQ(result.replay.mismatched, 1u);
+    reader.close();
+}
+
+TEST(harness_replay, input_limit_keeps_file_summary_consistent) {
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /one HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /two HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    SmallLoop loop;
+    loop.setup();
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.limits.max_input_bytes = entries[0].raw_header_len;
+
+    const auto result = harness::drive_replay_file(loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK(result.harness.has_reached_limit);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::InputBytes);
+    CHECK_EQ(result.harness.input_bytes, entries[0].raw_header_len);
+    CHECK_EQ(result.replay.total, 1u);
+    CHECK_EQ(result.replay.replayed, 1u);
+    CHECK_EQ(result.replay.matched, 1u);
+    CHECK_EQ(result.replay.failed, 0u);
+    CHECK_EQ(result.replay.replayed + result.replay.skipped + result.replay.failed,
+             result.replay.total);
     reader.close();
 }
 

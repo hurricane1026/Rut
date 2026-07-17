@@ -155,6 +155,10 @@ struct CacheRegistry {
     // redeclarations keep their birth and therefore their state.
     std::atomic<u32> birth_generations[kMaxInstances]{};
     std::atomic<u64> seed{0};  // 0 = unseeded sentinel
+    // Optional publication owner. Harness targets use this to withdraw only
+    // their own descriptors; an older target must not clear a newer target's
+    // publication when teardown order differs from activation order.
+    std::atomic<const void*> owner{nullptr};
 };
 
 inline CacheRegistry& cache_registry() {
@@ -178,7 +182,10 @@ inline void cache_registry_set_seed(u64 seed) {
     cache_registry().seed.store(seed, std::memory_order_relaxed);
 }
 
-inline void cache_registry_publish(const u32* capacities, const u64* identities, u32 count) {
+inline void cache_registry_publish(const u32* capacities,
+                                   const u64* identities,
+                                   u32 count,
+                                   const void* owner = nullptr) {
     auto& reg = cache_registry();
     if (count > CacheRegistry::kMaxInstances) count = CacheRegistry::kMaxInstances;
     if (reg.seed.load(std::memory_order_relaxed) == 0) {
@@ -222,8 +229,16 @@ inline void cache_registry_publish(const u32* capacities, const u64* identities,
         reg.identities[i].store(identities[i], std::memory_order_relaxed);
     }
     reg.count.store(count, std::memory_order_relaxed);
+    reg.owner.store(owner, std::memory_order_relaxed);
     // Leave the odd state: even generation = descriptors consistent.
     reg.generation.store(prev_gen + 2, std::memory_order_release);
+}
+
+inline bool cache_registry_unpublish_if_owner(const void* owner) {
+    if (owner == nullptr || cache_registry().owner.load(std::memory_order_acquire) != owner)
+        return false;
+    cache_registry_publish(nullptr, nullptr, 0, nullptr);
+    return true;
 }
 
 }  // namespace rut

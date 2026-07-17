@@ -22,7 +22,7 @@ void DeterministicEnvironment::reset(const DeterministicCompletion* scheduled, u
 
 CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
                                                 u32 yielded_target,
-                                                u64 earliest_at_us,
+                                                u64 earliest_timer_at_us,
                                                 u64 max_virtual_time_us,
                                                 DeterministicCompletion& completion) {
     if (!schedule_valid) return CompletionStatus::InvalidSchedule;
@@ -34,7 +34,8 @@ CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
     if (candidate.target_id != DeterministicCompletion::kAnyTarget &&
         candidate.target_id != yielded_target)
         return CompletionStatus::TargetMismatch;
-    if (candidate.at_us < earliest_at_us) return CompletionStatus::TooEarly;
+    if (candidate.kind == jit::YieldKind::Timer && candidate.at_us < earliest_timer_at_us)
+        return CompletionStatus::TooEarly;
     if (candidate.at_us < now_us || candidate.at_us > max_virtual_time_us)
         return CompletionStatus::TimeLimit;
 

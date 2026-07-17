@@ -93,6 +93,22 @@ TEST(cache_table, registry_publish_seeds_once) {
     CHECK_EQ(reg.seed.load(std::memory_order_relaxed), 0xDEADBEEFull);
 }
 
+TEST(cache_table, owned_publication_only_unpublishes_matching_owner) {
+    const u32 caps[1] = {64};
+    const u64 identities[1] = {cache_instance_identity("owned", 5)};
+    int first_owner = 0;
+    int second_owner = 0;
+
+    cache_registry_publish(caps, identities, 1, &first_owner);
+    cache_registry_publish(caps, identities, 1, &second_owner);
+    CHECK_FALSE(cache_registry_unpublish_if_owner(&first_owner));
+    CHECK_EQ(cache_registry().count.load(std::memory_order_acquire), 1u);
+    CHECK(cache_registry().owner.load(std::memory_order_acquire) == &second_owner);
+    CHECK(cache_registry_unpublish_if_owner(&second_owner));
+    CHECK_EQ(cache_registry().count.load(std::memory_order_acquire), 0u);
+    CHECK(cache_registry().owner.load(std::memory_order_acquire) == nullptr);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
