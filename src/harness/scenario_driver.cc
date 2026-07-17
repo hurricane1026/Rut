@@ -382,25 +382,21 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
                                                          scenario.now_us);
     }
 
-    bool needs_terminal_observation = false;
     if (rate_limited) {
         out.terminal = jit::HandlerResult::make_status(429);
         out.has_terminal = true;
-        needs_terminal_observation = true;
         out.harness.outcome = Outcome::Passed;
         out.harness.phase = Phase::Observe;
         out.harness.cleanup = CleanupOutcome::Clean;
     } else if (route->action == RouteAction::Static) {
         out.terminal = jit::HandlerResult::make_status(route->status_code);
         out.has_terminal = true;
-        needs_terminal_observation = true;
         out.harness.outcome = Outcome::Passed;
         out.harness.phase = Phase::Observe;
         out.harness.cleanup = CleanupOutcome::Clean;
     } else if (route->action == RouteAction::Proxy) {
         out.terminal = jit::HandlerResult::make_forward(route->upstream_id);
         out.has_terminal = true;
-        needs_terminal_observation = true;
         out.harness.outcome = Outcome::Passed;
         out.harness.phase = Phase::Observe;
         out.harness.cleanup = CleanupOutcome::Clean;
@@ -448,7 +444,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     if (out.harness.outcome == Outcome::Passed && out.has_terminal)
         (void)account_terminal_output(harness, out.harness, connection.connection, out.terminal);
 
-    if (needs_terminal_observation && out.harness.outcome == Outcome::Passed)
+    if (out.has_terminal && out.harness.outcome == Outcome::Passed)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal &&

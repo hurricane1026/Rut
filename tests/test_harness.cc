@@ -143,6 +143,19 @@ bool reject_route_selection(void*, const harness::Observation& event) {
     return event.kind != harness::ObservationKind::RouteSelected;
 }
 
+struct ResponseObservation {
+    bool seen = false;
+    u64 status = 0;
+};
+
+bool capture_response_observation(void* context, const harness::Observation& event) {
+    if (event.kind != harness::ObservationKind::ResponseProduced) return true;
+    auto* captured = static_cast<ResponseObservation*>(context);
+    captured->seen = true;
+    captured->status = event.value0;
+    return true;
+}
+
 struct TempSource {
     char path[64] = "/tmp/rut_harness_XXXXXX";
 
@@ -698,12 +711,17 @@ TEST(harness_scenario, formatter_fallback_updates_terminal_status) {
     spec.required_capabilities =
         harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
     spec.environment_capabilities = spec.required_capabilities;
+    ResponseObservation observed{};
+    spec.observations.context = &observed;
+    spec.observations.observe = &capture_response_observation;
 
     const auto result = harness::drive_scenario(scenario, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 500);
     CHECK(result.harness.output_bytes > 0);
+    CHECK(observed.seen);
+    CHECK_EQ(observed.status, 500u);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
