@@ -524,6 +524,11 @@ TEST(harness_connection, destroy_closes_owned_upstream_descriptor) {
     CHECK_EQ(::close(descriptors[1]), 0);
 }
 
+static_assert(!std::is_copy_constructible_v<harness::ConnectionExecution>);
+static_assert(!std::is_copy_assignable_v<harness::ConnectionExecution>);
+static_assert(!std::is_move_constructible_v<harness::ConnectionExecution>);
+static_assert(!std::is_move_assignable_v<harness::ConnectionExecution>);
+
 static harness::HarnessSpec scripted_scenario_harness(bool faults = false) {
     harness::HarnessSpec spec{};
     spec.layer = harness::ExecutionLayer::Connection;

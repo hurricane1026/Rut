@@ -19,6 +19,10 @@ struct ConnectionExecution {
     u8 send_storage[SlicePool::kSliceSize]{};
 
     ConnectionExecution();
+    ConnectionExecution(const ConnectionExecution&) = delete;
+    ConnectionExecution& operator=(const ConnectionExecution&) = delete;
+    ConnectionExecution(ConnectionExecution&&) = delete;
+    ConnectionExecution& operator=(ConnectionExecution&&) = delete;
     void reset(u32 peer_addr = 0, u16 peer_port = 0, u32 shard_id = 0);
     u64 invariant_violations() const;
     void destroy();
