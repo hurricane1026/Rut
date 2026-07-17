@@ -10,6 +10,7 @@
 #include "rut/runtime/cache_table.h"
 #endif
 
+#include <cstdio>
 #include <cstring>
 
 #include <fcntl.h>
@@ -106,8 +107,13 @@ bool reject_yield(void*, const harness::Observation& event) {
     return event.kind != harness::ObservationKind::HandlerYielded;
 }
 
-bool reject_all_observations(void*, const harness::Observation&) {
-    return false;
+bool reject_terminal_observations(void*, const harness::Observation& event) {
+    return event.kind != harness::ObservationKind::ResponseProduced &&
+           event.kind != harness::ObservationKind::UpstreamSelected;
+}
+
+bool reject_route_selection(void*, const harness::Observation& event) {
+    return event.kind != harness::ObservationKind::RouteSelected;
 }
 
 struct TempSource {
@@ -214,6 +220,28 @@ TEST(harness_handler, rejects_wait_any_timer_before_timeout) {
     const auto result = harness::drive_handler_deterministically(driver, spec);
     CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
     CHECK_EQ(result.harness.virtual_time_us, 0u);
+    CHECK_EQ(result.consumed_events, 0u);
+}
+
+TEST(harness_handler, wait_any_timeout_wins_over_later_completion) {
+    harness::HandlerExecution execution{};
+    execution.init(&any_timer_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Recv, 17, 50000, 1, 3},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 208);
+    CHECK_EQ(result.harness.virtual_time_us, 25000u);
     CHECK_EQ(result.consumed_events, 0u);
 }
 
@@ -400,14 +428,38 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     spec.required_capabilities =
         harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
     spec.environment_capabilities = spec.required_capabilities;
-    spec.observations.observe = &reject_all_observations;
+    spec.observations.observe = &reject_terminal_observations;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.semantic_events, 2u);
+    CHECK_EQ(result.harness.input_bytes, scenario.request_len);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, route_selection_is_published_before_terminal_handling) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_static("/selected", kRouteMethodGet, 204));
+    target.prepared = true;
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/selected", 9};
+    scenario.method = kRouteMethodGet;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations.observe = &reject_route_selection;
 
     const auto result = harness::drive_scenario(scenario, spec);
     CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
     CHECK_EQ(result.harness.semantic_events, 1u);
-    CHECK_EQ(result.harness.input_bytes, scenario.request_len);
-    REQUIRE(result.has_terminal);
-    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK(result.route_selected);
+    CHECK_EQ(result.route_index, 0u);
+    CHECK(!result.has_terminal);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
@@ -732,6 +784,31 @@ TEST(harness_source_target, enforces_source_limit_before_loading) {
     harness::HarnessSpec harness_spec{};
     harness_spec.limits.max_source_bytes = 1;
     const auto result = target.prepare({source.path, jit::OptLevel::O0}, harness_spec);
+    CHECK_EQ(result.outcome, harness::Outcome::Failed);
+    CHECK(result.has_reached_limit);
+    CHECK_EQ(result.reached_limit, harness::LimitKind::SourceBytes);
+    CHECK_EQ(result.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!target.prepared);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_source_target, enforces_source_limit_across_imported_modules) {
+    TempSource imported;
+    REQUIRE(imported.write("fn helper() -> i64 { return 1 }\n"));
+    TempSource root;
+    char source[256]{};
+    const int source_len = std::snprintf(source,
+                                         sizeof(source),
+                                         "import \"%s\"\nroute GET \"/health\" { return 204 }\n",
+                                         imported.path);
+    REQUIRE(source_len > 0);
+    REQUIRE(static_cast<size_t>(source_len) < sizeof(source));
+    REQUIRE(root.write(source));
+
+    harness::SourceTarget target{};
+    harness::HarnessSpec harness_spec{};
+    harness_spec.limits.max_source_bytes = static_cast<u64>(source_len);
+    const auto result = target.prepare({root.path, jit::OptLevel::O0}, harness_spec);
     CHECK_EQ(result.outcome, harness::Outcome::Failed);
     CHECK(result.has_reached_limit);
     CHECK_EQ(result.reached_limit, harness::LimitKind::SourceBytes);

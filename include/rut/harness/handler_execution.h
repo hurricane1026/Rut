@@ -37,8 +37,9 @@ struct HandlerExecution {
 struct DeterministicHandlerSpec {
     HandlerExecution execution{};
     DeterministicEnvironment* environment = nullptr;
-    // A Timer yield can always complete from its own payload. Other yield kinds
-    // require a matching declared event.
+    // A Timer yield can always complete from its own payload. `Any` also has an
+    // intrinsic timeout when its payload is non-zero; other yield kinds require
+    // a matching declared event.
     bool auto_complete_timers = true;
 };
 

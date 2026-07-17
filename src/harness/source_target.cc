@@ -63,8 +63,22 @@ HarnessResult SourceTarget::prepare(const SourceTargetSpec& target, const Harnes
         return result;
     }
 
-    if (!load_rut_program(target.path, program, load_error, target.opt)) {
+    if (!load_rut_program(
+            target.path, program, load_error, target.opt, harness.limits.max_source_bytes)) {
         result.outcome = Outcome::Failed;
+        if (load_error.source_limit_exceeded) {
+            result.has_reached_limit = true;
+            result.reached_limit = LimitKind::SourceBytes;
+            copy_detail(result.detail, sizeof(result.detail), "source-bytes limit reached");
+            (void)publish(harness,
+                          ObservationKind::LimitReached,
+                          Phase::Prepare,
+                          harness.limits.max_source_bytes,
+                          {"source-bytes", 12});
+            program.destroy();
+            result.cleanup = CleanupOutcome::Clean;
+            return result;
+        }
         char detail[LoadError::kMaxDetail + 128]{};
         (void)format_load_error(load_error, detail, sizeof(detail));
         copy_detail(result.detail, sizeof(result.detail), detail);

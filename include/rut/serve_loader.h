@@ -48,6 +48,7 @@ enum class LoadStage : u8 {
 struct LoadError {
     LoadStage stage = LoadStage::Read;
     bool has_diag = false;  // true iff `diag` was populated by the frontend
+    bool source_limit_exceeded = false;
     Diagnostic diag{};
     // Owns the bytes of `diag.detail`. The frontend's Diagnostic::detail can
     // point into analyzer-owned storage (e.g. imported-file source) that is
@@ -78,11 +79,13 @@ struct LoadedProgram {
 // partial config.
 //
 // `opt` selects the JIT IR optimization level (higher = faster handlers,
-// slower startup compile).
+// slower startup compile). `max_source_bytes` bounds the root source plus
+// every imported module read during analysis.
 bool load_rut_program(const char* path,
                       LoadedProgram& out,
                       LoadError& err,
-                      jit::OptLevel opt = jit::OptLevel::O2);
+                      jit::OptLevel opt = jit::OptLevel::O2,
+                      u64 max_source_bytes = ~u64{0});
 
 // Publish the program's Cache descriptors as part of installing its
 // RouteConfig. Compilation alone never mutates the live Cache registry;

@@ -67,6 +67,35 @@ bool publish_terminal(const HarnessSpec& spec,
     return false;
 }
 
+bool publish_route_selected(const HarnessSpec& spec,
+                            HarnessResult& result,
+                            u32 route_index,
+                            const RouteEntry& route,
+                            u64 timestamp_us) {
+    if (result.semantic_events >= spec.limits.max_semantic_events) {
+        result.outcome = Outcome::Failed;
+        result.has_reached_limit = true;
+        result.reached_limit = LimitKind::SemanticEvents;
+        copy_detail(result, "semantic-events limit reached");
+        return false;
+    }
+
+    Observation event{};
+    event.kind = ObservationKind::RouteSelected;
+    event.phase = Phase::Start;
+    event.sequence = result.semantic_events;
+    event.timestamp_us = timestamp_us;
+    event.value0 = route_index;
+    event.label = {route.path, route.path_len};
+    result.semantic_events++;
+    if (spec.observations.publish(event)) return true;
+
+    result.outcome = Outcome::Mismatched;
+    result.phase = Phase::Observe;
+    copy_detail(result, "observation rejected by oracle");
+    return false;
+}
+
 }  // namespace
 
 ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& harness) {
@@ -168,6 +197,11 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     }
     out.route_selected = true;
     out.route_index = static_cast<u32>(route - scenario.target->program.config.routes);
+    if (!publish_route_selected(harness, out.harness, out.route_index, *route, scenario.now_us)) {
+        connection.destroy();
+        out.harness.cleanup = CleanupOutcome::Clean;
+        return out;
+    }
 
     activate_rut_program(scenario.target->program);
     ScenarioState local_state{};
