@@ -19,6 +19,12 @@ struct SourceTarget {
     u64 generation = 0;
     bool prepared = false;
 
+    SourceTarget() = default;
+    SourceTarget(const SourceTarget&) = delete;
+    SourceTarget& operator=(const SourceTarget&) = delete;
+    SourceTarget(SourceTarget&&) = delete;
+    SourceTarget& operator=(SourceTarget&&) = delete;
+
     HarnessResult prepare(const SourceTargetSpec& target, const HarnessSpec& harness);
     CleanupOutcome destroy();
 };

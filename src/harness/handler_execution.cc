@@ -168,9 +168,12 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                                           harness.limits.max_virtual_time_us,
                                           event);
         }
+        const bool has_intrinsic_timer =
+            result.yield_kind == jit::YieldKind::Timer ||
+            (result.yield_kind == jit::YieldKind::Any && result.yield_payload_u32() != 0);
         if ((completion == CompletionStatus::Empty ||
              completion == CompletionStatus::KindMismatch) &&
-            driver.auto_complete_timers && result.yield_kind == jit::YieldKind::Timer) {
+            driver.auto_complete_timers && has_intrinsic_timer) {
             completion = environment.complete_timer(
                 result.yield_payload_u32(), harness.limits.max_virtual_time_us, event);
         }

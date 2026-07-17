@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -255,6 +256,20 @@ TEST(harness_handler, wait_any_timeout_wins_over_later_completion) {
     CHECK_EQ(result.consumed_events, 0u);
 }
 
+TEST(harness_handler, wait_any_timeout_completes_without_scripted_events) {
+    harness::HandlerExecution execution{};
+    execution.init(&any_timer_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 208);
+    CHECK_EQ(result.harness.virtual_time_us, 25000u);
+    CHECK_EQ(result.consumed_events, 0u);
+}
+
 TEST(harness_handler, wait_any_accepts_targeted_completion_before_timeout) {
     harness::HandlerExecution execution{};
     execution.init(&any_recv_handler, nullptr, nullptr, 0);
@@ -482,6 +497,36 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     CHECK_EQ(result.harness.input_bytes, scenario.request_len);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, rejects_routing_fields_that_disagree_with_request_line) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_static("/expected", kRouteMethodGet, 204));
+    target.prepared = true;
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/expected", 9};
+    scenario.method = kRouteMethodGet;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const char wrong_path[] = "GET /different HTTP/1.1\r\nHost: test\r\n\r\n";
+    scenario.request_data = reinterpret_cast<const u8*>(wrong_path);
+    scenario.request_len = sizeof(wrong_path) - 1;
+    const auto path_result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(path_result.harness.outcome, harness::Outcome::Invalid);
+    CHECK(!path_result.route_selected);
+
+    const char wrong_method[] = "POST /expected HTTP/1.1\r\nHost: test\r\n\r\n";
+    scenario.request_data = reinterpret_cast<const u8*>(wrong_method);
+    scenario.request_len = sizeof(wrong_method) - 1;
+    const auto method_result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(method_result.harness.outcome, harness::Outcome::Invalid);
+    CHECK(!method_result.route_selected);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
@@ -885,6 +930,11 @@ TEST(harness_source_target, prepares_production_loaded_program_and_cleans_up) {
     CHECK(!target.prepared);
     CHECK(!target.program.jit_inited);
 }
+
+static_assert(!std::is_copy_constructible_v<harness::SourceTarget>);
+static_assert(!std::is_copy_assignable_v<harness::SourceTarget>);
+static_assert(!std::is_move_constructible_v<harness::SourceTarget>);
+static_assert(!std::is_move_assignable_v<harness::SourceTarget>);
 
 TEST(harness_source_target, can_prepare_again_after_successful_load) {
     TempSource source;

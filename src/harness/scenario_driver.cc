@@ -1,5 +1,6 @@
 #include "rut/harness/scenario_driver.h"
 
+#include "rut/runtime/http_parser.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_canon.h"
 
@@ -17,6 +18,14 @@ void copy_detail(HarnessResult& result, const char* detail) {
 
 bool declared(CapabilitySet declared_set, Capability capability) {
     return declared_set.has(capability);
+}
+
+bool str_equal(Str lhs, Str rhs) {
+    if (lhs.len != rhs.len) return false;
+    for (u32 i = 0; i < lhs.len; i++) {
+        if (lhs.ptr[i] != rhs.ptr[i]) return false;
+    }
+    return true;
 }
 
 bool expectation_matches(const ScenarioExpectation& expected, const jit::HandlerResult& terminal) {
@@ -172,16 +181,42 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     }
     out.harness.input_bytes = scenario.request_len;
 
+    Str routing_path = scenario.path;
+    u8 routing_method = scenario.method;
+    ParsedRequest parsed_request{};
+    if (scenario.request_len != 0) {
+        HttpParser parser{};
+        parser.reset();
+        parsed_request.reset();
+        if (parser.parse(scenario.request_data, scenario.request_len, &parsed_request) !=
+            ParseStatus::Complete) {
+            out.harness.outcome = Outcome::Invalid;
+            out.harness.cleanup = CleanupOutcome::Clean;
+            copy_detail(out.harness, "scenario request is not a complete HTTP request");
+            return out;
+        }
+        if (parsed_request.method == HttpMethod::Unknown ||
+            !str_equal(scenario.path, parsed_request.path) ||
+            scenario.method != static_cast<u8>(parsed_request.method) + kRouteMethodGet) {
+            out.harness.outcome = Outcome::Invalid;
+            out.harness.cleanup = CleanupOutcome::Clean;
+            copy_detail(out.harness, "scenario routing fields do not match request line");
+            return out;
+        }
+        routing_path = parsed_request.path;
+        routing_method = static_cast<u8>(parsed_request.method) + kRouteMethodGet;
+    }
+
     ConnectionExecution connection{};
     connection.reset(scenario.peer_addr, scenario.peer_port, scenario.shard_id);
-    for (u32 i = 0; i < scenario.path.len; i++)
-        connection.connection.req_path[i] = scenario.path.ptr[i];
-    connection.connection.req_path[scenario.path.len] = '\0';
+    for (u32 i = 0; i < routing_path.len; i++)
+        connection.connection.req_path[i] = routing_path.ptr[i];
+    connection.connection.req_path[routing_path.len] = '\0';
     connection.connection.req_path_canon =
-        canonicalize_request({connection.connection.req_path, scenario.path.len});
+        canonicalize_request({connection.connection.req_path, routing_path.len});
     connection.connection.req_method =
-        scenario.method >= kRouteMethodGet && scenario.method <= kRouteMethodTrace
-            ? scenario.method - 1
+        routing_method >= kRouteMethodGet && routing_method <= kRouteMethodTrace
+            ? routing_method - 1
             : static_cast<u8>(LogHttpMethod::Other);
     connection.connection.req_size = scenario.request_len;
     connection.connection.request_config = &scenario.target->program.config;
@@ -190,7 +225,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     u32 route_param_count = 0;
     const RouteEntry* route =
         scenario.target->program.config.match_canonical(connection.connection.req_path_canon,
-                                                        scenario.method,
+                                                        routing_method,
                                                         route_params,
                                                         &route_param_count,
                                                         kMaxRouteParams);
@@ -238,7 +273,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         key_input.req_buf = scenario.request_data;
         key_input.req_header_end = request_header_end(scenario.request_data, scenario.request_len);
         key_input.path = connection.connection.req_path;
-        key_input.path_len = scenario.path.len;
+        key_input.path_len = routing_path.len;
         key_input.params = route_params;
         key_input.param_count = route_param_count;
         rate_limited = rate_limit_exceeded_with_limiters(*rate_limiter,
