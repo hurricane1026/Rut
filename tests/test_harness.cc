@@ -114,6 +114,22 @@ u64 any_recv_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(500).pack();
 }
 
+u64 any_without_timeout_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Any, 0).pack();
+    return jit::HandlerResult::make_status(500).pack();
+}
+
+u16 oversized_body_index = 0;
+u16 oversized_headers_index = 0;
+
+u64 oversized_response_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    jit::HandlerResult result = jit::HandlerResult::make_status(200);
+    result.upstream_id = oversized_body_index;
+    result.next_state = oversized_headers_index;
+    return result.pack();
+}
+
 bool reject_yield(void*, const harness::Observation& event) {
     return event.kind != harness::ObservationKind::HandlerYielded;
 }
@@ -290,6 +306,27 @@ TEST(harness_handler, wait_any_accepts_targeted_completion_before_timeout) {
     CHECK_EQ(result.terminal.status_code, 209);
     CHECK_EQ(result.harness.virtual_time_us, 10000u);
     CHECK_EQ(result.consumed_events, 1u);
+}
+
+TEST(harness_handler, wait_any_without_timeout_rejects_timer_completion) {
+    harness::HandlerExecution execution{};
+    execution.init(&any_without_timeout_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::Timer, 0, 100, 1},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Stalled);
+    CHECK(!result.has_terminal);
+    CHECK_EQ(result.consumed_events, 0u);
+    CHECK_EQ(result.harness.virtual_time_us, 0u);
 }
 
 TEST(harness_handler, stalls_when_yield_has_no_declared_event) {
@@ -630,6 +667,43 @@ TEST(harness_scenario, terminal_response_enforces_output_budget) {
     CHECK(result.harness.has_reached_limit);
     CHECK_EQ(result.harness.reached_limit, harness::LimitKind::OutputBytes);
     CHECK(result.harness.output_bytes > spec.limits.max_output_bytes);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, formatter_fallback_updates_terminal_status) {
+    harness::SourceTarget target{};
+    char body[RouteConfig::kResponseBodyPoolBytes];
+    char header_value[RouteConfig::kResponseHeaderBytesPoolBytes - 12];
+    std::memset(body, 'b', sizeof(body));
+    std::memset(header_value, 'v', sizeof(header_value));
+    oversized_body_index = target.program.config.add_response_body(body, sizeof(body));
+    const char* keys[] = {"X"};
+    const u32 key_lens[] = {1};
+    const char* values[] = {header_value};
+    const u32 value_lens[] = {sizeof(header_value)};
+    oversized_headers_index =
+        target.program.config.add_response_header_set(keys, key_lens, values, value_lens, 1);
+    REQUIRE(oversized_body_index != 0);
+    REQUIRE(oversized_headers_index != 0);
+    REQUIRE(target.program.config.add_jit_handler(
+        "/oversized", kRouteMethodGet, &oversized_response_handler));
+    target.prepared = true;
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/oversized", 10};
+    scenario.method = kRouteMethodGet;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 500);
+    CHECK(result.harness.output_bytes > 0);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

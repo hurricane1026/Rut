@@ -257,6 +257,9 @@ TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
     CHECK_EQ(matched.harness.cleanup, harness::CleanupOutcome::Clean);
     CHECK_EQ(matched.harness.semantic_events, 1u);
     CHECK_EQ(matched.harness.input_bytes, matched_entry.raw_header_len);
+    CHECK(matched.harness.output_bytes > 0);
+    CHECK_EQ(matched.harness.output_bytes, matched.replay.output_bytes);
+    CHECK_EQ(matched.harness.backend_completions, 4u);
 
     SmallLoop mismatched_loop;
     mismatched_loop.setup();
@@ -329,6 +332,28 @@ TEST(harness_replay, enforces_input_limit_and_oracle) {
     const auto rejected = harness::drive_replay_one(loop, entry, 43, oracle_spec);
     CHECK_EQ(rejected.harness.outcome, harness::Outcome::Mismatched);
     CHECK_EQ(rejected.harness.cleanup, harness::CleanupOutcome::Clean);
+
+    SmallLoop output_limited_loop;
+    output_limited_loop.setup();
+    harness::HarnessSpec output_limited_spec = oracle_spec;
+    output_limited_spec.observations.observe = nullptr;
+    output_limited_spec.limits.max_output_bytes = 1;
+    const auto output_limited =
+        harness::drive_replay_one(output_limited_loop, entry, 44, output_limited_spec);
+    CHECK_EQ(output_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(output_limited.harness.reached_limit, harness::LimitKind::OutputBytes);
+    CHECK(output_limited.harness.output_bytes > 1);
+
+    SmallLoop completion_limited_loop;
+    completion_limited_loop.setup();
+    harness::HarnessSpec completion_limited_spec = oracle_spec;
+    completion_limited_spec.observations.observe = nullptr;
+    completion_limited_spec.limits.max_backend_completions = 1;
+    const auto completion_limited =
+        harness::drive_replay_one(completion_limited_loop, entry, 45, completion_limited_spec);
+    CHECK_EQ(completion_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(completion_limited.harness.reached_limit, harness::LimitKind::BackendCompletions);
+    CHECK_EQ(completion_limited.harness.backend_completions, 4u);
 }
 
 TEST(harness_replay, rejects_missing_synthetic_io_capability) {
@@ -427,6 +452,8 @@ TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
     CHECK_EQ(result.harness.input_bytes,
              static_cast<u64>(entries[0].raw_header_len) + entries[1].raw_header_len +
                  entries[2].raw_header_len);
+    CHECK(result.harness.output_bytes > 0);
+    CHECK_EQ(result.harness.backend_completions, 12u);
     CHECK_EQ(result.replay.total, 3u);
     CHECK_EQ(result.replay.matched, 2u);
     CHECK_EQ(result.replay.mismatched, 1u);
@@ -446,6 +473,44 @@ TEST(harness_replay, file_adapter_rejects_unopened_reader) {
     CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
     CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
     CHECK_EQ(result.replay.total, 0u);
+}
+
+TEST(harness_replay, file_adapter_enforces_output_and_completion_limits) {
+    const CaptureEntry entry =
+        make_captured_request("GET /limited HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(&entry, 1));
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    ReplayReader output_reader;
+    REQUIRE(output_reader.open(tmp.path) == 0);
+    SmallLoop output_loop;
+    output_loop.setup();
+    spec.limits.max_output_bytes = 1;
+    const auto output_limited = harness::drive_replay_file(output_loop, output_reader, spec);
+    CHECK_EQ(output_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(output_limited.harness.reached_limit, harness::LimitKind::OutputBytes);
+    CHECK_EQ(output_limited.replay.total, 1u);
+    CHECK_EQ(output_limited.replay.replayed, 1u);
+    output_reader.close();
+
+    ReplayReader completion_reader;
+    REQUIRE(completion_reader.open(tmp.path) == 0);
+    SmallLoop completion_loop;
+    completion_loop.setup();
+    spec.limits.max_output_bytes = harness::RunLimits{}.max_output_bytes;
+    spec.limits.max_backend_completions = 1;
+    const auto completion_limited =
+        harness::drive_replay_file(completion_loop, completion_reader, spec);
+    CHECK_EQ(completion_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(completion_limited.harness.reached_limit, harness::LimitKind::BackendCompletions);
+    CHECK_EQ(completion_limited.harness.backend_completions, 4u);
+    CHECK_EQ(completion_limited.replay.total, 1u);
+    CHECK_EQ(completion_limited.replay.replayed, 1u);
+    completion_reader.close();
 }
 
 TEST(harness_replay, input_limit_keeps_file_summary_consistent) {

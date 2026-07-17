@@ -31,6 +31,9 @@ CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
     const DeterministicCompletion candidate = completions[cursor];
     if (yielded != jit::YieldKind::Any && yielded != candidate.kind)
         return CompletionStatus::KindMismatch;
+    if (yielded == jit::YieldKind::Any && earliest_timer_at_us == now_us &&
+        candidate.kind == jit::YieldKind::Timer)
+        return CompletionStatus::KindMismatch;
     // Production arms a real timer alongside the other operations for
     // `wait any`. If the next scripted I/O completion is later than that
     // deadline, the timer wins without consuming the later event.

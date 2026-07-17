@@ -110,9 +110,10 @@ bool publish_route_selected(const HarnessSpec& spec,
 bool account_terminal_output(const HarnessSpec& spec,
                              HarnessResult& result,
                              Connection& connection,
-                             const jit::HandlerResult& terminal) {
+                             jit::HandlerResult& terminal) {
     if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
 
+    connection.resp_status = terminal.status_code;
     const RouteConfig* config = connection.request_config;
     const bool has_body = terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
@@ -122,6 +123,7 @@ bool account_terminal_output(const HarnessSpec& spec,
     u32 header_count = 0;
     if (!collect_effective_response_headers(
             connection, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
+        connection.resp_status = 500;
         format_static_response(connection, 500, false);
     } else if (header_count != 0) {
         const char* body_data = nullptr;
@@ -153,6 +155,8 @@ bool account_terminal_output(const HarnessSpec& spec,
     }
 
     result.output_bytes = connection.send_buf.len();
+    if (connection.resp_status != terminal.status_code)
+        terminal = jit::HandlerResult::make_status(connection.resp_status);
     if (result.output_bytes <= spec.limits.max_output_bytes) return true;
     result.outcome = Outcome::Failed;
     result.has_reached_limit = true;

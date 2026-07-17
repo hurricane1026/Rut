@@ -111,6 +111,24 @@ ReplayItemResult drive_replay_one(Loop& loop,
     out.harness.input_bytes = entry.raw_header_len;
 
     out.replay = replay_one(loop, entry, fake_fd);
+    out.harness.output_bytes = out.replay.output_bytes;
+    out.harness.backend_completions = out.replay.backend_completions;
+    if (out.harness.output_bytes > spec.limits.max_output_bytes) {
+        out.harness.outcome = Outcome::Failed;
+        out.harness.has_reached_limit = true;
+        out.harness.reached_limit = LimitKind::OutputBytes;
+        detail::set_detail(out.harness, "output-bytes limit reached");
+        out.harness.cleanup = CleanupOutcome::Clean;
+        return out;
+    }
+    if (out.harness.backend_completions > spec.limits.max_backend_completions) {
+        out.harness.outcome = Outcome::Failed;
+        out.harness.has_reached_limit = true;
+        out.harness.reached_limit = LimitKind::BackendCompletions;
+        detail::set_detail(out.harness, "backend-completions limit reached");
+        out.harness.cleanup = CleanupOutcome::Clean;
+        return out;
+    }
     out.harness.outcome = detail::replay_outcome(out.replay);
     out.harness.phase = Phase::Observe;
     if (!detail::publish_replay_result(spec, out.harness, 0, out.replay)) {
@@ -179,6 +197,27 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
         } else {
             out.replay.failed++;
         }
+
+        if (replay.output_bytes > spec.limits.max_output_bytes - out.harness.output_bytes) {
+            out.harness.output_bytes += replay.output_bytes;
+            out.harness.backend_completions += replay.backend_completions;
+            out.harness.outcome = Outcome::Failed;
+            out.harness.has_reached_limit = true;
+            out.harness.reached_limit = LimitKind::OutputBytes;
+            detail::set_detail(out.harness, "output-bytes limit reached");
+            break;
+        }
+        out.harness.output_bytes += replay.output_bytes;
+        if (replay.backend_completions >
+            spec.limits.max_backend_completions - out.harness.backend_completions) {
+            out.harness.backend_completions += replay.backend_completions;
+            out.harness.outcome = Outcome::Failed;
+            out.harness.has_reached_limit = true;
+            out.harness.reached_limit = LimitKind::BackendCompletions;
+            detail::set_detail(out.harness, "backend-completions limit reached");
+            break;
+        }
+        out.harness.backend_completions += replay.backend_completions;
 
         if (!detail::publish_replay_result(spec, out.harness, out.replay.total - 1, replay)) {
             stopped_by_observer = !out.harness.has_reached_limit;
