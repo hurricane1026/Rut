@@ -40,6 +40,9 @@ struct DeterministicHandlerSpec {
     // Semantic observations already emitted by an outer adapter. This seeds
     // sequence numbers and keeps the run-wide event budget continuous.
     u32 initial_semantic_events = 0;
+    // Absolute virtual clock value at handler entry. Completion timestamps and
+    // time.nowMicros() share this clock; the run limit remains a duration.
+    u64 initial_virtual_time_us = 0;
     // A Timer yield can always complete from its own payload. `Any` also has an
     // intrinsic timeout when its payload is non-zero; other yield kinds require
     // a matching declared event.

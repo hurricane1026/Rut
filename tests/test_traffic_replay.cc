@@ -401,6 +401,19 @@ TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
     reader.close();
 }
 
+TEST(harness_replay, file_adapter_rejects_unopened_reader) {
+    ReplayReader reader;
+    SmallLoop loop;
+    loop.setup();
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+
+    const auto result = harness::drive_replay_file(loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(result.replay.total, 0u);
+}
+
 TEST(harness_replay, input_limit_keeps_file_summary_consistent) {
     CaptureEntry entries[2];
     entries[0] = make_captured_request("GET /one HTTP/1.1\r\nHost: x\r\n\r\n", 200);

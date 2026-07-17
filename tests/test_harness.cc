@@ -401,6 +401,9 @@ TEST(harness_handler, stalls_when_script_targets_a_different_upstream) {
 
 TEST(harness_connection, reports_and_resets_cleanup_invariants) {
     harness::ConnectionExecution execution{};
+    CHECK_EQ(execution.connection.fd, -1);
+    CHECK_EQ(execution.connection.upstream_fd, -1);
+    CHECK_EQ(execution.connection.idle_return_fd, -1);
     execution.reset(0x7f000001u, 8080, 3);
     CHECK_EQ(execution.invariant_violations(), 0u);
     execution.connection.pending_ops = 1;
@@ -733,6 +736,49 @@ TEST(harness_scenario, real_source_timer_obeys_virtual_duration_limit) {
     CHECK(result.harness.has_reached_limit);
     CHECK_EQ(result.harness.reached_limit, harness::LimitKind::VirtualDuration);
     CHECK_EQ(result.connection_invariant_violations, 0u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, handler_clock_and_timer_deadline_start_at_scenario_time) {
+    TempSource source;
+    REQUIRE(source.write(
+        "route GET \"/clock\" { if time.nowMicros() == 123456 { return 204 } else { return 500 "
+        "} }\n"
+        "route GET \"/timer\" { wait(5) return 205 }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    const char request[] = "GET /clock HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/clock", 6};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.now_us = 123456;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.limits.max_virtual_time_us = 5000;
+
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(result.harness.virtual_time_us, 123456u);
+
+    const char timer_request[] = "GET /timer HTTP/1.1\r\nHost: test\r\n\r\n";
+    scenario.path = {"/timer", 6};
+    scenario.request_data = reinterpret_cast<const u8*>(timer_request);
+    scenario.request_len = sizeof(timer_request) - 1;
+    const auto timer_result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(timer_result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(timer_result.has_terminal);
+    CHECK_EQ(timer_result.terminal.status_code, 205);
+    CHECK_EQ(timer_result.harness.virtual_time_us, 128456u);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

@@ -1,5 +1,7 @@
 #include "rut/harness/handler_execution.h"
 
+#include "rut/jit/runtime_helpers.h"
+
 namespace rut::harness {
 namespace {
 
@@ -87,6 +89,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     out.harness.phase = Phase::Drive;
     out.harness.cleanup = CleanupOutcome::NotRun;
     out.harness.semantic_events = driver.initial_semantic_events;
+    out.harness.virtual_time_us = driver.initial_virtual_time_us;
     struct CleanupMarker {
         HarnessResult& result;
         ~CleanupMarker() { result.cleanup = CleanupOutcome::Clean; }
@@ -124,6 +127,16 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             return out;
         }
     }
+    environment.now_us = driver.initial_virtual_time_us;
+    const u64 virtual_deadline_us =
+        harness.limits.max_virtual_time_us > ~u64{0} - driver.initial_virtual_time_us
+            ? ~u64{0}
+            : driver.initial_virtual_time_us + harness.limits.max_virtual_time_us;
+    const u64* previous_virtual_clock = rut_helper_time_set_virtual_clock(&environment.now_us);
+    struct VirtualClockRestore {
+        const u64* previous;
+        ~VirtualClockRestore() { (void)rut_helper_time_set_virtual_clock(previous); }
+    } virtual_clock_restore{previous_virtual_clock};
     EventPublisher publisher{harness, out.harness};
     if (!publisher.emit(ObservationKind::HandlerEntered)) return out;
     jit::HandlerResult result = execution.invoke();
@@ -153,7 +166,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         if (result.yield_kind == jit::YieldKind::Timer ||
             (result.yield_kind == jit::YieldKind::Any && result.yield_payload_u32() != 0)) {
             const u64 delay_us = static_cast<u64>(result.yield_payload_u32()) * 1000u;
-            if (delay_us > harness.limits.max_virtual_time_us - environment.now_us)
+            if (delay_us > virtual_deadline_us - environment.now_us)
                 completion = CompletionStatus::TimeLimit;
             else
                 earliest_timer_at_us += delay_us;
@@ -165,7 +178,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             completion = environment.next(result.yield_kind,
                                           yielded_target,
                                           earliest_timer_at_us,
-                                          harness.limits.max_virtual_time_us,
+                                          virtual_deadline_us,
                                           event);
         }
         const bool has_intrinsic_timer =
@@ -174,8 +187,8 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         if ((completion == CompletionStatus::Empty ||
              completion == CompletionStatus::KindMismatch) &&
             driver.auto_complete_timers && has_intrinsic_timer) {
-            completion = environment.complete_timer(
-                result.yield_payload_u32(), harness.limits.max_virtual_time_us, event);
+            completion =
+                environment.complete_timer(result.yield_payload_u32(), virtual_deadline_us, event);
         }
 
         if (completion == CompletionStatus::Empty || completion == CompletionStatus::KindMismatch ||

@@ -97,11 +97,11 @@ enum class LimitKind : u8 {
 };
 
 struct RunLimits {
-    u64 max_source_bytes = 4u * 1024u * 1024u;
-    u64 max_input_bytes = 16u * 1024u * 1024u;
-    u64 max_output_bytes = 16u * 1024u * 1024u;
-    u64 max_artifact_bytes = 64u * 1024u * 1024u;
-    u64 max_virtual_time_us = 60u * 1000u * 1000u;
+    u64 max_source_bytes = u64{4} * 1024u * 1024u;
+    u64 max_input_bytes = u64{16} * 1024u * 1024u;
+    u64 max_output_bytes = u64{16} * 1024u * 1024u;
+    u64 max_artifact_bytes = u64{64} * 1024u * 1024u;
+    u64 max_virtual_time_us = u64{60} * 1000u * 1000u;
     u32 max_handler_resumes = 32;
     u32 max_backend_completions = 4096;
     u32 max_semantic_events = 4096;

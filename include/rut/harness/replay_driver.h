@@ -128,6 +128,12 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
         detail::set_detail(out.harness, "replay requires connection or event-loop layer");
         return out;
     }
+    if (reader.fd < 0) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        detail::set_detail(out.harness, "replay reader is not open");
+        return out;
+    }
 
     CaptureEntry entry{};
     i32 fake_fd = 10000;

@@ -57,6 +57,7 @@ struct TimeCache {
     bool valid = false;
 };
 thread_local TimeCache t_time_cache;
+thread_local const u64* t_virtual_time_us = nullptr;
 
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
 // pc.primed untouched — callers set it.
@@ -536,10 +537,18 @@ u32 rut_helper_req_remote_addr(void* conn) {
 i64 rut_helper_time_now_micros() {
     TimeCache& tc = t_time_cache;
     if (!tc.valid) {
-        tc.value = static_cast<i64>(rut::monotonic_us());
+        tc.value = static_cast<i64>(t_virtual_time_us != nullptr ? *t_virtual_time_us
+                                                                 : rut::monotonic_us());
         tc.valid = true;
     }
     return tc.value;
+}
+
+const u64* rut_helper_time_set_virtual_clock(const u64* now_us) {
+    const u64* previous = t_virtual_time_us;
+    t_virtual_time_us = now_us;
+    t_time_cache.valid = false;
+    return previous;
 }
 
 void rut_helper_time_unlatch() {

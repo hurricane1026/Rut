@@ -20,7 +20,12 @@ void close_owned_descriptors(Connection& connection) {
 }  // namespace
 
 ConnectionExecution::ConnectionExecution() {
-    connection.reset();
+    // The aggregate member is zero-initialized, including its descriptors.
+    // Establish the descriptor sentinel before using the ownership-aware reset.
+    connection.fd = -1;
+    connection.upstream_fd = -1;
+    connection.idle_return_fd = -1;
+    reset();
 }
 
 void ConnectionExecution::reset(u32 peer_addr, u16 peer_port, u32 shard_id) {

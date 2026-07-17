@@ -341,6 +341,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         driver.execution = execution;
         driver.environment = runtime_environment;
         driver.initial_semantic_events = out.harness.semantic_events;
+        driver.initial_virtual_time_us = scenario.now_us;
         driver.auto_complete_timers = scenario.auto_complete_timers;
         HarnessSpec handler_harness = harness;
         handler_harness.layer = ExecutionLayer::Handler;

@@ -195,6 +195,11 @@ void rut_helper_cache_reset_local_state();
 // Backs the `time.nowMicros()` builtin.
 rut::i64 rut_helper_time_now_micros();
 
+// Install a deterministic clock for the current thread. The pointed-to value
+// may advance between handler resumes. Returns the previous source for scoped
+// restoration; nullptr selects the production monotonic clock.
+const rut::u64* rut_helper_time_set_virtual_clock(const rut::u64* now_us);
+
 // Reset the per-invocation time latch. Normally a side effect of
 // parse_prime/unprime; the JIT emits this at the prologue of handlers that
 // sample time.nowMicros() without reading the request, so their clock does
