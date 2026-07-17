@@ -365,6 +365,28 @@ TEST(harness_handler, wait_any_accepts_targeted_completion_before_timeout) {
     CHECK_EQ(result.consumed_events, 1u);
 }
 
+TEST(harness_handler, wait_any_ignores_upstream_completion_until_timeout) {
+    harness::HandlerExecution execution{};
+    execution.init(&any_timer_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::UpstreamRecv, 17, 10000, 1, 3},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 208);
+    CHECK_EQ(result.harness.virtual_time_us, 25000u);
+    CHECK_EQ(result.consumed_events, 0u);
+}
+
 TEST(harness_handler, wait_any_without_timeout_rejects_timer_completion) {
     harness::HandlerExecution execution{};
     execution.init(&any_without_timeout_handler, nullptr, nullptr, 0);
@@ -384,6 +406,27 @@ TEST(harness_handler, wait_any_without_timeout_rejects_timer_completion) {
     CHECK(!result.has_terminal);
     CHECK_EQ(result.consumed_events, 0u);
     CHECK_EQ(result.harness.virtual_time_us, 0u);
+}
+
+TEST(harness_handler, wait_any_without_timeout_rejects_upstream_completion) {
+    harness::HandlerExecution execution{};
+    execution.init(&any_without_timeout_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {
+        {jit::YieldKind::UpstreamConnect, 0, 100, 1, 2},
+    };
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Stalled);
+    CHECK(!result.has_terminal);
+    CHECK_EQ(result.harness.virtual_time_us, 0u);
+    CHECK_EQ(result.consumed_events, 0u);
 }
 
 TEST(harness_handler, stalls_when_yield_has_no_declared_event) {

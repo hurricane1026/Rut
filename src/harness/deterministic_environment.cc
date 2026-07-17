@@ -31,6 +31,9 @@ CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
     const DeterministicCompletion candidate = completions[cursor];
     if (yielded != jit::YieldKind::Any && yielded != candidate.kind)
         return CompletionStatus::KindMismatch;
+    if (yielded == jit::YieldKind::Any && candidate.kind != jit::YieldKind::Recv &&
+        candidate.kind != jit::YieldKind::Timer)
+        return CompletionStatus::KindMismatch;
     if (yielded == jit::YieldKind::Any && earliest_timer_at_us == now_us &&
         candidate.kind == jit::YieldKind::Timer)
         return CompletionStatus::KindMismatch;
