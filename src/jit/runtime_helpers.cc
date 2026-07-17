@@ -1,5 +1,6 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/common/shard_limits.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
@@ -581,9 +582,11 @@ struct ShardCacheTables {
     ~ShardCacheTables() { reset(); }
 };
 
+thread_local ShardCacheTables t_shard_cache_tables[rut::kMaxShards];
+thread_local rut::u32 t_active_cache_shard = 0;
+
 ShardCacheTables& shard_cache_tables() {
-    static thread_local ShardCacheTables state;
-    return state;
+    return t_shard_cache_tables[t_active_cache_shard];
 }
 
 rut::CacheTable* cache_table_for(rut::u32 instance) {
@@ -698,8 +701,14 @@ void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
     if (t != nullptr) t->set(key_ip, val);
 }
 
+u32 rut_helper_cache_select_local_shard(u32 shard_id) {
+    const u32 previous = t_active_cache_shard;
+    if (shard_id < rut::kMaxShards) t_active_cache_shard = shard_id;
+    return previous;
+}
+
 void rut_helper_cache_reset_local_state() {
-    shard_cache_tables().reset();
+    for (auto& state : t_shard_cache_tables) state.reset();
 }
 
 // ── String Operations ──────────────────────────────────────────────

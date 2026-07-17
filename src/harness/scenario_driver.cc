@@ -1,5 +1,6 @@
 #include "rut/harness/scenario_driver.h"
 
+#include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/route_canon.h"
@@ -206,6 +207,12 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         routing_path = parsed_request.path;
         routing_method = static_cast<u8>(parsed_request.method) + kRouteMethodGet;
     }
+
+    const u32 previous_cache_shard = rut_helper_cache_select_local_shard(scenario.shard_id);
+    struct CacheShardRestore {
+        u32 previous;
+        ~CacheShardRestore() { (void)rut_helper_cache_select_local_shard(previous); }
+    } cache_shard_restore{previous_cache_shard};
 
     ConnectionExecution connection{};
     connection.reset(scenario.peer_addr, scenario.peer_port, scenario.shard_id);

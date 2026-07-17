@@ -773,6 +773,17 @@ TEST(harness_scenario, cache_state_shares_within_group_and_resets_between_groups
     CHECK_EQ(first.harness.state_resets, 1u);
     CHECK_EQ(second.harness.state_resets, 0u);
 
+    scenario.shard_id = 1;
+    const auto other_shard = harness::drive_scenario(scenario, spec);
+    REQUIRE(other_shard.has_terminal);
+    CHECK_EQ(other_shard.terminal.status_code, 201);
+    CHECK_EQ(other_shard.harness.state_resets, 0u);
+
+    scenario.shard_id = 0;
+    const auto original_shard = harness::drive_scenario(scenario, spec);
+    REQUIRE(original_shard.has_terminal);
+    CHECK_EQ(original_shard.terminal.status_code, 200);
+
     scenario.state_group = 8;
     const auto other_group = harness::drive_scenario(scenario, spec);
     REQUIRE(other_group.has_terminal);
