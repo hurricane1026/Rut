@@ -204,11 +204,27 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
     }
 }
 
-static bool read_text_file(const std::filesystem::path& path, std::string& out) {
+enum class TextFileReadStatus : u8 { Ok, Failed, SourceLimit };
+
+static TextFileReadStatus read_text_file(const std::filesystem::path& path,
+                                         std::string& out,
+                                         SourceBudget* source_budget) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) return false;
-    out = std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    return true;
+    if (!in) return TextFileReadStatus::Failed;
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size < 0) return TextFileReadStatus::Failed;
+    if (source_budget != nullptr &&
+        (source_budget->used_bytes > source_budget->max_bytes ||
+         static_cast<u64>(size) > source_budget->max_bytes - source_budget->used_bytes)) {
+        source_budget->exceeded = true;
+        return TextFileReadStatus::SourceLimit;
+    }
+    in.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size));
+    if (size != 0 && !in.read(out.data(), size)) return TextFileReadStatus::Failed;
+    if (source_budget != nullptr) source_budget->used_bytes += static_cast<u64>(size);
+    return TextFileReadStatus::Ok;
 }
 
 static bool same_type_shape_node(const HirTypeShape& lhs, const HirTypeShape& rhs) {
@@ -11300,7 +11316,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     Str source_path,
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
-    const std::vector<Str>& external_decorator_names);
+    const std::vector<Str>& external_decorator_names,
+    SourceBudget* source_budget);
 
 static bool contains_str(const std::vector<Str>& names, Str needle) {
     for (const auto& name : names) {
@@ -12356,7 +12373,8 @@ static FrontendResult<void> load_imported_modules(
     std::deque<std::string>& owned_strings,
     std::vector<std::string>& import_stack,
     std::vector<std::unique_ptr<HirModule>>& imported_storage,
-    const std::vector<Str>& route_decorator_names) {
+    const std::vector<Str>& route_decorator_names,
+    SourceBudget* source_budget) {
     if (source_path.len == 0) return {};
     const auto base_dir = std::filesystem::path(str_to_std_string(source_path)).parent_path();
     auto collect_imported_decorator_names =
@@ -12440,7 +12458,12 @@ static FrontendResult<void> load_imported_modules(
             continue;
         }
         std::string content;
-        if (!read_text_file(normalized, content))
+        const TextFileReadStatus read_status = read_text_file(normalized, content, source_budget);
+        if (read_status == TextFileReadStatus::SourceLimit)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.import_decl.span,
+                                  lit_str("source-bytes limit reached"));
+        if (read_status == TextFileReadStatus::Failed)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.import_decl.span, item.import_decl.path);
         auto kept_source = stash_owned_string(owned_strings, content);
@@ -12457,8 +12480,12 @@ static FrontendResult<void> load_imported_modules(
         g_import_analysis_counter++;
         std::vector<Str> imported_decorator_names =
             collect_imported_decorator_names(item.import_decl, normalized);
-        auto imported = analyze_file_internal(
-            *ast_owned, kept_path, import_stack, &owned_strings, imported_decorator_names);
+        auto imported = analyze_file_internal(*ast_owned,
+                                              kept_path,
+                                              import_stack,
+                                              &owned_strings,
+                                              imported_decorator_names,
+                                              source_budget);
         if (!imported) return core::make_unexpected(imported.error());
         imported_storage.push_back(std::unique_ptr<HirModule>(imported.value()));
         ImportedModuleInfo info{};
@@ -14117,7 +14144,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     Str source_path,
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
-    const std::vector<Str>& external_decorator_names) {
+    const std::vector<Str>& external_decorator_names,
+    SourceBudget* source_budget) {
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
     mod.has_package_decl = file.has_package_decl;
@@ -14372,7 +14400,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                 *owned_strings,
                                                 import_stack,
                                                 imported_storage,
-                                                route_decorator_names);
+                                                route_decorator_names,
+                                                source_budget);
     if (!loaded_imports) return core::make_unexpected(loaded_imports.error());
     auto validated_namespaces = validate_import_namespaces(imported_modules);
     if (!validated_namespaces) return core::make_unexpected(validated_namespaces.error());
@@ -18867,10 +18896,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
 }
 
 FrontendResult<HirModule*> analyze_file(const AstFile& file, Str source_path) {
+    return analyze_file(file, source_path, nullptr);
+}
+
+FrontendResult<HirModule*> analyze_file(const AstFile& file,
+                                        Str source_path,
+                                        SourceBudget* source_budget) {
     std::vector<std::string> import_stack;
     const std::vector<Str> external_decorator_names;
     return analyze_file_internal(
-        file, source_path, import_stack, nullptr, external_decorator_names);
+        file, source_path, import_stack, nullptr, external_decorator_names, source_budget);
 }
 
 FrontendResult<HirModule*> analyze_file(const AstFile& file) {

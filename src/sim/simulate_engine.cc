@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
+#include "rut/harness/handler_execution.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
@@ -287,25 +288,6 @@ static u32 visible_path_len(Str path) {
     u32 n = 0;
     while (n < path.len && path.ptr[n] != '?' && path.ptr[n] != '#') n++;
     return n;
-}
-
-struct SimHandlerFrame {
-    jit::HandlerCtx ctx{};
-    u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
-};
-
-static void init_sim_handler_frame(SimHandlerFrame& frame) {
-    frame.ctx.state = 0;
-    frame.ctx.handler_idx = 0;
-    frame.ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots;
-}
-
-static void apply_synthetic_resume(jit::HandlerCtx& ctx,
-                                   const jit::HandlerResult& yielded,
-                                   jit::YieldKind kind) {
-    ctx.resume_event_kind = static_cast<u32>(kind);
-    ctx.resume_event_result = rut::sim_synthetic_resume_result(kind);
-    ctx.state = yielded.next_state;
 }
 
 static u8 non_match_verdict_rank(Verdict verdict) {
@@ -668,7 +650,8 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
                                                   const Engine::CompiledRoute& route,
                                                   const CaptureEntry& entry,
                                                   Connection& conn,
-                                                  SimHandlerFrame frame,
+                                                  harness::HandlerExecution execution,
+                                                  harness::DeterministicEnvironment environment,
                                                   SimulateResult result,
                                                   u32 max_yields);
 
@@ -758,20 +741,34 @@ static SimulateResult simulate_resume_candidate(const Engine& engine,
                                                 const Engine::CompiledRoute& route,
                                                 const CaptureEntry& entry,
                                                 Connection& conn,
-                                                SimHandlerFrame frame,
+                                                harness::HandlerExecution execution,
+                                                harness::DeterministicEnvironment environment,
                                                 const jit::HandlerResult& yielded,
                                                 jit::YieldKind resume_kind,
                                                 SimulateResult result,
                                                 u32 max_yields) {
-    apply_synthetic_resume(frame.ctx, yielded, resume_kind);
-    return drive_handler_to_completion(engine, route, entry, conn, frame, result, max_yields);
+    execution.connection = &conn;
+    harness::DeterministicCompletion completion{};
+    const auto completion_status =
+        resume_kind == jit::YieldKind::Timer
+            ? environment.complete_timer(yielded.yield_payload_u32(), ~u64{0}, completion)
+            : environment.complete_now(
+                  resume_kind, rut::sim_synthetic_resume_result(resume_kind), completion);
+    if (completion_status != harness::CompletionStatus::Ready) {
+        result.verdict = Verdict::Failed;
+        return result;
+    }
+    execution.apply_resume(yielded, completion.kind, completion.result);
+    return drive_handler_to_completion(
+        engine, route, entry, conn, execution, environment, result, max_yields);
 }
 
 static SimulateResult drive_handler_to_completion(const Engine& engine,
                                                   const Engine::CompiledRoute& route,
                                                   const CaptureEntry& entry,
                                                   Connection& conn,
-                                                  SimHandlerFrame frame,
+                                                  harness::HandlerExecution execution,
+                                                  harness::DeterministicEnvironment environment,
                                                   SimulateResult result,
                                                   u32 max_yields) {
     if (result.yield_count >= max_yields) {
@@ -781,9 +778,8 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
 
     jit::HandlerResult unpacked{};
     for (u32 iter = result.yield_count; iter < max_yields; iter++) {
-        const u64 kPacked =
-            route.fn(&conn, &frame.ctx, entry.raw_headers, entry.raw_header_len, nullptr);
-        unpacked = jit::HandlerResult::unpack(kPacked);
+        execution.connection = &conn;
+        unpacked = execution.invoke();
         if (unpacked.action != jit::HandlerAction::Yield) break;
         result.yield_count++;
 
@@ -794,7 +790,8 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
                                                                          route,
                                                                          entry,
                                                                          recv_conn,
-                                                                         frame,
+                                                                         execution,
+                                                                         environment,
                                                                          unpacked,
                                                                          jit::YieldKind::Recv,
                                                                          result,
@@ -807,7 +804,8 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
                                                                           route,
                                                                           entry,
                                                                           timer_conn,
-                                                                          frame,
+                                                                          execution,
+                                                                          environment,
                                                                           unpacked,
                                                                           jit::YieldKind::Timer,
                                                                           result,
@@ -818,7 +816,17 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
 
         jit::YieldKind resume_kind = unpacked.yield_kind;
         if (resume_kind == jit::YieldKind::Any) resume_kind = jit::YieldKind::Recv;
-        apply_synthetic_resume(frame.ctx, unpacked, resume_kind);
+        harness::DeterministicCompletion completion{};
+        const auto completion_status =
+            resume_kind == jit::YieldKind::Timer
+                ? environment.complete_timer(unpacked.yield_payload_u32(), ~u64{0}, completion)
+                : environment.complete_now(
+                      resume_kind, rut::sim_synthetic_resume_result(resume_kind), completion);
+        if (completion_status != harness::CompletionStatus::Ready) {
+            result.verdict = Verdict::Failed;
+            return result;
+        }
+        execution.apply_resume(unpacked, completion.kind, completion.result);
     }
 
     return finalize_handler_result(engine, entry, result, unpacked);
@@ -923,10 +931,11 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
 
     Connection conn;
     conn.reset();
-    SimHandlerFrame frame;
-    init_sim_handler_frame(frame);
-    frame.ctx.route_param_count = route_param_count;
-    for (u32 i = 0; i < route_param_count; i++) frame.ctx.route_params[i] = route_params[i];
+    harness::HandlerExecution execution{};
+    execution.init(route->fn, &conn, entry.raw_headers, entry.raw_header_len);
+    execution.frame.context.route_param_count = route_param_count;
+    for (u32 i = 0; i < route_param_count; i++)
+        execution.frame.context.route_params[i] = route_params[i];
 
     // Drive the handler's state machine to completion. Yields are the
     // handler's signal "I need I/O, resume me with state=next_state".
@@ -940,8 +949,9 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     // is deliberately small: real handlers yield at most a handful of times
     // per spec (submit + wait batches, not loops).
     static constexpr u32 kMaxHandlerYields = 32;
+    harness::DeterministicEnvironment environment{};
     return drive_handler_to_completion(
-        engine, *route, entry, conn, frame, result, kMaxHandlerYields);
+        engine, *route, entry, conn, execution, environment, result, kMaxHandlerYields);
 }
 
 SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {

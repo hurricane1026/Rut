@@ -1,9 +1,11 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/common/shard_limits.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include <new>
 #include <unordered_map>
 
 #include <hs.h>
@@ -56,6 +58,7 @@ struct TimeCache {
     bool valid = false;
 };
 thread_local TimeCache t_time_cache;
+thread_local const u64* t_virtual_time_us = nullptr;
 
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
 // pc.primed untouched — callers set it.
@@ -535,10 +538,18 @@ u32 rut_helper_req_remote_addr(void* conn) {
 i64 rut_helper_time_now_micros() {
     TimeCache& tc = t_time_cache;
     if (!tc.valid) {
-        tc.value = static_cast<i64>(rut::monotonic_us());
+        tc.value = static_cast<i64>(t_virtual_time_us != nullptr ? *t_virtual_time_us
+                                                                 : rut::monotonic_us());
         tc.valid = true;
     }
     return tc.value;
+}
+
+const u64* rut_helper_time_set_virtual_clock(const u64* now_us) {
+    const u64* previous = t_virtual_time_us;
+    t_virtual_time_us = now_us;
+    t_time_cache.valid = false;
+    return previous;
 }
 
 void rut_helper_time_unlatch() {
@@ -559,23 +570,45 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
 // detected by the rounded-capacity compare and resets that instance's state
 // (documented); an unchanged capacity persists across config swaps because
 // the swap never touches thread-locals.
-namespace {
 // Owns the per-shard tables so thread exit unmaps them — a bare
 // thread_local CacheTable array has a trivial destructor and would leak
 // the mmaps on shard stop/join/restart flows.
-struct ShardCacheTables {
-    rut::CacheTable tables[rut::CacheRegistry::kMaxInstances];
-    rut::u64 identities[rut::CacheRegistry::kMaxInstances] = {};
-    rut::u32 birth_generations[rut::CacheRegistry::kMaxInstances] = {};
-    rut::u32 generation = 0;
-    bool alloc_failed_logged[rut::CacheRegistry::kMaxInstances] = {};
-    ~ShardCacheTables() {
-        for (auto& t : tables) t.destroy();
-    }
+namespace rut {
+struct CacheLocalState {
+    struct ShardTables {
+        CacheTable tables[CacheRegistry::kMaxInstances];
+        u64 identities[CacheRegistry::kMaxInstances] = {};
+        u32 birth_generations[CacheRegistry::kMaxInstances] = {};
+        u32 generation = 0;
+        bool alloc_failed_logged[CacheRegistry::kMaxInstances] = {};
+        void reset() {
+            for (auto& t : tables) t.destroy();
+            for (u32 i = 0; i < CacheRegistry::kMaxInstances; i++) {
+                identities[i] = 0;
+                birth_generations[i] = 0;
+                alloc_failed_logged[i] = false;
+            }
+            generation = 0;
+        }
+        ~ShardTables() { reset(); }
+    };
+
+    ShardTables shards[kMaxShards];
 };
+}  // namespace rut
+
+namespace {
+
+thread_local rut::CacheLocalState t_default_cache_state;
+thread_local rut::CacheLocalState* t_active_cache_state = &t_default_cache_state;
+thread_local rut::u32 t_active_cache_shard = 0;
+
+rut::CacheLocalState::ShardTables& shard_cache_tables() {
+    return t_active_cache_state->shards[t_active_cache_shard];
+}
 
 rut::CacheTable* cache_table_for(rut::u32 instance) {
-    static thread_local ShardCacheTables t_state;
+    rut::CacheLocalState::ShardTables& t_state = shard_cache_tables();
     auto* t_tables = t_state.tables;
     auto* t_identities = t_state.identities;
     auto* t_birth_generations = t_state.birth_generations;
@@ -684,6 +717,38 @@ void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
 void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
     rut::CacheTable* t = cache_table_for(instance);
     if (t != nullptr) t->set(key_ip, val);
+}
+
+u32 rut_helper_cache_select_local_shard(u32 shard_id) {
+    const u32 previous = t_active_cache_shard;
+    if (shard_id < rut::kMaxShards) t_active_cache_shard = shard_id;
+    return previous;
+}
+
+rut::CacheLocalState* rut_helper_cache_select_local_state(rut::CacheLocalState* state) {
+    rut::CacheLocalState* previous =
+        t_active_cache_state == &t_default_cache_state ? nullptr : t_active_cache_state;
+    t_active_cache_state = state != nullptr ? state : &t_default_cache_state;
+    return previous;
+}
+
+rut::CacheLocalState* rut_helper_cache_create_local_state() {
+    return new (std::nothrow) rut::CacheLocalState{};
+}
+
+void rut_helper_cache_destroy_local_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    if (t_active_cache_state == state) t_active_cache_state = &t_default_cache_state;
+    delete state;
+}
+
+void rut_helper_cache_reset_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    for (auto& shard : state->shards) shard.reset();
+}
+
+void rut_helper_cache_reset_local_state() {
+    for (auto& state : t_active_cache_state->shards) state.reset();
 }
 
 // ── String Operations ──────────────────────────────────────────────

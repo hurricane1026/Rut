@@ -1,5 +1,6 @@
 // Tests for traffic replay: ReplayReader, replay_one, replay_file.
 #include "fault_injection.h"
+#include "rut/harness/replay_driver.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/traffic_replay.h"
 #include "test.h"
@@ -237,6 +238,137 @@ TEST(replay_one, multiple_sequential) {
     }
 }
 
+static bool reject_replay_observation(void*, const harness::Observation&) {
+    return false;
+}
+
+TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    SmallLoop matched_loop;
+    matched_loop.setup();
+    const CaptureEntry matched_entry =
+        make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    const auto matched = harness::drive_replay_one(matched_loop, matched_entry, 42, spec);
+    CHECK_EQ(matched.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(matched.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(matched.harness.semantic_events, 1u);
+    CHECK_EQ(matched.harness.input_bytes, matched_entry.raw_header_len);
+    CHECK(matched.harness.output_bytes > 0);
+    CHECK_EQ(matched.harness.output_bytes, matched.replay.output_bytes);
+    CHECK_EQ(matched.harness.backend_completions, 4u);
+
+    SmallLoop mismatched_loop;
+    mismatched_loop.setup();
+    const auto mismatched = harness::drive_replay_one(
+        mismatched_loop,
+        make_captured_request("GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 404),
+        43,
+        spec);
+    CHECK_EQ(mismatched.harness.outcome, harness::Outcome::Mismatched);
+    CHECK(mismatched.replay.replayed);
+
+    SmallLoop exhausted_loop;
+    exhausted_loop.setup();
+    exhausted_loop.free_top = 0;
+    const auto failed = harness::drive_replay_one(
+        exhausted_loop,
+        make_captured_request("GET /fail HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        44,
+        spec);
+    CHECK_EQ(failed.harness.outcome, harness::Outcome::Failed);
+    CHECK(!failed.replay.replayed);
+    CHECK(!failed.replay.skipped);
+
+    exhausted_loop.setup();
+    exhausted_loop.free_top = 0;
+    harness::HarnessSpec rejecting_spec = spec;
+    rejecting_spec.observations.observe = &reject_replay_observation;
+    const auto rejected_failure = harness::drive_replay_one(
+        exhausted_loop,
+        make_captured_request("GET /fail-observed HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        45,
+        rejecting_spec);
+    CHECK_EQ(rejected_failure.harness.outcome, harness::Outcome::Failed);
+}
+
+TEST(harness_replay, mismatch_takes_precedence_over_unsupported) {
+    harness::Outcome aggregate = harness::Outcome::Passed;
+    harness::detail::merge_outcome(harness::Outcome::Mismatched, aggregate);
+    harness::detail::merge_outcome(harness::Outcome::Unsupported, aggregate);
+    CHECK_EQ(aggregate, harness::Outcome::Mismatched);
+
+    aggregate = harness::Outcome::Passed;
+    harness::detail::merge_outcome(harness::Outcome::Unsupported, aggregate);
+    harness::detail::merge_outcome(harness::Outcome::Mismatched, aggregate);
+    CHECK_EQ(aggregate, harness::Outcome::Mismatched);
+}
+
+TEST(harness_replay, enforces_input_limit_and_oracle) {
+    SmallLoop loop;
+    loop.setup();
+    const CaptureEntry entry = make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+
+    harness::HarnessSpec limited_spec{};
+    limited_spec.layer = harness::ExecutionLayer::Connection;
+    limited_spec.required_capabilities =
+        harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    limited_spec.environment_capabilities = limited_spec.required_capabilities;
+    limited_spec.limits.max_input_bytes = 1;
+    const auto limited = harness::drive_replay_one(loop, entry, 42, limited_spec);
+    CHECK_EQ(limited.harness.outcome, harness::Outcome::Failed);
+    CHECK(limited.harness.has_reached_limit);
+    CHECK_EQ(limited.harness.reached_limit, harness::LimitKind::InputBytes);
+
+    harness::HarnessSpec oracle_spec{};
+    oracle_spec.layer = harness::ExecutionLayer::Connection;
+    oracle_spec.required_capabilities =
+        harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    oracle_spec.environment_capabilities = oracle_spec.required_capabilities;
+    oracle_spec.observations.observe = &reject_replay_observation;
+    const auto rejected = harness::drive_replay_one(loop, entry, 43, oracle_spec);
+    CHECK_EQ(rejected.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(rejected.harness.cleanup, harness::CleanupOutcome::Clean);
+
+    SmallLoop output_limited_loop;
+    output_limited_loop.setup();
+    harness::HarnessSpec output_limited_spec = oracle_spec;
+    output_limited_spec.observations.observe = nullptr;
+    output_limited_spec.limits.max_output_bytes = 1;
+    const auto output_limited =
+        harness::drive_replay_one(output_limited_loop, entry, 44, output_limited_spec);
+    CHECK_EQ(output_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(output_limited.harness.reached_limit, harness::LimitKind::OutputBytes);
+    CHECK(output_limited.harness.output_bytes > 1);
+
+    SmallLoop completion_limited_loop;
+    completion_limited_loop.setup();
+    harness::HarnessSpec completion_limited_spec = oracle_spec;
+    completion_limited_spec.observations.observe = nullptr;
+    completion_limited_spec.limits.max_backend_completions = 1;
+    const auto completion_limited =
+        harness::drive_replay_one(completion_limited_loop, entry, 45, completion_limited_spec);
+    CHECK_EQ(completion_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(completion_limited.harness.reached_limit, harness::LimitKind::BackendCompletions);
+    CHECK_EQ(completion_limited.harness.backend_completions, 4u);
+}
+
+TEST(harness_replay, rejects_missing_synthetic_io_capability) {
+    SmallLoop loop;
+    loop.setup();
+    const CaptureEntry entry = make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+
+    const auto result = harness::drive_replay_one(loop, entry, 42, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(!result.replay.replayed);
+}
+
 // === replay_file ===
 
 TEST(replay_file, full_roundtrip) {
@@ -295,6 +427,120 @@ TEST(replay_file, with_mismatches) {
 
     reader.close();
     tmp.cleanup();
+}
+
+TEST(harness_replay, file_adapter_preserves_summary_and_common_outcome) {
+    CaptureEntry entries[3];
+    entries[0] = make_captured_request("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /miss HTTP/1.1\r\nHost: x\r\n\r\n", 404);
+    entries[2] = make_captured_request("GET /ok2 HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 3));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    SmallLoop loop;
+    loop.setup();
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto result = harness::drive_replay_file(loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(result.harness.semantic_events, 3u);
+    CHECK_EQ(result.harness.input_bytes,
+             static_cast<u64>(entries[0].raw_header_len) + entries[1].raw_header_len +
+                 entries[2].raw_header_len);
+    CHECK(result.harness.output_bytes > 0);
+    CHECK_EQ(result.harness.backend_completions, 12u);
+    CHECK_EQ(result.replay.total, 3u);
+    CHECK_EQ(result.replay.matched, 2u);
+    CHECK_EQ(result.replay.mismatched, 1u);
+    reader.close();
+}
+
+TEST(harness_replay, file_adapter_rejects_unopened_reader) {
+    ReplayReader reader;
+    SmallLoop loop;
+    loop.setup();
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto result = harness::drive_replay_file(loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(result.replay.total, 0u);
+}
+
+TEST(harness_replay, file_adapter_enforces_output_and_completion_limits) {
+    const CaptureEntry entry =
+        make_captured_request("GET /limited HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(&entry, 1));
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    ReplayReader output_reader;
+    REQUIRE(output_reader.open(tmp.path) == 0);
+    SmallLoop output_loop;
+    output_loop.setup();
+    spec.limits.max_output_bytes = 1;
+    const auto output_limited = harness::drive_replay_file(output_loop, output_reader, spec);
+    CHECK_EQ(output_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(output_limited.harness.reached_limit, harness::LimitKind::OutputBytes);
+    CHECK_EQ(output_limited.replay.total, 1u);
+    CHECK_EQ(output_limited.replay.replayed, 1u);
+    output_reader.close();
+
+    ReplayReader completion_reader;
+    REQUIRE(completion_reader.open(tmp.path) == 0);
+    SmallLoop completion_loop;
+    completion_loop.setup();
+    spec.limits.max_output_bytes = harness::RunLimits{}.max_output_bytes;
+    spec.limits.max_backend_completions = 1;
+    const auto completion_limited =
+        harness::drive_replay_file(completion_loop, completion_reader, spec);
+    CHECK_EQ(completion_limited.harness.outcome, harness::Outcome::Failed);
+    CHECK_EQ(completion_limited.harness.reached_limit, harness::LimitKind::BackendCompletions);
+    CHECK_EQ(completion_limited.harness.backend_completions, 4u);
+    CHECK_EQ(completion_limited.replay.total, 1u);
+    CHECK_EQ(completion_limited.replay.replayed, 1u);
+    completion_reader.close();
+}
+
+TEST(harness_replay, input_limit_keeps_file_summary_consistent) {
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /one HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /two HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+    SmallLoop loop;
+    loop.setup();
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.limits.max_input_bytes = entries[0].raw_header_len;
+
+    const auto result = harness::drive_replay_file(loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Failed);
+    CHECK(result.harness.has_reached_limit);
+    CHECK_EQ(result.harness.reached_limit, harness::LimitKind::InputBytes);
+    CHECK_EQ(result.harness.input_bytes, entries[0].raw_header_len);
+    CHECK_EQ(result.replay.total, 1u);
+    CHECK_EQ(result.replay.replayed, 1u);
+    CHECK_EQ(result.replay.matched, 1u);
+    CHECK_EQ(result.replay.failed, 0u);
+    CHECK_EQ(result.replay.replayed + result.replay.skipped + result.replay.failed,
+             result.replay.total);
+    reader.close();
 }
 
 TEST(replay_file, empty_capture) {
@@ -888,6 +1134,17 @@ TEST(replay_gap, replay_one_proxy_route_not_replayed) {
     CHECK_EQ(result.expected_status, 200);
     CHECK_EQ(result.actual_status, 0);
     CHECK(!result.status_match);
+
+    RoutedLoop harness_loop;
+    harness_loop.setup(&cfg);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+    const auto adapted = harness::drive_replay_one(harness_loop.loop, entry, 43, spec);
+    CHECK_EQ(adapted.harness.outcome, harness::Outcome::Unsupported);
+    CHECK_EQ(adapted.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK(adapted.replay.skipped);
 }
 
 TEST(replay_gap, replay_file_proxy_route_counted_as_skipped) {

@@ -176,6 +176,16 @@ target_link_libraries(rut_runtime
     Threads::Threads
 )
 
+# Shared project harness contracts. This layer intentionally has no compiler,
+# JIT, or runtime dependency beyond common value types; mode-specific adapters
+# link those libraries in one direction below/elsewhere.
+add_library(rut_harness_core STATIC
+    harness/core.cc
+)
+target_include_directories(rut_harness_core PUBLIC
+    ${PROJECT_SOURCE_DIR}/include
+)
+
 # SIMD source needs to find simd.h and char_tables.h via "simd.h" include
 target_include_directories(rut_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -369,6 +379,42 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(rut_compiler PUBLIC RUT_VALIDATE_REGEX_WITH_VECTORSCAN=1)
     target_link_libraries(rut_compiler PUBLIC hs)
 
+    # Production source -> JIT/RouteConfig ownership bridge. Keep it reusable:
+    # the server and project harness must compile targets through the same path.
+    add_library(rut_loader STATIC
+        serve_loader.cc
+    )
+    target_include_directories(rut_loader PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(rut_loader PUBLIC RUT_ENABLE_JIT=1)
+    target_compile_definitions(rut_loader PRIVATE ${LLVM_DEFINITIONS})
+    target_link_libraries(rut_loader
+        rut_runtime
+        rut_compiler
+        rut_jit
+    )
+
+    add_library(rut_harness_runtime STATIC
+        harness/connection_execution.cc
+        harness/deterministic_environment.cc
+        harness/handler_execution.cc
+        harness/scenario_driver.cc
+        harness/scripted_environment.cc
+        harness/source_target.cc
+        harness/state.cc
+    )
+    target_include_directories(rut_harness_runtime PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+        ${LLVM_INCLUDE_DIRS}
+    )
+    target_compile_definitions(rut_harness_runtime PRIVATE ${LLVM_DEFINITIONS})
+    target_link_libraries(rut_harness_runtime
+        rut_harness_core
+        rut_loader
+    )
+
     # Offline simulate library — JIT-backed capture validation with no event loop.
     add_library(rut_simulate STATIC
         sim/simulate_engine.cc
@@ -382,6 +428,7 @@ if(RUT_ENABLE_JIT)
         rut_runtime
         rut_compiler
         rut_jit
+        rut_harness_runtime
     )
 
     add_executable(rut-simulate sim/main.cc)
@@ -403,7 +450,6 @@ target_link_libraries(rut
 # pulls in rut_jit (and thus LLVM). Without the JIT the binary still
 # builds and runs, just without program loading.
 if(RUT_ENABLE_JIT)
-    target_sources(rut PRIVATE serve_loader.cc)
-    target_link_libraries(rut rut_jit)
+    target_link_libraries(rut rut_loader)
     target_compile_definitions(rut PRIVATE RUT_ENABLE_JIT=1)
 endif()

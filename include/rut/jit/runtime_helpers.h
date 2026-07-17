@@ -2,6 +2,10 @@
 
 #include "rut/common/types.h"
 
+namespace rut {
+struct CacheLocalState;
+}
+
 // Runtime helper functions callable from JIT'd code.
 // All use extern "C" linkage with rut_helper_ prefix to avoid
 // C++ name mangling. The JIT engine registers these via a custom
@@ -184,10 +188,28 @@ void rut_helper_resp_header(void* conn,
 // a no-op (defensive; analyze bounds the index at compile time).
 void rut_helper_cache_get(rut::u32 instance, rut::u32 key_ip, rut::u8* out_has, rut::i64* out_val);
 void rut_helper_cache_set(rut::u32 instance, rut::u32 key_ip, rut::i64 val);
+// Harness hook for multiplexing logical shards on one thread. Production shard
+// threads leave the default shard selected. Returns the previously selected shard.
+rut::u32 rut_helper_cache_select_local_shard(rut::u32 shard_id);
+// Harness hook for selecting an independently owned Cache context. A null
+// context selects the production thread-local state. The returned pointer is
+// the previously selected context (null means production state).
+rut::CacheLocalState* rut_helper_cache_select_local_state(rut::CacheLocalState* state);
+rut::CacheLocalState* rut_helper_cache_create_local_state();
+void rut_helper_cache_destroy_local_state(rut::CacheLocalState* state);
+void rut_helper_cache_reset_state(rut::CacheLocalState* state);
+// Harness/shard-lifecycle hook: destroy every logical-shard Cache table owned by
+// the current thread. It never mutates the process registry or another thread's state.
+void rut_helper_cache_reset_local_state();
 // ── Time ──
 // Monotonic microseconds (fresh clock_gettime with a thread-local clamp).
 // Backs the `time.nowMicros()` builtin.
 rut::i64 rut_helper_time_now_micros();
+
+// Install a deterministic clock for the current thread. The pointed-to value
+// may advance between handler resumes. Returns the previous source for scoped
+// restoration; nullptr selects the production monotonic clock.
+const rut::u64* rut_helper_time_set_virtual_clock(const rut::u64* now_us);
 
 // Reset the per-invocation time latch. Normally a side effect of
 // parse_prime/unprime; the JIT emits this at the prologue of handlers that

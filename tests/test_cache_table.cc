@@ -3,6 +3,8 @@
 // seeded mix, mmap'd fixed capacity.
 #include "rut/runtime/cache_table.h"
 #include "test.h"
+#include <atomic>
+#include <thread>
 
 using namespace rut;
 
@@ -91,6 +93,49 @@ TEST(cache_table, registry_publish_seeds_once) {
     CHECK_EQ(reg.capacities[0].load(std::memory_order_relaxed), 64u);
     CHECK_EQ(reg.capacities[1].load(std::memory_order_relaxed), 128u);
     CHECK_EQ(reg.seed.load(std::memory_order_relaxed), 0xDEADBEEFull);
+}
+
+TEST(cache_table, owned_publication_only_unpublishes_matching_owner) {
+    const u32 caps[1] = {64};
+    const u64 identities[1] = {cache_instance_identity("owned", 5)};
+    int first_owner = 0;
+    int second_owner = 0;
+
+    cache_registry_publish(caps, identities, 1, &first_owner);
+    cache_registry_publish(caps, identities, 1, &second_owner);
+    CHECK_FALSE(cache_registry_unpublish_if_owner(&first_owner));
+    CHECK_EQ(cache_registry().count.load(std::memory_order_acquire), 1u);
+    CHECK(cache_registry().owner.load(std::memory_order_acquire) == &second_owner);
+    CHECK(cache_registry_unpublish_if_owner(&second_owner));
+    CHECK_EQ(cache_registry().count.load(std::memory_order_acquire), 0u);
+    CHECK(cache_registry().owner.load(std::memory_order_acquire) == nullptr);
+}
+
+TEST(cache_table, owner_withdrawal_revalidates_under_writer_lock) {
+    const u32 caps[1] = {64};
+    const u64 identities[1] = {cache_instance_identity("owned", 5)};
+    int old_owner = 0;
+    int new_owner = 0;
+    cache_registry_publish(caps, identities, 1, &old_owner);
+
+    auto& reg = cache_registry();
+    cache_registry_lock_writer(reg);
+    std::atomic<bool> withdrawal_started{false};
+    bool withdrew = true;
+    std::thread withdrawal([&] {
+        withdrawal_started.store(true, std::memory_order_release);
+        withdrew = cache_registry_unpublish_if_owner(&old_owner);
+    });
+    while (!withdrawal_started.load(std::memory_order_acquire)) {
+    }
+    cache_registry_publish_locked(reg, caps, identities, 1, &new_owner);
+    cache_registry_unlock_writer(reg);
+    withdrawal.join();
+
+    CHECK_FALSE(withdrew);
+    CHECK_EQ(reg.count.load(std::memory_order_acquire), 1u);
+    CHECK(reg.owner.load(std::memory_order_acquire) == &new_owner);
+    CHECK(cache_registry_unpublish_if_owner(&new_owner));
 }
 
 int main(int argc, char** argv) {

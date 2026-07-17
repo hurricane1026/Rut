@@ -322,13 +322,9 @@ if(RUT_ENABLE_JIT)
     add_test(NAME test_jit COMMAND test_jit)
     set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
 
-    # serve_loader.cc lives only in the rut binary target, so compile it
-    # directly here; it pulls in the frontend + JIT.
-    add_executable(test_serve_loader
-        test_serve_loader.cc
-        ${PROJECT_SOURCE_DIR}/src/serve_loader.cc
-    )
-    target_link_libraries(test_serve_loader rut_jit rut_compiler)
+    # Exercise the same reusable loader library linked by rut and SourceTarget.
+    add_executable(test_serve_loader test_serve_loader.cc)
+    target_link_libraries(test_serve_loader rut_loader)
     target_include_directories(test_serve_loader PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/testing
@@ -356,7 +352,7 @@ add_executable(test_traffic_replay
     test_traffic_replay.cc
     ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc
 )
-target_link_libraries(test_traffic_replay rut_runtime)
+target_link_libraries(test_traffic_replay rut_runtime rut_harness_core)
 target_include_directories(test_traffic_replay PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -374,6 +370,28 @@ target_include_directories(test_sim PRIVATE
 )
 add_test(NAME test_sim COMMAND test_sim)
 set_tests_properties(test_sim PROPERTIES LABELS "integration;sim")
+
+add_executable(test_harness test_harness.cc)
+target_link_libraries(test_harness rut_harness_core)
+target_include_directories(test_harness PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME test_harness COMMAND test_harness)
+set_tests_properties(test_harness PROPERTIES LABELS "unit;harness")
+
+if(RUT_ENABLE_JIT)
+    target_sources(test_harness PRIVATE ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc)
+    target_link_libraries(test_harness rut_harness_runtime)
+    target_include_directories(test_harness PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(test_harness PRIVATE
+        RUT_ENABLE_JIT_TESTS=1
+        ${LLVM_DEFINITIONS}
+    )
+else()
+    target_compile_definitions(test_harness PRIVATE RUT_ENABLE_JIT_TESTS=0)
+endif()
 
 if(RUT_ENABLE_JIT)
     add_executable(test_simulate_engine test_simulate_engine.cc)
@@ -428,10 +446,11 @@ if(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_traffic_replay>
         COMMAND $<TARGET_FILE:test_sim>
         COMMAND $<TARGET_FILE:test_simulate_engine>
+        COMMAND $<TARGET_FILE:test_harness>
         COMMAND $<TARGET_FILE:test_route_trie>
         COMMAND $<TARGET_FILE:test_route_art>
         COMMAND $<TARGET_FILE:test_route_select>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_route_trie test_route_art test_route_select
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select
         COMMENT "Running all tests..."
     )
 else()
@@ -461,10 +480,11 @@ else()
         COMMAND $<TARGET_FILE:test_traffic_capture>
         COMMAND $<TARGET_FILE:test_traffic_replay>
         COMMAND $<TARGET_FILE:test_sim>
+        COMMAND $<TARGET_FILE:test_harness>
         COMMAND $<TARGET_FILE:test_route_trie>
         COMMAND $<TARGET_FILE:test_route_art>
         COMMAND $<TARGET_FILE:test_route_select>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_route_trie test_route_art test_route_select
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select
         COMMENT "Running non-JIT tests..."
     )
 endif()

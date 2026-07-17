@@ -4,6 +4,7 @@
 #include "rut/compiler/mir_build.h"
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir_builder.h"
+#include "rut/harness/handler_execution.h"
 #include "rut/runtime/route_method.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
@@ -413,6 +414,69 @@ TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
     CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
     CHECK_EQ(result.actual_status, 204u);
     CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, harness_handler_execution_matches_static_simulation) {
+    Manifest manifest{};
+    manifest.route_count = 1;
+    manifest.routes[0].method = kRouteMethodGet;
+    strcpy(manifest.routes[0].pattern, "/health");
+    manifest.routes[0].action = ManifestAction::ReturnStatus;
+    manifest.routes[0].status_code = 204;
+
+    ModuleContext ctx;
+    Engine engine;
+    REQUIRE(init_engine(manifest, ctx, engine));
+    const CaptureEntry entry = make_entry("GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 204);
+    const auto simulated = simulate_one(engine, entry);
+
+    Connection conn;
+    conn.reset();
+    harness::HandlerExecution execution{};
+    execution.init(engine.routes[0].fn, &conn, entry.raw_headers, entry.raw_header_len);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+    const auto driven = harness::drive_handler_deterministically({execution}, spec);
+
+    REQUIRE_EQ(simulated.verdict, Verdict::Match);
+    REQUIRE_EQ(driven.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(driven.has_terminal);
+    CHECK_EQ(driven.terminal.action, simulated.action);
+    CHECK_EQ(driven.terminal.status_code, simulated.actual_status);
+    CHECK_EQ(driven.harness.handler_resumes, simulated.yield_count);
+
+    engine.shutdown();
+    ctx.destroy();
+}
+
+TEST(simulate_engine, harness_handler_execution_matches_timer_simulation) {
+    const char* src = "route GET \"/sleep\" { wait(25) return 205 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const CaptureEntry entry = make_entry("GET /sleep HTTP/1.1\r\nHost: x\r\n\r\n", 205);
+    const auto simulated = simulate_one(engine, entry);
+
+    Connection conn;
+    conn.reset();
+    harness::HandlerExecution execution{};
+    execution.init(engine.routes[0].fn, &conn, entry.raw_headers, entry.raw_header_len);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+    const auto driven = harness::drive_handler_deterministically({execution}, spec);
+
+    REQUIRE_EQ(simulated.verdict, Verdict::Match);
+    REQUIRE_EQ(driven.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(driven.has_terminal);
+    CHECK_EQ(driven.terminal.action, simulated.action);
+    CHECK_EQ(driven.terminal.status_code, simulated.actual_status);
+    CHECK_EQ(driven.harness.handler_resumes, simulated.yield_count);
+    CHECK_EQ(driven.harness.virtual_time_us, 25000u);
 
     engine.shutdown();
     rir.destroy();

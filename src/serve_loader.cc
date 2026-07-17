@@ -24,6 +24,7 @@
 namespace rut {
 
 void LoadedProgram::destroy() {
+    (void)cache_registry_unpublish_if_owner(this);
     if (jit_inited) {
         engine.shutdown();
         jit_inited = false;
@@ -34,6 +35,8 @@ void LoadedProgram::destroy() {
         src_map = nullptr;
         src_map_len = 0;
     }
+    config.~RouteConfig();
+    new (&config) RouteConfig();
 }
 
 namespace {
@@ -110,7 +113,8 @@ void set_load_diag(LoadError& err, const Diagnostic& diag) {
 
 }  // namespace
 
-bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt) {
+bool load_rut_program(
+    const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
     err = LoadError{};
 
     err.stage = LoadStage::Read;
@@ -121,6 +125,11 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     // non-null base even when len == 0 to avoid null-pointer arithmetic.
     const char* src_base = out.src_map ? static_cast<const char*>(out.src_map) : "";
     const Str kSource{src_base, static_cast<u32>(out.src_map_len)};
+    SourceBudget source_budget{max_source_bytes, out.src_map_len, false};
+    if (source_budget.used_bytes > source_budget.max_bytes) {
+        err.source_limit_exceeded = true;
+        return false;
+    }
 
     // ── Frontend: source text → RIR module ──────────────────────────
     // parse_file/analyze_file/build_mir each heap-allocate their result
@@ -151,8 +160,9 @@ bool load_rut_program(const char* path, LoadedProgram& out, LoadError& err, jit:
     // analyzer skips imports entirely.
     u32 path_len = 0;
     while (path[path_len]) path_len++;
-    auto hir = analyze_file(*ir.ast, Str{path, path_len});
+    auto hir = analyze_file(*ir.ast, Str{path, path_len}, &source_budget);
     if (!hir) {
+        err.source_limit_exceeded = source_budget.exceeded;
         set_load_diag(err, hir.error());
         return false;
     }
@@ -269,7 +279,7 @@ void activate_rut_program(const LoadedProgram& program) {
     // publishing here lets the owner pair descriptor publication with the
     // config installation instead of mutating live Cache semantics merely
     // because load_rut_program() succeeded.
-    cache_registry_publish_config(program.config);
+    cache_registry_publish_config(program.config, &program);
 }
 
 namespace {
