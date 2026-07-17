@@ -238,6 +238,10 @@ TEST(replay_one, multiple_sequential) {
     }
 }
 
+static bool reject_replay_observation(void*, const harness::Observation&) {
+    return false;
+}
+
 TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
     harness::HarnessSpec spec{};
     spec.layer = harness::ExecutionLayer::Connection;
@@ -275,10 +279,17 @@ TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
     CHECK_EQ(failed.harness.outcome, harness::Outcome::Failed);
     CHECK(!failed.replay.replayed);
     CHECK(!failed.replay.skipped);
-}
 
-static bool reject_replay_observation(void*, const harness::Observation&) {
-    return false;
+    exhausted_loop.setup();
+    exhausted_loop.free_top = 0;
+    harness::HarnessSpec rejecting_spec = spec;
+    rejecting_spec.observations.observe = &reject_replay_observation;
+    const auto rejected_failure = harness::drive_replay_one(
+        exhausted_loop,
+        make_captured_request("GET /fail-observed HTTP/1.1\r\nHost: x\r\n\r\n", 200),
+        45,
+        rejecting_spec);
+    CHECK_EQ(rejected_failure.harness.outcome, harness::Outcome::Failed);
 }
 
 TEST(harness_replay, mismatch_takes_precedence_over_unsupported) {

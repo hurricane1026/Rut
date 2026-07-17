@@ -181,10 +181,12 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         return out;
     }
     out.harness.input_bytes = scenario.request_len;
+    out.harness.virtual_time_us = scenario.now_us;
 
     Str routing_path = scenario.path;
     u8 routing_method = scenario.method;
     ParsedRequest parsed_request{};
+    u32 parsed_header_end = 0;
     if (scenario.request_len != 0) {
         HttpParser parser{};
         parser.reset();
@@ -196,6 +198,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
             copy_detail(out.harness, "scenario request is not a complete HTTP request");
             return out;
         }
+        parsed_header_end = parser.header_end;
         if (parsed_request.method == HttpMethod::Unknown ||
             !str_equal(scenario.path, parsed_request.path) ||
             scenario.method != static_cast<u8>(parsed_request.method) + kRouteMethodGet) {
@@ -249,6 +252,23 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         connection.destroy();
         out.harness.cleanup = CleanupOutcome::Clean;
         return out;
+    }
+    if (route->action == RouteAction::JitHandler && route->needs_req_body) {
+        if (parsed_request.chunked) {
+            out.harness.outcome = Outcome::Unsupported;
+            out.harness.cleanup = CleanupOutcome::Clean;
+            copy_detail(out.harness, "chunked JIT request bodies are unsupported");
+            connection.destroy();
+            return out;
+        }
+        const u64 available_body = scenario.request_len - parsed_header_end;
+        if (parsed_request.has_content_length && available_body < parsed_request.content_length) {
+            out.harness.outcome = Outcome::Stalled;
+            out.harness.cleanup = CleanupOutcome::Clean;
+            copy_detail(out.harness, "scenario request body is incomplete");
+            connection.destroy();
+            return out;
+        }
     }
 
     activate_rut_program(scenario.target->program);

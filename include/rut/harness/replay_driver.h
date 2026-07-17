@@ -49,8 +49,10 @@ inline bool publish_replay_result(const HarnessSpec& spec,
     result.semantic_events++;
     if (spec.observations.publish(event)) return true;
 
-    result.outcome = Outcome::Mismatched;
-    set_detail(result, "observation rejected by oracle");
+    if (result.outcome == Outcome::Passed) {
+        result.outcome = Outcome::Mismatched;
+        set_detail(result, "observation rejected by oracle");
+    }
     return false;
 }
 

@@ -461,6 +461,7 @@ TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
     scenario.method = kRouteMethodGet;
     scenario.request_data = reinterpret_cast<const u8*>(request);
     scenario.request_len = sizeof(request) - 1;
+    scenario.now_us = 999;
     scenario.environment = &environment;
     scenario.expected = {true, jit::HandlerAction::ReturnStatus, 204};
 
@@ -487,6 +488,7 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     const char request[] = "GET /static HTTP/1.1\r\nHost: test\r\n\r\n";
     scenario.request_data = reinterpret_cast<const u8*>(request);
     scenario.request_len = sizeof(request) - 1;
+    scenario.now_us = 777;
     harness::HarnessSpec spec{};
     spec.layer = harness::ExecutionLayer::Connection;
     spec.required_capabilities =
@@ -498,6 +500,7 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
     CHECK_EQ(result.harness.semantic_events, 2u);
     CHECK_EQ(result.harness.input_bytes, scenario.request_len);
+    CHECK_EQ(result.harness.virtual_time_us, scenario.now_us);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 204);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
@@ -779,6 +782,42 @@ TEST(harness_scenario, handler_clock_and_timer_deadline_start_at_scenario_time) 
     REQUIRE(timer_result.has_terminal);
     CHECK_EQ(timer_result.terminal.status_code, 205);
     CHECK_EQ(timer_result.harness.virtual_time_us, 128456u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, gates_jit_routes_on_complete_supported_request_bodies) {
+    TempSource source;
+    REQUIRE(source.write(
+        "route POST \"/body\" { if req.body == \"ping\" { return 204 } else { return 400 } }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/body", 5};
+    scenario.method = kRouteMethodPost;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const char incomplete[] = "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n";
+    scenario.request_data = reinterpret_cast<const u8*>(incomplete);
+    scenario.request_len = sizeof(incomplete) - 1;
+    const auto incomplete_result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(incomplete_result.harness.outcome, harness::Outcome::Stalled);
+    CHECK(!incomplete_result.has_terminal);
+
+    const char chunked[] =
+        "POST /body HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4\r\nping\r\n0\r\n\r\n";
+    scenario.request_data = reinterpret_cast<const u8*>(chunked);
+    scenario.request_len = sizeof(chunked) - 1;
+    const auto chunked_result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(chunked_result.harness.outcome, harness::Outcome::Unsupported);
+    CHECK(!chunked_result.has_terminal);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
