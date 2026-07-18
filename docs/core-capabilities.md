@@ -92,21 +92,25 @@ route {
 }
 ```
 
-The implemented chain boundary is `before` handler. More precise sequencing
+The request-side chain boundary is `before` handler. More precise sequencing
 belongs inside the handler body. `before` steps may fail closed with an explicit
-status. `after` is reserved for handler-adjacent observability or cleanup, but
-chains containing it are rejected until response-side lowering exists. Group
-chains and entry chains compose in source order.
+status. The implemented `after` slice accepts Response header effects only and
+is rejected on routes containing `wait` or `for`; buffered response body/status
+middleware remains experimental. Group chains and entry chains compose in
+source order.
 
 See [chains.md](chains.md) for the current design direction.
+The generated-code profile and compatibility migrations are listed in
+[syntax-stability.md](syntax-stability.md).
 
-## Deferred Risks
+## Compatibility Boundary
 
-The current decorator design has two known risks:
+The retired custom-decorator model had two known risks:
 
-- execution order is not yet a strict first-instruction guard chain,
-- magic request binding through a parameter named `req` can be shadowed.
+- execution order was not a strict first-instruction guard chain,
+- magic request binding through a parameter named `req` could be shadowed.
 
-These are not blockers for compatibility, but decorators should not become
-stable core syntax unless they can mechanically lower to the same chain model
-without adding hidden ordering or binding rules.
+Custom decorators are now rejected. The remaining official built-in decorators
+are compatibility syntax and lower to route metadata; they must not grow a
+second middleware ordering or binding model. New reusable middleware belongs in
+`chain`, while route-local policy stays explicit in the handler.

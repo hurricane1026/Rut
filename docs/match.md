@@ -2,6 +2,11 @@
 
 Rut supports `match` in routes and source functions.
 
+Flat scalar/boolean/string/variant match is Rut Core. `match const` and the
+restricted nested-route expansion below are compatibility forms: generated code
+should prefer a flat match with values bound in route scope. Unrestricted nested
+patterns remain experimental. See [syntax-stability.md](syntax-stability.md).
+
 ## Route Match
 
 ```rut

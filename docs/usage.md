@@ -99,7 +99,9 @@ Notes:
 - Requests that match no route fall through to the default action
   (currently a `200`).
 - See `DESIGN.md` for the full language; not every documented construct
-  is JIT-backed yet (see `docs/core-capabilities.md` and the gap notes).
+  is JIT-backed yet. New and generated programs should follow the profile in
+  `docs/syntax-stability.md`; capability gaps are tracked in
+  `docs/core-capabilities.md`.
 
 ## 3. Run it
 

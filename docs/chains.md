@@ -18,9 +18,11 @@ chain secure_upload {
 `before` steps run before the handler. They may fail closed, so each step must
 declare the status returned on failure.
 
-`after` is reserved for the same chain model, but it is not implemented yet. The
-parser accepts it so the design can be discussed in one syntax, but analysis
-rejects chains containing `after` until response-side lowering exists.
+`after` implements the response-header slice of the same chain model. Its helper
+must receive exactly one `Response` parameter and use `set`, `add`, or `remove`
+header effects. The analyzer rejects body/status-only observers and routes that
+combine these effects with `wait` or `for`; those need a resumable, stream-owned
+Response object first.
 
 If a route needs more precise control than "before handler" or "after handler",
 write that logic directly inside the handler with ordinary `guard`, `wait`,
@@ -90,9 +92,9 @@ common.after
 upload_secure.after
 ```
 
-When `after` lowering is added, it should use the same final chain order.
-`after` is not a reverse wrapper unwind; it follows the code's visible order so
-review, replay, and generated code do not need an extra execution model.
+Implemented `after` lowering uses this same final chain order. It is not a
+reverse wrapper unwind; it follows the code's visible order so review, replay,
+and generated code do not need an extra execution model.
 
 ## Core Restrictions
 
@@ -105,7 +107,8 @@ Rut Core should keep chains intentionally narrow:
   NOT — it carries its own status, and its respond guards expand at the
   chain position. This is the DESIGN "middleware = ordinary functions"
   surface: `respond` short-circuits, `return` passes through.
-- `after` is reserved; until lowering exists, chains containing it are rejected.
+- `after` is limited to ordered Response header effects and cannot yet be used
+  on `wait`/`for` routes.
 - Chain order is source order only; there is no priority or phase dispatch.
 - A route entry should attach at most one entry chain.
 - Chains are statically expanded before route verification.

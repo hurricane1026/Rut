@@ -182,8 +182,8 @@ match e {
     .dns(host) => log.warn("dns", host: host)
     _          => log.warn("other")
 }
-protocol Hashable { func hash() -> u64 }
-User impl Hashable { func hash() -> u64 => fnv64(self.id) }  // Type impl Protocol (NOT impl T: P)
+protocol Hashable { func hash() -> u64 }                    // compatibility/experimental API
+User impl Hashable { func hash() -> u64 => fnv64(self.id) } // generated Core uses direct helpers
 
 parseInt("42")        // ⏳ i32? — parse APIs for text (parseFloat, IP.parse,
                       //         CIDR.parse, Duration.parse) all pending
@@ -280,8 +280,8 @@ route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
 }
 
-@rateLimit(limit: 1000, window: 1m)               // official decorator applies
-route POST "/form" { return 204 }                 // to this one route
+@rateLimit(limit: 1000, window: 1m)               // compatibility only; do not generate
+route POST "/form" { return 204 }
 ```
 
 The shipped parser accepts repeated top-level `route METHOD "pattern"`
@@ -459,7 +459,6 @@ let users = upstream { "10.0.0.1:8080" }
 
 route GET "/health" { return 200 }
 
-@rateLimit(limit: 1000, window: 1m)
 route GET "/users/:id" { return forward(users) }
 
 route POST "/users" {

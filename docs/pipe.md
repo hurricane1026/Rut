@@ -8,26 +8,26 @@ Pipe is resolved during analysis. After type checking, a pipe becomes an
 ordinary inlined function-call expression; it does not introduce a separate
 MIR/RIR opcode.
 
-Use `or` and `and` as boolean operators only. Function-call forms `or(...)` and
-`and(...)` are not supported, and `&&` / `||` are rejected at parse time. For
-optional/error fallback in expressions, Rut Core uses the named value method
-`.or(default)`. The names `any` and `all` are reserved for concurrent/race
-semantics rather than ordinary value fallback.
+Use `||`, `&&`, and `!` as boolean operators. The near-miss words `or`, `and`,
+and `not` are rejected with fix-its, and function-call forms `or(...)` and
+`and(...)` are not supported. For optional/error fallback in expressions, Rut
+Core uses the named value method `.or(default)`. The names `any` and `all` are
+reserved for concurrent/race semantics rather than ordinary value fallback.
 
 ## Operator Precedence Notes
 
-`and` and `or` are parsed before `|`.
+`&&` and `||` are parsed before `|`.
 
-- `A and B | C` parses as `(A and B) | C`.
-- `A or B | C` parses as `(A or B) | C`.
-- `A | B and C` is rejected because `and` appears on the right side of `|`;
+- `A && B | C` parses as `(A && B) | C`.
+- `A || B | C` parses as `(A || B) | C`.
+- `A | B && C` is rejected because `&&` appears on the right side of `|`;
   the pipe RHS must be a call stage such as `f(...)` or `_.method(...)`.
-- `A | B or C` is rejected for the same reason.
+- `A | B || C` is rejected for the same reason.
 
 Write:
 
 ```rut
-let x = (A | B) or C
+let x = (A | B) || C
 ```
 
 to make the valid pipe stage grouping explicit before applying boolean

@@ -214,23 +214,23 @@ expansions. Some of these are useful, but stable core syntax needs one
 canonical spelling for common gateway tasks.
 
 **Work**:
-- Treat decorator syntax as compatibility and design `chain` as the stable
+- [x] Treat decorator syntax as compatibility and design `chain` as the stable
   before/after handler middleware model.
-- Keep pipe in core, but document generated code around direct function stages:
+- [x] Keep pipe in core, but document generated code around direct function stages:
   `value | fn(_, arg)`.
-- Keep method-stage pipe syntax and tuple-slot pipe placeholders out of core
+- [x] Keep method-stage pipe syntax and tuple-slot pipe placeholders out of core
   examples unless compatibility requires them; placeholder-free stages are
   rejected by the stable grammar.
-- Revisit protocol/impl exposure so protocol methods do not read like general
+- [x] Revisit protocol/impl exposure so protocol methods do not read like general
   structure member functions in generated Rut code.
-- Audit `match` and generic examples for constructs that should be core,
+- [x] Audit `match` and generic examples for constructs that should be core,
   compatibility, or experimental.
 
 **Acceptance**:
-- Core docs distinguish stable core, compatibility, and experimental syntax.
-- Generated examples use one canonical spelling for pipe, middleware, fallback,
+- [x] Core docs distinguish stable core, compatibility, and experimental syntax.
+- [x] Generated examples use one canonical spelling for pipe, middleware, fallback,
   and async boundaries.
-- Compatibility syntax has a clear lowering or migration path to core forms.
+- [x] Compatibility syntax has a clear lowering or migration path to core forms.
 
 ## P2: Coverage Tooling Hygiene
 

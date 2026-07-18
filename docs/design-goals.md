@@ -143,5 +143,5 @@ The current design review keeps the following direction:
   `.or(default)`, `guard let`, or `match`; the symbolic forms `?.` and `??`
   are deprecated and unsupported.
 - Chain order should be visible source order. Group chains and entry chains
-  compose in that order. If `after` lowering is added later, it should follow
+  compose in that order. Implemented response-header `after` lowering follows
   the same visible order rather than a reverse wrapper unwind.
