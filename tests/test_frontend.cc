@@ -15595,31 +15595,47 @@ TEST(frontend, analyze_rejects_route_guard_match_on_non_error_value) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
-TEST(frontend, analyze_rejects_route_array_local_used_outside_for_iter) {
+TEST(frontend, analyze_accepts_route_array_local_alias) {
     const char* src = "route GET \"/x\" { let nums = [1, 2, 3] let second = nums return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ArrayLit));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::LocalRef));
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
 }
 
-TEST(frontend, analyze_rejects_typed_empty_array_local_used_outside_for_iter) {
+TEST(frontend, analyze_accepts_typed_empty_array_local_alias) {
     const char* src = "route GET \"/x\" { let nums: [i32] = [] let second = nums return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(
-        hir.error().detail.eq(lit("array locals are only supported as static for-loop iterators")));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].init.array_len, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
 }
 
-TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
+TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
         "}\n";
@@ -15628,8 +15644,14 @@ TEST(frontend, analyze_rejects_array_local_alias_chain_used_outside_for_iter) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir);
-    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 3u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
 }
 
 TEST(frontend, analyze_rejects_match_without_wildcard) {

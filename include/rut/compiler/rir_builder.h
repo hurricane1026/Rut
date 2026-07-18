@@ -707,7 +707,7 @@ struct Builder {
     VoidResult emit_json_append(Opcode op, ValueId value, SourceLoc loc = {}) {
         if (!valid_val(value) || (op != Opcode::JsonAppendBool && op != Opcode::JsonAppendI32 &&
                                   op != Opcode::JsonAppendI64 && op != Opcode::JsonAppendStr &&
-                                  op != Opcode::JsonAppendStrList))
+                                  op != Opcode::JsonAppendStrList && op != Opcode::JsonAppendArray))
             return err(RirError::InvalidState);
         const TypeKind expected = op == Opcode::JsonAppendBool  ? TypeKind::Bool
                                   : op == Opcode::JsonAppendI32 ? TypeKind::I32
@@ -1034,6 +1034,47 @@ struct Builder {
         }
         inst->imm.struct_ref.name = sd->name;
         inst->imm.struct_ref.type = ty;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_create(const Type* elem_type,
+                                      const ValueId* values,
+                                      u32 count,
+                                      SourceLoc loc = {}) {
+        if (!elem_type || (!values && count != 0) || count > kMaxArrayItems)
+            return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; i++) {
+            if (!valid_val(values[i]) ||
+                !types_equal(cur_func->values[values[i].id].type, elem_type))
+                return err(RirError::InvalidState);
+        }
+        auto* ty = TRY(make_type(TypeKind::Array, elem_type));
+        auto emitted = TRY(emit(Opcode::ArrayCreate, ty, loc));
+        auto operands = set_operands(emitted.inst, values, count);
+        if (!operands) {
+            rollback_emit(emitted);
+            return core::make_unexpected(operands.error());
+        }
+        return emitted.vid;
+    }
+
+    Result<ValueId> emit_array_len(ValueId array, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::ArrayLen, ty, loc));
+        inst->operands[0] = array;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_get(ValueId array, ValueId index, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array) || !val_has_type(index, TypeKind::I32))
+            return err(RirError::InvalidState);
+        const Type* elem_type = cur_func->values[array.id].type->inner;
+        auto [inst, vid] = TRY(emit(Opcode::ArrayGet, elem_type, loc));
+        inst->operands[0] = array;
+        inst->operands[1] = index;
+        inst->operand_count = 2;
         return vid;
     }
 
