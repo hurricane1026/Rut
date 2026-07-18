@@ -32,8 +32,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   validation, HIR `ReturnStatus`, helper propagation, and respond-capable
   `chain before` steps are implemented. `respond resp` accepts a Response
   builder and preserves its ordered literal `set`/`add`/`remove` header prefix
-  through helper propagation. Dynamic middleware Response mutations remain
-  pending because they need effects owned by the short-circuit branch.
+  through helper propagation. `chain after` helpers with exactly one `Response`
+  parameter can apply ordered runtime header mutations to successful direct and
+  forwarded responses; short-circuit branches do not publish those effects.
 - [x] `guard` condition bool-only check + fix-it; guard-let usable-value
   semantics: known nil/error inits fold the condition to false (else always
   runs, binding skipped for known error); runtime error-capable inits lower
@@ -74,14 +75,15 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   `xor(a, -1)`; user bindings named `bitwise` shadow the namespace). Still
   [x] `Response` locals with ordered `set/remove/add/header`: literal prefixes
   fold into response-header sets and dynamic string values lower through a
-  bounded per-request mutation log for direct routes. Still pending:
-  buffered/post-middleware mutation (needs a stream-owned runtime Response);
-  `req.queryAll` (needs a runtime [str] value type — none exists); `respond`
-  legality (middleware only) vs status-`return` (handler only);
+  bounded per-request mutation log for direct routes; [x] `chain after`
+  response-header mutation for direct and forwarded responses. Still pending:
+  buffered body/status mutation and after middleware on `wait`/`for` routes
+  (needs a resumable, stream-owned runtime Response);
+  `req.queryAll` (needs a runtime [str] value type — none exists);
   `stats()/metrics()/reload()/upstream.mark()` declarations.
 - Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
   guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match
-  arms. Still pending: middleware/handler return-respond confusion.
+  arms; [x] middleware/handler return-respond confusion.
 - Tests/examples: migrate `examples/*.rut`, test fixtures, and docs/ topic
   pages (match.md, pipe.md, decorators.md, for-loops.md, ...) to the new
   surface once the front-end accepts it.
@@ -112,6 +114,11 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] `chain after` supports ordered `Response` header `set`/`add`/`remove`
+  effects on successful direct and forwarded routes. Effects use the pending
+  response mutation log and commit only on the selected success terminator;
+  invalid helper shapes, empty-effect helpers, and wait/for routes are rejected
+  with targeted diagnostics.
 - [x] Dynamic direct-route Response mutations use a two-phase pending/commit
   log: `resp.header()` observes ordered pending writes, while only `return resp`
   publishes them. Guards and pre-middleware short-circuits therefore cannot

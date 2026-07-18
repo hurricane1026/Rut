@@ -129,7 +129,8 @@ exceptions, no try/catch. `!` is logical not only.
   value (or passes through); to end the whole request immediately use
   **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
   A helper-local Response may carry ordered literal `set`/`add`/`remove`
-  mutations; dynamic middleware Response values remain ⏳.
+  mutations. A `chain after` helper may receive the runtime `Response` and add
+  ordered header effects to a successful handler response.
 
 ```swift
 func auth(_ req: Request, role: str) -> User {
@@ -224,12 +225,14 @@ resp.status                       // StatusCode, read/write
 return resp
 ```
 
-Dynamic Response header mutations currently require a direct route with no
-`wait` or `for`, exactly one builder, and that builder must be returned directly.
-Guards and pre-middleware decorators are supported: mutations stay pending on
-the builder and are published only by its successful `return`, so a short-circuit
-response cannot inherit them. Buffered Response and post-middleware execution
-still need their own runtime Response object.
+Dynamic Response header mutations currently require a route with no `wait` or
+`for`. A handler-local builder must be returned directly. A `chain after` helper
+must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
+literal names and runtime string values; its effects apply to successful direct
+and forwarded responses. Mutations stay pending until the selected success
+terminator, so a guard or pre-middleware short circuit cannot inherit them.
+Reading or changing a buffered response body/status remains ⏳ and needs a
+resumable, stream-owned runtime Response object.
 
 ## State types (top-level, per-shard, bounded)
 
@@ -281,8 +284,20 @@ bindings, host/path groups, method unions, typed captures, expression entries,
 and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
 Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
-Indistinguishable routes are a compile error. Middleware direction is inferred
-from signature: has `Response` param → post (forces buffered), else pre.
+Indistinguishable routes are a compile error. Stable middleware uses an explicit
+`chain` direction:
+
+```swift
+func add_trace(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Request-Path", req.path)
+    0
+}
+chain observability { after add_trace(req, resp) }
+route GET "/users" use chain observability { return forward(users) }
+```
+
+`before` helpers may gate a route; `after` currently supports Response header
+effects only. Full buffered body/status middleware remains ⏳.
 
 ## I/O
 
