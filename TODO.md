@@ -239,13 +239,13 @@ canonical spelling for common gateway tasks.
 **Why**: The project has many generated, third-party, benchmark, and architecture-specific files. Raw coverage can hide runtime gaps or chase irrelevant files.
 
 **Work**:
-- Review `scripts/coverage_report.py` exclusions and CI coverage target.
-- Keep per-area coverage summaries for runtime, compiler, replay/sim, and JIT actionable as test coverage changes.
-- Wire changed-file coverage summaries into CI/PR output if the signal proves useful.
+- [x] Review `scripts/coverage_report.py` exclusions and CI coverage target.
+- [x] Keep per-area coverage summaries for runtime, compiler, replay/sim, and JIT actionable as test coverage changes.
+- [x] Wire changed-file coverage summaries into CI/PR output.
 
 **Acceptance**:
-- CI coverage output identifies the lowest-covered first-party runtime files.
-- Third-party and benchmark files do not dominate coverage decisions.
+- [x] CI coverage output identifies the lowest-covered first-party runtime files.
+- [x] Third-party, benchmark, and host-ISA-specific files do not dominate coverage decisions.
 
 ## P2: TODO Maintenance
 
