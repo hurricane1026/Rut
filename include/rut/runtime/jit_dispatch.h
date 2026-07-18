@@ -61,6 +61,7 @@ struct JitDispatchOutcome {
     u16 response_body_idx = 0;
     const char* dynamic_response_body = nullptr;
     u32 dynamic_response_body_len = 0;
+    const jit::HandlerCtx* response_ctx = nullptr;
     // 1-based index into RouteConfig::response_header_sets for
     // Kind::ReturnStatus; 0 = no custom headers. Decoded from the
     // next_state slot per handler ABI (reused while action is
@@ -154,6 +155,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
         case jit::HandlerAction::ReturnStatus:
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
             out.status_code = r.status_code;
+            out.response_ctx = &ctx;
             // ABI: upstream_id carries a 1-based response-body index
             // and next_state a 1-based response-header-set index for
             // ReturnStatus (0 = no custom body / no custom headers;

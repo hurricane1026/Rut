@@ -15939,26 +15939,25 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
     const u32 value_lens[] = {4, 4, 5};
     REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 3), 1u);
 
-    Connection conn;
-    conn.reset();
-    auto add_mutation = [&](ConnectionBase::RespHeaderMutationMode mode,
+    jit::HandlerCtx ctx{};
+    auto add_mutation = [&](jit::ResponseHeaderMutationMode mode,
                             const char* name,
                             u32 name_len,
                             const char* value,
                             u32 value_len) {
-        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        auto& mutation = ctx.response_header_mutations[ctx.response_header_count++];
         mutation.mode = mode;
         mutation.name = {name, name_len};
         mutation.value = {value, value_len};
     };
-    add_mutation(ConnectionBase::RespHeaderMutationMode::Set, "x-base", 6, "new", 3);
-    add_mutation(ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
-    add_mutation(ConnectionBase::RespHeaderMutationMode::Remove, "x-keep", 6, nullptr, 0);
+    add_mutation(jit::ResponseHeaderMutationMode::Set, "x-base", 6, "new", 3);
+    add_mutation(jit::ResponseHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+    add_mutation(jit::ResponseHeaderMutationMode::Remove, "x-keep", 6, nullptr, 0);
 
-    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations];
     u32 count = 0;
     REQUIRE(collect_effective_response_headers(
-        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+        &ctx, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
     REQUIRE_EQ(count, 3u);
     CHECK((Str{out[0].key_data, out[0].key_len}.eq(Str{"X-Multi", 7})));
     CHECK((Str{out[0].value_data, out[0].value_len}.eq(Str{"first", 5})));
@@ -15967,9 +15966,9 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
     CHECK((Str{out[2].key_data, out[2].key_len}.eq(Str{"X-Multi", 7})));
     CHECK((Str{out[2].value_data, out[2].value_len}.eq(Str{"second", 6})));
 
-    conn.resp_header_mutation_overflow = true;
+    ctx.response_header_overflow = true;
     CHECK_FALSE(collect_effective_response_headers(
-        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+        &ctx, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
 TEST(response_headers, head_header_collection_failure_suppresses_fallback_body) {

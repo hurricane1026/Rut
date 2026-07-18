@@ -448,44 +448,44 @@ static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
     return true;
 }
 
-static void record_resp_header(void* conn,
+static void record_resp_header(void* ctx,
                                const char* name,
                                u32 nlen,
                                const char* val,
                                u32 vlen,
-                               Connection::RespHeaderMutationMode mode) {
-    if (conn == nullptr) return;
-    auto* c = static_cast<Connection*>(conn);
-    if (c->resp_header_mutation_pending_count >= Connection::kMaxRespHeaderMutations) {
-        c->resp_header_mutation_pending_overflow = true;
+                               jit::ResponseHeaderMutationMode mode) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    if (hctx->response_header_pending_count >= jit::kMaxResponseHeaderMutations) {
+        hctx->response_header_pending_overflow = true;
         return;
     }
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_pending_count++];
+    auto& mutation = hctx->response_header_mutations[hctx->response_header_pending_count++];
     mutation.name = {name, nlen};
     mutation.value = {val, vlen};
     mutation.mode = mode;
 }
 
-void rut_helper_resp_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
-    record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Set);
+void rut_helper_resp_set_header(void* ctx, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_resp_header(ctx, name, nlen, val, vlen, jit::ResponseHeaderMutationMode::Set);
 }
 
-void rut_helper_resp_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
-    record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Add);
+void rut_helper_resp_add_header(void* ctx, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_resp_header(ctx, name, nlen, val, vlen, jit::ResponseHeaderMutationMode::Add);
 }
 
-void rut_helper_resp_remove_header(void* conn, const char* name, u32 nlen) {
-    record_resp_header(conn, name, nlen, nullptr, 0, Connection::RespHeaderMutationMode::Remove);
+void rut_helper_resp_remove_header(void* ctx, const char* name, u32 nlen) {
+    record_resp_header(ctx, name, nlen, nullptr, 0, jit::ResponseHeaderMutationMode::Remove);
 }
 
-void rut_helper_resp_commit_headers(void* conn) {
-    if (conn == nullptr) return;
-    auto* c = static_cast<Connection*>(conn);
-    c->resp_header_mutation_count = c->resp_header_mutation_pending_count;
-    c->resp_header_mutation_overflow = c->resp_header_mutation_pending_overflow;
+void rut_helper_resp_commit_headers(void* ctx) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    hctx->response_header_count = hctx->response_header_pending_count;
+    hctx->response_header_overflow = hctx->response_header_pending_overflow;
 }
 
-void rut_helper_resp_header(void* conn,
+void rut_helper_resp_header(void* ctx,
                             const char* name,
                             u32 nlen,
                             u8 fallback_has,
@@ -497,16 +497,16 @@ void rut_helper_resp_header(void* conn,
     *out_has = fallback_has;
     *out_ptr = fallback_has ? fallback_ptr : nullptr;
     *out_len = fallback_has ? fallback_len : 0;
-    if (conn == nullptr) return;
-    auto* c = static_cast<Connection*>(conn);
-    for (u32 i = 0; i < c->resp_header_mutation_pending_count; i++) {
-        const auto& mutation = c->resp_header_mutations[i];
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    for (u32 i = 0; i < hctx->response_header_pending_count; i++) {
+        const auto& mutation = hctx->response_header_mutations[i];
         if (!ascii_header_name_eq(mutation.name, name, nlen)) continue;
-        if (mutation.mode == Connection::RespHeaderMutationMode::Remove) {
+        if (mutation.mode == jit::ResponseHeaderMutationMode::Remove) {
             *out_has = 0;
             *out_ptr = nullptr;
             *out_len = 0;
-        } else if (mutation.mode == Connection::RespHeaderMutationMode::Set || !*out_has) {
+        } else if (mutation.mode == jit::ResponseHeaderMutationMode::Set || !*out_has) {
             *out_has = 1;
             *out_ptr = mutation.value.ptr;
             *out_len = mutation.value.len;
