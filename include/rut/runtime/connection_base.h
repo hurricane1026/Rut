@@ -308,9 +308,13 @@ struct ConnectionBase {
     // the submitted prefix and preserve later buffered bytes.
     u32 ws_client_send_len;
     u32 ws_upstream_send_len;
-    // Bytes of the 101 Switching Protocols response sent before entering
-    // tunnel mode (HTTP headers only, excluding any early upstream bytes).
+    // Bytes in the upstream's original 101 header block. This is the prefix
+    // consumed from upstream_recv_buf after the (possibly rewritten) response
+    // reaches the client.
     u32 ws_upgrade_response_len;
+    // Bytes actually sent for the 101 header block after response mutations.
+    // Access logging and capture account this length, not the upstream prefix.
+    u32 ws_upgrade_sent_len;
     // Upstream closed during pre-tunnel 101 handling and should be closed once
     // tunnel mode is fully entered (after preserving buffered early bytes).
     bool ws_pre_tunnel_upstream_closed;
@@ -675,6 +679,7 @@ struct ConnectionBase {
         ws_client_send_len = 0;
         ws_upstream_send_len = 0;
         ws_upgrade_response_len = 0;
+        ws_upgrade_sent_len = 0;
         ws_pre_tunnel_upstream_closed = false;
         ws_client_eof = false;
         ws_upstream_eof = false;

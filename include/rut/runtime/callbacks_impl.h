@@ -4482,7 +4482,7 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // the access-log request size would depend on packet framing. Trim to the
     // parsed header length (an upgrade request has no body).
     if (conn.req_header_end > 0) conn.req_size = conn.req_header_end;
-    on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_response_len);
+    on_request_complete(loop, conn, conn.resp_status, conn.ws_upgrade_sent_len);
     // The HTTP request is complete at the 101: release the upstream max_inflight
     // slot now so a long-lived tunnel doesn't hold an in-flight request slot for
     // its whole lifetime and shed later requests with 503.
@@ -4694,6 +4694,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             upgrade_response = conn.response_header_buf.data();
             upgrade_response_len = conn.response_header_buf.len();
         }
+        conn.ws_upgrade_sent_len = upgrade_response_len;
         conn.ws_pre_tunnel_upstream_closed = false;
         if (!ws_pause_upstream_recv(loop, conn)) {
             loop->close_conn(conn);

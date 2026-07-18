@@ -1164,6 +1164,7 @@ TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
 
     const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
     REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
@@ -1468,6 +1469,7 @@ TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
 
     const u8 cb[] = {'H', 'I'};
     REQUIRE_EQ(conn->recv_buf.write(cb, sizeof(cb)), sizeof(cb));
@@ -1497,6 +1499,7 @@ TEST(websocket, upgrade_101_sent_rearms_client_recv_when_no_buffered_bytes) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
     REQUIRE_EQ(conn->recv_buf.len(), 0u);  // no buffered client bytes -> the no-buffered path
     // Simulate ws_stop_client_poll having paused the client recv on the io_uring 101 path.
     conn->recv_paused_for_send = true;
@@ -1520,6 +1523,7 @@ TEST(websocket, upgrade_101_sent_drains_both_when_backend_closed_pretunnel) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
     conn->ws_pre_tunnel_upstream_closed = true;  // backend FIN during the 101 drain
     const u32 cid = conn->id;
 
@@ -1564,6 +1568,7 @@ TEST(websocket, upgrade_101_sent_releases_upstream_slot) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
     conn->upstream_slot_held = true;  // slot taken at proxy dispatch
 
     on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
@@ -6435,6 +6440,9 @@ TEST(streaming, skip_1xx_continue_then_200) {
 TEST(streaming, _101_not_skipped) {
     SmallLoop loop;
     loop.setup();
+    AccessLogRing access_log;
+    access_log.init();
+    loop.access_log = &access_log;
     auto* conn = setup_proxy_conn(loop);
     REQUIRE(conn != nullptr);
     conn->req_wants_upgrade = true;  // client sent Connection: upgrade
@@ -6469,6 +6477,9 @@ TEST(streaming, _101_not_skipped) {
     const std::string handshake(reinterpret_cast<const char*>(handshake_send->send_buf),
                                 handshake_send_len);
     CHECK(handshake.find("X-After: applied\r\n") != std::string::npos);
+    CHECK_NE(handshake_send_len, resp_len);
+    CHECK_EQ(conn->ws_upgrade_response_len, resp_len);
+    CHECK_EQ(conn->ws_upgrade_sent_len, handshake_send_len);
     // The idle-timeout exemption starts only after the 101 reaches the client.
     CHECK(!conn->is_ws_tunnel);
     REQUIRE(conn->on_send != nullptr);
@@ -6491,6 +6502,9 @@ TEST(streaming, _101_not_skipped) {
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK(conn->is_ws_tunnel);
+    AccessLogEntry access_entry{};
+    REQUIRE(access_log.pop(access_entry));
+    CHECK_EQ(access_entry.resp_size, handshake_send_len);
     REQUIRE_EQ(loop.backend.op_count, 3u);
     CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 42);
