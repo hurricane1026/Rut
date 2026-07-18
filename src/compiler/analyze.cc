@@ -17574,7 +17574,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (fn_index == mod.functions.len)
             return frontend_error(FrontendError::UnsupportedSyntax, item.func.span, item.func.name);
         HirFunction& fn = mod.functions[fn_index];
-        HirRoute scratch{};
+        // HirRoute is ~1.1 MB. analyze_file_internal is recursive for imports,
+        // so keeping this scratch plus the route-analysis workspaces in every
+        // stack frame puts a two-file import graph on the default 8 MB stack
+        // cliff. The module itself is already heap-backed for the same reason.
+        auto scratch_storage = std::make_unique<HirRoute>();
+        HirRoute& scratch = *scratch_storage;
         scratch.is_helper_scratch = true;
         scratch.allow_respond_effects = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
@@ -17990,7 +17995,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // returns 200 (the timer path ignores the status). Non-empty bodies
         // must end in an explicit terminal statement, like a route body.
         if (is_timer_item && item.timer.statements.len == 0) {
-            HirRoute route{};
+            auto route_storage = std::make_unique<HirRoute>();
+            HirRoute& route = *route_storage;
             route.span = item.timer.span;
             route.path = item.timer.name;
             route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
@@ -18007,7 +18013,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         const AstRouteDecl& route_decl = is_timer_item ? *timer_route_view : item.route;
 
-        HirRoute route{};
+        auto route_storage = std::make_unique<HirRoute>();
+        HirRoute& route = *route_storage;
         route.span = route_decl.span;
         route.path = route_decl.path;
         route.method = route_method_key_from_token(route_decl.method);
