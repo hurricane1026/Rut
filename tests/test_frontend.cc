@@ -6584,6 +6584,32 @@ route {
     rir.destroy();
 }
 
+TEST(frontend, response_builder_alias_is_not_the_chain_response_parameter) {
+    const char* src = R"rut(
+func build_local(_ resp: Response) -> i32 {
+    let local = response(200)
+    let alias = local
+    alias.set("X-Local", "yes")
+    0
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    u32 response_effects = 0;
+    for (u32 i = 0; i < hir->functions[0].exprs.len; i++) {
+        const auto kind = hir->functions[0].exprs[i].kind;
+        response_effects += kind == HirExprKind::RespSetHeader ||
+                            kind == HirExprKind::RespAddHeader ||
+                            kind == HirExprKind::RespRemoveHeader;
+    }
+    CHECK_EQ(response_effects, 0u);
+}
+
 TEST(frontend, chain_after_commits_response_effects_before_forward) {
     const char* src = R"rut(
 upstream api at "127.0.0.1:9000"

@@ -1573,6 +1573,57 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         }
         return false;
     };
+    auto nominated_mutation = [&](const u8* token, u32 token_len) {
+        for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
+            if (!response_mutation_survives(conn, i)) continue;
+            const auto& mutation = conn.resp_header_mutations[i];
+            if (http_header_name_eq_ci(reinterpret_cast<const char*>(token),
+                                       token_len,
+                                       mutation.name.ptr,
+                                       mutation.name.len))
+                return true;
+        }
+        return false;
+    };
+    auto connection_nominates_mutation = [&](const u8* value, u32 value_len) {
+        u32 pos = 0;
+        while (pos < value_len) {
+            while (pos < value_len &&
+                   (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\t'))
+                pos++;
+            const u32 start = pos;
+            while (pos < value_len && value[pos] != ',') pos++;
+            u32 end = pos;
+            while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
+            if (end > start && nominated_mutation(value + start, end - start)) return true;
+        }
+        return false;
+    };
+    auto write_filtered_connection = [&](const u8* value, u32 value_len) {
+        static constexpr char kConnection[] = "Connection: ";
+        static constexpr char kCommaSpace[] = ", ";
+        static constexpr char kCrLf[] = "\r\n";
+        bool wrote_header = false;
+        u32 pos = 0;
+        while (pos < value_len) {
+            while (pos < value_len &&
+                   (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\t'))
+                pos++;
+            const u32 start = pos;
+            while (pos < value_len && value[pos] != ',') pos++;
+            u32 end = pos;
+            while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
+            if (end == start || nominated_mutation(value + start, end - start)) continue;
+            if (!wrote_header) {
+                if (!write(kConnection, sizeof(kConnection) - 1)) return false;
+                wrote_header = true;
+            } else if (!write(kCommaSpace, sizeof(kCommaSpace) - 1)) {
+                return false;
+            }
+            if (!write(value + start, end - start)) return false;
+        }
+        return !wrote_header || write(kCrLf, sizeof(kCrLf) - 1);
+    };
 
     conn.response_header_buf.reset();
     u32 line_start = 0;
@@ -1593,10 +1644,21 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         u32 name_end = colon;
         while (name_end > line_start && (data[name_end - 1] == ' ' || data[name_end - 1] == '\t'))
             name_end--;
+        const bool is_connection =
+            http_header_name_eq_ci(reinterpret_cast<const char*>(data + line_start),
+                                   name_end - line_start,
+                                   "connection",
+                                   10);
         if (!base_suppressed(reinterpret_cast<const char*>(data + line_start),
-                             name_end - line_start) &&
-            !write(data + line_start, line_end + 2 - line_start))
-            return false;
+                             name_end - line_start)) {
+            const u8* value = data + colon + 1;
+            const u32 value_len = line_end - colon - 1;
+            if (is_connection && connection_nominates_mutation(value, value_len)) {
+                if (!write_filtered_connection(value, value_len)) return false;
+            } else if (!write(data + line_start, line_end + 2 - line_start)) {
+                return false;
+            }
+        }
         line_start = line_end + 2;
     }
 

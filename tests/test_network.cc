@@ -16100,6 +16100,55 @@ TEST(response_headers, forwarded_mutations_reject_runtime_header_injection) {
     CHECK_EQ(conn.response_header_buf.len(), 0u);
 }
 
+TEST(response_headers, forwarded_mutations_remove_matching_connection_nominations) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: keep-alive, X-Security, upgrade\r\n"
+        "X-Security: origin\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Security", 10};
+    mutation.value = {"enforced", 8};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive, upgrade\r\n") != std::string::npos);
+    CHECK(out.find("Connection: keep-alive, X-Security") == std::string::npos);
+    CHECK(out.find("X-Security: origin") == std::string::npos);
+    CHECK(out.find("X-Security: enforced\r\n") != std::string::npos);
+}
+
+TEST(response_headers, stabilization_copies_only_mutations_that_survive_folding) {
+    Connection conn;
+    conn.reset();
+    u8 stable_storage[4]{};
+    conn.response_header_slice = stable_storage;
+    conn.response_header_buf.bind(stable_storage, sizeof(stable_storage));
+    static const char source[] = "discardedkept";
+    conn.resp_header_mutations[0] = {
+        {"X-Test", 6}, {source, 9}, ConnectionBase::RespHeaderMutationMode::Set};
+    conn.resp_header_mutations[1] = {
+        {"X-Test", 6}, {source + 9, 4}, ConnectionBase::RespHeaderMutationMode::Set};
+    conn.resp_header_mutation_count = 2;
+
+    REQUIRE(
+        conn.stabilize_response_mutations(reinterpret_cast<const u8*>(source), sizeof(source) - 1));
+    CHECK_EQ(conn.response_header_buf.len(), 4u);
+    CHECK(conn.resp_header_mutations[0].value.ptr == source);
+    CHECK(conn.resp_header_mutations[1].value.eq({"kept", 4}));
+}
+
 TEST(http2, forward_request_applies_jit_path_and_header_overrides) {
     Connection conn;
     conn.reset();

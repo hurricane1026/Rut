@@ -5977,8 +5977,25 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                               inner.span,
                                               lit_str("invalid or reserved response header"));
 
-                    const bool runtime_response =
-                        cur_locals[response_index].init.kind != HirExprKind::ResponseInit;
+                    // A Response-typed alias is not necessarily the chain's runtime
+                    // response parameter: it may ultimately refer to a local
+                    // response(...) builder. Follow LocalRef identity until reaching
+                    // either the self-referential parameter slot or a builder.
+                    auto originates_from_response_parameter =
+                        [&](auto&& self, u32 local_index, u32 depth) -> bool {
+                        if (depth > cur_local_count) return false;
+                        const auto& local = cur_locals[local_index];
+                        if (local.init.kind == HirExprKind::ResponseInit) return false;
+                        if (local.init.kind != HirExprKind::LocalRef) return false;
+                        if (local.init.local_index == local.ref_index) return true;
+                        for (u32 li = cur_local_count; li > 0; li--) {
+                            if (cur_locals[li - 1].ref_index == local.init.local_index)
+                                return self(self, li - 1, depth + 1);
+                        }
+                        return false;
+                    };
+                    const bool runtime_response = originates_from_response_parameter(
+                        originates_from_response_parameter, response_index, 0);
                     if (runtime_response) {
                         if (!cur_allow_respond_guards)
                             return frontend_error(

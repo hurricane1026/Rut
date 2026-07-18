@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
@@ -243,8 +244,22 @@ struct ConnectionBase {
     // HTTP/2 reuses its request scratch for the encoded response. Literal values
     // already live in JIT-owned storage and do not need copying.
     bool stabilize_response_mutations(const u8* source, u32 source_len) {
+        auto survives_folding = [&](u32 index) {
+            const auto& current = resp_header_mutations[index];
+            if (current.mode == RespHeaderMutationMode::Remove) return false;
+            for (u32 later_index = index + 1; later_index < resp_header_mutation_count;
+                 later_index++) {
+                const auto& later = resp_header_mutations[later_index];
+                if (later.mode != RespHeaderMutationMode::Add &&
+                    http_header_name_eq_ci(
+                        current.name.ptr, current.name.len, later.name.ptr, later.name.len))
+                    return false;
+            }
+            return true;
+        };
         u32 needed = 0;
         for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            if (!survives_folding(i)) continue;
             const auto& value = resp_header_mutations[i].value;
             if (value.ptr == nullptr) continue;
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
@@ -253,6 +268,7 @@ struct ConnectionBase {
         if (needed > response_header_buf.capacity()) return false;
         response_header_buf.reset();
         for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            if (!survives_folding(i)) continue;
             auto& value = resp_header_mutations[i].value;
             if (value.ptr == nullptr) continue;
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);

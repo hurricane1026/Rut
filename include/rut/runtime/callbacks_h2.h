@@ -610,7 +610,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const RouteConfig* cfg,
                     const u8* synth,
                     u32 synth_len,
-                    bool request_body_followed) {
+                    bool request_body_followed,
+                    bool request_forwardable) {
     auto* ctx = d.conn->reset_jit_ctx();
     d.conn->resp_header_mutation_pending_count = 0;
     d.conn->resp_header_mutation_pending_overflow = false;
@@ -633,6 +634,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         if (request_body_followed) {
             h2_emit_status(d, stream_id, 503);
+            return;
+        }
+        if (!request_forwardable) {
+            h2_emit_status(d, stream_id, 400);
             return;
         }
         const bool stable = d.conn->resp_header_mutation_count == 0 ||
@@ -728,7 +733,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen, true);
+    h2_invoke_emit(
+        d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen, true, false);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -895,8 +901,16 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 400);
                 return;
             }
-            h2_invoke_emit(
-                d, stream_id, route, params, param_count, config, synth, kSynthLen, false);
+            h2_invoke_emit(d,
+                           stream_id,
+                           route,
+                           params,
+                           param_count,
+                           config,
+                           synth,
+                           kSynthLen,
+                           false,
+                           h2_proxy_request_forwardable(headers, nheaders));
             return;
         }
         case RouteAction::Proxy:
