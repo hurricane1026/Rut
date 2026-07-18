@@ -275,6 +275,31 @@ TEST(set_header, fails_closed_on_record_overflow) {
     CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
 }
 
+TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET /original HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_path_overridden = true;
+    c->req_path_override = {"/forwarded", 10};
+    c->resp_header_mutations[0] = {{"X-Original", 10},
+                                   {reinterpret_cast<const char*>(c->recv_buf.data()) + 4, 9},
+                                   ConnectionBase::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE(rewrite_request_line_path(*c));
+
+    CHECK(c->resp_header_mutations[0].value.eq({"/original", 9}));
+    CHECK(buf_has(c->recv_buf.data(), c->recv_buf.len(), "GET /forwarded HTTP/1.1\r\n"));
+    CHECK_FALSE(c->retry_req_snapshot_replayable);
+}
+
 // === Recv ===
 
 TEST(recv, then_send) {
@@ -6412,6 +6437,9 @@ TEST(streaming, _101_not_skipped) {
     auto* conn = setup_proxy_conn(loop);
     REQUIRE(conn != nullptr);
     conn->req_wants_upgrade = true;  // client sent Connection: upgrade
+    conn->resp_header_mutations[0] = {
+        {"X-After", 7}, {"applied", 7}, ConnectionBase::RespHeaderMutationMode::Set};
+    conn->resp_header_mutation_count = 1;
 
     const char* resp =
         "HTTP/1.1 101 Switching Protocols\r\n"
@@ -6434,6 +6462,12 @@ TEST(streaming, _101_not_skipped) {
     // 101 is terminal — must NOT be skipped as an interim 1xx.
     CHECK_EQ(conn->resp_status, static_cast<u16>(101));
 #if RUT_ENABLE_WEBSOCKET
+    const MockOp* handshake_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(handshake_send != nullptr);
+    const u32 handshake_send_len = handshake_send->send_len;
+    const std::string handshake(reinterpret_cast<const char*>(handshake_send->send_buf),
+                                handshake_send_len);
+    CHECK(handshake.find("X-After: applied\r\n") != std::string::npos);
     // The idle-timeout exemption starts only after the 101 reaches the client.
     CHECK(!conn->is_ws_tunnel);
     REQUIRE(conn->on_send != nullptr);
@@ -6451,7 +6485,7 @@ TEST(streaming, _101_not_skipped) {
     CHECK(conn->upstream_recv_buf.len() == early_only_len ||
           conn->upstream_recv_buf.len() == header_plus_early_len);
     CHECK(!conn->is_ws_tunnel);
-    loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(handshake_send_len)));
     loop.backend.op_count = 0;
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);

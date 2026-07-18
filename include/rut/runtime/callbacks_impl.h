@@ -812,7 +812,7 @@ inline bool request_resendable_from_recv_buf(const Connection& conn) {
 // Used to gate BOTH reused-socket retry sites so they cannot drift.
 inline bool request_fully_resendable(const Connection& conn) {
     if (!request_body_replayable(conn)) return false;
-    if (conn.retry_req_send_len > 0) return true;
+    if (conn.retry_req_send_len > 0) return conn.retry_req_snapshot_replayable;
     return conn.req_initial_send_len > 0 && conn.recv_buf.len() >= conn.req_initial_send_len;
 }
 
@@ -1044,6 +1044,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_reused = false;
     conn.upstream_request_incomplete = false;
     conn.retry_req_send_len = 0;
+    conn.retry_req_snapshot_replayable = true;
+    conn.response_mutations_snapshotted = false;
     conn.req_body_streamed = false;
     if (loop->capture_ring) capture_stage_headers(conn);
     loop->epoch_enter();
@@ -2473,6 +2475,28 @@ inline void strip_ws_extensions(Connection& conn) {
 }
 #endif
 
+// Preserve request-backed after-mutation values before forward(set_path:) and
+// forward(set_header:) rewrite recv_buf in place. send_buf remains pinned until
+// the response completes; on_upstream_request_sent later reserves this snapshot
+// as the prefix used by pipeline_stash.
+inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn) {
+    if (conn.resp_header_mutation_count == 0 || conn.retry_req_send_len != 0 ||
+        conn.response_mutations_snapshotted)
+        return true;
+    if (conn.req_initial_send_len == 0 || conn.req_initial_send_len > conn.recv_buf.len() ||
+        conn.req_initial_send_len > conn.send_buf.capacity())
+        return false;
+    const u8* old_base = conn.recv_buf.data();
+    conn.send_buf.reset();
+    if (conn.send_buf.write(old_base, conn.req_initial_send_len) != conn.req_initial_send_len)
+        return false;
+    conn.reanchor_response_mutations(old_base, conn.req_initial_send_len, conn.send_buf.data());
+    conn.response_mutations_snapshotted = true;
+    conn.retry_req_snapshot_replayable =
+        !conn.req_path_overridden && conn.req_header_override_count == 0;
+    return true;
+}
+
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -2537,7 +2561,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // retry replay the request bytes live in send_buf, while recv_buf may already
     // hold the next pipelined request, so only rewrite the initial forward buffer.
     if (conn.retry_req_send_len == 0) {
-        const bool path_rewritten = rewrite_request_line_path(conn);
+        const bool mutations_snapshotted = snapshot_response_mutations_before_request_rewrite(conn);
+        const bool path_rewritten = mutations_snapshotted && rewrite_request_line_path(conn);
         // forward(set_header:) — inject/replace request header lines (no-op unless
         // overrides were recorded). After the path rewrite so it reads the updated
         // req_header_end. Fail closed (500) if a configured override can't be applied
@@ -2658,16 +2683,14 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining > 0) ||
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
-    bool response_mutation_snapshot = false;
-    if (conn.resp_header_mutation_count != 0 && conn.retry_req_send_len == 0 &&
-        conn.req_initial_send_len <= conn.recv_buf.len() &&
-        conn.req_initial_send_len <= conn.send_buf.capacity()) {
-        const u8* old_base = conn.recv_buf.data();
-        conn.send_buf.reset();
-        conn.send_buf.write(old_base, conn.req_initial_send_len);
-        conn.reanchor_response_mutations(old_base, conn.req_initial_send_len, conn.send_buf.data());
-        response_mutation_snapshot = true;
+    // Normal forwarding snapshots in on_upstream_connected, before overrides.
+    // Keep this fallback for callers that submit an already-prepared request
+    // directly (and fail closed if their request-backed values cannot be pinned).
+    if (!snapshot_response_mutations_before_request_rewrite(conn)) {
+        loop->close_conn(conn);
+        return;
     }
+    const bool response_mutation_snapshot = conn.response_mutations_snapshotted;
     if (kMoreReqBody) {
         // Body streaming begins here: recv_buf is reset and refilled with body
         // chunks, so the original headers+body are no longer replayable. Mark it so
@@ -2707,12 +2730,13 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         //   [retry_req_send_len, + pipeline_stash_len)       pipelined suffix
         // Guarded on upstream_reused so a fresh non-reused connect doesn't re-copy.
         if (response_mutation_snapshot) {
-            conn.retry_req_send_len = conn.req_initial_send_len;
+            conn.retry_req_send_len = conn.send_buf.len();
         } else if (conn.upstream_reused && request_resendable_from_recv_buf(conn) &&
                    conn.recv_buf.len() <= conn.send_buf.capacity()) {
             conn.send_buf.reset();
             conn.send_buf.write(conn.recv_buf.data(), conn.req_initial_send_len);
             conn.retry_req_send_len = conn.req_initial_send_len;
+            conn.retry_req_snapshot_replayable = true;
         }
         pipeline_stash(conn);
         // recv_buf is released: pipelined downstream bytes read during the upstream wait
@@ -4659,6 +4683,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.ws_upgrade_response_len = resp_parser.header_end;
+        const u8* upgrade_response = conn.upstream_recv_buf.data();
+        u32 upgrade_response_len = conn.ws_upgrade_response_len;
+        if (conn.resp_header_mutation_count != 0) {
+            if (!build_h1_forward_response_headers(
+                    conn, conn.ws_upgrade_response_len, /*draining=*/false)) {
+                loop->close_conn(conn);
+                return;
+            }
+            upgrade_response = conn.response_header_buf.data();
+            upgrade_response_len = conn.response_header_buf.len();
+        }
         conn.ws_pre_tunnel_upstream_closed = false;
         if (!ws_pause_upstream_recv(loop, conn)) {
             loop->close_conn(conn);
@@ -4666,7 +4701,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.transition_to_sending(&on_ws_101_sent<Loop>);
         conn.on_upstream_recv = &on_ws_pre_tunnel_upstream_recv<Loop>;
-        if (!loop->submit_send(conn, conn.upstream_recv_buf.data(), conn.ws_upgrade_response_len)) {
+        if (!loop->submit_send(conn, upgrade_response, upgrade_response_len)) {
             loop->close_conn(conn);
             return;
         }

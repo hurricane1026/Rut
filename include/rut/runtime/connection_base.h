@@ -483,6 +483,11 @@ struct ConnectionBase {
     // [0, retry_req_send_len) instead of recv_buf. Reset at the per-request boundary
     // like the reuse flags.
     u32 retry_req_send_len;
+    // A response mutation may pin the pre-override request in send_buf. Such a
+    // snapshot still reserves the retry prefix for pipeline_stash layout, but it
+    // is not replayable when the upstream received rewritten request bytes.
+    bool retry_req_snapshot_replayable;
+    bool response_mutations_snapshotted;
     bool req_malformed;  // true if request body is malformed (reject)
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
@@ -736,6 +741,8 @@ struct ConnectionBase {
         req_content_length = 0;
         req_initial_send_len = 0;
         retry_req_send_len = 0;
+        retry_req_snapshot_replayable = true;
+        response_mutations_snapshotted = false;
         req_malformed = false;
         req_keep_alive = false;
         req_wants_upgrade = false;
