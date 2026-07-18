@@ -5361,6 +5361,151 @@ static Connection* setup_proxy_conn_head(SmallLoop& loop) {
     return conn;
 }
 
+TEST(buffered_forward, applies_committed_status_body_and_header_mutations) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->response_status = 201;
+    ctx->response_status_set = true;
+    static const char kBody[] = "rewritten";
+    __builtin_memcpy(ctx->response_body_pending_storage, kBody, sizeof(kBody) - 1);
+    ctx->response_body_mutation_data = ctx->response_body_pending_storage;
+    ctx->response_body_mutation_len = sizeof(kBody) - 1;
+    ctx->response_body_mutation_set = true;
+    static const char kName[] = "X-After";
+    static const char kValue[] = "yes";
+    ctx->response_header_mutations[0] = {{kName, sizeof(kName) - 1},
+                                         {kValue, sizeof(kValue) - 1},
+                                         jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 8\r\n"
+        "X-After: no\r\n"
+        "X-Origin: kept\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "original";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(conn->resp_status, 201u);
+    CHECK_FALSE(conn->proxy_response_buffered);
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "HTTP/1.1 201", 12));
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 9\r\n", 19));
+    CHECK(buf_contains(wire, wire_len, "X-After: yes\r\n", 14));
+    CHECK(buf_contains(wire, wire_len, "X-Origin: kept\r\n", 16));
+    CHECK(!buf_contains(wire, wire_len, "X-After: no", 11));
+    CHECK(buf_contains(wire, wire_len, "\r\n\r\nrewritten", 13));
+}
+
+TEST(buffered_forward, mutated_205_suppresses_upstream_and_replacement_bodies) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+
+    auto* ctx = conn->reset_jit_ctx();
+    ctx->response_status = 205;
+    ctx->response_status_set = true;
+    static const char kReplacement[] = "rewritten";
+    __builtin_memcpy(ctx->response_body_pending_storage, kReplacement, sizeof(kReplacement) - 1);
+    ctx->response_body_mutation_data = ctx->response_body_pending_storage;
+    ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
+    ctx->response_body_mutation_set = true;
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 205u);
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "HTTP/1.1 205", 12));
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 0\r\n", 19));
+    CHECK(!buf_contains(wire, wire_len, "original", 8));
+    CHECK(!buf_contains(wire, wire_len, "rewritten", 9));
+}
+
+TEST(buffered_forward, waits_for_and_dechunks_complete_upstream_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static const char kFirst[] =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Origin: kept\r\n\r\n4\r\nWi";
+    loop.backend.clear_ops();
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kFirst), sizeof(kFirst) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kFirst) - 1)));
+    CHECK(conn->proxy_response_buffered);
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+
+    static const u8 kRest[] = {'k',
+                               'i',
+                               '\r',
+                               '\n',
+                               '5',
+                               '\r',
+                               '\n',
+                               'p',
+                               'e',
+                               'd',
+                               'i',
+                               'a',
+                               '\r',
+                               '\n',
+                               '0',
+                               '\r',
+                               '\n',
+                               '\r',
+                               '\n'};
+    loop.backend.clear_ops();
+    conn->upstream_recv_buf.write(kRest, static_cast<u32>(sizeof(kRest)));
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kRest))));
+
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 9\r\n", 19));
+    CHECK(!buf_contains(wire, wire_len, "Transfer-Encoding", 17));
+    CHECK(buf_contains(wire, wire_len, "\r\n\r\nWikipedia", 13));
+}
+
 // Large Content-Length response body that requires multiple recv→send cycles.
 // SmallLoop has 4KB buffers. A 10KB body needs 3 recv→send cycles.
 TEST(streaming, large_content_length) {
@@ -9319,6 +9464,7 @@ TEST(metadata, format_static_response_wire_format) {
         {200, "OK", 2, true},
         {201, "Created", 7, false},
         {204, "No Content", 0, true},
+        {205, "Unknown", 0, true},
         {301, "Moved Permanently", 17, false},
         {302, "Found", 5, true},
         {304, "Not Modified", 0, false},
@@ -9411,6 +9557,22 @@ TEST(metadata, format_static_response_wire_format) {
 
         conn.send_buf.bind(nullptr, 0);
     }
+}
+
+TEST(metadata, response_formatter_suppresses_body_for_205) {
+    Connection conn;
+    conn.reset();
+    u8 send_storage[4096];
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    format_response_with_body_and_headers(
+        conn, 205, "must-not-emit", 13, nullptr, 0, /*keep_alive=*/true);
+
+    const char* wire = reinterpret_cast<const char*>(conn.send_buf.data());
+    const u32 wire_len = conn.send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "HTTP/1.1 205", 12));
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 0\r\n", 19));
+    CHECK(!buf_contains(wire, wire_len, "must-not-emit", 13));
 }
 
 TEST(early_response, prepare_state_direct_content_length_body) {

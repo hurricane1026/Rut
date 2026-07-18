@@ -1459,6 +1459,16 @@ struct Parser {
                         if (!val) return core::make_unexpected(val.error());
                         stmt.forward_set_path = val.value()->text;
                         stmt.has_forward_set_path = true;
+                    } else if (kw_text.eq({"buffered", 8})) {
+                        if (stmt.forward_buffered)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        if (!take(TokenType::KwTrue))
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                span_from(cur()),
+                                lit_str("forward buffered mode requires `buffered: true`"));
+                        stmt.forward_buffered = true;
                     } else if (kw_text.eq({"set_header", 10})) {
                         // set_header: { "Name": "Value", ... } — request-header
                         // overrides applied to the outbound proxied request. Same

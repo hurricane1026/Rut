@@ -436,6 +436,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RetForward:
             buf.put_cstr("ret.forward");
             break;
+        case Opcode::RetForwardBuffered:
+            buf.put_cstr("ret.forward_buffered");
+            break;
         case Opcode::YieldTimer:
             buf.put_cstr("yield.timer");
             break;
@@ -841,6 +844,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             }
             break;
         case Opcode::RetForward:
+        case Opcode::RetForwardBuffered:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;
