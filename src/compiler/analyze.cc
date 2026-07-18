@@ -34,8 +34,9 @@ static Str intern_generated_name(const std::string& value) {
 
 constexpr Str kJsonLiteralDetail =
     lit_str("json currently accepts only literal bool/int/string/nil/array/object values");
-constexpr Str kReturnBodyExprDetail =
-    lit_str("return body expressions currently support json(literal) only");
+constexpr Str kReturnBodyExprDetail = lit_str(
+    "return body expressions require json(...) with a supported literal or declared "
+    "struct value");
 
 static bool append_json_bytes(std::string& out, const char* data, u32 len) {
     static constexpr u32 kMaxJsonLiteralBytes = 64 * 1024;
@@ -10039,6 +10040,30 @@ static FrontendResult<void> build_dynamic_json_plan(
 
     auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!value) return core::make_unexpected(value.error());
+    if (value->type == HirTypeKind::Struct && !value->may_nil && !value->may_error) {
+        if (value->struct_index >= mod.structs.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        const auto& decl = mod.structs[value->struct_index];
+        if (!append_json_bytes(segments.back(), "{", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        for (u32 i = 0; i < decl.fields.len; i++) {
+            if ((i != 0 && !append_json_bytes(segments.back(), ",", 1)) ||
+                !append_json_quoted(segments.back(), decl.fields[i].name) ||
+                !append_json_bytes(segments.back(), ":", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            AstExpr field{};
+            field.kind = AstExprKind::Field;
+            field.span = expr.span;
+            field.lhs = const_cast<AstExpr*>(&expr);
+            field.name = decl.fields[i].name;
+            auto child =
+                build_dynamic_json_plan(field, route, mod, segments, value_refs, depth + 1);
+            if (!child) return child;
+        }
+        if (!append_json_bytes(segments.back(), "}", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
     if ((value->type != HirTypeKind::Bool && value->type != HirTypeKind::I32 &&
          value->type != HirTypeKind::I64 && value->type != HirTypeKind::Str) ||
         value->may_nil || value->may_error)
