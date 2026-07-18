@@ -1952,6 +1952,14 @@ struct Parser {
             stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return stmt;
         }
+        if (cur().type == TokenType::KwBreak || cur().type == TokenType::KwContinue) {
+            const bool is_break = cur().type == TokenType::KwBreak;
+            const Token* keyword = take(cur().type);
+            AstStatement stmt{};
+            stmt.kind = is_break ? AstStmtKind::Break : AstStmtKind::Continue;
+            stmt.span = span_from(*keyword);
+            return stmt;
+        }
         if (take(TokenType::KwIf)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
             // `if let name = expr { ... } else { ... }` — value-binding form

@@ -10356,6 +10356,29 @@ static bool is_ast_hir_terminator(const AstStatement& stmt) {
            stmt.kind == AstStmtKind::ForwardUpstream;
 }
 
+static bool is_ast_for_branch(const AstStatement& stmt) {
+    return is_ast_hir_terminator(stmt) || stmt.kind == AstStmtKind::Break ||
+           stmt.kind == AstStmtKind::Continue;
+}
+
+static FrontendResult<HirForLoopBranch> analyze_for_branch(const AstStatement& stmt,
+                                                           HirModule& mod) {
+    HirForLoopBranch branch{};
+    if (stmt.kind == AstStmtKind::Break) {
+        branch.kind = HirForLoopBranch::Kind::Break;
+        return branch;
+    }
+    if (stmt.kind == AstStmtKind::Continue) {
+        branch.kind = HirForLoopBranch::Kind::Continue;
+        return branch;
+    }
+    auto term = analyze_term(stmt, mod);
+    if (!term) return core::make_unexpected(term.error());
+    branch.kind = HirForLoopBranch::Kind::Term;
+    branch.term = term.value();
+    return branch;
+}
+
 static bool terminator_reads_any_local(const HirTerminator& term,
                                        const HirLocal* locals,
                                        u32 local_count) {
@@ -13648,6 +13671,21 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
     for (u32 bi = 0; bi < body_item_count; bi++) {
         const AstStatement& bstmt =
             (body->kind == AstStmtKind::Block) ? *body->block_stmts[bi] : *body;
+        if (loop.body.has_loop_control)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                bstmt.span,
+                lit_str("static for-loop body cannot continue after break or continue"));
+        if (bstmt.kind == AstStmtKind::Break || bstmt.kind == AstStmtKind::Continue) {
+            HirForLoopBody::Step step{};
+            step.kind = bstmt.kind == AstStmtKind::Break ? HirForLoopBody::Step::Kind::Break
+                                                         : HirForLoopBody::Step::Kind::Continue;
+            step.span = bstmt.span;
+            if (!loop.body.steps.push(step))
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            loop.body.has_loop_control = true;
+            continue;
+        }
         if (bstmt.kind == AstStmtKind::Let) {
             if (loop.body.has_term)
                 return frontend_error(
@@ -13755,6 +13793,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         bstmt.expr.span,
                         lit_str("guard match inside static for-loop requires an error value"));
                 }
+            } else if (bstmt.else_stmt->kind == AstStmtKind::Break ||
+                       bstmt.else_stmt->kind == AstStmtKind::Continue) {
+                guard.fail_kind = HirGuard::FailKind::LoopControl;
+                guard.fail_loop_control = bstmt.else_stmt->kind == AstStmtKind::Break
+                                              ? HirLoopControl::Break
+                                              : HirLoopControl::Continue;
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
                 auto fail = analyze_term(*bstmt.else_stmt, mod);
                 if (!fail) return core::make_unexpected(fail.error());
@@ -13875,7 +13919,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
             const auto simple_branch = [](const AstStatement& branch) {
-                return is_ast_hir_terminator(branch);
+                return is_ast_for_branch(branch);
             };
             if (bstmt.then_stmt == nullptr || bstmt.else_stmt == nullptr ||
                 !simple_branch(*bstmt.then_stmt) || !simple_branch(*bstmt.else_stmt))
@@ -13891,16 +13935,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bstmt.expr.span,
                     lit_str("static for-loop if condition must be a non-fallible bool"));
             body_if.cond = cond.value();
-            auto then_term = analyze_term(*bstmt.then_stmt, mod);
-            if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*bstmt.else_stmt, mod);
-            if (!else_term) return core::make_unexpected(else_term.error());
-            body_if.then_term = then_term.value();
-            body_if.else_term = else_term.value();
+            auto then_branch = analyze_for_branch(*bstmt.then_stmt, mod);
+            if (!then_branch) return core::make_unexpected(then_branch.error());
+            auto else_branch = analyze_for_branch(*bstmt.else_stmt, mod);
+            if (!else_branch) return core::make_unexpected(else_branch.error());
+            body_if.then_branch = then_branch.value();
+            body_if.else_branch = else_branch.value();
             const u32 if_index = loop.body.ifs.len;
             if (!loop.body.ifs.push(body_if))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
-            loop.body.has_term = true;
+            loop.body.has_term = body_if.then_branch.kind == HirForLoopBranch::Kind::Term &&
+                                 body_if.else_branch.kind == HirForLoopBranch::Kind::Term;
+            loop.body.has_loop_control = !loop.body.has_term;
             HirForLoopBody::Step step{};
             step.kind = HirForLoopBody::Step::Kind::If;
             step.index = if_index;
@@ -14139,7 +14185,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         }
                         if (inner_arm.stmt->kind == AstStmtKind::If) {
                             const auto simple_branch = [](const AstStatement& branch) {
-                                return is_ast_hir_terminator(branch);
+                                return is_ast_for_branch(branch);
                             };
                             if (inner_arm.stmt->then_stmt == nullptr ||
                                 inner_arm.stmt->else_stmt == nullptr ||
@@ -14161,18 +14207,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
-                            auto then_term = analyze_term(*inner_arm.stmt->then_stmt, mod);
-                            if (!then_term) return core::make_unexpected(then_term.error());
-                            auto else_term = analyze_term(*inner_arm.stmt->else_stmt, mod);
-                            if (!else_term) return core::make_unexpected(else_term.error());
+                            auto then_branch = analyze_for_branch(*inner_arm.stmt->then_stmt, mod);
+                            if (!then_branch) return core::make_unexpected(then_branch.error());
+                            auto else_branch = analyze_for_branch(*inner_arm.stmt->else_stmt, mod);
+                            if (!else_branch) return core::make_unexpected(else_branch.error());
                             arm.body_kind = HirForLoopMatchArm::BodyKind::If;
                             arm.cond = cond_expr.value();
-                            arm.then_term = then_term.value();
-                            arm.else_term = else_term.value();
-                        } else if (is_ast_hir_terminator(*inner_arm.stmt)) {
-                            auto term = analyze_term(*inner_arm.stmt, mod);
-                            if (!term) return core::make_unexpected(term.error());
-                            arm.direct_term = term.value();
+                            arm.then_branch = then_branch.value();
+                            arm.else_branch = else_branch.value();
+                        } else if (is_ast_for_branch(*inner_arm.stmt)) {
+                            auto branch = analyze_for_branch(*inner_arm.stmt, mod);
+                            if (!branch) return core::make_unexpected(branch.error());
+                            arm.direct_branch = branch.value();
                         } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   inner_arm.stmt->span);
@@ -14414,7 +14460,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                 "error value"));
                                 }
                             } else {
-                                if (is_ast_hir_terminator(*inner.else_stmt)) {
+                                if (inner.else_stmt->kind == AstStmtKind::Break ||
+                                    inner.else_stmt->kind == AstStmtKind::Continue) {
+                                    guard.fail_kind = HirGuard::FailKind::LoopControl;
+                                    guard.fail_loop_control =
+                                        inner.else_stmt->kind == AstStmtKind::Break
+                                            ? HirLoopControl::Break
+                                            : HirLoopControl::Continue;
+                                } else if (is_ast_hir_terminator(*inner.else_stmt)) {
                                     auto fail = analyze_term(*inner.else_stmt, mod);
                                     if (!fail) return core::make_unexpected(fail.error());
                                     guard.fail_term = fail.value();
@@ -14663,7 +14716,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         }
                         if (inner_ast_arm.stmt->kind == AstStmtKind::If) {
                             const auto simple_branch = [](const AstStatement& branch) {
-                                return is_ast_hir_terminator(branch);
+                                return is_ast_for_branch(branch);
                             };
                             if (inner_ast_arm.stmt->then_stmt == nullptr ||
                                 inner_ast_arm.stmt->else_stmt == nullptr ||
@@ -14684,19 +14737,21 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_ast_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
-                            auto then_term = analyze_term(*inner_ast_arm.stmt->then_stmt, mod);
-                            if (!then_term) return core::make_unexpected(then_term.error());
-                            auto else_term = analyze_term(*inner_ast_arm.stmt->else_stmt, mod);
-                            if (!else_term) return core::make_unexpected(else_term.error());
+                            auto then_branch =
+                                analyze_for_branch(*inner_ast_arm.stmt->then_stmt, mod);
+                            if (!then_branch) return core::make_unexpected(then_branch.error());
+                            auto else_branch =
+                                analyze_for_branch(*inner_ast_arm.stmt->else_stmt, mod);
+                            if (!else_branch) return core::make_unexpected(else_branch.error());
                             expanded.body_kind = HirForLoopMatchArm::BodyKind::If;
                             expanded.cond = cond.value();
-                            expanded.then_term = then_term.value();
-                            expanded.else_term = else_term.value();
-                        } else if (is_ast_hir_terminator(*inner_ast_arm.stmt)) {
-                            auto term = analyze_term(*inner_ast_arm.stmt, mod);
-                            if (!term) return core::make_unexpected(term.error());
+                            expanded.then_branch = then_branch.value();
+                            expanded.else_branch = else_branch.value();
+                        } else if (is_ast_for_branch(*inner_ast_arm.stmt)) {
+                            auto branch = analyze_for_branch(*inner_ast_arm.stmt, mod);
+                            if (!branch) return core::make_unexpected(branch.error());
                             expanded.body_kind = HirForLoopMatchArm::BodyKind::Direct;
-                            expanded.direct_term = term.value();
+                            expanded.direct_branch = branch.value();
                         } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   inner_ast_arm.stmt->span);
@@ -14710,7 +14765,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 }
                 if (arm_stmt->kind == AstStmtKind::If) {
                     const auto simple_branch = [](const AstStatement& branch) {
-                        return is_ast_hir_terminator(branch);
+                        return is_ast_for_branch(branch);
                     };
                     if (arm_stmt->then_stmt == nullptr || arm_stmt->else_stmt == nullptr ||
                         !simple_branch(*arm_stmt->then_stmt) ||
@@ -14725,18 +14780,18 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             arm_stmt->expr.span,
                             lit_str("static for-loop match-arm if condition must be a "
                                     "non-fallible bool"));
-                    auto then_term = analyze_term(*arm_stmt->then_stmt, mod);
-                    if (!then_term) return core::make_unexpected(then_term.error());
-                    auto else_term = analyze_term(*arm_stmt->else_stmt, mod);
-                    if (!else_term) return core::make_unexpected(else_term.error());
+                    auto then_branch = analyze_for_branch(*arm_stmt->then_stmt, mod);
+                    if (!then_branch) return core::make_unexpected(then_branch.error());
+                    auto else_branch = analyze_for_branch(*arm_stmt->else_stmt, mod);
+                    if (!else_branch) return core::make_unexpected(else_branch.error());
                     arm.body_kind = HirForLoopMatchArm::BodyKind::If;
                     arm.cond = cond.value();
-                    arm.then_term = then_term.value();
-                    arm.else_term = else_term.value();
-                } else if (is_ast_hir_terminator(*arm_stmt)) {
-                    auto term = analyze_term(*arm_stmt, mod);
-                    if (!term) return core::make_unexpected(term.error());
-                    arm.direct_term = term.value();
+                    arm.then_branch = then_branch.value();
+                    arm.else_branch = else_branch.value();
+                } else if (is_ast_for_branch(*arm_stmt)) {
+                    auto branch = analyze_for_branch(*arm_stmt, mod);
+                    if (!branch) return core::make_unexpected(branch.error());
+                    arm.direct_branch = branch.value();
                 } else {
                     return frontend_error(FrontendError::UnsupportedSyntax, arm_stmt->span);
                 }
@@ -14747,7 +14802,32 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             const u32 match_index = loop.body.matches.len;
             if (!loop.body.matches.push(body_match))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
-            loop.body.has_term = true;
+            bool all_match_arms_terminate_route = true;
+            bool any_match_arm_controls_loop = false;
+            for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                const auto& arm = body_match.arms[ai];
+                for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                    if (arm.guards[gi].fail_kind == HirGuard::FailKind::LoopControl) {
+                        all_match_arms_terminate_route = false;
+                        any_match_arm_controls_loop = true;
+                    }
+                }
+                if (arm.body_kind == HirForLoopMatchArm::BodyKind::Direct) {
+                    all_match_arms_terminate_route &=
+                        arm.direct_branch.kind == HirForLoopBranch::Kind::Term;
+                    any_match_arm_controls_loop |=
+                        arm.direct_branch.kind != HirForLoopBranch::Kind::Term;
+                } else {
+                    all_match_arms_terminate_route &=
+                        arm.then_branch.kind == HirForLoopBranch::Kind::Term &&
+                        arm.else_branch.kind == HirForLoopBranch::Kind::Term;
+                    any_match_arm_controls_loop |=
+                        arm.then_branch.kind != HirForLoopBranch::Kind::Term ||
+                        arm.else_branch.kind != HirForLoopBranch::Kind::Term;
+                }
+            }
+            loop.body.has_term = all_match_arms_terminate_route;
+            loop.body.has_loop_control = any_match_arm_controls_loop;
             HirForLoopBody::Step step{};
             step.kind = HirForLoopBody::Step::Kind::Match;
             step.index = match_index;
@@ -14871,6 +14951,10 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
             return frontend_error(FrontendError::UnsupportedSyntax, body_span, kTimerReqDetail);
         return {};
     };
+    auto check_for_branch = [&](const HirForLoopBranch& branch) -> FrontendResult<void> {
+        if (branch.kind != HirForLoopBranch::Kind::Term) return {};
+        return check_term(branch.term);
+    };
     auto check_guard_body = [&](const HirGuardBody& body) -> FrontendResult<void> {
         for (u32 li = 0; li < body.locals.len; li++) {
             auto ok = check_expr(body.locals[li].init);
@@ -14966,11 +15050,11 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
             auto g_ok = check_guard(arm.guards[gi]);
             if (!g_ok) return g_ok;
         }
-        auto then_ok = check_term(arm.then_term);
+        auto then_ok = check_for_branch(arm.then_branch);
         if (!then_ok) return then_ok;
-        auto else_ok = check_term(arm.else_term);
+        auto else_ok = check_for_branch(arm.else_branch);
         if (!else_ok) return else_ok;
-        return check_term(arm.direct_term);
+        return check_for_branch(arm.direct_branch);
     };
     for (u32 fi = 0; fi < route.for_loops.len; fi++) {
         const auto& loop = route.for_loops[fi];
@@ -14988,9 +15072,9 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
         for (u32 ii = 0; ii < body.ifs.len; ii++) {
             auto c_ok = check_expr(body.ifs[ii].cond);
             if (!c_ok) return c_ok;
-            auto t_ok = check_term(body.ifs[ii].then_term);
+            auto t_ok = check_for_branch(body.ifs[ii].then_branch);
             if (!t_ok) return t_ok;
-            auto e_ok = check_term(body.ifs[ii].else_term);
+            auto e_ok = check_for_branch(body.ifs[ii].else_branch);
             if (!e_ok) return e_ok;
         }
         for (u32 mi = 0; mi < body.matches.len; mi++) {
@@ -19277,6 +19361,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto loop = analyze_for_stmt(stmt, &route, mod);
                 if (!loop) return core::make_unexpected(loop.error());
                 continue;
+            }
+            if (stmt.kind == AstStmtKind::Break || stmt.kind == AstStmtKind::Continue) {
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.span,
+                    stmt.kind == AstStmtKind::Break
+                        ? lit_str("break is only valid inside a verifier-bounded for-loop")
+                        : lit_str("continue is only valid inside a verifier-bounded for-loop"));
             }
             const HirLocal* dynamic_response = nullptr;
             for (u32 li = 0; li < route.locals.len; li++) {

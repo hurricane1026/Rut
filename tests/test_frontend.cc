@@ -24364,6 +24364,50 @@ TEST(frontend, bounded_static_for_rejects_runtime_iterators_and_cfg_overflow) {
     CHECK(overflow_mir.error().detail.eq(lit("static for-loop block budget exceeded")));
 }
 
+TEST(frontend, bounded_static_for_direct_break_and_continue_verify_cfg) {
+    const char* src =
+        "route GET \"/continue\" { for item in [1, 2, 3] { continue } return 204 }\n"
+        "route GET \"/break\" { for item in [1, 2, 3] { break } return 205 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 2u);
+    CHECK_EQ(mir->functions[0].blocks.len, 4u);
+    CHECK_EQ(mir->functions[1].blocks.len, 2u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, break_and_continue_reject_outside_bounded_for) {
+    struct Case {
+        const char* keyword;
+        Str detail;
+    };
+    const Case cases[] = {
+        {"break", lit("break is only valid inside a verifier-bounded for-loop")},
+        {"continue", lit("continue is only valid inside a verifier-bounded for-loop")},
+    };
+    for (const auto& test : cases) {
+        char src[96]{};
+        const int len = std::snprintf(src, sizeof(src), "route GET \"/x\" { %s }\n", test.keyword);
+        REQUIRE(len > 0);
+        auto lexed = lex({src, static_cast<u32>(len)});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(test.detail));
+    }
+}
+
 #if 0
 TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";

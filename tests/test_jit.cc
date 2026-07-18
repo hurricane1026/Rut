@@ -1556,6 +1556,7 @@ route GET "/accepted" {
     for item in [1, 2, 3] { guard item > 0 else { return 400 } }
     return 204
 }
+
 route GET "/rejected" {
     for item in [1, 0, 3] { guard item > 0 else { return 422 } }
     return 204
@@ -1599,6 +1600,286 @@ route GET "/rejected" {
                                                     nullptr);
     CHECK_EQ(rejected_result.status_code, 422u);
 
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_guard_break_and_continue_take_distinct_targets) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [1, 0, -1] {
+        guard item != 0 else { continue }
+        guard item > 0 else { return 422 }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [1, 0, -1] {
+        guard item != 0 else { break }
+        guard item > 0 else { return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_if_break_and_continue_take_distinct_targets) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, -1] {
+        if item == 0 { continue } else { return 422 }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [0, -1] {
+        if item == 0 { break } else { return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_match_break_and_continue_take_distinct_targets) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, -1] {
+        match item { 0 => continue _ => return 422 }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [0, -1] {
+        match item { 0 => break _ => return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bounded_static_for_match_prelude_guard_controls_the_current_loop) {
+    const auto src = R"rut(
+route GET "/continue" {
+    for item in [0, -1] {
+        match item {
+            0 => { guard false else { continue } return 421 }
+            _ => return 422
+        }
+    }
+    return 204
+}
+route GET "/break" {
+    for item in [0, -1] {
+        match item {
+            0 => { guard false else { break } return 423 }
+            _ => return 424
+        }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(continue_handler != nullptr);
+    REQUIRE(break_handler != nullptr);
+    TestHandlerCtxFrame continue_frame{};
+    TestHandlerCtxFrame break_frame{};
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    CHECK_EQ(continued.status_code, 422u);
+    CHECK_EQ(broken.status_code, 205u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, nested_bounded_static_for_controls_target_innermost_loop) {
+    const auto src = R"rut(
+route GET "/break" {
+    for outer in [1, -1] {
+        for inner in [1, 2] { break }
+        guard outer > 0 else { return 422 }
+    }
+    return 204
+}
+route GET "/continue" {
+    for outer in [1, -1] {
+        for inner in [1, 2] { continue }
+        guard outer > 0 else { return 423 }
+    }
+    return 205
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto break_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto continue_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(break_handler != nullptr);
+    REQUIRE(continue_handler != nullptr);
+    TestHandlerCtxFrame break_frame{};
+    TestHandlerCtxFrame continue_frame{};
+    const auto broken = invoke_jit_handler(break_handler,
+                                           nullptr,
+                                           break_frame.ctx,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr);
+    const auto continued = invoke_jit_handler(continue_handler,
+                                              nullptr,
+                                              continue_frame.ctx,
+                                              reinterpret_cast<const u8*>(kGetApiRequest),
+                                              sizeof(kGetApiRequest) - 1,
+                                              nullptr);
+    CHECK_EQ(broken.status_code, 422u);
+    CHECK_EQ(continued.status_code, 423u);
     engine.shutdown();
     rir.destroy();
 }

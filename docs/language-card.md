@@ -113,9 +113,10 @@ match status {                            // general dispatch — no `case` keyw
 }
 
 for item in [1, 2, 3] {                   // compile-time array only; bounded unroll, no while
-    guard item > 0 else { return 400 }
+    guard item >= 0 else { break }
+    guard item != 0 else { continue }
 }
-// ⏳ break / continue inside bounded `for`
+// break / continue target the innermost bounded `for`; no labels or loop else
 
 defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)
 ```

@@ -46,15 +46,20 @@ enum class AstStmtKind : u8 {
     //   - expr        = iteration source expression (must type-check as Array<T>)
     //   - then_stmt   = body block (via parse_braced_stmt_body; may be a single
     //                   stmt if the block contained exactly one stmt)
-    // No break / continue / else / labels (spec §3.3.9: every iteration runs
-    // to completion). Analyze (Phase 3b) enforces the iteration source is
-    // array-typed and compile-time-sized and builds a HirForLoop. `inline for`
-    // is not accepted as a compatibility spelling; static `for` is the single
-    // canonical loop surface. MIR build unrolls supported static for-loops into
-    // a source-ordered route step chain for Direct, if, and match route control
-    // — see mir_build.cc.
+    // There is no loop `else` or labeled control. `break` / `continue` are
+    // accepted only inside a verifier-bounded loop and target the innermost
+    // loop. Analyze (Phase 3b) enforces the iteration source is array-typed and
+    // compile-time-sized and builds a HirForLoop. `inline for` is not accepted
+    // as a compatibility spelling; static `for` is the single canonical loop
+    // surface. MIR build unrolls supported static for-loops into a
+    // source-ordered route CFG — see mir_build.cc.
     // Runtime iterables remain later work.
     For,
+    // Loop control is legal only while analyzing a verifier-bounded `For`.
+    // Labels are intentionally absent: nested controls always target the
+    // innermost loop, matching Swift's unlabeled spelling.
+    Break,
+    Continue,
 };
 
 enum class WaitEventKind : u8 {

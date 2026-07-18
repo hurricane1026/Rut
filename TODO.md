@@ -21,7 +21,6 @@ connected end to end.
 
 ### Remaining syntax migration
 
-- Implement `break`/`continue` only for verifier-bounded `for` loops.
 - Migrate remaining `.rut` examples and topic docs to
   `docs/syntax-stability.md` Core spellings.
 - Add a fixture gate that parses and type-checks every unmarked executable
@@ -87,6 +86,9 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Unlabeled `break`/`continue` lower only inside verifier-bounded static
+  `for`, work through direct, guard, if, match, and nested-loop CFG paths, and
+  always target the innermost loop without introducing runtime back edges.
 - [x] Static `for` accepts only compile-time array literals or aliases, unrolls
   under the MIR/verifier block budget, rejects every runtime iterator and wait
   combination, and executes through the same JIT CFG as hand-written guards.
