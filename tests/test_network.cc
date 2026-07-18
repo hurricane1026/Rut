@@ -16128,6 +16128,38 @@ TEST(http2, forward_request_applies_jit_path_and_header_overrides) {
     CHECK(rewritten.find("X-Added: yes\r\n") != std::string::npos);
 }
 
+TEST(http2, forward_request_rejects_unrepresentable_overrides) {
+    Connection conn;
+    conn.reset();
+    static const char request[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 out[128]{};
+    u32 out_len = 0;
+
+    CHECK_FALSE(h2_prepare_forward_request(conn,
+                                           reinterpret_cast<const u8*>(request),
+                                           sizeof(request) - 1,
+                                           out,
+                                           sizeof(request) - 2,
+                                           &out_len));
+
+    static const char malformed[] = "GET / HTTP/1.1\r\nHost: x\r\n";
+    CHECK_FALSE(h2_prepare_forward_request(conn,
+                                           reinterpret_cast<const u8*>(malformed),
+                                           sizeof(malformed) - 1,
+                                           out,
+                                           sizeof(out),
+                                           &out_len));
+
+    conn.req_path_overridden = true;
+    conn.req_path_override = {"", 0};
+    CHECK_FALSE(h2_prepare_forward_request(conn,
+                                           reinterpret_cast<const u8*>(request),
+                                           sizeof(request) - 1,
+                                           out,
+                                           sizeof(out),
+                                           &out_len));
+}
+
 TEST(http2, new_request_reset_clears_connection_wide_mutations) {
     Connection conn;
     conn.reset();
