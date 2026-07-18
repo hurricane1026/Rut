@@ -32041,6 +32041,23 @@ TEST(frontend, json_rejects_duplicate_object_fields) {
     CHECK(hir.error().detail.eq(lit("json object field names must be unique")));
 }
 
+TEST(frontend, json_rejects_excessive_literal_depth_deterministically) {
+    std::string src = "route GET \"/x\" { let payload = json(";
+    for (u32 i = 0; i < 34; i++) src += '[';
+    src += "true";
+    for (u32 i = 0; i < 34; i++) src += ']';
+    src += ") return 200 }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+    CHECK(hir.error().detail.eq(
+        lit("json currently accepts only literal bool/int/string/nil/array/object values")));
+}
+
 TEST(frontend, return_body_expression_rejects_non_json_calls) {
     const char* src = "route GET \"/x\" { return 200, req.path }\n";
     auto lexed = lex(lit(src));

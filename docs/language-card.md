@@ -84,6 +84,13 @@ bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 Statements end at newline (no semicolons). Blocks need no commas between items.
 Comments: `// line only`.
 
+JSON objects preserve source order; declared structs use field declaration
+order, and arrays/string-list views preserve carrier order. Duplicate object
+keys are a compile error rather than last-write-wins. Runtime strings are JSON
+escaped at the sink. A direct dynamic JSON response is capped at 7 KiB, while a
+`Response.body` mutation is capped at 4 KiB so it can remain stream-owned across
+resume; either overflow fails closed as 500 and never publishes a partial body.
+
 ## Bindings and control flow
 
 ```swift

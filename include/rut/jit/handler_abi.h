@@ -127,6 +127,7 @@ struct HandlerResult {
 
 inline constexpr u32 kMaxResponseHeaderMutations = 16;
 inline constexpr u32 kMaxResponseBodyMutationBytes = 4096;
+inline constexpr u32 kMaxDynamicJsonResponseBytes = 7 * 1024;
 enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
 struct ResponseHeaderMutation {
     Str name;

@@ -78,6 +78,48 @@ bool publish_terminal(const HarnessSpec& spec,
     return false;
 }
 
+bool publish_response_body(const HarnessSpec& spec,
+                           HarnessResult& result,
+                           const Connection& connection,
+                           u64 timestamp_us) {
+    if (result.semantic_events >= spec.limits.max_semantic_events) {
+        result.outcome = Outcome::Failed;
+        result.has_reached_limit = true;
+        result.reached_limit = LimitKind::SemanticEvents;
+        copy_detail(result, "semantic-events limit reached");
+        return false;
+    }
+
+    const u8* response = connection.send_buf.data();
+    const u32 response_len = connection.send_buf.len();
+    u32 body_offset = response_len;
+    for (u32 i = 0; i + 3 < response_len; i++) {
+        if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+            response[i + 3] == '\n') {
+            body_offset = i + 4;
+            break;
+        }
+    }
+
+    constexpr u32 kMaxObservedBodyLen = 4096;
+    const u32 body_len = response_len - body_offset;
+    const u32 observed_len = body_len < kMaxObservedBodyLen ? body_len : kMaxObservedBodyLen;
+    Observation event{};
+    event.kind = ObservationKind::ResponseBodyProduced;
+    event.phase = Phase::Observe;
+    event.sequence = result.semantic_events;
+    event.timestamp_us = timestamp_us;
+    event.value0 = body_len;
+    event.value1 = observed_len != body_len ? 1 : 0;
+    event.label = {reinterpret_cast<const char*>(response + body_offset), observed_len};
+    result.semantic_events++;
+    if (spec.observations.publish(event)) return true;
+
+    result.outcome = Outcome::Mismatched;
+    copy_detail(result, "observation rejected by oracle");
+    return false;
+}
+
 bool publish_route_selected(const HarnessSpec& spec,
                             HarnessResult& result,
                             u32 route_index,
@@ -490,6 +532,10 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
 
     if (out.has_terminal && out.harness.outcome == Outcome::Passed)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
+
+    if (out.has_terminal && out.terminal.action == jit::HandlerAction::ReturnStatus &&
+        out.harness.outcome == Outcome::Passed)
+        (void)publish_response_body(harness, out.harness, connection.connection, scenario.now_us);
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal &&
         !expectation_matches(scenario.expected, out.terminal)) {
