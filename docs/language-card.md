@@ -51,10 +51,11 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
 json({ users: [], total: 0 })           // literal object/array serialization ✅
-json({ path: req.path })                // ✅ in direct return; bounded scalar slots
+json({ path: req.path })                // ✅ reusable bounded JSON value
 json(payload)                           // ✅ declared struct; declaration-order fields
 json({ tags: req.queryAll("tag") })     // ✅ ordered bounded string-list array
 json({ tags: [req.path, "static"] })    // ✅ bounded Array<T>; nested/struct elements recurse
+func envelope(path: str) -> Json => json({ path: path })
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
@@ -227,6 +228,8 @@ resp.remove("Server")             // ✅ literal delete
 resp.add("Set-Cookie", "a=1")     // ✅ literal append/multi-value
 resp.header("Retry-After")        // ✅ str?; observes prior set/add/remove mutations
 resp.body = "retry later"         // ✅ bounded plain-string body replacement
+let body = json({ ok: true, path: req.path })
+resp.body = body                  // ✅ reusable JSON; serialized at the body sink
 resp.status = 503                 // ✅ StatusCode replacement
 return resp
 return 200, json({ ok: true, items: [] }) // ✅ compact literal JSON body
@@ -241,9 +244,10 @@ responses. Mutations stay pending until the selected success terminator, so a
 guard or pre-middleware short circuit cannot inherit them. Applying any of these
 mutations to a forwarded response still requires explicit buffered forwarding.
 Status/body writes use the same resumable commit boundary as headers and may be
-used by `chain after` after a yield. Body replacement is a bounded plain `str`
-view (4 KiB maximum); overflow or a runtime status outside 100...599 fails
-closed as 500. Reading either field, assigning `json(...)`, and mutating a
+used by `chain after` after a yield. Body replacement owns up to 4 KiB in the
+request/stream context; plain `str` and reusable `Json` values therefore survive
+resume without borrowing serializer scratch. Overflow or a runtime status
+outside 100...599 fails closed as 500. Reading either field and mutating a
 streaming forwarded response remain ⏳.
 
 ## State types (top-level, per-shard, bounded)

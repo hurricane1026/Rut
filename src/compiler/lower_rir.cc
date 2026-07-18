@@ -1302,6 +1302,45 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!created) return frontend_error(FrontendError::OutOfMemory, span);
         return created.value();
     }
+    if (value.kind == MirValueKind::JsonBuild) {
+        if (!b.emit_json_reset({span.line, span.col}))
+            return frontend_error(FrontendError::OutOfMemory, span);
+        for (u32 i = 0; i < value.field_inits.len; i++) {
+            const auto& part = value.field_inits[i];
+            if (part.value == nullptr || !b.emit_json_append_raw(part.name, {span.line, span.col}))
+                return frontend_error(FrontendError::OutOfMemory, span);
+            auto leaf = materialize_value(*part.value,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          span);
+            if (!leaf) return core::make_unexpected(leaf.error());
+            const auto kind = b.cur_func->values[leaf->id].type->kind;
+            const auto op = kind == rir::TypeKind::Bool      ? rir::Opcode::JsonAppendBool
+                            : kind == rir::TypeKind::I32     ? rir::Opcode::JsonAppendI32
+                            : kind == rir::TypeKind::I64     ? rir::Opcode::JsonAppendI64
+                            : kind == rir::TypeKind::Str     ? rir::Opcode::JsonAppendStr
+                            : kind == rir::TypeKind::StrList ? rir::Opcode::JsonAppendStrList
+                            : kind == rir::TypeKind::Array   ? rir::Opcode::JsonAppendArray
+                                                             : rir::Opcode::JsonFinish;
+            if (op == rir::Opcode::JsonFinish ||
+                !b.emit_json_append(op, leaf.value(), {span.line, span.col}))
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+        }
+        if (!b.emit_json_append_raw(value.str_value, {span.line, span.col}))
+            return frontend_error(FrontendError::OutOfMemory, span);
+        auto captured = b.emit_json_capture({span.line, span.col});
+        if (!captured) return frontend_error(FrontendError::OutOfMemory, span);
+        return captured.value();
+    }
     if (value.kind == MirValueKind::RegexMatch) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
