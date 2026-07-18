@@ -16,9 +16,11 @@ declared structs in direct responses are implemented. Struct keys follow field
 declaration order and scalar leaves share the existing eight-slot bound. The
 serializer uses shard-owned scratch, escapes strings at runtime, and turns
 capacity overflow into a 500 rather than publishing partial JSON. Remaining
-work: dynamic array carriers and reusable `json(...)` values outside a direct
-return. Replay now publishes the exact bounded response body bytes to harness
-oracles, with the full length and explicit truncation state.
+work: generic `Array<T>` runtime carriers and reusable `json(...)` values
+outside a direct return. Bounded runtime string-list views from `queryAll` and
+`getAll` serialize as ordered JSON arrays. Replay publishes the exact bounded
+response body bytes to harness oracles, with the full length and explicit
+truncation state.
 
 **Acceptance**:
 - Runtime size/depth overflow fails closed with a deterministic diagnostic.

@@ -1480,6 +1480,51 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_serializes_runtime_string_lists) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    return 200, json({ tags: req.queryAll("tag"), agents: req.getAll("X-Agent"), missing: req.queryAll("none") })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] =
+        "GET /api/users?tag=one&tag=two HTTP/1.1\r\nHost: test\r\nX-Agent: alpha\r\n"
+        "X-Agent: beta\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kRequest),
+                                            sizeof(kRequest) - 1,
+                                            nullptr);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(
+        lit("{\"tags\":[\"one\",\"two\"],\"agents\":[\"alpha\",\"beta\"],\"missing\":[]}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) {
     HandlerCtx ctx{};
     rut_helper_json_reset();
