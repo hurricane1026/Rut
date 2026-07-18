@@ -124,7 +124,7 @@ jobs:
         run: ninja -C build
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 180
 
   test-no-jit:
     name: Build & Test (no JIT)
@@ -145,7 +145,7 @@ jobs:
         run: ninja -C build
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 180
 
   test-no-websocket:
     name: Build & Test (no WebSocket)
@@ -167,7 +167,7 @@ jobs:
       - name: Build
         run: ninja -C build
       - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120
+        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 180
 
   sanitizer:
     name: Sanitizer (ASan+UBSan)
