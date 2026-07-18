@@ -346,6 +346,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::JsonAppendStrList:
             buf.put_cstr("json.append_str_list");
             break;
+        case Opcode::JsonAppendArray:
+            buf.put_cstr("json.append_array");
+            break;
         case Opcode::JsonFinish:
             buf.put_cstr("json.finish");
             break;
@@ -357,6 +360,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::BodyParse:
             buf.put_cstr("body.parse");
+            break;
+        case Opcode::ArrayCreate:
+            buf.put_cstr("array.create");
             break;
         case Opcode::OptNil:
             buf.put_cstr("opt.nil");
@@ -749,6 +755,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_type(buf, inst.imm.struct_ref.type);
             break;
+        case Opcode::ArrayCreate:
+            buf.put_cstr(" [");
+            for (u32 i = 0; i < inst.operand_count; i++) {
+                if (i != 0) buf.put_cstr(", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            buf.put(']');
+            break;
         case Opcode::CacheGet:
         case Opcode::CacheSet:
             buf.put(' ');
@@ -775,6 +789,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::JsonAppendI64:
         case Opcode::JsonAppendStr:
         case Opcode::JsonAppendStrList:
+        case Opcode::JsonAppendArray:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;

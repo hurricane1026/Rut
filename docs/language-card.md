@@ -54,6 +54,7 @@ json({ users: [], total: 0 })           // literal object/array serialization �
 json({ path: req.path })                // ✅ in direct return; bounded scalar slots
 json(payload)                           // ✅ declared struct; declaration-order fields
 json({ tags: req.queryAll("tag") })     // ✅ ordered bounded string-list array
+json({ tags: [req.path, "static"] })    // ✅ bounded Array<T>; nested/struct elements recurse
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)

@@ -25,6 +25,8 @@ struct SourceLoc {
     u32 col;
 };
 
+inline constexpr u32 kMaxArrayItems = 8;
+
 // ── Type System ─────────────────────────────────────────────────────
 // Mirrors Rutlang language types. Domain types are first-class so that
 // RIR-level optimizations can reason about them (e.g., CIDR containment
@@ -235,12 +237,14 @@ enum class Opcode : u8 {
     JsonAppendI64,      // append signed i64 operand
     JsonAppendStr,      // append escaped/quoted str operand
     JsonAppendStrList,  // append runtime ordered string view as a JSON array
+    JsonAppendArray,    // append a bounded generic Array<T> recursively
     JsonFinish,         // publish scratch through HandlerCtx
 
     // ── Struct operations ──
     StructField,     // %r = struct.field %s, "name"  → T
     StructCreate,    // %r = struct.create Name {...}  → Struct
     BodyParse,       // %r = body.parse TypeName       → T
+    ArrayCreate,     // %r = array.create [%a, %b, ...] → Array<T>
     ArrayLen,        // %r = array.len %arr            → i32
     ArrayGet,        // %r = array.get %arr, %idx      → T
     StrListLen,      // %r = str_list.len %list         → i32
