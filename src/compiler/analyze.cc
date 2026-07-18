@@ -30,6 +30,151 @@ static Str intern_generated_name(const std::string& value) {
     return {kept.c_str(), static_cast<u32>(kept.size())};
 }
 
+constexpr Str kJsonLiteralDetail =
+    lit_str("json currently accepts only literal bool/int/string/nil/array/object values");
+constexpr Str kReturnBodyExprDetail =
+    lit_str("return body expressions currently support json(literal) only");
+
+static bool append_json_bytes(std::string& out, const char* data, u32 len) {
+    static constexpr u32 kMaxJsonLiteralBytes = 64 * 1024;
+    if (out.size() > kMaxJsonLiteralBytes || len > kMaxJsonLiteralBytes - out.size()) return false;
+    out.append(data, len);
+    return true;
+}
+
+static bool append_json_quoted(std::string& out, Str value) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    if (!append_json_bytes(out, "\"", 1)) return false;
+    for (u32 i = 0; i < value.len; i++) {
+        u8 c = static_cast<u8>(value.ptr[i]);
+        if (c == '\\' && i + 1 < value.len) {
+            const u8 next = static_cast<u8>(value.ptr[i + 1]);
+            switch (next) {
+                case '"':
+                    c = '"';
+                    break;
+                case '\\':
+                    c = '\\';
+                    break;
+                case 'b':
+                    c = '\b';
+                    break;
+                case 'f':
+                    c = '\f';
+                    break;
+                case 'n':
+                    c = '\n';
+                    break;
+                case 'r':
+                    c = '\r';
+                    break;
+                case 't':
+                    c = '\t';
+                    break;
+                default:
+                    break;
+            }
+            if (c != '\\' || next == '\\') i++;
+        }
+        const char* escaped = nullptr;
+        switch (c) {
+            case '"':
+                escaped = "\\\"";
+                break;
+            case '\\':
+                escaped = "\\\\";
+                break;
+            case '\b':
+                escaped = "\\b";
+                break;
+            case '\f':
+                escaped = "\\f";
+                break;
+            case '\n':
+                escaped = "\\n";
+                break;
+            case '\r':
+                escaped = "\\r";
+                break;
+            case '\t':
+                escaped = "\\t";
+                break;
+            default:
+                break;
+        }
+        if (escaped != nullptr) {
+            if (!append_json_bytes(out, escaped, 2)) return false;
+        } else if (c < 0x20) {
+            char unicode_escape[6] = {'\\', 'u', '0', '0', kHex[c >> 4], kHex[c & 0x0f]};
+            if (!append_json_bytes(out, unicode_escape, 6)) return false;
+        } else if (!append_json_bytes(out, value.ptr + i, 1)) {
+            return false;
+        }
+    }
+    return append_json_bytes(out, "\"", 1);
+}
+
+static FrontendResult<void> serialize_json_literal(const AstExpr& expr,
+                                                   std::string& out,
+                                                   u32 depth = 0) {
+    if (depth > 32)
+        return frontend_error(FrontendError::TooManyItems, expr.span, kJsonLiteralDetail);
+    if (expr.kind == AstExprKind::BoolLit)
+        return append_json_bytes(out, expr.bool_value ? "true" : "false", expr.bool_value ? 4 : 5)
+                   ? FrontendResult<void>{}
+                   : frontend_error(FrontendError::TooManyItems, expr.span);
+    if (expr.kind == AstExprKind::IntLit) {
+        const auto value = std::to_string(expr.int_value);
+        return append_json_bytes(out, value.data(), static_cast<u32>(value.size()))
+                   ? FrontendResult<void>{}
+                   : frontend_error(FrontendError::TooManyItems, expr.span);
+    }
+    if (expr.kind == AstExprKind::StrLit)
+        return append_json_quoted(out, expr.str_value)
+                   ? FrontendResult<void>{}
+                   : frontend_error(FrontendError::TooManyItems, expr.span);
+    if (expr.kind == AstExprKind::Nil)
+        return append_json_bytes(out, "null", 4)
+                   ? FrontendResult<void>{}
+                   : frontend_error(FrontendError::TooManyItems, expr.span);
+    if (expr.kind == AstExprKind::ArrayLit) {
+        if (!append_json_bytes(out, "[", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        for (u32 i = 0; i < expr.args.len; i++) {
+            if (i != 0 && !append_json_bytes(out, ",", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            auto item = serialize_json_literal(*expr.args[i], out, depth + 1);
+            if (!item) return item;
+        }
+        if (!append_json_bytes(out, "]", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
+    if (expr.kind == AstExprKind::ObjectLit) {
+        if (!append_json_bytes(out, "{", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        for (u32 i = 0; i < expr.field_inits.len; i++) {
+            for (u32 j = 0; j < i; j++) {
+                if (expr.field_inits[j].name.eq(expr.field_inits[i].name))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.span,
+                                          lit_str("json object field names must be unique"));
+            }
+            if (i != 0 && !append_json_bytes(out, ",", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!append_json_quoted(out, expr.field_inits[i].name) ||
+                !append_json_bytes(out, ":", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            auto value = serialize_json_literal(*expr.field_inits[i].value, out, depth + 1);
+            if (!value) return value;
+        }
+        if (!append_json_bytes(out, "}", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
+    return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
+}
+
 // Fix-it detail for bare guards on non-bool values (DESIGN.md §3.6).
 constexpr Str kGuardBoolDetail =
     lit_str("guard condition must be bool; to bind a value use `guard let x = ...`");
@@ -8472,6 +8617,22 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return {};
     };
 
+    if (expr.name.eq({"json", 4}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"json", 4})) {
+        if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
+            expr.args[0] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
+        std::string serialized;
+        auto encoded = serialize_json_literal(*expr.args[0], serialized);
+        if (!encoded) return core::make_unexpected(encoded.error());
+        HirExpr out{};
+        out.kind = HirExprKind::StrLit;
+        out.type = HirTypeKind::Str;
+        out.span = expr.span;
+        out.str_value = intern_generated_name(serialized);
+        return out;
+    }
+
     // A response builder is a compile-time-only value in this first slice.
     // Header mutators update its bounded literal field list and `return resp`
     // folds the result into the existing ReturnStatus metadata path.
@@ -9603,7 +9764,20 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         // distinct from "no body" via has_response_body semantics:
         // analyze stores an explicit zero-length non-null Str when the
         // user wrote `body: ""`; lower_rir de-dupes on content.
-        if (stmt.has_response_body) term.response_body = stmt.response_body;
+        if (stmt.has_response_body) {
+            if (stmt.response_body.ptr != nullptr) {
+                term.response_body = stmt.response_body;
+            } else {
+                if (stmt.expr.kind != AstExprKind::Call || !stmt.expr.name.eq({"json", 4}) ||
+                    stmt.expr.args.len != 1 || stmt.expr.args[0] == nullptr)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
+                std::string serialized;
+                auto encoded = serialize_json_literal(*stmt.expr.args[0], serialized);
+                if (!encoded) return core::make_unexpected(encoded.error());
+                term.response_body = intern_generated_name(serialized);
+            }
+        }
         // Carry response headers verbatim (parser already rejected
         // explicit empty dicts and duplicate keys).
         for (u32 i = 0; i < stmt.response_headers.len; i++) {

@@ -319,7 +319,8 @@ struct Parser {
             if (!field_name) return core::make_unexpected(field_name.error());
             auto colon = expect(TokenType::Colon);
             if (!colon) return core::make_unexpected(colon.error());
-            auto field_value = parse_expr();
+            auto field_value =
+                cur().type == TokenType::LBrace ? parse_object_call_arg() : parse_expr();
             if (!field_value) return core::make_unexpected(field_value.error());
             auto field_value_ptr = alloc_expr(field_value.value());
             if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -1749,6 +1750,18 @@ struct Parser {
             if (!parsed) return core::make_unexpected(parsed.error());
             stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
+            if (take(TokenType::Comma)) {
+                if (const Token* body = take(TokenType::StringLit)) {
+                    stmt.response_body = body->text;
+                    stmt.span.end = body->end;
+                } else {
+                    auto body_expr = parse_expr();
+                    if (!body_expr) return core::make_unexpected(body_expr.error());
+                    stmt.expr = body_expr.value();
+                    stmt.span.end = body_expr->span.end;
+                }
+                stmt.has_response_body = true;
+            }
             return stmt;
         }
         if (take(TokenType::KwWait)) {

@@ -64,7 +64,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   `{ frame in ... }` binding; the legacy implicit-frame block is rejected.
 - [x] Object literal syntax is accepted only in call-argument position and
   represented explicitly in the AST; bare/general-expression use is rejected.
-  Still pending: `json()` lowering and runtime serialization.
+  [x] `json()` recursively serializes bounded literal
+  bool/int/string/nil/array/object values and can feed `return status, json(...)`.
+  Still pending: dynamic values and struct/runtime serialization.
 - [x] Pipeline RHS validation requires a call stage with an explicit `_` / `_N`
   placeholder and reports the canonical placement fix-it before call analysis.
 - Checker/builtins: [x] `.or(default)` (sugar for eager `any(value, default)`);
@@ -114,6 +116,10 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] Literal JSON serialization produces canonical compact JSON with string
+  escaping, nested objects/arrays, unique-field validation, and direct response
+  body lowering. Dynamic expressions are rejected until the bounded runtime
+  serializer lands.
 - [x] `chain after` supports ordered `Response` header `set`/`add`/`remove`
   effects on successful direct and forwarded routes. Effects use the pending
   response mutation log and commit only on the selected success terminator;
