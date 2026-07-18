@@ -3051,7 +3051,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         const u16 upstream_id = mir.upstreams[term.upstream_index].id;
         auto upstream =
             b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});
-        if (!upstream || !b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
+        if (!upstream) return frontend_error(FrontendError::OutOfMemory, term.span);
+        if (term.commit_response_mutations &&
+            !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        if (!b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }

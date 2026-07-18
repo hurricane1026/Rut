@@ -6518,15 +6518,23 @@ chain secure {
              static_cast<u8>(MirTerminatorKind::YieldTimer));
 }
 
-TEST(frontend, analyze_chain_after_is_reserved_until_lowering_exists) {
+TEST(frontend, analyze_chain_after_lowers_ordered_response_effects) {
     const char* src = R"rut(
-func access_log(_ req: i32) -> bool => true
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Path", req.path)
+    resp.add("X-Stage", "after")
+    resp.remove("Server")
+    0
+}
 chain access {
-    after access_log(req)
+    after response_headers(req, resp)
 }
 route {
     use chain access
-    GET "/users" { return 200 }
+    GET "/users" {
+        guard req.http11 else { return 505 }
+        return 200
+    }
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -6534,7 +6542,149 @@ route {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    u32 function_effects = 0;
+    for (u32 i = 0; i < hir->functions[0].exprs.len; i++) {
+        const auto kind = hir->functions[0].exprs[i].kind;
+        function_effects += kind == HirExprKind::RespSetHeader ||
+                            kind == HirExprKind::RespAddHeader ||
+                            kind == HirExprKind::RespRemoveHeader;
+    }
+    REQUIRE_EQ(function_effects, 3u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    CHECK_FALSE(hir->routes[0].guards[0].fail_term.commit_response_mutations);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK(mir->functions[0].blocks[1].term.commit_response_mutations);
+    CHECK_FALSE(mir->functions[0].blocks[2].term.commit_response_mutations);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    u32 sets = 0;
+    u32 adds = 0;
+    u32 removes = 0;
+    u32 commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            sets += block.insts[ii].op == rir::Opcode::RespSetHeader;
+            adds += block.insts[ii].op == rir::Opcode::RespAddHeader;
+            removes += block.insts[ii].op == rir::Opcode::RespRemoveHeader;
+            commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(sets, 1u);
+    CHECK_EQ(adds, 1u);
+    CHECK_EQ(removes, 1u);
+    CHECK_EQ(commits, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, chain_after_commits_response_effects_before_forward) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+func response_headers(_ resp: Response) -> i32 {
+    resp.set("X-Proxy", "rut")
+    0
+}
+chain access { after response_headers(resp) }
+route GET "/users" use chain access { return forward(api) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE(block.inst_count >= 3u);
+    CHECK_EQ(static_cast<u8>(block.insts[block.inst_count - 2].op),
+             static_cast<u8>(rir::Opcode::RespCommitHeaders));
+    CHECK_EQ(static_cast<u8>(block.insts[block.inst_count - 1].op),
+             static_cast<u8>(rir::Opcode::RetForward));
+    rir.destroy();
+}
+
+TEST(frontend, chain_after_rejects_invalid_response_helpers) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {R"rut(
+func observe(_ req: i32) -> bool => req.http11
+chain access { after observe(req) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after helper must have exactly one Response parameter"},
+        {R"rut(
+func mutate(_ first: Response, _ second: Response) -> i32 {
+    first.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(resp, resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after helper must have exactly one Response parameter"},
+        {R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(req) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after passes the runtime Response as `resp`"},
+        {R"rut(
+func observe(_ resp: Response) -> i32 => 0
+chain access { after observe(resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after currently supports Response header effects only"},
+    };
+    for (const auto& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK(hir.error().detail.eq(lit(c.detail)));
+    }
+}
+
+TEST(frontend, chain_after_rejects_wait_routes_until_effects_are_resumable) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(resp) }
+route GET "/users" use chain access {
+    wait(1)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain after Response effects cannot be combined with wait/for yet")));
 }
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {

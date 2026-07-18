@@ -1450,6 +1450,74 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, chain_after_response_headers_commit_only_on_success) {
+    const auto src = R"rut(
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Path", req.path)
+    resp.add("X-Stage", "after")
+    resp.remove("Server")
+    0
+}
+chain access { after response_headers(req, resp) }
+route GET "/api/users" use chain access {
+    guard req.http11 else { return 505 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(&conn,
+                                                        nullptr,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    CHECK(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].name.eq(lit("X-Stage")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[2].name.eq(lit("Server")));
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, cache_helpers_miss_and_out_of_range) {
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {64};

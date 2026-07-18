@@ -269,7 +269,7 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
                         type == HirTypeKind::I64 || type == HirTypeKind::Str ||
                         type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-                        type == HirTypeKind::IP;
+                        type == HirTypeKind::IP || type == HirTypeKind::Response;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -1820,6 +1820,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq({"Response", 8})) return HirTypeKind::Response;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
         variant_index = idx;
@@ -5146,6 +5147,23 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
     return out;
 }
 
+static bool collect_function_response_effects(HirFunction* fn,
+                                              const HirRoute& scratch,
+                                              const HirLocal* all_locals,
+                                              u32 all_local_count,
+                                              u32 param_count) {
+    for (u32 li = 0; li < scratch.locals.len; li++) {
+        const auto kind = scratch.locals[li].init.kind;
+        if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
+            kind != HirExprKind::RespRemoveHeader)
+            continue;
+        auto normalized = normalize_function_expr(
+            scratch.locals[li].init, fn, all_locals, all_local_count, param_count);
+        if (!normalized || !fn->exprs.push(normalized.value())) return false;
+    }
+    return true;
+}
+
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
                                                           const HirModule& mod,
@@ -5891,7 +5909,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     u32 response_index = cur_local_count;
                     for (u32 li = cur_local_count; li > 0; li--) {
                         if (!cur_locals[li - 1].name.eq(inner.expr.lhs->name)) continue;
-                        if (cur_locals[li - 1].init.kind == HirExprKind::ResponseInit)
+                        if (cur_locals[li - 1].type == HirTypeKind::Response)
                             response_index = li - 1;
                         break;
                     }
@@ -5903,21 +5921,70 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     const u32 wanted_args = is_remove ? 1u : 2u;
                     if (inner.expr.args.len != wanted_args || inner.expr.args[0] == nullptr ||
                         inner.expr.args[0]->kind != AstExprKind::StrLit ||
-                        (!is_remove && (inner.expr.args[1] == nullptr ||
-                                        inner.expr.args[1]->kind != AstExprKind::StrLit)))
+                        (!is_remove && inner.expr.args[1] == nullptr))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
                             inner.span,
-                            lit_str("middleware Response mutations require literal names and "
-                                    "values"));
+                            lit_str("middleware Response mutations require a literal name and a "
+                                    "plain string value"));
 
                     const Str name = inner.expr.args[0]->str_value;
-                    const Str value = is_remove ? Str{} : inner.expr.args[1]->str_value;
-                    if (validate_response_header(name.ptr, name.len, value.ptr, value.len) !=
+                    HirExpr value{};
+                    if (!is_remove) {
+                        auto analyzed = analyze_block_expr(
+                            *inner.expr.args[1], cur_locals, cur_local_count, nullptr);
+                        if (!analyzed) return core::make_unexpected(analyzed.error());
+                        if (analyzed->type != HirTypeKind::Str || analyzed->may_nil ||
+                            analyzed->may_error)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                inner.expr.args[1]->span,
+                                lit_str("middleware Response mutations require a literal name "
+                                        "and a plain string value"));
+                        value = analyzed.value();
+                    }
+                    const Str literal_value =
+                        !is_remove && value.kind == HirExprKind::StrLit ? value.str_value : Str{};
+                    if (validate_response_header(
+                            name.ptr, name.len, literal_value.ptr, literal_value.len) !=
                         HttpHeaderValidation::Ok)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               inner.span,
                                               lit_str("invalid or reserved response header"));
+
+                    const bool runtime_response =
+                        cur_locals[response_index].init.kind != HirExprKind::ResponseInit;
+                    if (runtime_response) {
+                        HirExpr effect{};
+                        effect.kind = is_remove ? HirExprKind::RespRemoveHeader
+                                      : is_add  ? HirExprKind::RespAddHeader
+                                                : HirExprKind::RespSetHeader;
+                        effect.type = HirTypeKind::Str;
+                        effect.span = inner.span;
+                        effect.str_value = name;
+                        if (!is_remove) {
+                            if (!scratch->exprs.push(value))
+                                return frontend_error(FrontendError::TooManyItems, inner.span);
+                            effect.lhs = &scratch->exprs[scratch->exprs.len - 1];
+                        }
+                        HirLocal carrier{};
+                        carrier.span = inner.span;
+                        carrier.ref_index =
+                            next_local_ref_index(scratch, cur_locals, cur_local_count);
+                        carrier.type = HirTypeKind::Str;
+                        carrier.init = effect;
+                        if (!scratch->locals.push(carrier))
+                            return frontend_error(FrontendError::TooManyItems, inner.span);
+                        return self(
+                            self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                    }
+
+                    if (!is_remove && value.kind != HirExprKind::StrLit)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            inner.expr.args[1]->span,
+                            lit_str(
+                                "middleware Response mutations require literal names and values"));
 
                     HirLocal next_locals[HirRoute::kMaxLocals]{};
                     for (u32 i = 0; i < cur_local_count; i++) next_locals[i] = cur_locals[i];
@@ -5939,7 +6006,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         literal.kind = HirExprKind::StrLit;
                         literal.type = HirTypeKind::Str;
                         literal.span = inner.expr.args[1]->span;
-                        literal.str_value = value;
+                        literal.str_value = value.str_value;
                         if (!scratch->exprs.push(literal))
                             return frontend_error(FrontendError::TooManyItems, inner.span);
                         if (!fields.push({name, &scratch->exprs[scratch->exprs.len - 1]}))
@@ -14235,6 +14302,92 @@ static FrontendResult<void> validate_timer_route(const HirRoute& route,
     return {};
 }
 
+static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl::Step& step,
+                                                              Span use_span,
+                                                              HirRoute* route,
+                                                              const HirModule& mod) {
+    if (step.call.kind != AstExprKind::Call || step.has_else)
+        return frontend_error(FrontendError::UnsupportedSyntax, step.span);
+    const u32 fn_index = find_function_index(mod, step.call.name);
+    if (fn_index == mod.functions.len)
+        return frontend_error(FrontendError::UnsupportedSyntax, step.call.span, step.call.name);
+    const auto& fn = mod.functions[fn_index];
+    if (fn.type_params.len != 0 || step.call.args.len != fn.params.len ||
+        fn.respond_guards.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax, step.span, fn.name);
+
+    auto args = std::unique_ptr<HirExpr[]>(new (std::nothrow) HirExpr[AstExpr::kMaxArgs]{});
+    if (!args) return frontend_error(FrontendError::OutOfMemory, step.span);
+    u32 response_params = 0;
+    for (u32 ai = 0; ai < fn.params.len; ai++) {
+        const AstExpr& source = *step.call.args[ai];
+        if (fn.params[ai].type == HirTypeKind::Response) {
+            response_params++;
+            if (source.kind != AstExprKind::Ident || !source.name.eq({"resp", 4}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      source.span,
+                                      lit_str("chain after passes the runtime Response as `resp`"));
+            args[ai].kind = HirExprKind::ResponseInit;
+            args[ai].type = HirTypeKind::Response;
+            args[ai].span = source.span;
+            continue;
+        }
+        FrontendResult<HirExpr> arg = [&]() -> FrontendResult<HirExpr> {
+            if (source.kind == AstExprKind::Ident && source.name.eq({"req", 3})) {
+                HirExpr placeholder{};
+                placeholder.kind = HirExprKind::IntLit;
+                placeholder.type = HirTypeKind::I32;
+                placeholder.int_value = 0;
+                placeholder.span = source.span;
+                return placeholder;
+            }
+            return analyze_expr(source, route, mod, route->locals.data, route->locals.len, nullptr);
+        }();
+        if (!arg) return core::make_unexpected(arg.error());
+        auto expected = make_expected_param_expr(fn.params[ai]);
+        if (!same_hir_type_shape(mod, arg.value(), expected))
+            return frontend_error(FrontendError::UnsupportedSyntax, source.span, fn.name);
+        args[ai] = arg.value();
+    }
+    if (response_params != 1)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            use_span,
+            lit_str("chain after helper must have exactly one Response parameter"));
+    auto is_response_effect = [](HirExprKind kind) {
+        return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+               kind == HirExprKind::RespRemoveHeader;
+    };
+    bool has_response_effect = false;
+    for (u32 ei = 0; ei < fn.exprs.len; ei++)
+        has_response_effect |= is_response_effect(fn.exprs[ei].kind);
+    if (!has_response_effect)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            use_span,
+            lit_str("chain after currently supports Response header effects only"));
+    if (route->waits.len != 0 || route->for_loops.len != 0)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            use_span,
+            lit_str("chain after Response effects cannot be combined with wait/for yet"));
+
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        if (!is_response_effect(fn.exprs[ei].kind)) continue;
+        auto effect = instantiate_function_expr(
+            fn.exprs[ei], route, mod, args.get(), fn.params.len, nullptr, 0);
+        if (!effect) return core::make_unexpected(effect.error());
+        HirLocal carrier{};
+        carrier.span = step.span;
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        carrier.type = HirTypeKind::Str;
+        carrier.init = effect.value();
+        if (!route->locals.push(carrier))
+            return frontend_error(FrontendError::TooManyItems, step.span);
+    }
+    return {};
+}
+
 static FrontendResult<HirModule*> analyze_file_internal(
     const AstFile& file,
     Str source_path,
@@ -15630,10 +15783,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // HirRoute is intentionally a large fixed-capacity analysis arena
         // (currently over 1 MiB). Keeping it in this import-recursive call
         // path can exhaust the 8 MiB thread stack after small layout growths.
-        auto scratch_storage = std::make_unique<HirRoute>();
-        HirRoute& scratch = *scratch_storage;
-        scratch.is_helper_scratch = true;
-        scratch.allow_respond_effects = true;
+        auto scratch = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+        if (!scratch) return frontend_error(FrontendError::OutOfMemory, span);
+        scratch->is_helper_scratch = true;
+        scratch->allow_respond_effects = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
         auto ast_collected = collect_named_error_cases_ast(*ast_func.body, ast_named_error_cases);
         if (!ast_collected) return core::make_unexpected(ast_collected.error());
@@ -15649,7 +15802,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             if (!mod.variants.push(error_variant))
                 return frontend_error(FrontendError::TooManyItems, span);
-            scratch.error_variant_index = mod.variants.len - 1;
+            scratch->error_variant_index = mod.variants.len - 1;
         }
         HirLocal param_locals[AstFunctionDecl::kMaxParams]{};
         for (u32 pi = 0; pi < fn.params.len; pi++) {
@@ -15707,20 +15860,20 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         auto body = analyze_function_body_stmt(
-            *ast_func.body, &scratch, mod, param_locals, fn.params.len, nullptr, true);
+            *ast_func.body, scratch.get(), mod, param_locals, fn.params.len, nullptr, true);
         if (!body) return core::make_unexpected(body.error());
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> named_error_cases;
-        for (u32 li = 0; li < scratch.locals.len; li++) {
-            auto collected = collect_named_error_cases(scratch.locals[li].init, named_error_cases);
+        for (u32 li = 0; li < scratch->locals.len; li++) {
+            auto collected = collect_named_error_cases(scratch->locals[li].init, named_error_cases);
             if (!collected) return core::make_unexpected(collected.error());
         }
-        for (u32 gi = 0; gi < scratch.guards.len; gi++) {
-            auto collected = collect_named_error_cases(scratch.guards[gi].cond, named_error_cases);
+        for (u32 gi = 0; gi < scratch->guards.len; gi++) {
+            auto collected = collect_named_error_cases(scratch->guards[gi].cond, named_error_cases);
             if (!collected) return core::make_unexpected(collected.error());
         }
         auto collected = collect_named_error_cases(body.value(), named_error_cases);
         if (!collected) return core::make_unexpected(collected.error());
-        if (named_error_cases.len != 0 && scratch.error_variant_index == 0xffffffffu) {
+        if (named_error_cases.len != 0 && scratch->error_variant_index == 0xffffffffu) {
             HirVariant error_variant{};
             error_variant.span = span;
             error_variant.name = {"__error_func", 12};
@@ -15732,22 +15885,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             if (!mod.variants.push(error_variant))
                 return frontend_error(FrontendError::TooManyItems, span);
-            scratch.error_variant_index = mod.variants.len - 1;
+            scratch->error_variant_index = mod.variants.len - 1;
         }
-        if (named_error_cases.len != 0 && scratch.error_variant_index != 0xffffffffu) {
-            const u32 error_variant_index = scratch.error_variant_index;
-            for (u32 li = 0; li < scratch.locals.len; li++) {
+        if (named_error_cases.len != 0 && scratch->error_variant_index != 0xffffffffu) {
+            const u32 error_variant_index = scratch->error_variant_index;
+            for (u32 li = 0; li < scratch->locals.len; li++) {
                 patch_named_error_variant(
-                    &scratch.locals[li].init, error_variant_index, named_error_cases);
-                patch_error_variant_refs(&scratch.locals[li].init, error_variant_index);
-                if (scratch.locals[li].may_error &&
-                    scratch.locals[li].error_variant_index == 0xffffffffu)
-                    scratch.locals[li].error_variant_index = error_variant_index;
+                    &scratch->locals[li].init, error_variant_index, named_error_cases);
+                patch_error_variant_refs(&scratch->locals[li].init, error_variant_index);
+                if (scratch->locals[li].may_error &&
+                    scratch->locals[li].error_variant_index == 0xffffffffu)
+                    scratch->locals[li].error_variant_index = error_variant_index;
             }
-            for (u32 gi = 0; gi < scratch.guards.len; gi++) {
+            for (u32 gi = 0; gi < scratch->guards.len; gi++) {
                 patch_named_error_variant(
-                    &scratch.guards[gi].cond, error_variant_index, named_error_cases);
-                patch_error_variant_refs(&scratch.guards[gi].cond, error_variant_index);
+                    &scratch->guards[gi].cond, error_variant_index, named_error_cases);
+                patch_error_variant_refs(&scratch->guards[gi].cond, error_variant_index);
             }
             patch_named_error_variant(&body.value(), error_variant_index, named_error_cases);
             patch_error_variant_refs(&body.value(), error_variant_index);
@@ -15850,17 +16003,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
-        if (scratch.guards.len != 0 && (body->may_nil || body->may_error))
+        if (scratch->guards.len != 0 && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax, ast_func.body->span);
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
-        for (u32 li = 0; li < scratch.locals.len; li++)
-            all_locals[all_local_count++] = scratch.locals[li];
+        for (u32 li = 0; li < scratch->locals.len; li++)
+            all_locals[all_local_count++] = scratch->locals[li];
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
-        for (u32 gi = 0; gi < scratch.guards.len; gi++) {
-            const auto& guard = scratch.guards[gi];
+        for (u32 gi = 0; gi < scratch->guards.len; gi++) {
+            const auto& guard = scratch->guards[gi];
             auto normalized_cond = normalize_function_expr(
                 guard.cond, &fn, all_locals, all_local_count, fn.params.len);
             if (!normalized_cond) return core::make_unexpected(normalized_cond.error());
@@ -17429,6 +17582,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        if (!collect_function_response_effects(
+                &fn, scratch, all_locals, all_local_count, fn.params.len))
+            return frontend_error(FrontendError::TooManyItems, item.func.body->span);
         auto normalized =
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
@@ -17568,8 +17724,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // are rejected after analysis (validate_timer_route). Bound the timer
         // count here (deterministic DSL capacity error) rather than letting
         // RouteConfig::add_timer reject the surplus at load time.
-        AstRouteDecl timer_route_view{};
+        std::unique_ptr<AstRouteDecl> timer_route_view;
         if (is_timer_item) {
+            timer_route_view = std::unique_ptr<AstRouteDecl>(new (std::nothrow) AstRouteDecl{});
+            if (!timer_route_view)
+                return frontend_error(FrontendError::OutOfMemory, item.timer.span);
             if (timer_count >= HirModule::kMaxTimers)
                 return frontend_error(FrontendError::TooManyItems, item.timer.span);
             timer_count++;
@@ -17591,12 +17750,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax,
                     item.timer.span,
                     lit_str("shard selector exceeds the supported shard range (0..63)"));
-            timer_route_view.span = item.timer.span;
-            timer_route_view.body_span = item.timer.body_span;
-            timer_route_view.path = item.timer.name;  // timer name (not an HTTP path)
-            timer_route_view.method = static_cast<u8>(TokenType::KwGet);
+            timer_route_view->span = item.timer.span;
+            timer_route_view->body_span = item.timer.body_span;
+            timer_route_view->path = item.timer.name;  // timer name (not an HTTP path)
+            timer_route_view->method = static_cast<u8>(TokenType::KwGet);
             for (u32 si = 0; si < item.timer.statements.len; si++) {
-                if (!timer_route_view.statements.push(item.timer.statements[si]))
+                if (!timer_route_view->statements.push(item.timer.statements[si]))
                     return frontend_error(FrontendError::TooManyItems, item.timer.span);
             }
         }
@@ -17619,7 +17778,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::TooManyItems, item.timer.span);
             continue;
         }
-        const AstRouteDecl& route_decl = is_timer_item ? timer_route_view : item.route;
+        const AstRouteDecl& route_decl = is_timer_item ? *timer_route_view : item.route;
 
         HirRoute route{};
         route.span = route_decl.span;
@@ -17732,12 +17891,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax, chain_use.span, chain_use.name);
             for (u32 si = 0; si < chain->steps.len; si++) {
                 const auto& step = chain->steps[si];
-                if (step.kind == AstChainStepKind::After)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        step.span,
-                        lit_str(
-                            "chain after steps are reserved until response-side lowering exists"));
+                if (step.kind == AstChainStepKind::After) continue;
                 auto before = analyze_chain_before_step(step, chain_use.span);
                 if (!before) return core::make_unexpected(before.error());
             }
@@ -18371,6 +18525,42 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       route_decl.statements[si + 1]->span);
             break;
+        }
+
+        bool has_chain_after_response_effects = false;
+        for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
+            const auto& chain_use = route_decl.chains[ci];
+            const AstChainDecl* chain = find_chain_decl(file, chain_use.name);
+            if (chain == nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, chain_use.span, chain_use.name);
+            for (u32 si = 0; si < chain->steps.len; si++) {
+                const auto& step = chain->steps[si];
+                if (step.kind != AstChainStepKind::After) continue;
+                const u32 before_count = route.locals.len;
+                auto after = analyze_chain_after_response_step(step, chain_use.span, &route, mod);
+                if (!after) return core::make_unexpected(after.error());
+                if (route.locals.len != before_count) has_chain_after_response_effects = true;
+            }
+        }
+        if (has_chain_after_response_effects) {
+            auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
+            if (route.control.kind == HirControlKind::Direct) {
+                mark_commit(route.control.direct_term);
+            } else if (route.control.kind == HirControlKind::If) {
+                mark_commit(route.control.then_term);
+                mark_commit(route.control.else_term);
+            } else {
+                for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                    auto& arm = route.control.match_arms[ai];
+                    if (arm.body_kind == HirMatchArm::BodyKind::Direct) {
+                        mark_commit(arm.direct_term);
+                    } else {
+                        mark_commit(arm.then_term);
+                        mark_commit(arm.else_term);
+                    }
+                }
+            }
         }
 
         // Wait-route backstop: the creation-time gates (kTimeWaitDetail /
