@@ -1339,10 +1339,19 @@ struct Parser {
             return stmt;
         }
         if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
-            peek().type == TokenType::IntLit) {
+            (peek().type == TokenType::IntLit || peek().type == TokenType::Ident)) {
             pos++;
             AstStatement stmt{};
             stmt.kind = AstStmtKind::RespondStatus;
+
+            if (cur().type == TokenType::Ident) {
+                const Token response_local = cur();
+                pos++;
+                stmt.name = response_local.text;
+                stmt.returns_response_local = true;
+                stmt.span = Span{start.start, response_local.end, start.line, start.col};
+                return stmt;
+            }
 
             auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
                 i32 value = 0;
@@ -2306,7 +2315,7 @@ struct Parser {
             return parse_func_guard_stmt(prev());
         }
         if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
-            peek().type == TokenType::IntLit) {
+            (peek().type == TokenType::IntLit || peek().type == TokenType::Ident)) {
             return parse_stmt();
         }
         if (take(TokenType::KwIf)) {
@@ -2466,6 +2475,12 @@ struct Parser {
                 if (!expr_ptr) return core::make_unexpected(expr_ptr.error());
                 if (!block.block_stmts.push(expr_ptr.value()))
                     return frontend_error(FrontendError::TooManyItems, expr->span);
+                const bool response_mutation =
+                    expr->kind == AstExprKind::MethodCall && expr->lhs != nullptr &&
+                    expr->lhs->kind == AstExprKind::Ident &&
+                    (expr->name.eq({"set", 3}) || expr->name.eq({"add", 3}) ||
+                     expr->name.eq({"remove", 6}));
+                if (response_mutation) continue;
                 break;
             }
             auto rbrace = expect(TokenType::RBrace);

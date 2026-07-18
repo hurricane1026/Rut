@@ -127,8 +127,9 @@ exceptions, no try/catch. `!` is logical not only.
   `return 200, body`, `return resp`, `return forward(x)`.
 - **Middleware/helper func**: `return` only produces the function's normal
   value (or passes through); to end the whole request immediately use
-  **`respond`**: `respond 401` / `respond 401, "expired"` (⏳ `respond resp`
-  with a Response value is pending — status must be a literal int today).
+  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
+  A helper-local Response may carry ordered literal `set`/`add`/`remove`
+  mutations; dynamic middleware Response values remain ⏳.
 
 ```swift
 func auth(_ req: Request, role: str) -> User {

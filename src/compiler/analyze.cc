@@ -3301,6 +3301,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                                           u32 local_count,
                                                           const MatchPayloadBinding* binding,
                                                           bool allow_respond_guards);
+static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatement& stmt,
+                                                                 const HirLocal* locals,
+                                                                 u32 local_count);
 static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -5878,6 +5881,81 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 return self(self, si + 1, next_locals, next_count, cur_allow_respond_guards);
             }
+            if (inner.kind == AstStmtKind::Expr && !is_last &&
+                inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
+                inner.expr.lhs->kind == AstExprKind::Ident) {
+                const bool is_set = inner.expr.name.eq({"set", 3});
+                const bool is_add = inner.expr.name.eq({"add", 3});
+                const bool is_remove = inner.expr.name.eq({"remove", 6});
+                if (is_set || is_add || is_remove) {
+                    u32 response_index = cur_local_count;
+                    for (u32 li = cur_local_count; li > 0; li--) {
+                        if (!cur_locals[li - 1].name.eq(inner.expr.lhs->name)) continue;
+                        if (cur_locals[li - 1].init.kind == HirExprKind::ResponseInit)
+                            response_index = li - 1;
+                        break;
+                    }
+                    if (response_index == cur_local_count)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              inner.span,
+                                              lit_str("Response supports set/add/remove"));
+
+                    const u32 wanted_args = is_remove ? 1u : 2u;
+                    if (inner.expr.args.len != wanted_args || inner.expr.args[0] == nullptr ||
+                        inner.expr.args[0]->kind != AstExprKind::StrLit ||
+                        (!is_remove && (inner.expr.args[1] == nullptr ||
+                                        inner.expr.args[1]->kind != AstExprKind::StrLit)))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            inner.span,
+                            lit_str("middleware Response mutations require literal names and "
+                                    "values"));
+
+                    const Str name = inner.expr.args[0]->str_value;
+                    const Str value = is_remove ? Str{} : inner.expr.args[1]->str_value;
+                    if (validate_response_header(name.ptr, name.len, value.ptr, value.len) !=
+                        HttpHeaderValidation::Ok)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              inner.span,
+                                              lit_str("invalid or reserved response header"));
+
+                    HirLocal next_locals[HirRoute::kMaxLocals]{};
+                    for (u32 i = 0; i < cur_local_count; i++) next_locals[i] = cur_locals[i];
+                    auto& fields = next_locals[response_index].init.field_inits;
+                    if (is_set || is_remove) {
+                        for (u32 fi = 0; fi < fields.len;) {
+                            if (!http_header_name_eq_ci(
+                                    fields[fi].name.ptr, fields[fi].name.len, name.ptr, name.len)) {
+                                fi++;
+                                continue;
+                            }
+                            for (u32 move = fi + 1; move < fields.len; move++)
+                                fields[move - 1] = fields[move];
+                            fields.len--;
+                        }
+                    }
+                    if (!is_remove) {
+                        HirExpr literal{};
+                        literal.kind = HirExprKind::StrLit;
+                        literal.type = HirTypeKind::Str;
+                        literal.span = inner.expr.args[1]->span;
+                        literal.str_value = value;
+                        if (!scratch->exprs.push(literal))
+                            return frontend_error(FrontendError::TooManyItems, inner.span);
+                        if (!fields.push({name, &scratch->exprs[scratch->exprs.len - 1]}))
+                            return frontend_error(FrontendError::TooManyItems, inner.span);
+                    }
+
+                    const u32 response_ref = next_locals[response_index].ref_index;
+                    for (u32 li = scratch->locals.len; li > 0; li--) {
+                        if (scratch->locals[li - 1].ref_index != response_ref) continue;
+                        scratch->locals[li - 1].init = next_locals[response_index].init;
+                        break;
+                    }
+                    return self(
+                        self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
+                }
+            }
             if (inner.kind == AstStmtKind::Guard && !is_last) {
                 auto bound = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
@@ -5948,22 +6026,29 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     const auto& respond = *inner.else_stmt;
                     if (!cur_allow_respond_guards)
                         return frontend_error(FrontendError::UnsupportedSyntax, respond.span);
-                    if (respond.status_code < 100 || respond.status_code > 599)
-                        return frontend_error(FrontendError::InvalidStatusCode, respond.span);
                     HirGuard guard{};
                     guard.span = inner.span;
                     guard.cond = cond.value();
                     guard.fail_kind = HirGuard::FailKind::Term;
-                    guard.fail_term.kind = HirTerminatorKind::ReturnStatus;
-                    guard.fail_term.source_kind = HirTerminatorSourceKind::Literal;
-                    guard.fail_term.status_code = static_cast<i32>(respond.status_code);
-                    guard.fail_term.span = respond.span;
-                    if (respond.has_response_body)
-                        guard.fail_term.response_body = respond.response_body;
-                    for (u32 hi = 0; hi < respond.response_headers.len; hi++) {
-                        const auto& hdr = respond.response_headers[hi];
-                        if (!guard.fail_term.response_headers.push({hdr.key, hdr.value}))
-                            return frontend_error(FrontendError::TooManyItems, respond.span);
+                    if (respond.returns_response_local) {
+                        auto term =
+                            analyze_response_local_term(respond, cur_locals, cur_local_count);
+                        if (!term) return core::make_unexpected(term.error());
+                        guard.fail_term = term.value();
+                    } else {
+                        if (respond.status_code < 100 || respond.status_code > 599)
+                            return frontend_error(FrontendError::InvalidStatusCode, respond.span);
+                        guard.fail_term.kind = HirTerminatorKind::ReturnStatus;
+                        guard.fail_term.source_kind = HirTerminatorSourceKind::Literal;
+                        guard.fail_term.status_code = static_cast<i32>(respond.status_code);
+                        guard.fail_term.span = respond.span;
+                        if (respond.has_response_body)
+                            guard.fail_term.response_body = respond.response_body;
+                        for (u32 hi = 0; hi < respond.response_headers.len; hi++) {
+                            const auto& hdr = respond.response_headers[hi];
+                            if (!guard.fail_term.response_headers.push({hdr.key, hdr.value}))
+                                return frontend_error(FrontendError::TooManyItems, respond.span);
+                        }
                     }
                     if (!scratch->guards.push(guard))
                         return frontend_error(FrontendError::TooManyItems, inner.span);
@@ -9401,6 +9486,36 @@ static void patch_error_variant_refs(HirExpr* expr, u32 variant_index) {
     }
 }
 
+static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatement& stmt,
+                                                                 const HirLocal* locals,
+                                                                 u32 local_count) {
+    const HirLocal* response = nullptr;
+    for (u32 li = local_count; li > 0; li--) {
+        if (locals[li - 1].name.eq(stmt.name)) {
+            response = &locals[li - 1];
+            break;
+        }
+    }
+    if (response == nullptr || response->init.kind != HirExprKind::ResponseInit)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("identifier must name a Response builder"));
+
+    HirTerminator term{};
+    term.kind = HirTerminatorKind::ReturnStatus;
+    term.source_kind = HirTerminatorSourceKind::Literal;
+    term.span = stmt.span;
+    term.status_code = static_cast<i32>(response->init.int_value);
+    for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
+        const auto& field = response->init.field_inits[fi];
+        if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
+            return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+        if (!term.response_headers.push({field.name, field.value->str_value}))
+            return frontend_error(FrontendError::TooManyItems, stmt.span);
+    }
+    return term;
+}
+
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, const HirModule& mod) {
     HirTerminator term{};
     term.span = stmt.span;
@@ -11276,31 +11391,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
 #endif
 
     route->control.kind = HirControlKind::Direct;
-    if (stmt.kind == AstStmtKind::ReturnStatus && stmt.returns_response_local) {
-        const HirLocal* response = nullptr;
-        for (u32 li = route->locals.len; li > 0; li--) {
-            if (route->locals[li - 1].name.eq(stmt.name)) {
-                response = &route->locals[li - 1];
-                break;
-            }
-        }
-        if (response == nullptr || response->init.kind != HirExprKind::ResponseInit)
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  stmt.span,
-                                  lit_str("return identifier must name a Response builder"));
-        HirTerminator term{};
-        term.kind = HirTerminatorKind::ReturnStatus;
-        term.source_kind = HirTerminatorSourceKind::Literal;
-        term.span = stmt.span;
-        term.status_code = static_cast<i32>(response->init.int_value);
-        for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
-            const auto& field = response->init.field_inits[fi];
-            if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
-                return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-            if (!term.response_headers.push({field.name, field.value->str_value}))
-                return frontend_error(FrontendError::TooManyItems, stmt.span);
-        }
-        route->control.direct_term = term;
+    if ((stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) &&
+        stmt.returns_response_local) {
+        auto term = analyze_response_local_term(stmt, route->locals.data, route->locals.len);
+        if (!term) return core::make_unexpected(term.error());
+        route->control.direct_term = term.value();
         return {};
     }
     auto term = analyze_term(stmt, mod);
