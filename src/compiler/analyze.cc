@@ -18217,7 +18217,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         HirFunction& fn = mod.functions[fn_index];
         // Keep the large helper-analysis arena off the analyze_file stack;
         // imported modules nest this frame recursively.
-        auto scratch_storage = std::make_unique<HirRoute>();
+        auto scratch_storage = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+        if (!scratch_storage)
+            return frontend_error(FrontendError::OutOfMemory, item.func.span);
         HirRoute& scratch = *scratch_storage;
         scratch.is_helper_scratch = true;
         scratch.allow_respond_effects = true;
@@ -18648,7 +18650,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // returns 200 (the timer path ignores the status). Non-empty bodies
         // must end in an explicit terminal statement, like a route body.
         if (is_timer_item && item.timer.statements.len == 0) {
-            HirRoute route{};
+            auto route_storage = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+            if (!route_storage)
+                return frontend_error(FrontendError::OutOfMemory, item.timer.span);
+            HirRoute& route = *route_storage;
             route.span = item.timer.span;
             route.path = item.timer.name;
             route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
@@ -18665,7 +18670,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         const AstRouteDecl& route_decl = is_timer_item ? *timer_route_view : item.route;
 
-        HirRoute route{};
+        auto route_storage = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+        if (!route_storage)
+            return frontend_error(FrontendError::OutOfMemory, route_decl.span);
+        HirRoute& route = *route_storage;
         route.span = route_decl.span;
         route.path = route_decl.path;
         route.method = route_method_key_from_token(route_decl.method);
