@@ -21,6 +21,11 @@ constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed a
 constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
 constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
 constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
+constexpr Str kRespondInHandlerDetail =
+    lit_str("a handler's return value is its response; replace `respond` with `return`");
+constexpr Str kStatusReturnInMiddlewareDetail = lit_str(
+    "middleware short-circuits with `respond <status>`; `return` is only for the function's "
+    "value");
 
 struct Parser {
     const LexedTokens* toks = nullptr;
@@ -32,6 +37,7 @@ struct Parser {
     // position is the only boundary signal (Swift-style newline sensitivity,
     // scoped to arm bodies only).
     bool arm_body_stops_cross_line_dot = false;
+    bool in_function_body = false;
     // Depth of enclosing `(...)` / `[...]` while parsing an arm body. The
     // newline-dot boundary only applies at the top level of the arm body: a
     // line-broken member access inside a call argument or group (e.g.
@@ -1340,6 +1346,9 @@ struct Parser {
         }
         if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
             (peek().type == TokenType::IntLit || peek().type == TokenType::Ident)) {
+            if (!in_function_body)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kRespondInHandlerDetail);
             pos++;
             AstStatement stmt{};
             stmt.kind = AstStmtKind::RespondStatus;
@@ -2311,6 +2320,10 @@ struct Parser {
     }
 
     FrontendResult<AstStatement> parse_func_body_stmt() {
+        if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(cur()),
+                                  kStatusReturnInMiddlewareDetail);
         if (take(TokenType::KwGuard)) {
             return parse_func_guard_stmt(prev());
         }
@@ -2428,6 +2441,10 @@ struct Parser {
             AstStatement block{};
             block.kind = AstStmtKind::Block;
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+                if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(cur()),
+                                          kStatusReturnInMiddlewareDetail);
                 if (cur().type == TokenType::KwLet) {
                     auto inner = parse_stmt();
                     if (!inner) return core::make_unexpected(inner.error());
@@ -2720,7 +2737,10 @@ struct Parser {
             body_stmt.expr = body.value();
             body_stmt.span = body->span;
         } else {
+            const bool saved_in_function_body = in_function_body;
+            in_function_body = true;
             auto body = parse_func_body_stmt();
+            in_function_body = saved_in_function_body;
             if (!body) return core::make_unexpected(body.error());
             body_stmt = body.value();
         }
@@ -2857,7 +2877,10 @@ struct Parser {
                 if (!body_ptr) return core::make_unexpected(body_ptr.error());
                 method.default_body = body_ptr.value();
             } else if (cur().type == TokenType::LBrace) {
+                const bool saved_in_function_body = in_function_body;
+                in_function_body = true;
                 auto body = parse_func_body_stmt();
+                in_function_body = saved_in_function_body;
                 if (!body) return core::make_unexpected(body.error());
                 auto body_ptr = alloc_stmt(body.value());
                 if (!body_ptr) return core::make_unexpected(body_ptr.error());

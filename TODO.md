@@ -76,12 +76,12 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   fold into response-header sets and dynamic string values lower through a
   bounded per-request mutation log for direct routes. Still pending:
   buffered/post-middleware mutation (needs a stream-owned runtime Response);
-  `req.queryAll` (needs a runtime [str] value type — none exists); `respond`
-  legality (middleware only) vs status-`return` (handler only);
+  `req.queryAll` (needs a runtime [str] value type — none exists);
   `stats()/metrics()/reload()/upstream.mark()` declarations.
 - Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
   guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match
-  arms. Still pending: middleware/handler return-respond confusion.
+  arms; [x] middleware status-`return` and handler `respond` context errors
+  with canonical replacement guidance.
 - Tests/examples: migrate `examples/*.rut`, test fixtures, and docs/ topic
   pages (match.md, pipe.md, decorators.md, for-loops.md, ...) to the new
   surface once the front-end accepts it.
@@ -112,6 +112,9 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] Handler bodies reject `respond` with a `return` fix-it, while middleware
+  functions reject status-`return` with a `respond` fix-it; valid helper
+  `respond` propagation and ordinary function value expressions are unchanged.
 - [x] Error-prelude exit-dominance now treats literal 4xx/5xx pre-rejects as
   fail-closed while keeping the prelude for success, redirect, dynamic, and
   forward exits that do not recover a fallible local.
