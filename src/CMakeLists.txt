@@ -383,6 +383,7 @@ if(RUT_ENABLE_JIT)
     # Production source -> JIT/RouteConfig ownership bridge. Keep it reusable:
     # the server and project harness must compile targets through the same path.
     add_library(rut_loader STATIC
+        reload_coordinator.cc
         serve_loader.cc
     )
     target_include_directories(rut_loader PUBLIC

@@ -6,9 +6,11 @@
 #include "rut/runtime/tls.h"
 
 #ifdef RUT_ENABLE_JIT
+#include "rut/reload_coordinator.h"
 #include "rut/serve_loader.h"
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <netinet/in.h>
@@ -24,6 +26,15 @@ using namespace rut;
 // compiler front-end, which validates `shard:` selectors against it).
 static constexpr u32 kDefaultDrainSecs = 30;
 static constexpr u16 kDefaultPort = 8080;
+
+struct ServerReloadConfig {
+#ifdef RUT_ENABLE_JIT
+    const char* source_path = nullptr;
+    jit::OptLevel opt = jit::OptLevel::O2;
+    LoadedProgram* active = nullptr;
+    LoadedProgram* spare = nullptr;
+#endif
+};
 
 // Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
@@ -42,6 +53,38 @@ static void write_u32(u32 val) {
     } while (tmp);
     for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
 }
+
+#ifdef RUT_ENABLE_JIT
+static void write_u64(u64 val) {
+    char buf[24];
+    i32 n = 0;
+    do {
+        buf[n++] = static_cast<char>('0' + val % 10);
+        val /= 10;
+    } while (val);
+    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
+}
+
+static void write_reload_record(const ReloadTerminalRecord& record) {
+    if (!record.valid) return;
+    const char* source = record.source == ReloadRequestSource::Signal ? "signal" : "route";
+    const char* outcome = "activated";
+    if (record.outcome == ReloadTerminalOutcome::CompileFailed) outcome = "compile_failed";
+    if (record.outcome == ReloadTerminalOutcome::ValidationFailed) outcome = "validation_failed";
+    if (record.outcome == ReloadTerminalOutcome::Stopped) outcome = "stopped";
+    write_str("{\"event\":\"reload\",\"request_id\":");
+    write_u64(record.request_id);
+    write_str(",\"source\":\"");
+    write_str(source);
+    write_str("\",\"old_generation\":");
+    write_u64(record.old_generation);
+    write_str(",\"new_generation\":");
+    write_u64(record.new_generation);
+    write_str(",\"outcome\":\"");
+    write_str(outcome);
+    write_str("\"}\n");
+}
+#endif
 
 static bool str_eq(const char* a, const char* b) {
     while (*a && *b) {
@@ -99,7 +142,8 @@ static i32 run_shards(u16 port,
                       bool access_log_compress,
                       i32 access_log_level,
                       RouteConfig* route_config,
-                      bool serve_metrics) {
+                      bool serve_metrics,
+                      ServerReloadConfig* reload_config) {
     Shard<EventLoopType> shards[kMaxShards];
     // Cross-shard metrics registry for snapshots and the optional built-in
     // /metrics endpoint. It outlives the shard threads, which join before this
@@ -115,10 +159,21 @@ static i32 run_shards(u16 port,
     static UpstreamConcurrency upstream_cc;
     upstream_cc.reset();
     // One process-shared bounded mutation boundary. Source lowering is still
-    // gated, so route admission starts disabled; SIGHUP/coordinator wiring and
-    // the explicit CLI authority flag land with the reload coordinator.
+    // gated, so route admission starts disabled; the follow-up that lowers
+    // reload() also owns the explicit CLI authority flag.
     ControlPlaneMutationPort control_plane_mutation;
-    control_plane_mutation.reset(1, false, route_config);
+    control_plane_mutation.reset(
+        route_config != nullptr ? route_config->config_generation : 1, false, route_config);
+
+    // Block process-control signals before publishing the listening state or
+    // spawning threads. Threads inherit this mask and the control thread owns
+    // every signal through sigtimedwait().
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGINT);
+    sigaddset(&wait_set, SIGTERM);
+    sigaddset(&wait_set, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
 
     // Create one SO_REUSEPORT listen socket per shard.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
@@ -187,6 +242,30 @@ static i32 run_shards(u16 port,
         shards[i].route_config = route_config;
     }
 
+#ifdef RUT_ENABLE_JIT
+    ProcessReloadCoordinator reload_coordinator;
+    bool reload_enabled = false;
+    if (reload_config != nullptr && reload_config->source_path != nullptr &&
+        reload_config->active != nullptr && reload_config->spare != nullptr) {
+        ReloadShardEndpoint endpoints[kMaxShards];
+        for (u32 i = 0; i < shard_count; i++) endpoints[i].control = &shards[i].control;
+        reload_enabled = reload_coordinator.init(&control_plane_mutation,
+                                                 reload_config->source_path,
+                                                 reload_config->opt,
+                                                 reload_config->active,
+                                                 reload_config->spare,
+                                                 endpoints,
+                                                 shard_count);
+        if (!reload_enabled) {
+            write_str("Failed to initialize reload coordinator\n");
+            for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
+            return 1;
+        }
+    }
+#else
+    (void)reload_config;
+#endif
+
     // Wire the registry before spawn so stats()/metrics() can latch a bounded
     // process snapshot even when the scrape endpoint is disabled.
     for (u32 i = 0; i < shard_count; i++) metrics_ptrs[i] = &shards[i].shard_metrics;
@@ -248,14 +327,6 @@ static i32 run_shards(u16 port,
     write_u32(shard_count);
     write_str(" shard(s)\n");
 
-    // Block SIGINT/SIGTERM so sigwait() can catch them race-free.
-    // Must block before spawning threads (threads inherit the mask).
-    sigset_t wait_set;
-    sigemptyset(&wait_set);
-    sigaddset(&wait_set, SIGINT);
-    sigaddset(&wait_set, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &wait_set, nullptr);
-
     // Spawn shard threads
     for (u32 i = 0; i < shard_count; i++) {
         i32 pin = pin_cpus ? static_cast<i32>(i) : -1;
@@ -285,9 +356,46 @@ static i32 run_shards(u16 port,
         }
     }
 
-    // Wait for SIGINT/SIGTERM — sigwait() is race-free (signal is blocked).
-    i32 sig = 0;
-    sigwait(&wait_set, &sig);
+    // Poll reload admission while waiting for shutdown. SIGHUP enters the same
+    // single-slot mutation boundary as route-triggered requests; compilation
+    // stays on this process-control thread, never a shard thread.
+    for (;;) {
+        struct timespec timeout{0, 100 * 1000 * 1000};
+        const i32 sig = sigtimedwait(&wait_set, nullptr, &timeout);
+        if (sig == SIGINT || sig == SIGTERM) break;
+#ifdef RUT_ENABLE_JIT
+        if (sig == SIGHUP) {
+            if (!reload_enabled) {
+                write_str("SIGHUP ignored: no .rut program is loaded\n");
+            } else if (!reload_coordinator.request_signal()) {
+                write_str("Reload request ignored: another reload is pending\n");
+            }
+        }
+        if (reload_enabled) {
+            const ReloadCoordinatorPoll result = reload_coordinator.poll();
+            if (result == ReloadCoordinatorPoll::CompileFailed) {
+                char msg[512];
+                format_load_error(reload_coordinator.last_load_error(), msg, sizeof(msg));
+                write_str("Reload failed: ");
+                write_str(msg);
+                write_str("\n");
+                write_reload_record(control_plane_mutation.last_record());
+            } else if (result == ReloadCoordinatorPoll::ValidationFailed) {
+                write_str("Reload rejected: program is incompatible with the running process\n");
+                write_reload_record(control_plane_mutation.last_record());
+            } else if (result == ReloadCoordinatorPoll::Published) {
+                write_str("Reload published; waiting for shard acknowledgements and old users\n");
+            } else if (result == ReloadCoordinatorPoll::Activated) {
+                write_str("Reload activated\n");
+                write_reload_record(control_plane_mutation.last_record());
+            }
+        }
+#endif
+        if (sig < 0 && errno != EAGAIN && errno != EINTR) {
+            write_str("sigtimedwait failed; beginning shutdown\n");
+            break;
+        }
+    }
 
     write_str("Draining connections (");
     write_u32(drain_secs);
@@ -301,6 +409,15 @@ static i32 run_shards(u16 port,
 
     // Wait for all shard threads to finish (they exit after drain completes).
     for (u32 i = 0; i < shard_count; i++) shards[i].join();
+
+#ifdef RUT_ENABLE_JIT
+    // Joining proves there are no remaining request/stream/session pins. Give a
+    // published generation one final chance to retire cleanly before stopping
+    // the mutation port; process teardown remains safe even if a shard exited
+    // before consuming its pending pointer.
+    if (reload_enabled) (void)reload_coordinator.poll();
+#endif
+    control_plane_mutation.stop();
 
     // Stop access log flusher (final flush of remaining entries).
     if (access_log_fd >= 0) {
@@ -481,8 +598,10 @@ int main(int argc, char** argv) {
     // for the whole run, so it lives at file scope to outlive every
     // shard and to keep the 1.28 MB RouteConfig off the stack.
     RouteConfig* route_config = nullptr;
+    ServerReloadConfig server_reload;
 #ifdef RUT_ENABLE_JIT
     static LoadedProgram program;
+    static LoadedProgram spare_program;
     if (config_path) {
         jit::OptLevel olvl = jit::OptLevel::O2;
         switch (opt_level) {
@@ -516,6 +635,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         route_config = &program.config;
+        server_reload.source_path = config_path;
+        server_reload.opt = olvl;
+        server_reload.active = &program;
+        server_reload.spare = &spare_program;
         // Loading is side-effect free with respect to live Cache state.
         // This startup installation is the activation boundary (no shard
         // exists yet); live reload must pair the same call with its config
@@ -572,7 +695,8 @@ int main(int argc, char** argv) {
                                           access_log_compress,
                                           access_log_level,
                                           route_config,
-                                          serve_metrics);
+                                          serve_metrics,
+                                          &server_reload);
         if (rc != 0 && tls_server) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
             rc = run_shards<EpollEventLoop>(port,
@@ -585,7 +709,8 @@ int main(int argc, char** argv) {
                                             access_log_compress,
                                             access_log_level,
                                             route_config,
-                                            serve_metrics);
+                                            serve_metrics,
+                                            &server_reload);
         }
     } else {
         write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
@@ -599,13 +724,15 @@ int main(int argc, char** argv) {
                                         access_log_compress,
                                         access_log_level,
                                         route_config,
-                                        serve_metrics);
+                                        serve_metrics,
+                                        &server_reload);
     }
     destroy_tls_server_context(tls_server);
 #ifdef RUT_ENABLE_JIT
     // Shards have joined inside run_shards; safe to release JIT code,
     // the RIR arena, and the source mapping.
     program.destroy();
+    spare_program.destroy();
 #endif
     return rc;
 }

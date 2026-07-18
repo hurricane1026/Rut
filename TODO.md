@@ -29,7 +29,9 @@ deterministic harness fixture plus timer-only shard-pinned source lowering are
 connected. Generation-carrying shard publication, installation
 acknowledgements, and exact HTTP/1 request / suspended HTTP/2 stream program
 pins plus terminate-mode WebSocket session pins are connected. The process
-coordinator, SIGHUP, and `reload()` lowering remain.
+coordinator, compatibility validation, SIGHUP activation path, and process
+harness are connected. Route-only `reload()` lowering and its explicit CLI
+authority flag remain.
 
 **Acceptance**:
 - Reload and upstream mutation define authorization, failure, and shard-ordering
@@ -100,6 +102,11 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] One process reload coordinator compiles into a spare program, validates
+  timer/Cache compatibility, publishes strict generations to every shard,
+  waits for installation acknowledgements and exact old-program pins, reuses
+  the retired slot, and drives the same single-slot path from SIGHUP. A real
+  process harness covers signal-to-activation and the bounded terminal record.
 - [x] Shard config publication acknowledges the generation actually installed
   at the event-loop command boundary, and loaded programs expose exact,
   close-safe HTTP/1 request, suspended HTTP/2 stream, and terminate-mode
