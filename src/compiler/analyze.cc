@@ -9506,6 +9506,7 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     term.source_kind = HirTerminatorSourceKind::Literal;
     term.span = stmt.span;
     term.status_code = static_cast<i32>(response->init.int_value);
+    term.commit_response_mutations = response->init.bool_value;
     for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
         const auto& field = response->init.field_inits[fi];
         if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
@@ -17792,7 +17793,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Pre-scan for waits: time.nowMicros() anywhere in a wait route is
         // rejected (see kTimeWaitDetail) — the flag must be set before any
         // statement is analyzed so pre-wait bindings are caught too.
-        bool response_runtime_mutation_blocked = seen_guard;
+        bool response_runtime_mutation_blocked = false;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
@@ -17800,8 +17801,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.cache_ops_blocked = true;
                 route.time_ops_blocked = true;
             }
-            if (s.kind == AstStmtKind::Guard || s.kind == AstStmtKind::Wait ||
-                s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For ||
+            if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
+                s.kind == AstStmtKind::For ||
                 (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
                 response_runtime_mutation_blocked = true;
         }
@@ -18342,12 +18343,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         stmt.span,
                         lit_str(
                             "a dynamically mutated Response builder must be returned directly"));
-                if (route.guards.len != 0)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        stmt.span,
-                        lit_str(
-                            "dynamic response header mutations cannot be combined with guards"));
                 for (u32 li = 0; li < route.locals.len; li++) {
                     if (route.locals[li].init.may_error)
                         return frontend_error(

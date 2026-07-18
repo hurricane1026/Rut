@@ -1033,6 +1033,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
+    conn.resp_header_mutation_pending_count = 0;
+    conn.resp_header_mutation_pending_overflow = false;
     conn.resp_header_mutation_count = 0;
     conn.resp_header_mutation_overflow = false;
     conn.proxy_resp_started = false;

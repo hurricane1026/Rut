@@ -342,6 +342,7 @@ struct Ctx {
     LLVMValueRef fn_resp_set_header = nullptr;
     LLVMValueRef fn_resp_add_header = nullptr;
     LLVMValueRef fn_resp_remove_header = nullptr;
+    LLVMValueRef fn_resp_commit_headers = nullptr;
     LLVMValueRef fn_resp_header = nullptr;
     LLVMValueRef get_resp_set_header() {
         if (!fn_resp_set_header) {
@@ -366,6 +367,15 @@ struct Ctx {
                 llvm_mod, "rut_helper_resp_remove_header", LLVMFunctionType(void_ty, params, 3, 0));
         }
         return fn_resp_remove_header;
+    }
+    LLVMValueRef get_resp_commit_headers() {
+        if (!fn_resp_commit_headers) {
+            LLVMTypeRef params[] = {ptr_ty};
+            fn_resp_commit_headers = LLVMAddFunction(llvm_mod,
+                                                     "rut_helper_resp_commit_headers",
+                                                     LLVMFunctionType(void_ty, params, 1, 0));
+        }
+        return fn_resp_commit_headers;
     }
     LLVMValueRef get_resp_header() {
         if (!fn_resp_header) {
@@ -1051,6 +1061,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            c.get_resp_remove_header(),
                            args,
                            3,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespCommitHeaders: {
+            LLVMValueRef args[] = {c.param_conn};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_commit_headers()),
+                           c.get_resp_commit_headers(),
+                           args,
+                           1,
                            "");
             break;
         }

@@ -31570,6 +31570,7 @@ TEST(frontend, response_local_dynamic_header_mutations_lower_to_runtime_ops) {
 route GET "/x" {
     let resp = response(200)
     resp.add("X-Base", "static")
+    guard req.http11 else { return 505 }
     resp.set("X-Path", req.path)
     resp.add("X-Path", "tail")
     let observed = resp.header("X-Path").or("missing")
@@ -31586,6 +31587,10 @@ route GET "/x" {
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(mir->functions[0].blocks[0].effects.len, 0u);
+    CHECK_EQ(mir->functions[0].blocks[1].effects.len, 0u);
+    CHECK_EQ(mir->functions[0].blocks[2].effects.len, 0u);
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);

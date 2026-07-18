@@ -1392,6 +1392,7 @@ TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
 route GET "/api/users" {
     let resp = response(200)
     resp.add("X-Base", "static")
+    guard req.http11 else { return 505 }
     resp.set("X-Path", req.path)
     resp.add("X-Path", "tail")
     let observed = resp.header("X-Path").or("missing")
@@ -1420,6 +1421,17 @@ route GET "/api/users" {
     REQUIRE(handler != nullptr);
 
     Connection conn;
+    conn.reset();
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(&conn,
+                                                        nullptr,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    CHECK(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+
     conn.reset();
     const auto result = HandlerResult::unpack(handler(&conn,
                                                       nullptr,

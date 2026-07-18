@@ -112,6 +112,10 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] Dynamic direct-route Response mutations use a two-phase pending/commit
+  log: `resp.header()` observes ordered pending writes, while only `return resp`
+  publishes them. Guards and pre-middleware short-circuits therefore cannot
+  leak builder headers into their own responses.
 - [x] Error-prelude exit-dominance now treats literal 4xx/5xx pre-rejects as
   fail-closed while keeping the prelude for success, redirect, dynamic, and
   forward exits that do not recover a fallible local.
