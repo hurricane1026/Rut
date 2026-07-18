@@ -241,6 +241,10 @@ constexpr Str kStateDeclDetail = lit_str(
 constexpr Str kCacheCapacityDetail = lit_str(
     "Cache capacity must be a positive int literal (slot count, rounded up "
     "to a power of two; capacity is capped at 4194304 slots)");
+constexpr Str kCacheBackendReservedDetail = lit_str(
+    "backend: on Cache is reserved — lossy Cache has no cross-node read "
+    "freshness/invalidation or atomic-update contract; keep source-of-truth "
+    "state external until backend state semantics are implemented");
 constexpr Str kCacheDupNameDetail = lit_str("duplicate Cache declaration name");
 constexpr Str kCacheGetDetail =
     lit_str("cache.get(key) expects exactly one plain IP key (e.g. req.remoteAddr)");
@@ -14735,6 +14739,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!args_ok)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.state.span, kStateDeclDetail);
+        for (u32 field_i = 0; field_i < init->field_inits.len; field_i++) {
+            if (init->field_inits[field_i].name.eq({"backend", 7}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      init->field_inits[field_i].value != nullptr
+                                          ? init->field_inits[field_i].value->span
+                                          : item.state.span,
+                                      kCacheBackendReservedDetail);
+        }
         constexpr i64 kMaxCacheCapacity = 1 << 22;  // 4M slots = 64 MB/instance/shard
         if (init->field_inits.len != 1 || !init->field_inits[0].name.eq({"capacity", 8}) ||
             init->field_inits[0].value == nullptr ||

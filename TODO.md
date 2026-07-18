@@ -112,8 +112,10 @@ without presenting lossy or per-shard state as exact shared state.
   whose absence would be incorrect. The accepted, not-yet-implemented contract
   is in `docs/hash-state.md`: no eviction, per-key owner linearization, pure
   bounded updater, definite-not-applied failures, and reload ownership rules.
-- Keep cross-node `backend:` syntax reserved until reads have an explicit
+- [x] Keep cross-node `backend:` syntax reserved until reads have an explicit
   freshness/invalidation contract; do not describe Cache as a source of truth.
+  The analyzer now rejects `Cache(..., backend: ...)` with that exact reason,
+  independent of named-argument order.
 
 **Acceptance**:
 - A rate-limit test demonstrates both meter-every-attempt and meter-on-accept
@@ -191,7 +193,7 @@ without presenting lossy or per-shard state as exact shared state.
 **Why**: Baseline slot/state invariant coverage is now in place for representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions. The remaining work is to widen that coverage so new paths do not drift from the same debug/metrics expectations.
 
 **Work**:
-- Add follow-up tests for less-common or newly introduced transitions not yet covered by the representative dispatch cases.
+- [x] Add follow-up tests for less-common or newly introduced transitions not yet covered by the representative dispatch cases.
 - Reuse the existing invariant helper/check pattern when adding new dispatch paths or callback-slot combinations.
 - Audit future state-machine changes for:
   - new `conn.state` values or transitions that need invariant assertions,
@@ -199,7 +201,7 @@ without presenting lossy or per-shard state as exact shared state.
   - teardown/reset flows where callback slots should be cleared before returning to idle/free states.
 
 **Acceptance**:
-- The backlog item is complete when remaining uncovered transitions have explicit invariant assertions or are documented as intentionally exempt.
+- [x] Remaining uncovered transitions have explicit invariant assertions or are documented as intentionally exempt in `docs/runtime-state-invariants.md`.
 
 ## P1: Rut Core Syntax Reduction
 

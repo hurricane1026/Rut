@@ -54,3 +54,24 @@ should update all of these together:
 Over time, key state mutations should move behind small transition APIs. Once
 that happens, each API can map one-to-one to a TLA+ action and the consistency
 gate can become stricter.
+
+## Coverage Audit
+
+The invariant tests in `tests/test_network.cc` cover each `ConnState` shape and
+the callback-slot combinations used by HTTP/1 static responses, proxy connect,
+request/response streaming, JIT waits, keep-alive reuse, and free/reset. Error
+coverage includes connect failure, malformed upstream responses, response EOF,
+proxy timeout, JIT operation submission failure, and HTTP/2 proxy timeout
+teardown.
+
+HTTP/2 reuses the same connection states but has protocol-specific callbacks.
+Its proxy failure assertion therefore checks the shared shape plus the resources
+that can otherwise leak across streams: upstream fd, concurrency slot, pinned
+config epoch, HTTP/2 async slot, and all upstream callbacks. The frame parser's
+per-stream states are intentionally outside `ConnState`; their transitions are
+covered in `tests/test_http2_conn.cc`.
+
+TLS does not introduce another `ConnState`. While an io_uring TLS receive is in
+flight, `set_slots` may stage the next receive callback in
+`tls_pending_on_recv`; TLS transition tests cover that transport exception, so
+the plain four-slot helpers are intentionally limited to non-TLS connections.
