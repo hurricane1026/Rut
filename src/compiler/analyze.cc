@@ -9830,7 +9830,11 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     return term;
 }
 
-static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, const HirModule& mod) {
+static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
+                                                  const HirModule& mod,
+                                                  const HirLocal* locals = nullptr,
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -9854,6 +9858,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
                 term.response_body = stmt.response_body;
             } else {
                 if (stmt.expr.kind != AstExprKind::Call || !stmt.expr.name.eq({"json", 4}) ||
+                    user_bound_ident_name(mod, locals, local_count, binding, {"json", 4}) ||
                     stmt.expr.args.len != 1 || stmt.expr.args[0] == nullptr)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
@@ -10016,7 +10021,7 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod);
+        auto term = analyze_term(*arm.stmt, mod, locals, local_count);
         if (!term) return core::make_unexpected(term.error());
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
@@ -10494,7 +10499,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     }
                 } else {
                     if (is_ast_hir_terminator(*inner.else_stmt)) {
-                        auto fail_term = analyze_term(*inner.else_stmt, mod);
+                        auto fail_term = analyze_term(
+                            *inner.else_stmt, mod, scoped_locals.data, scoped_locals.len, binding);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
@@ -10635,9 +10641,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();
@@ -10645,7 +10651,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
 
     arm->body_kind = HirMatchArm::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     arm->direct_term = term.value();
     return {};
@@ -10750,16 +10756,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         body->then_term = then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
@@ -10906,9 +10912,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
-            auto then_term = analyze_term(*stmt.then_stmt, mod);
+            auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*stmt.else_stmt, mod);
+            auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
@@ -11725,7 +11731,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, route->locals.data, route->locals.len, binding);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
     return {};
@@ -13016,9 +13022,9 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 
         route.control.kind = HirControlKind::If;
         route.control.cond = cond;
-        auto then_term = analyze_term(*timer_arm->stmt, mod);
+        auto then_term = analyze_term(*timer_arm->stmt, mod, route.locals.data, route.locals.len);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*recv_arm->stmt, mod);
+        auto else_term = analyze_term(*recv_arm->stmt, mod, route.locals.data, route.locals.len);
         if (!else_term) return core::make_unexpected(else_term.error());
         route.control.then_term = then_term.value();
         route.control.else_term = else_term.value();
@@ -13310,7 +13316,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         lit_str("guard match inside static for-loop requires an error value"));
                 }
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
-                auto fail = analyze_term(*bstmt.else_stmt, mod);
+                auto fail =
+                    analyze_term(*bstmt.else_stmt, mod, route->locals.data, route->locals.len);
                 if (!fail) return core::make_unexpected(fail.error());
                 guard.fail_term = fail.value();
             } else {
@@ -13397,7 +13404,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
-            auto t = analyze_term(bstmt, mod);
+            auto t = analyze_term(bstmt, mod, route->locals.data, route->locals.len);
             if (!t) return core::make_unexpected(t.error());
             loop.body.term = t.value();
             loop.body.has_term = true;
@@ -13445,9 +13452,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bstmt.expr.span,
                     lit_str("static for-loop if condition must be a non-fallible bool"));
             body_if.cond = cond.value();
-            auto then_term = analyze_term(*bstmt.then_stmt, mod);
+            auto then_term =
+                analyze_term(*bstmt.then_stmt, mod, route->locals.data, route->locals.len);
             if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*bstmt.else_stmt, mod);
+            auto else_term =
+                analyze_term(*bstmt.else_stmt, mod, route->locals.data, route->locals.len);
             if (!else_term) return core::make_unexpected(else_term.error());
             body_if.then_term = then_term.value();
             body_if.else_term = else_term.value();
@@ -13715,16 +13724,23 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
-                            auto then_term = analyze_term(*inner_arm.stmt->then_stmt, mod);
+                            auto then_term = analyze_term(*inner_arm.stmt->then_stmt,
+                                                          mod,
+                                                          route->locals.data,
+                                                          route->locals.len);
                             if (!then_term) return core::make_unexpected(then_term.error());
-                            auto else_term = analyze_term(*inner_arm.stmt->else_stmt, mod);
+                            auto else_term = analyze_term(*inner_arm.stmt->else_stmt,
+                                                          mod,
+                                                          route->locals.data,
+                                                          route->locals.len);
                             if (!else_term) return core::make_unexpected(else_term.error());
                             arm.body_kind = HirForLoopMatchArm::BodyKind::If;
                             arm.cond = cond_expr.value();
                             arm.then_term = then_term.value();
                             arm.else_term = else_term.value();
                         } else if (is_ast_hir_terminator(*inner_arm.stmt)) {
-                            auto term = analyze_term(*inner_arm.stmt, mod);
+                            auto term = analyze_term(
+                                *inner_arm.stmt, mod, route->locals.data, route->locals.len);
                             if (!term) return core::make_unexpected(term.error());
                             arm.direct_term = term.value();
                         } else {
@@ -13969,7 +13985,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 }
                             } else {
                                 if (is_ast_hir_terminator(*inner.else_stmt)) {
-                                    auto fail = analyze_term(*inner.else_stmt, mod);
+                                    auto fail = analyze_term(*inner.else_stmt,
+                                                             mod,
+                                                             arm_scoped_locals.data,
+                                                             arm_scoped_locals.len);
                                     if (!fail) return core::make_unexpected(fail.error());
                                     guard.fail_term = fail.value();
                                 } else {
@@ -14238,16 +14257,28 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_ast_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
-                            auto then_term = analyze_term(*inner_ast_arm.stmt->then_stmt, mod);
+                            auto then_term = analyze_term(*inner_ast_arm.stmt->then_stmt,
+                                                          mod,
+                                                          arm_locals,
+                                                          arm_local_count,
+                                                          arm_binding_ptr);
                             if (!then_term) return core::make_unexpected(then_term.error());
-                            auto else_term = analyze_term(*inner_ast_arm.stmt->else_stmt, mod);
+                            auto else_term = analyze_term(*inner_ast_arm.stmt->else_stmt,
+                                                          mod,
+                                                          arm_locals,
+                                                          arm_local_count,
+                                                          arm_binding_ptr);
                             if (!else_term) return core::make_unexpected(else_term.error());
                             expanded.body_kind = HirForLoopMatchArm::BodyKind::If;
                             expanded.cond = cond.value();
                             expanded.then_term = then_term.value();
                             expanded.else_term = else_term.value();
                         } else if (is_ast_hir_terminator(*inner_ast_arm.stmt)) {
-                            auto term = analyze_term(*inner_ast_arm.stmt, mod);
+                            auto term = analyze_term(*inner_ast_arm.stmt,
+                                                     mod,
+                                                     arm_locals,
+                                                     arm_local_count,
+                                                     arm_binding_ptr);
                             if (!term) return core::make_unexpected(term.error());
                             expanded.body_kind = HirForLoopMatchArm::BodyKind::Direct;
                             expanded.direct_term = term.value();
@@ -14279,16 +14310,19 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             arm_stmt->expr.span,
                             lit_str("static for-loop match-arm if condition must be a "
                                     "non-fallible bool"));
-                    auto then_term = analyze_term(*arm_stmt->then_stmt, mod);
+                    auto then_term = analyze_term(
+                        *arm_stmt->then_stmt, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!then_term) return core::make_unexpected(then_term.error());
-                    auto else_term = analyze_term(*arm_stmt->else_stmt, mod);
+                    auto else_term = analyze_term(
+                        *arm_stmt->else_stmt, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!else_term) return core::make_unexpected(else_term.error());
                     arm.body_kind = HirForLoopMatchArm::BodyKind::If;
                     arm.cond = cond.value();
                     arm.then_term = then_term.value();
                     arm.else_term = else_term.value();
                 } else if (is_ast_hir_terminator(*arm_stmt)) {
-                    auto term = analyze_term(*arm_stmt, mod);
+                    auto term =
+                        analyze_term(*arm_stmt, mod, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!term) return core::make_unexpected(term.error());
                     arm.direct_term = term.value();
                 } else {
@@ -18745,7 +18779,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 } else {
                     if (is_ast_hir_terminator(*stmt.else_stmt)) {
-                        auto fail_term = analyze_term(*stmt.else_stmt, mod);
+                        auto fail_term =
+                            analyze_term(*stmt.else_stmt, mod, route.locals.data, route.locals.len);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {

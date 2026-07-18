@@ -31808,6 +31808,22 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, json_serializes_objects_nested_in_arrays) {
+    const char* src = R"rut(
+route GET "/x" {
+    return 200, json([{ id: 1 }, { id: 2, meta: { ok: true } }])
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.response_body.eq(
+        lit("[{\"id\":1},{\"id\":2,\"meta\":{\"ok\":true}}]")));
+}
+
 TEST(frontend, json_serializes_empty_literal_arrays_and_objects) {
     const char* src =
         "route GET \"/x\" { let payload = json({ users: [], meta: {}, ok: true }) return 200 }\n";
@@ -31858,6 +31874,31 @@ TEST(frontend, return_body_expression_rejects_non_json_calls) {
     REQUIRE_FALSE(hir.has_value());
     CHECK(
         hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
+}
+
+TEST(frontend, return_body_json_builtin_respects_shadowing) {
+    const char* function_src = R"rut(
+func json(_ value: i32) -> str => "shadowed"
+route GET "/x" { return 200, json(1) }
+)rut";
+    auto function_lexed = lex(lit(function_src));
+    REQUIRE(function_lexed);
+    auto function_ast = parse_file_heap(function_lexed.value());
+    REQUIRE(function_ast);
+    auto function_hir = analyze_file_heap(function_ast.value());
+    REQUIRE_FALSE(function_hir.has_value());
+    CHECK(function_hir.error().detail.eq(
+        lit("return body expressions currently support json(literal) only")));
+
+    const char* local_src = "route GET \"/x\" { let json = 1 return 200, json(1) }\n";
+    auto local_lexed = lex(lit(local_src));
+    REQUIRE(local_lexed);
+    auto local_ast = parse_file_heap(local_lexed.value());
+    REQUIRE(local_ast);
+    auto local_hir = analyze_file_heap(local_ast.value());
+    REQUIRE_FALSE(local_hir.has_value());
+    CHECK(local_hir.error().detail.eq(
+        lit("return body expressions currently support json(literal) only")));
 }
 
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {

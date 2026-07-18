@@ -325,8 +325,7 @@ struct Parser {
             if (!field_name) return core::make_unexpected(field_name.error());
             auto colon = expect(TokenType::Colon);
             if (!colon) return core::make_unexpected(colon.error());
-            auto field_value =
-                cur().type == TokenType::LBrace ? parse_object_call_arg() : parse_expr();
+            auto field_value = parse_call_arg();
             if (!field_value) return core::make_unexpected(field_value.error());
             auto field_value_ptr = alloc_expr(field_value.value());
             if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -360,7 +359,9 @@ struct Parser {
             AstExpr arr{};
             arr.kind = AstExprKind::ArrayLit;
             while (!take(TokenType::RBracket)) {
-                auto elem = parse_expr();
+                // Object literals are expression-like only inside call arguments,
+                // including recursively nested JSON arrays.
+                auto elem = parse_call_arg();
                 if (!elem) return core::make_unexpected(elem.error());
                 auto elem_ptr = alloc_expr(elem.value());
                 if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
