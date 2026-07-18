@@ -16,6 +16,7 @@
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
+#include <vector>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -10703,6 +10704,82 @@ TEST(legacy_loop, alloc_upstream_buf) {
     CHECK(loop->alloc_upstream_buf(*c));
 
     loop->free_conn(*c);
+    loop->shutdown();
+}
+
+TEST(legacy_loop, lazy_aux_buffers_handle_exhaustion_atomically) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+
+    // Lazy buffers bind exactly once and are released with the connection.
+    CHECK(loop->alloc_response_header_buf(*c));
+    u8* response_headers = c->response_header_slice;
+    REQUIRE(response_headers != nullptr);
+    CHECK(loop->alloc_response_header_buf(*c));
+    CHECK_EQ(c->response_header_slice, response_headers);
+
+    CHECK(loop->alloc_ws_terminate_bufs(*c));
+    u8* ws_c2u = c->ws_c2u_msg;
+    u8* ws_u2c = c->ws_u2c_msg;
+    REQUIRE(ws_c2u != nullptr);
+    REQUIRE(ws_u2c != nullptr);
+    CHECK(loop->alloc_ws_terminate_bufs(*c));
+    CHECK_EQ(c->ws_c2u_msg, ws_c2u);
+    CHECK_EQ(c->ws_u2c_msg, ws_u2c);
+
+    c->fd = -1;
+    loop->free_conn(*c);
+
+    c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+
+    // Freeze growth at the currently committed size, then leave one slice.
+    // The two-slice WebSocket allocation must roll the first allocation back.
+    const u32 original_max = loop->pool.max_count;
+    loop->pool.max_count = loop->pool.count;
+    std::vector<u8*> held;
+    while (loop->pool.available() > 1) held.push_back(loop->pool.alloc());
+    REQUIRE_EQ(loop->pool.available(), 1u);
+    CHECK(!loop->alloc_ws_terminate_bufs(*c));
+    CHECK_EQ(c->ws_c2u_msg, nullptr);
+    CHECK_EQ(c->ws_u2c_msg, nullptr);
+    CHECK_EQ(loop->pool.available(), 1u);
+
+    u8* last = loop->pool.alloc();
+    REQUIRE(last != nullptr);
+    REQUIRE_EQ(loop->pool.available(), 0u);
+    CHECK(!loop->alloc_upstream_buf(*c));
+    CHECK(!loop->alloc_response_header_buf(*c));
+    CHECK(!loop->alloc_ws_terminate_bufs(*c));
+
+    loop->pool.max_count = original_max;
+    loop->pool.free(last);
+    for (u8* slice : held) loop->pool.free(slice);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+}
+
+TEST(legacy_async_loop, immediate_free_releases_all_lazy_buffers) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    REQUIRE(loop->alloc_response_header_buf(*c));
+    REQUIRE(loop->alloc_ws_terminate_bufs(*c));
+
+    c->fd = -1;
+    c->pending_ops = 0;
+    loop->free_conn(*c);
+    CHECK_EQ(c->recv_slice, nullptr);
+    CHECK_EQ(c->send_slice, nullptr);
+    CHECK_EQ(c->upstream_recv_slice, nullptr);
+    CHECK_EQ(c->response_header_slice, nullptr);
+    CHECK_EQ(c->ws_c2u_msg, nullptr);
+    CHECK_EQ(c->ws_u2c_msg, nullptr);
     loop->shutdown();
 }
 
