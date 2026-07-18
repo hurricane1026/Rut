@@ -6745,6 +6745,8 @@ TEST(frontend, response_type_is_not_an_aggregate_payload) {
         "struct Box { value: Response }\n",
         "variant Box { value(Response) }\n",
         "type Box = Response\n",
+        "func boxed(_ value: (Response, i32)) -> i32 => 0\n",
+        "func boxed() -> (Response, i32) => (response(200), 0)\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));

@@ -1836,14 +1836,25 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
 
 static bool ast_type_ref_contains_response(const AstTypeRef& ref) {
     if (!ref.is_tuple && ref.name.eq({"Response", 8})) return true;
-    for (u32 i = 0; i < ref.type_args.len; i++) {
-        if (ref.type_args[i] != nullptr && ast_type_ref_contains_response(*ref.type_args[i]))
+    const u32 arg_count =
+        ref.type_args.len > ref.type_arg_names.len ? ref.type_args.len : ref.type_arg_names.len;
+    for (u32 i = 0; i < arg_count; i++) {
+        if (i < ref.type_args.len && ref.type_args[i] != nullptr) {
+            if (ast_type_ref_contains_response(*ref.type_args[i])) return true;
+        } else if (i < ref.type_arg_names.len && ref.type_arg_names[i].eq({"Response", 8}) &&
+                   (i >= ref.type_arg_namespaces.len || ref.type_arg_namespaces[i].len == 0)) {
             return true;
+        }
     }
-    for (u32 i = 0; i < ref.tuple_elem_types.len; i++) {
-        if (ref.tuple_elem_types[i] != nullptr &&
-            ast_type_ref_contains_response(*ref.tuple_elem_types[i]))
+    const u32 tuple_count = ref.tuple_elem_types.len > ref.tuple_elem_names.len
+                                ? ref.tuple_elem_types.len
+                                : ref.tuple_elem_names.len;
+    for (u32 i = 0; i < tuple_count; i++) {
+        if (i < ref.tuple_elem_types.len && ref.tuple_elem_types[i] != nullptr) {
+            if (ast_type_ref_contains_response(*ref.tuple_elem_types[i])) return true;
+        } else if (i < ref.tuple_elem_names.len && ref.tuple_elem_names[i].eq({"Response", 8})) {
             return true;
+        }
     }
     return false;
 }
@@ -15494,6 +15505,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (ast_func.has_return_type) {
             const auto& ret_ref = ast_func.return_type;
+            const bool plain_response = !ret_ref.is_tuple && ret_ref.namespace_name.len == 0 &&
+                                        ret_ref.name.eq({"Response", 8}) &&
+                                        ret_ref.type_arg_names.len == 0 &&
+                                        ret_ref.type_args.len == 0;
+            if (!plain_response && ast_type_ref_contains_response(ret_ref))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span,
+                    lit_str("Response is only supported as a chain after parameter"));
             if (!ret_ref.is_tuple && ret_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
@@ -15640,6 +15660,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param.name = ast_func.params[pi].name;
             param.has_underscore_label = ast_func.params[pi].has_underscore_label;
             const auto& param_ref = ast_func.params[pi].type;
+            const bool plain_response = !param_ref.is_tuple && param_ref.namespace_name.len == 0 &&
+                                        param_ref.name.eq({"Response", 8}) &&
+                                        param_ref.type_arg_names.len == 0 &&
+                                        param_ref.type_args.len == 0;
+            if (!plain_response && ast_type_ref_contains_response(param_ref))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span,
+                    lit_str("Response is only supported as a chain after parameter"));
             if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
@@ -16431,6 +16460,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (item.func.has_return_type) {
             const auto& ret_ref = item.func.return_type;
+            const bool plain_response = !ret_ref.is_tuple && ret_ref.namespace_name.len == 0 &&
+                                        ret_ref.name.eq({"Response", 8}) &&
+                                        ret_ref.type_arg_names.len == 0 &&
+                                        ret_ref.type_args.len == 0;
+            if (!plain_response && ast_type_ref_contains_response(ret_ref))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    item.func.span,
+                    lit_str("Response is only supported as a chain after parameter"));
             if (!ret_ref.is_tuple && ret_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
@@ -16578,6 +16616,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param.name = item.func.params[pi].name;
             param.has_underscore_label = item.func.params[pi].has_underscore_label;
             const auto& param_ref = item.func.params[pi].type;
+            const bool plain_response = !param_ref.is_tuple && param_ref.namespace_name.len == 0 &&
+                                        param_ref.name.eq({"Response", 8}) &&
+                                        param_ref.type_arg_names.len == 0 &&
+                                        param_ref.type_args.len == 0;
+            if (!plain_response && ast_type_ref_contains_response(param_ref))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    item.func.span,
+                    lit_str("Response is only supported as a chain after parameter"));
             if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;

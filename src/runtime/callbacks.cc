@@ -13,6 +13,10 @@
 
 namespace rut {
 
+bool h2_apply_forward_request_overrides(Connection& conn) {
+    return rewrite_request_line_path(conn) && apply_request_header_overrides(conn);
+}
+
 u8 map_log_method(HttpMethod method) {
     switch (method) {
         case HttpMethod::GET:

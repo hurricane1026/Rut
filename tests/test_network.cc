@@ -16081,6 +16081,74 @@ TEST(response_headers, forwarded_mutations_keep_drain_close_signal) {
     CHECK(out.find("X-Test: yes\r\n") != std::string::npos);
 }
 
+TEST(response_headers, forwarded_mutations_reject_runtime_header_injection) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[256]{};
+    u8 header_storage[256]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Dynamic", 9};
+    mutation.value = {"safe\r\nInjected: yes", 19};
+
+    CHECK_FALSE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+}
+
+TEST(http2, forward_request_applies_jit_path_and_header_overrides) {
+    Connection conn;
+    conn.reset();
+    conn.req_path_overridden = true;
+    conn.req_path_override = {"/new", 4};
+    conn.req_header_override_count = 2;
+    conn.req_header_overrides[0] = {{"X-Auth", 6}, {"trusted", 7}};
+    conn.req_header_overrides[1] = {{"X-Added", 7}, {"yes", 3}};
+    conn.req_header_append_mask = 1u << 1;
+    static const char request[] =
+        "GET /old HTTP/1.1\r\nHost: x\r\nX-Auth: client\r\nX-Auth: duplicate\r\n\r\n";
+    u8 out[512]{};
+    u32 out_len = 0;
+
+    REQUIRE(h2_prepare_forward_request(conn,
+                                       reinterpret_cast<const u8*>(request),
+                                       sizeof(request) - 1,
+                                       out,
+                                       sizeof(out),
+                                       &out_len));
+    const std::string rewritten(reinterpret_cast<const char*>(out), out_len);
+    CHECK(rewritten.starts_with("GET /new HTTP/1.1\r\n"));
+    CHECK(rewritten.find("X-Auth: trusted\r\n") != std::string::npos);
+    CHECK(rewritten.find("X-Auth: client") == std::string::npos);
+    CHECK(rewritten.find("X-Auth: duplicate") == std::string::npos);
+    CHECK(rewritten.find("X-Added: yes\r\n") != std::string::npos);
+}
+
+TEST(http2, new_request_reset_clears_connection_wide_mutations) {
+    Connection conn;
+    conn.reset();
+    u8 response_header_storage[64]{};
+    conn.response_header_slice = response_header_storage;
+    conn.response_header_buf.bind(response_header_storage, sizeof(response_header_storage));
+    conn.response_header_buf.write(reinterpret_cast<const u8*>("stale"), 5);
+    conn.req_path_overridden = true;
+    conn.req_header_override_count = 1;
+    conn.resp_header_mutation_pending_count = 1;
+    conn.resp_header_mutation_count = 1;
+
+    h2_reset_request_mutations(conn);
+
+    CHECK_FALSE(conn.req_path_overridden);
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    CHECK_EQ(conn.resp_header_mutation_pending_count, 0u);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

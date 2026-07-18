@@ -1546,6 +1546,19 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         header_len > conn.upstream_recv_buf.len())
         return false;
 
+    // Compile-time validation cannot see request-derived values. Validate the
+    // committed runtime log before writing any bytes so malformed values fail
+    // closed without leaving a partially serialized header block.
+    for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
+        const auto& mutation = conn.resp_header_mutations[i];
+        const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+        if (validate_response_header(mutation.name.ptr,
+                                     mutation.name.len,
+                                     remove ? "" : mutation.value.ptr,
+                                     remove ? 0 : mutation.value.len) != HttpHeaderValidation::Ok)
+            return false;
+    }
+
     const u8* data = conn.upstream_recv_buf.data();
     auto write = [&](const void* src, u32 len) {
         return conn.response_header_buf.write(static_cast<const u8*>(src), len) == len;
@@ -2163,24 +2176,24 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 // it (remaining headers + any buffered body) shift by the length delta, and both
 // recv_buf's length and req_initial_send_len are adjusted to match. No-ops on a
 // malformed request line or if the rewritten request would exceed the buffer.
-inline void rewrite_request_line_path(Connection& conn) {
-    if (!conn.req_path_overridden || conn.req_path_override.ptr == nullptr) return;
+inline bool rewrite_request_line_path(Connection& conn) {
+    if (!conn.req_path_overridden || conn.req_path_override.ptr == nullptr) return true;
     u8* buf = conn.recv_slice;
     const u32 total = conn.recv_buf.len();
-    if (buf == nullptr || total == 0) return;
+    if (buf == nullptr || total == 0) return false;
     // Request line: METHOD SP PATH SP VERSION CRLF — locate the two spaces.
     u32 i = 0;
     while (i < total && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n') i++;
-    if (i >= total || buf[i] != ' ') return;
+    if (i >= total || buf[i] != ' ') return false;
     const u32 path_start = i + 1;
     u32 j = path_start;
     while (j < total && buf[j] != ' ' && buf[j] != '\r' && buf[j] != '\n') j++;
-    if (j >= total || buf[j] != ' ') return;
+    if (j >= total || buf[j] != ' ') return false;
     const u32 old_len = j - path_start;
     const u32 new_len = conn.req_path_override.len;
-    if (new_len == 0) return;
+    if (new_len == 0) return false;
     const i64 delta = static_cast<i64>(new_len) - static_cast<i64>(old_len);
-    if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) return;
+    if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) return false;
     if (delta != 0) {
         __builtin_memmove(
             buf + (static_cast<i64>(j) + delta), buf + j, static_cast<size_t>(total - j));
@@ -2201,6 +2214,7 @@ inline void rewrite_request_line_path(Connection& conn) {
         const i64 he = static_cast<i64>(conn.req_header_end) + delta;
         conn.req_header_end = he > 0 ? static_cast<u32>(he) : 0;
     }
+    return true;
 }
 
 // Apply forward(set_header:) overrides to the buffered request before forwarding.
@@ -2461,13 +2475,13 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // retry replay the request bytes live in send_buf, while recv_buf may already
     // hold the next pipelined request, so only rewrite the initial forward buffer.
     if (conn.retry_req_send_len == 0) {
-        rewrite_request_line_path(conn);
+        const bool path_rewritten = rewrite_request_line_path(conn);
         // forward(set_header:) — inject/replace request header lines (no-op unless
         // overrides were recorded). After the path rewrite so it reads the updated
         // req_header_end. Fail closed (500) if a configured override can't be applied
         // (oversized / no headroom) rather than forwarding the request with a
         // security-sensitive header silently dropped.
-        if (!apply_request_header_overrides(conn)) {
+        if (!path_rewritten || !apply_request_header_overrides(conn)) {
             // The upstream connected but no request will be sent. Release it now so a
             // client that stalls reading the 500 can't pin an idle upstream fd /
             // concurrency slot until keepalive/timeout (close_conn would otherwise only

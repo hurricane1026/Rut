@@ -7,11 +7,11 @@
 // Serves: static (return-status) routes, the default 200, synchronous JIT
 // handlers (status + optional body/headers + request bodies), timer-yielding JIT
 // handlers (wait(ms) — suspended on the async slot, resumed via the yield timer),
-// and no-body proxy routes (forwarded to the h1 upstream, response buffered and
-// re-framed). One suspended stream per connection (others queue). Still 503:
-// forwarding/event-yield JIT handlers, and proxy with a request body. HTTP/1 is
-// untouched: this path is only entered when conn.protocol == Http2 (ALPN) or the
-// cleartext h2c preface is detected.
+// and no-body proxy/JIT-forward routes (forwarded to the h1 upstream, response
+// buffered and re-framed). One suspended stream per connection (others queue).
+// Still 503: event-yield JIT handlers and proxy/JIT-forward outcomes carrying a
+// request body. HTTP/1 is untouched: this path is only entered when
+// conn.protocol == Http2 (ALPN) or the cleartext h2c preface is detected.
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
@@ -26,6 +26,56 @@
 #include <string.h>  // memmove
 
 namespace rut {
+
+// Implemented in callbacks.cc using the HTTP/1 override helpers. The h2
+// forwarding path temporarily presents its synthesized HTTP/1 request through
+// Connection::recv_buf so both protocols share the same validation and rewrite
+// semantics without making this standalone header depend on callbacks_impl.h.
+bool h2_apply_forward_request_overrides(Connection& conn);
+
+inline void h2_reset_request_mutations(Connection& conn) {
+    conn.req_path_overridden = false;
+    conn.req_path_override = {nullptr, 0};
+    conn.req_header_override_count = 0;
+    conn.req_header_append_mask = 0;
+    conn.req_header_override_overflow = false;
+    conn.resp_header_mutation_pending_count = 0;
+    conn.resp_header_mutation_pending_overflow = false;
+    conn.resp_header_mutation_count = 0;
+    conn.resp_header_mutation_overflow = false;
+    if (conn.response_header_buf.valid()) conn.response_header_buf.reset();
+}
+
+inline bool h2_prepare_forward_request(
+    Connection& conn, const u8* synth, u32 synth_len, u8* out, u32 out_cap, u32* out_len) {
+    if (synth_len > out_cap) return false;
+    __builtin_memmove(out, synth, synth_len);
+    u32 header_end = 0;
+    for (u32 i = 0; i + 3 < synth_len; i++) {
+        if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' && out[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    if (header_end == 0) return false;
+
+    u8* saved_slice = conn.recv_slice;
+    Buffer saved_buf = static_cast<Buffer&&>(conn.recv_buf);
+    const u32 saved_header_end = conn.req_header_end;
+    const u32 saved_initial_send_len = conn.req_initial_send_len;
+    conn.recv_slice = out;
+    conn.recv_buf.bind(out, out_cap);
+    conn.recv_buf.commit(synth_len);
+    conn.req_header_end = header_end;
+    conn.req_initial_send_len = synth_len;
+    const bool ok = h2_apply_forward_request_overrides(conn);
+    if (ok) *out_len = conn.recv_buf.len();
+    conn.recv_buf = static_cast<Buffer&&>(saved_buf);
+    conn.recv_slice = saved_slice;
+    conn.req_header_end = saved_header_end;
+    conn.req_initial_send_len = saved_initial_send_len;
+    return ok;
+}
 
 // Per-process() dispatch context, pointed at by Http2Conn::cb_ctx for the
 // duration of one process() call. Response frames produced by the on_headers
@@ -559,7 +609,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 param_count,
                     const RouteConfig* cfg,
                     const u8* synth,
-                    u32 synth_len) {
+                    u32 synth_len,
+                    bool request_body_followed) {
     auto* ctx = d.conn->reset_jit_ctx();
     d.conn->resp_header_mutation_pending_count = 0;
     d.conn->resp_header_mutation_pending_overflow = false;
@@ -580,18 +631,28 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (request_body_followed) {
+            h2_emit_status(d, stream_id, 503);
+            return;
+        }
         const bool stable = d.conn->resp_header_mutation_count == 0 ||
                             (d.loop->alloc_response_header_buf(*d.conn) &&
                              d.conn->stabilize_response_mutations(synth, synth_len));
-        if (!stable) {
+        u8 forward_synth[Http2Conn::kBodySynthCap];
+        u32 forward_len = 0;
+        const bool prepared =
+            stable &&
+            h2_prepare_forward_request(
+                *d.conn, synth, synth_len, forward_synth, sizeof(forward_synth), &forward_len);
+        if (!prepared) {
             h2_emit_status(d, stream_id, 500);
         } else if (cfg == nullptr || kOutcome.upstream_id >= cfg->upstream_count ||
                    !h2_suspend_proxy(d,
                                      stream_id,
                                      cfg,
                                      static_cast<u16>(kOutcome.upstream_id),
-                                     synth,
-                                     synth_len)) {
+                                     forward_synth,
+                                     forward_len)) {
             h2_emit_status(d, stream_id, 503);
         }
         return;
@@ -667,7 +728,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen);
+    h2_invoke_emit(d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen, true);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -678,6 +739,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          const hpack::Header* headers,
                          u32 nheaders,
                          bool end_stream) {
+    // The mutation logs are connection-owned. Clear them at every new request
+    // boundary once no suspended proxy owns them; a later plain proxy stream must
+    // never inherit a completed JIT stream's mutations.
+    if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
     if (!h2_headers_to_request(headers, nheaders, &req)) {
         h2_emit_status(d, stream_id, 400);
@@ -805,10 +870,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            // Defer when a body still follows: needs_req_body handlers wait to
-            // read it; others wait only to consume / validate a declared
-            // Content-Length. buffer_body decides whether DATA is accumulated.
-            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
+            // Defer whenever a body stream follows: needs_req_body handlers also
+            // buffer it, while others only drain/count it. This lets a later JIT
+            // Forward outcome reject the upload before opening an h1 upstream.
+            if (!end_stream) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
@@ -830,7 +895,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 400);
                 return;
             }
-            h2_invoke_emit(d, stream_id, route, params, param_count, config, synth, kSynthLen);
+            h2_invoke_emit(
+                d, stream_id, route, params, param_count, config, synth, kSynthLen, false);
             return;
         }
         case RouteAction::Proxy:
