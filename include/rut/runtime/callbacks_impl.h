@@ -1513,10 +1513,18 @@ inline bool collect_effective_response_headers(const jit::HandlerCtx* response_c
                                                u32 capacity,
                                                u32* out_count) {
     *out_count = 0;
+    if (response_ctx != nullptr && response_ctx->captured_response_valid) {
+        if (response_ctx->captured_response_header_count > capacity) return false;
+        for (u32 i = 0; i < response_ctx->captured_response_header_count; i++) {
+            const auto& header = response_ctx->captured_response_headers[i];
+            out[(*out_count)++] = {
+                header.name.ptr, header.name.len, header.value.ptr, header.value.len};
+        }
+    }
     if (static_set_index != 0 && cfg != nullptr &&
         static_set_index <= cfg->response_header_set_count) {
         const auto& ref = cfg->response_header_sets[static_set_index - 1];
-        if (ref.count > capacity) return false;
+        if (ref.count > capacity - *out_count) return false;
         for (u16 i = 0; i < ref.count; i++) {
             out[*out_count] = {cfg->header_keys[ref.offset + i].data,
                                cfg->header_keys[ref.offset + i].len,
@@ -1537,17 +1545,26 @@ void handle_jit_outcome(Loop* loop,
     switch (outcome.kind) {
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
+            const auto release_capture_slice = [&]() {
+                if (conn.response_capture_slice == nullptr) return;
+                if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
+                    loop->pool.free(conn.response_capture_slice);
+                conn.response_capture_slice = nullptr;
+            };
             conn.resp_status = outcome.status_code;
             // ABI: upstream_id is a 1-based index into the pinned
             // route config's response_bodies table (0 = use default
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
-            const bool has_dynamic_body = outcome.dynamic_response_body != nullptr;
+            const bool has_dynamic_body =
+                outcome.dynamic_response_body != nullptr ||
+                (outcome.response_ctx != nullptr && outcome.response_ctx->captured_response_valid);
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
-            constexpr u32 kMaxEffectiveHeaders =
-                RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
+            constexpr u32 kMaxEffectiveHeaders = RouteConfig::kMaxHeadersPerSet +
+                                                 jit::kMaxCapturedResponseHeaders +
+                                                 jit::kMaxResponseHeaderMutations;
             ResponseHeaderKV kvs[kMaxEffectiveHeaders];
             u32 header_count = 0;
             if (!collect_effective_response_headers(outcome.response_ctx,
@@ -1559,6 +1576,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.resp_status = 500;
                 conn.keep_alive = false;
                 format_static_response(conn, 500, false);
+                release_capture_slice();
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -1617,6 +1635,7 @@ void handle_jit_outcome(Loop* loop,
             } else {
                 format_static_response(conn, outcome.status_code, keep_alive);
             }
+            release_capture_slice();
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -1849,10 +1868,19 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward:
-        case JitDispatchOutcome::Kind::ForwardBuffered: {
-            conn.pending_handler_fn = nullptr;
-            conn.proxy_response_buffered =
-                outcome.kind == JitDispatchOutcome::Kind::ForwardBuffered;
+        case JitDispatchOutcome::Kind::ForwardBuffered:
+        case JitDispatchOutcome::Kind::ForwardCapture: {
+            const bool capture = outcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
+            const auto abandon_capture = [&]() {
+                if (!capture) return;
+                conn.pending_handler_fn = nullptr;
+                conn.proxy_response_buffered = false;
+                conn.proxy_response_capture = false;
+            };
+            conn.pending_handler_fn = capture ? fn : nullptr;
+            if (capture) conn.handler_state = outcome.next_state;
+            conn.proxy_response_buffered = outcome.kind != JitDispatchOutcome::Kind::Forward;
+            conn.proxy_response_capture = capture;
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
             // pick up a post-swap config whose upstream table doesn't
@@ -1862,6 +1890,7 @@ void handle_jit_outcome(Loop* loop,
                 // Unresolvable upstream id — handler returned a value
                 // the config doesn't know. Fail closed with 502 rather
                 // than hanging or silently discarding the request.
+                abandon_capture();
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
@@ -1882,6 +1911,7 @@ void handle_jit_outcome(Loop* loop,
                     acquired = loop->upstream_acquire(outcome.upstream_id, target.max_inflight);
                 }
                 if (!acquired) {
+                    abandon_capture();
                     conn.resp_status = 503;
                     format_static_response(conn, 503, /*keep_alive=*/false);
                     conn.keep_alive = false;
@@ -1940,6 +1970,7 @@ void handle_jit_outcome(Loop* loop,
 
             const i32 kUpstreamFd = UpstreamPool::create_socket();
             if (kUpstreamFd < 0) {
+                abandon_capture();
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
@@ -1955,6 +1986,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = -1;
                 conn.upstream_idx = 0;
                 loop->clear_upstream_fd(conn.id);
+                abandon_capture();
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn, 502, /*keep_alive=*/false);
                 conn.keep_alive = false;
@@ -2747,6 +2779,63 @@ void h2_proxy_finish(Loop* loop,
         if (nominated) continue;
         effective[effective_count++] = {
             kName.ptr, kName.len, resp.headers[i].value.ptr, resp.headers[i].value.len};
+    }
+    if (h2->async_capture_response) {
+        auto* capture_ctx = conn.jit_ctx();
+        capture_ctx->captured_response_valid = false;
+        if (conn.response_capture_slice == nullptr) {
+            if constexpr (requires { loop->pool.alloc(); })
+                conn.response_capture_slice = loop->pool.alloc();
+        }
+        if (conn.response_capture_slice == nullptr) {
+            h2_proxy_fail(loop, conn, 500);
+            return;
+        }
+        u32 cursor = 0;
+        capture_ctx->captured_response_header_count = 0;
+        for (u32 i = 0; i < effective_count; i++) {
+            if (capture_ctx->captured_response_header_count >= jit::kMaxCapturedResponseHeaders ||
+                effective[i].key_len > SlicePool::kSliceSize - cursor) {
+                h2_proxy_fail(loop, conn, 500);
+                return;
+            }
+            char* name = reinterpret_cast<char*>(conn.response_capture_slice + cursor);
+            if (effective[i].key_len != 0)
+                __builtin_memmove(name, effective[i].key_data, effective[i].key_len);
+            cursor += effective[i].key_len;
+            if (effective[i].value_len > SlicePool::kSliceSize - cursor) {
+                h2_proxy_fail(loop, conn, 500);
+                return;
+            }
+            char* value = reinterpret_cast<char*>(conn.response_capture_slice + cursor);
+            if (effective[i].value_len != 0)
+                __builtin_memmove(value, effective[i].value_data, effective[i].value_len);
+            cursor += effective[i].value_len;
+            capture_ctx->captured_response_headers[capture_ctx->captured_response_header_count++] =
+                {{name, effective[i].key_len}, {value, effective[i].value_len}};
+        }
+        if (body_len > SlicePool::kSliceSize - cursor) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        char* captured_body = reinterpret_cast<char*>(conn.response_capture_slice + cursor);
+        if (body_len != 0)
+            __builtin_memmove(captured_body, conn.upstream_recv_buf.data() + hdr_end, body_len);
+        capture_ctx->captured_response_status = resp.status_code;
+        capture_ctx->captured_response_body = captured_body;
+        capture_ctx->captured_response_body_len = body_len;
+        capture_ctx->captured_response_valid = true;
+
+        const auto resume_fn = h2->async_fn;
+        const u16 resume_state = h2->async_state;
+        h2_proxy_teardown_upstream(loop, conn);
+        conn.pending_handler_fn = resume_fn;
+        conn.handler_state = resume_state;
+        conn.resume_event_kind = jit::YieldKind::Forward;
+        conn.resume_event_result = static_cast<i32>(resp.status_code);
+        conn.transition_to_exec_handler_wait();
+        h2_resume_jit_handler<Loop>(loop, conn);
+        return;
     }
     const jit::HandlerCtx* response_ctx =
         h2->async_apply_response_mutations ? conn.jit_ctx() : nullptr;
@@ -4432,6 +4521,8 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
 template <typename Loop>
 void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
     conn.proxy_response_buffered = false;
+    conn.proxy_response_capture = false;
+    conn.pending_handler_fn = nullptr;
     conn.upstream_keep_alive = false;
     conn.resp_status = status;
     conn.keep_alive = false;
@@ -4472,6 +4563,66 @@ void finish_buffered_forward(Loop* loop,
     }
 
     const jit::HandlerCtx* response_ctx = conn.jit_ctx();
+    if (conn.proxy_response_capture) {
+        auto* capture_ctx = conn.jit_ctx();
+        capture_ctx->captured_response_valid = false;
+        if (conn.response_capture_slice == nullptr) {
+            if constexpr (requires { loop->pool.alloc(); })
+                conn.response_capture_slice = loop->pool.alloc();
+        }
+        if (conn.response_capture_slice == nullptr) {
+            buffered_forward_fail(loop, conn, 500);
+            return;
+        }
+
+        u32 cursor = 0;
+        capture_ctx->captured_response_header_count = 0;
+        for (u32 i = 0; i < header_count; i++) {
+            if (capture_ctx->captured_response_header_count >= jit::kMaxCapturedResponseHeaders ||
+                headers[i].key_len > SlicePool::kSliceSize - cursor) {
+                buffered_forward_fail(loop, conn, 500);
+                return;
+            }
+            char* name = reinterpret_cast<char*>(conn.response_capture_slice + cursor);
+            if (headers[i].key_len != 0)
+                __builtin_memmove(name, headers[i].key_data, headers[i].key_len);
+            cursor += headers[i].key_len;
+            if (headers[i].value_len > SlicePool::kSliceSize - cursor) {
+                buffered_forward_fail(loop, conn, 500);
+                return;
+            }
+            char* value = reinterpret_cast<char*>(conn.response_capture_slice + cursor);
+            if (headers[i].value_len != 0)
+                __builtin_memmove(value, headers[i].value_data, headers[i].value_len);
+            cursor += headers[i].value_len;
+            capture_ctx->captured_response_headers[capture_ctx->captured_response_header_count++] =
+                {{name, headers[i].key_len}, {value, headers[i].value_len}};
+        }
+        if (body_len > SlicePool::kSliceSize - cursor) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
+        char* captured_body = reinterpret_cast<char*>(conn.response_capture_slice + cursor);
+        const char* upstream_body =
+            reinterpret_cast<const char*>(conn.upstream_recv_buf.data() + parser.header_end);
+        if (body_len != 0) __builtin_memmove(captured_body, upstream_body, body_len);
+        capture_ctx->captured_response_status = resp.status_code;
+        capture_ctx->captured_response_body = captured_body;
+        capture_ctx->captured_response_body_len = body_len;
+        capture_ctx->captured_response_valid = true;
+
+        conn.proxy_response_buffered = false;
+        conn.proxy_response_capture = false;
+        release_upstream_slot(loop, conn);
+        release_upstream_conn(loop, conn);
+        conn.upstream_recv_buf.reset();
+        conn.clear_slots();
+        conn.transition_to_exec_handler_wait();
+        conn.resume_event_kind = jit::YieldKind::Forward;
+        conn.resume_event_result = static_cast<i32>(resp.status_code);
+        resume_jit_handler<Loop>(loop, conn);
+        return;
+    }
     if (!apply_response_header_mutations(
             response_ctx, headers, kMaxEffectiveHeaders, &header_count) ||
         response_ctx->response_status_invalid || response_ctx->response_body_mutation_overflow) {

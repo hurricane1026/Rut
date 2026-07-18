@@ -2256,6 +2256,77 @@ route GET "/api/users" use chain rewrite_chain { return forward(api, buffered: t
     rir.destroy();
 }
 
+TEST(jit, buffered_forward_expression_resumes_with_owned_response_fields) {
+    const auto src = R"rut(
+upstream api
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    resp.set("X-Captured", resp.header("X-Origin").or("missing"))
+    resp.status = resp.status
+    resp.body = resp.body
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    auto suspended = invoke_jit_handler(handler,
+                                        nullptr,
+                                        frame.ctx,
+                                        reinterpret_cast<const u8*>(kGetApiRequest),
+                                        sizeof(kGetApiRequest) - 1,
+                                        nullptr);
+    CHECK(suspended.kind == JitDispatchOutcome::Kind::ForwardCapture);
+    CHECK_EQ(suspended.upstream_id, 0u);
+    CHECK_EQ(suspended.next_state, 1u);
+
+    static constexpr char kBody[] = "origin-body";
+    static constexpr char kHeaderName[] = "X-Origin";
+    static constexpr char kHeaderValue[] = "yes";
+    frame.ctx.captured_response_valid = true;
+    frame.ctx.captured_response_status = 202;
+    frame.ctx.captured_response_body = kBody;
+    frame.ctx.captured_response_body_len = sizeof(kBody) - 1;
+    frame.ctx.captured_response_header_count = 1;
+    frame.ctx.captured_response_headers[0] = {{kHeaderName, sizeof(kHeaderName) - 1},
+                                              {kHeaderValue, sizeof(kHeaderValue) - 1}};
+    frame.ctx.state = suspended.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Forward);
+    frame.ctx.resume_event_result = 202;
+    auto resumed = invoke_jit_handler(handler,
+                                      nullptr,
+                                      frame.ctx,
+                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                      sizeof(kGetApiRequest) - 1,
+                                      nullptr);
+    CHECK(resumed.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(resumed.status_code, 202u);
+    REQUIRE(resumed.dynamic_response_body != nullptr);
+    CHECK((Str{resumed.dynamic_response_body, resumed.dynamic_response_body_len}).eq(lit(kBody)));
+    REQUIRE_EQ(frame.ctx.response_header_count, 1u);
+    CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-Captured")));
+    CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("yes")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};

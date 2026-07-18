@@ -60,6 +60,7 @@ void Http2Conn::init() {
     async_route = nullptr;
     async_upstream_id = 0;
     async_apply_response_mutations = false;
+    async_capture_response = false;
     async_resp_len = 0;
 }
 

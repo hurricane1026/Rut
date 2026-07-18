@@ -9,24 +9,6 @@ short hand-off summary under **Recently Completed**.
 **Goal**: Complete the remaining runtime-backed pieces of the revised syntax
 without accepting source forms that cannot be replayed or resumed faithfully.
 
-### Stream-owned Response mutation
-
-The terminal `return forward(upstream, buffered: true)` path now buffers a
-bounded complete upstream response and commits resumable `chain after`
-header/status/body mutations consistently over HTTP/1 and HTTP/2. Remaining
-work is promoting that terminal operation to a first-class expression such as
-`let resp = forward(upstream, buffered: true)`, materializing upstream
-status/body/header fields in stream-owned storage so they can be read and
-mutated before `return resp`.
-
-**Acceptance**:
-- A buffered forward can be bound as a `Response` and returned without losing
-  upstream fields.
-- Buffered field reads and subsequent mutations survive a yield without
-  borrowing proxy or serializer scratch.
-- Expression-form overflow, upstream failure, and unsupported request-rewrite
-  combinations fail with the same documented policy as terminal buffering.
-
 ### Control-plane builtins
 
 Connect the declared `stats()`, `metrics()`, `reload()`, and
@@ -110,6 +92,10 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Expression-form `forward(upstream, buffered: true)` materializes bounded
+  status/body/header fields in stream-owned storage, survives later yields,
+  replays through the deterministic harness, and preserves the terminal
+  buffering failure and request-rewrite policy over HTTP/1 and HTTP/2.
 - [x] Dynamic JSON plans support runtime scalars, declared structs, bounded
   arrays and string lists, preserve documented field order, reject duplicate
   keys, fail closed on overflow, and expose identical bounded body bytes to

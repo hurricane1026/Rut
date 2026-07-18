@@ -1154,11 +1154,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (!fn.waits.push(w)) return frontend_error(FrontendError::TooManyItems, w.span);
         }
 
+        auto is_response_effect = [](HirExprKind kind) {
+            return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                   kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                   kind == HirExprKind::RespSetBody;
+        };
+
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Json &&
                 module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild)
+                continue;
+            // Wait routes execute response mutations in their source-ordered
+            // resume block below. Materializing them in the function prelude
+            // would run post-forward reads before the captured response exists.
+            if (fn.waits.len != 0 && is_response_effect(module.routes[i].locals[li].init.kind))
                 continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
@@ -1798,6 +1809,30 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (steps[si].kind != RouteStep::Kind::Guard) continue;
                 auto emitted = emit_guard_fail(module.routes[i].guards[steps[si].index]);
                 if (!emitted) return core::make_unexpected(emitted.error());
+            }
+
+            // Attach each response mutation to the first control/wait block
+            // after its source position, or to the terminal block. This keeps
+            // effects behind preceding guards and after the buffered-forward
+            // resume that made their captured field reads valid.
+            for (u32 li = 0; li < module.routes[i].locals.len; li++) {
+                const auto& local = module.routes[i].locals[li];
+                if (!is_response_effect(local.init.kind)) continue;
+                u32 target = terminal_index;
+                for (u32 si = 0; si < step_count; si++) {
+                    if (local.span.start < steps[si].span.start) {
+                        target = si;
+                        break;
+                    }
+                }
+                if (target >= fn.blocks.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, local.span);
+                auto effect = mir_value(local.init, module, &fn);
+                if (!effect) return core::make_unexpected(effect.error());
+                if (!fn.values.push(effect.value()))
+                    return frontend_error(FrontendError::TooManyItems, local.span);
+                if (!fn.blocks[target].effects.push({fn.values.len - 1, local.span}))
+                    return frontend_error(FrontendError::TooManyItems, local.span);
             }
 
             if (!mir->functions.push(fn))

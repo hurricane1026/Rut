@@ -128,11 +128,16 @@ struct HandlerResult {
 inline constexpr u32 kMaxResponseHeaderMutations = 16;
 inline constexpr u32 kMaxResponseBodyMutationBytes = 4096;
 inline constexpr u32 kMaxDynamicJsonResponseBytes = 7 * 1024;
+inline constexpr u32 kMaxCapturedResponseHeaders = 64;
 enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
 struct ResponseHeaderMutation {
     Str name;
     Str value;
     ResponseHeaderMutationMode mode;
+};
+struct CapturedResponseHeader {
+    Str name;
+    Str value;
 };
 
 // ── Handler Context ────────────────────────────────────────────────
@@ -154,6 +159,15 @@ struct alignas(alignof(u64)) HandlerCtx {
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization
+    // Lazily materialized upstream response for expression-form buffered
+    // forwarding. String views point into Connection::response_capture_slice,
+    // never into the reusable proxy receive buffer.
+    bool captured_response_valid;
+    u16 captured_response_status;
+    const char* captured_response_body;
+    u32 captured_response_body_len;
+    u8 captured_response_header_count;
+    CapturedResponseHeader captured_response_headers[kMaxCapturedResponseHeaders];
     // Builder-local mutation log. Pending entries are visible to resp.header();
     // commit publishes exactly this prefix to the terminal response. Keeping
     // it in HandlerCtx makes it survive yields without leaking across streams.

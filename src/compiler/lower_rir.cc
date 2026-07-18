@@ -23,6 +23,8 @@ static u8 yield_kind_abi(WaitEventKind kind) {
             return static_cast<u8>(jit::YieldKind::UpstreamRecv);
         case WaitEventKind::UpstreamSend:
             return static_cast<u8>(jit::YieldKind::UpstreamSend);
+        case WaitEventKind::ForwardBuffered:
+            return static_cast<u8>(jit::YieldKind::Forward);
     }
     return static_cast<u8>(jit::YieldKind::Timer);
 }

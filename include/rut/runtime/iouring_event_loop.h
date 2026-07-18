@@ -542,6 +542,10 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        if (c.response_capture_slice) {
+            pool.free(c.response_capture_slice);
+            c.response_capture_slice = nullptr;
+        }
         // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {

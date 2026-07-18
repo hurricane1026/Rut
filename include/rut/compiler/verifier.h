@@ -96,10 +96,10 @@ inline bool verify_valid_yield_kind(u8 kind) {
         case jit::YieldKind::UpstreamConnect:
         case jit::YieldKind::UpstreamRecv:
         case jit::YieldKind::UpstreamSend:
+        case jit::YieldKind::Forward:
             return true;
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
             return false;
     }
     return false;
@@ -119,6 +119,7 @@ enum class VerifyRuntimePendingOp : u8 {
     UpstreamConnect,
     UpstreamRecv,
     UpstreamSend,
+    BufferedForward,
 };
 
 enum class VerifyRuntimeCallbackSlot : u8 {
@@ -128,6 +129,7 @@ enum class VerifyRuntimeCallbackSlot : u8 {
     DownstreamSend,
     UpstreamRecv,
     UpstreamSend,
+    BufferedForward,
 };
 
 enum class VerifyRuntimeProtocolReason : u8 {
@@ -242,9 +244,19 @@ struct VerifyRuntimeProtocolModel {
                 check.completion_transition_count = 1;
                 check.fail_closed_transition_count = 1;
                 return check;
+            case jit::YieldKind::Forward:
+                check.ok = true;
+                check.pending_op = VerifyRuntimePendingOp::BufferedForward;
+                check.callback_slot = VerifyRuntimeCallbackSlot::BufferedForward;
+                check.submit_transition = true;
+                check.completion_transition = true;
+                check.fail_closed_transition = true;
+                check.submit_transition_count = 1;
+                check.completion_transition_count = 1;
+                check.fail_closed_transition_count = 1;
+                return check;
             case jit::YieldKind::HttpGet:
             case jit::YieldKind::HttpPost:
-            case jit::YieldKind::Forward:
                 check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
                 return check;
         }
@@ -269,9 +281,10 @@ inline u8 verify_yield_default_arm_mask(u8 kind, u32 payload) {
             return 1u << 4;
         case jit::YieldKind::UpstreamSend:
             return 1u << 5;
+        case jit::YieldKind::Forward:
+            return 1u << 6;
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
             return 0;
     }
     return 0;
@@ -293,6 +306,8 @@ inline u8 verify_runtime_pending_op_arm_mask(VerifyRuntimePendingOp op) {
             return 1u << 4;
         case VerifyRuntimePendingOp::UpstreamSend:
             return 1u << 5;
+        case VerifyRuntimePendingOp::BufferedForward:
+            return 1u << 6;
     }
     return 0;
 }
@@ -311,6 +326,8 @@ inline u8 verify_runtime_callback_slot_mask(VerifyRuntimeCallbackSlot slot) {
             return 1u << 3;
         case VerifyRuntimeCallbackSlot::UpstreamSend:
             return 1u << 4;
+        case VerifyRuntimeCallbackSlot::BufferedForward:
+            return 1u << 6;
     }
     return 0;
 }
@@ -381,10 +398,10 @@ inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
         case jit::YieldKind::UpstreamConnect:
         case jit::YieldKind::UpstreamRecv:
         case jit::YieldKind::UpstreamSend:
+        case jit::YieldKind::Forward:
             return VerifyYieldRuntimeClass::Event;
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
             return VerifyYieldRuntimeClass::Unsupported;
     }
     return VerifyYieldRuntimeClass::Unsupported;
@@ -436,6 +453,8 @@ inline const char* verify_runtime_pending_op_name(VerifyRuntimePendingOp op) {
             return "UpstreamRecv";
         case VerifyRuntimePendingOp::UpstreamSend:
             return "UpstreamSend";
+        case VerifyRuntimePendingOp::BufferedForward:
+            return "BufferedForward";
     }
     return "Unknown";
 }
@@ -454,6 +473,8 @@ inline const char* verify_runtime_callback_slot_name(VerifyRuntimeCallbackSlot s
             return "UpstreamRecv";
         case VerifyRuntimeCallbackSlot::UpstreamSend:
             return "UpstreamSend";
+        case VerifyRuntimeCallbackSlot::BufferedForward:
+            return "BufferedForward";
     }
     return "Unknown";
 }

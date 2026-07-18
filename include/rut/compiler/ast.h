@@ -65,6 +65,10 @@ enum class WaitEventKind : u8 {
     UpstreamConnect,
     UpstreamRecv,
     UpstreamSend,
+    // Hidden suspension used by `let resp = forward(upstream, buffered: true)`.
+    // The payload is the resolved runtime upstream id; completion materializes
+    // a bounded Response before resuming the handler.
+    ForwardBuffered,
 };
 
 enum WaitEventArmMask : u8 {
@@ -75,6 +79,7 @@ enum WaitEventArmMask : u8 {
     kWaitEventArmUpstreamConnect = 1u << 3,
     kWaitEventArmUpstreamRecv = 1u << 4,
     kWaitEventArmUpstreamSend = 1u << 5,
+    kWaitEventArmForward = 1u << 6,
 };
 
 inline u8 wait_event_kind_default_arm_mask(WaitEventKind kind, u32 payload = 0) {
@@ -94,6 +99,8 @@ inline u8 wait_event_kind_default_arm_mask(WaitEventKind kind, u32 payload = 0) 
             return kWaitEventArmUpstreamRecv;
         case WaitEventKind::UpstreamSend:
             return kWaitEventArmUpstreamSend;
+        case WaitEventKind::ForwardBuffered:
+            return kWaitEventArmForward;
     }
     return kWaitEventArmNone;
 }
