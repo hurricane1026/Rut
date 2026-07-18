@@ -156,6 +156,14 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
             out.status_code = r.status_code;
             out.response_ctx = &ctx;
+            if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
+                out.status_code = 500;
+                out.response_body_idx = 0;
+                out.dynamic_response_body = nullptr;
+                out.dynamic_response_body_len = 0;
+                return out;
+            }
+            if (ctx.response_status_set) out.status_code = ctx.response_status;
             // ABI: upstream_id carries a 1-based response-body index
             // and next_state a 1-based response-header-set index for
             // ReturnStatus (0 = no custom body / no custom headers;
@@ -174,6 +182,11 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                 }
             } else {
                 out.response_body_idx = r.upstream_id;
+            }
+            if (ctx.response_body_mutation_set) {
+                out.response_body_idx = 0;
+                out.dynamic_response_body = ctx.response_body_mutation_data;
+                out.dynamic_response_body_len = ctx.response_body_mutation_len;
             }
             out.response_headers_idx = r.next_state;
             return out;

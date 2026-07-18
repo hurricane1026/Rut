@@ -5385,7 +5385,8 @@ static bool collect_function_response_effects(HirFunction* fn,
     for (u32 li = 0; li < scratch.locals.len; li++) {
         const auto kind = scratch.locals[li].init.kind;
         if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
-            kind != HirExprKind::RespRemoveHeader)
+            kind != HirExprKind::RespRemoveHeader && kind != HirExprKind::RespSetStatus &&
+            kind != HirExprKind::RespSetBody)
             continue;
         auto normalized = normalize_function_expr(
             scratch.locals[li].init, fn, all_locals, all_local_count, param_count);
@@ -6130,6 +6131,22 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 return self(self, si + 1, next_locals, next_count, cur_allow_respond_guards);
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
+                inner.expr.kind == AstExprKind::Assign) {
+                auto effect = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
+                if (!effect) return core::make_unexpected(effect.error());
+                if (effect->kind != HirExprKind::RespSetStatus &&
+                    effect->kind != HirExprKind::RespSetBody)
+                    return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                HirLocal carrier{};
+                carrier.span = inner.span;
+                carrier.ref_index = next_local_ref_index(scratch, cur_locals, cur_local_count);
+                carrier.type = effect->type;
+                carrier.init = effect.value();
+                if (!scratch->locals.push(carrier))
+                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                return self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+            }
+            if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
                 inner.expr.lhs->kind == AstExprKind::Ident) {
                 const bool is_set = inner.expr.name.eq({"set", 3});
@@ -6788,6 +6805,44 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.kind = HirExprKind::StrLit;
         out.type = HirTypeKind::Str;
         out.str_value = expr.str_value;
+        return out;
+    }
+    if (expr.kind == AstExprKind::Assign) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr || expr.lhs->kind != AstExprKind::Field ||
+            expr.lhs->lhs == nullptr || expr.lhs->lhs->kind != AstExprKind::Ident)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("only Response.status and Response.body are assignable"));
+        const Str receiver = expr.lhs->lhs->name;
+        bool is_response = false;
+        for (u32 li = local_count; li > 0; li--) {
+            if (!locals[li - 1].name.eq(receiver)) continue;
+            is_response = locals[li - 1].type == HirTypeKind::Response;
+            break;
+        }
+        const bool set_status = expr.lhs->name.eq({"status", 6});
+        const bool set_body = expr.lhs->name.eq({"body", 4});
+        if (!is_response || (!set_status && !set_body))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("only Response.status and Response.body are assignable"));
+        auto value = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->may_nil || value->may_error || (set_status && value->type != HirTypeKind::I32) ||
+            (set_body && value->type != HirTypeKind::Str))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  set_status
+                                      ? lit_str("Response.status requires a plain i32 value")
+                                      : lit_str("Response.body requires a plain string value"));
+        if (set_status && value->kind == HirExprKind::IntLit &&
+            (value->int_value < 100 || value->int_value > 599))
+            return frontend_error(FrontendError::InvalidStatusCode, expr.rhs->span);
+        if (!route->exprs.push(value.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.kind = set_status ? HirExprKind::RespSetStatus : HirExprKind::RespSetBody;
+        out.type = value->type;
+        out.lhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
     if (expr.kind == AstExprKind::ObjectLit) {
@@ -15031,7 +15086,8 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             lit_str("chain after helper must have exactly one Response parameter"));
     auto is_response_effect = [](HirExprKind kind) {
         return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
-               kind == HirExprKind::RespRemoveHeader;
+               kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+               kind == HirExprKind::RespSetBody;
     };
     bool has_response_effect = false;
     for (u32 ei = 0; ei < fn.exprs.len; ei++)
@@ -18771,6 +18827,31 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         }
                         continue;
                     }
+                }
+                if (stmt.expr.kind == AstExprKind::Assign) {
+                    auto value = analyze_expr(
+                        stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                    if (!value) return core::make_unexpected(value.error());
+                    if (value->kind != HirExprKind::RespSetStatus &&
+                        value->kind != HirExprKind::RespSetBody)
+                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                    if (stmt.expr.lhs != nullptr && stmt.expr.lhs->lhs != nullptr) {
+                        for (u32 li = route.locals.len; li > 0; li--) {
+                            if (!route.locals[li - 1].name.eq(stmt.expr.lhs->lhs->name)) continue;
+                            if (route.locals[li - 1].init.kind == HirExprKind::ResponseInit)
+                                route.locals[li - 1].init.bool_value = true;
+                            break;
+                        }
+                    }
+                    HirLocal carrier{};
+                    carrier.span = stmt.span;
+                    carrier.ref_index =
+                        next_local_ref_index(&route, route.locals.data, route.locals.len);
+                    carrier.type = value->type;
+                    carrier.init = value.value();
+                    if (!route.locals.push(carrier))
+                        return frontend_error(FrontendError::TooManyItems, stmt.span);
+                    continue;
                 }
                 const bool req_mutation_syntax =
                     stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
