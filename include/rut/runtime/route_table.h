@@ -165,6 +165,12 @@ struct RouteConfig {
     RouteEntry routes[kMaxRoutes];
     u32 route_count = 0;
 
+    // Monotonic activation identity assigned by the reload coordinator. A
+    // request pins both this config object and its generation, so manual
+    // health overrides for a newer config can never affect an older in-flight
+    // request that happens to reuse the same numeric upstream/backend slots.
+    u64 config_generation = 1;
+
     // Phase 2 dispatch — 2-way tagged union.
     //
     // Pre-add_*: caller picks ArtJit (default) or SegmentTrie via

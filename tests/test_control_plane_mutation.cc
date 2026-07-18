@@ -87,6 +87,29 @@ TEST(control_plane_mutation, manual_health_rejects_foreign_slots_and_preserves_n
     CHECK(!port.mark({8, 1, 0}, true));
 }
 
+TEST(control_plane_mutation, upstream_servers_view_pins_generation_without_runtime_pointers) {
+    ControlPlaneMutationPort port;
+    port.reset(12, false);
+    UpstreamServersView servers{};
+    REQUIRE(port.servers(12, 3, 2, &servers));
+    CHECK_EQ(servers.config_generation, 12u);
+    CHECK_EQ(servers.upstream_id, 3u);
+    CHECK_EQ(servers.backend_count, 2u);
+    ServerIdentity first{};
+    ServerIdentity second{};
+    REQUIRE(servers.at(0, &first));
+    REQUIRE(servers.at(1, &second));
+    CHECK_EQ(first.config_generation, 12u);
+    CHECK_EQ(first.upstream_id, 3u);
+    CHECK_EQ(first.backend_id, 0u);
+    CHECK_EQ(second.backend_id, 1u);
+    CHECK(!servers.at(2, &second));
+
+    port.reset(13, false);
+    CHECK(!port.servers(12, 3, 2, &servers));
+    CHECK(!port.mark(first, true));
+}
+
 TEST(control_plane_mutation, stop_terminalizes_an_accepted_request_once) {
     ControlPlaneMutationPort port;
     port.reset(5, true);

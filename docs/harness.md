@@ -154,7 +154,9 @@ discover halfway through a run that its environment cannot model an operation.
 the scenario driver inject the same allocation-free port into `HandlerCtx`, and
 the pointer remains stable across resumes. Missing or undeclared fixtures are
 invalid runs. Handler-layer coverage may exercise admission and manual-health
-atomics; activation still requires the `Process` layer.
+atomics. Its pointer-free `UpstreamServersView` pins the observed config
+generation, and selection scenarios apply the same manual-over-local health
+priority as production. Activation still requires the `Process` layer.
 
 `stats()`/`metrics()` scenarios use the `ControlPlaneSnapshot` capability and
 must supply `ScenarioSpec::control_plane_snapshot`. The fixture is a bounded,

@@ -128,6 +128,11 @@ their local active/passive health state:
 - `healthy: true` forces it into normal selection;
 - a reload clears all overrides while publishing the new generation.
 
+If every backend is manually unhealthy, selection reports no backend and the
+proxy attempt fails closed (503 for a new forward). The existing availability
+fallback applies only when shard-local active/passive health ejects every
+otherwise eligible backend; it never bypasses a manual unhealthy override.
+
 Manual state has priority over probe and passive-ejection state so a later local
 probe cannot silently undo an operator program's verdict. Calls from the one
 shard-pinned timer are ordered by program order. The generation check makes a
@@ -177,7 +182,7 @@ generation order, and terminal records.
 
 1. [x] Add the control-plane mutation port and deterministic admission/override
    model to the handler ABI and harness.
-2. Implement `Server` identities, `Upstream.servers`, and the shared manual
+2. [x] Implement `Server` identities, `Upstream.servers`, and the shared manual
    health override consulted by both network backends.
 3. Lower and execute timer-only, shard-pinned `upstream.mark`.
 4. Implement the reload coordinator, generation acknowledgements, program pins,

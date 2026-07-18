@@ -13607,6 +13607,32 @@ TEST(route, backend_ejection_skips_unhealthy) {
     CHECK(pick < 2u);
 }
 
+TEST(route, manual_health_override_precedes_shard_local_health) {
+    using namespace rut;
+    const u64 kNow = 20'000'000;
+    ControlPlaneMutationPort mutation;
+    mutation.reset(7, false);
+
+    const u16 kHealthyUid = 47;
+    for (u16 i = 0; i < kBackendFailThreshold; i++)
+        record_backend_result(kHealthyUid, 0, /*success=*/false, kNow);
+    REQUIRE(mutation.mark({7, kHealthyUid, 0}, true));
+    CHECK_EQ(select_backend(kHealthyUid, 1, kNow, 7, &mutation), 0u);
+
+    const u16 kUnhealthyUid = 48;
+    REQUIRE(mutation.mark({7, kUnhealthyUid, 0}, false));
+    CHECK_EQ(select_backend(kUnhealthyUid, 2, kNow, 7, &mutation), 1u);
+    REQUIRE(mutation.mark({7, kUnhealthyUid, 1}, false));
+    CHECK_EQ(select_backend(kUnhealthyUid, 2, kNow, 7, &mutation), 2u);
+
+    // A stale config pin cannot observe overrides for the newly active
+    // generation even when the numeric endpoint slot is reused.
+    mutation.reset(8, false);
+    REQUIRE(mutation.mark({8, 49, 0}, false));
+    CHECK_EQ(select_backend(49, 1, kNow, 7, &mutation), 0u);
+    CHECK_EQ(select_backend(49, 1, kNow, 8, &mutation), 1u);
+}
+
 // `upstream X { backends: [...] }` compiles through the IR and populates a
 // multi-backend UpstreamTarget (primary + extras) in the RouteConfig.
 TEST(route, upstream_backends_list_compiles) {

@@ -40,6 +40,22 @@ struct ServerIdentity {
     u16 backend_id = 0;
 };
 
+// Runtime shape of `Upstream.servers`: a bounded, pointer-free view whose
+// elements retain the configuration generation observed when the view was
+// created. Keeping the generation in each derived Server makes values fail
+// closed if a reload activates before `upstream.mark` consumes them.
+struct UpstreamServersView {
+    u64 config_generation = 0;
+    u16 upstream_id = 0;
+    u16 backend_count = 0;
+
+    [[nodiscard]] bool at(u32 index, ServerIdentity* out) const {
+        if (out == nullptr || config_generation == 0 || index >= backend_count) return false;
+        *out = {config_generation, upstream_id, static_cast<u16>(index)};
+        return true;
+    }
+};
+
 struct ReloadRequest {
     u64 id = 0;
     ReloadRequestSource source = ReloadRequestSource::Route;
@@ -205,6 +221,18 @@ public:
         overrides_[server.upstream_id][server.backend_id].store(pack_override(generation, value),
                                                                 std::memory_order_release);
         return active_generation() == generation;
+    }
+
+    [[nodiscard]] bool servers(u64 config_generation,
+                               u16 upstream_id,
+                               u16 backend_count,
+                               UpstreamServersView* out) const {
+        if (out == nullptr || config_generation == 0 || config_generation != active_generation() ||
+            upstream_id >= RouteConfig::kMaxUpstreams ||
+            backend_count > UpstreamTarget::kMaxBackends)
+            return false;
+        *out = {config_generation, upstream_id, backend_count};
+        return true;
     }
 
     [[nodiscard]] ManualHealthOverride manual_health(ServerIdentity server) const {

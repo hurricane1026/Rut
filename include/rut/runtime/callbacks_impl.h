@@ -148,23 +148,59 @@ inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
 // sweep_health_probes — instantiated in main.cc and the test TUs — and a single
 // strong symbol avoids multiple-definition across TUs that include this header.
 
-// Pick the next backend index for `upstream_id` via round-robin, skipping
-// ejected backends. If every backend is ejected, falls back to plain
-// round-robin (serving through a possibly-down backend beats refusing). A
-// single-backend upstream (count <= 1) always returns 0.
-inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
+// Pick the next backend index for `upstream_id` via round-robin. A manual
+// Healthy override admits a backend regardless of shard-local health; manual
+// Unhealthy excludes it regardless of local health. If local health alone has
+// ejected every otherwise-eligible backend, retain the existing availability
+// fallback. If manual policy excludes every backend, return backend_count as a
+// no-selection sentinel instead of routing through an explicitly disabled
+// endpoint.
+inline u32 select_backend(u16 upstream_id,
+                          u32 backend_count,
+                          u64 now_us,
+                          u64 config_generation,
+                          const ControlPlaneMutationPort* mutation) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
-    if (backend_count <= 1 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    const auto override_for = [&](u32 backend_idx) {
+        if (mutation == nullptr || config_generation == 0) return ManualHealthOverride::None;
+        return mutation->manual_health(
+            {config_generation, upstream_id, static_cast<u16>(backend_idx)});
+    };
     for (u32 step = 0; step < backend_count; step++) {
         const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
-        if (!backend_ejected(upstream_id, idx, now_us)) {
+        const auto manual = override_for(idx);
+        if (manual == ManualHealthOverride::Healthy ||
+            (manual == ManualHealthOverride::None && !backend_ejected(upstream_id, idx, now_us))) {
             rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
             return idx;
         }
     }
-    const u32 idx = rr_cursor[upstream_id] % backend_count;
-    rr_cursor[upstream_id] = static_cast<u16>((rr_cursor[upstream_id] + 1) % backend_count);
-    return idx;
+    for (u32 step = 0; step < backend_count; step++) {
+        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
+        if (override_for(idx) == ManualHealthOverride::None) {
+            rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
+            return idx;
+        }
+    }
+    return backend_count;
+}
+
+inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
+    return select_backend(upstream_id, backend_count, now_us, 0, nullptr);
+}
+
+template <typename Loop>
+inline u32 select_backend_for_config(
+    Loop* loop, const RouteConfig* config, u16 upstream_id, u32 backend_count, u64 now_us) {
+    const ControlPlaneMutationPort* mutation = nullptr;
+    if constexpr (requires { loop->control_plane_mutation; })
+        mutation = loop->control_plane_mutation;
+    return select_backend(upstream_id,
+                          backend_count,
+                          now_us,
+                          config != nullptr ? config->config_generation : 0,
+                          mutation);
 }
 
 // --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
@@ -1208,8 +1244,17 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // (terminate-mode config is set unconditionally above, for every request)
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
-        const u32 kBackend =
-            select_backend(route->upstream_id, target.addr_count, conn.upstream_start_us);
+        const u32 kBackend = select_backend_for_config(
+            loop, config, route->upstream_id, target.addr_count, conn.upstream_start_us);
+        if (kBackend >= target.addr_count) {
+            release_upstream_slot(loop, conn);
+            conn.resp_status = 503;
+            format_static_response(conn, 503, /*keep_alive=*/false);
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
         // Idle reuse: borrow a live keep-alive socket to this endpoint from the
@@ -1781,8 +1826,19 @@ void handle_jit_outcome(Loop* loop,
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
                 conn.upstream_start_us = monotonic_us();
-                const u32 kBackend = select_backend(
-                    static_cast<u16>(upstream_id), target.addr_count, conn.upstream_start_us);
+                const u32 kBackend = select_backend_for_config(loop,
+                                                               config,
+                                                               static_cast<u16>(upstream_id),
+                                                               target.addr_count,
+                                                               conn.upstream_start_us);
+                if (kBackend >= target.addr_count) {
+                    ::close(conn.upstream_fd);
+                    conn.upstream_fd = -1;
+                    conn.upstream_idx = 0;
+                    loop->clear_upstream_fd(conn.id);
+                    send_bad_gateway();
+                    return;
+                }
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
                 if (!loop->submit_connect(
                         conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
@@ -1949,8 +2005,21 @@ void handle_jit_outcome(Loop* loop,
             conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
             conn.upstream_start_us = monotonic_us();
-            const u32 kBackend = select_backend(
-                static_cast<u16>(outcome.upstream_id), target.addr_count, conn.upstream_start_us);
+            const u32 kBackend = select_backend_for_config(loop,
+                                                           config,
+                                                           static_cast<u16>(outcome.upstream_id),
+                                                           target.addr_count,
+                                                           conn.upstream_start_us);
+            if (kBackend >= target.addr_count) {
+                release_upstream_slot(loop, conn);
+                abandon_capture();
+                conn.resp_status = 503;
+                format_static_response(conn, 503, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             conn.upstream_backend_idx = static_cast<u8>(kBackend);
 
             // Idle reuse (mirrors the direct RouteAction::Proxy path): borrow a live
@@ -2084,8 +2153,14 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     conn.upstream_attempts++;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
-    const u32 kBackend =
-        select_backend(conn.upstream_idx, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_backend_for_config(
+        loop, config, conn.upstream_idx, target.addr_count, conn.upstream_start_us);
+    if (kBackend >= target.addr_count) {
+        ::close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        loop->clear_upstream_fd(conn.id);
+        return false;
+    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
@@ -3214,7 +3289,12 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
-    const u32 kBackend = select_backend(upstream_id, target.addr_count, conn.upstream_start_us);
+    const u32 kBackend = select_backend_for_config(
+        loop, cfg, upstream_id, target.addr_count, conn.upstream_start_us);
+    if (kBackend >= target.addr_count) {
+        h2_proxy_fail(loop, conn, 503);
+        return;
+    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     if (!loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
         h2_proxy_fail(loop, conn, 502);  // h2_proxy_fail closes the fd we just opened
