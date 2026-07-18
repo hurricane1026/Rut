@@ -13,6 +13,8 @@ namespace rut {
 
 // Result of replaying one captured request against a live event loop.
 struct ReplayResult {
+    static constexpr u32 kMaxObservedBodyLen = 4096;
+
     u16 expected_status;      // from capture file
     u16 actual_status;        // from replay
     bool status_match;        // expected == actual
@@ -22,7 +24,34 @@ struct ReplayResult {
                               // intentionally unsupported, false if failed
     u32 output_bytes;         // response bytes submitted for a replayed entry
     u32 backend_completions;  // synthetic completions dispatched by this replay
+    u32 response_body_len;    // full HTTP body length in the submitted response
+    u32 observed_body_len;    // bytes copied into observed_body
+    bool response_body_observed;
+    bool response_body_truncated;
+    u8 observed_body[kMaxObservedBodyLen];
 };
+
+inline void observe_replay_response_body(const u8* response,
+                                         u32 response_len,
+                                         ReplayResult* result) {
+    if (response == nullptr || result == nullptr) return;
+    for (u32 i = 0; i + 3 < response_len; i++) {
+        if (response[i] != '\r' || response[i + 1] != '\n' || response[i + 2] != '\r' ||
+            response[i + 3] != '\n')
+            continue;
+        const u32 body_offset = i + 4;
+        result->response_body_len = response_len - body_offset;
+        result->observed_body_len = result->response_body_len < ReplayResult::kMaxObservedBodyLen
+                                        ? result->response_body_len
+                                        : ReplayResult::kMaxObservedBodyLen;
+        if (result->observed_body_len != 0)
+            __builtin_memcpy(
+                result->observed_body, response + body_offset, result->observed_body_len);
+        result->response_body_observed = true;
+        result->response_body_truncated = result->observed_body_len != result->response_body_len;
+        return;
+    }
+}
 
 // Summary of a full replay session.
 struct ReplaySummary {
@@ -195,6 +224,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     }
     const u16 actual_status = conn->resp_status;
     result.output_bytes = send_len;
+    observe_replay_response_body(conn->send_buf.data(), send_len, &result);
     const u32 conn_id = conn->id;
     IoEvent send_ev = {conn_id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
     loop.inject_and_dispatch(send_ev);

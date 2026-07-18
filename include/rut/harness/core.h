@@ -126,6 +126,7 @@ enum class ObservationKind : u8 {
     LimitReached,
     InvariantViolation,
     CleanupFinished,
+    ResponseBodyProduced,
 };
 
 struct Observation {
