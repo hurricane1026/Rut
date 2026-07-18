@@ -31689,6 +31689,30 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, return_json_expands_declared_struct_fields_in_declaration_order) {
+    const char* src = R"rut(
+struct Payload { path: str, answer: i32, ok: bool }
+route GET "/x" {
+    let payload = Payload(path: req.path, answer: 40 + 2, ok: req.http11)
+    return 200, json(payload)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.has_dynamic_response_body);
+    REQUIRE_EQ(term.json_value_ref_indices.len, 3u);
+    REQUIRE_EQ(term.json_segments.len, 4u);
+    CHECK(term.json_segments[0].eq(lit("{\"path\":")));
+    CHECK(term.json_segments[1].eq(lit(",\"answer\":")));
+    CHECK(term.json_segments[2].eq(lit(",\"ok\":")));
+    CHECK(term.json_segments[3].eq(lit("}")));
+}
+
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
     const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
     const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));
@@ -31777,8 +31801,9 @@ TEST(frontend, return_body_expression_rejects_non_json_calls) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(
-        hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
+    CHECK(hir.error().detail.eq(
+        lit("return body expressions require json(...) with a supported literal or declared "
+            "struct value")));
 }
 
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
