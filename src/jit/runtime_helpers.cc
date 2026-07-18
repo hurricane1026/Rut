@@ -315,11 +315,11 @@ static void record_resp_header(void* conn,
                                Connection::RespHeaderMutationMode mode) {
     if (conn == nullptr) return;
     auto* c = static_cast<Connection*>(conn);
-    if (c->resp_header_mutation_count >= Connection::kMaxRespHeaderMutations) {
-        c->resp_header_mutation_overflow = true;
+    if (c->resp_header_mutation_pending_count >= Connection::kMaxRespHeaderMutations) {
+        c->resp_header_mutation_pending_overflow = true;
         return;
     }
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_pending_count++];
     mutation.name = {name, nlen};
     mutation.value = {val, vlen};
     mutation.mode = mode;
@@ -337,6 +337,13 @@ void rut_helper_resp_remove_header(void* conn, const char* name, u32 nlen) {
     record_resp_header(conn, name, nlen, nullptr, 0, Connection::RespHeaderMutationMode::Remove);
 }
 
+void rut_helper_resp_commit_headers(void* conn) {
+    if (conn == nullptr) return;
+    auto* c = static_cast<Connection*>(conn);
+    c->resp_header_mutation_count = c->resp_header_mutation_pending_count;
+    c->resp_header_mutation_overflow = c->resp_header_mutation_pending_overflow;
+}
+
 void rut_helper_resp_header(void* conn,
                             const char* name,
                             u32 nlen,
@@ -351,7 +358,7 @@ void rut_helper_resp_header(void* conn,
     *out_len = fallback_has ? fallback_len : 0;
     if (conn == nullptr) return;
     auto* c = static_cast<Connection*>(conn);
-    for (u32 i = 0; i < c->resp_header_mutation_count; i++) {
+    for (u32 i = 0; i < c->resp_header_mutation_pending_count; i++) {
         const auto& mutation = c->resp_header_mutations[i];
         if (!ascii_header_name_eq(mutation.name, name, nlen)) continue;
         if (mutation.mode == Connection::RespHeaderMutationMode::Remove) {

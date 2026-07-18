@@ -1107,6 +1107,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
             out->span = term.span;
             out->status_code = term.status_code;
+            out->commit_response_mutations = term.commit_response_mutations;
             out->upstream_index = term.upstream_index;
             out->kind = term.kind == HirTerminatorKind::ReturnStatus
                             ? MirTerminatorKind::ReturnStatus

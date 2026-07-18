@@ -755,6 +755,9 @@ struct HirTerminator {
     Span span{};
     HirTerminatorSourceKind source_kind = HirTerminatorSourceKind::Literal;
     i32 status_code = 0;
+    // A dynamically mutated Response builder keeps its mutations pending until
+    // this exact return path commits them to the outgoing response.
+    bool commit_response_mutations = false;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
     // Optional response body literal (populated when the source was

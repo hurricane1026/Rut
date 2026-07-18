@@ -628,6 +628,11 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_resp_commit_headers(SourceLoc loc = {}) {
+        TRY_VOID(emit(Opcode::RespCommitHeaders, nullptr, loc));
+        return {};
+    }
+
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));

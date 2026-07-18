@@ -217,6 +217,10 @@ struct ConnectionBase {
         RespHeaderMutationMode mode;
     };
     RespHeaderMutation resp_header_mutations[kMaxRespHeaderMutations];
+    // Helpers append to the pending builder-local prefix so resp.header() can
+    // observe source order. Only return of that builder publishes it.
+    u8 resp_header_mutation_pending_count;
+    bool resp_header_mutation_pending_overflow;
     u8 resp_header_mutation_count;
     bool resp_header_mutation_overflow;
     // Upstream concurrency slot: set true between try_acquire and release so the
@@ -592,6 +596,8 @@ struct ConnectionBase {
         req_header_override_count = 0;
         req_header_append_mask = 0;
         req_header_override_overflow = false;
+        resp_header_mutation_pending_count = 0;
+        resp_header_mutation_pending_overflow = false;
         resp_header_mutation_count = 0;
         resp_header_mutation_overflow = false;
         upstream_slot_held = false;

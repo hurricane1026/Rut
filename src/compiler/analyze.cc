@@ -9506,6 +9506,7 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     term.source_kind = HirTerminatorSourceKind::Literal;
     term.span = stmt.span;
     term.status_code = static_cast<i32>(response->init.int_value);
+    term.commit_response_mutations = response->init.bool_value;
     for (u32 fi = 0; fi < response->init.field_inits.len; fi++) {
         const auto& field = response->init.field_inits[fi];
         if (field.value == nullptr || field.value->kind != HirExprKind::StrLit)
@@ -15626,7 +15627,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
     auto analyze_function_body_like =
         [&](HirFunction& fn, const AstFunctionDecl& ast_func, Span span) -> FrontendResult<void> {
-        HirRoute scratch{};
+        // HirRoute is intentionally a large fixed-capacity analysis arena
+        // (currently over 1 MiB). Keeping it in this import-recursive call
+        // path can exhaust the 8 MiB thread stack after small layout growths.
+        auto scratch_storage = std::make_unique<HirRoute>();
+        HirRoute& scratch = *scratch_storage;
         scratch.is_helper_scratch = true;
         scratch.allow_respond_effects = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;
@@ -17186,7 +17191,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (fn_index == mod.functions.len)
             return frontend_error(FrontendError::UnsupportedSyntax, item.func.span, item.func.name);
         HirFunction& fn = mod.functions[fn_index];
-        HirRoute scratch{};
+        // Keep the large helper-analysis arena off the analyze_file stack;
+        // imported modules nest this frame recursively.
+        auto scratch_storage = std::make_unique<HirRoute>();
+        HirRoute& scratch = *scratch_storage;
         scratch.is_helper_scratch = true;
         scratch.allow_respond_effects = true;
         FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases> ast_named_error_cases;

@@ -115,6 +115,10 @@ without presenting lossy or per-shard state as exact shared state.
 - [x] Handler bodies reject `respond` with a `return` fix-it, while middleware
   functions reject status-`return` with a `respond` fix-it; valid helper
   `respond` propagation and ordinary function value expressions are unchanged.
+- [x] Dynamic direct-route Response mutations use a two-phase pending/commit
+  log: `resp.header()` observes ordered pending writes, while only `return resp`
+  publishes them. Guarded source-order lowering remains blocked until effects
+  and their dependent reads can move out of the function prelude together.
 - [x] Error-prelude exit-dominance now treats literal 4xx/5xx pre-rejects as
   fail-closed while keeping the prelude for success, redirect, dynamic, and
   forward exits that do not recover a fallible local.
