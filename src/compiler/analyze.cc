@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/shard_limits.h"
+#include "rut/compiler/builtin_decls.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/route_method.h"
@@ -8674,11 +8675,52 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return {};
     };
 
+    // Control-plane snapshot declarations are checker-visible before their
+    // HandlerCtx/runtime lowering lands. This preserves distinct Stats and
+    // Metrics types instead of pretending either snapshot is a string.
+    if ((expr.name.eq({"stats", 5}) || expr.name.eq({"metrics", 7})) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        const BuiltinDecl* decl = find_control_plane_builtin(BuiltinReceiver::None, expr.name);
+        if (decl == nullptr || pipe_lhs != nullptr || first_arg_override != nullptr ||
+            expr.args.len != decl->param_count)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("stats() and metrics() take no arguments"));
+        HirExpr out{};
+        out.kind =
+            expr.name.eq({"stats", 5}) ? HirExprKind::StatsSnapshot : HirExprKind::MetricsSnapshot;
+        out.type =
+            decl->return_type == BuiltinDeclType::Stats ? HirTypeKind::Stats : HirTypeKind::Metrics;
+        out.span = expr.span;
+        return out;
+    }
+
     if (expr.name.eq({"json", 4}) &&
         !user_bound_ident_name(mod, locals, local_count, binding, {"json", 4})) {
         if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
             expr.args[0] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
+        // These are the two declared runtime-json values. Keep the snapshot
+        // operation as an operand; never fold it to a fake empty/default body.
+        if (expr.args[0]->kind == AstExprKind::Call &&
+            (expr.args[0]->name.eq({"stats", 5}) || expr.args[0]->name.eq({"metrics", 7})) &&
+            !user_bound_ident_name(mod, locals, local_count, binding, expr.args[0]->name)) {
+            auto snapshot =
+                analyze_call_expr(*expr.args[0], route, mod, locals, local_count, binding, nullptr);
+            if (!snapshot) return core::make_unexpected(snapshot.error());
+            if ((snapshot->type != HirTypeKind::Stats && snapshot->type != HirTypeKind::Metrics) ||
+                snapshot->may_nil || snapshot->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[0]->span, kJsonLiteralDetail);
+            if (!route->exprs.push(snapshot.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr out{};
+            out.kind = HirExprKind::AdminJson;
+            out.type = HirTypeKind::Str;
+            out.span = expr.span;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         std::string serialized;
         auto encoded = serialize_json_literal(*expr.args[0], serialized);
         if (!encoded) return core::make_unexpected(encoded.error());

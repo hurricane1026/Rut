@@ -1,4 +1,5 @@
 #include "rut/compiler/analyze.h"
+#include "rut/compiler/builtin_decls.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
@@ -31578,6 +31579,74 @@ TEST(frontend, json_rejects_dynamic_values_until_runtime_serializer_exists) {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("json currently accepts only literal bool/int/string/nil/array/object values")));
+}
+
+TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
+    const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
+    const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));
+    const BuiltinDecl* reload = find_control_plane_builtin(BuiltinReceiver::None, lit("reload"));
+    const BuiltinDecl* mark = find_control_plane_builtin(BuiltinReceiver::Upstream, lit("mark"));
+    REQUIRE(stats != nullptr);
+    REQUIRE(metrics != nullptr);
+    REQUIRE(reload != nullptr);
+    REQUIRE(mark != nullptr);
+    CHECK_EQ(stats->return_type, BuiltinDeclType::Stats);
+    CHECK(stats->json_serializable);
+    CHECK_EQ(metrics->return_type, BuiltinDeclType::Metrics);
+    CHECK(metrics->json_serializable);
+    CHECK(reload->statement_only);
+    CHECK_EQ(reload->contexts, static_cast<u8>(BuiltinInRoute));
+    CHECK(mark->statement_only);
+    CHECK_EQ(mark->contexts, static_cast<u8>(BuiltinInTimer));
+    REQUIRE_EQ(mark->param_count, 2u);
+    CHECK_EQ(mark->params[0].type, BuiltinDeclType::Server);
+    CHECK(mark->params[0].label.len == 0);
+    CHECK(mark->params[1].label.eq(lit("healthy")));
+    CHECK_EQ(mark->params[1].type, BuiltinDeclType::Bool);
+}
+
+TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let snapshot = stats()
+    let statsBody = json(stats())
+    let metricSnapshot = metrics()
+    let metricsBody = json(metrics())
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Stats);
+    CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::StatsSnapshot);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[1].init.kind, HirExprKind::AdminJson);
+    CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::Metrics);
+    CHECK_EQ(hir->routes[0].locals[2].init.kind, HirExprKind::MetricsSnapshot);
+    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[3].init.kind, HirExprKind::AdminJson);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, control_plane_snapshot_declarations_validate_arity) {
+    const char* src = "route GET \"/admin\" { let snapshot = stats(1) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("stats() and metrics() take no arguments")));
 }
 
 TEST(frontend, json_rejects_duplicate_object_fields) {
