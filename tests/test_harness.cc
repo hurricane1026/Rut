@@ -934,6 +934,33 @@ TEST(harness_scenario, committed_response_status_and_body_are_observed_after_wai
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, response_field_reads_drive_committed_status_and_body) {
+    TempSource source;
+    REQUIRE(
+        source.write("route GET \"/x\" { let resp = response(200) let initial = resp.status "
+                     "resp.status = initial + 1 resp.body = req.path resp.status = resp.status + 1 "
+                     "resp.body = resp.body return resp }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 202};
+
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 202);
+    CHECK(result.harness.output_bytes > sizeof("/x") - 1);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     harness::SourceTarget target{};
     REQUIRE(target.program.config.add_static("/static", kRouteMethodGet, 204));

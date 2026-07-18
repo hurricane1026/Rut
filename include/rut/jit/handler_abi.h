@@ -159,7 +159,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     bool response_header_overflow;
     // Bounded mutable response scalars. Setters update pending state; the
     // terminal commit publishes it atomically with the header mutation prefix.
-    u16 response_status_pending;
+    // Keep the raw assigned value so resp.status observes source semantics
+    // even when the terminal commit will reject it as an invalid HTTP status.
+    i32 response_status_pending;
     bool response_status_pending_set;
     bool response_status_pending_invalid;
     u16 response_status;

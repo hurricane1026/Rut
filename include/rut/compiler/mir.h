@@ -34,6 +34,8 @@ enum class MirValueKind : u8 {
     ReqSetHeader,
     ReqAddHeader,
     RespHeader,
+    RespStatus,
+    RespBody,
     RespSetHeader,
     RespAddHeader,
     RespRemoveHeader,

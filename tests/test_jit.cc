@@ -2638,6 +2638,67 @@ route GET "/api/users" use chain access {
     rir.destroy();
 }
 
+TEST(jit, response_status_and_body_reads_observe_pending_mutations) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    let resp = response(200)
+    let initial_status = resp.status
+    let initial_body = resp.body
+    resp.status = initial_status + 1
+    resp.body = req.path
+    resp.status = resp.status + 1
+    resp.set("X-Seen-Body", resp.body)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 202u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("/api/users")));
+    REQUIRE_EQ(frame.ctx.response_header_count, 1u);
+    CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-Seen-Body")));
+    CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("/api/users")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, response_status_read_preserves_invalid_pending_value_until_fail_closed_commit) {
+    TestHandlerCtxFrame frame{};
+    rut_helper_resp_set_status(&frame.ctx, 700);
+    CHECK_EQ(rut_helper_resp_status(&frame.ctx, 200), 700);
+    rut_helper_resp_commit_headers(&frame.ctx);
+    CHECK(frame.ctx.response_status_set);
+    CHECK(frame.ctx.response_status_invalid);
+    CHECK_EQ(frame.ctx.response_status, 0u);
+}
+
 TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};

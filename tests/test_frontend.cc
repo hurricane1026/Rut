@@ -7331,6 +7331,73 @@ route GET "/x" use chain rewrite_response {
     rir.destroy();
 }
 
+TEST(frontend, response_status_and_body_reads_fold_initial_values_and_lower_pending_reads) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    let initial_status = resp.status
+    let initial_body = resp.body
+    resp.status = initial_status + 1
+    resp.body = req.path
+    resp.status = resp.status + 1
+    resp.set("X-Seen-Body", resp.body)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->routes[0].locals.len >= 3u);
+    CHECK(hir->routes[0].locals[1].init.kind == HirExprKind::IntLit);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 200);
+    CHECK(hir->routes[0].locals[2].init.kind == HirExprKind::StrLit);
+    CHECK_EQ(hir->routes[0].locals[2].init.str_value.len, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 status_reads = 0;
+    u32 body_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            status_reads += block.insts[ii].op == rir::Opcode::RespStatus;
+            body_reads += block.insts[ii].op == rir::Opcode::RespBody;
+        }
+    }
+    CHECK_EQ(status_reads, 1u);
+    CHECK_EQ(body_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, response_field_reads_reject_runtime_placeholders_and_unknown_fields) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {R"rut(
+func inspect(_ resp: Response) -> i32 { resp.status }
+)rut",
+         "runtime Response field reads require explicit buffered forwarding"},
+        {"route GET \"/x\" { let resp = response(200) let value = resp.foo return resp }\n",
+         "Response readable fields are status and body"},
+    };
+    for (const auto& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(c.detail)));
+    }
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));

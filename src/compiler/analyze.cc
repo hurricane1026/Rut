@@ -7811,6 +7811,54 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     if (expr.kind == AstExprKind::MethodCall) {
         return analyze_method_call_expr(expr, route, mod, locals, local_count, binding);
     }
+    // Handler-local Response builders have a compile-time initial status/body
+    // plus a request-owned pending mutation log. Reads before the first runtime
+    // mutation fold to that initial value; later reads query the log with the
+    // same initial value as their fallback. A Response parameter (for example
+    // in `chain after`) has no concrete upstream/body carrier yet and must not
+    // be fabricated from the response(0) analysis placeholder.
+    if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
+        expr.lhs->kind == AstExprKind::Ident) {
+        const HirLocal* response = nullptr;
+        for (u32 li = local_count; li > 0; li--) {
+            if (!locals[li - 1].name.eq(expr.lhs->name)) continue;
+            if (locals[li - 1].type == HirTypeKind::Response) response = &locals[li - 1];
+            break;
+        }
+        if (response != nullptr) {
+            const bool read_status = expr.name.eq({"status", 6});
+            const bool read_body = expr.name.eq({"body", 4});
+            if (!read_status && !read_body)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("Response readable fields are status and body"));
+            if (response->init.kind != HirExprKind::ResponseInit ||
+                response->init.int_value < 100 || response->init.int_value > 599)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("runtime Response field reads require explicit buffered forwarding"));
+
+            HirExpr fallback{};
+            fallback.span = expr.span;
+            if (read_status) {
+                fallback.kind = HirExprKind::IntLit;
+                fallback.type = HirTypeKind::I32;
+                fallback.int_value = response->init.int_value;
+            } else {
+                fallback.kind = HirExprKind::StrLit;
+                fallback.type = HirTypeKind::Str;
+                fallback.str_value = {"", 0};
+            }
+            if (!response->init.bool_value) return fallback;
+            if (!route->exprs.push(fallback))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.kind = read_status ? HirExprKind::RespStatus : HirExprKind::RespBody;
+            out.type = read_status ? HirTypeKind::I32 : HirTypeKind::Str;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+    }
     if (expr.kind == AstExprKind::Field && expr.lhs != nullptr &&
         expr.lhs->kind == AstExprKind::Ident && expr.lhs->name.eq({"req", 3})) {
         if (magic_req_receiver(*expr.lhs, mod, locals, local_count, binding)) {

@@ -2700,6 +2700,28 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
+    if (value.kind == MirValueKind::RespStatus || value.kind == MirValueKind::RespBody) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto fallback = materialize_value(*value.lhs,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          span);
+        if (!fallback) return core::make_unexpected(fallback.error());
+        auto out = value.kind == MirValueKind::RespStatus
+                       ? b.emit_resp_status(fallback.value(), {span.line, span.col})
+                       : b.emit_resp_body(fallback.value(), {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::RespSetHeader || value.kind == MirValueKind::RespAddHeader) {
         if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
         auto val = materialize_value(*value.lhs,
