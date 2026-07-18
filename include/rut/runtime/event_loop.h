@@ -5,6 +5,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
@@ -208,6 +209,7 @@ public:
             if (now < timer_deadline_ns[i]) continue;
             jit::HandlerCtx ctx{};
             latch_control_plane_snapshot(&self(), &ctx);
+            latch_control_plane_mutation(&self(), &ctx);
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
             timer_fire_count[i]++;
             // Reschedule from now (not the missed deadline) to avoid a catch-up
@@ -462,6 +464,7 @@ public:
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
     bool metrics_endpoint_enabled = false;
+    ControlPlaneMutationPort* control_plane_mutation = nullptr;
 
     // Per-shard control plane pointers. Set by Shard::init(), read by
     // poll_command() / epoch_enter() / epoch_leave() on the shard thread.

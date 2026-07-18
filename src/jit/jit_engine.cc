@@ -81,6 +81,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_json_append_bool", reinterpret_cast<void*>(&rut_helper_json_append_bool)},
     {"rut_helper_json_append_control_plane",
      reinterpret_cast<void*>(&rut_helper_json_append_control_plane)},
+    {"rut_helper_reload_request", reinterpret_cast<void*>(&rut_helper_reload_request)},
+    {"rut_helper_upstream_mark", reinterpret_cast<void*>(&rut_helper_upstream_mark)},
     {"rut_helper_json_capture_data", reinterpret_cast<void*>(&rut_helper_json_capture_data)},
     {"rut_helper_json_capture_len", reinterpret_cast<void*>(&rut_helper_json_capture_len)},
     {"rut_helper_json_finish", reinterpret_cast<void*>(&rut_helper_json_finish)},
@@ -118,23 +120,11 @@ bool JitEngine::init() {
     // MangleAndIntern produces correctly mangled names for the target.
     LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(lljit);
 
-    // Fixed stack buffer; raise kMaxHelpers in lockstep when kHelpers grows.
-    // Without the clamp on `count` the loop below can leave tail pairs
-    // uninitialized yet still hand them to LLVMOrcAbsoluteSymbols.
-    // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
-    // silently skipping helpers (which would produce opaque JIT link
-    // failures at runtime).
-    static constexpr u32 kMaxHelpers = 48;
-    u32 count = 0;
-    for (const auto* h = kHelpers; h->name; h++) count++;
-    if (count > kMaxHelpers) {
-        log_error("jit: helper table exceeds kMaxHelpers — raise the cap", nullptr);
-        LLVMOrcDisposeLLJIT(lljit);
-        lljit = nullptr;
-        return false;
-    }
-
-    LLVMOrcCSymbolMapPair pairs[kMaxHelpers];
+    // Derive the stack buffer size from the table so adding a helper cannot
+    // silently skip registration or require a second capacity edit. The final
+    // entry is the null sentinel and is intentionally excluded.
+    static constexpr u32 count = sizeof(kHelpers) / sizeof(kHelpers[0]) - 1;
+    LLVMOrcCSymbolMapPair pairs[count];
     for (u32 i = 0; i < count; i++) {
         pairs[i].Name = LLVMOrcLLJITMangleAndIntern(lljit, kHelpers[i].name);
         pairs[i].Sym.Address = reinterpret_cast<LLVMOrcExecutorAddress>(kHelpers[i].addr);

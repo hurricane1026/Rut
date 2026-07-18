@@ -255,6 +255,7 @@ public:
     ShardMetrics* const* all_shard_metrics = nullptr;
     u32 shard_metrics_count = 0;
     bool metrics_endpoint_enabled = false;
+    ControlPlaneMutationPort* control_plane_mutation = nullptr;
     // Per-shard idle upstream connection pool (HTTP/1 keep-alive reuse). Wired by
     // the shard; null in tests/mocks that don't exercise reuse.
     UpstreamPool* upstream = nullptr;

@@ -150,6 +150,14 @@ void rut_helper_json_append_str_list(const rut::Str* items, rut::u32 len);
 void rut_helper_json_append_i64(rut::i64 value);
 void rut_helper_json_append_bool(rut::u8 value);
 void rut_helper_json_append_control_plane(void* ctx, rut::u8 kind);
+// Bounded control-plane mutation entry points. Both return 1 only when the
+// operation defined by docs/control-plane-mutations.md succeeded.
+rut::u8 rut_helper_reload_request(void* ctx);
+rut::u8 rut_helper_upstream_mark(void* ctx,
+                                 rut::u64 config_generation,
+                                 rut::u16 upstream_id,
+                                 rut::u16 backend_id,
+                                 rut::u8 healthy);
 const char* rut_helper_json_capture_data();
 rut::u32 rut_helper_json_capture_len();
 void rut_helper_json_finish(void* ctx);

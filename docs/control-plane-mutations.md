@@ -1,6 +1,9 @@
 # Control-Plane Mutation Contract
 
-Status: accepted contract; runtime implementation is staged in TODO.md.
+Status: accepted contract. The shared mutation port, handler ABI capability,
+JIT helper boundary, production event-loop injection, and deterministic harness
+fixture are implemented; source lowering and the process reload coordinator
+remain staged in TODO.md.
 
 Rut exposes control-plane reads (`stats()` and `metrics()`) as bounded values
 latched at handler entry. Mutations are different: they change process-wide
@@ -172,7 +175,7 @@ generation order, and terminal records.
 
 ## Required implementation order
 
-1. Add the control-plane mutation port and deterministic admission/override
+1. [x] Add the control-plane mutation port and deterministic admission/override
    model to the handler ABI and harness.
 2. Implement `Server` identities, `Upstream.servers`, and the shared manual
    health override consulted by both network backends.
@@ -181,4 +184,3 @@ generation order, and terminal records.
    compatibility validation, SIGHUP, and process-harness coverage.
 5. Lower route-only `reload()` after the same coordinator is the sole activation
    path.
-

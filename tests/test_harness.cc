@@ -63,6 +63,8 @@ TEST(harness_core, stable_names_cover_public_enums) {
     CHECK(std::strcmp(harness::outcome_name(harness::Outcome::Stalled), "stalled") == 0);
     CHECK(std::strcmp(harness::capability_name(harness::Capability::ScriptedFaults),
                       "scripted-faults") == 0);
+    CHECK(std::strcmp(harness::capability_name(harness::Capability::ControlPlaneMutation),
+                      "control-plane-mutation") == 0);
     CHECK(std::strcmp(harness::limit_name(harness::LimitKind::HandlerResumes), "handler-resumes") ==
           0);
 }
@@ -72,6 +74,12 @@ namespace {
 
 u64 immediate_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(204).pack();
+}
+
+u64 reload_admission_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->control_plane_mutation == nullptr) return jit::HandlerResult::make_status(500).pack();
+    const bool accepted = ctx->control_plane_mutation->request_reload(ReloadRequestSource::Route);
+    return jit::HandlerResult::make_status(accepted ? 202 : 503).pack();
 }
 
 u64 timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -960,6 +968,51 @@ TEST(harness_scenario, response_field_reads_drive_committed_status_and_body) {
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(result.terminal.status_code, 202);
     CHECK(result.harness.output_bytes > sizeof("/x") - 1);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, control_plane_mutation_fixture_is_explicit_and_stable) {
+    harness::SourceTarget target{};
+    REQUIRE(target.program.config.add_jit_handler(
+        "/reload", kRouteMethodPost, &reload_admission_handler));
+    target.prepared = true;
+    ControlPlaneMutationPort mutation;
+    mutation.reset(1, true);
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/reload", 7};
+    scenario.method = kRouteMethodPost;
+    const char request[] = "POST /reload HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n";
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.control_plane_mutation = &mutation;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 202};
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.required_capabilities.add(harness::Capability::ControlPlaneMutation);
+    spec.environment_capabilities = spec.required_capabilities;
+
+    const auto accepted = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(accepted.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(accepted.terminal.status_code, 202);
+    scenario.expected.value = 503;
+    const auto full = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(full.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(full.terminal.status_code, 503);
+
+    scenario.control_plane_mutation = nullptr;
+    const auto missing = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(missing.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(missing.harness.detail, "control-plane mutation fixture is missing") == 0);
+    scenario.control_plane_mutation = &mutation;
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    const auto undeclared = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(undeclared.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(undeclared.harness.detail,
+                      "control-plane mutation capability was not declared") == 0);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

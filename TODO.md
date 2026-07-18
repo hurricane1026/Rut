@@ -20,6 +20,11 @@ and harness contract is fixed in `docs/control-plane-mutations.md`. Implement
 it in the required order documented there; do not reintroduce the old
 `Void`/statement-only declarations or a hidden wait.
 
+The shared bounded mutation port, generation-tagged manual override table,
+HandlerCtx/JIT helper boundary, production injection, and deterministic harness
+fixture are connected. `Server`/`Upstream.servers`, health-selection integration,
+source lowering, and the reload coordinator remain.
+
 **Acceptance**:
 - Reload and upstream mutation define authorization, failure, and shard-ordering
   behavior.
@@ -79,6 +84,10 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Production and deterministic harness execution share one allocation-free
+  control-plane mutation port with single-slot reload admission, terminal
+  outcome records, generation-tagged manual-health overrides, and fail-closed
+  JIT helper entry points; Rut source forms remain gated.
 - [x] Control-plane mutations have one explicit contract for authority, visible
   boolean failure, config-generation publication, program lifetime, shard
   ordering, manual-health priority, and deterministic replay; runtime wiring

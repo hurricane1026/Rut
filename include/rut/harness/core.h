@@ -57,6 +57,7 @@ enum class Capability : u8 {
     ScriptedFaults,
     SyscallFaults,
     ControlPlaneSnapshot,
+    ControlPlaneMutation,
     Count,
 };
 

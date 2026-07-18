@@ -4,6 +4,7 @@
 #include "rut/runtime/route_params.h"
 
 namespace rut {
+class ControlPlaneMutationPort;
 namespace jit {
 
 // ── Handler Action ─────────────────────────────────────────────────
@@ -187,6 +188,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     u32 route_param_count;    // number of populated route_params entries
     u32 reserved0;
     ControlPlaneSnapshot control_plane;
+    // Explicit mutation capability. Null means reload/health mutation is
+    // unavailable; JIT code never receives an EventLoop or coordinator object.
+    ControlPlaneMutationPort* control_plane_mutation;
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization

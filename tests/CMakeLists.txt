@@ -191,6 +191,15 @@ target_include_directories(test_cache_table PRIVATE
 add_test(NAME test_cache_table COMMAND test_cache_table)
 set_tests_properties(test_cache_table PROPERTIES LABELS "unit")
 
+add_executable(test_control_plane_mutation test_control_plane_mutation.cc)
+target_link_libraries(test_control_plane_mutation Threads::Threads)
+target_include_directories(test_control_plane_mutation PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_control_plane_mutation COMMAND test_control_plane_mutation)
+set_tests_properties(test_control_plane_mutation PROPERTIES LABELS "unit;runtime;harness")
+
 add_executable(test_types test_types.cc)
 target_include_directories(test_types PRIVATE
     ${PROJECT_SOURCE_DIR}/include

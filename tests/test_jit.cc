@@ -11,6 +11,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_mutation.h"
 #include "rut/runtime/jit_dispatch.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
@@ -1432,6 +1433,26 @@ route GET "/api/users" {
 
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_port) {
+    CHECK_EQ(rut_helper_reload_request(nullptr), 0u);
+    CHECK_EQ(rut_helper_upstream_mark(nullptr, 1, 0, 0, 1), 0u);
+    TestHandlerCtxFrame frame{};
+    CHECK_EQ(rut_helper_reload_request(&frame.ctx), 0u);
+    CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 1, 0, 0, 1), 0u);
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(6, false);
+    frame.ctx.control_plane_mutation = &mutation;
+    CHECK_EQ(rut_helper_reload_request(&frame.ctx), 0u);
+    REQUIRE(mutation.set_route_reload_enabled(true));
+    CHECK_EQ(rut_helper_reload_request(&frame.ctx), 1u);
+    CHECK_EQ(rut_helper_reload_request(&frame.ctx), 0u);
+    CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 5, 0, 0, 1), 0u);
+    CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 2), 0u);
+    CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 0), 1u);
+    CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
 }
 
 TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {
