@@ -10017,6 +10017,7 @@ static FrontendResult<void> analyze_guard_match_arms(
     const HirModule& mod,
     const HirLocal* locals,
     u32 local_count,
+    const MatchPayloadBinding* binding,
     FixedVec<HirGuardMatchArm, HirModule::kMaxGuardMatchArms>* guard_match_arms,
     HirGuard* guard) {
     bool seen_wildcard = false;
@@ -10071,7 +10072,7 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod, locals, local_count);
+        auto term = analyze_term(*arm.stmt, mod, locals, local_count, binding);
         if (!term) return core::make_unexpected(term.error());
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
@@ -10541,6 +10542,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                                                    mod,
                                                                    scoped_locals.data,
                                                                    scoped_locals.len,
+                                                                   binding,
                                                                    guard_match_arms,
                                                                    &guard);
                         if (!fail_match) return core::make_unexpected(fail_match.error());
@@ -13356,6 +13358,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                mod,
                                                                route->locals.data,
                                                                route->locals.len,
+                                                               nullptr,
                                                                &mod.guard_match_arms,
                                                                &guard);
                     if (!fail_match) return core::make_unexpected(fail_match.error());
@@ -14022,6 +14025,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                  mod,
                                                                  arm_scoped_locals.data,
                                                                  arm_scoped_locals.len,
+                                                                 arm_binding_ptr,
                                                                  &mod.guard_match_arms,
                                                                  &guard);
                                     if (!fail_match)
@@ -18823,6 +18827,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                    mod,
                                                                    route.locals.data,
                                                                    route.locals.len,
+                                                                   nullptr,
                                                                    &mod.guard_match_arms,
                                                                    &guard);
                         if (!fail_match) return core::make_unexpected(fail_match.error());

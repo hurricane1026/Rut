@@ -31986,6 +31986,22 @@ route GET "/x" { return 200, json(1) }
         lit("return body expressions currently support json(literal) only")));
 }
 
+TEST(frontend, guard_match_return_body_json_respects_payload_shadowing) {
+    const char* src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { let state = Result.ok(1) match state { .ok(json) => { let failed "
+        "= error(.timeout) guard match failed else { .timeout => return 200, json(1) _ => "
+        "return 500 } return 200 } .err => return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
+}
+
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
     const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
     auto lexed = lex(lit(src));
