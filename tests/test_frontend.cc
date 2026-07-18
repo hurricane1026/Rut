@@ -32434,22 +32434,98 @@ TEST(frontend, json_serializes_empty_literal_arrays_and_objects) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Json);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
-             static_cast<u8>(HirExprKind::StrLit));
+             static_cast<u8>(HirExprKind::JsonBuild));
     CHECK(
         hir->routes[0].locals[0].init.str_value.eq(lit("{\"users\":[],\"meta\":{},\"ok\":true}")));
 }
 
-TEST(frontend, json_rejects_dynamic_values_until_runtime_serializer_exists) {
-    const char* src = "route GET \"/x\" { let payload = json({ path: req.path }) return 200 }\n";
+TEST(frontend, reusable_json_local_can_be_returned) {
+    const char* src =
+        "route GET \"/x\" { let payload = json({ path: req.path }) return 200, payload }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.has_dynamic_response_body);
+    REQUIRE_EQ(term.json_value_ref_indices.len, 1u);
+    REQUIRE_EQ(term.json_segments.len, 2u);
+    CHECK(term.json_segments[0].eq(lit("{\"path\":")));
+    CHECK(term.json_segments[1].eq(lit("}")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, helper_functions_can_compose_json_values) {
+    const char* src = R"rut(
+func envelope(path: str) -> Json => json({ path: path })
+func identity(value: Json) -> Json => value
+route GET "/x" {
+    let payload = identity(envelope(req.path))
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.has_dynamic_response_body);
+    REQUIRE_EQ(term.json_value_ref_indices.len, 1u);
+    REQUIRE_EQ(term.json_segments.len, 2u);
+}
+
+TEST(frontend, response_body_accepts_reusable_json_and_rejects_other_values) {
+    const char* valid = R"rut(
+route GET "/x" {
+    let payload = json({ path: req.path })
+    let resp = response(200)
+    resp.body = payload
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool saw_capture = false;
+    bool saw_set_body = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            saw_capture |= block.insts[ii].op == rir::Opcode::JsonCapture;
+            saw_set_body |= block.insts[ii].op == rir::Opcode::RespSetBody;
+        }
+    }
+    CHECK(saw_capture);
+    CHECK(saw_set_body);
+    rir.destroy();
+
+    const char* invalid =
+        "route GET \"/x\" { let resp = response(200) resp.body = 1 return resp }\n";
+    lexed = lex(lit(invalid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(
-        lit("json currently accepts only literal bool/int/string/nil/array/object values")));
+    CHECK(hir.error().detail.eq(lit("Response.body requires a plain string or json(...) value")));
 }
 
 TEST(frontend, return_json_builds_bounded_runtime_scalar_template) {
@@ -32954,6 +33030,67 @@ TEST(frontend, return_body_expression_rejects_non_json_calls) {
     CHECK(hir.error().detail.eq(
         lit("return body expressions require json(...) with a supported literal or declared "
             "struct value")));
+}
+
+TEST(frontend, return_json_preserves_specific_plan_diagnostics) {
+    const char* src = "route GET \"/x\" { return 200, json({ value: 1, value: 2 }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("json object field names must be unique")));
+}
+
+TEST(frontend, respond_body_expression_uses_return_json_legality_rules) {
+    const char* valid = R"rut(
+route GET "/x" {
+    let payload = json({ path: req.path })
+    guard req.http11 else { respond 426, payload }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(valid));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK(hir->routes[0].guards[0].fail_term.has_dynamic_response_body);
+
+    const char* invalid = "route GET \"/x\" { respond 400, req.path }\n";
+    lexed = lex(lit(invalid));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("respond body expressions require json(...) with a supported literal or declared "
+            "struct value")));
+}
+
+TEST(frontend, json_values_are_opaque_outside_response_sinks) {
+    const char* sources[] = {
+        "route GET \"/x\" { let body = json({ ok: true }) let same = body == body return 200 }\n",
+        "route GET \"/x\" { let body = json({ ok: true }) let bodies = [body] return 200 }\n",
+        "route GET \"/x\" { let body = json({ ok: true }) let pair = (body, 1) return 200 }\n",
+        "struct Stored { body: Json } route GET \"/x\" { return 200 }\n",
+    };
+    const auto detail =
+        lit("Json values are opaque response plans; use them only through locals or helper calls "
+            "and consume them with return, respond, or Response.body");
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(detail));
+    }
 }
 
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {

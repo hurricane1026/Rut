@@ -37,6 +37,12 @@ constexpr Str kJsonLiteralDetail =
 constexpr Str kReturnBodyExprDetail = lit_str(
     "return body expressions require json(...) with a supported literal or declared "
     "struct value");
+constexpr Str kRespondBodyExprDetail = lit_str(
+    "respond body expressions require json(...) with a supported literal or declared "
+    "struct value");
+constexpr Str kJsonOpaqueValueDetail = lit_str(
+    "Json values are opaque response plans; use them only through locals or helper calls and "
+    "consume them with return, respond, or Response.body");
 
 static bool append_json_bytes(std::string& out, const char* data, u32 len) {
     static constexpr u32 kMaxJsonLiteralBytes = 64 * 1024;
@@ -421,10 +427,11 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.tuple_len = tuple_len;
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
-    shape.is_concrete =
-        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
-        type == HirTypeKind::Str || type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-        type == HirTypeKind::IP || type == HirTypeKind::StrList || type == HirTypeKind::Response;
+    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
+                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
+                        type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
+                        type == HirTypeKind::IP || type == HirTypeKind::StrList ||
+                        type == HirTypeKind::Response || type == HirTypeKind::Json;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -2173,6 +2180,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
+    if (name.eq({"Json", 4})) return HirTypeKind::Json;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
         variant_index = idx;
@@ -3946,6 +3954,16 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
                                                  bool allow_array_lit);
+static FrontendResult<void> build_dynamic_json_plan(
+    const AstExpr& expr,
+    HirRoute* route,
+    const HirModule& mod,
+    std::vector<std::string>& segments,
+    FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
+    const HirLocal* locals,
+    u32 local_count,
+    const MatchPayloadBinding* binding,
+    u32 depth = 0);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -7372,12 +7390,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         auto value = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!value) return core::make_unexpected(value.error());
         if (value->may_nil || value->may_error || (set_status && value->type != HirTypeKind::I32) ||
-            (set_body && value->type != HirTypeKind::Str))
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  expr.rhs->span,
-                                  set_status
-                                      ? lit_str("Response.status requires a plain i32 value")
-                                      : lit_str("Response.body requires a plain string value"));
+            (set_body && value->type != HirTypeKind::Str && value->type != HirTypeKind::Json))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.rhs->span,
+                set_status ? lit_str("Response.status requires a plain i32 value")
+                           : lit_str("Response.body requires a plain string or json(...) "
+                                     "value"));
         if (set_status && value->kind == HirExprKind::IntLit &&
             (value->int_value < 100 || value->int_value > 599))
             return frontend_error(FrontendError::InvalidStatusCode, expr.rhs->span);
@@ -8158,6 +8177,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             // tuple layout across the array.
             if (elem->type == HirTypeKind::Unknown || elem->may_error || elem->may_nil)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+            if (elem->type == HirTypeKind::Json)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kJsonOpaqueValueDetail);
             // First element defines the array's element type; subsequent
             // elements must match its shape exactly.
             if (i > 0 && !same_hir_type_shape(mod, first_elem_snapshot, elem.value()))
@@ -8218,6 +8240,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (elem->may_nil || elem->may_error || elem->type == HirTypeKind::Unknown ||
                 elem->type == HirTypeKind::Tuple)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
+            if (elem->type == HirTypeKind::Json)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, kJsonOpaqueValueDetail);
             out.tuple_types[i] = elem->type;
             out.tuple_variant_indices[i] =
                 elem->type == HirTypeKind::Variant ? elem->variant_index : 0xffffffffu;
@@ -8935,6 +8960,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
         adopt_int_literal_type(&lhs.value(), &rhs.value());
+        if (lhs->type == HirTypeKind::Json || rhs->type == HirTypeKind::Json)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kJsonOpaqueValueDetail);
         const bool lhs_maybe_missing = lhs->may_nil || lhs->may_error;
         const bool rhs_maybe_missing = rhs->may_nil || rhs->may_error;
         if (expr.kind != AstExprKind::Eq && (lhs_maybe_missing || rhs_maybe_missing))
@@ -9187,6 +9215,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 HirExpr tuple = locals[i].init;
                 tuple.span = expr.span;
                 return tuple;
+            }
+            if (locals[i].type == HirTypeKind::Json) {
+                HirExpr json = locals[i].init;
+                json.span = expr.span;
+                return json;
             }
             out.kind = HirExprKind::LocalRef;
             out.type = locals[i].type;
@@ -9555,14 +9588,55 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             out.lhs = &route->exprs[route->exprs.len - 1];
             return out;
         }
-        std::string serialized;
-        auto encoded = serialize_json_literal(*expr.args[0], serialized);
-        if (!encoded) return core::make_unexpected(encoded.error());
+        if (route == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
+        std::vector<std::string> segments(1);
+        FixedVec<u32, HirTerminator::kMaxJsonDynamicValues> value_refs;
+        auto plan = build_dynamic_json_plan(
+            *expr.args[0], route, mod, segments, value_refs, locals, local_count, binding);
+        if (!plan) return core::make_unexpected(plan.error());
         HirExpr out{};
-        out.kind = HirExprKind::StrLit;
-        out.type = HirTypeKind::Str;
+        out.kind = HirExprKind::JsonBuild;
+        out.type = HirTypeKind::Json;
         out.span = expr.span;
-        out.str_value = intern_generated_name(serialized);
+        for (u32 i = 0; i < value_refs.len; i++) {
+            const HirLocal* captured = nullptr;
+            for (u32 li = route->locals.len; li > 0; li--) {
+                if (route->locals[li - 1].ref_index == value_refs[i]) {
+                    captured = &route->locals[li - 1];
+                    break;
+                }
+            }
+            if (captured == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            AstExpr ident{};
+            ident.kind = AstExprKind::Ident;
+            ident.name = captured->name;
+            ident.span = expr.span;
+            auto leaf =
+                analyze_expr(ident, route, mod, route->locals.data, route->locals.len, binding);
+            if (!leaf) return core::make_unexpected(leaf.error());
+            if (!route->exprs.push(leaf.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr::FieldInit part{};
+            part.name = intern_generated_name(segments[i]);
+            part.value = &route->exprs[route->exprs.len - 1];
+            if (!out.field_inits.push(part))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        out.str_value = intern_generated_name(segments.back());
+        auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                           HirTypeKind::Json,
+                                           0xffffffffu,
+                                           0xffffffffu,
+                                           0xffffffffu,
+                                           0,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           expr.span);
+        if (!shape) return core::make_unexpected(shape.error());
+        out.shape_index = shape.value();
         return out;
     }
 
@@ -11120,92 +11194,59 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
         // analyze stores an explicit zero-length non-null Str when the
         // user wrote `body: ""`; lower_rir de-dupes on content.
         if (stmt.has_response_body) {
+            const Str body_expr_detail = stmt.kind == AstStmtKind::RespondStatus
+                                             ? kRespondBodyExprDetail
+                                             : kReturnBodyExprDetail;
             if (stmt.response_body.ptr != nullptr) {
                 term.response_body = stmt.response_body;
             } else {
-                if (stmt.expr.kind != AstExprKind::Call || !stmt.expr.name.eq({"json", 4}) ||
-                    stmt.expr.args.len != 1 || stmt.expr.args[0] == nullptr)
+                if (route == nullptr)
                     return frontend_error(
-                        FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
-                std::string serialized;
-                auto encoded = serialize_json_literal(*stmt.expr.args[0], serialized);
-                if (encoded) {
-                    term.response_body = intern_generated_name(serialized);
+                        FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
+                auto body = analyze_expr(
+                    stmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
+                if (!body) return core::make_unexpected(body.error());
+                if (body->type != HirTypeKind::Json || body->kind != HirExprKind::JsonBuild)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
+                if (body->field_inits.len == 0) {
+                    term.response_body = body->str_value;
                 } else {
-                    if (route == nullptr)
-                        return frontend_error(FrontendError::UnsupportedSyntax,
-                                              stmt.expr.span,
-                                              kReturnBodyExprDetail);
-                    std::vector<std::string> segments(1);
-                    if (locals == nullptr) {
-                        locals = route->locals.data;
-                        local_count = route->locals.len;
-                    }
-                    auto plan = build_dynamic_json_plan(*stmt.expr.args[0],
-                                                        route,
-                                                        mod,
-                                                        locals,
-                                                        local_count,
-                                                        binding,
-                                                        segments,
-                                                        term.json_value_ref_indices,
-                                                        term.json_value_expr_indices);
-                    if (!plan) return core::make_unexpected(plan.error());
-                    if (route->waits.len != 0) {
-                        bool retained[HirRoute::kMaxLocals]{};
-                        for (u32 li = 0; li < route->locals.len; li++)
-                            retained[li] = terminator_reads_local_ref(term,
-                                                                      route->exprs.data,
-                                                                      route->exprs.len,
-                                                                      route->locals[li].ref_index);
-                        bool changed = true;
-                        while (changed) {
-                            changed = false;
-                            for (u32 li = 0; li < route->locals.len; li++) {
-                                if (!retained[li]) continue;
-                                for (u32 dep = 0; dep < route->locals.len; dep++) {
-                                    if (retained[dep] ||
-                                        !expr_reads_local_ref(route->locals[li].init,
-                                                              route->locals[dep].ref_index))
-                                        continue;
-                                    retained[dep] = true;
-                                    changed = true;
-                                }
-                            }
+                    for (u32 i = 0; i < body->field_inits.len; i++) {
+                        const auto& part = body->field_inits[i];
+                        if (part.value == nullptr || !term.json_segments.push(part.name))
+                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        if (part.value->kind == HirExprKind::LocalRef) {
+                            if (!term.json_value_ref_indices.push(part.value->local_index))
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                            continue;
                         }
-                        for (u32 li = 0; li < route->locals.len; li++)
-                            if (retained[li] && !route->locals[li].materialize_on_resume)
-                                route->locals[li].rematerialize_after_wait = true;
-                    }
-                    u32 minimum_bytes = 0;
-                    for (const auto& segment : segments) {
-                        if (segment.size() > kJsonResponseScratchCapacity - minimum_bytes)
-                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                        minimum_bytes += static_cast<u32>(segment.size());
-                    }
-                    for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
-                        const u32 ref = term.json_value_ref_indices[ji];
-                        if (ref < HirRoute::kMaxLocals)
-                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-                        const u32 materialized_index = ref - HirRoute::kMaxLocals;
-                        if (materialized_index >= term.json_value_expr_indices.len)
-                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-                        const u32 expr_index = term.json_value_expr_indices[materialized_index];
-                        if (expr_index >= route->exprs.len)
-                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-                        const auto type = route->exprs[expr_index].type;
-                        const u32 encoded_minimum = type == HirTypeKind::Bool      ? 4u
-                                                    : type == HirTypeKind::Str     ? 2u
-                                                    : type == HirTypeKind::StrList ? 2u
-                                                                                   : 1u;
-                        if (encoded_minimum > kJsonResponseScratchCapacity - minimum_bytes)
-                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                        minimum_bytes += encoded_minimum;
-                    }
-                    for (const auto& segment : segments) {
-                        if (!term.json_segments.push(intern_generated_name(segment)))
+                        HirLocal captured{};
+                        captured.span = part.value->span;
+                        captured.name = intern_generated_name("$json.return." + std::to_string(i));
+                        captured.ref_index =
+                            next_local_ref_index(route, route->locals.data, route->locals.len);
+                        captured.type = part.value->type;
+                        captured.shape_index = part.value->shape_index;
+                        captured.may_nil = part.value->may_nil;
+                        captured.may_error = part.value->may_error;
+                        captured.variant_index = part.value->variant_index;
+                        captured.struct_index = part.value->struct_index;
+                        captured.tuple_len = part.value->tuple_len;
+                        for (u32 ti = 0; ti < part.value->tuple_len; ti++) {
+                            captured.tuple_types[ti] = part.value->tuple_types[ti];
+                            captured.tuple_variant_indices[ti] =
+                                part.value->tuple_variant_indices[ti];
+                            captured.tuple_struct_indices[ti] =
+                                part.value->tuple_struct_indices[ti];
+                        }
+                        captured.init = *part.value;
+                        if (!route->locals.push(captured) ||
+                            !term.json_value_ref_indices.push(captured.ref_index))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                     }
+                    if (!term.json_segments.push(body->str_value))
+                        return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                     term.has_dynamic_response_body = true;
                 }
             }
@@ -16587,7 +16628,7 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
-        carrier.type = HirTypeKind::Str;
+        carrier.type = effect->type;
         carrier.init = effect.value();
         if (!route->locals.push(carrier))
             return frontend_error(FrontendError::TooManyItems, step.span);
@@ -17503,6 +17544,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       field_tuple_elem_shape_indices);
                 if (!resolved) return core::make_unexpected(resolved.error());
                 field.type = resolved.value();
+                if (field.type == HirTypeKind::Json)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.struct_decl.span,
+                                          kJsonOpaqueValueDetail);
                 if (field.type == HirTypeKind::Generic &&
                     field.generic_index < struct_type_params.len) {
                     field.generic_has_error_constraint =

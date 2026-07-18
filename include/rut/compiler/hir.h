@@ -195,6 +195,10 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    // Compiler-owned reusable JSON plan. field_inits stores each raw segment
+    // in `name` and the following dynamic leaf in `value`; str_value is the
+    // final raw segment. The plan is serialized only at an output sink.
+    JsonBuild,
     // Checker-level control-plane snapshots. They deliberately have no MIR
     // carrier until HandlerCtx exposes the corresponding runtime services.
     StatsSnapshot,
@@ -233,6 +237,9 @@ enum class HirTypeKind : u8 {
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
+    // Compile-time JSON plan with captured typed leaves. It has no standalone
+    // runtime carrier and is consumed by response/return body sinks.
+    Json,
     // Opaque, json()-serializable control-plane snapshot types.
     Stats,
     Metrics,

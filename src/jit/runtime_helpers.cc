@@ -254,6 +254,14 @@ void rut_helper_json_append_bool(u8 value) {
     json_append(value != 0 ? "true" : "false", value != 0 ? 4 : 5);
 }
 
+const char* rut_helper_json_capture_data() {
+    return t_json_response.ok ? t_json_response.data : nullptr;
+}
+
+u32 rut_helper_json_capture_len() {
+    return t_json_response.ok ? t_json_response.len : 0xffffffffu;
+}
+
 void rut_helper_json_finish(void* ctx) {
     if (ctx == nullptr) return;
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);

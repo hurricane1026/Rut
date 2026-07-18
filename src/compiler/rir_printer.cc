@@ -349,6 +349,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::JsonAppendArray:
             buf.put_cstr("json.append_array");
             break;
+        case Opcode::JsonCapture:
+            buf.put_cstr("json.capture");
+            break;
         case Opcode::JsonFinish:
             buf.put_cstr("json.finish");
             break;
