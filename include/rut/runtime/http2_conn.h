@@ -157,10 +157,10 @@ struct Http2Conn {
     u32 async_timer_ms;
     jit::HandlerFn async_fn;
     u16 async_state;
-    // Proxy suspension only: the matched route (for upstream_id + inflight cap)
-    // and the running count of upstream h1 response bytes accumulated back into
-    // pending_synth (reused as the response buffer once the request is sent).
-    const RouteEntry* async_route;
+    // Proxy suspension only: selected upstream and the running count of upstream
+    // h1 response bytes accumulated back into pending_synth (reused as the
+    // response buffer once the request is sent).
+    u16 async_upstream_id;
     u32 async_resp_len;
 
     // Set callbacks (any may be null) then call init().

@@ -8910,6 +8910,33 @@ static u64 forward_upstream_0_handler(void* /*conn*/,
     return r.pack();
 }
 
+// Mirrors a compiled chain that mutates response headers and then forwards.
+// X-Path deliberately borrows the synthesized request target so the h2 proxy
+// must keep it stable after pending_synth is reused for response frames.
+static u64 forward_with_response_mutations_handler(
+    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    if (len < 8) return rut::jit::HandlerResult::make_status(500).pack();
+    auto add = [&](rut::ConnectionBase::RespHeaderMutationMode mode,
+                   const char* name,
+                   u32 name_len,
+                   const char* value,
+                   u32 value_len) {
+        auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, name_len};
+        mutation.value = {value, value_len};
+    };
+    add(rut::ConnectionBase::RespHeaderMutationMode::Set,
+        "X-Path",
+        6,
+        reinterpret_cast<const char*>(req + 4),
+        4);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Remove, "X-Remove", 8, nullptr, 0);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+    return rut::jit::HandlerResult::make_forward(0).pack();
+}
+
 // End-to-end: a JIT handler returning Forward must kick off the same
 // proxy flow as a RouteAction::Proxy match. Before the JIT forward wire-up,
 // handle_jit_outcome::Forward returned 500; this test guards against that
@@ -9873,6 +9900,64 @@ TEST(shard, serves_http2_proxy) {
     CHECK(!h2_response_has_header(resp, total, 1, "te", "gzip"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-hop", "secret"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-two", "also-secret"));  // 2nd Connection field
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_with_response_mutations) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "X-Path: origin\r\n"
+        "X-Remove: origin\r\n"
+        "X-Multi: first\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_with_response_mutations_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "x-path", "/api"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-path", "origin"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-remove", "origin"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-multi", "first"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-multi", "second"));
 
     close(c);
     shard.stop();

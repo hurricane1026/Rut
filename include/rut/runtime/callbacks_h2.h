@@ -472,7 +472,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_timer_ms = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
-    h2.async_route = nullptr;
+    h2.async_upstream_id = 0;
     h2.async_resp_len = 0;
 }
 
@@ -527,7 +527,7 @@ template <typename Loop>
 bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       u32 stream_id,
                       const RouteConfig* cfg,
-                      const RouteEntry* route,
+                      u16 upstream_id,
                       const u8* synth,
                       u32 synth_len) {
     Http2Conn* h2 = d.conn->h2;
@@ -542,15 +542,15 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2->async_stream = stream_id;
     h2->async_kind = H2AsyncKind::Proxy;
     h2->async_cfg = cfg;
-    h2->async_route = route;
+    h2->async_upstream_id = upstream_id;
     h2->async_resp_len = 0;
     return true;
 }
 
 // Invoke a JIT handler given the assembled HTTP/1 request bytes (headers, plus
-// body for POST), then serialize its response. A timer yield (wait(ms)) parks the
-// stream for async resume; forwarding / event-yield handlers are not supported
-// over h2 yet → 503.
+// body for POST), then serialize its response. A timer yield (wait(ms)) or
+// forwarding outcome parks the stream for async continuation; event yields are
+// not supported over h2 yet → 503.
 template <typename Loop>
 void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 stream_id,
@@ -565,6 +565,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     d.conn->resp_header_mutation_pending_overflow = false;
     d.conn->resp_header_mutation_count = 0;
     d.conn->resp_header_mutation_overflow = false;
+    if (d.conn->response_header_buf.valid()) d.conn->response_header_buf.reset();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
@@ -576,6 +577,23 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
         if (!h2_suspend_timer(d, stream_id, route->fn, kOutcome, cfg, synth, synth_len))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+        return;
+    }
+    if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        const bool stable = d.conn->resp_header_mutation_count == 0 ||
+                            (d.loop->alloc_response_header_buf(*d.conn) &&
+                             d.conn->stabilize_response_mutations(synth, synth_len));
+        if (!stable) {
+            h2_emit_status(d, stream_id, 500);
+        } else if (cfg == nullptr || kOutcome.upstream_id >= cfg->upstream_count ||
+                   !h2_suspend_proxy(d,
+                                     stream_id,
+                                     cfg,
+                                     static_cast<u16>(kOutcome.upstream_id),
+                                     synth,
+                                     synth_len)) {
+            h2_emit_status(d, stream_id, 503);
+        }
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
@@ -853,7 +871,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     h2_emit_status(d, stream_id, 400);
                     return;
                 }
-                if (!h2_suspend_proxy(d, stream_id, config, route, synth, kSynthLen))
+                if (!h2_suspend_proxy(d, stream_id, config, route->upstream_id, synth, kSynthLen))
                     h2_emit_status(d, stream_id, 503);  // a stream is already suspended
             }
             return;

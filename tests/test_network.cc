@@ -3882,6 +3882,42 @@ TEST(upstream_reuse, request_sent_reused_snapshots_before_pipeline_stash) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// Dynamic response mutations may borrow req.path/req.header slices from recv_buf.
+// Even a fresh upstream must preserve those bytes before releasing recv_buf.
+TEST(response_headers, request_backed_forward_mutation_survives_recv_reuse) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char request[] = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(request) - 1;
+    c->recv_buf.write(reinterpret_cast<const u8*>(request), len);
+    c->req_initial_send_len = len;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+
+    REQUIRE_EQ(c->retry_req_send_len, len);
+    REQUIRE_EQ(c->recv_buf.len(), 0u);
+    CHECK(mutation.value.ptr == reinterpret_cast<const char*>(c->send_buf.data() + 4));
+    CHECK((mutation.value.eq(Str{"/path", 5})));
+    c->recv_buf.write(reinterpret_cast<const u8*>("overwritten"), 11);
+    CHECK((mutation.value.eq(Str{"/path", 5})));
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // Regression: retry_req_send_len is also the offset to the stashed pipelined
 // suffix. Receiving response bytes proves GET1 will not be retried, but the
 // marker must survive until pipeline_recover copies GET2 from after GET1.
@@ -4857,7 +4893,7 @@ TEST(slice_conn, real_eventloop_pool_init) {
 
     // Lazy commit: pool starts empty, max set to 5 * kMaxConns (recv + send + upstream +
     // the two WebSocket terminate-mode reassembly slices).
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 5);
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
     CHECK_EQ(loop->pool.count, 0u);
 
     // Alloc a connection — triggers lazy grow, consumes 2 slices
@@ -7227,14 +7263,14 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
 }
 
 // Pool sized for 3 slices per connection (recv + send + upstream_recv).
-TEST(buffer_isolation, pool_sized_for_five_slices) {
+TEST(buffer_isolation, pool_sized_for_six_slices) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
     // recv + send + upstream_recv + the two WebSocket terminate reassembly slices.
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 5);
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
 
     loop->shutdown();
     destroy_real_loop(loop);
@@ -15920,7 +15956,10 @@ TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
     Connection conn;
     conn.reset();
     u8 upstream_storage[1024]{};
+    u8 response_header_storage[1024]{};
     conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = response_header_storage;
+    conn.response_header_buf.bind(response_header_storage, sizeof(response_header_storage));
     static const char response[] =
         "HTTP/1.1 200 OK\r\n"
         "Server: origin\r\n"
@@ -15946,15 +15985,100 @@ TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
     add_mutation(ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
 
     constexpr u32 kHeaderLen = sizeof(response) - 1 - 4;
-    REQUIRE(rewrite_h1_response_headers(conn, kHeaderLen, 4));
-    const std::string rewritten(reinterpret_cast<const char*>(conn.upstream_recv_buf.data()),
-                                conn.upstream_recv_buf.len());
+    REQUIRE(build_h1_forward_response_headers(conn, kHeaderLen, false));
+    const std::string rewritten(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                                conn.response_header_buf.len());
     CHECK(rewritten.find("Server:") == std::string::npos);
     CHECK(rewritten.find("X-Base: old") == std::string::npos);
     CHECK(rewritten.find("X-Base: new\r\n") != std::string::npos);
     CHECK(rewritten.find("X-Multi: first\r\n") != std::string::npos);
     CHECK(rewritten.find("X-Multi: second\r\n") != std::string::npos);
-    CHECK(rewritten.ends_with("\r\n\r\nbody"));
+    CHECK(rewritten.ends_with("\r\n\r\n"));
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(response) - 1);
+    CHECK(__builtin_memcmp(conn.upstream_recv_buf.data() + kHeaderLen, "body", 4) == 0);
+}
+
+TEST(response_headers, forwarded_mutations_fold_in_source_order) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] = "HTTP/1.1 200 OK\r\nX-Set: origin\r\nX-Gone: origin\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto add =
+        [&](ConnectionBase::RespHeaderMutationMode mode, const char* name, const char* value) {
+            auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+            mutation.mode = mode;
+            mutation.name = {name, static_cast<u32>(strlen(name))};
+            mutation.value = {value, value ? static_cast<u32>(strlen(value)) : 0u};
+        };
+    add(ConnectionBase::RespHeaderMutationMode::Set, "X-Set", "first");
+    add(ConnectionBase::RespHeaderMutationMode::Add, "X-Set", "added-before-last-set");
+    add(ConnectionBase::RespHeaderMutationMode::Set, "X-Set", "final");
+    add(ConnectionBase::RespHeaderMutationMode::Set, "X-Gone", "temporary");
+    add(ConnectionBase::RespHeaderMutationMode::Add, "X-Gone", "also-temporary");
+    add(ConnectionBase::RespHeaderMutationMode::Remove, "X-Gone", nullptr);
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("X-Set: origin") == std::string::npos);
+    CHECK(out.find("X-Set: first") == std::string::npos);
+    CHECK(out.find("added-before-last-set") == std::string::npos);
+    CHECK(out.find("X-Set: final\r\n") != std::string::npos);
+    CHECK(out.find("X-Gone") == std::string::npos);
+}
+
+TEST(response_headers, forwarded_header_growth_does_not_need_upstream_body_headroom) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[128]{};
+    u8 header_storage[256]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char prefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 90\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(prefix), sizeof(prefix) - 1);
+    while (conn.upstream_recv_buf.write_avail() != 0) {
+        static const u8 body = 'x';
+        conn.upstream_recv_buf.write(&body, 1);
+    }
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Expanded", 10};
+    static const char expanded[] = "a header that would not fit in the full upstream buffer";
+    mutation.value = {expanded, sizeof(expanded) - 1};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(prefix) - 1, false));
+    CHECK_EQ(conn.upstream_recv_buf.len(), conn.upstream_recv_buf.capacity());
+    CHECK(conn.response_header_buf.len() > sizeof(prefix) - 1);
+}
+
+TEST(response_headers, forwarded_mutations_keep_drain_close_signal) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[256]{};
+    u8 header_storage[256]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Test", 6};
+    mutation.value = {"yes", 3};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, true));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive") == std::string::npos);
+    CHECK(out.find("Connection: close\r\n") != std::string::npos);
+    CHECK(out.find("X-Test: yes\r\n") != std::string::npos);
 }
 
 int main(int argc, char** argv) {

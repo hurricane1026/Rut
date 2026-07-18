@@ -57,7 +57,7 @@ void Http2Conn::init() {
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;
-    async_route = nullptr;
+    async_upstream_id = 0;
     async_resp_len = 0;
 }
 

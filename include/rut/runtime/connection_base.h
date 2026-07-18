@@ -207,8 +207,8 @@ struct ConnectionBase {
     // silent no-op. Reset per request alongside the count.
     bool req_header_override_overflow;
     // Ordered response-header mutations recorded by compiled Response builders.
-    // Values may reference request-buffer bytes; they remain valid until the
-    // synchronous response formatter consumes the log.
+    // Forward paths re-anchor request-backed values into a stable request snapshot
+    // before recv_buf is released.
     static constexpr u32 kMaxRespHeaderMutations = 16;
     enum class RespHeaderMutationMode : u8 { Set, Add, Remove };
     struct RespHeaderMutation {
@@ -223,6 +223,46 @@ struct ConnectionBase {
     bool resp_header_mutation_pending_overflow;
     u8 resp_header_mutation_count;
     bool resp_header_mutation_overflow;
+    // Lazy slice used to serialize mutated forwarded response headers separately
+    // from upstream_recv_buf. Keeping the header block independent lets a full
+    // upstream body buffer stream normally even when mutations grow the headers.
+    u8* response_header_slice;
+    Buffer response_header_buf;
+
+    void reanchor_response_mutations(const u8* old_base, u32 old_len, const u8* new_base) {
+        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            auto& value = resp_header_mutations[i].value;
+            if (value.ptr == nullptr) continue;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr < old_base || ptr + value.len > old_base + old_len) continue;
+            value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
+        }
+    }
+
+    // Copy request-backed mutation values out of a synthesized request before
+    // HTTP/2 reuses its request scratch for the encoded response. Literal values
+    // already live in JIT-owned storage and do not need copying.
+    bool stabilize_response_mutations(const u8* source, u32 source_len) {
+        u32 needed = 0;
+        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            const auto& value = resp_header_mutations[i].value;
+            if (value.ptr == nullptr) continue;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr >= source && ptr + value.len <= source + source_len) needed += value.len;
+        }
+        if (needed > response_header_buf.capacity()) return false;
+        response_header_buf.reset();
+        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            auto& value = resp_header_mutations[i].value;
+            if (value.ptr == nullptr) continue;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr < source || ptr + value.len > source + source_len) continue;
+            const u32 offset = response_header_buf.len();
+            if (response_header_buf.write(ptr, value.len) != value.len) return false;
+            value.ptr = reinterpret_cast<const char*>(response_header_buf.data() + offset);
+        }
+        return true;
+    }
     // Upstream concurrency slot: set true between try_acquire and release so the
     // slot is freed exactly once, on whatever exit path runs (completion, failure,
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
@@ -600,6 +640,8 @@ struct ConnectionBase {
         resp_header_mutation_pending_overflow = false;
         resp_header_mutation_count = 0;
         resp_header_mutation_overflow = false;
+        response_header_slice = nullptr;
+        response_header_buf.bind(nullptr, 0);
         upstream_slot_held = false;
         upstream_slot_uid = 0;
         throttle_down_bps = 0;

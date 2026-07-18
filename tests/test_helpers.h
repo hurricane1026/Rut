@@ -49,6 +49,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 response_header_storage[kMaxConns][kBufSize];
     u8 capture_storage[kMaxConns][CaptureEntry::kMaxHeaderLen];
 
     bool set_capture(CaptureRing* ring) {
@@ -127,6 +128,13 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return true;
     }
 
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        c.response_header_slice = response_header_storage[c.id];
+        c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
+        return true;
+    }
+
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
         u32 id = free_stack[--free_top];
@@ -136,6 +144,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        conns[id].response_header_slice = response_header_storage[id];
+        conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
         if (capture_ring) conns[id].capture_buf = capture_storage[id];
         return &conns[id];
     }
@@ -460,6 +470,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 response_header_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -489,6 +500,13 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         if (id >= kMaxConns) return false;
         c.upstream_recv_slice = upstream_recv_storage[id];
         c.upstream_recv_buf.bind(upstream_recv_storage[id], kBufSize);
+        return true;
+    }
+
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        c.response_header_slice = response_header_storage[c.id];
+        c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
         return true;
     }
 
@@ -523,6 +541,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        conns[id].response_header_slice = response_header_storage[id];
+        conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
         return &conns[id];
     }
 
@@ -807,6 +827,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 response_header_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -837,6 +858,13 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         return true;
     }
 
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        c.response_header_slice = response_header_storage[c.id];
+        c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
+        return true;
+    }
+
     void setup() {
         running = true;
         draining = false;
@@ -864,6 +892,8 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        conns[id].response_header_slice = response_header_storage[id];
+        conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
         return &conns[id];
     }
 

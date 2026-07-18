@@ -193,7 +193,7 @@ public:
         // one long-lived ciphertext output slice per connection. TLS input uses
         // a slightly larger mmap buffer so one full ciphertext record fits.
         // tls_server is wired after init(), so reserve for the TLS-capable case.
-        TRY_VOID(pool.init(kMaxConns * 5, pool_prealloc));
+        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
@@ -393,6 +393,15 @@ public:
         return true;
     }
 
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.response_header_slice = s;
+        c.response_header_buf.bind(s, SlicePool::kSliceSize);
+        return true;
+    }
+
     // Two WebSocket terminate-mode reassembly slices (one per direction). All-or-nothing.
     bool alloc_ws_terminate_bufs(ConnectionBase& c) {
         if (c.ws_c2u_msg) return true;  // already allocated
@@ -469,6 +478,10 @@ public:
             pool.free(conns[cid].upstream_recv_slice);
             conns[cid].upstream_recv_slice = nullptr;
         }
+        if (conns[cid].response_header_slice) {
+            pool.free(conns[cid].response_header_slice);
+            conns[cid].response_header_slice = nullptr;
+        }
         free_tls_in_buf(conns[cid]);
         free_tls_out_buf(conns[cid]);
         free_stack[free_top++] = cid;
@@ -496,6 +509,10 @@ public:
                 if (conns[cid].upstream_recv_slice) {
                     pool.free(conns[cid].upstream_recv_slice);
                     conns[cid].upstream_recv_slice = nullptr;
+                }
+                if (conns[cid].response_header_slice) {
+                    pool.free(conns[cid].response_header_slice);
+                    conns[cid].response_header_slice = nullptr;
                 }
                 free_tls_in_buf(conns[cid]);
                 free_tls_out_buf(conns[cid]);
@@ -567,6 +584,7 @@ public:
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+            if (c.response_header_slice) pool.free(c.response_header_slice);
             free_tls_in_buf(c);
             free_tls_out_buf(c);
             c.reset();
@@ -577,6 +595,7 @@ public:
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         u8* us = c.upstream_recv_slice;
+        u8* hs = c.response_header_slice;
         u8* tin = c.tls_in_slice;
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
@@ -584,6 +603,7 @@ public:
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
+        conns[cid].response_header_slice = hs;
         conns[cid].tls_in_slice = tin;
         conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
