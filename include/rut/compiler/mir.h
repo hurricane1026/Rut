@@ -41,7 +41,12 @@ enum class MirValueKind : u8 {
     ReqParam,
     ReqCookie,
     ReqQuery,
+    ReqQueryAll,
+    ReqHeaderAll,
     ReqQueryString,
+    StrListLen,
+    StrListIsEmpty,
+    StrListGet,
     ReqPath,
     ReqPathOnly,
     ReqBody,
@@ -102,6 +107,7 @@ enum class MirTypeKind : u8 {
     Method,
     ByteSize,
     IP,
+    StrList,
 };
 
 struct MirTypeShape {

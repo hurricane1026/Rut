@@ -63,7 +63,7 @@ struct Builder {
     Block* cur_block;
 
     // Interned primitive types — allocated once, reused across all emissions.
-    static constexpr u32 kTypeKindCount = static_cast<u32>(TypeKind::Array) + 1;
+    static constexpr u32 kTypeKindCount = static_cast<u32>(TypeKind::StrList) + 1;
     const Type* type_cache[kTypeKindCount];
 
     void init(Module* m) {
@@ -561,6 +561,50 @@ struct Builder {
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
         auto [inst, vid] = TRY(emit(Opcode::ReqQuery, ty, loc));
         inst->imm.str_val = name;
+        return vid;
+    }
+
+    Result<ValueId> emit_req_query_all(Str name, SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::StrList));
+        auto [inst, vid] = TRY(emit(Opcode::ReqQueryAll, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
+    Result<ValueId> emit_req_header_all(Str name, SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::StrList));
+        auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
+    Result<ValueId> emit_str_list_len(ValueId list, SourceLoc loc = {}) {
+        if (!val_has_type(list, TypeKind::StrList)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto [inst, vid] = TRY(emit(Opcode::StrListLen, ty, loc));
+        inst->operands[0] = list;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_str_list_is_empty(ValueId list, SourceLoc loc = {}) {
+        if (!val_has_type(list, TypeKind::StrList)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::StrListIsEmpty, ty, loc));
+        inst->operands[0] = list;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_str_list_get(ValueId list, ValueId index, SourceLoc loc = {}) {
+        if (!val_has_type(list, TypeKind::StrList) || !val_has_type(index, TypeKind::I32))
+            return err(RirError::InvalidState);
+        auto* str = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, str));
+        auto [inst, vid] = TRY(emit(Opcode::StrListGet, ty, loc));
+        inst->operands[0] = list;
+        inst->operands[1] = index;
+        inst->operand_count = 2;
         return vid;
     }
 

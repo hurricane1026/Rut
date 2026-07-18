@@ -59,6 +59,9 @@ struct Ctx {
     // Str type: {ptr, i32} — matches rut::Str layout
     LLVMTypeRef str_ty;
 
+    // Runtime string-list view: {Str* items, i32 len}.
+    LLVMTypeRef str_list_ty;
+
     // Optional(Str): {i8, ptr, i32} — has_value byte + ptr + len
     LLVMTypeRef opt_str_ty;
 
@@ -91,6 +94,8 @@ struct Ctx {
     LLVMValueRef fn_req_header;
     LLVMValueRef fn_req_cookie;
     LLVMValueRef fn_req_query;
+    LLVMValueRef fn_req_query_all;
+    LLVMValueRef fn_req_header_all;
     LLVMValueRef fn_req_query_string;
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
@@ -152,6 +157,8 @@ struct Ctx {
         // Str: {ptr, i32}
         LLVMTypeRef str_fields[] = {ptr_ty, i32_ty};
         str_ty = LLVMStructTypeInContext(llvm_ctx, str_fields, 2, 0);
+        LLVMTypeRef str_list_fields[] = {ptr_ty, i32_ty};
+        str_list_ty = LLVMStructTypeInContext(llvm_ctx, str_list_fields, 2, 0);
 
         // Optional(Str): {i8, ptr, i32}
         LLVMTypeRef opt_str_fields[] = {i8_ty, ptr_ty, i32_ty};
@@ -405,6 +412,24 @@ struct Ctx {
             fn_req_query = LLVMAddFunction(llvm_mod, "rut_helper_req_query", ft);
         }
         return fn_req_query;
+    }
+
+    LLVMValueRef get_req_query_all() {
+        if (!fn_req_query_all) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_req_query_all = LLVMAddFunction(
+                llvm_mod, "rut_helper_req_query_all", LLVMFunctionType(i32_ty, params, 6, 0));
+        }
+        return fn_req_query_all;
+    }
+
+    LLVMValueRef get_req_header_all() {
+        if (!fn_req_header_all) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_req_header_all = LLVMAddFunction(
+                llvm_mod, "rut_helper_req_header_all", LLVMFunctionType(i32_ty, params, 6, 0));
+        }
+        return fn_req_header_all;
     }
 
     // void rut_helper_req_query_string(ptr, i32, ptr, ptr, ptr)
@@ -686,6 +711,8 @@ struct Ctx {
                 return LLVMDoubleTypeInContext(llvm_ctx);
             case rir::TypeKind::Str:
                 return str_ty;
+            case rir::TypeKind::StrList:
+                return str_list_ty;
             case rir::TypeKind::ByteSize:
             case rir::TypeKind::Duration:
             case rir::TypeKind::Time:
@@ -1181,6 +1208,89 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "query.opt.has");
             opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "query.opt.ptr");
             opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "query.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::ReqQueryAll:
+        case rir::Opcode::ReqHeaderAll: {
+            const bool query = inst.op == rir::Opcode::ReqQueryAll;
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr =
+                c.make_global_str(name, query ? "query_all.name" : "header_all.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef helper = query ? c.get_req_query_all() : c.get_req_header_all();
+            LLVMTypeRef helper_ty = LLVMGlobalGetValueType(helper);
+            LLVMValueRef null_out = LLVMConstNull(c.ptr_ty);
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMValueRef count_args[] = {
+                c.param_req_data, c.param_req_len, name_ptr, name_len, null_out, zero};
+            LLVMValueRef count =
+                LLVMBuildCall2(c.builder, helper_ty, helper, count_args, 6, "str_list.count");
+            LLVMValueRef one = LLVMConstInt(c.i32_ty, 1, 0);
+            LLVMValueRef alloc_count =
+                LLVMBuildSelect(c.builder,
+                                LLVMBuildICmp(c.builder, LLVMIntEQ, count, zero, "str_list.empty"),
+                                one,
+                                count,
+                                "str_list.alloc_count");
+            LLVMValueRef items =
+                LLVMBuildArrayAlloca(c.builder, c.str_ty, alloc_count, "str_list.items");
+            LLVMValueRef empty_item = LLVMGetUndef(c.str_ty);
+            empty_item = LLVMBuildInsertValue(
+                c.builder, empty_item, LLVMConstNull(c.ptr_ty), 0, "str_list.empty.ptr");
+            empty_item = LLVMBuildInsertValue(c.builder, empty_item, zero, 1, "str_list.empty.len");
+            LLVMBuildStore(c.builder, empty_item, items);
+            LLVMValueRef fill_args[] = {
+                c.param_req_data, c.param_req_len, name_ptr, name_len, items, count};
+            LLVMBuildCall2(c.builder, helper_ty, helper, fill_args, 6, "");
+            LLVMValueRef list = LLVMGetUndef(c.str_list_ty);
+            list = LLVMBuildInsertValue(c.builder, list, items, 0, "str_list.ptr");
+            list = LLVMBuildInsertValue(c.builder, list, count, 1, "str_list.len");
+            c.set_value(inst.result, list);
+            break;
+        }
+        case rir::Opcode::StrListLen:
+        case rir::Opcode::StrListIsEmpty: {
+            LLVMValueRef list = c.get_value(inst.operands[0]);
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, list, 1, "str_list.len");
+            c.set_value(inst.result,
+                        inst.op == rir::Opcode::StrListLen
+                            ? len
+                            : LLVMBuildICmp(c.builder,
+                                            LLVMIntEQ,
+                                            len,
+                                            LLVMConstInt(c.i32_ty, 0, 0),
+                                            "str_list.is_empty"));
+            break;
+        }
+        case rir::Opcode::StrListGet: {
+            LLVMValueRef list = c.get_value(inst.operands[0]);
+            LLVMValueRef index = c.get_value(inst.operands[1]);
+            LLVMValueRef items = LLVMBuildExtractValue(c.builder, list, 0, "str_list.items");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, list, 1, "str_list.len");
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMValueRef nonnegative =
+                LLVMBuildICmp(c.builder, LLVMIntSGE, index, zero, "str_list.index.nonnegative");
+            LLVMValueRef below =
+                LLVMBuildICmp(c.builder, LLVMIntSLT, index, len, "str_list.index.below");
+            LLVMValueRef valid =
+                LLVMBuildAnd(c.builder, nonnegative, below, "str_list.index.valid");
+            LLVMValueRef safe_index =
+                LLVMBuildSelect(c.builder, valid, index, zero, "str_list.index.safe");
+            LLVMValueRef item_ptr =
+                LLVMBuildGEP2(c.builder, c.str_ty, items, &safe_index, 1, "str_list.item.ptr");
+            LLVMValueRef item = LLVMBuildLoad2(c.builder, c.str_ty, item_ptr, "str_list.item");
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, item, 0, "str_list.item.data");
+            LLVMValueRef item_len = LLVMBuildExtractValue(c.builder, item, 1, "str_list.item.len");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt =
+                LLVMBuildInsertValue(c.builder,
+                                     opt,
+                                     LLVMBuildZExt(c.builder, valid, c.i8_ty, "str_list.item.has"),
+                                     0,
+                                     "str_list.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, ptr, 1, "str_list.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, item_len, 2, "str_list.opt.len");
             c.set_value(inst.result, opt);
             break;
         }
@@ -1817,6 +1927,8 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
             switch (blk.insts[ii].op) {
                 case rir::Opcode::ReqHeader:
                 case rir::Opcode::ReqQuery:
+                case rir::Opcode::ReqQueryAll:
+                case rir::Opcode::ReqHeaderAll:
                 case rir::Opcode::ReqQueryString:
                 case rir::Opcode::ReqMethod:
                 case rir::Opcode::ReqPath:
@@ -2044,6 +2156,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_header = nullptr;
     c.fn_req_cookie = nullptr;
     c.fn_req_query = nullptr;
+    c.fn_req_query_all = nullptr;
+    c.fn_req_header_all = nullptr;
     c.fn_req_query_string = nullptr;
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;

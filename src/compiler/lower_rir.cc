@@ -570,6 +570,11 @@ static FrontendResult<const rir::Type*> rir_type_for_shape(
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
         return ty.value();
     }
+    if (type == MirTypeKind::StrList) {
+        auto ty = b.make_type(rir::TypeKind::StrList);
+        if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
+        return ty.value();
+    }
     if (type == MirTypeKind::Variant && variant_index != 0xffffffffu &&
         variant_infos[variant_index].struct_type != nullptr)
         return variant_infos[variant_index].struct_type;
@@ -1457,6 +1462,70 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::ReqQuery) {
         auto v = b.emit_req_query(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqQueryAll) {
+        auto v = b.emit_req_query_all(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::ReqHeaderAll) {
+        auto v = b.emit_req_header_all(value.str_value, {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::StrListLen || value.kind == MirValueKind::StrListIsEmpty) {
+        auto list = materialize_value(*value.lhs,
+                                      mir,
+                                      variant_infos,
+                                      tuple_infos,
+                                      tuple_info_count,
+                                      error_scalar_infos,
+                                      error_variant_infos,
+                                      error_struct_infos,
+                                      user_struct_defs,
+                                      b,
+                                      locals,
+                                      local_count,
+                                      span);
+        if (!list) return core::make_unexpected(list.error());
+        auto v = value.kind == MirValueKind::StrListLen
+                     ? b.emit_str_list_len(list.value(), {span.line, span.col})
+                     : b.emit_str_list_is_empty(list.value(), {span.line, span.col});
+        if (!v) return frontend_error(FrontendError::OutOfMemory, span);
+        return v.value();
+    }
+    if (value.kind == MirValueKind::StrListGet) {
+        auto list = materialize_value(*value.lhs,
+                                      mir,
+                                      variant_infos,
+                                      tuple_infos,
+                                      tuple_info_count,
+                                      error_scalar_infos,
+                                      error_variant_infos,
+                                      error_struct_infos,
+                                      user_struct_defs,
+                                      b,
+                                      locals,
+                                      local_count,
+                                      span);
+        if (!list) return core::make_unexpected(list.error());
+        auto index = materialize_value(*value.rhs,
+                                       mir,
+                                       variant_infos,
+                                       tuple_infos,
+                                       tuple_info_count,
+                                       error_scalar_infos,
+                                       error_variant_infos,
+                                       error_struct_infos,
+                                       user_struct_defs,
+                                       b,
+                                       locals,
+                                       local_count,
+                                       span);
+        if (!index) return core::make_unexpected(index.error());
+        auto v = b.emit_str_list_get(list.value(), index.value(), {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }

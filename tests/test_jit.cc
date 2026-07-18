@@ -1655,6 +1655,47 @@ TEST(jit, frontend_req_route_param_field_guard) {
     rir.destroy();
 }
 
+TEST(jit, frontend_request_multi_value_lists_execute) {
+    const char* src =
+        "route GET \"/search\" { let tags = req.queryAll(\"tag\") let accepts = "
+        "req.getAll(\"Accept\") let second = tags.at(1).or(\"\") let first = "
+        "accepts.first().or(\"\") if tags.len == 3 && accepts.len == 2 && second == \"b\" "
+        "&& first == \"text/plain\" { return 204 } else { return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char hit[] =
+        "GET /search?tag=a&tag=b&tag=c HTTP/1.1\r\n"
+        "Accept: text/plain\r\n"
+        "accept: application/json\r\n\r\n";
+    auto result = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(hit), sizeof(hit) - 1, nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 204u);
+
+    static const char miss[] = "GET /search?tag=a HTTP/1.1\r\nAccept: text/plain\r\n\r\n";
+    result = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss), sizeof(miss) - 1, nullptr));
+    CHECK_EQ(result.status_code, 400u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_query_string_any_fallback) {
     const char* src =
         "route GET \"/search\" { let raw = any(req.queryString, \"\") if raw == "
@@ -7717,6 +7758,30 @@ TEST(helpers, req_query_from_request_bytes) {
         reinterpret_cast<const u8*>(req), sizeof(req) - 1, "missing", 7, &has, &ptr, &len);
     CHECK(has == 0);
     CHECK(len == 0u);
+}
+
+TEST(helpers, request_multi_values_preserve_order_and_empty_values) {
+    static const char req[] =
+        "GET /search?tag=a&other=x&tag=&tag=c#frag HTTP/1.1\r\n"
+        "Accept: text/plain\r\n"
+        "accept: application/json\r\n"
+        "\r\n";
+    const auto* bytes = reinterpret_cast<const u8*>(req);
+    const u32 len = sizeof(req) - 1;
+
+    CHECK_EQ(rut_helper_req_query_all(bytes, len, "tag", 3, nullptr, 0), 3u);
+    Str tags[3]{};
+    CHECK_EQ(rut_helper_req_query_all(bytes, len, "tag", 3, tags, 3), 3u);
+    CHECK(tags[0].eq({"a", 1}));
+    CHECK(tags[1].eq({"", 0}));
+    CHECK(tags[2].eq({"c", 1}));
+
+    CHECK_EQ(rut_helper_req_header_all(bytes, len, "ACCEPT", 6, nullptr, 0), 2u);
+    Str accepts[2]{};
+    CHECK_EQ(rut_helper_req_header_all(bytes, len, "Accept", 6, accepts, 2), 2u);
+    CHECK(accepts[0].eq({"text/plain", 10}));
+    CHECK(accepts[1].eq({"application/json", 16}));
+    CHECK_EQ(rut_helper_req_query_all(bytes, len, "missing", 7, tags, 3), 0u);
 }
 
 TEST(helpers, req_query_ignores_fragment_suffix) {

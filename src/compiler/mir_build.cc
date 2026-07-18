@@ -53,6 +53,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
            : kind == HirTypeKind::Method   ? MirTypeKind::Method
            : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
            : kind == HirTypeKind::IP       ? MirTypeKind::IP
+           : kind == HirTypeKind::StrList  ? MirTypeKind::StrList
            : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
            : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
            : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
@@ -440,6 +441,40 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::Str;
         v.may_nil = true;
         v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqQueryAll || expr.kind == HirExprKind::ReqHeaderAll) {
+        v.kind = expr.kind == HirExprKind::ReqQueryAll ? MirValueKind::ReqQueryAll
+                                                       : MirValueKind::ReqHeaderAll;
+        v.type = MirTypeKind::StrList;
+        v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::StrListLen || expr.kind == HirExprKind::StrListIsEmpty) {
+        auto list = mir_value(*expr.lhs, module, fn, ctx);
+        if (!list) return core::make_unexpected(list.error());
+        if (!fn->values.push(list.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = expr.kind == HirExprKind::StrListLen ? MirValueKind::StrListLen
+                                                      : MirValueKind::StrListIsEmpty;
+        v.type = expr.kind == HirExprKind::StrListLen ? MirTypeKind::I32 : MirTypeKind::Bool;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::StrListGet) {
+        auto list = mir_value(*expr.lhs, module, fn, ctx);
+        if (!list) return core::make_unexpected(list.error());
+        if (!fn->values.push(list.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
+        auto index = mir_value(*expr.rhs, module, fn, ctx);
+        if (!index) return core::make_unexpected(index.error());
+        if (!fn->values.push(index.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.kind = MirValueKind::StrListGet;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
         return v;
     }
     if (expr.kind == HirExprKind::ReqQueryString) {

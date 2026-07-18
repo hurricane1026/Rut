@@ -80,8 +80,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   bounded per-request mutation log for direct routes; [x] `chain after`
   response-header mutation for direct and forwarded responses. Still pending:
   buffered body/status mutation and after middleware on `wait`/`for` routes
-  (needs a resumable, stream-owned runtime Response);
-  `req.queryAll` (needs a runtime [str] value type — none exists);
+  (needs a resumable, stream-owned runtime Response); [x] runtime `[str]`
+  request views with ordered `req.queryAll`/`req.getAll`, `.len`, `.isEmpty`,
+  `.first()`, and bounds-safe `.at(i)`;
   `stats()/metrics()/reload()/upstream.mark()` declarations.
 - Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
   guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match

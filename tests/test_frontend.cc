@@ -13596,6 +13596,58 @@ TEST(frontend, req_query_flows_as_optional_str) {
     rir.destroy();
 }
 
+TEST(frontend, request_multi_values_lower_as_runtime_string_lists) {
+    const char* src =
+        "route GET \"/search\" { let tags: [str] = req.queryAll(\"tag\") let accepts = "
+        "req.getAll(\"Accept\") let second = tags.at(1).or(\"\") if tags.len == 2 && "
+        "accepts.isEmpty == false && second == \"b\" { return 204 } else { return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::StrList));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqQueryAll));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::StrList));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeaderAll));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqQueryAll));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeaderAll));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool saw_query_all = false;
+    bool saw_header_all = false;
+    bool saw_len = false;
+    bool saw_is_empty = false;
+    bool saw_get = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            saw_query_all |= block.insts[ii].op == rir::Opcode::ReqQueryAll;
+            saw_header_all |= block.insts[ii].op == rir::Opcode::ReqHeaderAll;
+            saw_len |= block.insts[ii].op == rir::Opcode::StrListLen;
+            saw_is_empty |= block.insts[ii].op == rir::Opcode::StrListIsEmpty;
+            saw_get |= block.insts[ii].op == rir::Opcode::StrListGet;
+        }
+    }
+    CHECK(saw_query_all);
+    CHECK(saw_header_all);
+    CHECK(saw_len);
+    CHECK(saw_is_empty);
+    CHECK(saw_get);
+    rir.destroy();
+}
+
 TEST(frontend, req_query_string_flows_as_optional_str) {
     const char* src =
         "route GET \"/search\" { let raw = req.queryString let value = any(raw, \"\") if value == "
