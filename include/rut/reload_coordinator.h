@@ -1,0 +1,80 @@
+#pragma once
+
+#include "rut/runtime/control_plane_mutation.h"
+#include "rut/runtime/shard_control.h"
+#include "rut/serve_loader.h"
+
+namespace rut {
+
+struct ReloadShardEndpoint {
+    ShardControlBlock* control = nullptr;
+};
+
+enum class ReloadCoordinatorPoll : u8 {
+    Idle = 0,
+    CompileFailed,
+    ValidationFailed,
+    Published,
+    Waiting,
+    Activated,
+};
+
+using ReloadProgramLoader = bool (*)(void* context,
+                                     const char* source_path,
+                                     LoadedProgram& output,
+                                     LoadError& error,
+                                     jit::OptLevel opt);
+
+// Single process owner for source compilation, generation publication, shard
+// acknowledgements, and LoadedProgram lifetime. poll() is called only by the
+// process control thread; request admission itself remains lock-free through
+// ControlPlaneMutationPort.
+class ProcessReloadCoordinator {
+public:
+    static constexpr u32 kMaxShards = 256;
+
+    [[nodiscard]] bool init(ControlPlaneMutationPort* mutation,
+                            const char* source_path,
+                            jit::OptLevel opt,
+                            LoadedProgram* active,
+                            LoadedProgram* spare,
+                            const ReloadShardEndpoint* shards,
+                            u32 shard_count,
+                            ReloadProgramLoader loader = nullptr,
+                            void* loader_context = nullptr);
+
+    [[nodiscard]] bool request_signal(u64* request_id = nullptr);
+    ReloadCoordinatorPoll poll();
+
+    [[nodiscard]] const LoadedProgram* active_program() const { return active_; }
+    [[nodiscard]] const LoadError& last_load_error() const { return last_load_error_; }
+    [[nodiscard]] bool waiting_for_activation() const { return retired_ != nullptr; }
+
+    static bool compatible(const RouteConfig& active,
+                           const RouteConfig& candidate,
+                           u32 shard_count);
+
+private:
+    static bool default_loader(void* context,
+                               const char* source_path,
+                               LoadedProgram& output,
+                               LoadError& error,
+                               jit::OptLevel opt);
+    bool all_shards_acknowledged(u64 generation) const;
+
+    ControlPlaneMutationPort* mutation_ = nullptr;
+    const char* source_path_ = nullptr;
+    jit::OptLevel opt_ = jit::OptLevel::O2;
+    LoadedProgram* active_ = nullptr;
+    LoadedProgram* spare_ = nullptr;
+    LoadedProgram* retired_ = nullptr;
+    ReloadShardEndpoint shards_[kMaxShards]{};
+    u32 shard_count_ = 0;
+    ReloadProgramLoader loader_ = nullptr;
+    void* loader_context_ = nullptr;
+    ReloadRequest request_{};
+    u64 old_generation_ = 0;
+    LoadError last_load_error_{};
+};
+
+}  // namespace rut

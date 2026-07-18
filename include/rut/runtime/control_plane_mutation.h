@@ -159,9 +159,8 @@ public:
             return false;
         const u64 old_generation = active_generation();
         if (outcome == ReloadTerminalOutcome::Activated) {
-            if (new_generation == 0 || new_generation <= old_generation ||
-                new_generation > kMaxGeneration)
-                return false;
+            if (!publish_reload_generation(request_id, source, new_generation)) return false;
+            return complete_published_reload(request_id, source, old_generation);
         } else if (new_generation != 0) {
             return false;
         }
@@ -171,15 +170,6 @@ public:
                 expected, completing, std::memory_order_acq_rel, std::memory_order_acquire))
             return false;
 
-        if (outcome == ReloadTerminalOutcome::Activated) {
-            // Generation zero is an intentionally unavailable publication
-            // window: old-generation writers fail their post-store recheck and
-            // new-generation writers cannot start until clearing is complete.
-            active_generation_.store(0, std::memory_order_release);
-            clear_overrides();
-            active_generation_.store(new_generation, std::memory_order_release);
-        }
-
         publish_record({true, request_id, old_generation, new_generation, source, outcome});
         u64 completing_expected = completing;
         (void)reload_word_.compare_exchange_strong(
@@ -187,6 +177,54 @@ public:
             pack_reload(ReloadAdmissionState::Idle, 0, ReloadRequestSource::Route),
             std::memory_order_release,
             std::memory_order_relaxed);
+        return true;
+    }
+
+    // Irreversible publication boundary. The coordinator calls this only after
+    // compilation and validation have completed and immediately before sending
+    // the same generation/config pair to every shard. The request remains in
+    // Completing, so no second reload can be admitted while shards acknowledge
+    // or the retired program is still pinned.
+    [[nodiscard]] bool publish_reload_generation(u64 request_id,
+                                                 ReloadRequestSource source,
+                                                 u64 new_generation) {
+        const u64 old_generation = active_generation();
+        if (new_generation == 0 || new_generation <= old_generation ||
+            new_generation > kMaxGeneration)
+            return false;
+        u64 expected = pack_reload(ReloadAdmissionState::InFlight, request_id, source);
+        const u64 completing = with_state(expected, ReloadAdmissionState::Completing);
+        if (!reload_word_.compare_exchange_strong(
+                expected, completing, std::memory_order_acq_rel, std::memory_order_acquire))
+            return false;
+        active_generation_.store(0, std::memory_order_release);
+        clear_overrides();
+        active_generation_.store(new_generation, std::memory_order_release);
+        return true;
+    }
+
+    // Finalize an already-published activation after every shard acknowledged
+    // and the old program's exact pin counts reached zero.
+    [[nodiscard]] bool complete_published_reload(u64 request_id,
+                                                 ReloadRequestSource source,
+                                                 u64 old_generation) {
+        const u64 new_generation = active_generation();
+        if (old_generation == 0 || new_generation <= old_generation) return false;
+        const u64 completing = pack_reload(ReloadAdmissionState::Completing, request_id, source);
+        if (reload_word_.load(std::memory_order_acquire) != completing) return false;
+        publish_record({true,
+                        request_id,
+                        old_generation,
+                        new_generation,
+                        source,
+                        ReloadTerminalOutcome::Activated});
+        u64 expected = completing;
+        if (!reload_word_.compare_exchange_strong(
+                expected,
+                pack_reload(ReloadAdmissionState::Idle, 0, ReloadRequestSource::Route),
+                std::memory_order_release,
+                std::memory_order_relaxed))
+            return false;
         return true;
     }
 

@@ -3,8 +3,9 @@
 Status: accepted contract. The shared mutation port, handler ABI capability,
 JIT helper boundary, production event-loop injection, deterministic harness
 fixture, shard-pinned `upstream.mark` source lowering, generation installation
-acknowledgements, and exact program pins are implemented. The process reload
-coordinator remains staged in TODO.md.
+acknowledgements, exact program pins, process reload coordinator, compatibility
+validation, SIGHUP entry point, and process harness are implemented. Route-only
+`reload()` lowering and its CLI authority flag remain staged in TODO.md.
 
 Rut exposes control-plane reads (`stats()` and `metrics()`) as bounded values
 latched at handler entry. Mutations are different: they change process-wide
@@ -98,7 +99,8 @@ The coordinator executes one request at a time:
 5. Wait for every shard to acknowledge installation at an event-loop command
    boundary before accepting another reload.
 6. Reclaim an old program only after all shards acknowledged a newer generation
-   and its HTTP/1 request and HTTP/2 stream pin counts reached zero.
+   and its HTTP/1 request, suspended HTTP/2 stream, and terminate-mode WebSocket
+   session pin counts reached zero.
 
 Compilation or validation failure is *definitely not applied*: the active
 generation and every live registry remain unchanged. Publication has no
@@ -202,7 +204,7 @@ generation order, and terminal records.
 3. [x] Lower and execute timer-only, shard-pinned `upstream.mark`.
 4. [x] Add generation acknowledgements and exact HTTP/1 request, suspended
    HTTP/2 stream, and terminate-mode WebSocket session program pins.
-5. Implement the reload coordinator, compatibility validation, SIGHUP, and
+5. [x] Implement the reload coordinator, compatibility validation, SIGHUP, and
    process-harness coverage.
 6. Lower route-only `reload()` after the same coordinator is the sole activation
    path.
