@@ -15,8 +15,9 @@
 //   - the JIT engine (it owns the native handler code the routes call),
 //   - the lowered RIR arena (route patterns / response bodies live here),
 //   - the source mmap (AST/RIR Str values may point back into it).
-// It must therefore outlive every shard. Destroy it only after all
-// shards have joined.
+// It must therefore outlive every request/stream that pinned it. At shutdown
+// that is implied by joining all shards; during live reload it is proved by all
+// shards acknowledging a newer generation plus `pins.empty()`.
 //
 // Everything here runs once at startup on the main thread. It is NOT a
 // hot path, so unlike the runtime it is free to use the compiler's
@@ -67,7 +68,8 @@ struct LoadedProgram {
     FrontendRirModule rir;  // owns the lowered module + its arena
     jit::JitEngine engine;  // owns the native handler code
     bool jit_inited = false;
-    RouteConfig config;  // what the shards read (1.28 MB — heap/BSS only)
+    ProgramPinCounters pins;  // exact request / stream / WebSocket lifetime pins
+    RouteConfig config;       // what the shards read (1.28 MB — heap/BSS only)
 
     void destroy();
 };

@@ -342,6 +342,11 @@ struct ConnectionBase {
     // config hot-swap during wait(ms) can't resolve an upstream_id
     // against the post-swap config. Cleared by reset().
     const RouteConfig* request_config;
+    // Exact reload lifetime pins. The pointers are non-null only while the
+    // corresponding counter in RouteConfig::program_pins is held.
+    const RouteConfig* http1_program_pin_config;
+    const RouteConfig* http2_program_pin_config;
+    const RouteConfig* websocket_program_pin_config;
 
     // Per-connection timespec storage for IORING_OP_TIMEOUT yields. The
     // kernel reads this asynchronously after SQE submission, so it must
@@ -635,6 +640,9 @@ struct ConnectionBase {
         // recycled reliably fails the generation match. It's
         // initialized at accept-time via EventLoop::alloc_conn_impl.
         request_config = nullptr;
+        http1_program_pin_config = nullptr;
+        http2_program_pin_config = nullptr;
+        websocket_program_pin_config = nullptr;
         pending_handler_fn = nullptr;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;

@@ -469,12 +469,16 @@ template <typename Loop>
 void h2_async_epoch_enter(Loop* loop, Connection& conn) {
     if (!conn.epoch_held) {
         loop->epoch_enter();
+        acquire_http2_program_pin(conn.request_config);
+        conn.http2_program_pin_config = conn.request_config;
         conn.epoch_held = true;
     }
 }
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
     if (conn.epoch_held) {
+        release_http2_program_pin(conn.http2_program_pin_config);
+        conn.http2_program_pin_config = nullptr;
         loop->epoch_leave();
         conn.epoch_held = false;
     }
@@ -1068,14 +1072,12 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;  // accumulates request bodies
     conn.h2->on_reset = &h2_on_reset_cb;      // cancels a parked stream on RST_STREAM
-    // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
-    // hot reload (poll_command runs once per loop iteration, after this dispatch
-    // batch) can't reclaim a RouteConfig/RouteEntry that a stream parks on —
-    // whether it suspends on wait/proxy or defers its body to a later DATA batch.
-    // Released at the bottom of this batch when nothing stays parked; held across
-    // batches otherwise (and dropped on resume or close_conn).
-    h2_async_epoch_enter(loop, conn);
+    // Snapshot and pin before matching. poll_command runs only after this
+    // dispatch batch on the same shard, so the active pointer cannot change
+    // between these two statements; storing it first lets the exact program pin
+    // name the same config as the stream instead of a stale prior snapshot.
     conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
+    h2_async_epoch_enter(loop, conn);
 
     u32 ctrl_len = 0;
     Http2Result r =

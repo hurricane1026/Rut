@@ -23,8 +23,11 @@ it in the required order documented there; do not reintroduce the old
 The shared bounded mutation port, pointer-free `Server`/`Upstream.servers`
 runtime model, generation-tagged manual override table, health-selection
 priority, HandlerCtx/JIT helper boundary, production injection, and
-deterministic harness fixture, and timer-only shard-pinned source lowering are
-connected. The reload coordinator remains.
+deterministic harness fixture plus timer-only shard-pinned source lowering are
+connected. Generation-carrying shard publication, installation
+acknowledgements, and exact HTTP/1 request / suspended HTTP/2 stream program
+pins plus terminate-mode WebSocket session pins are connected. The process
+coordinator, SIGHUP, and `reload()` lowering remain.
 
 **Acceptance**:
 - Reload and upstream mutation define authorization, failure, and shard-ordering
@@ -85,6 +88,10 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Shard config publication acknowledges the generation actually installed
+  at the event-loop command boundary, and loaded programs expose exact,
+  close-safe HTTP/1 request, suspended HTTP/2 stream, and terminate-mode
+  WebSocket session pins for reclamation.
 - [x] A shard-pinned timer can enumerate a statically declared upstream's
   pointer-free `Server` values, pass them through pure typed helpers, and
   synchronously publish generation-checked manual health with visible boolean

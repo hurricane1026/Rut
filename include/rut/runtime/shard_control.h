@@ -23,22 +23,20 @@ struct alignas(64) ShardControlBlock {
     std::atomic<const RouteConfig*> pending_config{nullptr};
     std::atomic<void*> pending_jit{nullptr};
     std::atomic<CaptureRing*> pending_capture{nullptr};
+    // Written only after pending_config has been adopted at an event-loop
+    // command boundary. The config object itself carries the generation, so
+    // pointer+generation publication cannot tear across separate atomic slots.
+    std::atomic<u64> acknowledged_generation{0};
 };
 
 // Per-shard monotonic epoch for RCU progress tracking.
 // Incremented on every request enter AND leave/close.
 //
-// LIMITATION: This epoch alone is NOT sufficient for safe reclamation
-// when multiple requests overlap on one shard. A long-running request
-// that started before a config swap can still be active while a newer
-// request advances the epoch past the control plane's snapshot.
-//
-// For safe reclamation, the control plane must ALSO ensure no request
-// that could reference the old config is still in flight. Options:
-//   1. Pin config per-request (Connection holds the config pointer it
-//      started with) — most precise, enables instant reclamation.
-//   2. Drain all connections before reclaiming (simplest, current plan
-//      for hot reload: drain old shard → swap config → re-accept).
+// This epoch alone is NOT sufficient for safe reclamation when multiple
+// requests overlap. ProgramPinCounters supplies exact HTTP/1 request,
+// suspended HTTP/2 stream, and terminate-mode WebSocket counts; a coordinator
+// must require both the shard generation acknowledgement and zero pins before
+// reclaiming an old program.
 //
 // Shard thread writes, control plane reads via epoch.load(acquire).
 struct alignas(64) ShardEpoch {

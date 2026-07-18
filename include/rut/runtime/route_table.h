@@ -12,12 +12,35 @@
 #include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn (terminate-mode routes)
+#include <atomic>
 
 #include <errno.h>
 #include <netinet/in.h>
 #include <string.h>
 
 namespace rut {
+
+// Exact lifetime pins owned by one loaded program. HTTP/1 requests, suspended
+// HTTP/2 streams, and terminate-mode WebSocket sessions are counted separately
+// so the reload coordinator can prove no execution path still references a
+// retired config or its JIT image before destroying the program.
+struct ProgramPinCounters {
+    std::atomic<u64> http1_requests{0};
+    std::atomic<u64> http2_streams{0};
+    std::atomic<u64> websocket_sessions{0};
+
+    void reset() {
+        http1_requests.store(0, std::memory_order_relaxed);
+        http2_streams.store(0, std::memory_order_relaxed);
+        websocket_sessions.store(0, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool empty() const {
+        return http1_requests.load(std::memory_order_acquire) == 0 &&
+               http2_streams.load(std::memory_order_acquire) == 0 &&
+               websocket_sessions.load(std::memory_order_acquire) == 0;
+    }
+};
 
 // Action for a matched route.
 enum class RouteAction : u8 {
@@ -170,6 +193,10 @@ struct RouteConfig {
     // health overrides for a newer config can never affect an older in-flight
     // request that happens to reuse the same numeric upstream/backend slots.
     u64 config_generation = 1;
+
+    // Non-owning pointer into LoadedProgram. Null is valid for hand-built test
+    // configs that do not participate in live-reload reclamation.
+    ProgramPinCounters* program_pins = nullptr;
 
     // Phase 2 dispatch — 2-way tagged union.
     //
@@ -1482,5 +1509,35 @@ private:
     // use scalar fallback.
     jit::ArtJitMatchFn art_jit_fn_ = nullptr;
 };
+
+inline void acquire_http1_program_pin(const RouteConfig* config) {
+    if (config != nullptr && config->program_pins != nullptr)
+        config->program_pins->http1_requests.fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline void release_http1_program_pin(const RouteConfig* config) {
+    if (config != nullptr && config->program_pins != nullptr)
+        config->program_pins->http1_requests.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+inline void acquire_http2_program_pin(const RouteConfig* config) {
+    if (config != nullptr && config->program_pins != nullptr)
+        config->program_pins->http2_streams.fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline void release_http2_program_pin(const RouteConfig* config) {
+    if (config != nullptr && config->program_pins != nullptr)
+        config->program_pins->http2_streams.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+inline void acquire_websocket_program_pin(const RouteConfig* config) {
+    if (config != nullptr && config->program_pins != nullptr)
+        config->program_pins->websocket_sessions.fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline void release_websocket_program_pin(const RouteConfig* config) {
+    if (config != nullptr && config->program_pins != nullptr)
+        config->program_pins->websocket_sessions.fetch_sub(1, std::memory_order_acq_rel);
+}
 
 }  // namespace rut
