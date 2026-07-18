@@ -3315,6 +3315,13 @@ static FrontendResult<void> apply_declared_type_to_expr(HirExpr* expr,
             expr->tuple_struct_indices[i] = tuple_struct_indices[i];
         }
     }
+    // Runtime request multi-values use the internal StrList carrier, while
+    // their source spelling remains `[str]`. Accept exactly that declared
+    // array shape; other Array<T> annotations keep the static-array rules.
+    if (expr->type == HirTypeKind::StrList && declared.value() == HirTypeKind::Array &&
+        array_elem_shape_index < mod.type_shapes.len &&
+        mod.type_shapes[array_elem_shape_index].type == HirTypeKind::Str)
+        return {};
     const auto expected = make_expected_type_expr(declared.value(),
                                                   variant_index,
                                                   struct_index,
@@ -4122,15 +4129,17 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
     if (receiver_override == nullptr &&
         magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
-        (expr.name.eq({"header", 6}) || expr.name.eq({"param", 5}) || expr.name.eq({"cookie", 6}) ||
-         expr.name.eq({"query", 5}))) {
+        (expr.name.eq({"header", 6}) || expr.name.eq({"getAll", 6}) || expr.name.eq({"param", 5}) ||
+         expr.name.eq({"cookie", 6}) || expr.name.eq({"query", 5}) ||
+         expr.name.eq({"queryAll", 8}))) {
         if (expr.args.len != 1 || expr.args[0] == nullptr ||
             expr.args[0]->kind != AstExprKind::StrLit) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         }
         HirExpr out{};
         out.span = expr.span;
-        out.type = HirTypeKind::Str;
+        const bool all_values = expr.name.eq({"getAll", 6}) || expr.name.eq({"queryAll", 8});
+        out.type = all_values ? HirTypeKind::StrList : HirTypeKind::Str;
         out.str_value = expr.args[0]->str_value;
         if (expr.name.eq({"param", 5})) {
             out.kind = HirExprKind::ReqParam;
@@ -4140,6 +4149,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         } else if (expr.name.eq({"query", 5})) {
             out.kind = HirExprKind::ReqQuery;
             out.may_nil = true;
+        } else if (expr.name.eq({"queryAll", 8})) {
+            out.kind = HirExprKind::ReqQueryAll;
+        } else if (expr.name.eq({"getAll", 6})) {
+            out.kind = HirExprKind::ReqHeaderAll;
         } else {
             out.kind = HirExprKind::ReqHeader;
             out.may_nil = true;
@@ -4276,6 +4289,39 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+
+    if (recv.type == HirTypeKind::StrList &&
+        (expr.name.eq({"first", 5}) || expr.name.eq({"at", 2}))) {
+        if ((expr.name.eq({"first", 5}) && expr.args.len != 0) ||
+            (expr.name.eq({"at", 2}) && expr.args.len != 1))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        HirExpr out{};
+        out.kind = HirExprKind::StrListGet;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.span = expr.span;
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        HirExpr index{};
+        if (expr.name.eq({"first", 5})) {
+            index.kind = HirExprKind::IntLit;
+            index.type = HirTypeKind::I32;
+            index.int_value = 0;
+            index.span = expr.span;
+        } else {
+            auto analyzed_index =
+                analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!analyzed_index) return core::make_unexpected(analyzed_index.error());
+            if (analyzed_index->type != HirTypeKind::I32 || analyzed_index->may_nil ||
+                analyzed_index->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[0]->span);
+            index = analyzed_index.value();
+        }
+        if (!route->exprs.push(index))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
 
     if (expr.name.eq({"matches", 7}) && recv.type == HirTypeKind::Str && expr.args.len == 1 &&
         expr.args[0]->kind == AstExprKind::RegexLit) {
@@ -7076,6 +7122,17 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
+        if (base->type == HirTypeKind::StrList && !base->may_nil && !base->may_error &&
+            (expr.name.eq({"len", 3}) || expr.name.eq({"isEmpty", 7}))) {
+            out.kind =
+                expr.name.eq({"len", 3}) ? HirExprKind::StrListLen : HirExprKind::StrListIsEmpty;
+            out.type = expr.name.eq({"len", 3}) ? HirTypeKind::I32 : HirTypeKind::Bool;
+            out.span = expr.span;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -14288,6 +14345,8 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqParam:
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
+        case HirExprKind::ReqQueryAll:
+        case HirExprKind::ReqHeaderAll:
         case HirExprKind::ReqQueryString:
         case HirExprKind::ReqPath:
         case HirExprKind::ReqPathOnly:

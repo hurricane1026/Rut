@@ -124,7 +124,12 @@ enum class HirExprKind : u8 {
     ReqParam,
     ReqCookie,
     ReqQuery,
+    ReqQueryAll,
+    ReqHeaderAll,
     ReqQueryString,
+    StrListLen,
+    StrListIsEmpty,
+    StrListGet,
     ReqPath,
     ReqPathOnly,
     ReqBody,
@@ -215,6 +220,9 @@ enum class HirTypeKind : u8 {
     // reference the shape through their existing `shape_index` rather than
     // mirroring inline fields.
     Array,
+    // Runtime view over ordered string slices. Unlike Array, this has a
+    // MIR/RIR carrier and may be stored in route locals.
+    StrList,
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,

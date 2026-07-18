@@ -202,12 +202,14 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 req.header("X-Request-ID")   // str?
 req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
 req.add("X-Tag", "a")        // ✅ preserve existing fields and append
-req.getAll("Accept")         // ⏳ [str]
+req.getAll("Accept")         // [str], preserves field order
 
 // Route captures / query / cookies / body
 req.params.id                // from :id — captures NEVER shadow built-ins
 req.query("page")            // str? (first value)
-req.queryAll("tags")         // ⏳ [str]
+req.queryAll("tags")         // [str], preserves query order
+req.queryAll("tags").len     // i32; empty when no value matches
+req.queryAll("tags").first() // str?; `.at(i)` is also bounds-safe
 req.cookie("session")        // str?
 req.body(User)               // typed parse, error-capable → guard let
 req.bodyRaw                  // str, error-capable; assignable before forward

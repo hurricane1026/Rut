@@ -57,6 +57,7 @@ enum class TypeKind : u8 {
     Optional,  // inner type follows
     Struct,    // named struct with fields
     Array,     // element type follows
+    StrList,   // runtime {Str* items, i32 len} view
 };
 
 // Type is arena-allocated and immutable once created.
@@ -147,6 +148,8 @@ enum class Opcode : u8 {
     ReqHeader,            // %r = req.header "Name"        → Optional(str)
     ReqParam,             // %r = req.param "id"           → str
     ReqQuery,             // %r = req.query "name"         → Optional(str)
+    ReqQueryAll,          // %r = req.query_all "name"     → StrList
+    ReqHeaderAll,         // %r = req.header_all "Name"    → StrList
     ReqQueryString,       // %r = req.queryString          → Optional(str)
     ReqMethod,            // %r = req.method               → Method
     ReqPath,              // %r = req.path                 → str
@@ -223,11 +226,14 @@ enum class Opcode : u8 {
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
     // ── Struct operations ──
-    StructField,   // %r = struct.field %s, "name"  → T
-    StructCreate,  // %r = struct.create Name {...}  → Struct
-    BodyParse,     // %r = body.parse TypeName       → T
-    ArrayLen,      // %r = array.len %arr            → i32
-    ArrayGet,      // %r = array.get %arr, %idx      → T
+    StructField,     // %r = struct.field %s, "name"  → T
+    StructCreate,    // %r = struct.create Name {...}  → Struct
+    BodyParse,       // %r = body.parse TypeName       → T
+    ArrayLen,        // %r = array.len %arr            → i32
+    ArrayGet,        // %r = array.get %arr, %idx      → T
+    StrListLen,      // %r = str_list.len %list         → i32
+    StrListIsEmpty,  // %r = str_list.is_empty %list  → bool
+    StrListGet,      // %r = str_list.get %list, %idx   → Optional(str)
 
     // ── Optional operations ──
     OptNil,     // %r = opt.nil                    → Optional(T)
