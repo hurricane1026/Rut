@@ -1523,6 +1523,83 @@ inline bool collect_effective_response_headers(const Connection& conn,
     return true;
 }
 
+// Rebuild an upstream HTTP/1 response header block when committed middleware
+// mutations are present. Set/remove suppress every matching upstream field; add
+// preserves the upstream fields and appends another value. The body bytes already
+// received with the headers are copied as-is after the rebuilt block.
+inline bool rewrite_h1_response_headers(Connection& conn, u32 header_len, u32 body_len) {
+    if (conn.resp_header_mutation_count == 0) return true;
+    if (conn.resp_header_mutation_overflow) return false;
+    if (header_len < 4 || header_len + body_len > conn.upstream_recv_buf.len()) return false;
+
+    u8* data = const_cast<u8*>(conn.upstream_recv_buf.data());
+    auto suppressed = [&](const char* name, u32 name_len) {
+        for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
+            const auto& mutation = conn.resp_header_mutations[i];
+            if (mutation.mode == Connection::RespHeaderMutationMode::Add) continue;
+            if (http_header_name_eq_ci(name, name_len, mutation.name.ptr, mutation.name.len))
+                return true;
+        }
+        return false;
+    };
+
+    u32 line_start = 0;
+    u32 line_end = 0;
+    while (line_end + 1 < header_len && (data[line_end] != '\r' || data[line_end + 1] != '\n'))
+        line_end++;
+    if (line_end + 1 >= header_len) return false;
+    u32 write_pos = line_end + 2;
+    line_start = line_end + 2;
+
+    while (line_start + 1 < header_len &&
+           (data[line_start] != '\r' || data[line_start + 1] != '\n')) {
+        line_end = line_start;
+        while (line_end + 1 < header_len && (data[line_end] != '\r' || data[line_end + 1] != '\n'))
+            line_end++;
+        if (line_end + 1 >= header_len) return false;
+        u32 colon = line_start;
+        while (colon < line_end && data[colon] != ':') colon++;
+        if (colon == line_end) return false;
+        u32 name_end = colon;
+        while (name_end > line_start && (data[name_end - 1] == ' ' || data[name_end - 1] == '\t'))
+            name_end--;
+        if (!suppressed(reinterpret_cast<const char*>(data + line_start), name_end - line_start)) {
+            const u32 line_len = line_end + 2 - line_start;
+            __builtin_memmove(data + write_pos, data + line_start, line_len);
+            write_pos += line_len;
+        }
+        line_start = line_end + 2;
+    }
+
+    u32 added_len = 2;  // final blank line
+    for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
+        const auto& mutation = conn.resp_header_mutations[i];
+        if (mutation.mode == Connection::RespHeaderMutationMode::Remove) continue;
+        added_len += mutation.name.len + 2 + mutation.value.len + 2;
+    }
+    const u32 new_header_len = write_pos + added_len;
+    if (new_header_len + body_len > conn.upstream_recv_buf.capacity()) return false;
+
+    __builtin_memmove(data + new_header_len, data + header_len, body_len);
+    static const char kColonSpace[] = ": ";
+    static const char kCrLf[] = "\r\n";
+    for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
+        const auto& mutation = conn.resp_header_mutations[i];
+        if (mutation.mode == Connection::RespHeaderMutationMode::Remove) continue;
+        __builtin_memmove(data + write_pos, mutation.name.ptr, mutation.name.len);
+        write_pos += mutation.name.len;
+        __builtin_memmove(data + write_pos, kColonSpace, 2);
+        write_pos += 2;
+        __builtin_memmove(data + write_pos, mutation.value.ptr, mutation.value.len);
+        write_pos += mutation.value.len;
+        __builtin_memmove(data + write_pos, kCrLf, 2);
+        write_pos += 2;
+    }
+    __builtin_memmove(data + write_pos, kCrLf, 2);
+    conn.upstream_recv_buf.set_len(new_header_len + body_len);
+    return true;
+}
+
 template <typename Loop>
 void handle_jit_outcome(Loop* loop,
                         Connection& conn,
@@ -4584,7 +4661,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (conn.upstream_keep_alive && (kContentLenOverlong || kChunkedOverlong || kNoBodyOverlong))
         conn.upstream_keep_alive = false;
 
-    if (loop->is_draining()) {
+    if (loop->is_draining() && conn.resp_header_mutation_count == 0) {
         u8* d = const_cast<u8*>(conn.upstream_recv_buf.data());
         const u32 kLen = conn.upstream_recv_buf.len();
         const u32 kHdrEnd =
@@ -4668,6 +4745,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         actual_body = chunked_consumed;
     u32 initial_send_len = kHeaderLen + actual_body;
 
+    const bool kHeadersRewritten = conn.resp_header_mutation_count != 0;
+    if (!rewrite_h1_response_headers(conn, kHeaderLen, actual_body)) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (kHeadersRewritten) initial_send_len = conn.upstream_recv_buf.len();
     conn.resp_body_sent = initial_send_len;
     conn.upstream_send_len = initial_send_len;
 

@@ -15916,6 +15916,47 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
         conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
+TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[1024]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "X-Base: old\r\n"
+        "X-Multi: first\r\n"
+        "Content-Length: 4\r\n"
+        "\r\n"
+        "body";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+
+    auto add_mutation = [&](ConnectionBase::RespHeaderMutationMode mode,
+                            const char* name,
+                            u32 name_len,
+                            const char* value,
+                            u32 value_len) {
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, name_len};
+        mutation.value = {value, value_len};
+    };
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Remove, "server", 6, nullptr, 0);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Set, "X-Base", 6, "new", 3);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 4;
+    REQUIRE(rewrite_h1_response_headers(conn, kHeaderLen, 4));
+    const std::string rewritten(reinterpret_cast<const char*>(conn.upstream_recv_buf.data()),
+                                conn.upstream_recv_buf.len());
+    CHECK(rewritten.find("Server:") == std::string::npos);
+    CHECK(rewritten.find("X-Base: old") == std::string::npos);
+    CHECK(rewritten.find("X-Base: new\r\n") != std::string::npos);
+    CHECK(rewritten.find("X-Multi: first\r\n") != std::string::npos);
+    CHECK(rewritten.find("X-Multi: second\r\n") != std::string::npos);
+    CHECK(rewritten.ends_with("\r\n\r\nbody"));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

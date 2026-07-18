@@ -1834,6 +1834,20 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     return HirTypeKind::Unknown;
 }
 
+static bool ast_type_ref_contains_response(const AstTypeRef& ref) {
+    if (!ref.is_tuple && ref.name.eq({"Response", 8})) return true;
+    for (u32 i = 0; i < ref.type_args.len; i++) {
+        if (ref.type_args[i] != nullptr && ast_type_ref_contains_response(*ref.type_args[i]))
+            return true;
+    }
+    for (u32 i = 0; i < ref.tuple_elem_types.len; i++) {
+        if (ref.tuple_elem_types[i] != nullptr &&
+            ast_type_ref_contains_response(*ref.tuple_elem_types[i]))
+            return true;
+    }
+    return false;
+}
+
 static AstTypeRef get_ast_type_arg_ref(const AstTypeRef& ref, u32 index) {
     if (index < ref.type_args.len && ref.type_args[index] != nullptr) return *ref.type_args[index];
     AstTypeRef out{};
@@ -5955,6 +5969,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     const bool runtime_response =
                         cur_locals[response_index].init.kind != HirExprKind::ResponseInit;
                     if (runtime_response) {
+                        if (!cur_allow_respond_guards)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                inner.span,
+                                lit_str("chain after Response mutations must be unconditional"));
                         HirExpr effect{};
                         effect.kind = is_remove ? HirExprKind::RespRemoveHeader
                                       : is_add  ? HirExprKind::RespAddHeader
@@ -8860,6 +8879,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if (fn_index == mod.functions.len) return fail_with_name(expr.span, "unknown function");
     const auto& fn = mod.functions[fn_index];
+    for (u32 i = 0; i < fn.params.len; i++) {
+        if (fn.params[i].type == HirTypeKind::Response)
+            return fail_call(
+                expr.span, "Response-mutating helpers are only callable from chain after", nullptr);
+    }
     u32 pipe_placeholder_count = 0;
     if (pipe_lhs != nullptr) {
         for (u32 i = 0; i < expr.args.len; i++) {
@@ -14341,9 +14365,16 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
                 placeholder.span = source.span;
                 return placeholder;
             }
-            return analyze_expr(source, route, mod, route->locals.data, route->locals.len, nullptr);
+            const bool saved_allow_respond_effects = route->allow_respond_effects;
+            route->allow_respond_effects = false;
+            auto analyzed =
+                analyze_expr(source, route, mod, route->locals.data, route->locals.len, nullptr);
+            route->allow_respond_effects = saved_allow_respond_effects;
+            return analyzed;
         }();
         if (!arg) return core::make_unexpected(arg.error());
+        if (arg->may_nil || arg->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, source.span, fn.name);
         auto expected = make_expected_param_expr(fn.params[ai]);
         if (!same_hir_type_shape(mod, arg.value(), expected))
             return frontend_error(FrontendError::UnsupportedSyntax, source.span, fn.name);
@@ -14835,6 +14866,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         alias.type_params = item.type_alias.type_params;
         alias.is_match = item.type_alias.is_match;
         alias.target = item.type_alias.target;
+        if ((!alias.is_match && ast_type_ref_contains_response(alias.target)))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  item.type_alias.span,
+                                  lit_str("Response is only supported as a chain after parameter"));
         auto detached_target = detach_type_alias_ref_pointers(&mod, alias.target);
         if (!detached_target) return core::make_unexpected(detached_target.error());
         for (u32 ai = 0; ai < item.type_alias.arms.len; ai++) {
@@ -14848,6 +14883,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
             arm.constraint_namespace = item.type_alias.arms[ai].constraint_namespace;
             arm.constraint = item.type_alias.arms[ai].constraint;
             arm.type = item.type_alias.arms[ai].type;
+            if (ast_type_ref_contains_response(arm.type))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    item.type_alias.span,
+                    lit_str("Response is only supported as a chain after parameter"));
             auto detached_arm = detach_type_alias_ref_pointers(&mod, arm.type);
             if (!detached_arm) return core::make_unexpected(detached_arm.error());
             if (!alias.arms.push(arm))
@@ -14992,6 +15032,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         return frontend_error(FrontendError::TooManyItems, item.variant.span);
                 }
                 const auto& payload_ref = item.variant.cases[ci].payload_type;
+                if (ast_type_ref_contains_response(payload_ref))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        item.variant.span,
+                        lit_str("Response is only supported as a chain after parameter"));
                 if (!payload_ref.is_tuple && payload_ref.type_arg_names.len != 0) {
                     u32 template_variant_index = 0xffffffffu;
                     u32 template_struct_index = 0xffffffffu;
@@ -15162,6 +15207,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         return frontend_error(FrontendError::TooManyItems, item.struct_decl.span);
                 }
                 const auto& type_ref = item.struct_decl.fields[fi].type;
+                if (ast_type_ref_contains_response(type_ref))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        item.struct_decl.span,
+                        lit_str("Response is only supported as a chain after parameter"));
                 if (!type_ref.is_tuple && type_ref.type_arg_names.len != 0) {
                     u32 template_variant_index = 0xffffffffu;
                     u32 template_struct_index = 0xffffffffu;
@@ -18544,6 +18594,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         if (has_chain_after_response_effects) {
+            if (route.is_ws_terminate)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    route_decl.span,
+                    lit_str("chain after Response effects are not supported on WebSocket routes"));
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);

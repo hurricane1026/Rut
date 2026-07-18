@@ -6687,6 +6687,122 @@ route GET "/users" use chain access {
         lit("chain after Response effects cannot be combined with wait/for yet")));
 }
 
+TEST(frontend, chain_after_rejects_conditional_response_effects) {
+    const char* src = R"rut(
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    if req.http11 { {
+        resp.set("X-Test", "yes")
+        0
+    } } else { 0 }
+}
+chain access { after mutate(req, resp) }
+route GET "/users" use chain access { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("chain after Response mutations must be unconditional")));
+}
+
+TEST(frontend, chain_after_rejects_fallible_and_responding_arguments) {
+    const char* sources[] = {
+        R"rut(
+func mutate(_ value: str, _ resp: Response) -> i32 {
+    resp.set("X-Test", value)
+    0
+}
+chain access { after mutate(req.header("X-Test"), resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+        R"rut(
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 401 }
+    1
+}
+func mutate(_ value: i32, _ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    value
+}
+chain access { after mutate(check(req), resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, response_type_is_not_an_aggregate_payload) {
+    const char* sources[] = {
+        "struct Box { value: Response }\n",
+        "variant Box { value(Response) }\n",
+        "type Box = Response\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("Response is only supported as a chain after parameter")));
+    }
+}
+
+TEST(frontend, response_mutating_helper_rejects_ordinary_calls) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+route GET "/users" {
+    let resp = response(200)
+    let ignored = mutate(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("Response-mutating helpers are only callable from chain after")));
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, chain_after_rejects_websocket_terminate_routes) {
+    const char* src = R"rut(
+upstream ws at "127.0.0.1:9000"
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(resp) }
+route GET "/ws" use chain access {
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain after Response effects are not supported on WebSocket routes")));
+}
+#endif
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));
