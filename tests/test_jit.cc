@@ -2202,6 +2202,60 @@ TEST(jit, response_status_read_preserves_invalid_pending_value_until_fail_closed
     CHECK_EQ(frame.ctx.response_status, 0u);
 }
 
+TEST(jit, buffered_forward_commits_chain_after_response_mutations) {
+    const auto src = R"rut(
+upstream api
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "rewritten"
+    resp.set("X-After", "yes")
+    0
+}
+chain rewrite_chain { after rewrite(resp) }
+route GET "/api/users" use chain rewrite_chain { return forward(api, buffered: true) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ForwardBuffered);
+    CHECK_EQ(outcome.upstream_id, 0u);
+    CHECK(outcome.response_ctx == &frame.ctx);
+    CHECK(frame.ctx.response_status_set);
+    CHECK_EQ(frame.ctx.response_status, 201u);
+    REQUIRE(frame.ctx.response_body_mutation_set);
+    const Str rewritten_body{frame.ctx.response_body_mutation_data,
+                             frame.ctx.response_body_mutation_len};
+    CHECK(rewritten_body.eq(lit("rewritten")));
+    REQUIRE_EQ(frame.ctx.response_header_count, 1u);
+    CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-After")));
+    CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("yes")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};

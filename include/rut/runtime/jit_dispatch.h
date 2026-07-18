@@ -29,6 +29,7 @@ struct JitDispatchOutcome {
     enum class Kind : u8 {
         ReturnStatus,
         Forward,
+        ForwardBuffered,
         TimerYield,
         EventYield,
         Error,
@@ -188,6 +189,11 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
         case jit::HandlerAction::Forward:
             out.kind = JitDispatchOutcome::Kind::Forward;
             out.upstream_id = r.upstream_id;
+            return out;
+        case jit::HandlerAction::ForwardBuffered:
+            out.kind = JitDispatchOutcome::Kind::ForwardBuffered;
+            out.upstream_id = r.upstream_id;
+            out.response_ctx = &ctx;
             return out;
         case jit::HandlerAction::Yield:
             out.next_state = r.next_state;

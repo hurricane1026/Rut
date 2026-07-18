@@ -2308,7 +2308,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildRet(c.builder, result);
             break;
         }
-        case rir::Opcode::RetForward: {
+        case rir::Opcode::RetForward:
+        case rir::Opcode::RetForwardBuffered: {
             // Pack: action=Forward, upstream_id from operand or immediate.
             LLVMValueRef upstream;
             if (inst.operand_count > 0) {
@@ -2319,8 +2320,10 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             } else {
                 upstream = LLVMConstInt(c.i32_ty, 0, 0);
             }
-            LLVMValueRef action =
-                LLVMConstInt(c.i64_ty, static_cast<u64>(HandlerAction::Forward), 0);
+            const auto action_kind = inst.op == rir::Opcode::RetForwardBuffered
+                                         ? HandlerAction::ForwardBuffered
+                                         : HandlerAction::Forward;
+            LLVMValueRef action = LLVMConstInt(c.i64_ty, static_cast<u64>(action_kind), 0);
             LLVMValueRef up_ext = LLVMBuildZExt(c.builder, upstream, c.i64_ty, "up.e");
             LLVMValueRef shifted =
                 LLVMBuildShl(c.builder, up_ext, LLVMConstInt(c.i64_ty, 24, 0), "up.shl");

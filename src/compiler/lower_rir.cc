@@ -3329,8 +3329,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (term.commit_response_mutations &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
-            return frontend_error(FrontendError::OutOfMemory, term.span);
+        const auto emitted =
+            term.forward_buffered
+                ? b.emit_ret_forward_buffered(upstream.value(), {term.span.line, term.span.col})
+                : b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col});
+        if (!emitted) return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
     if (term.kind == MirTerminatorKind::YieldTimer) {

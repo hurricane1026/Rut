@@ -269,6 +269,7 @@ struct MirTerminator {
     bool commit_response_mutations = false;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
+    bool forward_buffered = false;
     bool use_cmp = false;
     MirValue cond{};
     MirValue lhs{};

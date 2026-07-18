@@ -19,7 +19,7 @@ the parser does not make a spelling part of the stable core.
 | Capability | Rut Core spelling | Compatibility surface | Experimental surface |
 |---|---|---|---|
 | Routes | `route GET "/path" { ... }` | grouped `route { ... }` declarations | host/path groups, method unions, expression entries |
-| Middleware | `chain` with ordered `before`; constrained response-header `after` | official built-in decorators | buffered body/status post-processing |
+| Middleware | `chain` with ordered `before`; bounded response `after`; terminal `forward(..., buffered: true)` when proxying | official built-in decorators | first-class buffered Response expressions |
 | Pipe | `value \| fn(_, arg)` | placeholder-free stages, `_.method(...)`, `_1` … `_10` | a dedicated pipe IR or wider runtime tuple projection |
 | Fallback | `.or(default)`, `guard let`, `if let`, explicit `match` | none | none |
 | Match | flat scalar, boolean, string, or variant arms with an explicit fallback where needed | `match const` and restricted nested route-match expansion | unrestricted nested/pattern match |
@@ -83,11 +83,13 @@ middleware model.
 
 ## Chain Boundary
 
-`before` is the stable request-side chain operation. `after` is stable only for
-the implemented response-header slice: the helper must receive exactly one
-`Response`, perform `set`/`add`/`remove` header effects, and run on a route that
-does not contain `wait` or `for`. Buffered body/status mutation remains
-experimental until the response object has resumable, stream-owned lifetime.
+`before` is the stable request-side chain operation. `after` is stable for the
+implemented bounded response slice: the helper must receive exactly one
+`Response` and may perform ordered header, status, and body effects. Effects
+survive visible `wait` and verifier-bounded `for` control flow. Streaming
+forwards cannot be post-processed; proxy routes must opt into terminal
+`forward(..., buffered: true)`. Binding that operation as a first-class
+`Response` remains experimental.
 
 ## Review Rule
 

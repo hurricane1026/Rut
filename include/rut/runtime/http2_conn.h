@@ -161,6 +161,8 @@ struct Http2Conn {
     // and the running count of upstream h1 response bytes accumulated back into
     // pending_synth (reused as the response buffer once the request is sent).
     const RouteEntry* async_route;
+    u16 async_upstream_id;
+    bool async_apply_response_mutations;
     u32 async_resp_len;
 
     // Set callbacks (any may be null) then call init().
