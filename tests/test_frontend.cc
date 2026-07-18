@@ -2836,48 +2836,64 @@ TEST(frontend, parse_return_response_status_only) {
     CHECK_EQ(hir_route.control.direct_term.status_code, 200);
 }
 
-TEST(frontend, parse_respond_status_with_body) {
-    const char* src = "route GET \"/x\" { respond 401, \"denied\" }\n";
+TEST(frontend, respond_status_in_handler_rejected_with_fixit) {
+    const char* src = "route GET \"/x\" { respond 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    REQUIRE_EQ(ast->items.len, 1u);
-    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
-    const AstStatement& stmt = *ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::RespondStatus));
-    CHECK_EQ(stmt.status_code, 401u);
-    CHECK(stmt.has_response_body);
-    CHECK(stmt.response_body.eq(lit("denied")));
-
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes.len, 1u);
-    const auto& term = hir->routes[0].control.direct_term;
-    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
-    CHECK_EQ(term.status_code, 401);
-    CHECK(term.response_body.eq(lit("denied")));
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(
+        lit("a handler's return value is its response; replace `respond` with `return`")));
+    CHECK_EQ(ast.error().span.start, 17u);
 }
 
-TEST(frontend, respond_response_local_folds_to_status) {
+TEST(frontend, respond_response_local_in_handler_rejected_with_fixit) {
     const char* src = "route GET \"/x\" { let resp = response(418) respond resp }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    REQUIRE_EQ(ast->items.len, 1u);
-    REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
-    const AstStatement& stmt = *ast->items[0].route.statements[1];
-    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::RespondStatus));
-    CHECK(stmt.returns_response_local);
-    CHECK(stmt.name.eq(lit("resp")));
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(
+        lit("a handler's return value is its response; replace `respond` with `return`")));
+}
 
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes.len, 1u);
-    const auto& term = hir->routes[0].control.direct_term;
-    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
-    CHECK_EQ(term.status_code, 418);
+TEST(frontend, nested_respond_in_handler_rejected_with_fixit) {
+    const char* src = "route GET \"/x\" { guard req.http11 else { respond 505 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(
+        lit("a handler's return value is its response; replace `respond` with `return`")));
+}
+
+TEST(frontend, status_return_in_middleware_rejected_with_fixit) {
+    const char* src =
+        "func check(ok: bool) -> i32 { guard ok else { return 401 } 7 }\n"
+        "route GET \"/x\" { let value = check(req.http11) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit(
+        "middleware short-circuits with `respond <status>`; `return` is only for the function's "
+        "value")));
+}
+
+TEST(frontend, direct_status_return_in_middleware_rejected_with_fixit) {
+    const char* src = "func check() -> i32 { return 401 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit(
+        "middleware short-circuits with `respond <status>`; `return` is only for the function's "
+        "value")));
 }
 
 TEST(frontend, helper_respond_response_local_propagates_guard) {
