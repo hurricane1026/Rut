@@ -232,7 +232,7 @@ void rut_helper_json_append_control_plane(void* ctx, u8 kind) {
     }
     const bool stats = kind == static_cast<u8>(jit::ControlPlaneJsonKind::Stats);
     const auto& values = stats ? snapshot.stats : snapshot.metrics;
-    auto append_literal = []<size_t N>(const char(&literal)[N]) {
+    auto append_literal = []<size_t N>(const char (&literal)[N]) {
         json_append(literal, static_cast<u32>(N - 1));
     };
     if (stats)
