@@ -31603,6 +31603,41 @@ TEST(frontend, json_rejects_dynamic_values_until_runtime_serializer_exists) {
         lit("json currently accepts only literal bool/int/string/nil/array/object values")));
 }
 
+TEST(frontend, return_json_builds_bounded_runtime_scalar_template) {
+    const char* src = R"rut(
+route GET "/x" {
+    let answer = 40 + 2
+    return 200, json({ path: req.path, nested: [true, answer], http11: req.http11 })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.has_dynamic_response_body);
+    REQUIRE_EQ(term.json_value_ref_indices.len, 3u);
+    REQUIRE_EQ(term.json_segments.len, 4u);
+    CHECK(term.json_segments[0].eq(lit("{\"path\":")));
+    CHECK(term.json_segments[1].eq(lit(",\"nested\":[true,")));
+    CHECK(term.json_segments[2].eq(lit("],\"http11\":")));
+    CHECK(term.json_segments[3].eq(lit("}")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto* block = rir.module.functions[0].entry();
+    REQUIRE(block != nullptr);
+    CHECK_EQ(block->insts[block->inst_count - 1].op, rir::Opcode::RetStatus);
+    const auto packed = static_cast<u64>(block->insts[block->inst_count - 1].imm.i64_val);
+    CHECK_EQ((packed >> 16) & 0xffffu, 0xffffu);
+    rir.destroy();
+}
+
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
     const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
     const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));

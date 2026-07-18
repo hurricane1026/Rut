@@ -619,6 +619,36 @@ TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/x\" { return 200, json({ path: req.path }) }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 200);
+    // Includes the 13-byte {"path":"/x"} body, not the two-byte "OK"
+    // fallback that an unrecognized body marker would have produced.
+    CHECK_EQ(result.harness.output_bytes, 117u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     harness::SourceTarget target{};
     REQUIRE(target.program.config.add_static("/static", kRouteMethodGet, 204));

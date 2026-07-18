@@ -60,6 +60,30 @@ struct TimeCache {
 thread_local TimeCache t_time_cache;
 thread_local const u64* t_virtual_time_us = nullptr;
 
+// The event loop invokes one handler at a time per shard and consumes a
+// terminal response before invoking another one. A thread-local buffer thus
+// gives dynamic JSON stable response lifetime without borrowing send_buf (H1
+// header formatting and H2 framing both reuse that buffer). Keep the cap below
+// the H2 response scratch so framing overhead remains bounded as well.
+struct JsonResponseScratch {
+    static constexpr u32 kCapacity = 7 * 1024;
+    char data[kCapacity]{};
+    u32 len = 0;
+    bool ok = true;
+};
+thread_local JsonResponseScratch t_json_response;
+
+void json_append(const char* data, u32 len) {
+    auto& out = t_json_response;
+    if (!out.ok) return;
+    if (data == nullptr || len > JsonResponseScratch::kCapacity - out.len) {
+        out.ok = false;
+        return;
+    }
+    if (len != 0) __builtin_memcpy(out.data + out.len, data, len);
+    out.len += len;
+}
+
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
 // pc.primed untouched — callers set it.
 void parse_into(ParseCache& pc, const u8* data, u32 len) {
@@ -109,6 +133,84 @@ void rut_helper_parse_unprime() {
     // could match the stale primed entry; clearing the flag forces such a
     // caller to reparse.
     t_parse_cache.primed = false;
+}
+
+void rut_helper_json_reset() {
+    t_json_response.len = 0;
+    t_json_response.ok = true;
+}
+
+void rut_helper_json_append_raw(const char* data, u32 len) {
+    json_append(data, len);
+}
+
+void rut_helper_json_append_str(const char* data, u32 len) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    if (data == nullptr && len != 0) {
+        t_json_response.ok = false;
+        return;
+    }
+    json_append("\"", 1);
+    for (u32 i = 0; i < len && t_json_response.ok; i++) {
+        const u8 c = static_cast<u8>(data[i]);
+        switch (c) {
+            case '"':
+                json_append("\\\"", 2);
+                break;
+            case '\\':
+                json_append("\\\\", 2);
+                break;
+            case '\b':
+                json_append("\\b", 2);
+                break;
+            case '\f':
+                json_append("\\f", 2);
+                break;
+            case '\n':
+                json_append("\\n", 2);
+                break;
+            case '\r':
+                json_append("\\r", 2);
+                break;
+            case '\t':
+                json_append("\\t", 2);
+                break;
+            default:
+                if (c < 0x20) {
+                    const char escaped[6] = {'\\', 'u', '0', '0', kHex[c >> 4], kHex[c & 0xf]};
+                    json_append(escaped, 6);
+                } else {
+                    json_append(data + i, 1);
+                }
+        }
+    }
+    json_append("\"", 1);
+}
+
+void rut_helper_json_append_i64(i64 value) {
+    char buf[32];
+    const int n = snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
+    if (n <= 0 || static_cast<u32>(n) >= sizeof(buf)) {
+        t_json_response.ok = false;
+        return;
+    }
+    json_append(buf, static_cast<u32>(n));
+}
+
+void rut_helper_json_append_bool(u8 value) {
+    json_append(value != 0 ? "true" : "false", value != 0 ? 4 : 5);
+}
+
+void rut_helper_json_finish(void* ctx) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    hctx->response_body_data = nullptr;
+    hctx->response_body_len = 0;
+    hctx->response_body_valid = 0;
+    if (!t_json_response.ok) return;
+    hctx->response_body_data = t_json_response.data;
+    hctx->response_body_len = t_json_response.len;
+    hctx->response_body_valid = 1;
 }
 
 // ── Request Access ─────────────────────────────────────────────────

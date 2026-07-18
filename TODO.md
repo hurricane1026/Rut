@@ -11,8 +11,12 @@ without accepting source forms that cannot be replayed or resumed faithfully.
 
 ### Dynamic JSON serialization
 
-Literal JSON is implemented. Add bounded serialization for runtime scalar,
-array, object, and declared struct values.
+Literal JSON and bounded runtime scalar interpolation in direct response
+objects/arrays are implemented. The serializer uses shard-owned scratch,
+escapes strings at runtime, and turns capacity overflow into a 500 rather than
+publishing partial JSON. Remaining work: declared struct values, dynamic array
+carriers, reusable `json(...)` values outside a direct return, and exposing the
+dynamic body through replay/harness observations.
 
 **Acceptance**:
 - Runtime size/depth overflow fails closed with a deterministic diagnostic.

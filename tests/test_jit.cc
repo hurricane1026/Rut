@@ -1387,6 +1387,88 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_serializes_runtime_scalars) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    let answer = 40 + 2
+    return 200, json({ path: req.path, answer: answer, http11: req.http11 })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    CHECK_EQ(outcome.response_body_idx, 0u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42,\"http11\":true}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) {
+    HandlerCtx ctx{};
+    rut_helper_json_reset();
+    rut_helper_json_append_raw("{\"value\":", 9);
+    static const char kValue[] = "quote\" newline\n control\x01";
+    rut_helper_json_append_str(kValue, sizeof(kValue) - 1);
+    rut_helper_json_append_raw("}", 1);
+    rut_helper_json_finish(&ctx);
+    REQUIRE_EQ(ctx.response_body_valid, 1u);
+    const Str escaped{ctx.response_body_data, ctx.response_body_len};
+    CHECK(escaped.eq(lit("{\"value\":\"quote\\\" newline\\n control\\u0001\"}")));
+
+    char oversized[8 * 1024]{};
+    rut_helper_json_reset();
+    rut_helper_json_append_raw(oversized, sizeof(oversized));
+    rut_helper_json_finish(&ctx);
+    CHECK_EQ(ctx.response_body_valid, 0u);
+    CHECK(ctx.response_body_data == nullptr);
+    CHECK_EQ(ctx.response_body_len, 0u);
+
+    const auto overflow_handler =
+        +[](void*, HandlerCtx* handler_ctx, const u8*, u32, void*) -> u64 {
+        char bytes[8 * 1024]{};
+        rut_helper_json_reset();
+        rut_helper_json_append_raw(bytes, sizeof(bytes));
+        rut_helper_json_finish(handler_ctx);
+        HandlerResult result = HandlerResult::make_status(200);
+        result.upstream_id = HandlerResult::kDynamicResponseBody;
+        return result.pack();
+    };
+    const auto outcome = invoke_jit_handler(overflow_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 500u);
+    CHECK(outcome.dynamic_response_body == nullptr);
+}
+
 TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
     const auto src = R"rut(
 route GET "/api/users" {

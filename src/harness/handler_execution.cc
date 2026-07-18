@@ -289,6 +289,12 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
 
     out.terminal = result;
     out.has_terminal = true;
+    if (result.action == jit::HandlerAction::ReturnStatus &&
+        result.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
+        out.dynamic_response_body = execution.frame.context.response_body_data;
+        out.dynamic_response_body_len = execution.frame.context.response_body_len;
+        out.dynamic_response_body_valid = execution.frame.context.response_body_valid != 0;
+    }
     if (!publisher.emit(ObservationKind::HandlerTerminated,
                         static_cast<u64>(result.action),
                         result.action == jit::HandlerAction::ReturnStatus ? result.status_code

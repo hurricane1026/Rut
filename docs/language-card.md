@@ -51,7 +51,7 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
 json({ users: [], total: 0 })           // literal object/array serialization ✅
-json({ path: req.path })                // dynamic/runtime serialization ⏳
+json({ path: req.path })                // ✅ in direct return; bounded scalar slots
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)

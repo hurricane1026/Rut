@@ -677,6 +677,32 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_json_reset(SourceLoc loc = {}) {
+        TRY_VOID(emit(Opcode::JsonReset, nullptr, loc));
+        return {};
+    }
+
+    VoidResult emit_json_append_raw(Str bytes, SourceLoc loc = {}) {
+        auto r = TRY(emit(Opcode::JsonAppendRaw, nullptr, loc));
+        r.inst->imm.str_val = bytes;
+        return {};
+    }
+
+    VoidResult emit_json_append(Opcode op, ValueId value, SourceLoc loc = {}) {
+        if (!valid_val(value) || (op != Opcode::JsonAppendBool && op != Opcode::JsonAppendI32 &&
+                                  op != Opcode::JsonAppendI64 && op != Opcode::JsonAppendStr))
+            return err(RirError::InvalidState);
+        auto r = TRY(emit(op, nullptr, loc));
+        r.inst->operands[0] = value;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_json_finish(SourceLoc loc = {}) {
+        TRY_VOID(emit(Opcode::JsonFinish, nullptr, loc));
+        return {};
+    }
+
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));

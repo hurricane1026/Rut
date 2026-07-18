@@ -252,6 +252,7 @@ struct MirHeaderKV {
 };
 
 struct MirTerminator {
+    static constexpr u32 kMaxJsonDynamicValues = 8;
     MirTerminatorKind kind = MirTerminatorKind::ReturnStatus;
     Span span{};
     MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;
@@ -273,6 +274,9 @@ struct MirTerminator {
     // ReturnStatus terminators. lower_rir maps identical literals to a
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
     Str response_body{};
+    bool has_dynamic_response_body = false;
+    FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
+    FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     // Optional response headers carried from HIR. Inline-stored.
     // len == 0 means "no kwarg". lower_rir interns these into the
     // RIR module's shared header pool.

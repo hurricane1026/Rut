@@ -54,6 +54,9 @@ struct HandlerExecutionResult {
     jit::HandlerResult terminal{};
     bool has_terminal = false;
     u32 consumed_events = 0;
+    const char* dynamic_response_body = nullptr;
+    u32 dynamic_response_body_len = 0;
+    bool dynamic_response_body_valid = false;
 };
 
 HandlerExecutionResult drive_handler_deterministically(const DeterministicHandlerSpec& driver,
