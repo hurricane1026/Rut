@@ -44,6 +44,7 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
 | Full surface language in examples below | **Designed** | Many examples are target syntax, not necessarily accepted by current code |
 | Cross-shard language primitives (`notify`, `consistent`) | **Designed** | Runtime direction is defined here; treat semantics as target contract |
+| Strict `Hash` + owner-shard atomic update | **Designed** | Lossless in-process contract is fixed in `docs/hash-state.md`; not implemented |
 | External state backends (`backend: .redis`) | **Designed** | Not a current repository guarantee |
 | Zero-downtime hot reload of full `.rut` programs | **Partially designed / partial runtime pieces** | Runtime has design direction; full language-level flow is not complete yet |
 
@@ -654,7 +655,8 @@ budget is exceeded, either the write fails visibly or old data dies (eBPF's
 a `Cache` whose absence yields a wrong answer** (sessions, in-flight
 counts). Multi-field algorithm state can pack into the single i64 using
 `bitwise.*`. Expiry is lazy (window index in the value), there is no `ttl:`.
-The name `Hash` is **reserved** for a future strict, visible-failure table:
+The name `Hash` is **reserved** for the designed strict, visible-failure table
+in `docs/hash-state.md` (not implemented yet):
 "hash map" carries a lossless prior this structure does not honor. (The
 former `Hash<string, Session>` example is retired for a second reason:
 per-shard KV gives wrong answers for cross-connection sessions; that use
@@ -788,7 +790,9 @@ To remove per-shard divergence (all shards see one copy of the state),
 declare with `consistent: true`. Operations route to the owner shard
 (determined by key hash), processed sequentially — no locks, just SPSC
 message round-trip. On a `Cache` this is single-owner but still
-approximate (see below); exact global limiting is future work.
+approximate (see below). Exact global limiting uses the designed strict `Hash`
+and owner-executed atomic `update` contract in `docs/hash-state.md`; neither is
+implemented yet.
 
 ```swift
 // rut:allow(consistent)
@@ -807,8 +811,9 @@ shard holds the state) — it does NOT make the state exact: the slot table
 stays lossy (a colliding `set` can still evict a bucket, and `.or(0)`
 restarts it), and a read-modify-write built from separate `get`/`set`
 round-trips can interleave between shards, losing updates. Exact global
-limiting needs a strict (visible-failure) table plus an owner-shard atomic
-update primitive — both future work; until then `consistent:` Cache is
+limiting needs the strict (visible-failure) `Hash` plus owner-shard atomic
+`update` specified in `docs/hash-state.md` — both remain unimplemented; until
+then `consistent:` Cache is
 "single-owner, still lossy".
 
 Cost: 1 SPSC round-trip when current shard != owner shard (local ops are free).
@@ -855,8 +860,9 @@ clear but the contract is underspecified.
 **`consistent: true`**
 
 - A consistent operation either completes on the owner shard and returns its result, or fails the request-visible operation
-- Timeouts on cross-shard round trips must surface as runtime failures, not stale success
+- A deadline is rejected before owner execution; the runtime never reports a timeout that can race an already-committed mutation
 - Reads and writes routed through the owner shard observe owner-shard program order
+- Exact read-modify-write uses one pure, bounded owner-executed `Hash.update`; separate `get`/`set` operations are not atomic
 
 **External backends**
 
@@ -1854,9 +1860,10 @@ resp.upstream                 // string — which target served this ("10.0.0.1:
 
 `resp.cookie()` and `resp.upstream` provide the observations needed for a
 future sticky-session "learn" mode. Rut cannot express that mode today:
-`Hash` is reserved for the future strict table (§3.3.6), and lossy `Cache`
+`Hash` is reserved for the designed strict table (§3.3.6 and
+`docs/hash-state.md`) but is not implemented, and lossy `Cache`
 must not hold sessions. No copyable declaration is specified until the strict
-table and its cross-connection consistency contract exist.
+table and its cross-connection consistency contract are implemented.
 
 #### 3.4.6 Response Caching
 
@@ -3468,12 +3475,16 @@ State operations (Cache.set, Set.add) executed before the crash are
   is restricted to algorithms where a miss/eviction is a safe reset
 - An idempotent Set.add (for example, an administrator-requested blacklist fact)
   remains applied; callers must not use it as an intermediate transaction step
-- Session-like state is never valid in lossy Cache and awaits the future strict
-  table, so the runtime promises no rollback semantics for that unsupported form
+- Session-like state is never valid in lossy Cache and awaits the designed
+  strict table runtime, so the runtime promises no rollback semantics for that
+  unsupported form
 
 Transactional rollback would require write-ahead logging on every state operation —
-unacceptable overhead on the hot path. State operations are best-effort, idempotent
-by convention.
+unacceptable overhead on the hot path. State operations are not route
+transactions: a completed mutation remains applied if later handler code
+crashes. Lossy operations are idempotent by convention; designed strict Hash
+operations, once implemented, additionally obey the visible-failure and
+definite-application contract in `docs/hash-state.md`.
 
 ### 4.4 Client Disconnect Cancellation
 
@@ -7084,7 +7095,7 @@ is correct either way.
 **Degradation principle:** silent fallback is allowed ONLY when a higher layer
 provides equivalent protection (firewall → L7 guards, SO_MAX_PACING_RATE →
 token bucket). Control-plane delivery/synchronization operations (`notify`,
-`consistent: true`, and future strict-table writes) must surface failures for
+`consistent: true`, and designed strict-table writes) must surface failures for
 the caller to handle. `Cache.set` is deliberately different: it has no error
 channel, and collision eviction is part of its documented lossy semantics.
 

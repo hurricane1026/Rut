@@ -249,7 +249,7 @@ buckets.set(req.remoteAddr, v)                   // bare statement, before any g
 // Never store anything whose absence yields a wrong answer (sessions,
 // in-flight counts). Rate limiting over Cache is implemented in
 // examples/ratelimit.rut;
-// Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
+// Counter<K> is deleted; Hash is RESERVED (strict design accepted, runtime ⏳).
 // A leading set is materialized in the entry prelude and meters every attempt.
 // A set inside a selected if/match branch executes on that branch immediately
 // before its terminal body, enabling meter-on-accept policies. Cache ops are
@@ -268,6 +268,8 @@ notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
                                   // bare-statement cache.set does not nest)
 // single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
 // remains lossy and separate get/set operations are not an atomic update.
+// The designed strict Hash.update executes one pure bounded updater on the
+// owner shard; it is not implemented yet (docs/hash-state.md).
 // ⏳ cross-node backend is unspecified until Cache has a freshness contract.
 ```
 

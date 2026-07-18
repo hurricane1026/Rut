@@ -1673,6 +1673,28 @@ TEST(frontend, cache_decl_validation_errors) {
     }
 }
 
+TEST(frontend, cache_backend_stays_reserved_until_freshness_contract_exists) {
+    const char* cases[] = {
+        "let b = Cache<IP, i64>(capacity: 64, backend: .redis(\"127.0.0.1:6379\"))\n"
+        "route GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(backend: .redis(\"127.0.0.1:6379\"), capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n",
+    };
+    const auto expected =
+        lit("backend: on Cache is reserved — lossy Cache has no cross-node read "
+            "freshness/invalidation or atomic-update contract; keep source-of-truth "
+            "state external until backend state semantics are implemented");
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(expected));
+    }
+}
+
 TEST(frontend, cache_op_gates_and_shadowing) {
     // Wrong key type.
     const char* bad_key =
