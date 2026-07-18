@@ -6135,10 +6135,11 @@ TEST(frontend, analyze_rejects_wait_after_for_loop) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(static_cast<u8>(ast.error().code),
-                 static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("wait cannot be used after a static for-loop")));
     }
 }
 
@@ -6157,10 +6158,11 @@ TEST(frontend, analyze_rejects_for_loop_after_wait) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(static_cast<u8>(ast.error().code),
-                 static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("static for-loop cannot be combined with wait")));
     }
 }
 
@@ -24273,14 +24275,14 @@ TEST(frontend, parse_array_lit_nested_type) {
     CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
 }
 
-TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
+TEST(frontend, parse_for_loop_basic) {
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
+    CHECK_EQ(ast->items[0].route.statements[0]->kind, AstStmtKind::For);
 }
 
 TEST(frontend, parse_inline_identifier_is_not_reserved) {
@@ -24304,6 +24306,62 @@ TEST(frontend, parse_rejects_inline_for_compat_spelling) {
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("use 'for', not 'inline for'")));
+}
+
+TEST(frontend, bounded_static_for_unrolls_elements_and_verifies_cfg) {
+    const char* src =
+        "route GET \"/x\" { for item in [1, 2, 3] { guard item > 0 else "
+        "{ return 400 } } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 7u);
+    for (u32 i = 0; i < 3; i++) {
+        const auto& cond = mir->functions[0].blocks[i].term.cond;
+        REQUIRE_EQ(cond.kind, MirValueKind::Gt);
+        REQUIRE(cond.lhs != nullptr);
+        CHECK_EQ(cond.lhs->kind, MirValueKind::IntConst);
+        CHECK_EQ(cond.lhs->int_value, static_cast<i64>(i + 1));
+    }
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
+TEST(frontend, bounded_static_for_rejects_runtime_iterators_and_cfg_overflow) {
+    const char* runtime_src =
+        "func make() -> [i32] => [1, 2, 3]\n"
+        "route GET \"/x\" { for item in make() { return 200 } return 204 }\n";
+    auto runtime_lexed = lex(lit(runtime_src));
+    REQUIRE(runtime_lexed);
+    auto runtime_ast = parse_file_heap(runtime_lexed.value());
+    REQUIRE(runtime_ast);
+    auto runtime_hir = analyze_file_heap(runtime_ast.value());
+    REQUIRE_FALSE(runtime_hir.has_value());
+    CHECK(runtime_hir.error().detail.eq(
+        lit("static for-loop iterator must be a compile-time array literal or alias")));
+
+    const char* overflow_src =
+        "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
+        "guard n > 0 else { return 400 } } return 200 }\n";
+    auto overflow_lexed = lex(lit(overflow_src));
+    REQUIRE(overflow_lexed);
+    auto overflow_ast = parse_file_heap(overflow_lexed.value());
+    REQUIRE(overflow_ast);
+    auto overflow_hir = analyze_file_heap(overflow_ast.value());
+    REQUIRE(overflow_hir);
+    auto overflow_mir = build_mir_heap(overflow_hir.value());
+    REQUIRE_FALSE(overflow_mir.has_value());
+    CHECK_EQ(overflow_mir.error().code, FrontendError::TooManyItems);
+    CHECK(overflow_mir.error().detail.eq(lit("static for-loop block budget exceeded")));
 }
 
 #if 0
@@ -31417,22 +31475,20 @@ TEST(frontend, guard_let_function_body_parity_lowers_and_recovers) {
     rir.destroy();
 }
 
-TEST(frontend, if_let_inside_static_for_loop_is_parser_unreachable) {
-    // Round-2 finding 2: an `if let` inside a static for-loop body cannot be
-    // reached — the parser rejects for-loops wholesale, so no AstStmtKind::For is
-    // ever produced and the static-for If analyzer (which would mis-treat an
-    // if-let usable-value test as a plain bool cond) is dead code. This pins the
-    // reachability: the enclosing for-loop fails to parse before any if-let is
-    // seen. (The analyzer also now fail-loud rejects bind_value defensively, so a
-    // future for-loop enablement fails cleanly instead of mis-analyzing.)
+TEST(frontend, if_let_inside_static_for_loop_is_rejected_explicitly) {
+    // Static unrolling has no branch-local carrier for an `if let` binding.
+    // Reject it in analysis instead of treating the usable-value test as a bool.
     const char* src =
         "route GET \"/u\" { for item in [1] { if let x = error(7) { return 500 } "
         "else { return 200 } } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("if-let is not supported inside a static for-loop body")));
 }
 
 TEST(frontend, case_in_match_arm_still_rejected_with_fixit) {

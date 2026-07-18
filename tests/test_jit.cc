@@ -1550,6 +1550,59 @@ route GET "/builder" {
     rir.destroy();
 }
 
+TEST(jit, bounded_static_for_executes_unrolled_guard_chain) {
+    const auto src = R"rut(
+route GET "/accepted" {
+    for item in [1, 2, 3] { guard item > 0 else { return 400 } }
+    return 204
+}
+route GET "/rejected" {
+    for item in [1, 0, 3] { guard item > 0 else { return 422 } }
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto accepted = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto rejected = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(accepted != nullptr);
+    REQUIRE(rejected != nullptr);
+
+    TestHandlerCtxFrame accepted_frame{};
+    const auto accepted_result = invoke_jit_handler(accepted,
+                                                    nullptr,
+                                                    accepted_frame.ctx,
+                                                    reinterpret_cast<const u8*>(kGetApiRequest),
+                                                    sizeof(kGetApiRequest) - 1,
+                                                    nullptr);
+    CHECK_EQ(accepted_result.status_code, 204u);
+
+    TestHandlerCtxFrame rejected_frame{};
+    const auto rejected_result = invoke_jit_handler(rejected,
+                                                    nullptr,
+                                                    rejected_frame.ctx,
+                                                    reinterpret_cast<const u8*>(kGetApiRequest),
+                                                    sizeof(kGetApiRequest) - 1,
+                                                    nullptr);
+    CHECK_EQ(rejected_result.status_code, 422u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_return_json_serializes_nested_declared_structs) {
     const auto src = R"rut(
 struct Meta { ok: bool }

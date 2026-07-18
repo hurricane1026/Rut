@@ -87,6 +87,9 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Static `for` accepts only compile-time array literals or aliases, unrolls
+  under the MIR/verifier block budget, rejects every runtime iterator and wait
+  combination, and executes through the same JIT CFG as hand-written guards.
 - [x] Expression-form `forward(upstream, buffered: true)` materializes bounded
   status/body/header fields in stream-owned storage, survives later yields,
   replays through the deterministic harness, and preserves the terminal

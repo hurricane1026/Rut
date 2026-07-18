@@ -112,10 +112,10 @@ match status {                            // general dispatch — no `case` keyw
     _        => "other"                   // exhaustive: all cases or _
 }
 
-for item in order.items {                 // ⏳ finite collections only, no while
-    if item.qty == 0 { continue }         // ⏳ break / continue allowed
-    guard item.qty > 0 else { return 400 }
+for item in [1, 2, 3] {                   // compile-time array only; bounded unroll, no while
+    guard item > 0 else { return 400 }
 }
+// ⏳ break / continue inside bounded `for`
 
 defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)
 ```
