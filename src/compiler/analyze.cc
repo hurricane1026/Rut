@@ -44,6 +44,42 @@ static bool append_json_bytes(std::string& out, const char* data, u32 len, u32 m
     return true;
 }
 
+static bool valid_utf8(Str value) {
+    u32 i = 0;
+    while (i < value.len) {
+        const u8 c0 = static_cast<u8>(value.ptr[i]);
+        if (c0 < 0x80) {
+            i++;
+            continue;
+        }
+        auto continuation = [&](u32 offset) {
+            return i + offset < value.len &&
+                   (static_cast<u8>(value.ptr[i + offset]) & 0xc0) == 0x80;
+        };
+        if (c0 >= 0xc2 && c0 <= 0xdf) {
+            if (!continuation(1)) return false;
+            i += 2;
+            continue;
+        }
+        if (c0 >= 0xe0 && c0 <= 0xef) {
+            if (!continuation(1) || !continuation(2)) return false;
+            const u8 c1 = static_cast<u8>(value.ptr[i + 1]);
+            if ((c0 == 0xe0 && c1 < 0xa0) || (c0 == 0xed && c1 >= 0xa0)) return false;
+            i += 3;
+            continue;
+        }
+        if (c0 >= 0xf0 && c0 <= 0xf4) {
+            if (!continuation(1) || !continuation(2) || !continuation(3)) return false;
+            const u8 c1 = static_cast<u8>(value.ptr[i + 1]);
+            if ((c0 == 0xf0 && c1 < 0x90) || (c0 == 0xf4 && c1 >= 0x90)) return false;
+            i += 4;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool append_json_quoted(std::string& out, Str value, u32 max_bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
     if (!append_json_bytes(out, "\"", 1, max_bytes)) return false;
@@ -127,10 +163,15 @@ static FrontendResult<void> serialize_json_literal(const AstExpr& expr,
                    ? FrontendResult<void>{}
                    : frontend_error(FrontendError::TooManyItems, expr.span);
     }
-    if (expr.kind == AstExprKind::StrLit)
+    if (expr.kind == AstExprKind::StrLit) {
+        if (!valid_utf8(expr.str_value))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("json string literals must contain valid UTF-8"));
         return append_json_quoted(out, expr.str_value, max_bytes)
                    ? FrontendResult<void>{}
                    : frontend_error(FrontendError::TooManyItems, expr.span);
+    }
     if (expr.kind == AstExprKind::Nil)
         return append_json_bytes(out, "null", 4, max_bytes)
                    ? FrontendResult<void>{}
@@ -283,7 +324,7 @@ static Str stash_owned_string(std::deque<std::string>& store, const std::string&
 
 static Str intern_module_string(const HirModule& mod, const std::string& value) {
     auto& store =
-        mod.analysis_owned_strings != nullptr ? *mod.analysis_owned_strings : mod.owned_strings;
+        mod.analysis_owned_strings != nullptr ? *mod.analysis_owned_strings : *mod.owned_strings;
     for (const auto& kept : store) {
         if (kept == value) return {kept.c_str(), static_cast<u32>(kept.size())};
     }
@@ -14731,7 +14772,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
     mod.analysis_owned_strings =
-        shared_owned_strings != nullptr ? shared_owned_strings : &mod.owned_strings;
+        shared_owned_strings != nullptr ? shared_owned_strings : mod.owned_strings.get();
     mod.has_package_decl = file.has_package_decl;
     mod.package_span = file.package_span;
     mod.package_name = file.package_name;
@@ -14971,7 +15012,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     }
 
     auto* owned_strings =
-        shared_owned_strings != nullptr ? shared_owned_strings : &mod.owned_strings;
+        shared_owned_strings != nullptr ? shared_owned_strings : mod.owned_strings.get();
     auto validated_chain_names = validate_unique_chain_names(file);
     if (!validated_chain_names) return core::make_unexpected(validated_chain_names.error());
     std::vector<Str> route_decorator_names = external_decorator_names;

@@ -31797,9 +31797,9 @@ route GET "/x" {
     const auto expected =
         lit("{\"quote\":\"a\\\"b\\n\",\"flags\":[true,false,null],\"negative\":-12}");
     CHECK(hir->routes[0].control.direct_term.response_body.eq(expected));
-    REQUIRE_EQ(hir->owned_strings.size(), 1u);
+    REQUIRE_EQ(hir->owned_strings->size(), 1u);
     CHECK_EQ(hir->routes[0].control.direct_term.response_body.ptr,
-             hir->owned_strings.front().c_str());
+             hir->owned_strings->front().c_str());
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -31824,6 +31824,41 @@ route GET "/x" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     CHECK(hir->routes[0].control.direct_term.response_body.eq(lit("\"a\\\\b\\\\f\\\\q\"")));
+}
+
+TEST(frontend, copied_hir_keeps_generated_json_storage_alive) {
+    const char* src = "route GET \"/x\" { return 200, json({ ok: true }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto copied = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+
+    CHECK(copied->routes[0].control.direct_term.response_body.eq(lit("{\"ok\":true}")));
+    auto mir = build_mir_heap(*copied);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    CHECK(rir.module.response_bodies[0].eq(lit("{\"ok\":true}")));
+    rir.destroy();
+}
+
+TEST(frontend, json_rejects_malformed_utf8_string_literals) {
+    std::string src = "route GET \"/x\" { return 200, json(\"a";
+    src.push_back(static_cast<char>(0x80));
+    src += "b\") }\n";
+    auto lexed = lex({src.c_str(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("json string literals must contain valid UTF-8")));
 }
 
 TEST(frontend, json_rejects_body_larger_than_runtime_pool) {
