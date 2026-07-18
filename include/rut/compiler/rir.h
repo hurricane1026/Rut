@@ -238,6 +238,7 @@ enum class Opcode : u8 {
     JsonAppendStr,      // append escaped/quoted str operand
     JsonAppendStrList,  // append runtime ordered string view as a JSON array
     JsonAppendArray,    // append a bounded generic Array<T> recursively
+    JsonCapture,        // capture scratch as str; overflow becomes an invalid view
     JsonFinish,         // publish scratch through HandlerCtx
 
     // ── Struct operations ──

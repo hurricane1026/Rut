@@ -55,6 +55,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
            : kind == HirTypeKind::IP       ? MirTypeKind::IP
            : kind == HirTypeKind::StrList  ? MirTypeKind::StrList
            : kind == HirTypeKind::Array    ? MirTypeKind::Array
+           : kind == HirTypeKind::Json     ? MirTypeKind::Json
            : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
            : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
            : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
@@ -291,6 +292,25 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             if (!fn->values.push(elem.value()))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             if (!v.args.push(&fn->values[fn->values.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        return v;
+    }
+    if (expr.kind == HirExprKind::JsonBuild) {
+        v.kind = MirValueKind::JsonBuild;
+        v.type = MirTypeKind::Json;
+        v.str_value = expr.str_value;
+        for (u32 i = 0; i < expr.field_inits.len; i++) {
+            if (expr.field_inits[i].value == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            auto leaf = mir_value(*expr.field_inits[i].value, module, fn, ctx);
+            if (!leaf) return core::make_unexpected(leaf.error());
+            if (!fn->values.push(leaf.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            MirValue::FieldInit part{};
+            part.name = expr.field_inits[i].name;
+            part.value = &fn->values[fn->values.len - 1];
+            if (!v.field_inits.push(part))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         }
         return v;
@@ -1125,6 +1145,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Json &&
+                module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild)
+                continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
             // a stable ref_index, then blanks the name for scope-hiding

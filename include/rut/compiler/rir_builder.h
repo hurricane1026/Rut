@@ -715,6 +715,11 @@ struct Builder {
         return {};
     }
 
+    Result<ValueId> emit_json_capture(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::Str));
+        return TRY(emit(Opcode::JsonCapture, ty, loc)).vid;
+    }
+
     VoidResult emit_json_finish(SourceLoc loc = {}) {
         TRY_VOID(emit(Opcode::JsonFinish, nullptr, loc));
         return {};

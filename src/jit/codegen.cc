@@ -112,6 +112,8 @@ struct Ctx {
     LLVMValueRef fn_json_append_str_list;
     LLVMValueRef fn_json_append_i64;
     LLVMValueRef fn_json_append_bool;
+    LLVMValueRef fn_json_capture_data;
+    LLVMValueRef fn_json_capture_len;
     LLVMValueRef fn_json_finish;
 
     // True while emitting a handler that reads the request (and therefore
@@ -242,6 +244,20 @@ struct Ctx {
             fn_json_append_bool = LLVMAddFunction(llvm_mod, "rut_helper_json_append_bool", ft);
         }
         return fn_json_append_bool;
+    }
+    LLVMValueRef get_json_capture_data() {
+        if (!fn_json_capture_data) {
+            LLVMTypeRef ft = LLVMFunctionType(ptr_ty, nullptr, 0, 0);
+            fn_json_capture_data = LLVMAddFunction(llvm_mod, "rut_helper_json_capture_data", ft);
+        }
+        return fn_json_capture_data;
+    }
+    LLVMValueRef get_json_capture_len() {
+        if (!fn_json_capture_len) {
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, nullptr, 0, 0);
+            fn_json_capture_len = LLVMAddFunction(llvm_mod, "rut_helper_json_capture_len", ft);
+        }
+        return fn_json_capture_len;
     }
     LLVMValueRef get_json_finish() {
         if (!fn_json_finish) {
@@ -2127,6 +2143,25 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::JsonAppendArray: {
             const auto* type = c.cur_fn->values[inst.operands[0].id].type;
             emit_json_value(c, c.get_value(inst.operands[0]), type, 0);
+            break;
+        }
+        case rir::Opcode::JsonCapture: {
+            LLVMValueRef data = LLVMBuildCall2(c.builder,
+                                               LLVMGlobalGetValueType(c.get_json_capture_data()),
+                                               c.get_json_capture_data(),
+                                               nullptr,
+                                               0,
+                                               "json.data");
+            LLVMValueRef len = LLVMBuildCall2(c.builder,
+                                              LLVMGlobalGetValueType(c.get_json_capture_len()),
+                                              c.get_json_capture_len(),
+                                              nullptr,
+                                              0,
+                                              "json.len");
+            LLVMValueRef value = LLVMGetUndef(c.str_ty);
+            value = LLVMBuildInsertValue(c.builder, value, data, 0, "json.value.ptr");
+            value = LLVMBuildInsertValue(c.builder, value, len, 1, "json.value");
+            c.set_value(inst.result, value);
             break;
         }
         case rir::Opcode::JsonFinish: {

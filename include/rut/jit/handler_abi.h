@@ -168,6 +168,7 @@ struct alignas(alignof(u64)) HandlerCtx {
     u32 response_body_pending_len;
     bool response_body_pending_set;
     bool response_body_pending_overflow;
+    char response_body_pending_storage[kMaxResponseBodyMutationBytes];
     const char* response_body_mutation_data;
     u32 response_body_mutation_len;
     bool response_body_mutation_set;

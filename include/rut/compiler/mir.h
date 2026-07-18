@@ -93,6 +93,7 @@ enum class MirValueKind : u8 {
     WaitField,
     CacheGet,
     CacheSet,
+    JsonBuild,
 };
 
 enum class MirTypeKind : u8 {
@@ -109,6 +110,7 @@ enum class MirTypeKind : u8 {
     IP,
     StrList,
     Array,
+    Json,
 };
 
 struct MirTypeShape {

@@ -149,6 +149,8 @@ void rut_helper_json_append_str(const char* data, rut::u32 len);
 void rut_helper_json_append_str_list(const rut::Str* items, rut::u32 len);
 void rut_helper_json_append_i64(rut::i64 value);
 void rut_helper_json_append_bool(rut::u8 value);
+const char* rut_helper_json_capture_data();
+rut::u32 rut_helper_json_capture_len();
 void rut_helper_json_finish(void* ctx);
 
 // ── String Operations ──────────────────────────────────────────────
