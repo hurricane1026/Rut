@@ -241,6 +241,9 @@ target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
+target_compile_definitions(test_frontend PRIVATE
+    RUT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
 add_test(NAME test_frontend COMMAND test_frontend)
 set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
 

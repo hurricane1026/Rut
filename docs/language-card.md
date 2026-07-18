@@ -7,16 +7,19 @@ task — if a form is not on this card, do not invent it. Derived from DESIGN.md
 Core contract: **Swift-exact or absent** — anything that looks like Swift
 behaves exactly like Swift; near-miss variants do not exist in this language.
 
-**Implementation status**: this card documents the target surface. The
-front-end migration is in progress (TODO.md → "Front-End Migration"); forms
-marked ⏳ are specified but **not yet accepted by the current compiler** —
-they fail to compile today rather than misbehave. Everything unmarked works.
+**Implementation status**: this card documents both shipped Core and the target
+surface. Forms marked ⏳ are specified but **not yet accepted by the current
+compiler** — they fail to compile today rather than misbehave. Every `rut`
+fence is a front-end fixture unless it is immediately preceded by a reasoned
+`<!-- rut-example: skip ... -->` marker; skipped survey blocks contain target
+or fragment syntax, while every unmarked example parses and type-checks in CI.
 
 ## File anatomy
 
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
-```swift
+<!-- rut-example: skip target-surface overview mixes pending top-level forms -->
+```rut
 // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
@@ -39,7 +42,8 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 
 ## Lexical
 
-```swift
+<!-- rut-example: skip lexical survey contains expression fragments and pending literals -->
+```rut
 // Literals
 42                                      // number (plain integer)
 3.14   0xFF   1_000_000                 // ⏳ float / hex / underscored (lexer takes plain digit runs only)
@@ -93,7 +97,8 @@ resume; either overflow fails closed as 500 and never publishes a partial body.
 
 ## Bindings and control flow
 
-```swift
+<!-- rut-example: skip control-flow survey contains statement fragments and pending forms -->
+```rut
 let x = 42                    // immutable (default)
 var n = 0                     // ⏳ mutable, handler-local only
 const key = env("SECRET")     // must be compile-time evaluable
@@ -145,7 +150,8 @@ exceptions, no try/catch. `!` is logical not only.
   mutations. A `chain after` helper may receive the runtime `Response` and add
   ordered header effects to a successful handler response.
 
-```swift
+<!-- rut-example: skip illustrative helper depends on target JWT and user APIs -->
+```rut
 func auth(_ req: Request, role: str) -> User {
     let token = req.authorization.or("")
     guard token.hasPrefix("Bearer ") else { respond 401 }
@@ -158,7 +164,8 @@ func auth(_ req: Request, role: str) -> User {
 
 ## Functions, UFCS, pipeline
 
-```swift
+<!-- rut-example: skip function survey contains fragments and pending call syntax -->
+```rut
 func f(_ req: Request, limit: ByteSize) { ... }   // first param unlabeled, rest named
 f(req, limit: 1mb)                // ⏳ mixed positional+named call args (parser rejects the label)
 req.f(limit: 1mb)                 // UFCS: t.f(a) == f(t, a) — use when value
@@ -179,7 +186,8 @@ Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
 MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
 tuples `(a, b)` — ⏳ `.0`/`.1` projection and `let (x, y) = pair` destructuring pending.
 
-```swift
+<!-- rut-example: skip type survey contains fragments and experimental protocol syntax -->
+```rut
 struct User {                 // fields: name: type — newline-separated, no commas
     id: str
     role: str
@@ -204,7 +212,8 @@ parseInt("42")        // ⏳ i32? — parse APIs for text (parseFloat, IP.parse,
 
 ## Request / Response
 
-```swift
+<!-- rut-example: skip request-response survey contains route-scoped statement fragments -->
+```rut
 // Typed built-in properties (standard headers)
 req.method == .GET          req.path (str)           req.remoteAddr (IP)
 req.contentLength (ByteSize)  req.contentType (MediaType)
@@ -278,7 +287,8 @@ rejected because it cannot provide owned response fields.
 
 ## State types (top-level, per-shard, bounded)
 
-```swift
+<!-- rut-example: skip state survey intentionally includes pending state and notify forms -->
+```rut
 let buckets = Cache<IP, i64>(capacity: 100000)   // lossy per-key slots
 let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
 buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait/for;
@@ -312,7 +322,8 @@ notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
 
 ## Routing
 
-```swift
+<!-- rut-example: skip routing survey includes an intentionally deprecated decorator -->
+```rut
 route GET "/health" { return 200 }
 route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
@@ -331,7 +342,8 @@ Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
 Indistinguishable routes are a compile error. Stable middleware uses an explicit
 `chain` direction:
 
-```swift
+<!-- rut-example: skip chain surface is a focused fragment with external helpers -->
+```rut
 func add_trace(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Request-Path", req.path)
     0
@@ -347,7 +359,8 @@ or incrementally editing an upstream buffered body remains ⏳.
 
 ## I/O
 
-```swift
+<!-- rut-example: skip I-O survey intentionally includes pending capabilities -->
+```rut
 // Proxy — the ONLY three forms
 return forward(users)                          // zero-copy, terminal
 return forward(users, buffered: true)          // ✅ bounded terminal buffering + after mutations
@@ -404,7 +417,7 @@ shutdown { ... }     // per-shard, after drain
 
 ## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
 
-```swift
+```rut
 let buckets = Cache<IP, i64>(capacity: 100000)
 
 route GET "/api" {                                   // GCRA token bucket
@@ -427,7 +440,7 @@ boundary bursts and is not a sliding-window limit.
 
 ## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
 
-```swift
+```rut
 let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots
 
 route GET "/api" {
@@ -504,25 +517,18 @@ if the runtime capability is unavailable.
 
 ## Minimal complete example
 
-```swift
-listen :80                         // ⏳ (no top-level listen yet)
-let users = upstream { "10.0.0.1:8080" }
+```rut
+upstream users at "10.0.0.1:8080"
 // A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
 // is no shipped top-level catch-all syntax yet. Configure the surrounding
 // listener/proxy to return 404 for traffic outside these declared routes.
 
 route GET "/health" { return 200 }
-
 route GET "/users/:id" { return forward(users) }
 
 route POST "/users" {
-    guard let user = req.body(User) else { return 400 }
-    return forward(users)
+    if req.body == "" { return 400 } else { return forward(users) }
 }
 
-struct User {
-    id: str
-    role: str
-}
 ```

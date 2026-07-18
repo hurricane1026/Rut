@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 using namespace rut;
 static Str lit(const char* s) {
     u32 n = 0;
@@ -159,6 +160,97 @@ static std::string format_verify_text(const rir::VerifyResult& result) {
     msg.init(msg_data, sizeof(msg_data), -1);
     rir::format_verify_result(msg, result);
     return std::string(msg.data, msg.len);
+}
+
+TEST(frontend, language_card_unmarked_rut_examples_parse_and_typecheck) {
+    const std::string path = std::string(RUT_SOURCE_DIR) + "/docs/language-card.md";
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE_MSG(input.good(), "language card must be readable");
+
+    constexpr std::string_view skip_prefix = "<!-- rut-example: skip ";
+    std::string line;
+    std::string source;
+    bool in_rut_fence = false;
+    bool pending_skip = false;
+    bool skip_current = false;
+    u32 line_number = 0;
+    u32 fence_line = 0;
+    u32 executable_count = 0;
+    u32 skipped_count = 0;
+
+    auto report_failure = [&](const char* phase, const Diagnostic* diagnostic = nullptr) {
+        rut::test::out("language-card Rut example failed ");
+        rut::test::out(phase);
+        rut::test::out(" at fence starting on line ");
+        rut::test::out_int(static_cast<int>(fence_line));
+        if (diagnostic != nullptr) {
+            rut::test::out(" (example line ");
+            rut::test::out_int(static_cast<int>(diagnostic->span.line));
+            rut::test::out(", column ");
+            rut::test::out_int(static_cast<int>(diagnostic->span.col));
+            rut::test::out(")");
+            if (diagnostic->detail.len != 0) {
+                const std::string detail(diagnostic->detail.ptr, diagnostic->detail.len);
+                rut::test::out(": ");
+                rut::test::out(detail.c_str());
+            }
+        }
+        rut::test::out("\n");
+    };
+
+    while (std::getline(input, line)) {
+        line_number++;
+        if (!in_rut_fence) {
+            if (line.starts_with(skip_prefix)) {
+                REQUIRE_MSG(!pending_skip, "skip markers cannot be stacked");
+                REQUIRE_MSG(line.ends_with(" -->") &&
+                                line.size() > skip_prefix.size() + std::string_view(" -->").size(),
+                            "language-card skip markers require a nonempty reason");
+                pending_skip = true;
+                continue;
+            }
+            REQUIRE_MSG(line != "```swift", "language-card language fences must use rut");
+            if (line == "```rut") {
+                in_rut_fence = true;
+                skip_current = pending_skip;
+                pending_skip = false;
+                fence_line = line_number;
+                source.clear();
+                continue;
+            }
+            REQUIRE_MSG(!pending_skip, "a skip marker must immediately precede a rut fence");
+            continue;
+        }
+
+        if (line != "```") {
+            source.append(line);
+            source.push_back('\n');
+            continue;
+        }
+
+        in_rut_fence = false;
+        if (skip_current) {
+            skipped_count++;
+            continue;
+        }
+
+        executable_count++;
+        const Str input_source{source.data(), static_cast<u32>(source.size())};
+        auto lexed = lex(input_source);
+        if (!lexed) report_failure("lexing", &lexed.error());
+        REQUIRE_MSG(lexed, "language-card Rut example must lex");
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) report_failure("parsing", &ast.error());
+        REQUIRE_MSG(ast, "language-card Rut example must parse");
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) report_failure("type checking", &hir.error());
+        REQUIRE_MSG(hir, "language-card Rut example must type-check");
+    }
+
+    REQUIRE_MSG(!in_rut_fence, "language card contains an unterminated rut fence");
+    REQUIRE_MSG(!pending_skip, "language card contains a dangling skip marker");
+    CHECK_GE(executable_count, 3u);
+    CHECK_GT(skipped_count, 0u);
 }
 
 TEST(frontend, rir_verifier_e2e_accepts_lowered_wait_route) {

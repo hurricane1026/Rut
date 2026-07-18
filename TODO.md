@@ -19,16 +19,6 @@ connected end to end.
 - Reload and upstream mutation define authorization, failure, and shard-ordering
   behavior.
 
-### Remaining syntax migration
-
-- Add a fixture gate that parses and type-checks every unmarked executable
-  example in `docs/language-card.md`.
-
-**Acceptance**:
-- Old/compatibility forms produce the documented prescriptive diagnostics.
-- Core examples parse and type-check in CI.
-- `./dev.sh test` remains green with no hidden-yield additions.
-
 ## P1: Implement Exact Owner-Shard State
 
 **Goal**: Implement the accepted strict `Hash<K,V>` contract in
@@ -84,6 +74,9 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] `language-card.md` Rut fences are front-end fixtures by default; target
+  and fragment surveys require an adjacent reasoned skip marker, and every
+  unmarked example parses and type-checks in CI.
 - [x] Executable `.rut` examples and topic documentation use Rut Core route
   declarations; chain examples attach one explicit chain directly to each
   route instead of teaching grouped-route inheritance.
