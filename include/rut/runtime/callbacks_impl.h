@@ -1538,6 +1538,7 @@ void handle_jit_outcome(Loop* loop,
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
+            const bool has_dynamic_body = outcome.dynamic_response_body != nullptr;
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
             constexpr u32 kMaxEffectiveHeaders =
@@ -1568,7 +1569,10 @@ void handle_jit_outcome(Loop* loop,
                 const char* body_data = nullptr;
                 u32 body_len = 0;
                 bool body_is_fallback = false;
-                if (has_body) {
+                if (has_dynamic_body) {
+                    body_data = outcome.dynamic_response_body;
+                    body_len = outcome.dynamic_response_body_len;
+                } else if (has_body) {
                     const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                     body_data = body.data;
                     body_len = body.len;
@@ -1595,6 +1599,12 @@ void handle_jit_outcome(Loop* loop,
                                                       header_count,
                                                       keep_alive,
                                                       body_is_fallback);
+            } else if (has_dynamic_body) {
+                format_response_with_body(conn,
+                                          outcome.status_code,
+                                          outcome.dynamic_response_body,
+                                          outcome.dynamic_response_body_len,
+                                          keep_alive);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(

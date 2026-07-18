@@ -3063,7 +3063,35 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
-        if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
+        if (term.has_dynamic_response_body) {
+            if (term.json_segments.len != term.json_value_ref_indices.len + 1 ||
+                !b.emit_json_reset({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            for (u32 ji = 0; ji < term.json_segments.len; ji++) {
+                if (!b.emit_json_append_raw(term.json_segments[ji],
+                                            {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::OutOfMemory, term.span);
+                if (ji >= term.json_value_ref_indices.len) continue;
+                const u32 ref = term.json_value_ref_indices[ji];
+                if (ref >= local_count)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                if (locals[ref].id >= fn->value_count || fn->values[locals[ref].id].type == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                const auto value_type = fn->values[locals[ref].id].type->kind;
+                const rir::Opcode op =
+                    value_type == rir::TypeKind::Bool  ? rir::Opcode::JsonAppendBool
+                    : value_type == rir::TypeKind::I32 ? rir::Opcode::JsonAppendI32
+                    : value_type == rir::TypeKind::I64 ? rir::Opcode::JsonAppendI64
+                    : value_type == rir::TypeKind::Str ? rir::Opcode::JsonAppendStr
+                                                       : rir::Opcode::JsonFinish;
+                if (op == rir::Opcode::JsonFinish ||
+                    !b.emit_json_append(op, locals[ref], {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            }
+            if (!b.emit_json_finish({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;  // HandlerResult::kDynamicResponseBody
+        } else if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
             body_idx = b.intern_response_body(term.response_body);
             if (body_idx == 0) {
                 // intern returns 0 for both "table full" and "arena

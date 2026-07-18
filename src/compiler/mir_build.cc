@@ -1160,6 +1160,19 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
+            out->has_dynamic_response_body = term.has_dynamic_response_body;
+            out->json_segments.len = 0;
+            out->json_value_ref_indices.len = 0;
+            static_assert(
+                HirTerminator::kMaxJsonDynamicValues == MirTerminator::kMaxJsonDynamicValues,
+                "HIR/MIR dynamic JSON caps must match");
+            for (u32 ji = 0; ji < term.json_segments.len; ji++) {
+                if (!out->json_segments.push(term.json_segments[ji])) __builtin_trap();
+            }
+            for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
+                if (!out->json_value_ref_indices.push(term.json_value_ref_indices[ji]))
+                    __builtin_trap();
+            }
             out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;
             // Both HIR and MIR cap at 16 headers per terminator, so a

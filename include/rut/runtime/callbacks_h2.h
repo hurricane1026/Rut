@@ -374,8 +374,11 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      const RouteConfig* cfg) {
     const u8* body = nullptr;
     u32 body_len = 0;
-    if (o.response_body_idx != 0 && cfg != nullptr &&
-        o.response_body_idx <= cfg->response_body_count) {
+    if (o.dynamic_response_body != nullptr) {
+        body = reinterpret_cast<const u8*>(o.dynamic_response_body);
+        body_len = o.dynamic_response_body_len;
+    } else if (o.response_body_idx != 0 && cfg != nullptr &&
+               o.response_body_idx <= cfg->response_body_count) {
         const auto& b = cfg->response_bodies[o.response_body_idx - 1];
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;

@@ -59,6 +59,8 @@ struct JitDispatchOutcome {
     //       no-body-code rule above). Preserved in both the
     //       no-headers and headers paths.
     u16 response_body_idx = 0;
+    const char* dynamic_response_body = nullptr;
+    u32 dynamic_response_body_len = 0;
     // 1-based index into RouteConfig::response_header_sets for
     // Kind::ReturnStatus; 0 = no custom headers. Decoded from the
     // next_state slot per handler ABI (reused while action is
@@ -154,7 +156,18 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             // dispatch behaviour when idx == 0 — reason-phrase fallback
             // vs. headers-only empty body — is documented on the
             // response_body_idx field above).
-            out.response_body_idx = r.upstream_id;
+            if (r.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
+                // A failed/overflowed serializer is a server error, never a
+                // partial JSON response. The helper clears valid before work.
+                if (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) {
+                    out.status_code = 500;
+                } else {
+                    out.dynamic_response_body = ctx.response_body_data;
+                    out.dynamic_response_body_len = ctx.response_body_len;
+                }
+            } else {
+                out.response_body_idx = r.upstream_id;
+            }
             out.response_headers_idx = r.next_state;
             return out;
         case jit::HandlerAction::Forward:

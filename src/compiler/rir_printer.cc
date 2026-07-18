@@ -319,6 +319,27 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CacheSet:
             buf.put_cstr("cache.set");
             break;
+        case Opcode::JsonReset:
+            buf.put_cstr("json.reset");
+            break;
+        case Opcode::JsonAppendRaw:
+            buf.put_cstr("json.append_raw");
+            break;
+        case Opcode::JsonAppendBool:
+            buf.put_cstr("json.append_bool");
+            break;
+        case Opcode::JsonAppendI32:
+            buf.put_cstr("json.append_i32");
+            break;
+        case Opcode::JsonAppendI64:
+            buf.put_cstr("json.append_i64");
+            break;
+        case Opcode::JsonAppendStr:
+            buf.put_cstr("json.append_str");
+            break;
+        case Opcode::JsonFinish:
+            buf.put_cstr("json.finish");
+            break;
         case Opcode::StructField:
             buf.put_cstr("struct.field");
             break;
@@ -733,6 +754,17 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[0]);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[1]);
+            break;
+        case Opcode::JsonAppendRaw:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            break;
+        case Opcode::JsonAppendBool:
+        case Opcode::JsonAppendI32:
+        case Opcode::JsonAppendI64:
+        case Opcode::JsonAppendStr:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
             break;
 
         // Terminators

@@ -140,6 +140,16 @@ void rut_helper_parse_prime(const rut::u8* req_data, rut::u32 req_len);
 // call before each terminal return of a request-reading handler.
 void rut_helper_parse_unprime();
 
+// Bounded per-shard JSON response serializer. reset starts one document;
+// append_* are no-ops after overflow; finish publishes an all-or-nothing view
+// through HandlerCtx. raw is compiler-owned JSON punctuation/key text only.
+void rut_helper_json_reset();
+void rut_helper_json_append_raw(const char* data, rut::u32 len);
+void rut_helper_json_append_str(const char* data, rut::u32 len);
+void rut_helper_json_append_i64(rut::i64 value);
+void rut_helper_json_append_bool(rut::u8 value);
+void rut_helper_json_finish(void* ctx);
+
 // ── String Operations ──────────────────────────────────────────────
 
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).
