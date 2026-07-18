@@ -1048,6 +1048,9 @@ struct Builder {
             if (mod->response_bodies[i].eq(body)) return static_cast<u16>(i + 1);
         }
         if (mod->response_body_count >= Module::kMaxResponseBodies) return 0;
+        if (mod->response_body_pool_used > kResponseBodyPoolBytes ||
+            body.len > kResponseBodyPoolBytes - mod->response_body_pool_used)
+            return 0;
         char* buf = nullptr;
         if (body.len > 0) {
             buf = mod->arena->alloc_array<char>(body.len);
@@ -1056,6 +1059,7 @@ struct Builder {
         }
         const u32 idx = mod->response_body_count++;
         mod->response_bodies[idx] = {buf, body.len};
+        mod->response_body_pool_used += body.len;
         return static_cast<u16>(idx + 1);
     }
 

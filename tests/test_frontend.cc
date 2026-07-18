@@ -31797,6 +31797,9 @@ route GET "/x" {
     const auto expected =
         lit("{\"quote\":\"a\\\"b\\n\",\"flags\":[true,false,null],\"negative\":-12}");
     CHECK(hir->routes[0].control.direct_term.response_body.eq(expected));
+    REQUIRE_EQ(hir->owned_strings.size(), 1u);
+    CHECK_EQ(hir->routes[0].control.direct_term.response_body.ptr,
+             hir->owned_strings.front().c_str());
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -31805,6 +31808,53 @@ route GET "/x" {
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.response_body_count, 1u);
     CHECK(rir.module.response_bodies[0].eq(expected));
+    rir.destroy();
+}
+
+TEST(frontend, json_preserves_unsupported_rut_string_escapes) {
+    const char* src = R"rut(
+route GET "/x" {
+    return 200, json("a\b\f\q")
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.response_body.eq(lit("\"a\\\\b\\\\f\\\\q\"")));
+}
+
+TEST(frontend, json_rejects_body_larger_than_runtime_pool) {
+    std::string payload(kResponseBodyPoolBytes, 'a');
+    const std::string src = "route GET \"/x\" { return 200, json(\"" + payload + "\") }\n";
+    auto lexed = lex({src.c_str(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::TooManyItems));
+}
+
+TEST(frontend, rir_rejects_aggregate_response_bodies_larger_than_runtime_pool) {
+    std::string first(kResponseBodyPoolBytes / 2, 'a');
+    std::string second(kResponseBodyPoolBytes / 2, 'b');
+    const std::string src = "route GET \"/a\" { return 200, json(\"" + first +
+                            "\") }\nroute GET \"/b\" { return 200, json(\"" + second + "\") }\n";
+    auto lexed = lex({src.c_str(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK_EQ(static_cast<u8>(lowered.error().code), static_cast<u8>(FrontendError::TooManyItems));
     rir.destroy();
 }
 

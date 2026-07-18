@@ -3001,9 +3001,13 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 // OOM for the body-bytes copy". Distinguish here so
                 // the diagnostic isn't misleading: if the count is
                 // still under the cap, the arena must have failed.
-                const auto err = b.mod->response_body_count < rir::Module::kMaxResponseBodies
-                                     ? FrontendError::OutOfMemory
-                                     : FrontendError::TooManyItems;
+                const bool pool_full = b.mod->response_body_pool_used > kResponseBodyPoolBytes ||
+                                       term.response_body.len >
+                                           kResponseBodyPoolBytes - b.mod->response_body_pool_used;
+                const auto err =
+                    (pool_full || b.mod->response_body_count >= rir::Module::kMaxResponseBodies)
+                        ? FrontendError::TooManyItems
+                        : FrontendError::OutOfMemory;
                 return frontend_error(err, term.span);
             }
         }
