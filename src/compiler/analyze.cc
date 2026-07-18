@@ -4097,6 +4097,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             break;
         }
         if (response != nullptr) {
+            const bool captured = response->init.is_wait_result &&
+                                  response->init.wait_event_kind == WaitEventKind::ForwardBuffered;
             if (!expr.name.eq({"header", 6}) || expr.args.len != 1 || expr.args[0] == nullptr ||
                 expr.args[0]->kind != AstExprKind::StrLit)
                 return frontend_error(
@@ -4114,7 +4116,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                     break;
                 }
             }
-            if (!response->init.bool_value) {
+            if (!captured && !response->init.bool_value) {
                 if (fallback != nullptr) return *fallback;
                 HirExpr out{};
                 out.kind = HirExprKind::Nil;
@@ -6462,6 +6464,8 @@ static i32 wait_event_resume_kind_value(WaitEventKind kind) {
             return 9;
         case WaitEventKind::Any:
             return 4;
+        case WaitEventKind::ForwardBuffered:
+            return 2;
     }
     return 0;
 }
@@ -7067,8 +7071,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.span,
                                       lit_str("Response readable fields are status and body"));
+            const bool captured = response->init.kind == HirExprKind::ResponseInit &&
+                                  response->init.is_wait_result &&
+                                  response->init.wait_event_kind == WaitEventKind::ForwardBuffered;
             if (response->init.kind != HirExprKind::ResponseInit ||
-                response->init.int_value < 100 || response->init.int_value > 599)
+                (!captured && (response->init.int_value < 100 || response->init.int_value > 599)))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     expr.span,
@@ -7079,13 +7086,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (read_status) {
                 fallback.kind = HirExprKind::IntLit;
                 fallback.type = HirTypeKind::I32;
-                fallback.int_value = response->init.int_value;
+                fallback.int_value = captured ? 0 : response->init.int_value;
             } else {
                 fallback.kind = HirExprKind::StrLit;
                 fallback.type = HirTypeKind::Str;
                 fallback.str_value = {"", 0};
             }
-            if (!response->init.bool_value) return fallback;
+            if (!captured && !response->init.bool_value) return fallback;
             if (!route->exprs.push(fallback))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             out.kind = read_status ? HirExprKind::RespStatus : HirExprKind::RespBody;
@@ -8917,6 +8924,31 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                            expr.span);
         if (!shape) return core::make_unexpected(shape.error());
         out.shape_index = shape.value();
+        return out;
+    }
+
+    if (expr.name.eq({"forward", 7}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"forward", 7})) {
+        if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
+            expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::Ident)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("expression-form forward requires `forward(upstream, buffered: true)`"));
+        auto upstream_index =
+            find_upstream_index_by_name(mod, expr.args[0]->name, expr.args[0]->span);
+        if (!upstream_index) return core::make_unexpected(upstream_index.error());
+        HirExpr out{};
+        out.kind = HirExprKind::ResponseInit;
+        out.type = HirTypeKind::Response;
+        out.span = expr.span;
+        // Status zero is an internal sentinel for a captured response. Source
+        // response() builders remain restricted to 100...599.
+        out.int_value = 0;
+        out.is_wait_result = true;
+        out.wait_event_kind = WaitEventKind::ForwardBuffered;
+        out.wait_payload = mod.upstreams[upstream_index.value()].id;
+        out.wait_arm_mask = kWaitEventArmForward;
         return out;
     }
 
@@ -18648,8 +18680,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // statement is analyzed so pre-wait bindings are caught too.
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
+            const bool buffered_forward_let = s.kind == AstStmtKind::Let &&
+                                              s.expr.kind == AstExprKind::Call &&
+                                              s.expr.name.eq({"forward", 7});
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
-                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait) ||
+                buffered_forward_let) {
                 route.cache_ops_blocked = true;
                 route.time_ops_blocked = true;
             }
@@ -18719,7 +18755,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         }
 
                         auto& response_init = route.locals[response_local].init;
-                        const bool runtime = response_init.bool_value ||
+                        const bool runtime = response_init.is_wait_result ||
+                                             response_init.bool_value ||
                                              (!is_remove && value.kind != HirExprKind::StrLit);
                         if (runtime) {
                             u32 response_builder_count = 0;
@@ -18922,6 +18959,24 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const bool let_wait_result =
                 stmt.kind == AstStmtKind::Let && stmt.expr.kind == AstExprKind::Wait;
             if (stmt.kind == AstStmtKind::Let && seen_wait && !let_wait_result) {
+                bool has_captured_response = false;
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    const auto& existing = route.locals[li].init;
+                    if (existing.kind == HirExprKind::ResponseInit && existing.is_wait_result &&
+                        existing.wait_event_kind == WaitEventKind::ForwardBuffered) {
+                        has_captured_response = true;
+                        break;
+                    }
+                }
+                const bool adds_response =
+                    stmt.expr.kind == AstExprKind::Call &&
+                    (stmt.expr.name.eq({"forward", 7}) || stmt.expr.name.eq({"response", 8}));
+                if (has_captured_response && adds_response)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.span,
+                        lit_str("first-class buffered forward requires exactly one Response "
+                                "builder in the route"));
                 return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
             }
             if (stmt.kind == AstStmtKind::Let) {
@@ -18994,7 +19049,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
-                if (init->kind == HirExprKind::WaitResult) {
+                if (init->is_wait_result &&
+                    init->wait_event_kind == WaitEventKind::ForwardBuffered) {
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].init.kind == HirExprKind::ResponseInit)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.expr.span,
+                                lit_str("first-class buffered forward requires exactly one "
+                                        "Response builder in the route"));
+                    }
+                }
+                if (init->is_wait_result) {
                     if (seen_for)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
@@ -19018,9 +19084,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         stmt.expr.span,
                         lit_str("Response builders cannot be copied or aliased in this slice"));
                 if (init->kind == HirExprKind::ResponseInit) {
+                    const bool captured_init =
+                        init->is_wait_result &&
+                        init->wait_event_kind == WaitEventKind::ForwardBuffered;
                     for (u32 li = 0; li < route.locals.len; li++) {
-                        if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
-                            route.locals[li].init.bool_value)
+                        if (route.locals[li].init.kind != HirExprKind::ResponseInit) continue;
+                        const bool existing_capture =
+                            route.locals[li].init.is_wait_result &&
+                            route.locals[li].init.wait_event_kind == WaitEventKind::ForwardBuffered;
+                        if (captured_init || existing_capture)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.expr.span,
+                                lit_str("first-class buffered forward requires exactly one "
+                                        "Response builder in the route"));
+                        if (route.locals[li].init.bool_value)
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax,
                                 stmt.expr.span,

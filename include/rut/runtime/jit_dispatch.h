@@ -30,6 +30,7 @@ struct JitDispatchOutcome {
         ReturnStatus,
         Forward,
         ForwardBuffered,
+        ForwardCapture,
         TimerYield,
         EventYield,
         Error,
@@ -153,6 +154,15 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
             out.status_code = r.status_code;
             out.response_ctx = &ctx;
+            if (r.status_code == 0) {
+                if (!ctx.captured_response_valid) {
+                    out.status_code = 500;
+                    return out;
+                }
+                out.status_code = ctx.captured_response_status;
+                out.dynamic_response_body = ctx.captured_response_body;
+                out.dynamic_response_body_len = ctx.captured_response_body_len;
+            }
             if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
                 out.status_code = 500;
                 out.response_body_idx = 0;
@@ -214,7 +224,10 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                     return out;
                 case jit::YieldKind::HttpGet:
                 case jit::YieldKind::HttpPost:
+                    return out;
                 case jit::YieldKind::Forward:
+                    out.kind = JitDispatchOutcome::Kind::ForwardCapture;
+                    out.upstream_id = static_cast<u16>(r.yield_payload_u32());
                     return out;
             }
             return out;

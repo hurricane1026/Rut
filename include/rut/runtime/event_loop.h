@@ -736,6 +736,10 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        if (c.response_capture_slice) {
+            pool.free(c.response_capture_slice);
+            c.response_capture_slice = nullptr;
+        }
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
         if (c.ws_c2u_msg) {

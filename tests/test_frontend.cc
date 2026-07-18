@@ -6895,6 +6895,118 @@ route GET "/x" {
     }
 }
 
+TEST(frontend, buffered_forward_expression_builds_response_resume_state) {
+    const auto src = R"rut(
+upstream api
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    resp.set("X-Captured", resp.header("X-Origin").or("missing"))
+    resp.status = resp.status
+    resp.body = resp.body
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK(hir->routes[0].waits[0].event_kind == WaitEventKind::ForwardBuffered);
+    CHECK_EQ(hir->routes[0].waits[0].ms, 0u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK(hir->routes[0].locals[0].init.is_wait_result);
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 0);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].waits.len, 1u);
+    CHECK(mir->functions[0].waits[0].event_kind == WaitEventKind::ForwardBuffered);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 2u);
+    CHECK(mir->functions[0].blocks[0].term.kind == MirTerminatorKind::YieldTimer);
+    CHECK_EQ(mir->functions[0].blocks[0].effects.len, 0u);
+    CHECK_EQ(mir->functions[0].blocks[1].effects.len, 3u);
+    CHECK(mir->functions[0].blocks[1].term.kind == MirTerminatorKind::ReturnStatus);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    const auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
+TEST(frontend, buffered_forward_expression_rejects_unowned_and_request_rewrite_forms) {
+    struct Case {
+        const char* expression;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {"forward(api)", "expression-form forward requires `buffered: true`"},
+        {"forward(api, buffered: false)", "expression-form forward requires `buffered: true`"},
+        {"forward(api, buffered: true, set_path: \"/v2\")",
+         "expression-form buffered forward does not support request rewrites"},
+    };
+    for (const auto& c : cases) {
+        std::string source = "upstream api\nroute GET \"/x\" { let resp = ";
+        source += c.expression;
+        source += " return resp }\n";
+        auto lexed = lex(Str{source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        u32 detail_len = 0;
+        while (c.detail[detail_len] != '\0') detail_len++;
+        CHECK(ast.error().detail.eq(Str{c.detail, detail_len}));
+    }
+}
+
+TEST(frontend, buffered_forward_expression_rejects_multiple_response_builders) {
+    struct Case {
+        const char* name;
+        const char* source;
+    };
+    const Case cases[] = {
+        {"builder-before-capture", R"rut(
+upstream api
+route GET "/x" {
+    let local = response(200)
+    let captured = forward(api, buffered: true)
+    return captured
+}
+)rut"},
+        {"builder-after-capture", R"rut(
+upstream api
+route GET "/x" {
+    let captured = forward(api, buffered: true)
+    let local = response(200)
+    return captured
+}
+)rut"},
+        {"two-captures", R"rut(
+upstream api
+route GET "/x" {
+    let first = forward(api, buffered: true)
+    let second = forward(api, buffered: true)
+    return second
+}
+)rut"},
+    };
+    for (const auto& c : cases) {
+        const char* source = c.source;
+        auto lexed = lex(Str{source, static_cast<u32>(__builtin_strlen(source))});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_MSG(
+            hir.error().detail.eq(lit(
+                "first-class buffered forward requires exactly one Response builder in the route")),
+            c.name);
+    }
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));

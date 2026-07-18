@@ -487,6 +487,50 @@ struct Parser {
             expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return expr;
         }
+        if (take(TokenType::KwForward)) {
+            // Expression-form forwarding is intentionally narrower than the
+            // terminal builder: it must be buffered so the resumed handler can
+            // own and inspect a complete response.
+            auto lparen = expect(TokenType::LParen);
+            if (!lparen) return core::make_unexpected(lparen.error());
+            auto upstream = expect(TokenType::Ident);
+            if (!upstream) return core::make_unexpected(upstream.error());
+            if (!take(TokenType::Comma))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(cur()),
+                                      lit_str("expression-form forward requires `buffered: true`"));
+            auto buffered = expect(TokenType::Ident);
+            if (!buffered) return core::make_unexpected(buffered.error());
+            if (!buffered.value()->text.eq({"buffered", 8}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*buffered.value()),
+                                      lit_str("expression-form forward requires `buffered: true`"));
+            auto colon = expect(TokenType::Colon);
+            if (!colon) return core::make_unexpected(colon.error());
+            if (!take(TokenType::KwTrue))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(cur()),
+                                      lit_str("expression-form forward requires `buffered: true`"));
+            if (cur().type == TokenType::Comma)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span_from(cur()),
+                    lit_str("expression-form buffered forward does not support request rewrites"));
+            auto rparen = expect(TokenType::RParen);
+            if (!rparen) return core::make_unexpected(rparen.error());
+
+            AstExpr upstream_ref{};
+            upstream_ref.kind = AstExprKind::Ident;
+            upstream_ref.name = upstream.value()->text;
+            upstream_ref.span = span_from(*upstream.value());
+            auto upstream_ptr = alloc_expr(upstream_ref);
+            if (!upstream_ptr) return core::make_unexpected(upstream_ptr.error());
+            expr.kind = AstExprKind::Call;
+            expr.name = {"forward", 7};
+            expr.args.push(upstream_ptr.value());
+            expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
+            return expr;
+        }
         if (take(TokenType::KwTrue)) {
             expr.kind = AstExprKind::BoolLit;
             expr.bool_value = true;

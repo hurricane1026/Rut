@@ -502,7 +502,8 @@ void rut_helper_resp_commit_headers(void* ctx) {
 i32 rut_helper_resp_status(void* ctx, i32 fallback) {
     if (ctx == nullptr) return fallback;
     const auto* hctx = static_cast<const jit::HandlerCtx*>(ctx);
-    return hctx->response_status_pending_set ? hctx->response_status_pending : fallback;
+    if (hctx->response_status_pending_set) return hctx->response_status_pending;
+    return hctx->captured_response_valid ? hctx->captured_response_status : fallback;
 }
 
 void rut_helper_resp_body(
@@ -511,6 +512,10 @@ void rut_helper_resp_body(
     *out_len = fallback_len;
     if (ctx == nullptr) return;
     const auto* hctx = static_cast<const jit::HandlerCtx*>(ctx);
+    if (hctx->captured_response_valid) {
+        *out_ptr = hctx->captured_response_body;
+        *out_len = hctx->captured_response_body_len;
+    }
     // Overflow is already a fail-closed terminal condition. Do not expose a
     // partial or dangling value to later expressions while building that 500.
     if (!hctx->response_body_pending_set || hctx->response_body_pending_overflow) return;
@@ -532,6 +537,16 @@ void rut_helper_resp_header(void* ctx,
     *out_len = fallback_has ? fallback_len : 0;
     if (ctx == nullptr) return;
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    if (hctx->captured_response_valid) {
+        for (u32 i = 0; i < hctx->captured_response_header_count; i++) {
+            const auto& header = hctx->captured_response_headers[i];
+            if (!ascii_header_name_eq(header.name, name, nlen)) continue;
+            *out_has = 1;
+            *out_ptr = header.value.ptr;
+            *out_len = header.value.len;
+            break;
+        }
+    }
     for (u32 i = 0; i < hctx->response_header_pending_count; i++) {
         const auto& mutation = hctx->response_header_mutations[i];
         if (!ascii_header_name_eq(mutation.name, name, nlen)) continue;

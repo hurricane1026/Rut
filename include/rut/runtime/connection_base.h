@@ -214,6 +214,9 @@ struct ConnectionBase {
     // Explicit `forward(..., buffered: true)`: accumulate the complete upstream
     // response, then apply the committed HandlerCtx Response mutations.
     bool proxy_response_buffered;
+    // Buffered proxy completion resumes the handler instead of publishing the
+    // upstream response directly.
+    bool proxy_response_capture;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -546,6 +549,10 @@ struct ConnectionBase {
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
+    // Lazy stream-owned copy used only by expression-form buffered forwarding.
+    // It remains stable across later handler yields and is returned with the
+    // connection/request buffers.
+    u8* response_capture_slice;
 
     void reset() {
         on_recv = nullptr;
@@ -585,6 +592,7 @@ struct ConnectionBase {
         upstream_slot_held = false;
         upstream_slot_uid = 0;
         proxy_response_buffered = false;
+        proxy_response_capture = false;
         throttle_down_bps = 0;
         throttle_tat_ns = 0;
         throttle_paused = false;
@@ -712,6 +720,7 @@ struct ConnectionBase {
         send_progress = 0;
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);
+        response_capture_slice = nullptr;
     }
 };
 

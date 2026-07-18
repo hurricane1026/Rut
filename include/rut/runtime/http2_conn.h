@@ -163,6 +163,7 @@ struct Http2Conn {
     const RouteEntry* async_route;
     u16 async_upstream_id;
     bool async_apply_response_mutations;
+    bool async_capture_response;
     u32 async_resp_len;
 
     // Set callbacks (any may be null) then call init().

@@ -567,6 +567,7 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        if (c.response_capture_slice) pool.free(c.response_capture_slice);
         // Sync backend: kernel is done with buffers. Free immediately.
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);

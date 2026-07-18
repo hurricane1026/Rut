@@ -22,9 +22,10 @@ inline u8 default_yield_arm_mask(u8 kind, u32 payload) {
             return 1u << 4;
         case jit::YieldKind::UpstreamSend:
             return 1u << 5;
+        case jit::YieldKind::Forward:
+            return 1u << 6;
         case jit::YieldKind::HttpGet:
         case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
             return 0;
     }
     return 0;

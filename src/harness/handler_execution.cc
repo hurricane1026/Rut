@@ -230,19 +230,41 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         out.harness.virtual_time_us = environment.now_us;
         out.consumed_events = environment.cursor;
         if (event.data_len != 0 && event.kind != jit::YieldKind::Recv &&
-            event.kind != jit::YieldKind::UpstreamRecv) {
+            event.kind != jit::YieldKind::UpstreamRecv && event.kind != jit::YieldKind::Forward) {
             out.harness.outcome = Outcome::Invalid;
             copy_detail(out.harness.detail,
                         sizeof(out.harness.detail),
-                        "scripted data requires a recv completion");
+                        "scripted data requires a recv or forward completion");
             return out;
         }
-        if (event.data_len != 0 && event.result != static_cast<i32>(event.data_len)) {
+        if (event.data_len != 0 && event.kind != jit::YieldKind::Forward &&
+            event.result != static_cast<i32>(event.data_len)) {
             out.harness.outcome = Outcome::Invalid;
             copy_detail(out.harness.detail,
                         sizeof(out.harness.detail),
                         "recv result does not match scripted data length");
             return out;
+        }
+        if (event.kind == jit::YieldKind::Forward) {
+            if (event.response_status < 100 || event.response_status > 599 ||
+                event.response_header_count > jit::kMaxCapturedResponseHeaders ||
+                (event.response_header_count != 0 && event.response_headers == nullptr) ||
+                (event.data_len != 0 && event.data == nullptr)) {
+                out.harness.outcome = Outcome::Invalid;
+                copy_detail(out.harness.detail,
+                            sizeof(out.harness.detail),
+                            "forward completion requires a valid response fixture");
+                return out;
+            }
+            auto& response = execution.frame.context;
+            response.captured_response_valid = true;
+            response.captured_response_status = event.response_status;
+            response.captured_response_body = reinterpret_cast<const char*>(event.data);
+            response.captured_response_body_len = event.data_len;
+            response.captured_response_header_count = event.response_header_count;
+            for (u32 i = 0; i < event.response_header_count; i++)
+                response.captured_response_headers[i] = event.response_headers[i];
+            event.result = event.response_status;
         }
         if (event.data_len > harness.limits.max_input_bytes - out.harness.input_bytes) {
             out.harness.outcome = Outcome::Failed;

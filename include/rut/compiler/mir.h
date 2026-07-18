@@ -308,7 +308,9 @@ struct MirBlock {
     Str label{};
     // Side effects materialized in this block immediately before `term`.
     // Each entry indexes the owning MirFunction::values pool.
-    static constexpr u32 kMaxEffects = 2;
+    // A resumed Response may apply the full bounded header mutation log plus
+    // one status and one body replacement before its terminal return.
+    static constexpr u32 kMaxEffects = 18;
     FixedVec<Effect, kMaxEffects> effects;
     MirTerminator term{};
 };

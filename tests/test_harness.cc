@@ -98,6 +98,23 @@ u64 targeted_upstream_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*
     return jit::HandlerResult::make_status(204).pack();
 }
 
+u64 captured_forward_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (ctx->resume_event_kind != static_cast<u32>(jit::YieldKind::Forward) ||
+        ctx->resume_event_result != 206 || !ctx->captured_response_valid ||
+        ctx->captured_response_status != 206 || ctx->captured_response_body_len != 4 ||
+        ctx->captured_response_header_count != 1 ||
+        !ctx->captured_response_headers[0].value.eq({"fixture", 7}))
+        return jit::HandlerResult::make_status(500).pack();
+    ctx->response_body_data = ctx->captured_response_body;
+    ctx->response_body_len = ctx->captured_response_body_len;
+    ctx->response_body_valid = 1;
+    auto result = jit::HandlerResult::make_status(206);
+    result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+    return result.pack();
+}
+
 u64 any_timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Any, 25).pack();
@@ -554,6 +571,46 @@ TEST(harness_handler, stalls_when_script_targets_a_different_upstream) {
     CHECK_EQ(result.harness.outcome, harness::Outcome::Stalled);
     CHECK_EQ(result.consumed_events, 0u);
     CHECK_EQ(result.harness.virtual_time_us, 0u);
+}
+
+TEST(harness_handler, replays_owned_buffered_forward_response_fields) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_forward_handler, nullptr, nullptr, 0);
+    static constexpr u8 kBody[] = {'b', 'o', 'd', 'y'};
+    static constexpr char kName[] = "X-Origin";
+    static constexpr char kValue[] = "fixture";
+    const jit::CapturedResponseHeader headers[] = {
+        {{kName, sizeof(kName) - 1}, {kValue, sizeof(kValue) - 1}},
+    };
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        kBody,
+        sizeof(kBody),
+        false,
+        false,
+        206,
+        headers,
+        1,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 206);
+    REQUIRE(result.dynamic_response_body_valid);
+    CHECK_EQ(result.dynamic_response_body_len, sizeof(kBody));
+    CHECK(std::memcmp(result.dynamic_response_body, kBody, sizeof(kBody)) == 0);
 }
 
 TEST(harness_connection, reports_and_resets_cleanup_invariants) {

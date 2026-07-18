@@ -251,8 +251,8 @@ must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
 literal names and runtime string values; its effects apply to successful direct
 responses. Mutations stay pending until the selected success terminator, so a
 guard or pre-middleware short circuit cannot inherit them. Applying any of these
-mutations to a forwarded response requires the terminal
-`return forward(upstream, buffered: true)` form.
+mutations to a forwarded response requires buffered forwarding, either terminal
+`return forward(upstream, buffered: true)` or the first-class expression form.
 Status/body writes use the same resumable commit boundary as headers and may be
 used by `chain after` after a yield. Body replacement owns up to 4 KiB in the
 request/stream context; plain `str` and reusable `Json` values therefore survive
@@ -268,8 +268,12 @@ HTTP/1 and HTTP/2 paths use the same boundary and preserve effects across
 `wait`. Malformed, truncated, upgraded, or over-cap upstream responses fail
 closed as 502; invalid or overflowing mutations fail closed as 500. Combining
 buffered response handling with `set_path` or `set_header` request rewrites is
-rejected until the HTTP/2 request-rewrite path is wired. Binding the buffered
-result as a first-class `Response` for upstream field reads remains ⏳.
+rejected until the HTTP/2 request-rewrite path is wired. The expression form
+`let resp = forward(upstream, buffered: true)` owns the filtered status, body,
+and up to 64 headers in a separate lazy 16 KiB stream slice. Reads, mutations,
+and a subsequent `wait` remain valid until `return resp`; the slice is returned
+to the pool after final serialization. Unbuffered expression forwarding is
+rejected because it cannot provide owned response fields.
 
 ## State types (top-level, per-shard, bounded)
 
@@ -346,7 +350,7 @@ or incrementally editing an upstream buffered body remains ⏳.
 // Proxy — the ONLY three forms
 return forward(users)                          // zero-copy, terminal
 return forward(users, buffered: true)          // ✅ bounded terminal buffering + after mutations
-let resp = forward(users, buffered: true)      // ⏳ first-class buffered Response expression
+let resp = forward(users, buffered: true)      // ✅ first-class bounded Response expression
 return forward(users, streaming: true)         // large bodies, no buffering
 
 // Static files / pipes

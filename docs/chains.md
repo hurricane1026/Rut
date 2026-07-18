@@ -24,7 +24,9 @@ or `remove` header effects plus status and bounded body replacement. These
 effects live in resumable stream-owned state, so they survive explicit `wait`
 and verifier-bounded `for` control flow. A forwarded response must use
 `return forward(upstream, buffered: true)` so the runtime can materialize the
-complete response before committing the effects.
+complete response before committing the effects. A handler that needs direct
+field access may instead bind `let resp = forward(upstream, buffered: true)`,
+read or mutate its owned fields across later yields, and `return resp`.
 
 If a route needs more precise control than "before handler" or "after handler",
 write that logic directly inside the handler with ordinary `guard`, `wait`,
