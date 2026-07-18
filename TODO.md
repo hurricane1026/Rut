@@ -107,9 +107,11 @@ without presenting lossy or per-shard state as exact shared state.
 - [x] Lower `Cache.set` at its branch position instead of only in the route-entry
   prelude. This enables a Rut limiter to commit the successor only on its
   accepted branch; the shipped example now demonstrates that policy.
-- Design the strict, visible-failure `Hash` table and an owner-shard atomic
+- [x] Design the strict, visible-failure `Hash` table and an owner-shard atomic
   update primitive before offering exact cross-shard rate limiting or state
-  whose absence would be incorrect.
+  whose absence would be incorrect. The accepted, not-yet-implemented contract
+  is in `docs/hash-state.md`: no eviction, per-key owner linearization, pure
+  bounded updater, definite-not-applied failures, and reload ownership rules.
 - Keep cross-node `backend:` syntax reserved until reads have an explicit
   freshness/invalidation contract; do not describe Cache as a source of truth.
 
