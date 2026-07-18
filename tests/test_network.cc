@@ -12455,6 +12455,46 @@ TEST(state_invariant, proxy_timeout_clears_proxy_slots) {
     check_idle_invariant(_tc, &loop.conns[cid]);
 }
 
+TEST(state_invariant, h2_proxy_timeout_tears_down_upstream_before_sending_504) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->state = ConnState::Proxying;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    const i32 upstream_fd = c->upstream_fd;
+    c->upstream_slot_held = true;
+    c->epoch_held = true;
+    c->set_slots(nullptr,
+                 nullptr,
+                 &h2_on_upstream_response<SmallLoop>,
+                 &h2_on_upstream_request_sent<SmallLoop>);
+
+    h2_proxy_fail(&loop, *c, 504);
+
+    CHECK_EQ(fcntl(upstream_fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(!c->upstream_slot_held);
+    CHECK(!c->epoch_held);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK_EQ(static_cast<u8>(h2.async_kind), static_cast<u8>(H2AsyncKind::None));
+    check_sending_response_invariant(_tc, c);
+    CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
+
+    // The mock connection does not own stack-backed Http2Conn storage.
+    c->h2 = nullptr;
+}
+
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     SmallLoop loop;
     loop.setup();
