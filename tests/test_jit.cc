@@ -1453,6 +1453,57 @@ TEST(jit, control_plane_mutation_helpers_fail_closed_and_delegate_to_explicit_po
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 2), 0u);
     CHECK_EQ(rut_helper_upstream_mark(&frame.ctx, 6, 0, 0, 0), 1u);
     CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 1, 0, 0, 1), 0u);
+    CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Unhealthy);
+    CHECK_EQ(rut_helper_upstream_mark_checked(&frame.ctx, 6, 0, 0, 0, 1), 1u);
+    CHECK_EQ(mutation.manual_health({6, 0, 0}), ManualHealthOverride::Healthy);
+}
+
+TEST(jit, pinned_timer_upstream_mark_executes_with_latched_generation) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: true) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    ControlPlaneMutationPort mutation;
+    mutation.reset(9, false);
+    TestHandlerCtxFrame frame{};
+    frame.ctx.control_plane_mutation = &mutation;
+    frame.ctx.config_generation = 9;
+    auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(mutation.manual_health({9, 0, 0}), ManualHealthOverride::Healthy);
+    CHECK_EQ(mutation.manual_health({9, 0, 1}), ManualHealthOverride::Healthy);
+
+    mutation.reset(10, false);
+    result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    CHECK_EQ(result.status_code, 500u);
+    CHECK_EQ(mutation.manual_health({10, 0, 0}), ManualHealthOverride::None);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {

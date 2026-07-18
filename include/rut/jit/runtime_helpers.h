@@ -158,6 +158,12 @@ rut::u8 rut_helper_upstream_mark(void* ctx,
                                  rut::u16 upstream_id,
                                  rut::u16 backend_id,
                                  rut::u8 healthy);
+rut::u8 rut_helper_upstream_mark_checked(void* ctx,
+                                         rut::u64 config_generation,
+                                         rut::u16 receiver_upstream_id,
+                                         rut::u16 server_upstream_id,
+                                         rut::u16 backend_id,
+                                         rut::u8 healthy);
 const char* rut_helper_json_capture_data();
 rut::u32 rut_helper_json_capture_len();
 void rut_helper_json_finish(void* ctx);

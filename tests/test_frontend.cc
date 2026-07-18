@@ -32293,6 +32293,91 @@ TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contex
     CHECK_EQ(mark->params[1].type, BuiltinDeclType::Bool);
 }
 
+TEST(frontend, pinned_timer_upstream_mark_lowers_declared_servers_in_source_order) {
+    const char* src = R"rut(
+upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
+func check(_ server: Server) -> bool => true
+timer check_health, every: 5s, shard: 0 {
+    for server in users.servers {
+        guard users.mark(server, healthy: check(server)) else { return 500 }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const AstStatement& for_stmt = *ast->items[2].timer.statements[0];
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    const AstStatement& guard_stmt = for_stmt.then_stmt->kind == AstStmtKind::Block
+                                         ? *for_stmt.then_stmt->block_stmts[0]
+                                         : *for_stmt.then_stmt;
+    const AstExpr& mark_call = guard_stmt.expr;
+    CHECK(mark_call.msg.eq(lit("healthy")));
+    CHECK_EQ(mark_call.int_value, 2);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].params.len, 1u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Server);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    CHECK_EQ(hir->routes[0].for_loops[0].loop_var_type, HirTypeKind::Server);
+    CHECK_EQ(hir->routes[0].for_loops[0].iter_expr.args.len, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 marks = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            if (block.insts[ii].op == rir::Opcode::UpstreamMark) {
+                marks++;
+                CHECK_EQ(block.insts[ii].imm.i32_val, 0);
+            }
+        }
+    }
+    CHECK_EQ(marks, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, upstream_mark_rejects_unpinned_route_and_unknown_backend_set) {
+    const char* cases[] = {
+        "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+        "timer check_health, every: 5s { for server in users.servers { guard "
+        "users.mark(server, healthy: true) else { return 500 } } return 200 }\n",
+        "upstream users { backends: [\"127.0.0.1:8080\"] }\n"
+        "route GET \"/x\" { for server in users.servers { guard users.mark(server, healthy: "
+        "true) else { return 500 } } return 200 }\n",
+        "upstream users\n"
+        "timer check_health, every: 5s, shard: 0 { for server in users.servers { return 200 } "
+        "return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex({src, static_cast<u32>(__builtin_strlen(src))});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(!hir);
+    }
+}
+
+TEST(frontend, method_argument_labels_remain_restricted_to_upstream_mark) {
+    const char* src =
+        "route GET \"/x\" { if req.path.hasPrefix(prefix: \"/x\") { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK(hir.error().detail.eq(lit("argument labels are not supported for this method")));
+}
+
 TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {
     const char* src = R"rut(
 route GET "/admin" {

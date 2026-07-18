@@ -49,6 +49,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
     return kind == HirTypeKind::Bool       ? MirTypeKind::Bool
            : kind == HirTypeKind::I32      ? MirTypeKind::I32
            : kind == HirTypeKind::I64      ? MirTypeKind::I64
+           : kind == HirTypeKind::Server   ? MirTypeKind::I64
            : kind == HirTypeKind::Str      ? MirTypeKind::Str
            : kind == HirTypeKind::Method   ? MirTypeKind::Method
            : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
@@ -269,9 +270,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.bool_value = expr.bool_value;
         return v;
     }
-    if (expr.kind == HirExprKind::IntLit) {
+    if (expr.kind == HirExprKind::IntLit || expr.kind == HirExprKind::ServerLit) {
         v.kind = MirValueKind::IntConst;
-        v.type = mir_type_kind(expr.type);  // I32 or I64
+        v.type = mir_type_kind(expr.type);  // I32, I64, or opaque Server as I64
         v.int_value = expr.int_value;
         return v;
     }
@@ -774,6 +775,23 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::I64;
         v.cache_index = expr.cache_index;
         v.lhs = key_ptr;
+        v.rhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::UpstreamMark) {
+        auto server = mir_value(*expr.lhs, module, fn, ctx);
+        if (!server) return core::make_unexpected(server.error());
+        auto healthy = mir_value(*expr.rhs, module, fn, ctx);
+        if (!healthy) return core::make_unexpected(healthy.error());
+        if (!fn->values.push(server.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        MirValue* server_ptr = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(healthy.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::UpstreamMark;
+        v.type = MirTypeKind::Bool;
+        v.int_value = expr.int_value;
+        v.lhs = server_ptr;
         v.rhs = &fn->values[fn->values.len - 1];
         return v;
     }

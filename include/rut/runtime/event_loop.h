@@ -209,7 +209,7 @@ public:
             if (now < timer_deadline_ns[i]) continue;
             jit::HandlerCtx ctx{};
             latch_control_plane_snapshot(&self(), &ctx);
-            latch_control_plane_mutation(&self(), &ctx);
+            latch_control_plane_mutation(&self(), &ctx, cfg->config_generation);
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
             timer_fire_count[i]++;
             // Reschedule from now (not the missed deadline) to avoid a catch-up

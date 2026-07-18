@@ -1,9 +1,9 @@
 # Control-Plane Mutation Contract
 
 Status: accepted contract. The shared mutation port, handler ABI capability,
-JIT helper boundary, production event-loop injection, and deterministic harness
-fixture are implemented; source lowering and the process reload coordinator
-remain staged in TODO.md.
+JIT helper boundary, production event-loop injection, deterministic harness
+fixture, and shard-pinned `upstream.mark` source lowering are implemented. The
+process reload coordinator remains staged in TODO.md.
 
 Rut exposes control-plane reads (`stats()` and `metrics()`) as bounded values
 latched at handler entry. Mutations are different: they change process-wide
@@ -17,6 +17,9 @@ source form until it implements the corresponding contract end to end.
 ## Source contract
 
 ```rut
+upstream users { backends: ["127.0.0.1:8080", "127.0.0.2:8080"] }
+func check(_ server: Server) -> bool => true
+
 route POST "/admin/reload" {
     guard reload() else { return 503 }
     return 202
@@ -25,8 +28,9 @@ route POST "/admin/reload" {
 timer check_health, every: 5s, shard: 0 {
     for server in users.servers {
         let healthy = check(server)
-        guard users.mark(server, healthy: healthy) else { return }
+        guard users.mark(server, healthy: healthy) else { return 503 }
     }
+    return 200
 }
 ```
 
@@ -124,6 +128,16 @@ generation and upstream membership, then writes a process-shared bounded
 override slot for that exact identity. All shards consult the override before
 their local active/passive health state:
 
+The current source iterator is deliberately narrower than the runtime view:
+`upstream.servers` requires backend addresses in the source declaration so the
+verifier can statically unroll the bounded loop in declaration order. A
+name-only, runtime-bound upstream is rejected until bounded runtime iteration is
+implemented. The `Server` carrier holds upstream/backend identity; the handler
+context independently latches the config generation for the whole timer
+invocation. Server values cannot be constructed by source or persisted in
+state, so a late invocation still fails the generation check without exposing
+a pointer.
+
 - `healthy: false` forces the target out of normal selection;
 - `healthy: true` forces it into normal selection;
 - a reload clears all overrides while publishing the new generation.
@@ -184,7 +198,7 @@ generation order, and terminal records.
    model to the handler ABI and harness.
 2. [x] Implement `Server` identities, `Upstream.servers`, and the shared manual
    health override consulted by both network backends.
-3. Lower and execute timer-only, shard-pinned `upstream.mark`.
+3. [x] Lower and execute timer-only, shard-pinned `upstream.mark`.
 4. Implement the reload coordinator, generation acknowledgements, program pins,
    compatibility validation, SIGHUP, and process-harness coverage.
 5. Lower route-only `reload()` after the same coordinator is the sole activation

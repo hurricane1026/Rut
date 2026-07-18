@@ -231,6 +231,9 @@ enum class Opcode : u8 {
     CacheGet,  // %r = cache.get %key, inst=N        → Optional(i64)  (imm.i32_val = instance)
     CacheSet,  // %r = cache.set %key, %val, inst=N  → i64 (echoes %val)
 
+    // ── Control-plane mutation ──
+    UpstreamMark,  // %r = upstream.mark %server, %healthy → bool
+
     // ── Bounded dynamic JSON response construction ──
     JsonReset,               // reset shard-local serializer scratch
     JsonAppendRaw,           // append compiler-owned JSON bytes (imm.str_val)

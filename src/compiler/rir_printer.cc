@@ -331,6 +331,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CacheSet:
             buf.put_cstr("cache.set");
             break;
+        case Opcode::UpstreamMark:
+            buf.put_cstr("upstream.mark");
+            break;
         case Opcode::JsonReset:
             buf.put_cstr("json.reset");
             break;
@@ -789,6 +792,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
                 print_value_ref(buf, inst.operands[1]);
             }
             buf.put_cstr(", inst=");
+            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            break;
+        case Opcode::UpstreamMark:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
+            buf.put_cstr(", receiver=");
             buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             break;
         case Opcode::HashHmacSha256:

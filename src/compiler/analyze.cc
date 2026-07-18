@@ -423,10 +423,11 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.tuple_len = tuple_len;
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
-    shape.is_concrete =
-        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
-        type == HirTypeKind::Str || type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-        type == HirTypeKind::IP || type == HirTypeKind::Response || type == HirTypeKind::Json;
+    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
+                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
+                        type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
+                        type == HirTypeKind::IP || type == HirTypeKind::Response ||
+                        type == HirTypeKind::Json || type == HirTypeKind::Server;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -1979,6 +1980,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"str", 3})) return HirTypeKind::Str;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
+    if (name.eq({"Server", 6})) return HirTypeKind::Server;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
         variant_index = idx;
@@ -3904,6 +3906,64 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     const MatchPayloadBinding* binding,
     const HirExpr* receiver_override = nullptr) {
     if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+
+    // Control-plane upstream receiver. Upstream declarations are compile-time
+    // namespaces rather than runtime pointers; the Server operand carries the
+    // numeric identity and HandlerCtx supplies the invocation's config pin.
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.name.eq({"mark", 4})) {
+        u32 upstream_index = mod.upstreams.len;
+        for (u32 i = 0; i < mod.upstreams.len; i++) {
+            if (mod.upstreams[i].name.eq(expr.lhs->name)) {
+                upstream_index = i;
+                break;
+            }
+        }
+        bool shadowed = false;
+        for (u32 i = 0; i < local_count; i++) {
+            if (locals[i].name.len != 0 && locals[i].name.eq(expr.lhs->name)) {
+                shadowed = true;
+                break;
+            }
+        }
+        if (upstream_index < mod.upstreams.len && !shadowed) {
+            if (route == nullptr || !route->is_timer || route->timer_shard < 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("upstream.mark is available only in a timer with an explicit shard"));
+            if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr ||
+                expr.int_value != 2 || !expr.msg.eq({"healthy", 7}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("upstream.mark expects (server, healthy: bool)"));
+            auto server = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!server) return core::make_unexpected(server.error());
+            auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+            if (!healthy) return core::make_unexpected(healthy.error());
+            if (server->type != HirTypeKind::Server || server->may_nil || server->may_error ||
+                healthy->type != HirTypeKind::Bool || healthy->may_nil || healthy->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("upstream.mark expects (server, healthy: bool)"));
+            HirExpr out{};
+            out.kind = HirExprKind::UpstreamMark;
+            out.type = HirTypeKind::Bool;
+            out.span = expr.span;
+            out.int_value = static_cast<i64>(mod.upstreams[upstream_index].id);
+            if (!route->exprs.push(server.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            if (!route->exprs.push(healthy.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.rhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+    }
+    if (expr.msg.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expr.span,
+                              lit_str("argument labels are not supported for this method"));
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         has_import_namespace(mod, expr.lhs->name)) {
         Str qualified_member{};
@@ -13574,8 +13634,79 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             HirRoute* route,
                                             HirModule& mod) {
-    if (stmt.expr.kind == AstExprKind::Call || stmt.expr.kind == AstExprKind::MethodCall ||
-        stmt.expr.kind == AstExprKind::Field || stmt.expr.kind == AstExprKind::Pipe)
+    HirExpr upstream_servers{};
+    bool has_upstream_servers = false;
+    if (stmt.expr.kind == AstExprKind::Field && stmt.expr.lhs != nullptr &&
+        stmt.expr.lhs->kind == AstExprKind::Ident && stmt.expr.name.eq({"servers", 7})) {
+        bool shadowed = false;
+        for (u32 i = 0; i < route->locals.len; i++) {
+            if (route->locals[i].name.len != 0 && route->locals[i].name.eq(stmt.expr.lhs->name)) {
+                shadowed = true;
+                break;
+            }
+        }
+        u32 upstream_index = mod.upstreams.len;
+        if (!shadowed) {
+            for (u32 i = 0; i < mod.upstreams.len; i++) {
+                if (mod.upstreams[i].name.eq(stmt.expr.lhs->name)) {
+                    upstream_index = i;
+                    break;
+                }
+            }
+        }
+        if (upstream_index < mod.upstreams.len) {
+            const auto& upstream = mod.upstreams[upstream_index];
+            if (!upstream.has_address)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.expr.span,
+                    lit_str("Upstream.servers requires statically declared backend addresses"));
+            auto server_shape = intern_hir_type_shape(&mod,
+                                                      HirTypeKind::Server,
+                                                      0xffffffffu,
+                                                      0xffffffffu,
+                                                      0xffffffffu,
+                                                      0,
+                                                      nullptr,
+                                                      nullptr,
+                                                      nullptr,
+                                                      stmt.expr.span);
+            if (!server_shape) return core::make_unexpected(server_shape.error());
+            auto array_shape = intern_hir_type_shape(&mod,
+                                                     HirTypeKind::Array,
+                                                     0xffffffffu,
+                                                     0xffffffffu,
+                                                     0xffffffffu,
+                                                     0,
+                                                     nullptr,
+                                                     nullptr,
+                                                     nullptr,
+                                                     stmt.expr.span,
+                                                     server_shape.value());
+            if (!array_shape) return core::make_unexpected(array_shape.error());
+            upstream_servers.kind = HirExprKind::ArrayLit;
+            upstream_servers.type = HirTypeKind::Array;
+            upstream_servers.shape_index = array_shape.value();
+            upstream_servers.span = stmt.expr.span;
+            upstream_servers.array_len = upstream.extra_count + 1;
+            for (u32 backend = 0; backend < upstream_servers.array_len; backend++) {
+                HirExpr server{};
+                server.kind = HirExprKind::ServerLit;
+                server.type = HirTypeKind::Server;
+                server.shape_index = server_shape.value();
+                server.span = stmt.expr.span;
+                server.int_value = (static_cast<i64>(upstream.id) << 16) | backend;
+                if (!route->exprs.push(server))
+                    return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                if (!upstream_servers.args.push(&route->exprs[route->exprs.len - 1]))
+                    return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+            }
+            has_upstream_servers = true;
+        }
+    }
+    if (!has_upstream_servers &&
+        (stmt.expr.kind == AstExprKind::Call || stmt.expr.kind == AstExprKind::MethodCall ||
+         stmt.expr.kind == AstExprKind::Field || stmt.expr.kind == AstExprKind::Pipe))
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             stmt.expr.span,
@@ -13584,7 +13715,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
     const bool saved_allow_respond_effects = route->allow_respond_effects;
     route->allow_respond_effects = false;
     auto iter =
-        analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
+        has_upstream_servers
+            ? FrontendResult<HirExpr>(upstream_servers)
+            : analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
     route->allow_respond_effects = saved_allow_respond_effects;
     if (!iter) return core::make_unexpected(iter.error());
     if (iter->type != HirTypeKind::Array || iter->shape_index >= mod.type_shapes.len)

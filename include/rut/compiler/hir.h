@@ -89,6 +89,7 @@ struct HirTypeAlias {
 enum class HirExprKind : u8 {
     BoolLit,
     IntLit,
+    ServerLit,
     StrLit,
     RegexMatch,
     Tuple,
@@ -197,6 +198,7 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    UpstreamMark,
     // Compiler-owned reusable JSON plan. field_inits stores each raw segment
     // in `name` and the following dynamic leaf in `value`; str_value is the
     // final raw segment. The plan is serialized only at an output sink.
@@ -245,6 +247,9 @@ enum class HirTypeKind : u8 {
     // Opaque, json()-serializable control-plane snapshot types.
     Stats,
     Metrics,
+    // Opaque pointer-free `(upstream_id, backend_id)` token. The active config
+    // generation is latched in HandlerCtx when a timer invocation begins.
+    Server,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;

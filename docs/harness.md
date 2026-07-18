@@ -152,9 +152,10 @@ discover halfway through a run that its environment cannot model an operation.
 `ControlPlaneMutation` scenarios provide an explicit
 `ScenarioSpec::control_plane_mutation` fixture. The production event loops and
 the scenario driver inject the same allocation-free port into `HandlerCtx`, and
-the pointer remains stable across resumes. Missing or undeclared fixtures are
-invalid runs. Handler-layer coverage may exercise admission and manual-health
-atomics. Its pointer-free `UpstreamServersView` pins the observed config
+the pointer and invocation generation remain stable across resumes. Missing or
+undeclared fixtures are invalid runs. Handler-layer coverage may execute the
+same shard-pinned `upstream.mark` lowering and manual-health atomics as
+production. Its pointer-free `UpstreamServersView` pins the observed config
 generation, and selection scenarios apply the same manual-over-local health
 priority as production. Activation still requires the `Process` layer.
 

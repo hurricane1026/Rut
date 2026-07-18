@@ -1145,6 +1145,22 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_upstream_mark(u16 receiver_upstream,
+                                       ValueId server,
+                                       ValueId healthy,
+                                       SourceLoc loc = {}) {
+        if (!valid_val(server) || !val_has_type(server, TypeKind::I64) || !valid_val(healthy) ||
+            !val_has_type(healthy, TypeKind::Bool))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Bool));
+        auto [inst, vid] = TRY(emit(Opcode::UpstreamMark, ty, loc));
+        inst->operands[0] = server;
+        inst->operands[1] = healthy;
+        inst->operand_count = 2;
+        inst->imm.i32_val = receiver_upstream;
+        return vid;
+    }
+
     // ── Terminators ─────────────────────────────────────────────────
 
     VoidResult emit_br(ValueId cond, BlockId then_blk, BlockId else_blk, SourceLoc loc = {}) {

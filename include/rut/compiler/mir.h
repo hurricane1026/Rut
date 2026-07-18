@@ -95,6 +95,7 @@ enum class MirValueKind : u8 {
     WaitField,
     CacheGet,
     CacheSet,
+    UpstreamMark,
     JsonBuild,
     AdminJson,
 };

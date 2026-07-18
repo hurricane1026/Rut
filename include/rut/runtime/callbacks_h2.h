@@ -588,7 +588,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
     latch_control_plane_snapshot(d.loop, ctx);
-    latch_control_plane_mutation(d.loop, ctx);
+    latch_control_plane_mutation(d.loop, ctx, cfg != nullptr ? cfg->config_generation : 0);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;

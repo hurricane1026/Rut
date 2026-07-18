@@ -83,6 +83,8 @@ static const HelperEntry kHelpers[] = {
      reinterpret_cast<void*>(&rut_helper_json_append_control_plane)},
     {"rut_helper_reload_request", reinterpret_cast<void*>(&rut_helper_reload_request)},
     {"rut_helper_upstream_mark", reinterpret_cast<void*>(&rut_helper_upstream_mark)},
+    {"rut_helper_upstream_mark_checked",
+     reinterpret_cast<void*>(&rut_helper_upstream_mark_checked)},
     {"rut_helper_json_capture_data", reinterpret_cast<void*>(&rut_helper_json_capture_data)},
     {"rut_helper_json_capture_len", reinterpret_cast<void*>(&rut_helper_json_capture_len)},
     {"rut_helper_json_finish", reinterpret_cast<void*>(&rut_helper_json_finish)},

@@ -191,6 +191,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     // Explicit mutation capability. Null means reload/health mutation is
     // unavailable; JIT code never receives an EventLoop or coordinator object.
     ControlPlaneMutationPort* control_plane_mutation;
+    // Generation of the RouteConfig pinned for this handler invocation.
+    // `Server` values combine this pin with their packed upstream/backend id.
+    u64 config_generation;
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization
