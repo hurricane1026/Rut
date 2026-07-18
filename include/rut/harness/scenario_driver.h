@@ -28,6 +28,9 @@ struct ScenarioSpec {
     u64 state_group = 0;
     ScenarioState* state = nullptr;
     ScriptedEnvironment* environment = nullptr;
+    // Explicit value-only fixture for stats()/metrics(). The scenario must
+    // declare ControlPlaneSnapshot; the copied value is stable across resumes.
+    const jit::ControlPlaneSnapshot* control_plane_snapshot = nullptr;
     bool auto_complete_timers = true;
     ScenarioExpectation expected{};
 };

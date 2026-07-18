@@ -731,6 +731,80 @@ TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, control_plane_snapshot_fixture_replays_exact_json) {
+    TempSource source;
+    REQUIRE(source.write("route GET \"/stats\" { wait(1) return 200, json(stats()) }\n"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    jit::ControlPlaneSnapshot fixture{};
+    fixture.valid = true;
+    fixture.shard_id = 2;
+    fixture.shard_count = 4;
+    fixture.stats.requests_total = 9;
+    fixture.stats.requests_active = 1;
+    fixture.stats.connections_total = 8;
+    fixture.stats.connections_active = 2;
+    fixture.stats.connections_closed = 6;
+    fixture.stats.request_latency_buckets[0] = 3;
+    fixture.stats.request_latency_sum_us = 30;
+    fixture.stats.request_latency_count = 3;
+    fixture.stats.memory_arena_used = 10;
+    fixture.stats.memory_slices_used = 11;
+    fixture.stats.memory_slices_free = 12;
+    fixture.stats.memory_connections_used = 13;
+    static constexpr char kExpectedBytes[] =
+        "{\"scope\":\"shard\",\"shard_id\":2,\"shard_count\":4,\"requests\":{"
+        "\"total\":9,\"active\":1,\"latency_us\":{\"buckets\":[3,0,0,0,0,0,0,0,0,0,"
+        "0],\"sum\":30,\"count\":3}},\"connections\":{\"total\":8,\"active\":2,"
+        "\"closed\":6},\"memory\":{\"arena_used\":10,\"slices_used\":11,"
+        "\"slices_free\":12,\"connections_used\":13}}";
+    const Str kExpected{kExpectedBytes, sizeof(kExpectedBytes) - 1};
+
+    const char request[] = "GET /stats HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/stats", 6};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.control_plane_snapshot = &fixture;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.required_capabilities.add(harness::Capability::ControlPlaneSnapshot);
+    spec.environment_capabilities = spec.required_capabilities;
+    ResponseBodyObservation first_body{};
+    spec.observations = {&first_body, &capture_response_body_observation};
+    const auto first = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(first.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(first.harness.handler_resumes, 1u);
+    REQUIRE(first_body.seen);
+    CHECK(!first_body.truncated);
+    CHECK_EQ(first_body.full_len, kExpected.len);
+    CHECK_EQ(first_body.copied_len, kExpected.len);
+    CHECK(__builtin_memcmp(first_body.bytes, kExpected.ptr, kExpected.len) == 0);
+    CHECK(first.harness.output_bytes > kExpected.len);
+
+    ResponseBodyObservation replay_body{};
+    spec.observations = {&replay_body, &capture_response_body_observation};
+    const auto replay = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(replay.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(replay.harness.output_bytes, first.harness.output_bytes);
+    CHECK_EQ(replay_body.copied_len, first_body.copied_len);
+    CHECK(__builtin_memcmp(replay_body.bytes, first_body.bytes, first_body.copied_len) == 0);
+
+    scenario.control_plane_snapshot = nullptr;
+    const auto missing = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(missing.harness.outcome, harness::Outcome::Invalid);
+    CHECK(std::strcmp(missing.harness.detail, "control-plane snapshot fixture is missing") == 0);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, dynamic_json_overflow_has_deterministic_500_observation) {
     std::string source = "route GET \"/x\" { return 200, json({ path: req.path, value: \"";
     source.append(jit::kMaxDynamicJsonResponseBytes, 'x');

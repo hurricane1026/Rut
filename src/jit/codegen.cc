@@ -112,6 +112,7 @@ struct Ctx {
     LLVMValueRef fn_json_append_str_list;
     LLVMValueRef fn_json_append_i64;
     LLVMValueRef fn_json_append_bool;
+    LLVMValueRef fn_json_append_control_plane;
     LLVMValueRef fn_json_capture_data;
     LLVMValueRef fn_json_capture_len;
     LLVMValueRef fn_json_finish;
@@ -244,6 +245,15 @@ struct Ctx {
             fn_json_append_bool = LLVMAddFunction(llvm_mod, "rut_helper_json_append_bool", ft);
         }
         return fn_json_append_bool;
+    }
+    LLVMValueRef get_json_append_control_plane() {
+        if (!fn_json_append_control_plane) {
+            LLVMTypeRef params[] = {ptr_ty, i8_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_json_append_control_plane =
+                LLVMAddFunction(llvm_mod, "rut_helper_json_append_control_plane", ft);
+        }
+        return fn_json_append_control_plane;
     }
     LLVMValueRef get_json_capture_data() {
         if (!fn_json_capture_data) {
@@ -2188,6 +2198,17 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         case rir::Opcode::JsonAppendArray: {
             const auto* type = c.cur_fn->values[inst.operands[0].id].type;
             emit_json_value(c, c.get_value(inst.operands[0]), type, 0);
+            break;
+        }
+        case rir::Opcode::JsonAppendControlPlane: {
+            LLVMValueRef kind = LLVMConstInt(c.i8_ty, static_cast<u8>(inst.imm.i32_val), 0);
+            LLVMValueRef args[] = {c.param_ctx, kind};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_json_append_control_plane()),
+                           c.get_json_append_control_plane(),
+                           args,
+                           2,
+                           "");
             break;
         }
         case rir::Opcode::JsonCapture: {

@@ -8854,26 +8854,38 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
             expr.args[0] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
-        // These are the two declared runtime-json values. Keep the snapshot
-        // operation as an operand; never fold it to a fake empty/default body.
-        if (expr.args[0]->kind == AstExprKind::Call &&
+        // The two runtime snapshot values may be serialized directly or via a
+        // local (`let snapshot = stats(); json(snapshot)`). Keep the snapshot
+        // kind as an operand; never fold it to a fake empty/default body.
+        const bool direct_snapshot_call =
+            expr.args[0]->kind == AstExprKind::Call &&
             (expr.args[0]->name.eq({"stats", 5}) || expr.args[0]->name.eq({"metrics", 7})) &&
-            !user_bound_ident_name(mod, locals, local_count, binding, expr.args[0]->name)) {
+            !user_bound_ident_name(mod, locals, local_count, binding, expr.args[0]->name);
+        const bool possible_snapshot_local = expr.args[0]->kind == AstExprKind::Ident;
+        if (direct_snapshot_call || possible_snapshot_local) {
             auto snapshot =
-                analyze_call_expr(*expr.args[0], route, mod, locals, local_count, binding, nullptr);
+                direct_snapshot_call
+                    ? analyze_call_expr(
+                          *expr.args[0], route, mod, locals, local_count, binding, nullptr)
+                    : analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
             if (!snapshot) return core::make_unexpected(snapshot.error());
-            if ((snapshot->type != HirTypeKind::Stats && snapshot->type != HirTypeKind::Metrics) ||
-                snapshot->may_nil || snapshot->may_error)
+            if ((snapshot->type == HirTypeKind::Stats || snapshot->type == HirTypeKind::Metrics) &&
+                !snapshot->may_nil && !snapshot->may_error) {
+                if (!route || !route->exprs.push(snapshot.value()))
+                    return frontend_error(
+                        route ? FrontendError::TooManyItems : FrontendError::UnsupportedSyntax,
+                        expr.span);
+                HirExpr out{};
+                out.kind = HirExprKind::AdminJson;
+                out.type = HirTypeKind::Json;
+                out.int_value = snapshot->type == HirTypeKind::Stats ? 0 : 1;
+                out.span = expr.span;
+                out.lhs = &route->exprs[route->exprs.len - 1];
+                return out;
+            }
+            if (direct_snapshot_call)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, expr.args[0]->span, kJsonLiteralDetail);
-            if (!route->exprs.push(snapshot.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
-            HirExpr out{};
-            out.kind = HirExprKind::AdminJson;
-            out.type = HirTypeKind::Str;
-            out.span = expr.span;
-            out.lhs = &route->exprs[route->exprs.len - 1];
-            return out;
         }
         if (route == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
@@ -10250,10 +10262,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 auto body = analyze_expr(
                     stmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
                 if (!body) return core::make_unexpected(body.error());
-                if (body->type != HirTypeKind::Json || body->kind != HirExprKind::JsonBuild)
+                if (body->type != HirTypeKind::Json ||
+                    (body->kind != HirExprKind::JsonBuild && body->kind != HirExprKind::AdminJson))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
-                if (body->field_inits.len == 0) {
+                if (body->kind == HirExprKind::AdminJson) {
+                    term.control_plane_json_kind = static_cast<u8>(body->int_value + 1);
+                } else if (body->field_inits.len == 0) {
                     term.response_body = body->str_value;
                 } else {
                     for (u32 i = 0; i < body->field_inits.len; i++) {

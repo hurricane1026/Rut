@@ -273,6 +273,16 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         copy_detail(out.harness, "scripted faults capability was not declared");
         return out;
     }
+    const bool declares_control_plane =
+        declared(harness.required_capabilities, Capability::ControlPlaneSnapshot);
+    if (declares_control_plane != (scenario.control_plane_snapshot != nullptr)) {
+        out.harness.outcome = Outcome::Invalid;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness,
+                    declares_control_plane ? "control-plane snapshot fixture is missing"
+                                           : "control-plane snapshot capability was not declared");
+        return out;
+    }
     if (scenario.target == nullptr || !scenario.target->prepared) {
         out.harness.outcome = Outcome::Invalid;
         out.harness.cleanup = CleanupOutcome::Clean;
@@ -493,6 +503,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         HandlerExecution execution{};
         execution.init(
             route->fn, &connection.connection, scenario.request_data, scenario.request_len);
+        if (scenario.control_plane_snapshot != nullptr)
+            execution.frame.context.control_plane = *scenario.control_plane_snapshot;
         execution.frame.context.route_param_count = route_param_count;
         for (u32 i = 0; i < route_param_count; i++)
             execution.frame.context.route_params[i] = route_params[i];

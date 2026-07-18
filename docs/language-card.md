@@ -462,8 +462,22 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
          uses in one request see the same value)  max(a, b)  min(a, b)
          — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
-admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats() ⏳ runtime
+admin:   stats() metrics() ✅ bounded JSON snapshots; reload() upstream_status()
+         config_dump() shard_stats() ⏳ runtime
 ```
+
+`json(stats())` is a handler-entry snapshot for the invoking shard;
+`json(metrics())` is the process aggregate captured at the same boundary. Both
+use fixed field order and unsigned decimal counters:
+
+```json
+{"scope":"shard","shard_id":0,"shard_count":1,"requests":{"total":0,"active":1,"latency_us":{"buckets":[0,0,0,0,0,0,0,0,0,0,0],"sum":0,"count":0}},"connections":{"total":1,"active":1,"closed":0},"memory":{"arena_used":0,"slices_used":0,"slices_free":0,"connections_used":0}}
+```
+
+The process form replaces `scope` with `"process"`, omits `shard_id`, and
+aggregates the same `requests`, `connections`, and `memory` fields. Serialization
+is bounded by the dynamic-response limit and fails the response closed with 500
+if the runtime capability is unavailable.
 
 ## Do NOT write (compile errors — with the fix)
 

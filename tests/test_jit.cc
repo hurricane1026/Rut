@@ -1434,6 +1434,122 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, control_plane_snapshots_serialize_exact_unsigned_json_and_fail_closed) {
+    const auto src = R"rut(
+route GET "/stats" { return 200, json(stats()) }
+route GET "/metrics" { return 200, json(metrics()) }
+route GET "/builder" {
+    let snapshot = stats()
+    let resp = response(200)
+    resp.body = json(snapshot)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    TestHandlerCtxFrame frame{};
+    auto& snapshot = frame.ctx.control_plane;
+    snapshot.valid = true;
+    snapshot.shard_id = 7;
+    snapshot.shard_count = 8;
+    snapshot.stats.requests_total = ~u64{0};
+    snapshot.stats.requests_active = 2;
+    snapshot.stats.connections_total = 3;
+    snapshot.stats.connections_active = 4;
+    snapshot.stats.connections_closed = 5;
+    for (u32 i = 0; i < jit::kControlPlaneLatencyBucketCount; i++)
+        snapshot.stats.request_latency_buckets[i] = 10 + i;
+    snapshot.stats.request_latency_sum_us = 21;
+    snapshot.stats.request_latency_count = 22;
+    snapshot.stats.memory_arena_used = 23;
+    snapshot.stats.memory_slices_used = 24;
+    snapshot.stats.memory_slices_free = 25;
+    snapshot.stats.memory_connections_used = 26;
+    snapshot.metrics.requests_total = 101;
+    snapshot.metrics.requests_active = 102;
+    snapshot.metrics.connections_total = 103;
+    snapshot.metrics.connections_active = 104;
+    snapshot.metrics.connections_closed = 105;
+    for (u32 i = 0; i < jit::kControlPlaneLatencyBucketCount; i++)
+        snapshot.metrics.request_latency_buckets[i] = 110 + i;
+    snapshot.metrics.request_latency_sum_us = 121;
+    snapshot.metrics.request_latency_count = 122;
+    snapshot.metrics.memory_arena_used = 123;
+    snapshot.metrics.memory_slices_used = 124;
+    snapshot.metrics.memory_slices_free = 125;
+    snapshot.metrics.memory_connections_used = 126;
+
+    static const Str kExpectedStats =
+        lit("{\"scope\":\"shard\",\"shard_id\":7,\"shard_count\":8,\"requests\":{"
+            "\"total\":18446744073709551615,\"active\":2,\"latency_us\":{"
+            "\"buckets\":[10,11,12,13,14,15,16,17,18,19,20],\"sum\":21,\"count\":22}},"
+            "\"connections\":{\"total\":3,\"active\":4,\"closed\":5},\"memory\":{"
+            "\"arena_used\":23,\"slices_used\":24,\"slices_free\":25,"
+            "\"connections_used\":26}}");
+    static const Str kExpectedMetrics =
+        lit("{\"scope\":\"process\",\"shard_count\":8,\"requests\":{\"total\":101,"
+            "\"active\":102,\"latency_us\":{\"buckets\":[110,111,112,113,114,115,116,"
+            "117,118,119,120],\"sum\":121,\"count\":122}},\"connections\":{"
+            "\"total\":103,\"active\":104,\"closed\":105},\"memory\":{\"arena_used\":123,"
+            "\"slices_used\":124,\"slices_free\":125,\"connections_used\":126}}");
+
+    auto stats_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto metrics_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    auto builder_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_2"));
+    REQUIRE(stats_handler != nullptr);
+    REQUIRE(metrics_handler != nullptr);
+    REQUIRE(builder_handler != nullptr);
+    auto invoke = [&](HandlerFn handler, TestHandlerCtxFrame& ctx_frame) {
+        return invoke_jit_handler(handler,
+                                  nullptr,
+                                  ctx_frame.ctx,
+                                  reinterpret_cast<const u8*>(kGetApiRequest),
+                                  sizeof(kGetApiRequest) - 1,
+                                  nullptr);
+    };
+
+    const auto stats = invoke(stats_handler, frame);
+    REQUIRE(stats.dynamic_response_body != nullptr);
+    CHECK((Str{stats.dynamic_response_body, stats.dynamic_response_body_len}.eq(kExpectedStats)));
+
+    frame.ctx.response_body_data = nullptr;
+    frame.ctx.response_body_len = 0;
+    frame.ctx.response_body_valid = 0;
+    const auto metrics = invoke(metrics_handler, frame);
+    REQUIRE(metrics.dynamic_response_body != nullptr);
+    CHECK((Str{metrics.dynamic_response_body, metrics.dynamic_response_body_len}.eq(
+        kExpectedMetrics)));
+
+    TestHandlerCtxFrame builder_frame{};
+    builder_frame.ctx.control_plane = snapshot;
+    const auto builder = invoke(builder_handler, builder_frame);
+    REQUIRE(builder.dynamic_response_body != nullptr);
+    CHECK(
+        (Str{builder.dynamic_response_body, builder.dynamic_response_body_len}.eq(kExpectedStats)));
+
+    TestHandlerCtxFrame missing{};
+    const auto failed = invoke(stats_handler, missing);
+    CHECK_EQ(failed.status_code, 500u);
+    CHECK(failed.dynamic_response_body == nullptr);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_return_json_serializes_nested_declared_structs) {
     const auto src = R"rut(
 struct Meta { ok: bool }

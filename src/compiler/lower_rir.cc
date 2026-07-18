@@ -1343,6 +1343,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!captured) return frontend_error(FrontendError::OutOfMemory, span);
         return captured.value();
     }
+    if (value.kind == MirValueKind::AdminJson) {
+        if (value.int_value < 0 || value.int_value > 1 ||
+            !b.emit_json_reset({span.line, span.col}) ||
+            !b.emit_json_append_control_plane(static_cast<u8>(value.int_value),
+                                              {span.line, span.col}))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto captured = b.emit_json_capture({span.line, span.col});
+        if (!captured) return frontend_error(FrontendError::OutOfMemory, span);
+        return captured.value();
+    }
     if (value.kind == MirValueKind::RegexMatch) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
@@ -3240,7 +3250,15 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
-        if (term.has_dynamic_response_body) {
+        if (term.control_plane_json_kind != 0) {
+            if (term.control_plane_json_kind > 2 ||
+                !b.emit_json_reset({term.span.line, term.span.col}) ||
+                !b.emit_json_append_control_plane(static_cast<u8>(term.control_plane_json_kind - 1),
+                                                  {term.span.line, term.span.col}) ||
+                !b.emit_json_finish({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;  // HandlerResult::kDynamicResponseBody
+        } else if (term.has_dynamic_response_body) {
             if (term.json_segments.len != term.json_value_ref_indices.len + 1 ||
                 !b.emit_json_reset({term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);

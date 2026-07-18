@@ -1,4 +1,5 @@
 // Per-shard metrics tests: counters, histograms, aggregation, callback integration.
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/prometheus.h"
 #include "test.h"
@@ -181,6 +182,36 @@ TEST(aggregate, empty) {
     auto agg = aggregate_metrics(nullptr, 0);
     CHECK_EQ(agg.requests_total, 0u);
     CHECK_EQ(agg.connections_total, 0u);
+}
+
+TEST(aggregate, handler_snapshot_is_value_only_and_latched) {
+    ShardMetrics local;
+    ShardMetrics other;
+    local.init();
+    other.init();
+    local.requests_total = 10;
+    local.requests_active = 1;
+    other.requests_total = 20;
+    ShardMetrics* registry[] = {&local, &other};
+    struct Loop {
+        u32 shard_id = 3;
+        ShardMetrics* metrics = nullptr;
+        ShardMetrics* const* all_shard_metrics = nullptr;
+        u32 shard_metrics_count = 0;
+    } loop{3, &local, registry, 2};
+    jit::HandlerCtx ctx{};
+
+    latch_control_plane_snapshot(&loop, &ctx);
+    REQUIRE(ctx.control_plane.valid);
+    CHECK_EQ(ctx.control_plane.shard_id, 3u);
+    CHECK_EQ(ctx.control_plane.shard_count, 2u);
+    CHECK_EQ(ctx.control_plane.stats.requests_total, 10u);
+    CHECK_EQ(ctx.control_plane.metrics.requests_total, 30u);
+
+    local.requests_total = 100;
+    other.requests_total = 200;
+    CHECK_EQ(ctx.control_plane.stats.requests_total, 10u);
+    CHECK_EQ(ctx.control_plane.metrics.requests_total, 30u);
 }
 
 // === Callback + proxy integration ===

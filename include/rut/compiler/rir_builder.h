@@ -734,6 +734,13 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_json_append_control_plane(u8 kind, SourceLoc loc = {}) {
+        if (kind > 1) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::JsonAppendControlPlane, nullptr, loc));
+        r.inst->imm.i32_val = kind;
+        return {};
+    }
+
     Result<ValueId> emit_json_capture(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::Str));
         return TRY(emit(Opcode::JsonCapture, ty, loc)).vid;

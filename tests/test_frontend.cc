@@ -32101,9 +32101,9 @@ TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {
     const char* src = R"rut(
 route GET "/admin" {
     let snapshot = stats()
-    let statsBody = json(stats())
+    let statsBody = json(snapshot)
     let metricSnapshot = metrics()
-    let metricsBody = json(metrics())
+    let metricsBody = json(metricSnapshot)
     return 200
 }
 )rut";
@@ -32116,18 +32116,54 @@ route GET "/admin" {
     REQUIRE_EQ(hir->routes[0].locals.len, 4u);
     CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Stats);
     CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::StatsSnapshot);
-    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Json);
     CHECK_EQ(hir->routes[0].locals[1].init.kind, HirExprKind::AdminJson);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 0);
     CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::Metrics);
     CHECK_EQ(hir->routes[0].locals[2].init.kind, HirExprKind::MetricsSnapshot);
-    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Json);
     CHECK_EQ(hir->routes[0].locals[3].init.kind, HirExprKind::AdminJson);
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 1);
 
     auto mir = build_mir_heap(hir.value());
-    REQUIRE_FALSE(mir.has_value());
-    CHECK(mir.error().detail.eq(
-        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
-            "connected yet")));
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, stats_and_metrics_lower_as_deterministic_response_json) {
+    const char* src = R"rut(
+route GET "/stats" { return 200, json(stats()) }
+route GET "/metrics" { return 200, json(metrics()) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 2u);
+    CHECK_EQ(hir->routes[0].control.direct_term.control_plane_json_kind, 1u);
+    CHECK_EQ(hir->routes[1].control.direct_term.control_plane_json_kind, 2u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.func_count, 2u);
+    for (u32 fi = 0; fi < rir.module.func_count; fi++) {
+        bool saw_snapshot = false;
+        for (u32 bi = 0; bi < rir.module.functions[fi].block_count; bi++) {
+            const auto& block = rir.module.functions[fi].blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ii++) {
+                if (block.insts[ii].op != rir::Opcode::JsonAppendControlPlane) continue;
+                saw_snapshot = true;
+                CHECK_EQ(block.insts[ii].imm.i32_val, static_cast<i32>(fi));
+            }
+        }
+        CHECK(saw_snapshot);
+    }
+    rir.destroy();
 }
 
 TEST(frontend, control_plane_snapshot_declarations_validate_arity) {

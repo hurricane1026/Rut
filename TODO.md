@@ -11,16 +11,11 @@ without accepting source forms that cannot be replayed or resumed faithfully.
 
 ### Control-plane builtins
 
-Connect the declared `stats()`, `metrics()`, `reload()`, and
-`upstream.mark()` surface to runtime services. The checker currently validates
-their types and contexts, while MIR rejects lowering rather than returning fake
-data.
+Connect the remaining declared `reload()` and `upstream.mark()` mutation
+surface to runtime services. Read-only `stats()` and `metrics()` snapshots are
+connected end to end.
 
 **Acceptance**:
-- `HandlerCtx` exposes only the bounded control-plane capabilities each builtin
-  needs.
-- Snapshot values serialize deterministically and are covered by harness/replay
-  observations.
 - Reload and upstream mutation define authorization, failure, and shard-ordering
   behavior.
 
@@ -109,8 +104,9 @@ implementation promise.
   upstream fd, concurrency slot, pinned epoch, async slot, and callbacks.
 - [x] `Cache(..., backend: ...)` is reserved with a targeted source-of-truth
   diagnostic; strict `Hash` owner-shard semantics have an accepted design.
-- [x] Control-plane builtins have checker declarations and targeted
-  not-yet-lowered diagnostics instead of fake runtime results.
+- [x] `stats()` and `metrics()` latch value-only shard/process metric snapshots
+  at handler entry, serialize fixed-order bounded JSON, survive resumes without
+  rereading mutable state, and replay through an explicit harness capability.
 - [x] Import analysis moves large route workspaces off the thread stack.
 - [x] Request runtime `[str]` views support ordered `queryAll`/`getAll`, `len`,
   `isEmpty`, `first`, and bounds-safe `at`.

@@ -7,6 +7,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"
@@ -1064,8 +1065,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    // Built-in Prometheus endpoint. Opt-in: only when the loop carries the
-    // cross-shard metrics registry (main wires it under --metrics). Served on
+    // Built-in Prometheus endpoint. Opt-in through metrics_endpoint_enabled;
+    // the registry itself is always available to runtime snapshot builtins.
+    // Served on
     // the data listener at GET /metrics, ahead of route matching, and works
     // even with no RouteConfig. `if constexpr` keeps it out of loops/mocks that
     // don't expose the registry.
@@ -1077,8 +1079,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // Only GET is intercepted — POST/PUT/DELETE/… /metrics fall through to
     // normal routing (they are not the scrape endpoint and must not return the
     // metrics body, keeping the behavior consistent with "Prometheus endpoint").
-    if constexpr (requires { loop->all_shard_metrics; }) {
-        if (loop->all_shard_metrics != nullptr &&
+    if constexpr (requires {
+                      loop->all_shard_metrics;
+                      loop->metrics_endpoint_enabled;
+                  }) {
+        if (loop->metrics_endpoint_enabled && loop->all_shard_metrics != nullptr &&
             conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
             conn.req_path_canon.eq(Str{"metrics", 7})) {
             // Fixed 8 KiB exposition buffer. The current metric set (counters +
@@ -1279,6 +1284,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.handler_state = 0;  // entry state
         conn.transition_to_exec_handler_wait();
         auto* ctx = conn.reset_jit_ctx();
+        latch_control_plane_snapshot(loop, ctx);
         ctx->state = 0;
         ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
         ctx->resume_event_result = 0;
@@ -1349,6 +1355,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     conn.handler_state = 0;
     conn.transition_to_exec_handler_wait();
     auto* ctx = conn.reset_jit_ctx();
+    latch_control_plane_snapshot(loop, ctx);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;

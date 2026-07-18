@@ -210,6 +210,70 @@ void rut_helper_json_append_i64(i64 value) {
     json_append(buf, static_cast<u32>(n));
 }
 
+static void json_append_u64(u64 value) {
+    char buf[32];
+    const int n = snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(value));
+    if (n <= 0 || static_cast<u32>(n) >= sizeof(buf)) {
+        t_json_response.ok = false;
+        return;
+    }
+    json_append(buf, static_cast<u32>(n));
+}
+
+void rut_helper_json_append_control_plane(void* ctx, u8 kind) {
+    if (ctx == nullptr || kind > static_cast<u8>(jit::ControlPlaneJsonKind::Metrics)) {
+        t_json_response.ok = false;
+        return;
+    }
+    const auto& snapshot = static_cast<const jit::HandlerCtx*>(ctx)->control_plane;
+    if (!snapshot.valid) {
+        t_json_response.ok = false;
+        return;
+    }
+    const bool stats = kind == static_cast<u8>(jit::ControlPlaneJsonKind::Stats);
+    const auto& values = stats ? snapshot.stats : snapshot.metrics;
+    auto append_literal = []<size_t N>(const char(&literal)[N]) {
+        json_append(literal, static_cast<u32>(N - 1));
+    };
+    if (stats)
+        append_literal("{\"scope\":\"shard\",\"shard_id\":");
+    else
+        append_literal("{\"scope\":\"process\",\"shard_count\":");
+    if (stats) {
+        json_append_u64(snapshot.shard_id);
+        append_literal(",\"shard_count\":");
+    }
+    json_append_u64(snapshot.shard_count);
+    append_literal(",\"requests\":{\"total\":");
+    json_append_u64(values.requests_total);
+    append_literal(",\"active\":");
+    json_append_u64(values.requests_active);
+    append_literal(",\"latency_us\":{\"buckets\":[");
+    for (u32 i = 0; i < jit::kControlPlaneLatencyBucketCount; i++) {
+        if (i != 0) json_append(",", 1);
+        json_append_u64(values.request_latency_buckets[i]);
+    }
+    append_literal("],\"sum\":");
+    json_append_u64(values.request_latency_sum_us);
+    append_literal(",\"count\":");
+    json_append_u64(values.request_latency_count);
+    append_literal("}},\"connections\":{\"total\":");
+    json_append_u64(values.connections_total);
+    append_literal(",\"active\":");
+    json_append_u64(values.connections_active);
+    append_literal(",\"closed\":");
+    json_append_u64(values.connections_closed);
+    append_literal("},\"memory\":{\"arena_used\":");
+    json_append_u64(values.memory_arena_used);
+    append_literal(",\"slices_used\":");
+    json_append_u64(values.memory_slices_used);
+    append_literal(",\"slices_free\":");
+    json_append_u64(values.memory_slices_free);
+    append_literal(",\"connections_used\":");
+    json_append_u64(values.memory_connections_used);
+    append_literal("}}");
+}
+
 void rut_helper_json_append_bool(u8 value) {
     json_append(value != 0 ? "true" : "false", value != 0 ? 4 : 5);
 }

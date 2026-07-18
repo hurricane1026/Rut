@@ -252,13 +252,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                                           const HirModule& module,
                                           MirFunction* fn,
                                           const ForLoopCtx* ctx = nullptr) {
-    if (expr.kind == HirExprKind::StatsSnapshot || expr.kind == HirExprKind::MetricsSnapshot ||
-        expr.kind == HirExprKind::AdminJson) {
+    if (expr.kind == HirExprKind::StatsSnapshot || expr.kind == HirExprKind::MetricsSnapshot) {
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             expr.span,
-            lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
-                    "is not connected yet"));
+            lit_str("stats() and metrics() snapshots are opaque; pass the snapshot to json() "
+                    "before using it as a response value"));
     }
     MirValue v{};
     v.shape_index = expr.shape_index;
@@ -313,6 +312,12 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             if (!v.field_inits.push(part))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         }
+        return v;
+    }
+    if (expr.kind == HirExprKind::AdminJson) {
+        v.kind = MirValueKind::AdminJson;
+        v.type = MirTypeKind::Json;
+        v.int_value = expr.int_value;
         return v;
     }
     if (expr.kind == HirExprKind::RegexMatch) {
@@ -1163,8 +1168,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Stats ||
+                module.routes[i].locals[li].type == HirTypeKind::Metrics)
+                continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Json &&
-                module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild)
+                (module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild ||
+                 module.routes[i].locals[li].init.kind == HirExprKind::AdminJson))
                 continue;
             // Wait routes execute response mutations in their source-ordered
             // resume block below. Materializing them in the function prelude
@@ -1244,6 +1253,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
             out->has_dynamic_response_body = term.has_dynamic_response_body;
+            out->control_plane_json_kind = term.control_plane_json_kind;
             out->json_segments.len = 0;
             out->json_value_ref_indices.len = 0;
             static_assert(

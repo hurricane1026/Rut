@@ -808,6 +808,9 @@ struct HirTerminator {
     // json_value_ref_indices: segment[0], value[0], segment[1], ... .
     // Values name synthetic route locals and are limited to scalar carriers.
     bool has_dynamic_response_body = false;
+    // 0 = ordinary body, 1 = stats(), 2 = metrics(). The snapshot JSON is
+    // produced directly at the terminal sink rather than quoted as a leaf.
+    u8 control_plane_json_kind = 0;
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     // Optional response headers from `response(N, headers: {...})`.

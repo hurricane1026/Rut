@@ -563,8 +563,8 @@ TEST(socket, double_listen_ok) {
 
 // === Built-in /metrics endpoint ===
 
-// GET /metrics returns the Prometheus exposition when the loop carries the
-// cross-shard metrics registry (what main wires under --metrics).
+// GET /metrics returns the Prometheus exposition when the endpoint flag is on;
+// the registry is also wired when only stats()/metrics() snapshots need it.
 TEST(metrics_endpoint, serves_prometheus_exposition) {
     using namespace rut;
     RealLoop* loop = create_real_loop();
@@ -579,8 +579,9 @@ TEST(metrics_endpoint, serves_prometheus_exposition) {
     m.init();
     loop->metrics = &m;
     ShardMetrics* reg[1] = {&m};
-    loop->all_shard_metrics = reg;  // enable the endpoint
+    loop->all_shard_metrics = reg;
     loop->shard_metrics_count = 1;
+    loop->metrics_endpoint_enabled = true;
 
     LoopThread lt = {loop, {}, 100};
     lt.start();
@@ -610,8 +611,8 @@ TEST(metrics_endpoint, serves_prometheus_exposition) {
     destroy_real_loop(loop);
 }
 
-// Without the registry wired, /metrics is just a normal path (no exposition).
-TEST(metrics_endpoint, disabled_without_registry) {
+// A registry alone does not reserve /metrics; the CLI flag is authoritative.
+TEST(metrics_endpoint, disabled_without_endpoint_flag) {
     using namespace rut;
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -620,7 +621,13 @@ TEST(metrics_endpoint, disabled_without_registry) {
     const i32 listen_fd = lfd.value();
     const u16 port = get_port(listen_fd);
     REQUIRE(loop->init(0, listen_fd).has_value());
-    // all_shard_metrics stays null → endpoint disabled.
+    ShardMetrics m;
+    m.init();
+    loop->metrics = &m;
+    ShardMetrics* reg[1] = {&m};
+    loop->all_shard_metrics = reg;
+    loop->shard_metrics_count = 1;
+    // metrics_endpoint_enabled stays false.
     LoopThread lt = {loop, {}, 100};
     lt.start();
 
@@ -658,8 +665,9 @@ TEST(metrics_endpoint, non_get_does_not_serve_exposition) {
     m.init();
     loop->metrics = &m;
     ShardMetrics* reg[1] = {&m};
-    loop->all_shard_metrics = reg;  // endpoint enabled
+    loop->all_shard_metrics = reg;
     loop->shard_metrics_count = 1;
+    loop->metrics_endpoint_enabled = true;
 
     LoopThread lt = {loop, {}, 100};
     lt.start();
@@ -1471,8 +1479,15 @@ TEST(timer_dsl, rejects_more_than_max_timers) {
 // A captureless probe used as a timer handler: the event loop should invoke it
 // each time the timer's interval elapses.
 static rut::u32 g_timer_probe_calls = 0;
+static rut::jit::ControlPlaneSnapshot g_timer_snapshot{};
 static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut::u32, void*) {
     g_timer_probe_calls++;
+    return 0;
+}
+
+static rut::u64 timer_snapshot_probe_fn(
+    void*, rut::jit::HandlerCtx* ctx, const rut::u8*, rut::u32, void*) {
+    g_timer_snapshot = ctx->control_plane;
     return 0;
 }
 
@@ -1529,6 +1544,36 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+}
+
+TEST(timer, control_plane_snapshot_is_latched_before_timer_handler) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_snapshot_probe_fn));
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    loop->shard_id = 4;
+    ShardMetrics local;
+    ShardMetrics other;
+    local.init();
+    other.init();
+    local.requests_total = 7;
+    other.requests_total = 9;
+    ShardMetrics* registry[] = {&local, &other};
+    loop->metrics = &local;
+    loop->all_shard_metrics = registry;
+    loop->shard_metrics_count = 2;
+    g_timer_snapshot = {};
+
+    loop->fire_due_timers();
+    usleep(5000);
+    loop->fire_due_timers();
+    REQUIRE(g_timer_snapshot.valid);
+    CHECK_EQ(g_timer_snapshot.shard_id, 4u);
+    CHECK_EQ(g_timer_snapshot.shard_count, 2u);
+    CHECK_EQ(g_timer_snapshot.stats.requests_total, 7u);
+    CHECK_EQ(g_timer_snapshot.metrics.requests_total, 16u);
 }
 
 // The same scheduler must drive timers on the io_uring backend: main.cc prefers
@@ -9411,6 +9456,10 @@ route GET "/json" {
     return 200, json({ path: req.path, items: items })
 }
 )rut";
+
+static constexpr const char kControlPlaneSnapshotSource[] = R"rut(
+route GET "/stats" { wait(1) return 200, json(stats()) }
+)rut";
 #endif
 
 struct ScopedProxyLoop {
@@ -9967,6 +10016,94 @@ TEST(shard, dynamic_json_bytes_are_exact_over_http2) {
     CHECK_EQ(body_len, sizeof(kExpected) - 1);
     CHECK(body_len == sizeof(kExpected) - 1 &&
           __builtin_memcmp(body, kExpected, sizeof(kExpected) - 1) == 0);
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, control_plane_snapshot_is_latched_over_http1) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kControlPlaneSnapshotSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/stats", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /stats HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response,
+                       total,
+                       "{\"scope\":\"shard\",\"shard_id\":0,"
+                       "\"shard_count\":1,",
+                       46));
+    CHECK(buf_contains(response, total, "\"requests\":{\"total\":0,\"active\":1", 32));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, control_plane_snapshot_is_latched_over_http2) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kControlPlaneSnapshotSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/stats", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/stats", 6);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    u8 body[1024];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(response, total, 1) == 200 && body_len != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK(buf_contains(reinterpret_cast<const char*>(body),
+                       body_len,
+                       "{\"scope\":\"shard\",\"shard_id\":0,\"shard_count\":1,",
+                       46));
 
     close(client);
     shard.stop();

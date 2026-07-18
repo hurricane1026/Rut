@@ -129,6 +129,8 @@ inline constexpr u32 kMaxResponseHeaderMutations = 16;
 inline constexpr u32 kMaxResponseBodyMutationBytes = 4096;
 inline constexpr u32 kMaxDynamicJsonResponseBytes = 7 * 1024;
 inline constexpr u32 kMaxCapturedResponseHeaders = 64;
+inline constexpr u32 kControlPlaneLatencyBucketCount = 11;
+enum class ControlPlaneJsonKind : u8 { Stats = 0, Metrics = 1 };
 enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
 struct ResponseHeaderMutation {
     Str name;
@@ -138,6 +140,34 @@ struct ResponseHeaderMutation {
 struct CapturedResponseHeader {
     Str name;
     Str value;
+};
+
+// Value-only control-plane capability copied into a request at handler entry.
+// JIT code never receives EventLoop, ShardMetrics, or a cross-shard registry
+// pointer: the snapshot is bounded, owns no storage, and remains stable across
+// yields/resumes. `stats` is the invoking shard; `metrics` is the process-wide
+// aggregate captured at the same boundary.
+struct ControlPlaneMetricValues {
+    u64 requests_total;
+    u64 requests_active;
+    u64 connections_total;
+    u64 connections_active;
+    u64 connections_closed;
+    u64 request_latency_buckets[kControlPlaneLatencyBucketCount];
+    u64 request_latency_sum_us;
+    u64 request_latency_count;
+    u64 memory_arena_used;
+    u64 memory_slices_used;
+    u64 memory_slices_free;
+    u64 memory_connections_used;
+};
+
+struct ControlPlaneSnapshot {
+    bool valid;
+    u32 shard_id;
+    u32 shard_count;
+    ControlPlaneMetricValues stats;
+    ControlPlaneMetricValues metrics;
 };
 
 // ── Handler Context ────────────────────────────────────────────────
@@ -156,6 +186,7 @@ struct alignas(alignof(u64)) HandlerCtx {
     i32 resume_event_result;  // IoEvent::result for event waits
     u32 route_param_count;    // number of populated route_params entries
     u32 reserved0;
+    ControlPlaneSnapshot control_plane;
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization

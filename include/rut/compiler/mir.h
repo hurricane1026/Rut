@@ -96,6 +96,7 @@ enum class MirValueKind : u8 {
     CacheGet,
     CacheSet,
     JsonBuild,
+    AdminJson,
 };
 
 enum class MirTypeKind : u8 {
@@ -285,6 +286,7 @@ struct MirTerminator {
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
     Str response_body{};
     bool has_dynamic_response_body = false;
+    u8 control_plane_json_kind = 0;
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     // Optional response headers carried from HIR. Inline-stored.

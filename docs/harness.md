@@ -134,10 +134,18 @@ Http1 | Http2 | WebSocket | Tls
 SingleShard | MultiShard
 ScriptedUpstream | LoopbackUpstream | ExternalUpstream
 FaultsNone | FaultsScripted | SyscallInterpose
+ControlPlaneSnapshot
 ```
 
 The runner validates required capabilities before starting. No driver should
 discover halfway through a run that its environment cannot model an operation.
+
+`stats()`/`metrics()` scenarios use the `ControlPlaneSnapshot` capability and
+must supply `ScenarioSpec::control_plane_snapshot`. The fixture is a bounded,
+pointer-free value copied into `HandlerCtx` before the first invocation. It is
+not refreshed on resume, so a replay observes exactly the same bytes even when
+the handler yields. Omitting either the declaration or fixture is an invalid
+scenario rather than an implicit all-zero snapshot.
 
 ### Driver
 

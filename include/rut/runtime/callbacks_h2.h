@@ -15,6 +15,7 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/control_plane_snapshot.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
@@ -585,6 +586,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const u8* synth,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
+    latch_control_plane_snapshot(d.loop, ctx);
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
