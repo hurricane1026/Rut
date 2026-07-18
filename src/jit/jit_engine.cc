@@ -57,6 +57,8 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_resp_set_header", reinterpret_cast<void*>(&rut_helper_resp_set_header)},
     {"rut_helper_resp_add_header", reinterpret_cast<void*>(&rut_helper_resp_add_header)},
     {"rut_helper_resp_remove_header", reinterpret_cast<void*>(&rut_helper_resp_remove_header)},
+    {"rut_helper_resp_set_status", reinterpret_cast<void*>(&rut_helper_resp_set_status)},
+    {"rut_helper_resp_set_body", reinterpret_cast<void*>(&rut_helper_resp_set_body)},
     {"rut_helper_resp_commit_headers", reinterpret_cast<void*>(&rut_helper_resp_commit_headers)},
     {"rut_helper_resp_header", reinterpret_cast<void*>(&rut_helper_resp_header)},
     {"rut_helper_req_cookie", reinterpret_cast<void*>(&rut_helper_req_cookie)},
@@ -115,7 +117,7 @@ bool JitEngine::init() {
     // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
     // silently skipping helpers (which would produce opaque JIT link
     // failures at runtime).
-    static constexpr u32 kMaxHelpers = 40;
+    static constexpr u32 kMaxHelpers = 48;
     u32 count = 0;
     for (const auto* h = kHelpers; h->name; h++) count++;
     if (count > kMaxHelpers) {

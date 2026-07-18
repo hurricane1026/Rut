@@ -287,13 +287,29 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             return out;
     }
 
+    const auto& response = execution.frame.context;
+    if (result.action == jit::HandlerAction::ReturnStatus) {
+        if (response.response_status_invalid || response.response_body_mutation_overflow) {
+            result = jit::HandlerResult::make_status(500);
+        } else {
+            if (response.response_status_set) result.status_code = response.response_status;
+            if (response.response_body_mutation_set)
+                result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+        }
+    }
     out.terminal = result;
     out.has_terminal = true;
     if (result.action == jit::HandlerAction::ReturnStatus &&
         result.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
-        out.dynamic_response_body = execution.frame.context.response_body_data;
-        out.dynamic_response_body_len = execution.frame.context.response_body_len;
-        out.dynamic_response_body_valid = execution.frame.context.response_body_valid != 0;
+        if (response.response_body_mutation_set) {
+            out.dynamic_response_body = response.response_body_mutation_data;
+            out.dynamic_response_body_len = response.response_body_mutation_len;
+            out.dynamic_response_body_valid = !response.response_body_mutation_overflow;
+        } else {
+            out.dynamic_response_body = response.response_body_data;
+            out.dynamic_response_body_len = response.response_body_len;
+            out.dynamic_response_body_valid = response.response_body_valid != 0;
+        }
     }
     out.response_header_count = execution.frame.context.response_header_count;
     out.response_header_overflow = execution.frame.context.response_header_overflow;

@@ -121,6 +121,8 @@ enum class HirExprKind : u8 {
     RespSetHeader,
     RespAddHeader,
     RespRemoveHeader,
+    RespSetStatus,
+    RespSetBody,
     ReqParam,
     ReqCookie,
     ReqQuery,
