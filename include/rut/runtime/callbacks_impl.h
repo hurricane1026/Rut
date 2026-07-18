@@ -2909,7 +2909,13 @@ void h2_proxy_finish(Loop* loop,
         return;
     }
     for (u32 mi = 0; mi < conn.resp_header_mutation_count; mi++) {
+        // Superseded value-bearing entries may intentionally retain request-backed
+        // views that were not stabilized. Do not dereference them after suspension;
+        // Remove carries no value and must still be applied to the upstream fields.
         const auto& mutation = conn.resp_header_mutations[mi];
+        if (mutation.mode != Connection::RespHeaderMutationMode::Remove &&
+            !response_mutation_survives(conn, mi))
+            continue;
         const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
         if (validate_response_header(mutation.name.ptr,
                                      mutation.name.len,

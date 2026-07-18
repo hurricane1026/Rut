@@ -1835,7 +1835,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
 }
 
 static bool ast_type_ref_contains_response(const AstTypeRef& ref) {
-    if (!ref.is_tuple && ref.name.eq({"Response", 8})) return true;
+    if (!ref.is_tuple && ref.namespace_name.len == 0 && ref.name.eq({"Response", 8})) return true;
     const u32 arg_count =
         ref.type_args.len > ref.type_arg_names.len ? ref.type_args.len : ref.type_arg_names.len;
     for (u32 i = 0; i < arg_count; i++) {

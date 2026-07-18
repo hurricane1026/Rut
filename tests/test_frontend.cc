@@ -8661,6 +8661,26 @@ route GET "/users" {
 
 #endif
 
+TEST(frontend, namespaced_response_is_not_the_builtin_response_type) {
+    const std::string dir = "/tmp/rut_import_namespace_response_type_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Response { value: i32 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func read(_ x: proto.Response) -> i32 => 1
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
+
 TEST(frontend, import_namespace_generic_type_ref_is_supported) {
     const std::string dir = "/tmp/rut_import_namespace_generic_type_ref_frontend";
     std::filesystem::create_directories(dir);

@@ -8932,6 +8932,12 @@ static u64 forward_with_response_mutations_handler(
         6,
         reinterpret_cast<const char*>(req + 4),
         4);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Set,
+        "X-Folded",
+        8,
+        reinterpret_cast<const char*>(req + 4),
+        4);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Set, "X-Folded", 8, "final", 5);
     add(rut::ConnectionBase::RespHeaderMutationMode::Remove, "X-Remove", 8, nullptr, 0);
     add(rut::ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
     return rut::jit::HandlerResult::make_forward(0).pack();
@@ -9954,6 +9960,7 @@ TEST(shard, serves_http2_jit_forward_with_response_mutations) {
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
     CHECK(h2_response_has_header(resp, total, 1, "x-path", "/api"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-folded", "final"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-path", "origin"));
     CHECK(!h2_response_has_header(resp, total, 1, "x-remove", "origin"));
     CHECK(h2_response_has_header(resp, total, 1, "x-multi", "first"));
