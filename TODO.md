@@ -21,8 +21,6 @@ connected end to end.
 
 ### Remaining syntax migration
 
-- Migrate remaining `.rut` examples and topic docs to
-  `docs/syntax-stability.md` Core spellings.
 - Add a fixture gate that parses and type-checks every unmarked executable
   example in `docs/language-card.md`.
 
@@ -86,6 +84,9 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Executable `.rut` examples and topic documentation use Rut Core route
+  declarations; chain examples attach one explicit chain directly to each
+  route instead of teaching grouped-route inheritance.
 - [x] Unlabeled `break`/`continue` lower only inside verifier-bounded static
   `for`, work through direct, guard, if, match, and nested-loop CFG paths, and
   always target the innermost loop without introducing runtime back edges.
