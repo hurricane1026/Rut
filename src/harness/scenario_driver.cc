@@ -113,7 +113,8 @@ bool account_terminal_output(const HarnessSpec& spec,
                              jit::HandlerResult& terminal,
                              const char* dynamic_body = nullptr,
                              u32 dynamic_body_len = 0,
-                             bool dynamic_body_valid = false) {
+                             bool dynamic_body_valid = false,
+                             const jit::HandlerCtx* response_ctx = nullptr) {
     if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
 
     connection.resp_status = terminal.status_code;
@@ -134,12 +135,11 @@ bool account_terminal_output(const HarnessSpec& spec,
     const RouteConfig* config = connection.request_config;
     const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
-    constexpr u32 kMaxHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+    constexpr u32 kMaxHeaders = RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
     u32 header_count = 0;
     if (!collect_effective_response_headers(
-            connection, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
+            response_ctx, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
         connection.resp_status = 500;
         format_static_response(connection, 500, false);
     } else if (header_count != 0) {
@@ -198,6 +198,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     const char* dynamic_response_body = nullptr;
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
+    jit::HandlerCtx response_ctx{};
     out.harness = validate_spec(harness);
     if (out.harness.outcome != Outcome::Passed) return out;
     out.harness.phase = Phase::Prepare;
@@ -471,6 +472,10 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         dynamic_response_body = driven.dynamic_response_body;
         dynamic_response_body_len = driven.dynamic_response_body_len;
         dynamic_response_body_valid = driven.dynamic_response_body_valid;
+        response_ctx.response_header_count = driven.response_header_count;
+        response_ctx.response_header_overflow = driven.response_header_overflow;
+        for (u32 i = 0; i < driven.response_header_count; i++)
+            response_ctx.response_header_mutations[i] = driven.response_header_mutations[i];
     }
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal)
@@ -480,7 +485,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
                                       out.terminal,
                                       dynamic_response_body,
                                       dynamic_response_body_len,
-                                      dynamic_response_body_valid);
+                                      dynamic_response_body_valid,
+                                      &response_ctx);
 
     if (out.has_terminal && out.harness.outcome == Outcome::Passed)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);

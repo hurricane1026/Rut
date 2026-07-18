@@ -384,7 +384,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+        RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
@@ -405,13 +405,15 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    if (d.conn->resp_header_mutation_overflow) {
+    if (o.response_ctx != nullptr && o.response_ctx->response_header_overflow) {
         h2_emit_status(d, stream_id, 500);
         return;
     }
-    for (u32 mi = 0; mi < d.conn->resp_header_mutation_count; mi++) {
-        const auto& mutation = d.conn->resp_header_mutations[mi];
-        const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+    const u32 mutation_count =
+        o.response_ctx != nullptr ? o.response_ctx->response_header_count : 0;
+    for (u32 mi = 0; mi < mutation_count; mi++) {
+        const auto& mutation = o.response_ctx->response_header_mutations[mi];
+        const bool remove = mutation.mode == jit::ResponseHeaderMutationMode::Remove;
         if (validate_response_header(mutation.name.ptr,
                                      mutation.name.len,
                                      remove ? "" : mutation.value.ptr,
@@ -419,7 +421,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 500);
             return;
         }
-        if (mutation.mode != Connection::RespHeaderMutationMode::Add) {
+        if (mutation.mode != jit::ResponseHeaderMutationMode::Add) {
             for (u32 i = 0; i < nhdrs;) {
                 if (!http_header_name_eq_ci(
                         hdrs[i].name.ptr, hdrs[i].name.len, mutation.name.ptr, mutation.name.len)) {
@@ -564,10 +566,6 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const u8* synth,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
-    d.conn->resp_header_mutation_pending_count = 0;
-    d.conn->resp_header_mutation_pending_overflow = false;
-    d.conn->resp_header_mutation_count = 0;
-    d.conn->resp_header_mutation_overflow = false;
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;

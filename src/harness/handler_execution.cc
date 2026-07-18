@@ -295,6 +295,10 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         out.dynamic_response_body_len = execution.frame.context.response_body_len;
         out.dynamic_response_body_valid = execution.frame.context.response_body_valid != 0;
     }
+    out.response_header_count = execution.frame.context.response_header_count;
+    out.response_header_overflow = execution.frame.context.response_header_overflow;
+    for (u32 i = 0; i < out.response_header_count; i++)
+        out.response_header_mutations[i] = execution.frame.context.response_header_mutations[i];
     if (!publisher.emit(ObservationKind::HandlerTerminated,
                         static_cast<u64>(result.action),
                         result.action == jit::HandlerAction::ReturnStatus ? result.status_code

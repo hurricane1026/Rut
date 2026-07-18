@@ -14748,12 +14748,6 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             FrontendError::UnsupportedSyntax,
             use_span,
             lit_str("chain after currently supports Response header effects only"));
-    if (route->waits.len != 0 || route->for_loops.len != 0)
-        return frontend_error(
-            FrontendError::UnsupportedSyntax,
-            use_span,
-            lit_str("chain after Response effects cannot be combined with wait/for yet"));
-
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
         if (!is_response_effect(fn.exprs[ei].kind)) continue;
         auto effect = instantiate_function_expr(
@@ -18345,7 +18339,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Pre-scan for waits: time.nowMicros() anywhere in a wait route is
         // rejected (see kTimeWaitDetail) — the flag must be set before any
         // statement is analyzed so pre-wait bindings are caught too.
-        bool response_runtime_mutation_blocked = false;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
@@ -18353,10 +18346,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.cache_ops_blocked = true;
                 route.time_ops_blocked = true;
             }
-            if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
-                s.kind == AstStmtKind::For ||
-                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
-                response_runtime_mutation_blocked = true;
         }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
@@ -18426,12 +18415,6 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         const bool runtime = response_init.bool_value ||
                                              (!is_remove && value.kind != HirExprKind::StrLit);
                         if (runtime) {
-                            if (response_runtime_mutation_blocked)
-                                return frontend_error(
-                                    FrontendError::UnsupportedSyntax,
-                                    stmt.span,
-                                    lit_str("dynamic response header mutations cannot be combined "
-                                            "with guards/waits/for loops yet"));
                             u32 response_builder_count = 0;
                             for (u32 li = 0; li < route.locals.len; li++) {
                                 if (route.locals[li].init.kind == HirExprKind::ResponseInit)

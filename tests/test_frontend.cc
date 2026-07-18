@@ -6672,7 +6672,7 @@ route GET "/users" use chain access { return 200 }
     }
 }
 
-TEST(frontend, chain_after_rejects_wait_routes_until_effects_are_resumable) {
+TEST(frontend, chain_after_response_effects_are_resumable_across_wait) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
     resp.set("X-Test", "yes")
@@ -6689,9 +6689,18 @@ route GET "/users" use chain access {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(
-        lit("chain after Response effects cannot be combined with wait/for yet")));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    bool found_committing_terminal = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::ReturnStatus && term.commit_response_mutations)
+            found_committing_terminal = true;
+    }
+    CHECK(found_committing_terminal);
 }
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {

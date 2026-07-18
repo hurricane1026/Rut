@@ -1033,10 +1033,6 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.req_header_override_count = 0;  // forward(set_header:) — same leak risk
     conn.req_header_append_mask = 0;
     conn.req_header_override_overflow = false;
-    conn.resp_header_mutation_pending_count = 0;
-    conn.resp_header_mutation_pending_overflow = false;
-    conn.resp_header_mutation_count = 0;
-    conn.resp_header_mutation_overflow = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
     conn.upstream_keep_alive = false;
@@ -1475,14 +1471,14 @@ void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev) {
     resume_jit_handler<Loop>(loop, conn);
 }
 
-inline bool collect_effective_response_headers(const Connection& conn,
+inline bool collect_effective_response_headers(const jit::HandlerCtx* response_ctx,
                                                const RouteConfig* cfg,
                                                u16 static_set_index,
                                                ResponseHeaderKV* out,
                                                u32 capacity,
                                                u32* out_count) {
     *out_count = 0;
-    if (conn.resp_header_mutation_overflow) return false;
+    if (response_ctx != nullptr && response_ctx->response_header_overflow) return false;
     if (static_set_index != 0 && cfg != nullptr &&
         static_set_index <= cfg->response_header_set_count) {
         const auto& ref = cfg->response_header_sets[static_set_index - 1];
@@ -1495,15 +1491,16 @@ inline bool collect_effective_response_headers(const Connection& conn,
             (*out_count)++;
         }
     }
-    for (u32 mi = 0; mi < conn.resp_header_mutation_count; mi++) {
-        const auto& mutation = conn.resp_header_mutations[mi];
-        const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+    const u32 mutation_count = response_ctx != nullptr ? response_ctx->response_header_count : 0;
+    for (u32 mi = 0; mi < mutation_count; mi++) {
+        const auto& mutation = response_ctx->response_header_mutations[mi];
+        const bool remove = mutation.mode == jit::ResponseHeaderMutationMode::Remove;
         if (validate_response_header(mutation.name.ptr,
                                      mutation.name.len,
                                      remove ? "" : mutation.value.ptr,
                                      remove ? 0 : mutation.value.len) != HttpHeaderValidation::Ok)
             return false;
-        if (mutation.mode != Connection::RespHeaderMutationMode::Add) {
+        if (mutation.mode != jit::ResponseHeaderMutationMode::Add) {
             for (u32 i = 0; i < *out_count;) {
                 if (!http_header_name_eq_ci(
                         out[i].key_data, out[i].key_len, mutation.name.ptr, mutation.name.len)) {
@@ -1542,10 +1539,10 @@ void handle_jit_outcome(Loop* loop,
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
             constexpr u32 kMaxEffectiveHeaders =
-                RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
             ResponseHeaderKV kvs[kMaxEffectiveHeaders];
             u32 header_count = 0;
-            if (!collect_effective_response_headers(conn,
+            if (!collect_effective_response_headers(outcome.response_ctx,
                                                     cfg,
                                                     outcome.response_headers_idx,
                                                     kvs,

@@ -206,23 +206,6 @@ struct ConnectionBase {
     // path fails the request closed so a dropped override can't be forwarded as a
     // silent no-op. Reset per request alongside the count.
     bool req_header_override_overflow;
-    // Ordered response-header mutations recorded by compiled Response builders.
-    // Values may reference request-buffer bytes; they remain valid until the
-    // synchronous response formatter consumes the log.
-    static constexpr u32 kMaxRespHeaderMutations = 16;
-    enum class RespHeaderMutationMode : u8 { Set, Add, Remove };
-    struct RespHeaderMutation {
-        Str name;
-        Str value;
-        RespHeaderMutationMode mode;
-    };
-    RespHeaderMutation resp_header_mutations[kMaxRespHeaderMutations];
-    // Helpers append to the pending builder-local prefix so resp.header() can
-    // observe source order. Only return of that builder publishes it.
-    u8 resp_header_mutation_pending_count;
-    bool resp_header_mutation_pending_overflow;
-    u8 resp_header_mutation_count;
-    bool resp_header_mutation_overflow;
     // Upstream concurrency slot: set true between try_acquire and release so the
     // slot is freed exactly once, on whatever exit path runs (completion, failure,
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
@@ -596,10 +579,6 @@ struct ConnectionBase {
         req_header_override_count = 0;
         req_header_append_mask = 0;
         req_header_override_overflow = false;
-        resp_header_mutation_pending_count = 0;
-        resp_header_mutation_pending_overflow = false;
-        resp_header_mutation_count = 0;
-        resp_header_mutation_overflow = false;
         upstream_slot_held = false;
         upstream_slot_uid = 0;
         throttle_down_bps = 0;

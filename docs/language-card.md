@@ -229,8 +229,9 @@ return resp
 return 200, json({ ok: true, items: [] }) // ✅ compact literal JSON body
 ```
 
-Dynamic Response header mutations currently require a route with no `wait` or
-`for`. A handler-local builder must be returned directly. A `chain after` helper
+Dynamic Response header mutations are stored in the resumable handler context,
+so pending mutations survive `wait` and remain isolated per request/stream. A
+handler-local builder must be returned directly. A `chain after` helper
 must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
 literal names and runtime string values; its effects apply to successful direct
 and forwarded responses. Mutations stay pending until the selected success
