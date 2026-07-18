@@ -37,6 +37,7 @@ void LoadedProgram::destroy() {
     }
     config.~RouteConfig();
     new (&config) RouteConfig();
+    pins.reset();
 }
 
 namespace {
@@ -270,6 +271,8 @@ bool load_rut_program(
     }
 #endif
 
+    out.pins.reset();
+    out.config.program_pins = &out.pins;
     return true;
 }
 

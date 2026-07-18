@@ -1487,6 +1487,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
+    acquire_http1_program_pin(config);
+    conn.http1_program_pin_config = config;
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
         conn.resp_status = 403;
         format_static_response(conn, 403, /*keep_alive=*/false);
@@ -1862,6 +1864,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     on_request_complete(loop, conn, conn.resp_status, conn.send_buf.len());
     conn.send_buf.reset();
+    release_http1_program_pin(conn.http1_program_pin_config);
+    conn.http1_program_pin_config = nullptr;
     loop->epoch_leave();
 
     if (conn.upstream_fd >= 0) {
@@ -4125,6 +4129,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
             on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
+            release_http1_program_pin(conn.http1_program_pin_config);
+            conn.http1_program_pin_config = nullptr;
             loop->epoch_leave();
             loop->close_conn(conn);
             return;
@@ -4302,6 +4308,8 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     release_upstream_slot(loop, conn);  // free the backend slot promptly
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
+    release_http1_program_pin(conn.http1_program_pin_config);
+    conn.http1_program_pin_config = nullptr;
     loop->epoch_leave();
 
     // Mirror on_proxy_response_sent: during graceful drain, close the upstream
@@ -5284,6 +5292,12 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // slot now so a long-lived tunnel doesn't hold an in-flight request slot for
     // its whole lifetime and shed later requests with 503.
     release_upstream_slot(loop, conn);
+    if (conn.is_ws_terminate) {
+        acquire_websocket_program_pin(conn.http1_program_pin_config);
+        conn.websocket_program_pin_config = conn.http1_program_pin_config;
+    }
+    release_http1_program_pin(conn.http1_program_pin_config);
+    conn.http1_program_pin_config = nullptr;
     loop->epoch_leave();
     u32 kRemaining = conn.upstream_recv_buf.len();
     if (kRemaining >= conn.ws_upgrade_response_len) {
@@ -6110,6 +6124,8 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     release_upstream_slot(loop, conn);
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
+    release_http1_program_pin(conn.http1_program_pin_config);
+    conn.http1_program_pin_config = nullptr;
     loop->epoch_leave();
 
     if (loop->is_draining()) {
