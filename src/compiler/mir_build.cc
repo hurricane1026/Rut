@@ -54,6 +54,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
            : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
            : kind == HirTypeKind::IP       ? MirTypeKind::IP
            : kind == HirTypeKind::StrList  ? MirTypeKind::StrList
+           : kind == HirTypeKind::Array    ? MirTypeKind::Array
            : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
            : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
            : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
@@ -110,8 +111,13 @@ static bool shape_carrier_ready(const MirModule& mir,
     const auto& shape = mir.type_shapes[shape_index];
     if (!shape.is_concrete) return false;
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
-        shape.type == MirTypeKind::Str || shape.type == MirTypeKind::Method)
+        shape.type == MirTypeKind::I64 || shape.type == MirTypeKind::Str ||
+        shape.type == MirTypeKind::Method || shape.type == MirTypeKind::ByteSize ||
+        shape.type == MirTypeKind::IP || shape.type == MirTypeKind::StrList)
         return true;
+    if (shape.type == MirTypeKind::Array)
+        return shape.array_elem_shape_index < mir.type_shapes.len &&
+               shape_carrier_ready(mir, shape.array_elem_shape_index, struct_ready, variant_ready);
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
     if (shape.type == MirTypeKind::Variant)
@@ -134,8 +140,14 @@ static bool shape_slot_carrier_ready(const MirModule& mir,
     if (!shape.is_concrete) return false;
     if (shape.type == MirTypeKind::Method) return false;
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
-        shape.type == MirTypeKind::Str)
+        shape.type == MirTypeKind::I64 || shape.type == MirTypeKind::Str ||
+        shape.type == MirTypeKind::ByteSize || shape.type == MirTypeKind::IP ||
+        shape.type == MirTypeKind::StrList)
         return true;
+    if (shape.type == MirTypeKind::Array)
+        return shape.array_elem_shape_index < mir.type_shapes.len &&
+               shape_slot_carrier_ready(
+                   mir, shape.array_elem_shape_index, struct_ready, variant_ready);
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
     if (shape.type == MirTypeKind::Variant)
@@ -267,6 +279,20 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.kind = MirValueKind::StrConst;
         v.type = MirTypeKind::Str;
         v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ArrayLit) {
+        v.kind = MirValueKind::ArrayLit;
+        v.type = MirTypeKind::Array;
+        apply_expr_shape_if_available(module, expr, &v);
+        for (u32 i = 0; i < expr.args.len; i++) {
+            auto elem = mir_value(*expr.args[i], module, fn, ctx);
+            if (!elem) return core::make_unexpected(elem.error());
+            if (!fn->values.push(elem.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!v.args.push(&fn->values[fn->values.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
         return v;
     }
     if (expr.kind == HirExprKind::RegexMatch) {
@@ -910,6 +936,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         shape.variant_index = module.type_shapes[i].variant_index;
         shape.struct_index = module.type_shapes[i].struct_index;
         shape.tuple_len = module.type_shapes[i].tuple_len;
+        shape.array_elem_shape_index = module.type_shapes[i].array_elem_shape_index;
         for (u32 ti = 0; ti < shape.tuple_len; ti++) {
             shape.tuple_elem_shape_indices[ti] = module.type_shapes[i].tuple_elem_shape_indices[ti];
         }
@@ -1097,12 +1124,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
-            // Array locals are compile-time constants for for-loop unroll
-            // only. They have no runtime MirValue carrier yet, so do not
-            // emit a MIR local for them.
-            if (module.routes[i].locals[li].type == HirTypeKind::Array ||
-                module.routes[i].locals[li].type == HirTypeKind::Response)
-                continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
             // a stable ref_index, then blanks the name for scope-hiding
@@ -1846,9 +1868,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const HirExpr* iter_array = iter_array_for(fl);
                 // This unroll requires a compile-time-known array literal,
                 // either inline in the for expression or through a
-                // route-local array constant. Other array-producing
-                // expressions need a runtime array carrier before they can
-                // be lowered.
+                // route-local array constant. Runtime array values are
+                // carried normally, but are not statically unrolled here.
                 const bool supported = fl.body.steps.len != 0 && iter_array != nullptr;
                 if (!supported || fl.loop_var_ref_index == 0xffffffffu) {
                     return frontend_error(

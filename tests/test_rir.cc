@@ -175,6 +175,38 @@ TEST(RirBuilder, ConstantInstructions) {
     ctx.destroy();
 }
 
+TEST(RirBuilder, BoundedArrayCarrierInstructions) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("array_ops"), lit("/array"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+
+    auto* i32_type = V(b.make_type(TypeKind::I32));
+    ValueId elements[] = {V(b.emit_const_i32(10)), V(b.emit_const_i32(20))};
+    auto array = V(b.emit_array_create(i32_type, elements, 2));
+    auto len = V(b.emit_array_len(array));
+    auto index = V(b.emit_const_i32(1));
+    auto value = V(b.emit_array_get(array, index));
+
+    CHECK_EQ(static_cast<u8>(fn->values[array.id].type->kind), static_cast<u8>(TypeKind::Array));
+    CHECK_EQ(static_cast<u8>(fn->values[array.id].type->inner->kind),
+             static_cast<u8>(TypeKind::I32));
+    CHECK_EQ(static_cast<u8>(fn->values[len.id].type->kind), static_cast<u8>(TypeKind::I32));
+    CHECK_EQ(static_cast<u8>(fn->values[value.id].type->kind), static_cast<u8>(TypeKind::I32));
+    CHECK_EQ(static_cast<u8>(fn->entry()->insts[2].op), static_cast<u8>(Opcode::ArrayCreate));
+    CHECK_EQ(fn->entry()->insts[2].operand_count, 2u);
+
+    ValueId too_many[kMaxArrayItems + 1]{};
+    for (u32 i = 0; i < kMaxArrayItems + 1; i++) too_many[i] = V(b.emit_const_i32(i));
+    CHECK_FALSE(b.emit_array_create(i32_type, too_many, kMaxArrayItems + 1));
+
+    ctx.destroy();
+}
+
 TEST(RirBuilder, RequestAccess) {
     TestContext ctx;
     REQUIRE(ctx.init());

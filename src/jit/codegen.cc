@@ -795,6 +795,8 @@ struct Ctx {
                 return str_ty;
             case rir::TypeKind::StrList:
                 return str_list_ty;
+            case rir::TypeKind::Array:
+                return str_list_ty;
             case rir::TypeKind::ByteSize:
             case rir::TypeKind::Duration:
             case rir::TypeKind::Time:
@@ -853,6 +855,140 @@ struct Ctx {
 };
 
 // ── Instruction Emission ───────────────────────────────────────────
+
+static void emit_json_raw(Ctx& c, Str bytes, const char* name = "json.raw") {
+    LLVMValueRef ptr = c.make_global_str(bytes, name);
+    LLVMValueRef len = LLVMConstInt(c.i32_ty, bytes.len, 0);
+    LLVMValueRef args[] = {ptr, len};
+    LLVMBuildCall2(c.builder,
+                   LLVMGlobalGetValueType(c.get_json_append_raw()),
+                   c.get_json_append_raw(),
+                   args,
+                   2,
+                   "");
+}
+
+static void emit_json_value(Ctx& c, LLVMValueRef value, const rir::Type* type, u32 depth) {
+    if (type == nullptr || depth > 32) __builtin_trap();
+    switch (type->kind) {
+        case rir::TypeKind::Bool: {
+            LLVMValueRef widened = LLVMBuildZExt(c.builder, value, c.i8_ty, "json.bool");
+            LLVMValueRef args[] = {widened};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_json_append_bool()),
+                           c.get_json_append_bool(),
+                           args,
+                           1,
+                           "");
+            return;
+        }
+        case rir::TypeKind::I32:
+            value = LLVMBuildSExt(c.builder, value, c.i64_ty, "json.i64");
+            [[fallthrough]];
+        case rir::TypeKind::I64: {
+            LLVMValueRef args[] = {value};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_json_append_i64()),
+                           c.get_json_append_i64(),
+                           args,
+                           1,
+                           "");
+            return;
+        }
+        case rir::TypeKind::Str: {
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, value, 0, "json.str.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, value, 1, "json.str.len");
+            LLVMValueRef args[] = {ptr, len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_json_append_str()),
+                           c.get_json_append_str(),
+                           args,
+                           2,
+                           "");
+            return;
+        }
+        case rir::TypeKind::StrList: {
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, value, 0, "json.list.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, value, 1, "json.list.len");
+            LLVMValueRef args[] = {ptr, len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_json_append_str_list()),
+                           c.get_json_append_str_list(),
+                           args,
+                           2,
+                           "");
+            return;
+        }
+        case rir::TypeKind::Struct: {
+            if (type->struct_def == nullptr) __builtin_trap();
+            emit_json_raw(c, {"{", 1});
+            for (u32 i = 0; i < type->struct_def->field_count; i++) {
+                if (i != 0) emit_json_raw(c, {",", 1});
+                emit_json_raw(c, {"\"", 1});
+                emit_json_raw(c, type->struct_def->fields()[i].name, "json.field");
+                emit_json_raw(c, {"\":", 2});
+                LLVMValueRef field =
+                    LLVMBuildExtractValue(c.builder, value, i, "json.struct.field");
+                emit_json_value(c, field, type->struct_def->fields()[i].type, depth + 1);
+            }
+            emit_json_raw(c, {"}", 1});
+            return;
+        }
+        case rir::TypeKind::Array: {
+            if (type->inner == nullptr) __builtin_trap();
+            emit_json_raw(c, {"[", 1});
+            LLVMValueRef items = LLVMBuildExtractValue(c.builder, value, 0, "json.array.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, value, 1, "json.array.len");
+            LLVMBasicBlockRef preheader = LLVMGetInsertBlock(c.builder);
+            LLVMValueRef function = LLVMGetBasicBlockParent(preheader);
+            LLVMBasicBlockRef loop =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "json.array.loop");
+            LLVMBasicBlockRef body =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "json.array.body");
+            LLVMBasicBlockRef comma =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "json.array.comma");
+            LLVMBasicBlockRef element =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "json.array.element");
+            LLVMBasicBlockRef done =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "json.array.done");
+            LLVMBuildBr(c.builder, loop);
+
+            LLVMPositionBuilderAtEnd(c.builder, loop);
+            LLVMValueRef index = LLVMBuildPhi(c.builder, c.i32_ty, "json.array.index");
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMAddIncoming(index, &zero, &preheader, 1);
+            LLVMValueRef more = LLVMBuildICmp(c.builder, LLVMIntULT, index, len, "json.array.more");
+            LLVMBuildCondBr(c.builder, more, body, done);
+
+            LLVMPositionBuilderAtEnd(c.builder, body);
+            LLVMValueRef first =
+                LLVMBuildICmp(c.builder, LLVMIntEQ, index, zero, "json.array.first");
+            LLVMBuildCondBr(c.builder, first, element, comma);
+
+            LLVMPositionBuilderAtEnd(c.builder, comma);
+            emit_json_raw(c, {",", 1});
+            LLVMBuildBr(c.builder, element);
+
+            LLVMPositionBuilderAtEnd(c.builder, element);
+            LLVMTypeRef elem_type = c.map_type(type->inner);
+            LLVMValueRef slot =
+                LLVMBuildGEP2(c.builder, elem_type, items, &index, 1, "json.array.slot");
+            LLVMValueRef elem = LLVMBuildLoad2(c.builder, elem_type, slot, "json.array.value");
+            emit_json_value(c, elem, type->inner, depth + 1);
+            LLVMBasicBlockRef latch = LLVMGetInsertBlock(c.builder);
+            LLVMValueRef next =
+                LLVMBuildAdd(c.builder, index, LLVMConstInt(c.i32_ty, 1, 0), "json.array.next");
+            LLVMBuildBr(c.builder, loop);
+            LLVMAddIncoming(index, &next, &latch, 1);
+
+            LLVMPositionBuilderAtEnd(c.builder, done);
+            emit_json_raw(c, {"]", 1});
+            return;
+        }
+        default:
+            __builtin_trap();
+    }
+}
 
 static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
     switch (inst.op) {
@@ -1878,6 +2014,43 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, s);
             break;
         }
+        case rir::Opcode::ArrayCreate: {
+            const auto* array_type = c.cur_fn->values[inst.result.id].type;
+            LLVMTypeRef elem_type = c.map_type(array_type->inner);
+            LLVMValueRef storage = LLVMConstNull(c.ptr_ty);
+            if (inst.operand_count != 0) {
+                LLVMValueRef count = LLVMConstInt(c.i32_ty, inst.operand_count, 0);
+                storage = LLVMBuildArrayAlloca(c.builder, elem_type, count, "array.items");
+                for (u32 i = 0; i < inst.operand_count; i++) {
+                    LLVMValueRef index = LLVMConstInt(c.i32_ty, i, 0);
+                    LLVMValueRef slot =
+                        LLVMBuildGEP2(c.builder, elem_type, storage, &index, 1, "array.slot");
+                    LLVMBuildStore(c.builder, c.get_value(inst.operand(i)), slot);
+                }
+            }
+            LLVMValueRef array = LLVMGetUndef(c.str_list_ty);
+            array = LLVMBuildInsertValue(c.builder, array, storage, 0, "array.ptr");
+            array = LLVMBuildInsertValue(
+                c.builder, array, LLVMConstInt(c.i32_ty, inst.operand_count, 0), 1, "array.len");
+            c.set_value(inst.result, array);
+            break;
+        }
+        case rir::Opcode::ArrayLen: {
+            LLVMValueRef array = c.get_value(inst.operands[0]);
+            c.set_value(inst.result, LLVMBuildExtractValue(c.builder, array, 1, "array.len"));
+            break;
+        }
+        case rir::Opcode::ArrayGet: {
+            const auto* array_type = c.cur_fn->values[inst.operands[0].id].type;
+            LLVMTypeRef elem_type = c.map_type(array_type->inner);
+            LLVMValueRef array = c.get_value(inst.operands[0]);
+            LLVMValueRef storage = LLVMBuildExtractValue(c.builder, array, 0, "array.ptr");
+            LLVMValueRef index = c.get_value(inst.operands[1]);
+            LLVMValueRef slot =
+                LLVMBuildGEP2(c.builder, elem_type, storage, &index, 1, "array.slot");
+            c.set_value(inst.result, LLVMBuildLoad2(c.builder, elem_type, slot, "array.elem"));
+            break;
+        }
         case rir::Opcode::JsonReset: {
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_json_reset()),
@@ -1949,6 +2122,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            args,
                            2,
                            "");
+            break;
+        }
+        case rir::Opcode::JsonAppendArray: {
+            const auto* type = c.cur_fn->values[inst.operands[0].id].type;
+            emit_json_value(c, c.get_value(inst.operands[0]), type, 0);
             break;
         }
         case rir::Opcode::JsonFinish: {
