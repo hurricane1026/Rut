@@ -561,6 +561,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const u8* synth,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
+    d.conn->resp_header_mutation_pending_count = 0;
+    d.conn->resp_header_mutation_pending_overflow = false;
     d.conn->resp_header_mutation_count = 0;
     d.conn->resp_header_mutation_overflow = false;
     ctx->state = 0;

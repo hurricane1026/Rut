@@ -2975,6 +2975,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::ReturnStatus) {
+        if (term.commit_response_mutations &&
+            !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
         if (term.source_kind == MirTerminatorSourceKind::LocalRef) {
             if (term.local_ref_index >= local_count)
                 return frontend_error(FrontendError::UnsupportedSyntax, term.span);

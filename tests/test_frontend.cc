@@ -31642,6 +31642,26 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, response_local_dynamic_mutation_before_guard_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Path", req.path)
+    guard resp.header("X-Path") == "expected" else { return resp }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("dynamic response header mutations cannot be combined with guards/waits/for loops "
+            "yet")));
+}
+
 TEST(frontend, response_header_lookup_respects_nearest_shadowing_local) {
     const char* src = R"rut(
 route GET "/x" {

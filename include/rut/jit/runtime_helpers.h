@@ -170,6 +170,7 @@ void rut_helper_resp_set_header(
 void rut_helper_resp_add_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_resp_remove_header(void* conn, const char* name, rut::u32 nlen);
+void rut_helper_resp_commit_headers(void* conn);
 void rut_helper_resp_header(void* conn,
                             const char* name,
                             rut::u32 nlen,

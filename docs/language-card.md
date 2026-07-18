@@ -225,9 +225,11 @@ return resp
 ```
 
 Dynamic Response header mutations currently require a direct route with no
-guards, decorators, `wait`, or `for`, and the builder must be returned directly.
-Those restrictions keep mutation state request-local until buffered Response and
-post-middleware execution have their own runtime Response object.
+guards, decorators, `wait`, or `for`, exactly one builder, and that builder must
+be returned directly. Mutations stay pending until that return commits them,
+but source-ordered mutation lowering around guards still needs a runtime
+Response object. Buffered Response and post-middleware execution need that same
+runtime boundary.
 
 ## State types (top-level, per-shard, bounded)
 

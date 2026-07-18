@@ -217,6 +217,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RespRemoveHeader:
             buf.put_cstr("resp.remove_header");
             break;
+        case Opcode::RespCommitHeaders:
+            buf.put_cstr("resp.commit_headers");
+            break;
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
@@ -573,6 +576,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqHttpVersion:
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:
+        case Opcode::RespCommitHeaders:
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');
