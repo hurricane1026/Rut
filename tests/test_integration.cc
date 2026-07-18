@@ -9350,6 +9350,7 @@ struct ScriptedUpstreamServer {
     }
 };
 
+#if RUT_ENABLE_JIT_TESTS
 struct CompiledRutRoute {
     FrontendRirModule rir{};
     jit::JitEngine engine{};
@@ -9391,6 +9392,7 @@ func rewrite(_ resp: Response) -> i32 {
 chain rewrite_chain { after rewrite(resp) }
 route GET "/api" use chain rewrite_chain { wait(1) return forward(api, buffered: true) }
 )rut";
+#endif
 
 struct ScopedProxyLoop {
     RealLoop* loop = nullptr;
@@ -9865,6 +9867,7 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     close(lfd);
 }
 
+#if RUT_ENABLE_JIT_TESTS
 TEST(shard, buffered_jit_forward_applies_response_mutations_over_http1) {
     ScriptedUpstreamServer backend;
     static const char kResp[] =
@@ -9978,6 +9981,7 @@ TEST(shard, buffered_jit_forward_applies_response_mutations_over_http2) {
     shard.shutdown();
     close(lfd);
 }
+#endif
 
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
