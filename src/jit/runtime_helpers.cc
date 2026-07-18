@@ -187,6 +187,19 @@ void rut_helper_json_append_str(const char* data, u32 len) {
     json_append("\"", 1);
 }
 
+void rut_helper_json_append_str_list(const Str* items, u32 len) {
+    if (items == nullptr && len != 0) {
+        t_json_response.ok = false;
+        return;
+    }
+    json_append("[", 1);
+    for (u32 i = 0; i < len && t_json_response.ok; i++) {
+        if (i != 0) json_append(",", 1);
+        rut_helper_json_append_str(items[i].ptr, items[i].len);
+    }
+    json_append("]", 1);
+}
+
 void rut_helper_json_append_i64(i64 value) {
     char buf[32];
     const int n = snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));

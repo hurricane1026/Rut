@@ -3102,11 +3102,12 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 const auto value_type = fn->values[locals[ref].id].type->kind;
                 const rir::Opcode op =
-                    value_type == rir::TypeKind::Bool  ? rir::Opcode::JsonAppendBool
-                    : value_type == rir::TypeKind::I32 ? rir::Opcode::JsonAppendI32
-                    : value_type == rir::TypeKind::I64 ? rir::Opcode::JsonAppendI64
-                    : value_type == rir::TypeKind::Str ? rir::Opcode::JsonAppendStr
-                                                       : rir::Opcode::JsonFinish;
+                    value_type == rir::TypeKind::Bool      ? rir::Opcode::JsonAppendBool
+                    : value_type == rir::TypeKind::I32     ? rir::Opcode::JsonAppendI32
+                    : value_type == rir::TypeKind::I64     ? rir::Opcode::JsonAppendI64
+                    : value_type == rir::TypeKind::Str     ? rir::Opcode::JsonAppendStr
+                    : value_type == rir::TypeKind::StrList ? rir::Opcode::JsonAppendStrList
+                                                           : rir::Opcode::JsonFinish;
                 if (op == rir::Opcode::JsonFinish ||
                     !b.emit_json_append(op, locals[ref], {term.span.line, term.span.col}))
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);

@@ -9991,12 +9991,14 @@ static FrontendResult<void> build_dynamic_json_plan(
         return {};
     }
     if ((value->type != HirTypeKind::Bool && value->type != HirTypeKind::I32 &&
-         value->type != HirTypeKind::I64 && value->type != HirTypeKind::Str) ||
+         value->type != HirTypeKind::I64 && value->type != HirTypeKind::Str &&
+         value->type != HirTypeKind::StrList) ||
         value->may_nil || value->may_error)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             expr.span,
-            lit_str("runtime json values currently support non-optional bool/i32/i64/str only"));
+            lit_str("runtime json values currently support non-optional bool/i32/i64/str and "
+                    "bounded string-list carriers only"));
     if (value_refs.len >= HirTerminator::kMaxJsonDynamicValues ||
         route->locals.len >= HirRoute::kMaxLocals)
         return frontend_error(FrontendError::TooManyItems, expr.span);
