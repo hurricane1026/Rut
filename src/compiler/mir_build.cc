@@ -459,6 +459,18 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.lhs = &fn->values[fn->values.len - 1];
         return v;
     }
+    if (expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto fallback = mir_value(*expr.lhs, module, fn, ctx);
+        if (!fallback) return core::make_unexpected(fallback.error());
+        if (!fn->values.push(fallback.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = expr.kind == HirExprKind::RespStatus ? MirValueKind::RespStatus
+                                                      : MirValueKind::RespBody;
+        v.type = expr.kind == HirExprKind::RespStatus ? MirTypeKind::I32 : MirTypeKind::Str;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::RespSetHeader || expr.kind == HirExprKind::RespAddHeader ||
         expr.kind == HirExprKind::RespRemoveHeader) {
         v.kind = expr.kind == HirExprKind::RespSetHeader   ? MirValueKind::RespSetHeader

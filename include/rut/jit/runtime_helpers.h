@@ -207,6 +207,12 @@ void rut_helper_resp_remove_header(void* ctx, const char* name, rut::u32 nlen);
 void rut_helper_resp_set_status(void* ctx, rut::i32 status);
 void rut_helper_resp_set_body(void* ctx, const char* body, rut::u32 len);
 void rut_helper_resp_commit_headers(void* ctx);
+rut::i32 rut_helper_resp_status(void* ctx, rut::i32 fallback);
+void rut_helper_resp_body(void* ctx,
+                          const char* fallback_ptr,
+                          rut::u32 fallback_len,
+                          const char** out_ptr,
+                          rut::u32* out_len);
 void rut_helper_resp_header(void* ctx,
                             const char* name,
                             rut::u32 nlen,

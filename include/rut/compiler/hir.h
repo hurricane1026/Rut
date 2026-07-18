@@ -118,6 +118,8 @@ enum class HirExprKind : u8 {
     // field_inits stores ordered literal response headers.
     ResponseInit,
     RespHeader,
+    RespStatus,
+    RespBody,
     RespSetHeader,
     RespAddHeader,
     RespRemoveHeader,
