@@ -295,6 +295,10 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             if (response.response_status_set) result.status_code = response.response_status;
             if (response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+            if (result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
+                !response.response_body_mutation_set &&
+                (response.response_body_valid == 0 || response.response_body_data == nullptr))
+                result = jit::HandlerResult::make_status(500);
         }
     }
     out.terminal = result;

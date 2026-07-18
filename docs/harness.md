@@ -298,12 +298,11 @@ This bus is the common source for assertions, differential comparison, debug
 traces, replay diagnostics, and benchmark counters. It is not a general logging
 framework and must not change dispatch behavior.
 
-Traffic replay publishes response status and response body as separate semantic
-observations. Body bytes are copied out of the connection-owned send buffer
-before completion and are valid for the synchronous observation callback. The
-body observation carries the full wire-body length, up to 4096 exact bytes, and
-an explicit truncation flag; observers never receive a connection-buffer
-pointer.
+Traffic replay and typed source scenarios publish response status and response
+body as separate semantic observations before the connection buffer can be
+reused. The body label is valid for the synchronous observation callback, which
+must copy any bytes it wants to retain. The event carries the full wire-body
+length, up to 4096 exact bytes, and an explicit truncation flag.
 
 ## Deterministic environment
 

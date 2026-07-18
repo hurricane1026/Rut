@@ -9392,6 +9392,13 @@ func rewrite(_ resp: Response) -> i32 {
 chain rewrite_chain { after rewrite(resp) }
 route GET "/api" use chain rewrite_chain { wait(1) return forward(api, buffered: true) }
 )rut";
+
+static constexpr const char kDynamicJsonTransportSource[] = R"rut(
+route GET "/json" {
+    let items = [req.path, "a\"b"]
+    return 200, json({ path: req.path, items: items })
+}
+)rut";
 #endif
 
 struct ScopedProxyLoop {
@@ -9868,6 +9875,94 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
 }
 
 #if RUT_ENABLE_JIT_TESTS
+TEST(shard, dynamic_json_bytes_are_exact_over_http1) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kDynamicJsonTransportSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/json", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    static const char kReq[] = "GET /json HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
+    char response[2048];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 got = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+    }
+    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\\\"b"]})json";
+    CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
+    CHECK(buf_contains(response, total, "Content-Length: 43\r\n", 20));
+    CHECK(buf_contains(response, total, kExpected, sizeof(kExpected) - 1));
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, dynamic_json_bytes_are_exact_over_http2) {
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kDynamicJsonTransportSource));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.add_jit_handler("/json", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/json", 5);
+    REQUIRE(write_all_fd(client, request, request_len));
+
+    u8 response[4096];
+    u32 total = 0;
+    u8 body[256];
+    u32 body_len = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(response, total, 1) == 200 && body_len != 0) break;
+    }
+    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\\\"b"]})json";
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK_EQ(body_len, sizeof(kExpected) - 1);
+    CHECK(body_len == sizeof(kExpected) - 1 &&
+          __builtin_memcmp(body, kExpected, sizeof(kExpected) - 1) == 0);
+
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(shard, buffered_jit_forward_applies_response_mutations_over_http1) {
     ScriptedUpstreamServer backend;
     static const char kResp[] =

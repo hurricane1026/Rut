@@ -66,7 +66,7 @@ thread_local const u64* t_virtual_time_us = nullptr;
 // header formatting and H2 framing both reuse that buffer). Keep the cap below
 // the H2 response scratch so framing overhead remains bounded as well.
 struct JsonResponseScratch {
-    static constexpr u32 kCapacity = 7 * 1024;
+    static constexpr u32 kCapacity = jit::kMaxDynamicJsonResponseBytes;
     char data[kCapacity]{};
     u32 len = 0;
     bool ok = true;

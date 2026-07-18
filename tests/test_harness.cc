@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 #include <fcntl.h>
@@ -153,6 +154,25 @@ bool capture_response_observation(void* context, const harness::Observation& eve
     auto* captured = static_cast<ResponseObservation*>(context);
     captured->seen = true;
     captured->status = event.value0;
+    return true;
+}
+
+struct ResponseBodyObservation {
+    bool seen = false;
+    bool truncated = false;
+    u32 full_len = 0;
+    u32 copied_len = 0;
+    char bytes[4096]{};
+};
+
+bool capture_response_body_observation(void* context, const harness::Observation& event) {
+    if (event.kind != harness::ObservationKind::ResponseBodyProduced) return true;
+    auto* captured = static_cast<ResponseBodyObservation*>(context);
+    captured->seen = true;
+    captured->truncated = event.value1 != 0;
+    captured->full_len = static_cast<u32>(event.value0);
+    captured->copied_len = event.label.len;
+    if (event.label.len != 0) __builtin_memcpy(captured->bytes, event.label.ptr, event.label.len);
     return true;
 }
 
@@ -640,12 +660,54 @@ TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
     spec.required_capabilities =
         harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
     spec.environment_capabilities = spec.required_capabilities;
+    ResponseBodyObservation observed{};
+    spec.observations = {&observed, &capture_response_body_observation};
     const auto result = harness::drive_scenario(scenario, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(result.terminal.status_code, 200);
-    // Includes the 13-byte {"path":"/x"} body, not the two-byte "OK"
-    // fallback that an unrecognized body marker would have produced.
+    REQUIRE(observed.seen);
+    CHECK(!observed.truncated);
+    CHECK_EQ(observed.full_len, 13u);
+    CHECK_EQ(observed.copied_len, 13u);
+    CHECK(__builtin_memcmp(observed.bytes, "{\"path\":\"/x\"}", 13) == 0);
     CHECK_EQ(result.harness.output_bytes, 117u);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, dynamic_json_overflow_has_deterministic_500_observation) {
+    std::string source = "route GET \"/x\" { return 200, json({ path: req.path, value: \"";
+    source.append(jit::kMaxDynamicJsonResponseBytes, 'x');
+    source += "\" }) }\n";
+    TempSource file;
+    REQUIRE(file.write(source.c_str()));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({file.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    ResponseBodyObservation observed{};
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations = {&observed, &capture_response_body_observation};
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 500);
+    REQUIRE(observed.seen);
+    CHECK(!observed.truncated);
+    CHECK_EQ(observed.full_len, 21u);
+    CHECK_EQ(observed.copied_len, 21u);
+    CHECK(__builtin_memcmp(observed.bytes, "Internal Server Error", 21) == 0);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

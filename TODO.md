@@ -9,25 +9,6 @@ short hand-off summary under **Recently Completed**.
 **Goal**: Complete the remaining runtime-backed pieces of the revised syntax
 without accepting source forms that cannot be replayed or resumed faithfully.
 
-### Dynamic JSON serialization
-
-`json(...)` produces a reusable compiler-owned plan that may flow through
-locals and helper parameters/returns, then serialize at a direct return,
-`respond`, or `Response.body` sink. Literal JSON, bounded runtime scalar
-interpolation, recursively expanded declared structs, generic bounded
-`Array<T>` carriers, and ordered string-list views are supported. Struct keys
-follow field declaration order and dynamic leaves share the existing
-eight-slot bound. The serializer escapes strings at runtime; capacity or 4 KiB
-mutable-body overflow fails closed instead of publishing partial JSON.
-Response-body sinks copy bytes into stream-owned resumable context, while
-replay publishes exact bounded output bytes and explicit truncation state to
-harness oracles.
-
-**Acceptance**:
-- Runtime size/depth overflow fails closed with a deterministic diagnostic.
-- HTTP/1, HTTP/2, replay, and harness observe the same serialized bytes.
-- Dynamic object fields have one documented ordering and duplicate-key rule.
-
 ### Stream-owned Response mutation
 
 The terminal `return forward(upstream, buffered: true)` path now buffers a
@@ -137,6 +118,10 @@ implementation promise.
 
 ## Recently Completed
 
+- [x] Dynamic JSON plans support runtime scalars, declared structs, bounded
+  arrays and string lists, preserve documented field order, reject duplicate
+  keys, fail closed on overflow, and expose identical bounded body bytes to
+  HTTP/1, HTTP/2, replay, and scenario harness oracles.
 - [x] Coverage reporting separates informational host/integration coverage from
   the unchanged runtime gate, labels ISA/gate exclusions, reports changed files,
   and publishes the full result in GitHub Job Summary.
