@@ -20,9 +20,9 @@ the parser does not make a spelling part of the stable core.
 |---|---|---|---|
 | Routes | `route GET "/path" { ... }` | grouped `route { ... }` declarations | host/path groups, method unions, expression entries |
 | Middleware | `chain` with ordered `before`; constrained response-header `after` | official built-in decorators | buffered body/status post-processing |
-| Pipe | `value \| fn(_, arg)` | placeholder-free stages, `_.method(...)`, `_1` … `_10` | a dedicated pipe IR or wider runtime tuple projection |
-| Fallback | `.or(default)`, `guard let`, `if let`, explicit `match` | none | none |
-| Match | flat scalar, boolean, string, or variant arms with an explicit fallback where needed | `match const` and restricted nested route-match expansion | unrestricted nested/pattern match |
+| Pipe | `value \| fn(_, arg)` | `_.method(...)`, `_1` … `_10` | a dedicated pipe IR or wider runtime tuple projection |
+| Fallback | `.or(default)`, `guard let`, `if let`, explicit `match` | eager `any(value, default)` and present-only `all(value, next)` | none |
+| Match | flat `i32`, boolean, string, or variant arms with an explicit fallback where needed | `match const` and restricted nested route-match expansion | `i64` subjects and unrestricted nested/pattern match |
 | Reuse | concrete direct functions and named builtin helpers | inferred generic helpers and protocol-style calls in hand-written code | custom `protocol`/`impl` or generic constraints as generated-code abstractions |
 | Async | explicit `wait(...)`, `wait any`, terminal `forward(...)` | none | outbound HTTP, `submit`, `fire`, raw socket, and lifecycle syntax not wired end to end |
 
@@ -69,9 +69,11 @@ protocol method.
 | Existing spelling | Migration |
 |---|---|
 | custom `@auth` decorator | `chain auth { before auth(req) else <status> }`, then `use chain auth` |
-| official `@rateLimit` / `@throttle` | keep only while migrating; spell the policy explicitly with the rate-limit state/helper or `throttle(...)` in the route |
-| `value \| fn(arg)` | `value \| fn(_, arg)` |
-| `value \| _.method(arg)` | `value \| method(_, arg)` |
+| official `@rateLimit` | spell the policy explicitly with supported rate-limit state/helpers |
+| official `@throttle` | keep the compatibility decorator; no equivalent Core route call exists yet |
+| `any(value, default)` | `value.or(default)`; both eagerly evaluate the default |
+| `all(value, next)` | use explicit `if let`/branching so `next` is selected only when `value` is present |
+| `value \| _.method(arg)` | introduce a real named helper that performs the method call, then use `value \| helper(_, arg)` |
 | `tuple \| fn(_1, _2)` | bind named locals or pass the tuple to a named helper, then use `_` if another pipe stage is useful |
 | generic helper used only once | specialize it to a concrete direct helper in generated code |
 | `value \| protocolMethod(_)` where ownership is unclear | call a direct domain helper whose name identifies the operation |

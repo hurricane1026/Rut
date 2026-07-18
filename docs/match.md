@@ -2,10 +2,12 @@
 
 Rut supports `match` in routes and source functions.
 
-Flat scalar/boolean/string/variant match is Rut Core. `match const` and the
-restricted nested-route expansion below are compatibility forms: generated code
-should prefer a flat match with values bound in route scope. Unrestricted nested
-patterns remain experimental. See [syntax-stability.md](syntax-stability.md).
+Flat `i32`/boolean/string/variant match is Rut Core. An `i64` subject is not
+supported; generated code must compare it with `if`/`guard` instead. `match
+const` and the restricted nested-route expansion below are compatibility forms:
+generated code should prefer a flat match with values bound in route scope.
+Unrestricted nested patterns remain experimental. See
+[syntax-stability.md](syntax-stability.md).
 
 ## Route Match
 
@@ -21,8 +23,8 @@ route GET "/status" {
 }
 ```
 
-Route match patterns can be integer, boolean, string, and variant cases. Non-exhaustive scalar
-matches need a wildcard arm.
+Route match patterns can be `i32`, boolean, string, and variant cases.
+Non-exhaustive scalar matches need a wildcard arm.
 
 ```rut
 route GET "/path" {
