@@ -6521,7 +6521,8 @@ chain secure {
 TEST(frontend, analyze_chain_after_lowers_ordered_response_effects) {
     const char* src = R"rut(
 func response_headers(_ req: i32, _ resp: Response) -> i32 {
-    resp.set("X-Path", req.path)
+    let path = req.path
+    resp.set("X-Path", path)
     resp.add("X-Stage", "after")
     resp.remove("Server")
     0
@@ -6550,10 +6551,16 @@ route {
         function_effects += kind == HirExprKind::RespSetHeader ||
                             kind == HirExprKind::RespAddHeader ||
                             kind == HirExprKind::RespRemoveHeader;
+        if (kind == HirExprKind::RespSetHeader) {
+            REQUIRE(hir->functions[0].exprs[i].lhs != nullptr);
+            CHECK_EQ(hir->functions[0].exprs[i].lhs->kind, HirExprKind::ReqPath);
+        }
     }
     REQUIRE_EQ(function_effects, 3u);
     REQUIRE_EQ(hir->routes.len, 1u);
     REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    REQUIRE(hir->routes[0].locals[0].init.lhs != nullptr);
+    CHECK_EQ(hir->routes[0].locals[0].init.lhs->kind, HirExprKind::ReqPath);
     CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
     CHECK_FALSE(hir->routes[0].guards[0].fail_term.commit_response_mutations);
 
