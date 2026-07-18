@@ -828,7 +828,6 @@ struct Ctx {
             case rir::TypeKind::Str:
                 return str_ty;
             case rir::TypeKind::StrList:
-                return str_list_ty;
             case rir::TypeKind::Array:
                 return str_list_ty;
             case rir::TypeKind::ByteSize:
