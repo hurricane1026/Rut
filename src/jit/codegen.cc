@@ -1127,7 +1127,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef value = c.get_value(inst.operands[0]);
             LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "resp.vptr");
             LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "resp.vlen");
-            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
+            LLVMValueRef args[] = {c.param_ctx, name_ptr, name_len, vptr, vlen};
             LLVMValueRef helper = add ? c.get_resp_add_header() : c.get_resp_set_header();
             LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 5, "");
             break;
@@ -1136,7 +1136,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "respremove.name");
             LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
-            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len};
+            LLVMValueRef args[] = {c.param_ctx, name_ptr, name_len};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_resp_remove_header()),
                            c.get_resp_remove_header(),
@@ -1146,7 +1146,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::RespCommitHeaders: {
-            LLVMValueRef args[] = {c.param_conn};
+            LLVMValueRef args[] = {c.param_ctx};
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_resp_commit_headers()),
                            c.get_resp_commit_headers(),
@@ -1169,7 +1169,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "resp.hdr.has");
             LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "resp.hdr.ptr");
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "resp.hdr.len");
-            LLVMValueRef args[] = {c.param_conn,
+            LLVMValueRef args[] = {c.param_ctx,
                                    name_ptr,
                                    name_len,
                                    fallback_has,
