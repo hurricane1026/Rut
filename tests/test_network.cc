@@ -5506,6 +5506,34 @@ TEST(buffered_forward, waits_for_and_dechunks_complete_upstream_body) {
     CHECK(buf_contains(wire, wire_len, "\r\n\r\nWikipedia", 13));
 }
 
+TEST(buffered_forward, rejects_body_longer_than_content_length) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nabc";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    CHECK_EQ(conn->resp_status, 502u);
+    CHECK_FALSE(conn->proxy_response_buffered);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(wire, conn->send_buf.len(), "HTTP/1.1 502", 12));
+    CHECK(buf_contains(wire, conn->send_buf.len(), "\r\n\r\nBad Gateway", 15));
+}
+
 // Large Content-Length response body that requires multiple recv→send cycles.
 // SmallLoop has 4KB buffers. A 10KB body needs 3 recv→send cycles.
 TEST(streaming, large_content_length) {
