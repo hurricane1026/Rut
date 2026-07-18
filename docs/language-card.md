@@ -52,6 +52,7 @@ re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
 json({ users: [], total: 0 })           // literal object/array serialization ✅
 json({ path: req.path })                // ✅ in direct return; bounded scalar slots
+json(payload)                           // ✅ declared struct; declaration-order fields
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
