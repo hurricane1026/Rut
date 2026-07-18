@@ -214,6 +214,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RespHeader:
             buf.put_cstr("resp.header");
             break;
+        case Opcode::RespStatus:
+            buf.put_cstr("resp.status");
+            break;
+        case Opcode::RespBody:
+            buf.put_cstr("resp.body");
+            break;
         case Opcode::RespSetHeader:
             buf.put_cstr("resp.set_header");
             break;
@@ -661,6 +667,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::ReqSetPath:
+        case Opcode::RespStatus:
+        case Opcode::RespBody:
         case Opcode::RespSetStatus:
         case Opcode::RespSetBody:
         case Opcode::SextI64:

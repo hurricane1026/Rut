@@ -465,8 +465,7 @@ void rut_helper_resp_set_status(void* ctx, i32 status) {
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     hctx->response_status_pending_set = true;
     hctx->response_status_pending_invalid = status < 100 || status > 599;
-    hctx->response_status_pending =
-        hctx->response_status_pending_invalid ? 0 : static_cast<u16>(status);
+    hctx->response_status_pending = status;
 }
 
 void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
@@ -490,13 +489,33 @@ void rut_helper_resp_commit_headers(void* ctx) {
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     hctx->response_header_count = hctx->response_header_pending_count;
     hctx->response_header_overflow = hctx->response_header_pending_overflow;
-    hctx->response_status = hctx->response_status_pending;
+    hctx->response_status =
+        hctx->response_status_pending_invalid ? 0 : static_cast<u16>(hctx->response_status_pending);
     hctx->response_status_set = hctx->response_status_pending_set;
     hctx->response_status_invalid = hctx->response_status_pending_invalid;
     hctx->response_body_mutation_data = hctx->response_body_pending_data;
     hctx->response_body_mutation_len = hctx->response_body_pending_len;
     hctx->response_body_mutation_set = hctx->response_body_pending_set;
     hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
+}
+
+i32 rut_helper_resp_status(void* ctx, i32 fallback) {
+    if (ctx == nullptr) return fallback;
+    const auto* hctx = static_cast<const jit::HandlerCtx*>(ctx);
+    return hctx->response_status_pending_set ? hctx->response_status_pending : fallback;
+}
+
+void rut_helper_resp_body(
+    void* ctx, const char* fallback_ptr, u32 fallback_len, const char** out_ptr, u32* out_len) {
+    *out_ptr = fallback_ptr;
+    *out_len = fallback_len;
+    if (ctx == nullptr) return;
+    const auto* hctx = static_cast<const jit::HandlerCtx*>(ctx);
+    // Overflow is already a fail-closed terminal condition. Do not expose a
+    // partial or dangling value to later expressions while building that 500.
+    if (!hctx->response_body_pending_set || hctx->response_body_pending_overflow) return;
+    *out_ptr = hctx->response_body_pending_data;
+    *out_len = hctx->response_body_pending_len;
 }
 
 void rut_helper_resp_header(void* ctx,

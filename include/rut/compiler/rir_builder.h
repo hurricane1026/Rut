@@ -648,6 +648,24 @@ struct Builder {
         return r.vid;
     }
 
+    Result<ValueId> emit_resp_status(ValueId fallback, SourceLoc loc = {}) {
+        if (!val_has_type(fallback, TypeKind::I32)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I32));
+        auto r = TRY(emit(Opcode::RespStatus, ty, loc));
+        r.inst->operands[0] = fallback;
+        r.inst->operand_count = 1;
+        return r.vid;
+    }
+
+    Result<ValueId> emit_resp_body(ValueId fallback, SourceLoc loc = {}) {
+        if (!val_has_type(fallback, TypeKind::Str)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Str));
+        auto r = TRY(emit(Opcode::RespBody, ty, loc));
+        r.inst->operands[0] = fallback;
+        r.inst->operand_count = 1;
+        return r.vid;
+    }
+
     VoidResult emit_resp_set_header(Str name, ValueId val, SourceLoc loc = {}) {
         if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
