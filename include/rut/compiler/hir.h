@@ -199,6 +199,11 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    // Checker-level control-plane snapshots. They deliberately have no MIR
+    // carrier until HandlerCtx exposes the corresponding runtime services.
+    StatsSnapshot,
+    MetricsSnapshot,
+    AdminJson,
 };
 
 enum class HirTypeKind : u8 {
@@ -232,6 +237,9 @@ enum class HirTypeKind : u8 {
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
+    // Opaque, json()-serializable control-plane snapshot types.
+    Stats,
+    Metrics,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;

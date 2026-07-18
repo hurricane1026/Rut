@@ -83,7 +83,11 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   (needs a resumable, stream-owned runtime Response); [x] runtime `[str]`
   request views with ordered `req.queryAll`/`req.getAll`, `.len`, `.isEmpty`,
   `.first()`, and bounds-safe `.at(i)`;
-  `stats()/metrics()/reload()/upstream.mark()` declarations.
+  [x] checker-level `stats()/metrics()/reload()/upstream.mark()` declarations
+  (opaque Stats/Metrics types, JSON-serializable metadata, parameter labels,
+  statement/value and route/timer context contracts). Runtime lowering remains
+  pending: HandlerCtx does not yet expose control-plane services, so MIR rejects
+  snapshot values instead of compiling a fake result.
 - Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
   guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match
   arms; [x] middleware status-`return` and handler `respond` context errors

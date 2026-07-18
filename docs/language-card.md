@@ -421,7 +421,7 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
          uses in one request see the same value)  max(a, b)  min(a, b)
          — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
-admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
+admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats() ⏳ runtime
 ```
 
 ## Do NOT write (compile errors — with the fix)

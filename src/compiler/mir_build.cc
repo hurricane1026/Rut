@@ -239,6 +239,14 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                                           const HirModule& module,
                                           MirFunction* fn,
                                           const ForLoopCtx* ctx = nullptr) {
+    if (expr.kind == HirExprKind::StatsSnapshot || expr.kind == HirExprKind::MetricsSnapshot ||
+        expr.kind == HirExprKind::AdminJson) {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                    "is not connected yet"));
+    }
     MirValue v{};
     v.shape_index = expr.shape_index;
     v.may_nil = expr.may_nil;
