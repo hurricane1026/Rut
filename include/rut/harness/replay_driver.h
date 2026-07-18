@@ -47,7 +47,32 @@ inline bool publish_replay_result(const HarnessSpec& spec,
     event.label = replay.replayed ? Str{"replayed", 8}
                                   : (replay.skipped ? Str{"unsupported", 11} : Str{"failed", 6});
     result.semantic_events++;
-    if (spec.observations.publish(event)) return true;
+    if (!spec.observations.publish(event)) {
+        if (result.outcome == Outcome::Passed) {
+            result.outcome = Outcome::Mismatched;
+            set_detail(result, "observation rejected by oracle");
+        }
+        return false;
+    }
+
+    if (!replay.response_body_observed) return true;
+    if (result.semantic_events >= spec.limits.max_semantic_events) {
+        result.outcome = Outcome::Failed;
+        result.has_reached_limit = true;
+        result.reached_limit = LimitKind::SemanticEvents;
+        set_detail(result, "semantic-events limit reached");
+        return false;
+    }
+
+    Observation body{};
+    body.kind = ObservationKind::ResponseBodyProduced;
+    body.phase = Phase::Observe;
+    body.sequence = sequence;
+    body.value0 = replay.response_body_len;
+    body.value1 = replay.response_body_truncated ? 1 : 0;
+    body.label = {reinterpret_cast<const char*>(replay.observed_body), replay.observed_body_len};
+    result.semantic_events++;
+    if (spec.observations.publish(body)) return true;
 
     if (result.outcome == Outcome::Passed) {
         result.outcome = Outcome::Mismatched;
