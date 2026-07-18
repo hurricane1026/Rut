@@ -672,6 +672,22 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_resp_set_status(ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::I32)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespSetStatus, nullptr, loc));
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_resp_set_body(ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespSetBody, nullptr, loc));
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_resp_commit_headers(SourceLoc loc = {}) {
         TRY_VOID(emit(Opcode::RespCommitHeaders, nullptr, loc));
         return {};

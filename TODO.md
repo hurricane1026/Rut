@@ -28,8 +28,10 @@ dynamic body through replay/harness observations.
 Response header mutation logs now live in resumable `HandlerCtx` state rather
 than `Connection`; pending logs survive `wait`, stay isolated per request or H2
 stream invocation, and `chain after` no longer rejects `wait`/`for` routes.
-Remaining work is to add mutable buffered body/status carriers and move those
-through the same commit boundary.
+Bounded plain-string body replacement and status replacement now use the same
+pending/committed boundary. Remaining work is field reads, JSON-valued body
+assignment, and applying header/status/body mutations to an explicitly buffered
+forwarded response.
 
 **Acceptance**:
 - `chain after` can mutate buffered status/body and survive a yield.

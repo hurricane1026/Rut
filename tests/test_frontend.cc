@@ -6703,6 +6703,48 @@ route GET "/users" use chain access {
     CHECK(found_committing_terminal);
 }
 
+TEST(frontend, chain_after_lowers_mutable_response_status_and_body) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "rewritten"
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response {
+    wait(1)
+    return 200, "original"
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    u32 statuses = 0;
+    u32 bodies = 0;
+    u32 commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            statuses += block.insts[ii].op == rir::Opcode::RespSetStatus;
+            bodies += block.insts[ii].op == rir::Opcode::RespSetBody;
+            commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(statuses, 1u);
+    CHECK_EQ(bodies, 1u);
+    CHECK_EQ(commits, 1u);
+    rir.destroy();
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));

@@ -1181,6 +1181,20 @@ struct Parser {
             expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
             lhs = expr;
         }
+        if (take(TokenType::Eq)) {
+            auto rhs = parse_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = AstExprKind::Assign;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
         return lhs.value();
     }
 
@@ -2008,7 +2022,7 @@ struct Parser {
             const Token start_tok = cur();
             auto expr = parse_expr();
             if (!expr) return core::make_unexpected(expr.error());
-            if (expr->kind == AstExprKind::MethodCall) {
+            if (expr->kind == AstExprKind::MethodCall || expr->kind == AstExprKind::Assign) {
                 AstStatement stmt{};
                 stmt.kind = AstStmtKind::Expr;
                 stmt.expr = expr.value();
@@ -2489,10 +2503,11 @@ struct Parser {
                 if (!block.block_stmts.push(expr_ptr.value()))
                     return frontend_error(FrontendError::TooManyItems, expr->span);
                 const bool response_mutation =
-                    expr->kind == AstExprKind::MethodCall && expr->lhs != nullptr &&
-                    expr->lhs->kind == AstExprKind::Ident &&
-                    (expr->name.eq({"set", 3}) || expr->name.eq({"add", 3}) ||
-                     expr->name.eq({"remove", 6}));
+                    (expr->kind == AstExprKind::MethodCall && expr->lhs != nullptr &&
+                     expr->lhs->kind == AstExprKind::Ident &&
+                     (expr->name.eq({"set", 3}) || expr->name.eq({"add", 3}) ||
+                      expr->name.eq({"remove", 6}))) ||
+                    expr->kind == AstExprKind::Assign;
                 if (response_mutation) continue;
                 break;
             }
