@@ -112,8 +112,10 @@ without presenting lossy or per-shard state as exact shared state.
   whose absence would be incorrect. The accepted, not-yet-implemented contract
   is in `docs/hash-state.md`: no eviction, per-key owner linearization, pure
   bounded updater, definite-not-applied failures, and reload ownership rules.
-- Keep cross-node `backend:` syntax reserved until reads have an explicit
+- [x] Keep cross-node `backend:` syntax reserved until reads have an explicit
   freshness/invalidation contract; do not describe Cache as a source of truth.
+  The analyzer now rejects `Cache(..., backend: ...)` with that exact reason,
+  independent of named-argument order.
 
 **Acceptance**:
 - A rate-limit test demonstrates both meter-every-attempt and meter-on-accept
