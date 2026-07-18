@@ -1278,8 +1278,10 @@ get /custom {
 `addr` (string), `weight` (i32), `healthy` (bool), `activeConns` (i32),
 `latencyEwma` (Duration). The user can read these to implement any selection logic.
 
-`upstream.mark(server, healthy: bool)` manually overrides a target's health —
-used by custom health checks running in `timer` blocks.
+`upstream.mark(server, healthy: bool) -> bool` manually overrides a target's
+health. It is restricted to explicitly shard-pinned custom-health-check timers;
+the boolean makes stale target and unavailable-capability failure visible. See
+`docs/control-plane-mutations.md` for authority, generation, and ordering rules.
 
 **Health check modes:**
 
@@ -1728,8 +1730,8 @@ route {
     /admin {
         get /stats => 200, json(stats())
         post /reload {
-            reload()
-            return 200
+            guard reload() else { return 503 }
+            return 202
         }
     }
 
@@ -3001,7 +3003,7 @@ config_dump()                 // string (JSON) — current compiled config: rout
 shard_stats()                 // string (JSON) — per-shard: requests, connections, memory, latency
 stats()                       // Stats — request/connection counters, json()-serializable
 metrics()                     // Metrics — metrics snapshot for push/export, json()-serializable
-reload()                      // trigger config hot reload (same as SIGHUP / admin endpoint)
+reload() -> bool              // enqueue hot reload; true means accepted, not activated
 
 // --- Numeric ---
 i8, i16, i32, i64             // signed integers, wrapping overflow
@@ -3292,8 +3294,8 @@ route {
     admin.example.com {
         get /stats => 200, json(stats())
         post /reload {
-            reload()
-            return 200
+            guard reload() else { return 503 }
+            return 202
         }
         post /ban {
             guard let ip = req.body(IP) else { return 400 }

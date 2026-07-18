@@ -120,10 +120,18 @@ The environment owns all effects outside the selected target:
 - TLS peer and certificate metadata; and
 - fault injection.
 
+Control-plane mutation is also an environment capability. Its deterministic
+port owns reload admission/outcomes, config-generation acknowledgements, and
+manual upstream-health overrides. The exact authority, failure, ordering, and
+replay rules are specified in `docs/control-plane-mutations.md`; a reload
+activation requires the `Process` layer rather than a handler-level
+approximation.
+
 Environment capabilities are ports, not global mode flags. A run receives an
 explicit `ClockPort`, `IoPort`, `UpstreamPort`, `StatePort`, and `FaultPort` as
-required by its layer. Production adapters call the OS. Deterministic adapters
-use a virtual event queue. Loopback adapters use real local resources.
+well as a `ControlPlaneMutationPort` when required by its layer. Production
+adapters call the OS. Deterministic adapters use a virtual event queue. Loopback
+adapters use real local resources.
 
 An environment advertises capabilities such as:
 
@@ -135,6 +143,7 @@ SingleShard | MultiShard
 ScriptedUpstream | LoopbackUpstream | ExternalUpstream
 FaultsNone | FaultsScripted | SyscallInterpose
 ControlPlaneSnapshot
+ControlPlaneMutation
 ```
 
 The runner validates required capabilities before starting. No driver should

@@ -476,7 +476,8 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
          uses in one request see the same value)  max(a, b)  min(a, b)
          — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
-admin:   stats() metrics() ✅ bounded JSON snapshots; reload() upstream_status()
+admin:   stats() metrics() ✅ bounded JSON snapshots; reload() -> bool
+         (accepted, not activated; route-only, capability-gated) upstream_status()
          config_dump() shard_stats() ⏳ runtime
 ```
 
@@ -492,6 +493,11 @@ The process form replaces `scope` with `"process"`, omits `shard_id`, and
 aggregates the same `requests`, `connections`, and `memory` fields. Serialization
 is bounded by the dynamic-response limit and fails the response closed with 500
 if the runtime capability is unavailable.
+
+Control-plane mutations use visible boolean failure results and never introduce
+hidden waits. Their authority, generation ordering, and replay contract are
+specified in `docs/control-plane-mutations.md`; the runtime surface remains ⏳
+until that contract is connected end to end.
 
 ## Do NOT write (compile errors — with the fix)
 
