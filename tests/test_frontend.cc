@@ -31782,6 +31782,84 @@ TEST(frontend, parse_object_literal_as_call_argument) {
     CHECK_EQ(object.field_inits[1].value->int_value, 0);
 }
 
+TEST(frontend, json_serializes_literal_object_to_response_body) {
+    const char* src = R"rut(
+route GET "/x" {
+    return 200, json({ quote: "a\"b\n", flags: [true, false, nil], negative: -12 })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto expected =
+        lit("{\"quote\":\"a\\\"b\\n\",\"flags\":[true,false,null],\"negative\":-12}");
+    CHECK(hir->routes[0].control.direct_term.response_body.eq(expected));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    CHECK(rir.module.response_bodies[0].eq(expected));
+    rir.destroy();
+}
+
+TEST(frontend, json_serializes_empty_literal_arrays_and_objects) {
+    const char* src =
+        "route GET \"/x\" { let payload = json({ users: [], meta: {}, ok: true }) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::StrLit));
+    CHECK(
+        hir->routes[0].locals[0].init.str_value.eq(lit("{\"users\":[],\"meta\":{},\"ok\":true}")));
+}
+
+TEST(frontend, json_rejects_dynamic_values_until_runtime_serializer_exists) {
+    const char* src = "route GET \"/x\" { let payload = json({ path: req.path }) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("json currently accepts only literal bool/int/string/nil/array/object values")));
+}
+
+TEST(frontend, json_rejects_duplicate_object_fields) {
+    const char* src =
+        "route GET \"/x\" { let payload = json({ value: 1, value: 2 }) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("json object field names must be unique")));
+}
+
+TEST(frontend, return_body_expression_rejects_non_json_calls) {
+    const char* src = "route GET \"/x\" { return 200, req.path }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
+}
+
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
     const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
     auto lexed = lex(lit(src));
