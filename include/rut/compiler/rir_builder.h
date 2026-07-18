@@ -706,7 +706,8 @@ struct Builder {
 
     VoidResult emit_json_append(Opcode op, ValueId value, SourceLoc loc = {}) {
         if (!valid_val(value) || (op != Opcode::JsonAppendBool && op != Opcode::JsonAppendI32 &&
-                                  op != Opcode::JsonAppendI64 && op != Opcode::JsonAppendStr))
+                                  op != Opcode::JsonAppendI64 && op != Opcode::JsonAppendStr &&
+                                  op != Opcode::JsonAppendStrList))
             return err(RirError::InvalidState);
         const TypeKind expected = op == Opcode::JsonAppendBool  ? TypeKind::Bool
                                   : op == Opcode::JsonAppendI32 ? TypeKind::I32

@@ -146,6 +146,7 @@ void rut_helper_parse_unprime();
 void rut_helper_json_reset();
 void rut_helper_json_append_raw(const char* data, rut::u32 len);
 void rut_helper_json_append_str(const char* data, rut::u32 len);
+void rut_helper_json_append_str_list(const rut::Str* items, rut::u32 len);
 void rut_helper_json_append_i64(rut::i64 value);
 void rut_helper_json_append_bool(rut::u8 value);
 void rut_helper_json_finish(void* ctx);

@@ -109,6 +109,7 @@ struct Ctx {
     LLVMValueRef fn_json_reset;
     LLVMValueRef fn_json_append_raw;
     LLVMValueRef fn_json_append_str;
+    LLVMValueRef fn_json_append_str_list;
     LLVMValueRef fn_json_append_i64;
     LLVMValueRef fn_json_append_bool;
     LLVMValueRef fn_json_finish;
@@ -216,6 +217,15 @@ struct Ctx {
             fn_json_append_str = LLVMAddFunction(llvm_mod, "rut_helper_json_append_str", ft);
         }
         return fn_json_append_str;
+    }
+    LLVMValueRef get_json_append_str_list() {
+        if (!fn_json_append_str_list) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            fn_json_append_str_list =
+                LLVMAddFunction(llvm_mod, "rut_helper_json_append_str_list", ft);
+        }
+        return fn_json_append_str_list;
     }
     LLVMValueRef get_json_append_i64() {
         if (!fn_json_append_i64) {
@@ -1923,6 +1933,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_json_append_str()),
                            c.get_json_append_str(),
+                           args,
+                           2,
+                           "");
+            break;
+        }
+        case rir::Opcode::JsonAppendStrList: {
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, value, 0, "json.list.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, value, 1, "json.list.len");
+            LLVMValueRef args[] = {ptr, len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_json_append_str_list()),
+                           c.get_json_append_str_list(),
                            args,
                            2,
                            "");
