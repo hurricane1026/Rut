@@ -31848,6 +31848,7 @@ TEST(frontend, copied_hir_keeps_generated_json_storage_alive) {
     CHECK(copied->routes[0].control.direct_term.response_body.eq(lit("{\"ok\":true}")));
     auto mir = build_mir_heap(*copied);
     REQUIRE(mir);
+    copied.reset();
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
