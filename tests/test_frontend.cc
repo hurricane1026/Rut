@@ -13680,6 +13680,24 @@ route GET "/search" {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+
+    const char* derived_value = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    let count = tags.len
+    wait(1ms)
+    if count > 0 { return 204 } else { return 404 }
+}
+)rut";
+    lexed = lex(lit(derived_value));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
 }
 
 TEST(frontend, req_query_string_flows_as_optional_str) {

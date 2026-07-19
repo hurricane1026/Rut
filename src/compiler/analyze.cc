@@ -19145,11 +19145,43 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::UnsupportedSyntax, found->span, detail);
 
             // Request multi-value lists are backed by an invocation-local
-            // bounded pool and lower to SSA aggregates. A resumed state cannot
-            // reuse either the prior invocation's pool or a state-0 SSA value.
-            // Keep pre-wait consumption valid, but reject a LocalRef whose own
-            // source span is after the first wait.
+            // bounded pool and lower to SSA aggregates. Values derived from a
+            // list (for example `let count = tags.len`) are state-0 SSA values
+            // too, so they cannot be consumed after resume either. Propagate
+            // that dependency through local initializers before checking uses.
             const u32 first_wait_start = route.waits[0].span.start;
+            bool list_dependent[HirRoute::kMaxLocals]{};
+            auto expr_reads_dependent_local = [&](const auto& self, const HirExpr& expr) -> bool {
+                if (expr.kind == HirExprKind::LocalRef) {
+                    for (u32 li = 0; li < route.locals.len; li++)
+                        if (route.locals[li].ref_index == expr.local_index)
+                            return list_dependent[li];
+                }
+                if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
+                if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
+                for (u32 ai = 0; ai < expr.args.len; ai++)
+                    if (expr.args[ai] != nullptr && self(self, *expr.args[ai])) return true;
+                for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+                    if (expr.field_inits[fi].value != nullptr &&
+                        self(self, *expr.field_inits[fi].value))
+                        return true;
+                return false;
+            };
+            for (u32 li = 0; li < route.locals.len; li++)
+                list_dependent[li] = route.locals[li].span.start < first_wait_start &&
+                                     route.locals[li].type == HirTypeKind::StrList;
+            for (u32 pass = 0; pass < route.locals.len; pass++) {
+                bool changed = false;
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    const auto& local = route.locals[li];
+                    if (list_dependent[li] || local.span.start >= first_wait_start) continue;
+                    if (expr_reads_dependent_local(expr_reads_dependent_local, local.init)) {
+                        list_dependent[li] = true;
+                        changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
             auto reads_list_after_wait =
                 [&](const auto& self, const HirExpr& expr, u32 ref_index) -> bool {
                 if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index &&
@@ -19168,8 +19200,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             };
             for (u32 li = 0; li < route.locals.len; li++) {
                 const auto& local = route.locals[li];
-                if (local.type != HirTypeKind::StrList || local.span.start > first_wait_start)
-                    continue;
+                if (!list_dependent[li]) continue;
                 bool read_after = false;
                 for (u32 ei = 0; ei < route.exprs.len && !read_after; ei++)
                     read_after = reads_list_after_wait(
