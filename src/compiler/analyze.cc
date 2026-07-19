@@ -5738,10 +5738,11 @@ static bool collect_function_response_effects(HirFunction* fn,
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
-                                                  const HirLocal* locals,
-                                                  u32 local_count,
-                                                  const MatchPayloadBinding* binding,
-                                                  Str scoped_binding_name);
+                                                  const HirLocal* locals = nullptr,
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr,
+                                                  Str scoped_binding_name = {},
+                                                  HirRoute* runtime_body_route = nullptr);
 
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
@@ -10379,10 +10380,11 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
-                                                  const HirLocal* locals = nullptr,
-                                                  u32 local_count = 0,
-                                                  const MatchPayloadBinding* binding = nullptr,
-                                                  Str scoped_binding_name = {}) {
+                                                  const HirLocal* locals,
+                                                  u32 local_count,
+                                                  const MatchPayloadBinding* binding,
+                                                  Str scoped_binding_name,
+                                                  HirRoute* runtime_body_route) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -10420,8 +10422,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     // local operand, its stable route-local identity.
                     HirRoute body_scratch{};
                     body_scratch.is_helper_scratch = true;
+                    HirRoute* body_route =
+                        runtime_body_route != nullptr ? runtime_body_route : &body_scratch;
+                    const bool saved_allow_respond_effects = body_route->allow_respond_effects;
+                    if (runtime_body_route != nullptr) body_route->allow_respond_effects = true;
                     auto snapshot =
-                        analyze_expr(body_arg, &body_scratch, mod, locals, local_count, binding);
+                        analyze_expr(body_arg, body_route, mod, locals, local_count, binding);
+                    body_route->allow_respond_effects = saved_allow_respond_effects;
                     const bool stable_snapshot_operand =
                         snapshot && (snapshot->kind == HirExprKind::LocalRef ||
                                      snapshot->kind == HirExprKind::StatsSnapshot ||
@@ -12359,7 +12366,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod, route->locals.data, route->locals.len, binding);
+    auto term = analyze_term(stmt, mod, route->locals.data, route->locals.len, binding, {}, route);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
     return {};

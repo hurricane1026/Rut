@@ -32561,6 +32561,27 @@ route GET "/admin" {
             "connected yet")));
 }
 
+TEST(frontend, direct_admin_json_preserves_snapshot_helper_respond_guard) {
+    const char* src = R"rut(
+func snapshot() {
+    guard false else { respond 503 }
+    stats()
+}
+route GET "/admin" {
+    return 200, json(snapshot())
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 503);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
+}
+
 TEST(frontend, direct_admin_json_rejects_unretained_snapshot_expression_tree) {
     const char* src = R"rut(
 func choose<T>(cond: bool, first: T, second: T) -> T {
