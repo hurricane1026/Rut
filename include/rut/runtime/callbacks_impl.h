@@ -2737,6 +2737,12 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // delivered so proxy_upstream_reusable refuses it. A successful retry
         // clears it again (the fresh attempt re-sends from scratch).
         conn.upstream_request_incomplete = true;
+        // The initial request snapshot may still have a zero-length reservation:
+        // on the successful path that reservation is normally established below,
+        // after the send completes. Every early-response recovery branch calls
+        // prepare_early_response_state, which can pipeline-stash and reset send_buf,
+        // so pin the snapshot prefix before entering any of those branches.
+        reserve_response_mutation_snapshot(conn);
         if (conn.upstream_recv_buf.len() > 0) {
             prepare_early_response_state(conn);
             conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);

@@ -11548,6 +11548,48 @@ TEST(response_headers, early_response_reserves_snapshot_before_pipeline_stash) {
           0);
 }
 
+TEST(response_headers, failed_initial_send_reserves_snapshot_before_pipeline_stash) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->fd = 42;
+
+    static const char request[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char first[] = "GET /first HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char next[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    c->req_initial_send_len = sizeof(first) - 1;
+    c->req_body_mode = BodyMode::None;
+    c->keep_alive = true;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE_EQ(c->retry_req_send_len, 0u);
+
+    static const char response[] = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1),
+        sizeof(response) - 1);
+    on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK(c->upstream_request_incomplete);
+    CHECK_EQ(c->retry_req_send_len, sizeof(first) - 1);
+    CHECK_EQ(c->pipeline_stash_len, sizeof(next) - 1);
+    CHECK(mutation.value.eq({"/first", 6}));
+    CHECK(
+        buf_has(c->response_header_buf.data(), c->response_header_buf.len(), "X-Path: /first\r\n"));
+    CHECK(__builtin_memcmp(c->send_buf.data() + c->retry_req_send_len, next, sizeof(next) - 1) ==
+          0);
+}
+
 // Verify initial send phase also sets on_upstream_recv for early response detection.
 TEST(slot_state, initial_send_has_early_response_slot) {
     SmallLoop loop;
