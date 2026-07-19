@@ -6,6 +6,10 @@ Flat `i32`/boolean/string/variant match is Rut Core. An `i64` subject is not
 supported; generated code must compare it with `if`/`guard` instead. `match
 const` and the restricted nested-route expansion below are compatibility forms:
 generated code should prefer a flat match with values bound in route scope.
+When migrating an existing `match const`, preserve compile-time selection by
+emitting only the selected arm (or otherwise eliminating dead arms). Ordinary
+`match` analyzes every arm, so it is not a semantics-preserving textual
+replacement when an unselected arm is invalid.
 Unrestricted nested patterns remain experimental. See
 [syntax-stability.md](syntax-stability.md).
 

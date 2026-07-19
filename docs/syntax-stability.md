@@ -69,12 +69,12 @@ protocol method.
 | Existing spelling | Migration |
 |---|---|
 | custom `@auth` decorator | first convert its legacy `i32` status helper to a bool predicate or respond-capable helper, then call that helper from `chain auth` and `use chain auth` |
-| official `@rateLimit` | spell the policy explicitly with supported rate-limit state/helpers |
+| official `@rateLimit` | for shard-scoped rules, spell the policy explicitly with supported rate-limit state/helpers; retain the compatibility decorator for `scope: global` |
 | official `@throttle` | keep the compatibility decorator; no equivalent Core route call exists yet |
 | `any(value, default)` | `value.or(default)`; both eagerly evaluate the default |
-| `all(value, next)` | evaluate `next` into a local first, then use explicit `if let`/branching so the saved value is selected only when `value` is present; inline `next` only when it is pure |
+| `all(value, next)` | preserve static selection: if `value` is known absent, remove the unevaluated `next`; otherwise evaluate `next` before explicit branching, and inline it only when pure |
 | `value \| _.method(arg)` | introduce a real named helper that performs the method call, then use `value \| helper(_, arg)` |
-| `tuple \| fn(_1, _2)` | bind named locals or pass the tuple to a named helper, then use `_` if another pipe stage is useful |
+| `tuple \| fn(_1, _2)` | retain tuple-slot compatibility, or change the producer to separate values/a named struct; Core projection and destructuring are not available yet |
 | generic helper used only once | specialize it to a concrete direct helper in generated code |
 | `value \| protocolMethod(_)` where ownership is unclear | call a direct domain helper whose name identifies the operation |
 | restricted nested route `match` | bind the outer decision, then use a flat `match` or explicit `if` in the selected branch |
@@ -90,10 +90,12 @@ and attach `else <status>`. If the helper chooses among rejection statuses,
 rewrite it as a respond-capable helper whose guards issue `respond <status>`,
 then use it as a `before` step without `else`.
 
-Compatibility `all(value, next)` evaluates `next` eagerly even when the left
-side is absent. A behavior-preserving migration must therefore bind/evaluate
-`next` before the explicit presence branch. Moving a fallible or effectful
-`next` expression inside only the present arm changes error/effect behavior.
+Compatibility `all(value, next)` normally evaluates `next` eagerly, so a
+behavior-preserving migration must bind/evaluate it before the explicit
+presence branch. The exception is a statically known absent left side: existing
+analysis selects that absence without evaluating `next`, so migration must drop
+the dead RHS rather than bind it. Moving a fallible or effectful RHS across
+either boundary changes error/effect behavior.
 
 ## Chain Boundary
 

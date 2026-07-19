@@ -280,7 +280,7 @@ route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
 }
 
-@rateLimit(limit: 1000, window: 1m)               // compatibility only; do not generate
+@rateLimit(limit: 1000, window: 1m, scope: global) // retain for an exact cross-shard cap
 route POST "/form" { return 204 }
 ```
 
@@ -376,8 +376,10 @@ route GET "/api" {                                   // GCRA token bucket
 }
 ```
 
-For equivalent parameters, this matches `@rateLimit`, including leaving TAT
-unchanged after a rejection (verified by JIT execution tests). Move the set to
+For equivalent shard-scoped parameters, this matches shard-local `@rateLimit`,
+including leaving TAT unchanged after a rejection (verified by JIT execution
+tests). It does not replace `scope: global`: retain that compatibility decorator
+for the process-shared exact cross-shard cap. Move the set to
 the leading statement region when a deliberately punitive policy should meter
 every attempt. The Rut form also supports custom policies such as per-tier
 limits and composite conditions. See
