@@ -530,8 +530,9 @@ jobs:
           # threshold still gates runtime coverage by default.
           #
           # Host-dependent backend/event-loop files remain visible in the
-          # report but are excluded from the percentage gate. ISA-specific
-          # implementations are covered by the separate SIMD jobs.
+          # report but are excluded from the percentage gate. llvm-cov exports
+          # only the linked SIMD implementation, so the active backend stays in
+          # this gate; the separate SIMD jobs build the other implementations.
           #
           # test_traffic_capture / test_traffic_replay / test_sim /
           # test_shard_control are not passed as --object because they

@@ -38,13 +38,6 @@ class CoverageArea:
     gate_exclude: re.Pattern[str] | None = None
 
 
-# Architecture-specific implementations are exercised by the SIMD jobs, not by
-# the single-host line-coverage job. Do not let whichever ISA that runner lacks
-# dominate its first-party report.
-RUNTIME_REPORT_EXCLUDE_PATH_RE = re.compile(
-    r"(?:^|/)src/runtime/simd/(?:avx2|avx512|neon|sse2|sve)\.cc$"
-)
-
 # Runtime files excluded from the percentage gate, but still included in the
 # per-area report and lowest-covered-file list:
 #   - io_uring_backend / epoll_backend: require kernel features / perms
@@ -64,8 +57,7 @@ AREAS = (
     CoverageArea(
         "runtime",
         ("include/rut/common/", "include/rut/runtime/", "src/runtime/"),
-        RUNTIME_REPORT_EXCLUDE_PATH_RE,
-        RUNTIME_GATE_EXCLUDE_PATH_RE,
+        gate_exclude=RUNTIME_GATE_EXCLUDE_PATH_RE,
     ),
     CoverageArea("compiler", ("include/rut/compiler/", "src/compiler/")),
     CoverageArea("replay/sim", ("include/rut/sim/", "src/sim/")),

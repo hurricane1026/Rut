@@ -45,12 +45,14 @@ class CoverageReportTest(unittest.TestCase):
         self.assertIsNotNone(area)
         self.assertTrue(coverage_report.gate_includes_path(area, shard_control))
 
-    def test_arch_specific_runtime_file_is_report_excluded(self) -> None:
-        avx = "src/runtime/simd/avx2.cc"
-        self.assertIsNone(coverage_report.area_for_path(avx))
-        area = coverage_report.area_for_path(avx, include_report_excluded=True)
-        self.assertIsNotNone(area)
-        self.assertEqual(area.name, "runtime")
+    def test_runtime_simd_backends_remain_in_the_coverage_gate(self) -> None:
+        for backend in ("scalar", "sse2", "avx2", "avx512", "neon", "sve"):
+            path = f"src/runtime/simd/{backend}.cc"
+            with self.subTest(path=path):
+                area = coverage_report.area_for_path(path)
+                self.assertIsNotNone(area)
+                self.assertEqual(area.name, "runtime")
+                self.assertTrue(coverage_report.gate_includes_path(area, path))
 
     def test_third_party_path_cannot_claim_first_party_prefix(self) -> None:
         path = "/repo/third_party/vendor/include/rut/runtime/copied.h"
@@ -75,7 +77,7 @@ class CoverageReportTest(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("runtime         no", rendered)
         self.assertIn("runtime        yes", rendered)
-        self.assertIn("runtime       skip", rendered)
+        self.assertIn("runtime        yes     n/a", rendered)
 
     def test_area_stats_prioritizes_missed_lines(self) -> None:
         covered, total, files = coverage_report.area_stats(
