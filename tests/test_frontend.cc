@@ -32040,6 +32040,33 @@ TEST(frontend, guard_match_return_body_json_respects_payload_shadowing) {
         hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
 }
 
+TEST(frontend, nested_const_match_preserves_outer_json_payload_shadowing) {
+    const char* src = R"rut(
+variant Result { ok(i32), err }
+route GET "/x" {
+    let outer = Result.ok(1)
+    match outer {
+        .ok(json) => {
+            let inner = Result.ok(2)
+            match const inner {
+                .ok(other) => return 200, json(1)
+                .err => return 500
+            }
+        }
+        .err => return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
+}
+
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
     const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
     auto lexed = lex(lit(src));

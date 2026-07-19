@@ -524,6 +524,7 @@ enum class KnownValueState : u8 {
 };
 
 struct MatchPayloadBinding {
+    const MatchPayloadBinding* outer = nullptr;
     Str name{};
     HirTypeKind type = HirTypeKind::Unknown;
     u32 generic_index = 0xffffffffu;
@@ -3579,7 +3580,8 @@ static bool user_bound_req_name(const HirModule& mod,
                                 const HirLocal* locals,
                                 u32 local_count,
                                 const MatchPayloadBinding* binding) {
-    if (binding && binding->subject && binding->name.eq({"req", 3})) return true;
+    for (const auto* current = binding; current != nullptr; current = current->outer)
+        if (current->subject && current->name.eq({"req", 3})) return true;
     bool has_magic_request_proxy = false;
     for (u32 i = 0; i < local_count; i++) {
         if (!locals[i].name.eq({"req", 3})) continue;
@@ -3605,7 +3607,8 @@ static bool user_bound_ident_name(const HirModule& mod,
                                   u32 local_count,
                                   const MatchPayloadBinding* binding,
                                   Str name) {
-    if (binding && binding->subject && binding->name.eq(name)) return true;
+    for (const auto* current = binding; current != nullptr; current = current->outer)
+        if (current->subject && current->name.eq(name)) return true;
     for (u32 i = 0; i < local_count; i++) {
         if (locals[i].name.eq(name)) return true;
     }
@@ -4932,10 +4935,12 @@ static FrontendResult<HirExpr> analyze_match_pattern(const AstExpr& pattern_expr
 }
 
 static void bind_match_payload(MatchPayloadBinding* binding,
+                               const MatchPayloadBinding* outer,
                                Str name,
                                const HirVariant::CaseDecl& case_decl,
                                u32 case_index,
                                const HirExpr* subject) {
+    binding->outer = outer;
     binding->name = name;
     binding->type = case_decl.payload_type;
     binding->generic_index = case_decl.payload_generic_index;
@@ -5827,6 +5832,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
                 bind_match_payload(&selected_binding,
+                                   binding,
                                    arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
@@ -6004,8 +6010,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 const auto& case_decl = mod.variants[pattern->variant_index].cases[case_index];
                 if (case_decl.has_payload && arm.pattern->lhs != nullptr) {
-                    bind_match_payload(
-                        &arm_binding, arm.pattern->lhs->name, case_decl, case_index, subject_ptr);
+                    bind_match_payload(&arm_binding,
+                                       binding,
+                                       arm.pattern->lhs->name,
+                                       case_decl,
+                                       case_index,
+                                       subject_ptr);
                     arm_binding_ptr = &arm_binding;
                 }
             }
@@ -8547,28 +8557,32 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
     }
-    if (binding && binding->subject && expr.name.eq(binding->name)) {
+    const MatchPayloadBinding* matched_binding = binding;
+    while (matched_binding != nullptr &&
+           (!matched_binding->subject || !expr.name.eq(matched_binding->name)))
+        matched_binding = matched_binding->outer;
+    if (matched_binding != nullptr) {
         out.kind = HirExprKind::MatchPayload;
-        out.type = binding->type;
-        out.generic_index = binding->generic_index;
-        out.generic_has_error_constraint = binding->generic_has_error_constraint;
-        out.generic_has_eq_constraint = binding->generic_has_eq_constraint;
-        out.generic_has_ord_constraint = binding->generic_has_ord_constraint;
-        out.generic_protocol_index = binding->generic_protocol_index;
-        out.generic_protocol_count = binding->generic_protocol_count;
-        for (u32 cpi = 0; cpi < binding->generic_protocol_count; cpi++)
-            out.generic_protocol_indices[cpi] = binding->generic_protocol_indices[cpi];
-        out.variant_index = binding->variant_index;
-        out.struct_index = binding->struct_index;
-        out.shape_index = binding->shape_index;
-        out.case_index = binding->case_index;
-        out.tuple_len = binding->tuple_len;
-        for (u32 ti = 0; ti < binding->tuple_len; ti++) {
-            out.tuple_types[ti] = binding->tuple_types[ti];
-            out.tuple_variant_indices[ti] = binding->tuple_variant_indices[ti];
-            out.tuple_struct_indices[ti] = binding->tuple_struct_indices[ti];
+        out.type = matched_binding->type;
+        out.generic_index = matched_binding->generic_index;
+        out.generic_has_error_constraint = matched_binding->generic_has_error_constraint;
+        out.generic_has_eq_constraint = matched_binding->generic_has_eq_constraint;
+        out.generic_has_ord_constraint = matched_binding->generic_has_ord_constraint;
+        out.generic_protocol_index = matched_binding->generic_protocol_index;
+        out.generic_protocol_count = matched_binding->generic_protocol_count;
+        for (u32 cpi = 0; cpi < matched_binding->generic_protocol_count; cpi++)
+            out.generic_protocol_indices[cpi] = matched_binding->generic_protocol_indices[cpi];
+        out.variant_index = matched_binding->variant_index;
+        out.struct_index = matched_binding->struct_index;
+        out.shape_index = matched_binding->shape_index;
+        out.case_index = matched_binding->case_index;
+        out.tuple_len = matched_binding->tuple_len;
+        for (u32 ti = 0; ti < matched_binding->tuple_len; ti++) {
+            out.tuple_types[ti] = matched_binding->tuple_types[ti];
+            out.tuple_variant_indices[ti] = matched_binding->tuple_variant_indices[ti];
+            out.tuple_struct_indices[ti] = matched_binding->tuple_struct_indices[ti];
         }
-        if (!route->exprs.push(*binding->subject))
+        if (!route->exprs.push(*matched_binding->subject))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         return out;
@@ -10441,6 +10455,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
                 bind_match_payload(&selected_binding,
+                                   binding,
                                    inner_arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
@@ -10932,6 +10947,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 const auto& case_decl =
                     mod.variants[pattern->variant_index].cases[pattern->case_index];
                 bind_match_payload(&selected_binding,
+                                   binding,
                                    arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
@@ -11225,6 +11241,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                             .cases[matched_pattern.case_index];
                                 if (case_decl.has_payload) {
                                     bind_match_payload(&arm_binding,
+                                                       binding,
                                                        arm.pattern->lhs->name,
                                                        case_decl,
                                                        matched_pattern.case_index,
@@ -13903,8 +13920,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 arm.bind_tuple_struct_indices[ti] =
                                     case_decl.payload_tuple_struct_indices[ti];
                             }
-                            bind_match_payload(
-                                &arm_binding, arm.bind_name, case_decl, case_index, subject_ptr);
+                            bind_match_payload(&arm_binding,
+                                               nullptr,
+                                               arm.bind_name,
+                                               case_decl,
+                                               case_index,
+                                               subject_ptr);
                             arm_binding_ptr = &arm_binding;
                         }
                     } else if (ast_arm.pattern->lhs != nullptr) {
