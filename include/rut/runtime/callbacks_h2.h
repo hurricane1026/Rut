@@ -1326,8 +1326,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             failure_status = 503;
         } else if (!h2->async_request_forwardable) {
             failure_status = 400;
-        } else if (h2->async_cfg == nullptr ||
-                   kOutcome.upstream_id >= h2->async_cfg->upstream_count) {
+        }
+        if (failure_status == 0 &&
+            (h2->async_cfg == nullptr || kOutcome.upstream_id >= h2->async_cfg->upstream_count)) {
             failure_status = 503;
         }
 
