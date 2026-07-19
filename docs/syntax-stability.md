@@ -71,7 +71,7 @@ protocol method.
 | custom `@auth` decorator | first convert its legacy `i32` status helper to a bool predicate or respond-capable helper, then call that helper from `chain auth` and `use chain auth` |
 | official `@rateLimit` | for shard-scoped rules, spell the policy explicitly with supported rate-limit state/helpers; retain the compatibility decorator for `scope: global` |
 | official `@throttle` | keep the compatibility decorator; no equivalent Core route call exists yet |
-| `any(value, default)` | `value.or(default)`; both eagerly evaluate the default |
+| `any(value, default)` | for a missing-capable receiver with no applicable user `or` member, use `value.or(default)`; otherwise use an explicit presence branch so migration cannot change method dispatch; preserve eager default evaluation |
 | `all(value, next)` | preserve static selection: if `value` is known absent, remove the unevaluated `next`; otherwise evaluate `next` before explicit branching, and inline it only when pure |
 | `value \| _.method(arg)` | introduce a real named helper that performs the method call, then use `value \| helper(_, arg)` |
 | `tuple \| fn(_1, _2)` | retain tuple-slot compatibility, or change the producer to separate values/a named struct; Core projection and destructuring are not available yet |
@@ -96,6 +96,13 @@ presence branch. The exception is a statically known absent left side: existing
 analysis selects that absence without evaluating `next`, so migration must drop
 the dead RHS rather than bind it. Moving a fallible or effectful RHS across
 either boundary changes error/effect behavior.
+
+Compatibility `any(value, default)` is an unconditional builtin, while
+`value.or(default)` first respects an applicable user/protocol method named
+`or`. The short migration is therefore valid only for the builtin
+missing-value receiver path. If member dispatch is possible, spell the
+presence/fallback branch explicitly and evaluate `default` beforehand to keep
+the compatibility form's eager effects.
 
 ## Chain Boundary
 
