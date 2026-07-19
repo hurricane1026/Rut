@@ -16254,6 +16254,62 @@ TEST(response_headers, forwarded_mutations_remove_matching_connection_nomination
     CHECK(out.find("X-Security: enforced\r\n") != std::string::npos);
 }
 
+TEST(response_headers, forwarded_101_upgrade_mutation_preserves_connection_nomination) {
+    Connection conn;
+    conn.reset();
+    conn.resp_status = 101;
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Connection: keep-alive, Upgrade\r\n"
+        "Upgrade: h2c\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"Upgrade", 7};
+    mutation.value = {"websocket", 9};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive, Upgrade\r\n") != std::string::npos);
+    CHECK(out.find("Upgrade: h2c") == std::string::npos);
+    CHECK(out.find("Upgrade: websocket\r\n") != std::string::npos);
+}
+
+TEST(response_headers, forwarded_101_rejects_destructive_handshake_mutations) {
+    auto rejected = [](ConnectionBase::RespHeaderMutationMode mode, const char* name) {
+        Connection conn;
+        conn.reset();
+        conn.resp_status = 101;
+        u8 upstream_storage[256]{};
+        u8 header_storage[256]{};
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        static const char response[] =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: websocket\r\n"
+            "\r\n";
+        conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, static_cast<u32>(strlen(name))};
+        mutation.value =
+            mode == ConnectionBase::RespHeaderMutationMode::Remove ? Str{} : Str{"close", 5};
+        return build_h1_forward_response_headers(conn, sizeof(response) - 1, false);
+    };
+
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Remove, "Upgrade"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Connection"));
+}
+
 TEST(response_headers, stabilization_copies_only_mutations_that_survive_folding) {
     Connection conn;
     conn.reset();

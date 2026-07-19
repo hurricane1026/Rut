@@ -1554,6 +1554,16 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
     for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
         const auto& mutation = conn.resp_header_mutations[i];
         const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+        // Once a 101 is accepted the runtime will enter the raw upgrade
+        // tunnel. Do not allow mutations to remove or rewrite its required
+        // Connection nomination. Upgrade itself may still be set/added, but
+        // removing it would send a handshake that no longer describes the
+        // protocol switch we are about to perform.
+        if (conn.resp_status == 101 &&
+            (http_header_name_eq_ci(mutation.name.ptr, mutation.name.len, "connection", 10) ||
+             (remove &&
+              http_header_name_eq_ci(mutation.name.ptr, mutation.name.len, "upgrade", 7))))
+            return false;
         if (validate_response_header(mutation.name.ptr,
                                      mutation.name.len,
                                      remove ? "" : mutation.value.ptr,
@@ -1576,6 +1586,12 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         return false;
     };
     auto nominated_mutation = [&](const u8* token, u32 token_len) {
+        // `Connection: Upgrade` is part of a successful 101 handshake, not an
+        // ordinary hop-by-hop nomination to strip when an after-mutation
+        // rewrites the Upgrade header.
+        if (conn.resp_status == 101 &&
+            http_header_name_eq_ci(reinterpret_cast<const char*>(token), token_len, "upgrade", 7))
+            return false;
         for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
             if (!response_mutation_survives(conn, i)) continue;
             const auto& mutation = conn.resp_header_mutations[i];
