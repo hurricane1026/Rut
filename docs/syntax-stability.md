@@ -68,11 +68,11 @@ protocol method.
 
 | Existing spelling | Migration |
 |---|---|
-| custom `@auth` decorator | `chain auth { before auth(req) else <status> }`, then `use chain auth` |
+| custom `@auth` decorator | first convert its legacy `i32` status helper to a bool predicate or respond-capable helper, then call that helper from `chain auth` and `use chain auth` |
 | official `@rateLimit` | spell the policy explicitly with supported rate-limit state/helpers |
 | official `@throttle` | keep the compatibility decorator; no equivalent Core route call exists yet |
 | `any(value, default)` | `value.or(default)`; both eagerly evaluate the default |
-| `all(value, next)` | use explicit `if let`/branching so `next` is selected only when `value` is present |
+| `all(value, next)` | evaluate `next` into a local first, then use explicit `if let`/branching so the saved value is selected only when `value` is present; inline `next` only when it is pure |
 | `value \| _.method(arg)` | introduce a real named helper that performs the method call, then use `value \| helper(_, arg)` |
 | `tuple \| fn(_1, _2)` | bind named locals or pass the tuple to a named helper, then use `_` if another pipe stage is useful |
 | generic helper used only once | specialize it to a concrete direct helper in generated code |
@@ -82,6 +82,18 @@ protocol method.
 Official decorators lower to route metadata today; custom route decorators are
 already rejected. The migration target is explicit source, not a second hidden
 middleware model.
+
+Legacy custom decorator helpers use an `i32` convention: zero passes and a
+non-zero value rejects. A `chain before` step does not accept that contract. If
+the rejection status is fixed, wrap or rewrite the helper as a bool predicate
+and attach `else <status>`. If the helper chooses among rejection statuses,
+rewrite it as a respond-capable helper whose guards issue `respond <status>`,
+then use it as a `before` step without `else`.
+
+Compatibility `all(value, next)` evaluates `next` eagerly even when the left
+side is absent. A behavior-preserving migration must therefore bind/evaluate
+`next` before the explicit presence branch. Moving a fallible or effectful
+`next` expression inside only the present arm changes error/effect behavior.
 
 ## Chain Boundary
 

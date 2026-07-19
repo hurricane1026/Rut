@@ -100,7 +100,9 @@ and generated code do not need an extra execution model.
 
 Rut Core should keep chains intentionally narrow:
 
-- `before` is the only implemented route-level extension point.
+- The implemented route-level extension points are request-side `before` and
+  the constrained response-header `after` slice described above; there are no
+  arbitrary phases or body/status post-processing hooks.
 - A `before` step must be a direct call. A bool predicate must declare
   `else <status>` (its only rejection channel); a respond-capable helper
   (one whose body uses `guard ... else { respond <status>[, body] }`) must
