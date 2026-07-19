@@ -55,6 +55,8 @@ void Http2Conn::init() {
     async_cfg = nullptr;
     async_synth_len = 0;
     async_synth_sent = 0;
+    async_request_body_followed = false;
+    async_request_forwardable = false;
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;

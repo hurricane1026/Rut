@@ -155,6 +155,11 @@ struct Http2Conn {
     // sends can complete short (full socket buffer, large header block), so the
     // proxy resubmits the remainder until async_synth_sent == async_synth_len.
     u32 async_synth_sent;
+    // Request properties captured before a timer yield. A resumed handler may
+    // return Forward, which must apply the same body/header validation as an
+    // immediate Forward outcome without consulting reused decoder scratch.
+    bool async_request_body_followed;
+    bool async_request_forwardable;
     u32 async_timer_ms;
     jit::HandlerFn async_fn;
     u16 async_state;

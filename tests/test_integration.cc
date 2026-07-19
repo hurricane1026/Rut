@@ -8943,6 +8943,28 @@ static u64 forward_with_response_mutations_handler(
     return rut::jit::HandlerResult::make_forward(0).pack();
 }
 
+// Mirrors a chain-after mutation whose value is req.params.id. The matcher
+// originally exposes the value from Http2Conn::hdr_scratch; the serving layer
+// must re-anchor it before the upstream response reuses pending_synth.
+static u64 forward_with_param_mutation_handler(
+    void* raw_conn, rut::jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx == nullptr || ctx->route_param_count != 1)
+        return rut::jit::HandlerResult::make_status(500).pack();
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+    mutation.mode = rut::ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Param", 7};
+    mutation.value = {ctx->route_params[0].value, ctx->route_params[0].value_len};
+    return rut::jit::HandlerResult::make_forward(0).pack();
+}
+
+static u64 wait_then_forward_handler(void*, rut::jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx != nullptr && ctx->state == 7) return rut::jit::HandlerResult::make_forward(0).pack();
+    return rut::jit::HandlerResult::make_yield_payload(
+               7, rut::jit::YieldKind::Timer, /*milliseconds=*/20)
+        .pack();
+}
+
 // End-to-end: a JIT handler returning Forward must kick off the same
 // proxy flow as a RouteAction::Proxy match. Before the JIT forward wire-up,
 // handle_jit_outcome::Forward returned 500; this test guards against that
@@ -9965,6 +9987,116 @@ TEST(shard, serves_http2_jit_forward_with_response_mutations) {
     CHECK(!h2_response_has_header(resp, total, 1, "x-remove", "origin"));
     CHECK(h2_response_has_header(resp, total, 1, "x-multi", "first"));
     CHECK(h2_response_has_header(resp, total, 1, "x-multi", "second"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_stabilizes_route_param_mutation) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "X-Param: origin\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.use_segment_trie());
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/users/:id", 'G', &forward_with_param_mutation_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/users/alice", 12);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "x-param", "alice"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-param", "origin"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_after_timer_resume) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &wait_then_forward_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    u8 body[16];
+    u32 body_len = 0;
+    for (int attempt = 0; attempt < 12 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(resp, total, 1) != 0 && body_len == 2) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    REQUIRE_EQ(body_len, 2u);
+    CHECK_EQ(body[0], static_cast<u8>('o'));
+    CHECK_EQ(body[1], static_cast<u8>('k'));
 
     close(c);
     shard.stop();
