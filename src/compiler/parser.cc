@@ -343,8 +343,34 @@ struct Parser {
         return object;
     }
 
+    FrontendResult<AstExpr> parse_array_literal(bool objects_allowed) {
+        const Token start = cur();
+        auto lbracket = expect(TokenType::LBracket);
+        if (!lbracket) return core::make_unexpected(lbracket.error());
+        NestedDelimiterGuard nested(this);
+        AstExpr arr{};
+        arr.kind = AstExprKind::ArrayLit;
+        while (!take(TokenType::RBracket)) {
+            // Preserve the surrounding expression context recursively: object
+            // literals are accepted in arrays only when the array itself is a
+            // call argument (or nested inside one).
+            auto elem = objects_allowed ? parse_call_arg() : parse_expr();
+            if (!elem) return core::make_unexpected(elem.error());
+            auto elem_ptr = alloc_expr(elem.value());
+            if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
+            if (!arr.args.push(elem_ptr.value()))
+                return frontend_error(FrontendError::TooManyItems, elem->span);
+            if (take(TokenType::RBracket)) break;
+            auto comma = expect(TokenType::Comma);
+            if (!comma) return core::make_unexpected(comma.error());
+        }
+        arr.span = Span{start.start, prev().end, start.line, start.col};
+        return arr;
+    }
+
     FrontendResult<AstExpr> parse_call_arg() {
         if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        if (cur().type == TokenType::LBracket) return parse_array_literal(true);
         return parse_expr();
     }
 
@@ -354,26 +380,7 @@ struct Parser {
         if (cur().type == TokenType::LBrace)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(cur()), kObjectCallArgDetail);
-        if (take(TokenType::LBracket)) {
-            NestedDelimiterGuard nested(this);
-            AstExpr arr{};
-            arr.kind = AstExprKind::ArrayLit;
-            while (!take(TokenType::RBracket)) {
-                // Object literals are expression-like only inside call arguments,
-                // including recursively nested JSON arrays.
-                auto elem = parse_call_arg();
-                if (!elem) return core::make_unexpected(elem.error());
-                auto elem_ptr = alloc_expr(elem.value());
-                if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
-                if (!arr.args.push(elem_ptr.value()))
-                    return frontend_error(FrontendError::TooManyItems, elem->span);
-                if (take(TokenType::RBracket)) break;
-                auto comma = expect(TokenType::Comma);
-                if (!comma) return core::make_unexpected(comma.error());
-            }
-            arr.span = Span{start.start, prev().end, start.line, start.col};
-            return arr;
-        }
+        if (cur().type == TokenType::LBracket) return parse_array_literal(false);
         if (take(TokenType::LParen)) {
             NestedDelimiterGuard nested(this);
             auto first = parse_expr();

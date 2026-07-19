@@ -32025,6 +32025,54 @@ TEST(frontend, parse_rejects_object_literal_as_general_expression) {
     CHECK(ast.error().detail.eq(lit("object literals are only allowed as call arguments")));
 }
 
+TEST(frontend, parse_rejects_object_literal_nested_in_general_array) {
+    const char* src = "route GET \"/x\" { let payload = [{ users: [] }] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("object literals are only allowed as call arguments")));
+}
+
+TEST(frontend, if_let_direct_terminators_preserve_json_shadowing) {
+    const char* route_src =
+        "route GET \"/x\" { if let json = error(7) { return 200, json(1) } else { return 500 } "
+        "}\n";
+    auto route_lexed = lex(lit(route_src));
+    REQUIRE(route_lexed);
+    auto route_ast = parse_file_heap(route_lexed.value());
+    REQUIRE(route_ast);
+    auto route_hir = analyze_file_heap(route_ast.value());
+    REQUIRE_FALSE(route_hir.has_value());
+    CHECK(route_hir.error().detail.eq(
+        lit("return body expressions currently support json(literal) only")));
+
+    const char* match_src =
+        "route GET \"/x\" { match 1 { 1 => { if let json = error(7) { return 200, json(1) } "
+        "else { return 500 } } _ => return 404 } }\n";
+    auto match_lexed = lex(lit(match_src));
+    REQUIRE(match_lexed);
+    auto match_ast = parse_file_heap(match_lexed.value());
+    REQUIRE(match_ast);
+    auto match_hir = analyze_file_heap(match_ast.value());
+    REQUIRE_FALSE(match_hir.has_value());
+    CHECK(match_hir.error().detail.eq(
+        lit("return body expressions currently support json(literal) only")));
+
+    const char* guard_src =
+        "route GET \"/x\" { let value = error(7) guard let ok = value else { if let json = "
+        "error(8) { return 200, json(1) } else { return 500 } } return 200 }\n";
+    auto guard_lexed = lex(lit(guard_src));
+    REQUIRE(guard_lexed);
+    auto guard_ast = parse_file_heap(guard_lexed.value());
+    REQUIRE(guard_ast);
+    auto guard_hir = analyze_file_heap(guard_ast.value());
+    REQUIRE_FALSE(guard_hir.has_value());
+    CHECK(guard_hir.error().detail.eq(
+        lit("return body expressions currently support json(literal) only")));
+}
+
 TEST(frontend, analyze_rejects_object_literal_after_empty_name_effect_local) {
     const char* src = R"rut(
 func accept(value: str) -> str => value

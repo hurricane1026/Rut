@@ -10670,9 +10670,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
         arm->body_kind = HirMatchArm::BodyKind::If;
         // `if let` inside a match arm: the cond folds to `HasValue(expr)` (with
         // known-value folding + pure-optional rejection via analyze_guard_cond).
-        // Both branches here are route terminators (return/forward), which take
-        // no locals, so the binding is never referenceable — no local is
-        // injected. Plain `if cond` keeps its bool-condition path.
+        // Direct terminators do not need a materialized local, but name lookup
+        // still has to see the narrowed binding (for example, it can shadow the
+        // builtin `json` in a response-body expression).
         HirExpr cond_expr{};
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
@@ -10693,7 +10693,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, binding);
+        MatchPayloadBinding narrowed_binding{};
+        const MatchPayloadBinding* then_binding = binding;
+        if (stmt.bind_value) {
+            narrowed_binding.name = stmt.name;
+            narrowed_binding.subject = &cond_expr;
+            then_binding = &narrowed_binding;
+        }
+        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, then_binding);
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
@@ -10786,8 +10793,9 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
         body->body_kind = HirGuardBody::BodyKind::If;
         // `if let` inside a guard-fail body: cond folds to `HasValue(expr)`
         // (known-value folding + pure-optional rejection via analyze_guard_cond).
-        // Both branches are route terminators (no locals), so the binding is
-        // never referenceable — no local is injected.
+        // Direct terminators do not need a materialized local, but name lookup
+        // still has to see the narrowed binding (for example, it can shadow the
+        // builtin `json` in a response-body expression).
         HirExpr cond_expr{};
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
@@ -10808,7 +10816,14 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, binding);
+        MatchPayloadBinding narrowed_binding{};
+        const MatchPayloadBinding* then_binding = binding;
+        if (stmt.bind_value) {
+            narrowed_binding.name = stmt.name;
+            narrowed_binding.subject = &cond_expr;
+            then_binding = &narrowed_binding;
+        }
+        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, then_binding);
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
@@ -10960,11 +10975,19 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             return is_ast_hir_terminator(branch);
         };
         if (simple_branch(*stmt.then_stmt) && simple_branch(*stmt.else_stmt)) {
-            // Terminator branches take no locals, so an `if let` binding here is
-            // never referenceable — no local is injected.
+            // Direct terminators do not need a materialized local, but name
+            // lookup still has to see the narrowed binding (for example, it can
+            // shadow the builtin `json` in a response-body expression).
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
-            auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, binding);
+            MatchPayloadBinding narrowed_binding{};
+            const MatchPayloadBinding* then_binding = binding;
+            if (stmt.bind_value) {
+                narrowed_binding.name = stmt.name;
+                narrowed_binding.subject = &cond_expr;
+                then_binding = &narrowed_binding;
+            }
+            auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, then_binding);
             if (!then_term) return core::make_unexpected(then_term.error());
             auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
