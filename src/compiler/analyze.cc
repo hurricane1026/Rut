@@ -4049,9 +4049,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         !user_bound_ident_name(mod, locals, local_count, binding, {"upstream", 8})) {
         if (!route->control_plane_stmt_ok || !route->is_timer || expr.args.len != 2 ||
             expr.arg_labels.len != 2 || expr.arg_labels[0].len != 0 ||
-            !expr.arg_labels[1].eq({"healthy", 7}) ||
-            expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::Ident ||
-            expr.args[1] == nullptr)
+            !expr.arg_labels[1].eq({"healthy", 7}) || expr.args[0] == nullptr ||
+            expr.args[0]->kind != AstExprKind::Ident || expr.args[1] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         u32 upstream_index = mod.upstreams.len;
         for (u32 ui = 0; ui < mod.upstreams.len; ui++) {
@@ -4062,9 +4061,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         }
         auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (upstream_index == mod.upstreams.len ||
-            (upstream_index < mod.upstreams.len && mod.upstreams[upstream_index].extra_count != 0) ||
-            !healthy || healthy->type != HirTypeKind::Bool ||
-            healthy->may_nil || healthy->may_error)
+            (upstream_index < mod.upstreams.len &&
+             mod.upstreams[upstream_index].extra_count != 0) ||
+            !healthy || healthy->type != HirTypeKind::Bool || healthy->may_nil ||
+            healthy->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         route->control_plane_stmt_ok = false;
         HirExpr out{};
@@ -10387,8 +10387,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                              locals[li - 1].type == HirTypeKind::Metrics) &&
                             !locals[li - 1].may_nil && !locals[li - 1].may_error) {
                             term.runtime_response_body_type = locals[li - 1].type;
-                            term.runtime_response_body_local_ref_index =
-                                locals[li - 1].ref_index;
+                            term.runtime_response_body_local_ref_index = locals[li - 1].ref_index;
                         }
                         break;
                     }

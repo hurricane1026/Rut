@@ -32532,9 +32532,9 @@ TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "control-plane statements currently require a straight-line route without "
-            "guard/wait/for")));
+        CHECK(hir.error().detail.eq(
+            lit("control-plane statements currently require a straight-line route without "
+                "guard/wait/for")));
     }
 }
 

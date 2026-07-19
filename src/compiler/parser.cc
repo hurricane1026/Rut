@@ -885,12 +885,13 @@ struct Parser {
                         while (true) {
                             Str arg_label{};
                             if (cur().type == TokenType::Ident && peek().type == TokenType::Colon) {
-                                const bool mark_label = lhs_ptr.value()->kind == AstExprKind::Ident &&
-                                                        lhs_ptr.value()->name.eq({"upstream", 8}) &&
-                                                        field.name.eq({"mark", 4});
+                                const bool mark_label =
+                                    lhs_ptr.value()->kind == AstExprKind::Ident &&
+                                    lhs_ptr.value()->name.eq({"upstream", 8}) &&
+                                    field.name.eq({"mark", 4});
                                 if (!mark_label)
-                                    return frontend_error(
-                                        FrontendError::UnsupportedSyntax, span_from(cur()));
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(cur()));
                                 arg_label = cur().text;
                                 pos++;
                                 pos++;  // ':'
