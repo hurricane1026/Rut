@@ -880,6 +880,7 @@ struct Parser {
                     method.kind = AstExprKind::MethodCall;
                     method.lhs = lhs_ptr.value();
                     method.name = field.name;
+                    method.type_args = field.type_args;
                     method.span = field.span;
                     if (!take(TokenType::RParen)) {
                         while (true) {

@@ -32490,6 +32490,17 @@ TEST(frontend, upstream_mark_rejects_ambiguous_multi_backend_target) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    const char* externally_bound =
+        "upstream api\n"
+        "timer health, every: 1s { upstream.mark(api, healthy: true) return 200 }\n";
+    lexed = lex(lit(externally_bound));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, upstream_mark_requires_healthy_argument_label) {
@@ -32550,6 +32561,44 @@ route GET "/admin" {
             "connected yet")));
 }
 
+TEST(frontend, direct_admin_json_rejects_unretained_snapshot_expression_tree) {
+    const char* src = R"rut(
+func choose<T>(cond: bool, first: T, second: T) -> T {
+    if cond { first } else { second }
+}
+route GET "/admin" {
+    let first = stats()
+    let second = stats()
+    return 200, json(choose(req.http11, first, second))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, admin_json_analyzes_pipeline_snapshot_operand) {
+    const char* src = R"rut(
+func identity<T>(value: T) -> T => value
+route GET "/admin" {
+    let payload = json(stats() | identity(_))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::AdminJson);
+}
+
 TEST(frontend, control_plane_snapshot_cannot_cross_wait_boundary) {
     const char* src = R"rut(
 route GET "/admin" {
@@ -32592,6 +32641,8 @@ TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {
     const char* cases[] = {
         "route GET \"/admin\" { guard req.http11 else { return 505 } reload() return 204 }\n",
         "route GET \"/admin\" { reload() wait(1) return 204 }\n",
+        "route GET \"/admin\" { let x = any(1, error(500)) reload() guard let value = x "
+        "else { return 400 } return 204 }\n",
     };
     for (const char* src : cases) {
         auto lexed = lex(lit(src));
@@ -32677,6 +32728,26 @@ TEST(frontend, control_plane_effect_rejected_on_websocket_terminate_route) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+
+    const char* guard_body = R"rut(
+upstream ws
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 503, json(stats()) }
+    7
+}
+chain health { before check(req) }
+route GET "/ws" use chain health {
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    lexed = lex(lit(guard_body));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("control-plane effects are not supported on WebSocket terminate routes")));

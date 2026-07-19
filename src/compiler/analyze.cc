@@ -4078,7 +4078,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (upstream_index == mod.upstreams.len ||
             (upstream_index < mod.upstreams.len &&
-             mod.upstreams[upstream_index].extra_count != 0) ||
+             (!mod.upstreams[upstream_index].has_address ||
+              mod.upstreams[upstream_index].extra_count != 0)) ||
             !healthy || healthy->type != HirTypeKind::Bool || healthy->may_nil ||
             healthy->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -9154,21 +9155,27 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // Dynamic JSON is limited to the two declared snapshot types. Analyze
         // the operand so bindings (and eventually helper returns) retain the
         // same behavior as an immediate stats()/metrics() call.
-        if (expr.args[0]->kind == AstExprKind::Ident || expr.args[0]->kind == AstExprKind::Call) {
-            auto snapshot = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
-            if (snapshot &&
-                (snapshot->type == HirTypeKind::Stats || snapshot->type == HirTypeKind::Metrics) &&
-                !snapshot->may_nil && !snapshot->may_error) {
-                if (!route->exprs.push(snapshot.value()))
-                    return frontend_error(FrontendError::TooManyItems, expr.span);
-                HirExpr out{};
-                out.kind = HirExprKind::AdminJson;
-                out.type = HirTypeKind::Str;
-                out.span = expr.span;
-                out.lhs = &route->exprs[route->exprs.len - 1];
-                return out;
-            }
+        const u32 saved_exprs = route->exprs.len;
+        const u32 saved_guards = route->guards.len;
+        const u32 saved_locals = route->locals.len;
+        auto snapshot = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (snapshot &&
+            (snapshot->type == HirTypeKind::Stats || snapshot->type == HirTypeKind::Metrics) &&
+            !snapshot->may_nil && !snapshot->may_error) {
+            if (!route->exprs.push(snapshot.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr out{};
+            out.kind = HirExprKind::AdminJson;
+            out.type = HirTypeKind::Str;
+            out.span = expr.span;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
         }
+        // Literal JSON is serialized below. Discard any speculative HIR that
+        // ordinary expression analysis appended while probing its result type.
+        route->exprs.len = saved_exprs;
+        route->guards.len = saved_guards;
+        route->locals.len = saved_locals;
         std::string serialized;
         auto encoded = serialize_json_literal(*expr.args[0], serialized);
         if (!encoded) return core::make_unexpected(encoded.error());
@@ -10415,7 +10422,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     body_scratch.is_helper_scratch = true;
                     auto snapshot =
                         analyze_expr(body_arg, &body_scratch, mod, locals, local_count, binding);
-                    if (snapshot &&
+                    const bool stable_snapshot_operand =
+                        snapshot && (snapshot->kind == HirExprKind::LocalRef ||
+                                     snapshot->kind == HirExprKind::StatsSnapshot ||
+                                     snapshot->kind == HirExprKind::MetricsSnapshot);
+                    if (stable_snapshot_operand &&
                         (snapshot->type == HirTypeKind::Stats ||
                          snapshot->type == HirTypeKind::Metrics) &&
                         !snapshot->may_nil && !snapshot->may_error) {
@@ -19070,6 +19081,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     if (control_plane_entry_effect_blocked)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].init.may_error)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  stmt.span,
+                                                  kControlPlaneOrderDetail);
+                    }
                     route.control_plane_stmt_ok = true;
                     auto value = analyze_expr(
                         stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
@@ -19660,6 +19677,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
                         route.locals[li].span,
+                        lit_str("control-plane effects are not supported on WebSocket terminate "
+                                "routes"));
+            }
+            for (u32 gi = 0; gi < route.guards.len; gi++) {
+                const auto body_type = route.guards[gi].fail_term.runtime_response_body_type;
+                if (body_type == HirTypeKind::Stats || body_type == HirTypeKind::Metrics)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        route.guards[gi].fail_term.span,
                         lit_str("control-plane effects are not supported on WebSocket terminate "
                                 "routes"));
             }
