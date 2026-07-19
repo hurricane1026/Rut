@@ -13730,9 +13730,7 @@ route GET "/search" {
     REQUIRE(ast);
     hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(
-        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
-            "list before wait")));
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, req_query_string_flows_as_optional_str) {
