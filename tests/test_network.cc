@@ -301,6 +301,39 @@ TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
     CHECK_FALSE(c->retry_req_snapshot_replayable);
 }
 
+TEST(set_path, streamed_pipeline_stash_preserves_response_mutation_snapshot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "POST /original HTTP/1.1\r\nHost: client\r\n\r\nbody";
+    const u32 kReqLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kReqLen), kReqLen);
+    c->req_initial_send_len = kReqLen;
+    c->resp_header_mutations[0] = {{"X-Original", 10},
+                                   {reinterpret_cast<const char*>(c->recv_buf.data()) + 5, 9},
+                                   ConnectionBase::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    reserve_response_mutation_snapshot(*c);
+    const u32 snapshot_len = c->retry_req_send_len;
+    REQUIRE_EQ(snapshot_len, kReqLen);
+
+    c->recv_buf.reset();
+    static const char final_body_and_pipeline[] = "tailGET /next HTTP/1.1\r\nHost: client\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(final_body_and_pipeline),
+                                 sizeof(final_body_and_pipeline) - 1),
+               sizeof(final_body_and_pipeline) - 1);
+    c->req_initial_send_len = 4;
+    pipeline_stash(*c);
+
+    CHECK(c->resp_header_mutations[0].value.eq({"/original", 9}));
+    REQUIRE_EQ(c->pipeline_stash_len, sizeof(final_body_and_pipeline) - 1 - 4);
+    CHECK(buf_has(
+        c->send_buf.data() + snapshot_len, c->pipeline_stash_len, "GET /next HTTP/1.1\r\n"));
+}
+
 // === Recv ===
 
 TEST(recv, then_send) {
@@ -16310,6 +16343,9 @@ TEST(response_headers, forwarded_101_rejects_destructive_handshake_mutations) {
     CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Upgrade"));
     CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Add, "Upgrade"));
     CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Connection"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Sec-WebSocket-Protocol"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Add, "Sec-WebSocket-Extensions"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Remove, "Sec-WebSocket-Accept"));
 }
 
 TEST(response_headers, stabilization_copies_only_mutations_that_survive_folding) {

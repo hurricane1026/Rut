@@ -4265,6 +4265,13 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             matched_req = req;
         }
         if (matched_protocol_index != 0xffffffffu && matched_req != nullptr) {
+            for (u32 i = 0; i < matched_req->params.len; i++) {
+                if (matched_req->params[i].type == HirTypeKind::Response)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.span,
+                        lit_str("Response-mutating helpers are only callable from chain after"));
+            }
             GenericBinding recv_bindings[HirFunction::kMaxTypeParams]{};
             u32 recv_binding_count = 0;
             if (recv.generic_index < HirFunction::kMaxTypeParams) {
@@ -4844,6 +4851,13 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             function_index = req->function_index;
         }
         const auto& fn = mod.functions[function_index];
+        for (u32 i = 0; i < fn.params.len; i++) {
+            if (fn.params[i].type == HirTypeKind::Response)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("Response-mutating helpers are only callable from chain after"));
+        }
         HirExpr call_args[AstExpr::kMaxArgs]{};
         u32 call_arg_count = 0;
         call_args[call_arg_count++] = recv.value();
@@ -14395,8 +14409,7 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             }
             const bool saved_allow_respond_effects = route->allow_respond_effects;
             route->allow_respond_effects = false;
-            auto analyzed =
-                analyze_expr(source, route, mod, route->locals.data, route->locals.len, nullptr);
+            auto analyzed = analyze_expr(source, route, mod, nullptr, 0, nullptr);
             route->allow_respond_effects = saved_allow_respond_effects;
             return analyzed;
         }();

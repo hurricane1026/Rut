@@ -6839,6 +6839,52 @@ route GET "/users" {
         hir.error().detail.eq(lit("Response-mutating helpers are only callable from chain after")));
 }
 
+TEST(frontend, response_mutating_protocol_method_rejects_generic_dispatch) {
+    const char* src = R"rut(
+protocol Mutator {
+    func mutate(resp: Response) -> i32
+}
+struct Box { value: i32 }
+Box impl Mutator {
+    func mutate(self: Box, resp: Response) -> i32 {
+        resp.set("X-Test", "yes")
+        0
+    }
+}
+func run<T: Mutator>(value: T, resp: Response) -> i32 => value.mutate(resp)
+chain access { after run(Box(value: 0), resp) }
+route GET "/users" use chain access { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("Response-mutating helpers are only callable from chain after")));
+}
+
+TEST(frontend, global_chain_after_cannot_capture_route_local) {
+    const char* src = R"rut(
+func mutate(_ value: str, _ resp: Response) -> i32 {
+    resp.set("X-Test", value)
+    0
+}
+chain access { after mutate(value, resp) }
+route GET "/users" use chain access {
+    let value = req.path
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(frontend, chain_after_rejects_websocket_terminate_routes) {
     const char* src = R"rut(

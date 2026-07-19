@@ -1556,11 +1556,17 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
         // Once a 101 is accepted the runtime will enter the raw upgrade
         // tunnel. Do not allow mutations to rewrite its required Connection
-        // nomination or the selected protocol after tunnel mode was chosen
-        // from the original upstream response.
+        // nomination or negotiated upgrade/WebSocket handshake fields after
+        // tunnel mode was chosen from the original upstream response.
         if (conn.resp_status == 101 &&
             (http_header_name_eq_ci(mutation.name.ptr, mutation.name.len, "connection", 10) ||
-             http_header_name_eq_ci(mutation.name.ptr, mutation.name.len, "upgrade", 7)))
+             http_header_name_eq_ci(mutation.name.ptr, mutation.name.len, "upgrade", 7) ||
+             http_header_name_eq_ci(
+                 mutation.name.ptr, mutation.name.len, "sec-websocket-protocol", 22) ||
+             http_header_name_eq_ci(
+                 mutation.name.ptr, mutation.name.len, "sec-websocket-extensions", 24) ||
+             http_header_name_eq_ci(
+                 mutation.name.ptr, mutation.name.len, "sec-websocket-accept", 20)))
             return false;
         if (validate_response_header(mutation.name.ptr,
                                      mutation.name.len,
@@ -2505,6 +2511,14 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
     return true;
 }
 
+// Keep a snapshotted request prefix pinned while pipeline_stash appends later
+// downstream bytes. This is also required for streamed request bodies: their
+// final chunk can contain the beginning of the next pipelined request.
+inline void reserve_response_mutation_snapshot(Connection& conn) {
+    if (conn.response_mutations_snapshotted && conn.retry_req_send_len == 0)
+        conn.retry_req_send_len = conn.send_buf.len();
+}
+
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -2704,6 +2718,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // chunks, so the original headers+body are no longer replayable. Mark it so
         // request_fully_resendable refuses any later reused-socket retry.
         conn.req_body_streamed = true;
+        reserve_response_mutation_snapshot(conn);
         conn.recv_buf.reset();
         conn.set_slots(
             &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
@@ -2738,7 +2753,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         //   [retry_req_send_len, + pipeline_stash_len)       pipelined suffix
         // Guarded on upstream_reused so a fresh non-reused connect doesn't re-copy.
         if (response_mutation_snapshot) {
-            conn.retry_req_send_len = conn.send_buf.len();
+            reserve_response_mutation_snapshot(conn);
         } else if (conn.upstream_reused && request_resendable_from_recv_buf(conn) &&
                    conn.recv_buf.len() <= conn.send_buf.capacity()) {
             conn.send_buf.reset();
