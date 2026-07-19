@@ -1639,8 +1639,18 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         }
         return false;
     };
+    const bool nominated_framing = upstream_connection_nominates("content-length", 14) ||
+                                   upstream_connection_nominates("transfer-encoding", 17);
     auto base_suppressed = [&](const char* name, u32 name_len) {
-        if (draining && http_header_name_eq_ci(name, name_len, "connection", 10)) return true;
+        const bool framing = http_header_name_eq_ci(name, name_len, "content-length", 14) ||
+                             http_header_name_eq_ci(name, name_len, "transfer-encoding", 17);
+        // Even a malformed upstream Connection nomination must not strip the
+        // field that frames the already-parsed body. Preserve that field and
+        // force downstream close below so the message stays self-delimiting.
+        if (framing) return false;
+        if ((draining || nominated_framing) &&
+            http_header_name_eq_ci(name, name_len, "connection", 10))
+            return true;
         if (upstream_connection_nominates(name, name_len)) return true;
         for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
             const auto& mutation = conn.resp_header_mutations[i];
@@ -1749,7 +1759,9 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
             return false;
     }
     static const char kConnectionClose[] = "Connection: close\r\n";
-    if (draining && !write(kConnectionClose, sizeof(kConnectionClose) - 1)) return false;
+    if (nominated_framing) conn.keep_alive = false;
+    if ((draining || nominated_framing) && !write(kConnectionClose, sizeof(kConnectionClose) - 1))
+        return false;
     return write(kCrLf, 2);
 }
 
@@ -1770,6 +1782,9 @@ void handle_jit_outcome(Loop* loop,
             const RouteConfig* cfg = conn.request_config;
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
+            const bool has_header_set =
+                outcome.response_headers_idx != 0 && cfg != nullptr &&
+                outcome.response_headers_idx <= cfg->response_header_set_count;
             constexpr u32 kMaxEffectiveHeaders =
                 RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
             ResponseHeaderKV kvs[kMaxEffectiveHeaders];
@@ -1796,7 +1811,7 @@ void handle_jit_outcome(Loop* loop,
             // — matches the no-headers path's documented behavior of
             // falling back rather than rendering garbage.
             const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
-            if (header_count != 0 || suppress_default_content_type) {
+            if (has_header_set || header_count != 0 || suppress_default_content_type) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
                 bool body_is_fallback = false;

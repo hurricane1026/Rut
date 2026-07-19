@@ -16177,6 +16177,34 @@ TEST(response_headers, content_type_removal_suppresses_direct_response_default) 
     CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
 }
 
+TEST(response_headers, removing_last_header_preserves_headers_only_body_mode) {
+    RouteConfig cfg{};
+    const char* keys[] = {"X-Test"};
+    const u32 key_lens[] = {6};
+    const char* values[] = {"yes"};
+    const u32 value_lens[] = {3};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+
+    Connection conn;
+    conn.reset();
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
+    mutation.name = {"x-test", 6};
+    mutation.value = {nullptr, 0};
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+    REQUIRE_EQ(count, 0u);
+
+    u8 send_storage[1024]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    format_response_with_body_and_headers(conn, 200, nullptr, 0, out, count, true);
+    const char* response = reinterpret_cast<const char*>(conn.send_buf.data());
+    CHECK(buf_contains(response, conn.send_buf.len(), "Content-Length: 0\r\n", 19));
+    CHECK_FALSE(buf_contains(response, conn.send_buf.len(), "\r\n\r\nOK", 8));
+}
+
 TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
     Connection conn;
     conn.reset();
@@ -16380,6 +16408,37 @@ TEST(response_headers, forwarded_add_drops_upstream_connection_nominated_field) 
     CHECK(out.find("Connection: keep-alive\r\n") != std::string::npos);
     CHECK(out.find("X-Internal: secret") == std::string::npos);
     CHECK(out.find("X-Internal: public\r\n") != std::string::npos);
+}
+
+TEST(response_headers, forwarded_connection_nomination_preserves_body_framing) {
+    Connection conn;
+    conn.reset();
+    conn.keep_alive = true;
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: keep-alive, Content-Length\r\n"
+        "Content-Length: 4\r\n"
+        "\r\n"
+        "body";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 4;
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Test", 6};
+    mutation.value = {"yes", 3};
+
+    REQUIRE(build_h1_forward_response_headers(conn, kHeaderLen, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Content-Length: 4\r\n") != std::string::npos);
+    CHECK(out.find("Connection: close\r\n") != std::string::npos);
+    CHECK(out.find("Connection: keep-alive, Content-Length") == std::string::npos);
+    CHECK_FALSE(conn.keep_alive);
 }
 
 TEST(response_headers, forwarded_101_unrelated_mutation_preserves_upgrade_handshake) {
