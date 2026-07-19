@@ -32431,7 +32431,8 @@ TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary)
             "connected yet")));
 
     const char* mark_src =
-        "upstream api at \"127.0.0.1:8080\"\n"
+        "upstream primary at \"127.0.0.1:8080\"\n"
+        "upstream api at \"127.0.0.1:8081\"\n"
         "timer health, every: 1s { upstream.mark(api, true) return 200 }\n";
     auto mark_lexed = lex(lit(mark_src));
     REQUIRE(mark_lexed);
@@ -32441,6 +32442,7 @@ TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary)
     REQUIRE(mark_hir);
     REQUIRE_EQ(mark_hir->routes[0].locals.len, 1u);
     CHECK_EQ(mark_hir->routes[0].locals[0].init.kind, HirExprKind::AdminUpstreamMark);
+    CHECK_EQ(mark_hir->routes[0].locals[0].init.upstream_index, 1u);
     auto mark_mir = build_mir_heap(mark_hir.value());
     REQUIRE_FALSE(mark_mir.has_value());
     CHECK(mark_mir.error().detail.eq(
@@ -32449,7 +32451,13 @@ TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary)
 }
 
 TEST(frontend, direct_admin_json_response_reaches_runtime_lowering_boundary) {
-    const char* src = "route GET \"/admin\" { return 200, json(stats()) }\n";
+    const char* src = R"rut(
+route GET "/admin" {
+    let first = stats()
+    let selected = stats()
+    return 200, json(selected)
+}
+)rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -32457,11 +32465,31 @@ TEST(frontend, direct_admin_json_response_reaches_runtime_lowering_boundary) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_local_ref_index,
+             hir->routes[0].locals[1].ref_index);
     auto mir = build_mir_heap(hir.value());
     REQUIRE_FALSE(mir.has_value());
     CHECK(mir.error().detail.eq(
         lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
             "connected yet")));
+}
+
+TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {
+    const char* cases[] = {
+        "route GET \"/admin\" { guard req.http11 else { return 505 } reload() return 204 }\n",
+        "route GET \"/admin\" { reload() wait(1) return 204 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+            "control-plane statements currently require a straight-line route without "
+            "guard/wait/for")));
+    }
 }
 
 TEST(frontend, control_plane_snapshot_declarations_validate_arity) {

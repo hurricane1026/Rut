@@ -469,6 +469,8 @@ struct HirExpr {
     u32 array_len = 0;
     // CacheGet/CacheSet: index into HirModule::caches.
     u32 cache_index = 0xffffffffu;
+    // AdminUpstreamMark: resolved target in HirModule::upstreams.
+    u32 upstream_index = 0xffffffffu;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     bool is_pipe_conditional = false;
@@ -811,6 +813,9 @@ struct HirTerminator {
     // lands. Preserve their type so MIR reports the declared boundary instead
     // of rejecting the source as a literal-only JSON body in analysis.
     HirTypeKind runtime_response_body_type = HirTypeKind::Unknown;
+    // For json(snapshotLocal), retain the exact selected snapshot rather than
+    // collapsing all values of the same opaque type into one marker.
+    u32 runtime_response_body_local_ref_index = 0xffffffffu;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0

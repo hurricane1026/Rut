@@ -36,6 +36,8 @@ constexpr Str kJsonLiteralDetail =
     lit_str("json currently accepts only literal bool/int/string/nil/array/object values");
 constexpr Str kReturnBodyExprDetail =
     lit_str("return body expressions currently support json(literal) only");
+constexpr Str kControlPlaneOrderDetail = lit_str(
+    "control-plane statements currently require a straight-line route without guard/wait/for");
 
 static constexpr u32 kMaxJsonLiteralBytes = 64 * 1024;
 
@@ -4065,6 +4067,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         out.kind = HirExprKind::AdminUpstreamMark;
         out.type = HirTypeKind::Unknown;
         out.span = expr.span;
+        out.upstream_index = upstream_index;
         if (!route->exprs.push(healthy.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
@@ -10376,8 +10379,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     for (u32 li = local_count; li > 0; li--) {
                         if (!locals[li - 1].name.eq(body_arg.name)) continue;
                         if (locals[li - 1].type == HirTypeKind::Stats ||
-                            locals[li - 1].type == HirTypeKind::Metrics)
+                            locals[li - 1].type == HirTypeKind::Metrics) {
                             term.runtime_response_body_type = locals[li - 1].type;
+                            term.runtime_response_body_local_ref_index =
+                                locals[li - 1].ref_index;
+                        }
                         break;
                     }
                 }
@@ -18959,6 +18965,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // rejected (see kTimeWaitDetail) — the flag must be set before any
         // statement is analyzed so pre-wait bindings are caught too.
         bool response_runtime_mutation_blocked = seen_guard;
+        bool control_plane_entry_effect_blocked = seen_guard;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
@@ -18968,8 +18975,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             if (s.kind == AstStmtKind::Guard || s.kind == AstStmtKind::Wait ||
                 s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For ||
-                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
                 response_runtime_mutation_blocked = true;
+                control_plane_entry_effect_blocked = true;
+            }
         }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
@@ -18981,6 +18990,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     stmt.expr.lhs->kind == AstExprKind::Ident &&
                     stmt.expr.lhs->name.eq({"upstream", 8}) && stmt.expr.name.eq({"mark", 4});
                 if (reload_syntax || mark_syntax) {
+                    if (control_plane_entry_effect_blocked)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
                     route.control_plane_stmt_ok = true;
                     auto value = analyze_expr(
                         stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
