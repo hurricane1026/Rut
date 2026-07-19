@@ -11660,6 +11660,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                 case_decl.payload_tuple_struct_indices[ti];
                         }
                         arm_binding.subject = &route->control.match_expr;
+                        arm_binding.outer = binding;
                         arm_binding_ptr = &arm_binding;
                     }
                 }
@@ -14083,7 +14084,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     auto fail = analyze_term(*inner.else_stmt,
                                                              mod,
                                                              arm_scoped_locals.data,
-                                                             arm_scoped_locals.len);
+                                                             arm_scoped_locals.len,
+                                                             arm_binding_ptr);
                                     if (!fail) return core::make_unexpected(fail.error());
                                     guard.fail_term = fail.value();
                                 } else {
