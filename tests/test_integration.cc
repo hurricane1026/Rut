@@ -10108,7 +10108,8 @@ TEST(shard, serves_http2_jit_forward_after_timer_resume) {
         {{"x-new-path", 10}, {"/rewritten", 10}},
         {{"x-token", 7}, {"trusted", 7}},
     };
-    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 6, /*end_stream=*/true);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 6, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>(""), 0, true);
     REQUIRE(write_all_fd(c, out, n));
 
     u8 resp[4096];

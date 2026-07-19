@@ -3788,6 +3788,7 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
     // request desynced (otherwise the next request would be parsed as leftover body).
     if (ev.result < 0) conn.upstream_request_incomplete = true;
 
+    reserve_response_mutation_snapshot(conn);
     prepare_early_response_state(conn);
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
 

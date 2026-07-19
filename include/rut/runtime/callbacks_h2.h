@@ -469,9 +469,12 @@ bool h2_defer_prepared_forward(H2Dispatch<Loop>& d,
                                const RouteConfig* cfg,
                                u16 upstream_id,
                                const u8* synth,
-                               u32 synth_len) {
+                               u32 synth_len,
+                               bool replace_owned_async = false) {
     Http2Conn* h2 = d.conn->h2;
-    if (h2->pending_stream != 0 || h2->async_stream != 0 || d.conn->h2_proxy_synth_quarantined ||
+    const bool async_conflict =
+        h2->async_stream != 0 && (!replace_owned_async || h2->async_stream != stream_id);
+    if (h2->pending_stream != 0 || async_conflict || d.conn->h2_proxy_synth_quarantined ||
         synth_len > Http2Conn::kBodySynthCap)
         return false;
     for (u32 i = 0; i < synth_len; i++) h2->pending_synth[i] = synth[i];
@@ -602,7 +605,10 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_synth_len = 0;
     h2.async_synth_sent = 0;
     h2.async_request_body_followed = false;
+    h2.async_request_stream_open = false;
     h2.async_request_forwardable = false;
+    h2.async_request_has_content_length = false;
+    h2.async_request_content_length = 0;
     h2.async_timer_ms = 0;
     h2.async_fn = nullptr;
     h2.async_state = 0;
@@ -635,7 +641,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       const u8* synth,
                       u32 synth_len,
                       bool request_body_followed,
-                      bool request_forwardable) {
+                      bool request_forwardable,
+                      const ParsedRequest* open_request = nullptr) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
@@ -662,7 +669,11 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_kind = H2AsyncKind::Timer;
     h2->async_cfg = cfg;
     h2->async_request_body_followed = request_body_followed;
+    h2->async_request_stream_open = open_request != nullptr;
     h2->async_request_forwardable = request_forwardable;
+    h2->async_request_has_content_length =
+        open_request != nullptr && open_request->has_content_length;
+    h2->async_request_content_length = open_request != nullptr ? open_request->content_length : 0;
     h2->async_timer_ms = o.timer_ms;
     h2->async_fn = fn;
     h2->async_state = static_cast<u16>(o.next_state);
@@ -736,7 +747,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               synth,
                               synth_len,
                               request_body_followed,
-                              request_forwardable))
+                              request_forwardable,
+                              open_request))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         return;
     }
@@ -1405,7 +1417,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
         u16 failure_status = 0;
-        if (h2->async_request_body_followed) {
+        if (h2->async_request_body_followed && !h2->async_request_stream_open) {
             failure_status = 503;
         } else if (!h2->async_request_forwardable) {
             failure_status = 400;
@@ -1429,6 +1441,37 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                        sizeof(forward_synth),
                                                        &forward_len))
                 failure_status = 500;
+        }
+
+        if (failure_status == 0 && h2->async_request_stream_open) {
+            ParsedRequest open_request;
+            open_request.reset();
+            open_request.has_content_length = h2->async_request_has_content_length;
+            open_request.content_length = h2->async_request_content_length;
+            u8 resp[8192];
+            H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+            if (!h2_defer_prepared_forward(d,
+                                           kStreamId,
+                                           open_request,
+                                           h2->async_cfg,
+                                           static_cast<u16>(kOutcome.upstream_id),
+                                           forward_synth,
+                                           forward_len,
+                                           /*replace_owned_async=*/true)) {
+                failure_status = 503;
+            } else {
+                conn.pending_handler_fn = nullptr;
+                h2_clear_async(*h2);
+                conn.transition_to_reading_header(&on_h2_data<Loop>);
+                if (conn.recv_buf.len() > 0) {
+                    IoEvent synth{
+                        conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+                    on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
+                } else {
+                    loop->submit_recv(conn);
+                }
+                return;
+            }
         }
 
         if (failure_status == 0) {
