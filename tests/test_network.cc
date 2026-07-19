@@ -16254,7 +16254,7 @@ TEST(response_headers, forwarded_mutations_remove_matching_connection_nomination
     CHECK(out.find("X-Security: enforced\r\n") != std::string::npos);
 }
 
-TEST(response_headers, forwarded_101_upgrade_mutation_preserves_connection_nomination) {
+TEST(response_headers, forwarded_101_unrelated_mutation_preserves_upgrade_handshake) {
     Connection conn;
     conn.reset();
     conn.resp_status = 101;
@@ -16271,15 +16271,15 @@ TEST(response_headers, forwarded_101_upgrade_mutation_preserves_connection_nomin
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
     auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
-    mutation.name = {"Upgrade", 7};
-    mutation.value = {"websocket", 9};
+    mutation.name = {"X-Trace", 7};
+    mutation.value = {"yes", 3};
 
     REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
     const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
                           conn.response_header_buf.len());
     CHECK(out.find("Connection: keep-alive, Upgrade\r\n") != std::string::npos);
-    CHECK(out.find("Upgrade: h2c") == std::string::npos);
-    CHECK(out.find("Upgrade: websocket\r\n") != std::string::npos);
+    CHECK(out.find("Upgrade: h2c\r\n") != std::string::npos);
+    CHECK(out.find("X-Trace: yes\r\n") != std::string::npos);
 }
 
 TEST(response_headers, forwarded_101_rejects_destructive_handshake_mutations) {
@@ -16307,6 +16307,8 @@ TEST(response_headers, forwarded_101_rejects_destructive_handshake_mutations) {
     };
 
     CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Remove, "Upgrade"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Upgrade"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Add, "Upgrade"));
     CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Connection"));
 }
 

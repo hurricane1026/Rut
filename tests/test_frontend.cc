@@ -6720,6 +6720,31 @@ route GET "/users" use chain access {
         lit("chain after Response effects cannot be combined with wait/for yet")));
 }
 
+TEST(frontend, chain_after_rejects_response_time_state_evaluated_at_request_dispatch) {
+    const char* sources[] = {
+        R"rut(
+func phase() -> str { if time.nowMicros() > 0 { "late" } else { "early" } }
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Phase", phase())
+    0
+}
+chain access { after mutate(resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+            "chain after Response header values cannot read time, cache, or response state until "
+            "effects execute at response time")));
+    }
+}
+
 TEST(frontend, chain_after_rejects_conditional_response_effects) {
     const char* src = R"rut(
 func mutate(_ req: i32, _ resp: Response) -> i32 {

@@ -14436,6 +14436,26 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
         auto effect = instantiate_function_expr(
             fn.exprs[ei], route, mod, args.get(), fn.params.len, nullptr, 0);
         if (!effect) return core::make_unexpected(effect.error());
+        const auto reads_response_time_state = [&](auto&& self, const HirExpr& expr) -> bool {
+            if (expr.kind == HirExprKind::TimeNowMicros || expr.kind == HirExprKind::CacheGet ||
+                expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::RespHeader)
+                return true;
+            if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
+            if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
+            for (u32 i = 0; i < expr.args.len; i++)
+                if (expr.args[i] != nullptr && self(self, *expr.args[i])) return true;
+            for (u32 i = 0; i < expr.field_inits.len; i++)
+                if (expr.field_inits[i].value != nullptr && self(self, *expr.field_inits[i].value))
+                    return true;
+            return false;
+        };
+        if (effect->lhs != nullptr &&
+            reads_response_time_state(reads_response_time_state, *effect->lhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                effect->lhs->span,
+                lit_str("chain after Response header values cannot read time, cache, or response "
+                        "state until effects execute at response time"));
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
