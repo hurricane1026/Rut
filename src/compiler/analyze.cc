@@ -18218,8 +18218,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Keep the large helper-analysis arena off the analyze_file stack;
         // imported modules nest this frame recursively.
         auto scratch_storage = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
-        if (!scratch_storage)
-            return frontend_error(FrontendError::OutOfMemory, item.func.span);
+        if (!scratch_storage) return frontend_error(FrontendError::OutOfMemory, item.func.span);
         HirRoute& scratch = *scratch_storage;
         scratch.is_helper_scratch = true;
         scratch.allow_respond_effects = true;
@@ -18651,8 +18650,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // must end in an explicit terminal statement, like a route body.
         if (is_timer_item && item.timer.statements.len == 0) {
             auto route_storage = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
-            if (!route_storage)
-                return frontend_error(FrontendError::OutOfMemory, item.timer.span);
+            if (!route_storage) return frontend_error(FrontendError::OutOfMemory, item.timer.span);
             HirRoute& route = *route_storage;
             route.span = item.timer.span;
             route.path = item.timer.name;
@@ -18671,8 +18669,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         const AstRouteDecl& route_decl = is_timer_item ? *timer_route_view : item.route;
 
         auto route_storage = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
-        if (!route_storage)
-            return frontend_error(FrontendError::OutOfMemory, route_decl.span);
+        if (!route_storage) return frontend_error(FrontendError::OutOfMemory, route_decl.span);
         HirRoute& route = *route_storage;
         route.span = route_decl.span;
         route.path = route_decl.path;
