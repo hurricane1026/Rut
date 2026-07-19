@@ -240,7 +240,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                                           MirFunction* fn,
                                           const ForLoopCtx* ctx = nullptr) {
     if (expr.kind == HirExprKind::StatsSnapshot || expr.kind == HirExprKind::MetricsSnapshot ||
-        expr.kind == HirExprKind::AdminJson) {
+        expr.kind == HirExprKind::AdminJson || expr.kind == HirExprKind::AdminReload ||
+        expr.kind == HirExprKind::AdminUpstreamMark) {
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             expr.span,
@@ -1139,7 +1140,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespAddHeader &&
-                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader)
+                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::AdminReload &&
+                module.routes[i].locals[li].init.kind != HirExprKind::AdminUpstreamMark)
                 continue;
             if (module.routes[i].locals[li].is_wait_result) continue;
             MirLocal local{};
@@ -1190,7 +1193,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
+        bool unsupported_admin_term = false;
+        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
+            if (term.runtime_response_body_type == HirTypeKind::Stats ||
+                term.runtime_response_body_type == HirTypeKind::Metrics)
+                unsupported_admin_term = true;
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
@@ -3267,6 +3274,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        if (unsupported_admin_term)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                fn.span,
+                lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                        "is not connected yet"));
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 

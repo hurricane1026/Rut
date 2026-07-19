@@ -32385,9 +32385,9 @@ TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {
     const char* src = R"rut(
 route GET "/admin" {
     let snapshot = stats()
-    let statsBody = json(stats())
+    let statsBody = json(snapshot)
     let metricSnapshot = metrics()
-    let metricsBody = json(metrics())
+    let metricsBody = json(metricSnapshot)
     return 200
 }
 )rut";
@@ -32407,6 +32407,56 @@ route GET "/admin" {
     CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Str);
     CHECK_EQ(hir->routes[0].locals[3].init.kind, HirExprKind::AdminJson);
 
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary) {
+    const char* reload_src = "route GET \"/admin\" { reload() return 204 }\n";
+    auto reload_lexed = lex(lit(reload_src));
+    REQUIRE(reload_lexed);
+    auto reload_ast = parse_file_heap(reload_lexed.value());
+    REQUIRE(reload_ast);
+    auto reload_hir = analyze_file_heap(reload_ast.value());
+    REQUIRE(reload_hir);
+    REQUIRE_EQ(reload_hir->routes[0].locals.len, 1u);
+    CHECK_EQ(reload_hir->routes[0].locals[0].init.kind, HirExprKind::AdminReload);
+    auto reload_mir = build_mir_heap(reload_hir.value());
+    REQUIRE_FALSE(reload_mir.has_value());
+    CHECK(reload_mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+
+    const char* mark_src =
+        "upstream api at \"127.0.0.1:8080\"\n"
+        "timer health, every: 1s { upstream.mark(api, true) return 200 }\n";
+    auto mark_lexed = lex(lit(mark_src));
+    REQUIRE(mark_lexed);
+    auto mark_ast = parse_file_heap(mark_lexed.value());
+    REQUIRE(mark_ast);
+    auto mark_hir = analyze_file_heap(mark_ast.value());
+    REQUIRE(mark_hir);
+    REQUIRE_EQ(mark_hir->routes[0].locals.len, 1u);
+    CHECK_EQ(mark_hir->routes[0].locals[0].init.kind, HirExprKind::AdminUpstreamMark);
+    auto mark_mir = build_mir_heap(mark_hir.value());
+    REQUIRE_FALSE(mark_mir.has_value());
+    CHECK(mark_mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, direct_admin_json_response_reaches_runtime_lowering_boundary) {
+    const char* src = "route GET \"/admin\" { return 200, json(stats()) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
     auto mir = build_mir_heap(hir.value());
     REQUIRE_FALSE(mir.has_value());
     CHECK(mir.error().detail.eq(

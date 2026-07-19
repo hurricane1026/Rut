@@ -204,6 +204,8 @@ enum class HirExprKind : u8 {
     StatsSnapshot,
     MetricsSnapshot,
     AdminJson,
+    AdminReload,
+    AdminUpstreamMark,
 };
 
 enum class HirTypeKind : u8 {
@@ -805,6 +807,10 @@ struct HirTerminator {
     // had `has_response_body == true`, so the sentinel is preserved
     // end-to-end.
     Str response_body{};
+    // Opaque admin snapshots cannot be serialized until MIR/runtime support
+    // lands. Preserve their type so MIR reports the declared boundary instead
+    // of rejecting the source as a literal-only JSON body in analysis.
+    HirTypeKind runtime_response_body_type = HirTypeKind::Unknown;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0
@@ -1107,6 +1113,9 @@ struct HirRoute {
     // One-shot permission for a bare `req.set(...)` statement. Like Cache.set,
     // request mutation cannot escape into an eager/lazy value expression.
     bool req_header_mutation_stmt_ok = false;
+    // One-shot permission for checker-visible, statement-only control-plane
+    // builtins such as reload() and upstream.mark(...).
+    bool control_plane_stmt_ok = false;
     // Analysis-only (never serialized): the route body contains a wait, so
     // time.nowMicros() is rejected — locals re-materialize on resume, and a
     // pre-wait timestamp binding would sample after the wait.

@@ -4042,6 +4042,35 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             expr, route, mod, locals, local_count, binding, nullptr);
     }
 
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq({"upstream", 8}) && expr.name.eq({"mark", 4}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"upstream", 8})) {
+        if (!route->control_plane_stmt_ok || !route->is_timer || expr.args.len != 2 ||
+            expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::Ident ||
+            expr.args[1] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        u32 upstream_index = mod.upstreams.len;
+        for (u32 ui = 0; ui < mod.upstreams.len; ui++) {
+            if (mod.upstreams[ui].name.eq(expr.args[0]->name)) {
+                upstream_index = ui;
+                break;
+            }
+        }
+        auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (upstream_index == mod.upstreams.len || !healthy || healthy->type != HirTypeKind::Bool ||
+            healthy->may_nil || healthy->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        route->control_plane_stmt_ok = false;
+        HirExpr out{};
+        out.kind = HirExprKind::AdminUpstreamMark;
+        out.type = HirTypeKind::Unknown;
+        out.span = expr.span;
+        if (!route->exprs.push(healthy.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     // Cache<K, i64> instance receiver (DESIGN.md §3.3.6): an Ident
     // matching a declared cache, unless shadowed by a user binding (same
     // precedence rule as the bitwise namespace). Handlers get exactly
@@ -9066,31 +9095,41 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq({"reload", 6}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (!route->control_plane_stmt_ok || route->is_timer || pipe_lhs != nullptr ||
+            first_arg_override != nullptr || expr.args.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        route->control_plane_stmt_ok = false;
+        HirExpr out{};
+        out.kind = HirExprKind::AdminReload;
+        out.type = HirTypeKind::Unknown;
+        out.span = expr.span;
+        return out;
+    }
+
     if (expr.name.eq({"json", 4}) &&
         !user_bound_ident_name(mod, locals, local_count, binding, {"json", 4})) {
         if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
             expr.args[0] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
-        // These are the two declared runtime-json values. Keep the snapshot
-        // operation as an operand; never fold it to a fake empty/default body.
-        if (expr.args[0]->kind == AstExprKind::Call &&
-            (expr.args[0]->name.eq({"stats", 5}) || expr.args[0]->name.eq({"metrics", 7})) &&
-            !user_bound_ident_name(mod, locals, local_count, binding, expr.args[0]->name)) {
-            auto snapshot =
-                analyze_call_expr(*expr.args[0], route, mod, locals, local_count, binding, nullptr);
-            if (!snapshot) return core::make_unexpected(snapshot.error());
-            if ((snapshot->type != HirTypeKind::Stats && snapshot->type != HirTypeKind::Metrics) ||
-                snapshot->may_nil || snapshot->may_error)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, expr.args[0]->span, kJsonLiteralDetail);
-            if (!route->exprs.push(snapshot.value()))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
-            HirExpr out{};
-            out.kind = HirExprKind::AdminJson;
-            out.type = HirTypeKind::Str;
-            out.span = expr.span;
-            out.lhs = &route->exprs[route->exprs.len - 1];
-            return out;
+        // Dynamic JSON is limited to the two declared snapshot types. Analyze
+        // the operand so bindings (and eventually helper returns) retain the
+        // same behavior as an immediate stats()/metrics() call.
+        if (expr.args[0]->kind == AstExprKind::Ident || expr.args[0]->kind == AstExprKind::Call) {
+            auto snapshot = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (snapshot &&
+                (snapshot->type == HirTypeKind::Stats || snapshot->type == HirTypeKind::Metrics) &&
+                !snapshot->may_nil && !snapshot->may_error) {
+                if (!route->exprs.push(snapshot.value()))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr out{};
+                out.kind = HirExprKind::AdminJson;
+                out.type = HirTypeKind::Str;
+                out.span = expr.span;
+                out.lhs = &route->exprs[route->exprs.len - 1];
+                return out;
+            }
         }
         std::string serialized;
         auto encoded = serialize_json_literal(*expr.args[0], serialized);
@@ -10327,11 +10366,28 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     stmt.expr.args.len != 1 || stmt.expr.args[0] == nullptr)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
-                std::string serialized;
-                auto encoded =
-                    serialize_json_literal(*stmt.expr.args[0], serialized, kResponseBodyPoolBytes);
-                if (!encoded) return core::make_unexpected(encoded.error());
-                term.response_body = intern_module_string(mod, serialized);
+                const AstExpr& body_arg = *stmt.expr.args[0];
+                if (body_arg.kind == AstExprKind::Call && body_arg.args.len == 0 &&
+                    (body_arg.name.eq({"stats", 5}) || body_arg.name.eq({"metrics", 7})) &&
+                    !user_bound_ident_name(mod, locals, local_count, binding, body_arg.name)) {
+                    term.runtime_response_body_type =
+                        body_arg.name.eq({"stats", 5}) ? HirTypeKind::Stats : HirTypeKind::Metrics;
+                } else if (body_arg.kind == AstExprKind::Ident) {
+                    for (u32 li = local_count; li > 0; li--) {
+                        if (!locals[li - 1].name.eq(body_arg.name)) continue;
+                        if (locals[li - 1].type == HirTypeKind::Stats ||
+                            locals[li - 1].type == HirTypeKind::Metrics)
+                            term.runtime_response_body_type = locals[li - 1].type;
+                        break;
+                    }
+                }
+                if (term.runtime_response_body_type == HirTypeKind::Unknown) {
+                    std::string serialized;
+                    auto encoded =
+                        serialize_json_literal(body_arg, serialized, kResponseBodyPoolBytes);
+                    if (!encoded) return core::make_unexpected(encoded.error());
+                    term.response_body = intern_module_string(mod, serialized);
+                }
                 if (!term.response_headers.push(
                         {lit_str("Content-Type"), lit_str("application/json")}))
                     return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
@@ -11078,15 +11134,19 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         req_mutation_syntax ? kReqHeaderMutationOrderDetail : kCacheStmtDetail);
                 route->cache_set_stmt_ok = !req_mutation_syntax;
                 route->req_header_mutation_stmt_ok = req_mutation_syntax;
+                route->control_plane_stmt_ok = true;
                 const u32 guards_before_set = route->guards.len;
                 auto value = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 route->cache_set_stmt_ok = false;
                 route->req_header_mutation_stmt_ok = false;
+                route->control_plane_stmt_ok = false;
                 if (!value) return core::make_unexpected(value.error());
                 const bool supported_effect = value->kind == HirExprKind::CacheSet ||
                                               value->kind == HirExprKind::ReqSetHeader ||
-                                              value->kind == HirExprKind::ReqAddHeader;
+                                              value->kind == HirExprKind::ReqAddHeader ||
+                                              value->kind == HirExprKind::AdminReload ||
+                                              value->kind == HirExprKind::AdminUpstreamMark;
                 if (route->guards.len > guards_before_set || !supported_effect)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
@@ -18914,6 +18974,31 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
             if (stmt.kind == AstStmtKind::Expr) {
+                const bool reload_syntax =
+                    stmt.expr.kind == AstExprKind::Call && stmt.expr.name.eq({"reload", 6});
+                const bool mark_syntax =
+                    stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
+                    stmt.expr.lhs->kind == AstExprKind::Ident &&
+                    stmt.expr.lhs->name.eq({"upstream", 8}) && stmt.expr.name.eq({"mark", 4});
+                if (reload_syntax || mark_syntax) {
+                    route.control_plane_stmt_ok = true;
+                    auto value = analyze_expr(
+                        stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                    route.control_plane_stmt_ok = false;
+                    if (!value) return core::make_unexpected(value.error());
+                    if (value->kind != HirExprKind::AdminReload &&
+                        value->kind != HirExprKind::AdminUpstreamMark)
+                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                    HirLocal local{};
+                    local.span = stmt.span;
+                    local.ref_index =
+                        next_local_ref_index(&route, route.locals.data, route.locals.len);
+                    local.type = value->type;
+                    local.init = value.value();
+                    if (!route.locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, stmt.span);
+                    continue;
+                }
                 // Response builder mutation. Literal-only prefixes fold into
                 // the terminator's static header set. At the first dynamic
                 // value, this and every subsequent mutation becomes an ordered

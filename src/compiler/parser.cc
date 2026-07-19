@@ -2037,14 +2037,15 @@ struct Parser {
         // explicit and consistent with `return response(...)`.
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
-        // Bare method-call statement (`buckets.set(k, v)`): the only
-        // expression form accepted in statement position. Analyze restricts
-        // it further (cache state writes only, before guards/waits).
-        if (cur().type == TokenType::Ident) {
+        // Bare effect statement. Receiver calls cover state/header mutations
+        // and upstream.mark(...); reload() is the sole receiver-less form.
+        // Analyze performs the context and statement-only checks.
+        if (cur().type == TokenType::Ident || cur().type == TokenType::KwUpstream) {
             const Token start_tok = cur();
             auto expr = parse_expr();
             if (!expr) return core::make_unexpected(expr.error());
-            if (expr->kind == AstExprKind::MethodCall) {
+            if (expr->kind == AstExprKind::MethodCall ||
+                (expr->kind == AstExprKind::Call && expr->name.eq({"reload", 6}))) {
                 AstStatement stmt{};
                 stmt.kind = AstStmtKind::Expr;
                 stmt.expr = expr.value();
