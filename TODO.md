@@ -54,7 +54,9 @@ data.
   example in `docs/language-card.md`.
 
 **Acceptance**:
-- Old/compatibility forms produce the documented prescriptive diagnostics.
+- Removed or unsupported forms produce the documented prescriptive diagnostics.
+- Compatibility forms remain accepted and keep tests for their documented
+  lowering or migration behavior.
 - Core examples parse and type-check in CI.
 - `./dev.sh test` remains green with no hidden-yield additions.
 
