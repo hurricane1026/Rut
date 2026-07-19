@@ -10,6 +10,19 @@
 #include <fstream>
 #include <string>
 using namespace rut;
+
+TEST(hir, function_moves_preserve_non_response_statement_effect) {
+    HirFunction source;
+    source.has_non_response_statement_effect = true;
+
+    HirFunction moved(static_cast<HirFunction&&>(source));
+    CHECK(moved.has_non_response_statement_effect);
+
+    HirFunction assigned;
+    assigned = static_cast<HirFunction&&>(moved);
+    CHECK(assigned.has_non_response_statement_effect);
+}
+
 static Str lit(const char* s) {
     u32 n = 0;
     while (s[n]) n++;

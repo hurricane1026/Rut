@@ -10340,8 +10340,8 @@ TEST(shard, serves_http2_jit_forward_rejects_non_forwardable_headers) {
     set_socket_timeouts(c, 2);
     const hpack::Header hs[] = {
         {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
         {{":path", 5}, {"/api", 4}},
-        {{":authority", 10}, {"localhost", 9}},
     };
     u8 out[512];
     u32 n = h2_client_prologue(out);

@@ -281,24 +281,28 @@ inline u32 h2_reanchor_route_params(const hpack::Header* headers,
 //      requests; h2_headers_to_request tracks but doesn't require it (CONNECT and
 //      synthetic local requests legitimately omit it), so a scheme-less proxy
 //      request would otherwise reach the upstream.
-//   2. Ambiguous Host — with no :authority, two regular `host` fields would
-//      synthesize duplicate Host headers upstream. (When :authority is present
-//      h2_synth_h1_request drops every regular host, so that case is already safe.)
+//   2. Missing/ambiguous Host — without a usable :authority, exactly one
+//      non-empty regular `host` field is required. Otherwise the synthesized
+//      HTTP/1.1 request has no Host or duplicate Host fields. (When a non-empty
+//      :authority is present h2_synth_h1_request drops every regular host.)
 // Returns false to reject (→ 400) before opening the upstream.
 inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
     bool have_scheme = false;
     bool have_authority = false;
     u32 host_fields = 0;
+    bool have_usable_host = false;
     for (u32 i = 0; i < n; i++) {
         if (hs[i].name.eq(Str{":scheme", 7}))
-            have_scheme = true;
+            have_scheme = hs[i].value.len != 0;
         else if (hs[i].name.eq(Str{":authority", 10}))
-            have_authority = true;
-        else if (hs[i].name.len > 0 && hs[i].name.ptr[0] != ':' && hs[i].name.eq(Str{"host", 4}))
+            have_authority = hs[i].value.len != 0;
+        else if (hs[i].name.len > 0 && hs[i].name.ptr[0] != ':' && hs[i].name.eq(Str{"host", 4})) {
             host_fields++;
+            have_usable_host = hs[i].value.len != 0;
+        }
     }
     if (!have_scheme) return false;
-    if (!have_authority && host_fields > 1) return false;
+    if (!have_authority && (host_fields != 1 || !have_usable_host)) return false;
     return true;
 }
 

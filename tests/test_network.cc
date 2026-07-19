@@ -16594,6 +16594,49 @@ TEST(response_headers, stabilization_copies_only_mutations_that_survive_folding)
     CHECK(conn.resp_header_mutations[1].value.eq({"kept", 4}));
 }
 
+TEST(http2, proxy_forwardability_requires_scheme_and_usable_host) {
+    const hpack::Header authority[] = {
+        {{":scheme", 7}, {"https", 5}},
+        {{":authority", 10}, {"example.com", 11}},
+    };
+    CHECK(h2_proxy_request_forwardable(authority, 2));
+
+    const hpack::Header host[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{"host", 4}, {"example.com", 11}},
+    };
+    CHECK(h2_proxy_request_forwardable(host, 2));
+
+    const hpack::Header missing_scheme[] = {
+        {{":authority", 10}, {"example.com", 11}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(missing_scheme, 1));
+
+    const hpack::Header missing_host[] = {
+        {{":scheme", 7}, {"http", 4}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(missing_host, 1));
+
+    const hpack::Header empty_authority[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{":authority", 10}, {"", 0}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(empty_authority, 2));
+
+    const hpack::Header empty_host[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{"host", 4}, {"", 0}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(empty_host, 2));
+
+    const hpack::Header duplicate_host[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{"host", 4}, {"one.example", 11}},
+        {{"host", 4}, {"two.example", 11}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(duplicate_host, 3));
+}
+
 TEST(http2, forward_request_applies_jit_path_and_header_overrides) {
     Connection conn;
     conn.reset();
