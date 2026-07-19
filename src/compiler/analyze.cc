@@ -3579,6 +3579,11 @@ static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route
     };
     for (u32 gi = 0; gi < route.guards.len; gi++) {
         const auto& guard = route.guards[gi];
+        if (hir_contains_admin_effect(&guard.cond))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                guard.span,
+                lit_str("control-plane effects are not supported on WebSocket terminate routes"));
         bool has_snapshot_body = terminator_has_snapshot_body(guard.fail_term);
         if (guard.fail_kind == HirGuard::FailKind::Body) {
             has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.direct_term);
@@ -4113,7 +4118,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         if (!route->control_plane_stmt_ok || !route->is_timer || expr.type_args.len != 0 ||
             expr.args.len != 2 || expr.arg_labels.len != 2 || expr.arg_labels[0].len != 0 ||
             !expr.arg_labels[1].eq({"healthy", 7}) || expr.args[0] == nullptr ||
-            expr.args[0]->kind != AstExprKind::Ident || expr.args[1] == nullptr)
+            expr.args[0]->kind != AstExprKind::Ident || expr.args[1] == nullptr ||
+            user_bound_ident_name(mod, locals, local_count, binding, expr.args[0]->name))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         u32 upstream_index = mod.upstreams.len;
         for (u32 ui = 0; ui < mod.upstreams.len; ui++) {

@@ -32550,6 +32550,24 @@ TEST(frontend, upstream_mark_rejects_ambiguous_multi_backend_target) {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, upstream_mark_honors_local_target_shadowing) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:8080"
+timer health, every: 1s {
+    let api = false
+    upstream.mark(api, healthy: true)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, upstream_mark_requires_healthy_argument_label) {
     const char* src =
         "upstream api at \"127.0.0.1:8080\"\n"
@@ -32819,6 +32837,22 @@ TEST(frontend, control_plane_effect_rejected_on_websocket_terminate_route) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+
+    const char* guard_condition = R"rut(
+upstream ws
+route GET "/ws" {
+    guard json(stats()) == "{}" else { return 503 }
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    lexed = lex(lit(guard_condition));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("control-plane effects are not supported on WebSocket terminate routes")));
