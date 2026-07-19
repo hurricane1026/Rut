@@ -13662,9 +13662,9 @@ route GET "/search" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(lit(
-        "request string-list locals cannot cross a wait boundary yet — bind and consume the "
-        "list before wait")));
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
 
     const char* pre_wait_only = R"rut(
 route GET "/search" {

@@ -19150,9 +19150,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // Keep pre-wait consumption valid, but reject a LocalRef whose own
             // source span is after the first wait.
             const u32 first_wait_start = route.waits[0].span.start;
-            auto reads_list_after_wait = [&](const auto& self,
-                                             const HirExpr& expr,
-                                             u32 ref_index) -> bool {
+            auto reads_list_after_wait =
+                [&](const auto& self, const HirExpr& expr, u32 ref_index) -> bool {
                 if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index &&
                     expr.span.start > first_wait_start)
                     return true;
