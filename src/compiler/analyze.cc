@@ -5408,6 +5408,13 @@ static bool collect_function_response_effects(HirFunction* fn,
     return true;
 }
 
+static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
+                                                  const HirModule& mod,
+                                                  const HirLocal* locals,
+                                                  u32 local_count,
+                                                  const MatchPayloadBinding* binding,
+                                                  Str scoped_binding_name);
+
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
                                                           const HirModule& mod,
@@ -6387,19 +6394,10 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         if (!term) return core::make_unexpected(term.error());
                         guard.fail_term = term.value();
                     } else {
-                        if (respond.status_code < 100 || respond.status_code > 599)
-                            return frontend_error(FrontendError::InvalidStatusCode, respond.span);
-                        guard.fail_term.kind = HirTerminatorKind::ReturnStatus;
-                        guard.fail_term.source_kind = HirTerminatorSourceKind::Literal;
-                        guard.fail_term.status_code = static_cast<i32>(respond.status_code);
-                        guard.fail_term.span = respond.span;
-                        if (respond.has_response_body)
-                            guard.fail_term.response_body = respond.response_body;
-                        for (u32 hi = 0; hi < respond.response_headers.len; hi++) {
-                            const auto& hdr = respond.response_headers[hi];
-                            if (!guard.fail_term.response_headers.push({hdr.key, hdr.value}))
-                                return frontend_error(FrontendError::TooManyItems, respond.span);
-                        }
+                        auto term = analyze_term(
+                            respond, mod, cur_locals, cur_local_count, binding, Str{});
+                        if (!term) return core::make_unexpected(term.error());
+                        guard.fail_term = term.value();
                     }
                     if (!scratch->guards.push(guard))
                         return frontend_error(FrontendError::TooManyItems, inner.span);

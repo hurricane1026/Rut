@@ -6361,7 +6361,7 @@ route GET "/users" use chain secure {
 TEST(frontend, chain_before_respond_capable_step_expands_respond_guards) {
     const char* src = R"rut(
 func check(_ req: i32) -> i32 {
-    guard req.http11 else { respond 401, "denied" }
+    guard req.http11 else { respond 401, json({ ok: false }) }
     7
 }
 chain auth {
@@ -6381,7 +6381,11 @@ route {
     REQUIRE_EQ(hir->routes.len, 1u);
     REQUIRE_EQ(hir->routes[0].guards.len, 1u);
     CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
-    CHECK(hir->routes[0].guards[0].fail_term.response_body.eq(lit("denied")));
+    CHECK(hir->routes[0].guards[0].fail_term.response_body.eq(lit("{\"ok\":false}")));
+    REQUIRE_EQ(hir->routes[0].guards[0].fail_term.response_headers.len, 1u);
+    CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].key.eq(lit("Content-Type")));
+    CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].value.eq(
+        lit("application/json")));
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};

@@ -1404,11 +1404,16 @@ struct Parser {
             stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             if (take(TokenType::Comma)) {
-                auto body_tok = expect(TokenType::StringLit);
-                if (!body_tok) return core::make_unexpected(body_tok.error());
-                stmt.response_body = body_tok.value()->text;
+                if (const Token* body = take(TokenType::StringLit)) {
+                    stmt.response_body = body->text;
+                    stmt.span.end = body->end;
+                } else {
+                    auto body_expr = parse_expr();
+                    if (!body_expr) return core::make_unexpected(body_expr.error());
+                    stmt.expr = body_expr.value();
+                    stmt.span.end = body_expr->span.end;
+                }
                 stmt.has_response_body = true;
-                stmt.span.end = body_tok.value()->end;
             }
             return stmt;
         }
