@@ -47,7 +47,11 @@ data.
 
 ### Remaining syntax migration
 
-- Implement `break`/`continue` only for verifier-bounded `for` loops.
+- Implement verifier-bounded `for` loops end to end: parser acceptance,
+  analyzer proof of a finite static bound, MIR/RIR lowering, and verifier
+  rejection of unbounded or runtime-sized iteration.
+- Add `break`/`continue` only after that bounded-loop substrate exists, and keep
+  both operations inside the verifier-proven loop control-flow region.
 - Migrate remaining `.rut` examples and topic docs to
   `docs/syntax-stability.md` Core spellings.
 - Add a fixture gate that parses and type-checks every unmarked executable
@@ -57,6 +61,8 @@ data.
 - Removed or unsupported forms produce the documented prescriptive diagnostics.
 - Compatibility forms remain accepted and keep tests for their documented
   lowering or migration behavior.
+- Bounded `for` examples parse, lower, and execute with an analyzer-visible
+  maximum trip count; unbounded loops remain a source error.
 - Core examples parse and type-check in CI.
 - `./dev.sh test` remains green with no hidden-yield additions.
 
