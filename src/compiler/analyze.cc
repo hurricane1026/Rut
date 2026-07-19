@@ -19146,12 +19146,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
             // Request multi-value lists are backed by an invocation-local
             // bounded pool and lower to SSA aggregates. Values derived from a
-            // list (for example `let count = tags.len`) are state-0 SSA values
-            // too, so they cannot be consumed after resume either. Propagate
-            // that dependency through local initializers before checking uses.
-            const u32 first_wait_start = route.waits[0].span.start;
+            // list (for example `let count = tags.len`) are per-invocation SSA
+            // values too, so they cannot be consumed after a later resume.
+            // Propagate both named and inline producers through local
+            // initializers, then check each local against the first wait that
+            // follows its own definition (not merely the route's first wait).
             bool list_dependent[HirRoute::kMaxLocals]{};
-            auto expr_reads_dependent_local = [&](const auto& self, const HirExpr& expr) -> bool {
+            auto expr_depends_on_list = [&](const auto& self, const HirExpr& expr) -> bool {
+                if (expr.kind == HirExprKind::ReqQueryAll || expr.kind == HirExprKind::ReqHeaderAll)
+                    return true;
                 if (expr.kind == HirExprKind::LocalRef) {
                     for (u32 li = 0; li < route.locals.len; li++)
                         if (route.locals[li].ref_index == expr.local_index)
@@ -19168,14 +19171,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return false;
             };
             for (u32 li = 0; li < route.locals.len; li++)
-                list_dependent[li] = route.locals[li].span.start < first_wait_start &&
-                                     route.locals[li].type == HirTypeKind::StrList;
+                list_dependent[li] =
+                    route.locals[li].type == HirTypeKind::StrList ||
+                    expr_depends_on_list(expr_depends_on_list, route.locals[li].init);
             for (u32 pass = 0; pass < route.locals.len; pass++) {
                 bool changed = false;
                 for (u32 li = 0; li < route.locals.len; li++) {
                     const auto& local = route.locals[li];
-                    if (list_dependent[li] || local.span.start >= first_wait_start) continue;
-                    if (expr_reads_dependent_local(expr_reads_dependent_local, local.init)) {
+                    if (list_dependent[li]) continue;
+                    if (expr_depends_on_list(expr_depends_on_list, local.init)) {
                         list_dependent[li] = true;
                         changed = true;
                     }
@@ -19183,37 +19187,52 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!changed) break;
             }
             auto reads_list_after_wait =
-                [&](const auto& self, const HirExpr& expr, u32 ref_index) -> bool {
+                [&](const auto& self, const HirExpr& expr, u32 ref_index, u32 wait_start) -> bool {
                 if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index &&
-                    expr.span.start > first_wait_start)
+                    expr.span.start > wait_start)
                     return true;
-                if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index)) return true;
-                if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index)) return true;
+                if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index, wait_start))
+                    return true;
+                if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index, wait_start))
+                    return true;
                 for (u32 ai = 0; ai < expr.args.len; ai++)
-                    if (expr.args[ai] != nullptr && self(self, *expr.args[ai], ref_index))
+                    if (expr.args[ai] != nullptr &&
+                        self(self, *expr.args[ai], ref_index, wait_start))
                         return true;
                 for (u32 fi = 0; fi < expr.field_inits.len; fi++)
                     if (expr.field_inits[fi].value != nullptr &&
-                        self(self, *expr.field_inits[fi].value, ref_index))
+                        self(self, *expr.field_inits[fi].value, ref_index, wait_start))
                         return true;
                 return false;
             };
             for (u32 li = 0; li < route.locals.len; li++) {
                 const auto& local = route.locals[li];
                 if (!list_dependent[li]) continue;
+                u32 next_wait_start = 0xffffffffu;
+                for (u32 wi = 0; wi < route.waits.len; wi++)
+                    if (route.waits[wi].span.start > local.span.start &&
+                        route.waits[wi].span.start < next_wait_start)
+                        next_wait_start = route.waits[wi].span.start;
+                if (next_wait_start == 0xffffffffu) continue;
                 bool read_after = false;
                 for (u32 ei = 0; ei < route.exprs.len && !read_after; ei++)
                     read_after = reads_list_after_wait(
-                        reads_list_after_wait, route.exprs[ei], local.ref_index);
+                        reads_list_after_wait, route.exprs[ei], local.ref_index, next_wait_start);
                 for (u32 gi = 0; gi < route.guards.len && !read_after; gi++)
-                    read_after = reads_list_after_wait(
-                        reads_list_after_wait, route.guards[gi].cond, local.ref_index);
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.guards[gi].cond,
+                                                       local.ref_index,
+                                                       next_wait_start);
                 if (!read_after && route.control.kind == HirControlKind::If)
-                    read_after = reads_list_after_wait(
-                        reads_list_after_wait, route.control.cond, local.ref_index);
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.control.cond,
+                                                       local.ref_index,
+                                                       next_wait_start);
                 if (!read_after && route.control.kind == HirControlKind::Match)
-                    read_after = reads_list_after_wait(
-                        reads_list_after_wait, route.control.match_expr, local.ref_index);
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.control.match_expr,
+                                                       local.ref_index,
+                                                       next_wait_start);
                 if (read_after)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, local.span, kStrListWaitDetail);
