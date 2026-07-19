@@ -121,11 +121,17 @@ bool account_terminal_output(const HarnessSpec& spec,
         RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
     u32 header_count = 0;
-    if (!collect_effective_response_headers(
-            connection, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
+    bool suppress_default_content_type = false;
+    if (!collect_effective_response_headers(connection,
+                                            config,
+                                            terminal.next_state,
+                                            headers,
+                                            kMaxHeaders,
+                                            &header_count,
+                                            &suppress_default_content_type)) {
         connection.resp_status = 500;
         format_static_response(connection, 500, false);
-    } else if (header_count != 0) {
+    } else if (header_count != 0 || suppress_default_content_type) {
         const char* body_data = nullptr;
         u32 body_len = 0;
         bool fallback_body = false;
@@ -145,7 +151,8 @@ bool account_terminal_output(const HarnessSpec& spec,
                                               headers,
                                               header_count,
                                               connection.keep_alive,
-                                              fallback_body);
+                                              fallback_body,
+                                              suppress_default_content_type);
     } else if (has_body) {
         const auto& body = config->response_bodies[terminal.upstream_id - 1];
         format_response_with_body(

@@ -16139,6 +16139,44 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
         conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
+TEST(response_headers, content_type_removal_suppresses_direct_response_default) {
+    RouteConfig cfg{};
+    const char* keys[] = {"Content-Type"};
+    const u32 key_lens[] = {12};
+    const char* values[] = {"application/json"};
+    const u32 value_lens[] = {16};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+
+    Connection conn;
+    conn.reset();
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
+    mutation.name = {"content-type", 12};
+    mutation.value = {nullptr, 0};
+
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    u32 count = 0;
+    bool suppress_default_content_type = false;
+    REQUIRE(collect_effective_response_headers(conn,
+                                               &cfg,
+                                               1,
+                                               out,
+                                               static_cast<u32>(std::size(out)),
+                                               &count,
+                                               &suppress_default_content_type));
+    CHECK_EQ(count, 0u);
+    CHECK(suppress_default_content_type);
+
+    u8 send_storage[1024]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    format_response_with_body_and_headers(
+        conn, 200, "{}", 2, out, count, true, false, suppress_default_content_type);
+    const char* response = reinterpret_cast<const char*>(conn.send_buf.data());
+    CHECK(buf_contains(response, conn.send_buf.len(), "Content-Length: 2\r\n", 19));
+    CHECK_FALSE(buf_contains(response, conn.send_buf.len(), "Content-Type:", 13));
+    CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
+}
+
 TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
     Connection conn;
     conn.reset();

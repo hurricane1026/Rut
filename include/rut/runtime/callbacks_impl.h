@@ -474,6 +474,9 @@ void format_response_with_body(
 // matches format_static_response's wire shape so the "fallback"
 // semantic is consistent regardless of whether custom headers were
 // present.
+// `suppress_default_content_type` is a tombstone from a committed
+// Content-Type removal. It preserves an intentional absence even when
+// no effective header remains to suppress the normal text/plain default.
 struct ResponseHeaderKV {
     const char* key_data;
     u32 key_len;
@@ -487,7 +490,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
                                            bool keep_alive,
-                                           bool body_is_fallback_reason_phrase = false);
+                                           bool body_is_fallback_reason_phrase = false,
+                                           bool suppress_default_content_type = false);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1483,8 +1487,10 @@ inline bool collect_effective_response_headers(const Connection& conn,
                                                u16 static_set_index,
                                                ResponseHeaderKV* out,
                                                u32 capacity,
-                                               u32* out_count) {
+                                               u32* out_count,
+                                               bool* out_suppress_default_content_type = nullptr) {
     *out_count = 0;
+    if (out_suppress_default_content_type != nullptr) *out_suppress_default_content_type = false;
     if (conn.resp_header_mutation_overflow) return false;
     if (static_set_index != 0 && cfg != nullptr &&
         static_set_index <= cfg->response_header_set_count) {
@@ -1506,6 +1512,9 @@ inline bool collect_effective_response_headers(const Connection& conn,
                                      remove ? "" : mutation.value.ptr,
                                      remove ? 0 : mutation.value.len) != HttpHeaderValidation::Ok)
             return false;
+        if (out_suppress_default_content_type != nullptr &&
+            http_header_name_eq_ci(mutation.name.ptr, mutation.name.len, "content-type", 12))
+            *out_suppress_default_content_type = remove;
         if (mutation.mode != Connection::RespHeaderMutationMode::Add) {
             for (u32 i = 0; i < *out_count;) {
                 if (!http_header_name_eq_ci(
@@ -1765,12 +1774,14 @@ void handle_jit_outcome(Loop* loop,
                 RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
             ResponseHeaderKV kvs[kMaxEffectiveHeaders];
             u32 header_count = 0;
+            bool suppress_default_content_type = false;
             if (!collect_effective_response_headers(conn,
                                                     cfg,
                                                     outcome.response_headers_idx,
                                                     kvs,
                                                     kMaxEffectiveHeaders,
-                                                    &header_count)) {
+                                                    &header_count,
+                                                    &suppress_default_content_type)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
                 format_static_response(conn, 500, false);
@@ -1785,7 +1796,7 @@ void handle_jit_outcome(Loop* loop,
             // — matches the no-headers path's documented behavior of
             // falling back rather than rendering garbage.
             const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
-            if (header_count != 0) {
+            if (header_count != 0 || suppress_default_content_type) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
                 bool body_is_fallback = false;
@@ -1815,7 +1826,8 @@ void handle_jit_outcome(Loop* loop,
                                                       kvs,
                                                       header_count,
                                                       keep_alive,
-                                                      body_is_fallback);
+                                                      body_is_fallback,
+                                                      suppress_default_content_type);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(

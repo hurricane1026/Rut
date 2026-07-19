@@ -585,7 +585,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
                                            bool keep_alive,
-                                           bool body_is_fallback_reason_phrase) {
+                                           bool body_is_fallback_reason_phrase,
+                                           bool suppress_default_content_type) {
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
@@ -608,8 +609,9 @@ void format_response_with_body_and_headers(Connection& conn,
     // user content — format_static_response would have emitted no
     // Content-Type at all here, so suppressing it keeps the fallback
     // wire shape consistent regardless of whether headers are present.
-    const bool emit_default_content_type =
-        !user_has_content_type && body_len_emit > 0 && !body_is_fallback_reason_phrase;
+    const bool emit_default_content_type = !user_has_content_type &&
+                                           !suppress_default_content_type && body_len_emit > 0 &&
+                                           !body_is_fallback_reason_phrase;
 
     // Precompute the exact number of bytes we're about to write.
     // Buffer::write() silently truncates on capacity — if we ran past
