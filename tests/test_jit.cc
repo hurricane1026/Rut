@@ -1726,6 +1726,39 @@ TEST(jit, request_multi_value_lists_use_bounded_shared_pool) {
     rir.destroy();
 }
 
+TEST(jit, request_multi_value_list_pool_exhaustion_fails_closed) {
+    const char* src =
+        "route GET \"/search\" { let first = req.queryAll(\"x\") let second = "
+        "req.queryAll(\"x\") if first.len == second.len { return 204 } else { return 409 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    std::string request = "GET /search?";
+    for (u32 i = 0; i < 5000; i++) request += i == 0 ? "x=a" : "&x=a";
+    request += " HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request.data()), request.size(), nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 500u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_query_string_any_fallback) {
     const char* src =
         "route GET \"/search\" { let raw = any(req.queryString, \"\") if raw == "

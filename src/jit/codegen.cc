@@ -1239,8 +1239,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef remaining = LLVMBuildSub(c.builder, limit, used, "str_list.remaining");
             LLVMValueRef fits =
                 LLVMBuildICmp(c.builder, LLVMIntULE, count, remaining, "str_list.fits");
-            LLVMValueRef written =
-                LLVMBuildSelect(c.builder, fits, count, remaining, "str_list.written");
+            LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+            LLVMBasicBlockRef fill_block =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "str_list.fill");
+            LLVMBasicBlockRef overflow_block =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "str_list.overflow");
+            LLVMBuildCondBr(c.builder, fits, fill_block, overflow_block);
+            LLVMPositionBuilderAtEnd(c.builder, overflow_block);
+            c.emit_parse_unprime();
+            LLVMBuildRet(c.builder, c.make_result_status(500));
+            LLVMPositionBuilderAtEnd(c.builder, fill_block);
             LLVMValueRef items =
                 LLVMBuildGEP2(c.builder, c.str_ty, c.str_list_items, &used, 1, "str_list.items");
             LLVMValueRef empty_item = LLVMGetUndef(c.str_ty);
@@ -1249,13 +1257,13 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             empty_item = LLVMBuildInsertValue(c.builder, empty_item, zero, 1, "str_list.empty.len");
             LLVMBuildStore(c.builder, empty_item, items);
             LLVMValueRef fill_args[] = {
-                c.param_req_data, c.param_req_len, name_ptr, name_len, items, written};
+                c.param_req_data, c.param_req_len, name_ptr, name_len, items, count};
             LLVMBuildCall2(c.builder, helper_ty, helper, fill_args, 6, "");
-            LLVMValueRef next_used = LLVMBuildAdd(c.builder, used, written, "str_list.next_used");
+            LLVMValueRef next_used = LLVMBuildAdd(c.builder, used, count, "str_list.next_used");
             LLVMBuildStore(c.builder, next_used, c.str_list_used);
             LLVMValueRef list = LLVMGetUndef(c.str_list_ty);
             list = LLVMBuildInsertValue(c.builder, list, items, 0, "str_list.ptr");
-            list = LLVMBuildInsertValue(c.builder, list, written, 1, "str_list.len");
+            list = LLVMBuildInsertValue(c.builder, list, count, 1, "str_list.len");
             c.set_value(inst.result, list);
             break;
         }
