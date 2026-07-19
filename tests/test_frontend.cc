@@ -13648,6 +13648,40 @@ TEST(frontend, request_multi_values_lower_as_runtime_string_lists) {
     rir.destroy();
 }
 
+TEST(frontend, request_string_list_local_cannot_cross_wait_boundary) {
+    const char* src = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    wait(1ms)
+    if tags.len > 0 { return 204 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit(
+        "request string-list locals cannot cross a wait boundary yet — bind and consume the "
+        "list before wait")));
+
+    const char* pre_wait_only = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    guard tags.len > 0 else { return 404 }
+    wait(1ms)
+    return 204
+}
+)rut";
+    lexed = lex(lit(pre_wait_only));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, req_query_string_flows_as_optional_str) {
     const char* src =
         "route GET \"/search\" { let raw = req.queryString let value = any(raw, \"\") if value == "

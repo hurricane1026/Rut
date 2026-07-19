@@ -297,6 +297,9 @@ constexpr Str kCacheWaitDetail = lit_str(
     "cache ops in routes containing wait are not supported yet — locals "
     "re-materialize on resume, so the op would run after the wait instead "
     "of at its source position");
+constexpr Str kStrListWaitDetail = lit_str(
+    "request string-list locals cannot cross a wait boundary yet — bind and "
+    "consume the list before wait");
 constexpr Str kCacheNameCollisionDetail = lit_str(
     "Cache declaration name collides with another binding or a builtin "
     "receiver (req/resp/time/bitwise) — the cache would be unreachable");
@@ -19140,6 +19143,51 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     probe(route.guards[g].fail_body.locals[li].init);
             if (found != nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, found->span, detail);
+
+            // Request multi-value lists are backed by an invocation-local
+            // bounded pool and lower to SSA aggregates. A resumed state cannot
+            // reuse either the prior invocation's pool or a state-0 SSA value.
+            // Keep pre-wait consumption valid, but reject a LocalRef whose own
+            // source span is after the first wait.
+            const u32 first_wait_start = route.waits[0].span.start;
+            auto reads_list_after_wait = [&](const auto& self,
+                                             const HirExpr& expr,
+                                             u32 ref_index) -> bool {
+                if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index &&
+                    expr.span.start > first_wait_start)
+                    return true;
+                if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index)) return true;
+                if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index)) return true;
+                for (u32 ai = 0; ai < expr.args.len; ai++)
+                    if (expr.args[ai] != nullptr && self(self, *expr.args[ai], ref_index))
+                        return true;
+                for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+                    if (expr.field_inits[fi].value != nullptr &&
+                        self(self, *expr.field_inits[fi].value, ref_index))
+                        return true;
+                return false;
+            };
+            for (u32 li = 0; li < route.locals.len; li++) {
+                const auto& local = route.locals[li];
+                if (local.type != HirTypeKind::StrList || local.span.start > first_wait_start)
+                    continue;
+                bool read_after = false;
+                for (u32 ei = 0; ei < route.exprs.len && !read_after; ei++)
+                    read_after = reads_list_after_wait(
+                        reads_list_after_wait, route.exprs[ei], local.ref_index);
+                for (u32 gi = 0; gi < route.guards.len && !read_after; gi++)
+                    read_after = reads_list_after_wait(
+                        reads_list_after_wait, route.guards[gi].cond, local.ref_index);
+                if (!read_after && route.control.kind == HirControlKind::If)
+                    read_after = reads_list_after_wait(
+                        reads_list_after_wait, route.control.cond, local.ref_index);
+                if (!read_after && route.control.kind == HirControlKind::Match)
+                    read_after = reads_list_after_wait(
+                        reads_list_after_wait, route.control.match_expr, local.ref_index);
+                if (read_after)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, local.span, kStrListWaitDetail);
+            }
         }
 
         // A ws-terminate route carries a HirWsHandler, not a direct_term, so its empty
