@@ -648,6 +648,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     // Immediate dispatch uses a stack synth. Preserve every request-backed
     // pointer retained across the yield, not just the raw request bytes.
+    d.conn->reanchor_request_overrides(synth, synth_len, h2->pending_synth);
     d.conn->reanchor_response_mutations(synth, synth_len, h2->pending_synth);
     auto* ctx = d.conn->jit_ctx();
     for (u32 i = 0; i < ctx->route_param_count; i++) {

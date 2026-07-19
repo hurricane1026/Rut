@@ -230,6 +230,20 @@ struct ConnectionBase {
     u8* response_header_slice;
     Buffer response_header_buf;
 
+    void reanchor_request_overrides(const u8* old_base, u32 old_len, const u8* new_base) {
+        auto reanchor = [&](Str& value) {
+            if (value.ptr == nullptr) return;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr < old_base || ptr + value.len > old_base + old_len) return;
+            value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
+        };
+        reanchor(req_path_override);
+        for (u32 i = 0; i < req_header_override_count; i++) {
+            reanchor(req_header_overrides[i].name);
+            reanchor(req_header_overrides[i].value);
+        }
+    }
+
     void reanchor_response_mutations(const u8* old_base, u32 old_len, const u8* new_base) {
         for (u32 i = 0; i < resp_header_mutation_count; i++) {
             auto& value = resp_header_mutations[i].value;

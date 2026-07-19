@@ -16425,6 +16425,32 @@ TEST(response_headers, forwarded_mutations_reject_runtime_header_injection) {
     CHECK_EQ(conn.response_header_buf.len(), 0u);
 }
 
+TEST(response_headers, forwarded_mutations_reject_framing_headers) {
+    auto rejected = [](ConnectionBase::RespHeaderMutationMode mode, const char* name) {
+        Connection conn;
+        conn.reset();
+        u8 upstream_storage[256]{};
+        u8 header_storage[256]{};
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+        conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, static_cast<u32>(strlen(name))};
+        mutation.value = {"100", 3};
+        const bool ok =
+            build_h1_forward_response_headers(conn, sizeof(response) - 1 - 4, /*draining=*/false);
+        return !ok && conn.response_header_buf.len() == 0;
+    };
+
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Content-Length"));
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Add, "content-length"));
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Transfer-Encoding"));
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Add, "transfer-encoding"));
+}
+
 TEST(response_headers, forwarded_mutations_remove_matching_connection_nominations) {
     Connection conn;
     conn.reset();
@@ -16635,6 +16661,46 @@ TEST(http2, proxy_forwardability_requires_scheme_and_usable_host) {
         {{"host", 4}, {"two.example", 11}},
     };
     CHECK_FALSE(h2_proxy_request_forwardable(duplicate_host, 3));
+}
+
+TEST(http2, timer_suspend_reanchors_request_overrides) {
+    struct EpochLoop {
+        void epoch_enter() {}
+    } loop;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init();
+    conn.h2 = &h2;
+
+    u8 synth[64]{};
+    conn.req_path_overridden = true;
+    conn.req_path_override = {reinterpret_cast<const char*>(synth + 4), 8};
+    conn.req_header_override_count = 1;
+    conn.req_header_overrides[0] = {
+        {reinterpret_cast<const char*>(synth + 16), 6},
+        {reinterpret_cast<const char*>(synth + 24), 7},
+    };
+    u8 response[1]{};
+    H2Dispatch<EpochLoop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    JitDispatchOutcome outcome;
+    outcome.timer_ms = 20;
+    outcome.next_state = 7;
+
+    REQUIRE(h2_suspend_timer(dispatch,
+                             1,
+                             /*fn=*/nullptr,
+                             outcome,
+                             /*cfg=*/nullptr,
+                             synth,
+                             sizeof(synth),
+                             /*request_body_followed=*/false,
+                             /*request_forwardable=*/true));
+    CHECK(conn.req_path_override.ptr == reinterpret_cast<const char*>(h2.pending_synth + 4));
+    CHECK(conn.req_header_overrides[0].name.ptr ==
+          reinterpret_cast<const char*>(h2.pending_synth + 16));
+    CHECK(conn.req_header_overrides[0].value.ptr ==
+          reinterpret_cast<const char*>(h2.pending_synth + 24));
 }
 
 TEST(http2, forward_request_applies_jit_path_and_header_overrides) {

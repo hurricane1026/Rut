@@ -1563,6 +1563,9 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
     for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
         const auto& mutation = conn.resp_header_mutations[i];
         const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+        // ReservedKey includes Content-Length and Transfer-Encoding. Reject
+        // those mutations before serialization so the upstream framing parsed
+        // into resp_body_mode remains the sole downstream framing authority.
         // Once a 101 is accepted the runtime will enter the raw upgrade
         // tunnel. Do not allow mutations to rewrite its required Connection
         // nomination or negotiated upgrade/WebSocket handshake fields after

@@ -8958,8 +8958,26 @@ static u64 forward_with_param_mutation_handler(
     return rut::jit::HandlerResult::make_forward(0).pack();
 }
 
-static u64 wait_then_forward_handler(void*, rut::jit::HandlerCtx* ctx, const u8*, u32, void*) {
+static u64 wait_then_forward_with_request_overrides_handler(
+    void* raw_conn, rut::jit::HandlerCtx* ctx, const u8* req, u32 len, void*) {
     if (ctx != nullptr && ctx->state == 7) return rut::jit::HandlerResult::make_forward(0).pack();
+    auto find_value = [&](const char* prefix, u32 prefix_len, u32 value_len) -> const char* {
+        for (u32 i = 0; i + prefix_len + value_len <= len; i++) {
+            if (__builtin_memcmp(req + i, prefix, prefix_len) == 0)
+                return reinterpret_cast<const char*>(req + i + prefix_len);
+        }
+        return nullptr;
+    };
+    const char* path = find_value("x-new-path: ", 12, 10);
+    const char* token = find_value("x-token: ", 9, 7);
+    if (path == nullptr || token == nullptr)
+        return rut::jit::HandlerResult::make_status(500).pack();
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    conn->req_path_overridden = true;
+    conn->req_path_override = {path, 10};
+    conn->req_header_override_count = 1;
+    conn->req_header_overrides[0] = {{"X-Copied", 8}, {token, 7}};
+    conn->req_header_append_mask = 0;
     return rut::jit::HandlerResult::make_yield_payload(
                7, rut::jit::YieldKind::Timer, /*milliseconds=*/20)
         .pack();
@@ -9314,6 +9332,8 @@ struct ScriptedUpstreamServer {
     const char* response = nullptr;
     u32 response_len = 0;
     bool keep_open = false;  // hold the connection open after replying (HTTP keep-alive)
+    char request[1024]{};
+    std::atomic<u32> request_len{0};
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -9339,8 +9359,10 @@ struct ScriptedUpstreamServer {
         }
         if (client >= 0) {
             if (set_blocking(client)) {
-                char req[1024];
-                (void)recv_timeout(client, req, sizeof(req), 1000);
+                const i32 got =
+                    recv_timeout(client, server->request, sizeof(server->request), 1000);
+                if (got > 0)
+                    server->request_len.store(static_cast<u32>(got), std::memory_order_release);
                 if (server->response != nullptr && server->response_len > 0) {
                     (void)send_all(client, server->response, server->response_len);
                 }
@@ -10062,7 +10084,7 @@ TEST(shard, serves_http2_jit_forward_after_timer_resume) {
     auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
     REQUIRE(id.has_value());
     REQUIRE_EQ(id.value(), 0u);
-    REQUIRE(cfg.add_jit_handler("/api", 'G', &wait_then_forward_handler));
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &wait_then_forward_with_request_overrides_handler));
 
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
@@ -10078,7 +10100,15 @@ TEST(shard, serves_http2_jit_forward_after_timer_resume) {
     set_socket_timeouts(c, 2);
     u8 out[512];
     u32 n = h2_client_prologue(out);
-    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"x-new-path", 10}, {"/rewritten", 10}},
+        {{"x-token", 7}, {"trusted", 7}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 6, /*end_stream=*/true);
     REQUIRE(write_all_fd(c, out, n));
 
     u8 resp[4096];
@@ -10097,6 +10127,10 @@ TEST(shard, serves_http2_jit_forward_after_timer_resume) {
     REQUIRE_EQ(body_len, 2u);
     CHECK_EQ(body[0], static_cast<u8>('o'));
     CHECK_EQ(body[1], static_cast<u8>('k'));
+    const u32 request_len = backend.request_len.load(std::memory_order_acquire);
+    const std::string forwarded(backend.request, request_len);
+    CHECK(forwarded.starts_with("GET /rewritten HTTP/1.1\r\n"));
+    CHECK(forwarded.find("X-Copied: trusted\r\n") != std::string::npos);
 
     close(c);
     shard.stop();
