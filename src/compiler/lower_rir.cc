@@ -2991,10 +2991,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             return {};
         }
         // Literal form: intern the body (if any) into the module table
-        // and pack the 1-based idx into RetStatus's immediate. Empty /
-        // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
+        // and pack the 1-based idx into RetStatus's immediate. Presence is
+        // represented by ptr, not len, so an explicitly empty body still gets
+        // an index while a missing body uses idx 0 (default status-reason).
         u16 body_idx = 0;
-        if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
+        if (term.response_body.ptr != nullptr) {
             body_idx = b.intern_response_body(term.response_body);
             if (body_idx == 0) {
                 // intern returns 0 for both "table full" and "arena

@@ -38,6 +38,10 @@ struct Parser {
     // scoped to arm bodies only).
     bool arm_body_stops_cross_line_dot = false;
     bool in_function_body = false;
+    // Object literals are expression-like only while parsing a call
+    // argument. A depth counter (rather than a one-token special case) keeps
+    // that context through transparent parentheses and nested arrays.
+    u32 object_call_arg_depth = 0;
     // Depth of enclosing `(...)` / `[...]` while parsing an arm body. The
     // newline-dot boundary only applies at the top level of the arm body: a
     // line-broken member access inside a call argument or group (e.g.
@@ -54,6 +58,14 @@ struct Parser {
         ~NestedDelimiterGuard() { parser->arm_body_dot_stop_depth--; }
         NestedDelimiterGuard(const NestedDelimiterGuard&) = delete;
         NestedDelimiterGuard& operator=(const NestedDelimiterGuard&) = delete;
+    };
+
+    struct CallArgGuard {
+        Parser* parser;
+        explicit CallArgGuard(Parser* p) : parser(p) { parser->object_call_arg_depth++; }
+        ~CallArgGuard() { parser->object_call_arg_depth--; }
+        CallArgGuard(const CallArgGuard&) = delete;
+        CallArgGuard& operator=(const CallArgGuard&) = delete;
     };
 
     const Token& cur() const { return toks->tokens[pos]; }
@@ -369,18 +381,20 @@ struct Parser {
     }
 
     FrontendResult<AstExpr> parse_call_arg() {
-        if (cur().type == TokenType::LBrace) return parse_object_call_arg();
-        if (cur().type == TokenType::LBracket) return parse_array_literal(true);
+        CallArgGuard call_arg(this);
         return parse_expr();
     }
 
     FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
+        if (cur().type == TokenType::LBrace && object_call_arg_depth != 0)
+            return parse_object_call_arg();
         if (cur().type == TokenType::LBrace)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(cur()), kObjectCallArgDetail);
-        if (cur().type == TokenType::LBracket) return parse_array_literal(false);
+        if (cur().type == TokenType::LBracket)
+            return parse_array_literal(object_call_arg_depth != 0);
         if (take(TokenType::LParen)) {
             NestedDelimiterGuard nested(this);
             auto first = parse_expr();

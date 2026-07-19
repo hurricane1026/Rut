@@ -3679,11 +3679,11 @@ TEST(frontend, parse_return_response_with_body) {
     rir.destroy();
 }
 
-TEST(frontend, parse_return_response_empty_body_is_noop) {
+TEST(frontend, parse_return_response_empty_body_is_distinct_from_missing_body) {
     // `body: ""` has the explicit-empty flag but zero bytes; HIR
     // preserves the kwarg (ptr != nullptr, len == 0 — the documented
-    // sentinel), and lower_rir treats it as "no custom body" so no
-    // entry is interned into the module table.
+    // sentinel), and lower_rir interns a zero-length entry so runtime
+    // dispatch does not replace it with the status reason phrase.
     const char* src = "route GET \"/x\" { return response(200, body: \"\") }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -3701,14 +3701,15 @@ TEST(frontend, parse_return_response_empty_body_is_noop) {
     const auto& term = hir->routes[0].control.direct_term;
     CHECK(term.response_body.ptr != nullptr);
     CHECK_EQ(term.response_body.len, 0u);
-    // Lower through MIR → RIR and verify the module table stays empty:
-    // zero-length bodies should not produce an intern entry.
+    // Lower through MIR → RIR and verify the explicit empty body has a
+    // distinct 1-based table entry.
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
-    CHECK_EQ(rir.module.response_body_count, 0u);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    CHECK_EQ(rir.module.response_bodies[0].len, 0u);
     rir.destroy();
 }
 
@@ -31797,6 +31798,9 @@ route GET "/x" {
     const auto expected =
         lit("{\"quote\":\"a\\\"b\\n\",\"flags\":[true,false,null],\"negative\":-12}");
     CHECK(hir->routes[0].control.direct_term.response_body.eq(expected));
+    REQUIRE_EQ(hir->routes[0].control.direct_term.response_headers.len, 1u);
+    CHECK(hir->routes[0].control.direct_term.response_headers[0].key.eq(lit("Content-Type")));
+    CHECK(hir->routes[0].control.direct_term.response_headers[0].value.eq(lit("application/json")));
     REQUIRE_EQ(hir->owned_strings->size(), 1u);
     CHECK_EQ(hir->routes[0].control.direct_term.response_body.ptr,
              hir->owned_strings->front().c_str());
@@ -31807,6 +31811,7 @@ route GET "/x" {
     auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
     CHECK(rir.module.response_bodies[0].eq(expected));
     rir.destroy();
 }
@@ -31907,6 +31912,39 @@ route GET "/x" {
     REQUIRE(hir);
     CHECK(hir->routes[0].control.direct_term.response_body.eq(
         lit("[{\"id\":1},{\"id\":2,\"meta\":{\"ok\":true}}]")));
+}
+
+TEST(frontend, json_parses_parenthesized_objects_in_call_argument_context) {
+    const char* src = R"rut(
+route GET "/x" {
+    return 200, json([({ id: 1 }), (({ id: 2 }))])
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.response_body.eq(lit("[{\"id\":1},{\"id\":2}]")));
+}
+
+TEST(frontend, direct_empty_response_body_gets_distinct_rir_entry) {
+    const char* src = "route GET \"/x\" { return 200, \"\" }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    CHECK_EQ(rir.module.response_bodies[0].len, 0u);
+    rir.destroy();
 }
 
 TEST(frontend, json_serializes_empty_literal_arrays_and_objects) {
@@ -32070,6 +32108,20 @@ TEST(frontend, if_let_direct_terminators_preserve_json_shadowing) {
     auto guard_hir = analyze_file_heap(guard_ast.value());
     REQUIRE_FALSE(guard_hir.has_value());
     CHECK(guard_hir.error().detail.eq(
+        lit("return body expressions currently support json(literal) only")));
+
+    const char* outer_binding_src =
+        "variant Result { ok(i32), err }\n"
+        "route GET \"/x\" { let state = Result.ok(1) match state { .ok(json) => { if let other "
+        "= req.query(\"x\") { return 200, json(1) } else { return 500 } } .err => return 404 } "
+        "}\n";
+    auto outer_binding_lexed = lex(lit(outer_binding_src));
+    REQUIRE(outer_binding_lexed);
+    auto outer_binding_ast = parse_file_heap(outer_binding_lexed.value());
+    REQUIRE(outer_binding_ast);
+    auto outer_binding_hir = analyze_file_heap(outer_binding_ast.value());
+    REQUIRE_FALSE(outer_binding_hir.has_value());
+    CHECK(outer_binding_hir.error().detail.eq(
         lit("return body expressions currently support json(literal) only")));
 }
 

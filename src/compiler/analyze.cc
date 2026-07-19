@@ -9883,7 +9883,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
                                                   const HirLocal* locals = nullptr,
                                                   u32 local_count = 0,
-                                                  const MatchPayloadBinding* binding = nullptr) {
+                                                  const MatchPayloadBinding* binding = nullptr,
+                                                  Str scoped_binding_name = {}) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -9907,6 +9908,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 term.response_body = stmt.response_body;
             } else {
                 if (stmt.expr.kind != AstExprKind::Call || !stmt.expr.name.eq({"json", 4}) ||
+                    scoped_binding_name.eq({"json", 4}) ||
                     user_bound_ident_name(mod, locals, local_count, binding, {"json", 4}) ||
                     stmt.expr.args.len != 1 || stmt.expr.args[0] == nullptr)
                     return frontend_error(
@@ -9916,6 +9918,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     serialize_json_literal(*stmt.expr.args[0], serialized, kResponseBodyPoolBytes);
                 if (!encoded) return core::make_unexpected(encoded.error());
                 term.response_body = intern_module_string(mod, serialized);
+                if (!term.response_headers.push(
+                        {lit_str("Content-Type"), lit_str("application/json")}))
+                    return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
             }
         }
         // Carry response headers verbatim (parser already rejected
@@ -10693,14 +10698,12 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        MatchPayloadBinding narrowed_binding{};
-        const MatchPayloadBinding* then_binding = binding;
-        if (stmt.bind_value) {
-            narrowed_binding.name = stmt.name;
-            narrowed_binding.subject = &cond_expr;
-            then_binding = &narrowed_binding;
-        }
-        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, then_binding);
+        auto then_term = analyze_term(*stmt.then_stmt,
+                                      mod,
+                                      locals,
+                                      local_count,
+                                      binding,
+                                      stmt.bind_value ? stmt.name : Str{});
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
@@ -10816,14 +10819,12 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        MatchPayloadBinding narrowed_binding{};
-        const MatchPayloadBinding* then_binding = binding;
-        if (stmt.bind_value) {
-            narrowed_binding.name = stmt.name;
-            narrowed_binding.subject = &cond_expr;
-            then_binding = &narrowed_binding;
-        }
-        auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, then_binding);
+        auto then_term = analyze_term(*stmt.then_stmt,
+                                      mod,
+                                      locals,
+                                      local_count,
+                                      binding,
+                                      stmt.bind_value ? stmt.name : Str{});
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
@@ -10980,14 +10981,12 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // shadow the builtin `json` in a response-body expression).
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
-            MatchPayloadBinding narrowed_binding{};
-            const MatchPayloadBinding* then_binding = binding;
-            if (stmt.bind_value) {
-                narrowed_binding.name = stmt.name;
-                narrowed_binding.subject = &cond_expr;
-                then_binding = &narrowed_binding;
-            }
-            auto then_term = analyze_term(*stmt.then_stmt, mod, locals, local_count, then_binding);
+            auto then_term = analyze_term(*stmt.then_stmt,
+                                          mod,
+                                          locals,
+                                          local_count,
+                                          binding,
+                                          stmt.bind_value ? stmt.name : Str{});
             if (!then_term) return core::make_unexpected(then_term.error());
             auto else_term = analyze_term(*stmt.else_stmt, mod, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
