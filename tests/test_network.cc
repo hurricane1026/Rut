@@ -8355,6 +8355,21 @@ TEST(proxy, proxy_response_sent_send_error) {
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
+TEST(proxy, proxy_response_sent_closes_when_response_disabled_keepalive) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
+    c->req_start_us = monotonic_us();
+    c->keep_alive = false;
+    const u32 cid = c->id;
+
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
 TEST(proxy, proxy_response_sent_wrong_type) {
     SmallLoop loop;
     loop.setup();

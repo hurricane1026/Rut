@@ -5102,6 +5102,11 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 
+    if (!conn.keep_alive) {
+        loop->close_conn(conn);
+        return;
+    }
+
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;
         const u32 kLateLen = conn.recv_buf.len();
