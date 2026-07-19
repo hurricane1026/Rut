@@ -14280,6 +14280,38 @@ TEST(coverage, chunked_502_in_initial_buffer) {
     CHECK_EQ(c->resp_status, kStatusBadGateway);
 }
 
+TEST(response_headers, malformed_initial_chunk_is_rejected_before_mutated_headers) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->resp_header_mutations[0] = {
+        {"X-After", 7}, {"applied", 7}, ConnectionBase::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "XYZ\r\n";
+    const u32 kLen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), kLen), kLen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kLen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    const u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    const MockOp* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    CHECK(buf_has(send->send_buf, send->send_len, "502 Bad Gateway"));
+    CHECK_FALSE(buf_has(send->send_buf, send->send_len, "X-After: applied"));
+}
+
 // Chunked request body in on_request_body_recvd. Lines 1085-1103.
 TEST(coverage, chunked_request_body_streaming) {
     SmallLoop loop;

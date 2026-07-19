@@ -6694,7 +6694,7 @@ func mutate(_ req: i32, _ resp: Response) -> i32 {
 chain access { after mutate(req, resp) }
 route GET "/users" use chain access { return 200 }
 )rut",
-         "Response supports set/add/remove"},
+         "non-response statement effects are not supported in helpers"},
     };
     for (const auto& c : cases) {
         auto lexed = lex(lit(c.src));
@@ -6729,6 +6729,32 @@ route GET "/users" use chain access {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("chain after Response effects cannot be combined with wait/for yet")));
+}
+
+TEST(frontend, chain_after_rejects_nested_helper_with_non_response_statement_effect) {
+    const char* src = R"rut(
+let flags = Cache<IP, i64>(capacity: 16)
+func value(_ req: i32) -> str {
+    flags.set(req.remoteAddr, 1)
+    "set"
+}
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Test", value(req))
+    0
+}
+chain access { after mutate(req, resp) }
+route GET "/users" use chain access { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("non-response statement effects are not supported in helpers")));
+    REQUIRE(hir.error().span.start + 5 <= lit(src).len);
+    CHECK((Str{src + hir.error().span.start, 5}.eq(lit("flags"))));
 }
 
 TEST(frontend, chain_after_rejects_response_time_state_evaluated_at_request_dispatch) {

@@ -114,6 +114,7 @@ struct Http2Conn {
     u32 pending_content_length;
     bool pending_has_content_length;
     bool pending_buffer_body;
+    bool pending_request_forwardable;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
     // Snapshot of matched route decisions at END_HEADERS time for deferred
     // requests. This keeps delayed DATA handlers stable when config changes

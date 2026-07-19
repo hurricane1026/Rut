@@ -39,6 +39,7 @@ void Http2Conn::init() {
     pending_content_length = 0;
     pending_has_content_length = false;
     pending_buffer_body = false;
+    pending_request_forwardable = false;
     pending_overflow = false;
     pending_route_config = nullptr;
     pending_route = nullptr;

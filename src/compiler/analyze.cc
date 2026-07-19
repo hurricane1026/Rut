@@ -5952,16 +5952,29 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const bool is_remove = inner.expr.name.eq({"remove", 6});
                 if (is_set || is_add || is_remove) {
                     u32 response_index = cur_local_count;
+                    bool receiver_is_local = false;
                     for (u32 li = cur_local_count; li > 0; li--) {
                         if (!cur_locals[li - 1].name.eq(inner.expr.lhs->name)) continue;
+                        receiver_is_local = true;
                         if (cur_locals[li - 1].type == HirTypeKind::Response)
                             response_index = li - 1;
                         break;
                     }
-                    if (response_index == cur_local_count)
+                    if (response_index == cur_local_count) {
+                        if (!receiver_is_local) {
+                            for (u32 ci = 0; ci < mod.caches.len; ci++) {
+                                if (!mod.caches[ci].name.eq(inner.expr.lhs->name)) continue;
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.span,
+                                    lit_str("non-response statement effects are not supported in "
+                                            "helpers"));
+                            }
+                        }
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               inner.span,
                                               lit_str("Response supports set/add/remove"));
+                    }
 
                     const u32 wanted_args = is_remove ? 1u : 2u;
                     if (inner.expr.args.len != wanted_args || inner.expr.args[0] == nullptr ||

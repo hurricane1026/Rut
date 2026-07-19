@@ -277,6 +277,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_content_length = 0;
     h2.pending_has_content_length = false;
     h2.pending_buffer_body = false;
+    h2.pending_request_forwardable = false;
     h2.pending_overflow = false;
     h2.pending_route_config = nullptr;
     h2.pending_route = nullptr;
@@ -370,6 +371,8 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_content_length = req.content_length;
     h2->pending_has_content_length = req.has_content_length;
     h2->pending_buffer_body = buffer_body;
+    h2->pending_request_forwardable =
+        action == RouteAction::JitHandler && h2_proxy_request_forwardable(headers, nheaders);
     h2->pending_overflow = false;
     h2->pending_route_config = route_config;
     h2->pending_route = route;
@@ -717,6 +720,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const RouteConfig* cfg = h2->pending_route_config;
     const RouteEntry* route = h2->pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
+    const bool kRequestBodyFollowed = h2->pending_body_len != 0;
+    const bool kRequestForwardable = h2->pending_request_forwardable;
     const u32 kRouteParamCount = h2->pending_route_param_count;
     RouteParam route_params[kMaxRouteParams];
     for (u32 i = 0; i < kRouteParamCount; i++) {
@@ -733,8 +738,16 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(
-        d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen, true, false);
+    h2_invoke_emit(d,
+                   stream_id,
+                   route,
+                   route_params,
+                   kRouteParamCount,
+                   cfg,
+                   synth,
+                   kLen,
+                   kRequestBodyFollowed,
+                   kRequestForwardable);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is

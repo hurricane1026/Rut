@@ -4884,6 +4884,42 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const u32 kInitialBodyLen = (kTotalLen > kHeaderLen) ? kTotalLen - kHeaderLen : 0;
 
     if (conn.resp_header_mutation_count != 0) {
+        // Keep the body in upstream_recv_buf while rewritten headers drain, but
+        // validate any chunk bytes already received before committing a success
+        // response downstream. The streaming callback will parse the same bytes
+        // with the connection-owned parser after the header send completes.
+        if (conn.resp_body_mode == BodyMode::Chunked && kInitialBodyLen > 0) {
+            ChunkedParser probe = conn.resp_chunk_parser;
+            const u8* body_start = conn.upstream_recv_buf.data() + kHeaderLen;
+            u32 pos = 0;
+            while (pos < kInitialBodyLen) {
+                u32 consumed = 0, out_start = 0, out_len = 0;
+                const ChunkStatus kChunkStatus = probe.feed(
+                    body_start + pos, kInitialBodyLen - pos, &consumed, &out_start, &out_len);
+                pos += consumed;
+                if (kChunkStatus == ChunkStatus::Error) {
+                    if (conn.upstream_fd >= 0) {
+                        ::close(conn.upstream_fd);
+                        conn.upstream_fd = -1;
+                    }
+                    static const char k502[] =
+                        "HTTP/1.1 502 Bad Gateway\r\n"
+                        "Content-Length: 11\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "Bad Gateway";
+                    conn.send_buf.reset();
+                    conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+                    conn.keep_alive = false;
+                    conn.resp_status = kStatusBadGateway;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                if (kChunkStatus == ChunkStatus::NeedMore || kChunkStatus == ChunkStatus::Done)
+                    break;
+            }
+        }
         if (!build_h1_forward_response_headers(conn, kHeaderLen, loop->is_draining())) {
             loop->close_conn(conn);
             return;

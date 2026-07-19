@@ -10131,6 +10131,63 @@ TEST(shard, serves_http2_jit_forward_rejects_request_body) {
     close(lfd);
 }
 
+TEST(shard, serves_http2_jit_forward_accepts_deferred_empty_data) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_0_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>(""), 0, true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 TEST(shard, serves_http2_jit_forward_rejects_non_forwardable_headers) {
     RouteConfig cfg;
     auto id = cfg.add_upstream("dead", 0x7F000001, 9);
