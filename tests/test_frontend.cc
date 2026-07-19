@@ -32606,6 +32606,60 @@ TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {
     }
 }
 
+TEST(frontend, control_plane_snapshot_rejects_post_guard_materialization) {
+    const char* src = R"rut(
+route GET "/admin" {
+    guard req.http11 else { return 505 }
+    let snapshot = stats()
+    return 200, json(snapshot)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane statements currently require a straight-line route without "
+            "guard/wait/for")));
+}
+
+TEST(frontend, control_plane_builtins_reject_type_arguments) {
+    const char* cases[] = {
+        "route GET \"/admin\" { let snapshot = stats<i32>() return 200 }\n",
+        "route GET \"/admin\" { let snapshot = metrics<i32>() return 200 }\n",
+        "route GET \"/admin\" { reload<i32>() return 204 }\n",
+        "upstream api at \"127.0.0.1:8080\"\n"
+        "timer health, every: 1s { upstream.mark<i32>(api, healthy: true) return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, control_plane_effect_rejected_on_websocket_terminate_route) {
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { reload() return websocket(ws) { frame in "
+        "frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+}
+#endif
+
 TEST(frontend, control_plane_snapshot_declarations_validate_arity) {
     const char* src = "route GET \"/admin\" { let snapshot = stats(1) return 200 }\n";
     auto lexed = lex(lit(src));

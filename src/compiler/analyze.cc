@@ -3533,6 +3533,19 @@ static bool hir_contains_fallible_has_value(const HirExpr* expr) {
         if (hir_contains_fallible_has_value(expr->field_inits[fi].value)) return true;
     return false;
 }
+
+static bool hir_contains_admin_snapshot(const HirExpr* expr) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::StatsSnapshot || expr->kind == HirExprKind::MetricsSnapshot)
+        return true;
+    if (hir_contains_admin_snapshot(expr->lhs) || hir_contains_admin_snapshot(expr->rhs))
+        return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_contains_admin_snapshot(expr->args[ai])) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_contains_admin_snapshot(expr->field_inits[fi].value)) return true;
+    return false;
+}
 static bool const_eval_expr(
     const HirExpr& expr, const HirLocal* locals, u32 local_count, ConstValue* out, u32 depth);
 static KnownErrorCase known_error_case(const HirExpr& expr,
@@ -4050,8 +4063,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         expr.lhs->name.eq({"upstream", 8}) && expr.name.eq({"mark", 4}) &&
         !user_bound_ident_name(mod, locals, local_count, binding, {"upstream", 8})) {
-        if (!route->control_plane_stmt_ok || !route->is_timer || expr.args.len != 2 ||
-            expr.arg_labels.len != 2 || expr.arg_labels[0].len != 0 ||
+        if (!route->control_plane_stmt_ok || !route->is_timer || expr.type_args.len != 0 ||
+            expr.args.len != 2 || expr.arg_labels.len != 2 || expr.arg_labels[0].len != 0 ||
             !expr.arg_labels[1].eq({"healthy", 7}) || expr.args[0] == nullptr ||
             expr.args[0]->kind != AstExprKind::Ident || expr.args[1] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -9107,7 +9120,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         const BuiltinDecl* decl = find_control_plane_builtin(BuiltinReceiver::None, expr.name);
         if (decl == nullptr || pipe_lhs != nullptr || first_arg_override != nullptr ||
-            expr.args.len != decl->param_count)
+            expr.type_args.len != 0 || expr.args.len != decl->param_count)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("stats() and metrics() take no arguments"));
@@ -9123,7 +9136,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (expr.name.eq({"reload", 6}) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (!route->control_plane_stmt_ok || route->is_timer || pipe_lhs != nullptr ||
-            first_arg_override != nullptr || expr.args.len != 0)
+            first_arg_override != nullptr || expr.type_args.len != 0 || expr.args.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         route->control_plane_stmt_ok = false;
         HirExpr out{};
@@ -19387,6 +19400,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
+                if ((seen_guard || route.guards.len > 0) &&
+                    hir_contains_admin_snapshot(&init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
                 if (init.value().type == HirTypeKind::Array) {
                     if (!used_for_iter || !is_static_for_iter_expr(
                                               init.value(), route.locals.data, route.locals.len, 0))
@@ -19626,6 +19643,20 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       route_decl.statements[si + 1]->span);
             break;
+        }
+
+        if (route.is_ws_terminate) {
+            for (u32 li = 0; li < route.locals.len; li++) {
+                const auto kind = route.locals[li].init.kind;
+                if (kind == HirExprKind::AdminReload || kind == HirExprKind::AdminUpstreamMark ||
+                    kind == HirExprKind::StatsSnapshot || kind == HirExprKind::MetricsSnapshot ||
+                    kind == HirExprKind::AdminJson)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        route.locals[li].span,
+                        lit_str("control-plane effects are not supported on WebSocket terminate "
+                                "routes"));
+            }
         }
 
         bool has_chain_after_response_effects = false;
