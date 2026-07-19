@@ -6729,6 +6729,16 @@ route GET "/users" use chain access { return 200 }
 )rut",
          "chain after helper must have exactly one Response parameter"},
         {R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Snapshot", json(stats()))
+    0
+}
+chain access { after mutate(resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after Response header values cannot read time, cache, response, or control-plane "
+         "state until effects execute at response time"},
+        {R"rut(
 func mutate(_ first: Response, _ second: Response) -> i32 {
     first.set("X-Test", "yes")
     0
@@ -6844,9 +6854,9 @@ route GET "/users" use chain access { return 200 }
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "chain after Response header values cannot read time, cache, or response state until "
-            "effects execute at response time")));
+        CHECK(hir.error().detail.eq(
+            lit("chain after Response header values cannot read time, cache, response, or "
+                "control-plane state until effects execute at response time")));
     }
 }
 
@@ -32442,6 +32452,43 @@ route GET "/admin" {
             "connected yet")));
 }
 
+TEST(frontend, snapshot_types_are_valid_explicit_helper_contracts) {
+    const char* src = R"rut(
+func encodeStats(value: Stats) -> str => json(value)
+func encodeMetrics(value: Metrics) -> str => json(value)
+route GET "/admin" {
+    let statsBody = encodeStats(stats())
+    let metricsBody = encodeMetrics(metrics())
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Stats);
+    CHECK_EQ(hir->functions[1].params[0].type, HirTypeKind::Metrics);
+}
+
+TEST(frontend, opaque_snapshots_reject_direct_equality) {
+    const char* cases[] = {
+        "route GET \"/admin\" { if stats() == stats() { return 200 } else { return 204 } }\n",
+        "route GET \"/admin\" { if metrics() == metrics() { return 200 } else { return 204 } }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
 TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary) {
     const char* reload_src = "route GET \"/admin\" { reload() return 204 }\n";
     auto reload_lexed = lex(lit(reload_src));
@@ -32722,6 +32769,27 @@ route GET "/admin" {
             "preserves arm ordering")));
 }
 
+TEST(frontend, control_plane_snapshot_rejects_guard_failure_local_materialization) {
+    const char* src = R"rut(
+route GET "/admin" {
+    guard req.http11 else {
+        let snapshot = stats()
+        return 503, json(snapshot)
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots are not supported in guard-failure bindings until lowering "
+            "preserves branch ordering")));
+}
+
 TEST(frontend, control_plane_builtins_reject_type_arguments) {
     const char* cases[] = {
         "route GET \"/admin\" { let snapshot = stats<i32>() return 200 }\n",
@@ -32751,6 +32819,22 @@ TEST(frontend, control_plane_effect_rejected_on_websocket_terminate_route) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+
+    const char* block_guard_body = R"rut(
+upstream ws
+route GET "/ws" {
+    guard req.http11 else { return 503, json(stats()) }
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    lexed = lex(lit(block_guard_body));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("control-plane effects are not supported on WebSocket terminate routes")));

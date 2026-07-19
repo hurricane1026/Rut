@@ -478,7 +478,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
                         type == HirTypeKind::I64 || type == HirTypeKind::Str ||
                         type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-                        type == HirTypeKind::IP || type == HirTypeKind::Response;
+                        type == HirTypeKind::IP || type == HirTypeKind::Response ||
+                        type == HirTypeKind::Stats || type == HirTypeKind::Metrics;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -2030,6 +2031,8 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq({"Stats", 5})) return HirTypeKind::Stats;
+    if (name.eq({"Metrics", 7})) return HirTypeKind::Metrics;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
@@ -3570,12 +3573,22 @@ static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route
                 route.locals[li].span,
                 lit_str("control-plane effects are not supported on WebSocket terminate routes"));
     }
+    auto terminator_has_snapshot_body = [](const HirTerminator& term) {
+        return term.runtime_response_body_type == HirTypeKind::Stats ||
+               term.runtime_response_body_type == HirTypeKind::Metrics;
+    };
     for (u32 gi = 0; gi < route.guards.len; gi++) {
-        const auto body_type = route.guards[gi].fail_term.runtime_response_body_type;
-        if (body_type == HirTypeKind::Stats || body_type == HirTypeKind::Metrics)
+        const auto& guard = route.guards[gi];
+        bool has_snapshot_body = terminator_has_snapshot_body(guard.fail_term);
+        if (guard.fail_kind == HirGuard::FailKind::Body) {
+            has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.direct_term);
+            has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.then_term);
+            has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.else_term);
+        }
+        if (has_snapshot_body)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
-                route.guards[gi].fail_term.span,
+                guard.span,
                 lit_str("control-plane effects are not supported on WebSocket terminate routes"));
     }
     return {};
@@ -8685,8 +8698,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.span,
                                       lit_str("runtime string-list equality is not supported"));
-            if (lhs->type == HirTypeKind::Generic && !lhs->generic_has_eq_constraint)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (lhs->type == HirTypeKind::Generic) {
+                if (!lhs->generic_has_eq_constraint)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            } else {
+                bool struct_visiting[HirModule::kMaxStructs]{};
+                bool variant_visiting[HirModule::kMaxVariants]{};
+                if (!hir_type_shape_satisfies_eq_constraint(mod,
+                                                            lhs->type,
+                                                            lhs->variant_index,
+                                                            lhs->struct_index,
+                                                            lhs->tuple_len,
+                                                            lhs->tuple_types,
+                                                            lhs->tuple_variant_indices,
+                                                            lhs->tuple_struct_indices,
+                                                            struct_visiting,
+                                                            variant_visiting))
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            }
         } else {
             if (lhs->type == HirTypeKind::Generic) {
                 if (!lhs->generic_has_ord_constraint)
@@ -11342,6 +11371,12 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 auto init = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_contains_admin_snapshot(&init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.span,
+                        lit_str("control-plane snapshots are not supported in guard-failure "
+                                "bindings until lowering preserves branch ordering"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -15368,6 +15403,7 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             if (expr.kind == HirExprKind::TimeNowMicros || expr.kind == HirExprKind::CacheGet ||
                 expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::RespHeader)
                 return true;
+            if (hir_contains_admin_effect(&expr)) return true;
             if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
             if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
             for (u32 i = 0; i < expr.args.len; i++)
@@ -15382,8 +15418,8 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 effect->lhs->span,
-                lit_str("chain after Response header values cannot read time, cache, or response "
-                        "state until effects execute at response time"));
+                lit_str("chain after Response header values cannot read time, cache, response, or "
+                        "control-plane state until effects execute at response time"));
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
