@@ -6384,8 +6384,7 @@ route {
     CHECK(hir->routes[0].guards[0].fail_term.response_body.eq(lit("{\"ok\":false}")));
     REQUIRE_EQ(hir->routes[0].guards[0].fail_term.response_headers.len, 1u);
     CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].key.eq(lit("Content-Type")));
-    CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].value.eq(
-        lit("application/json")));
+    CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].value.eq(lit("application/json")));
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};

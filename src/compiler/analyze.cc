@@ -6394,8 +6394,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         if (!term) return core::make_unexpected(term.error());
                         guard.fail_term = term.value();
                     } else {
-                        auto term = analyze_term(
-                            respond, mod, cur_locals, cur_local_count, binding, Str{});
+                        auto term =
+                            analyze_term(respond, mod, cur_locals, cur_local_count, binding, Str{});
                         if (!term) return core::make_unexpected(term.error());
                         guard.fail_term = term.value();
                     }
