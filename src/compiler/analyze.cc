@@ -19218,6 +19218,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 for (u32 ei = 0; ei < route.exprs.len && !read_after; ei++)
                     read_after = reads_list_after_wait(
                         reads_list_after_wait, route.exprs[ei], local.ref_index, next_wait_start);
+                for (u32 ri = 0; ri < route.locals.len && !read_after; ri++)
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.locals[ri].init,
+                                                       local.ref_index,
+                                                       next_wait_start);
                 for (u32 gi = 0; gi < route.guards.len && !read_after; gi++)
                     read_after = reads_list_after_wait(reads_list_after_wait,
                                                        route.guards[gi].cond,

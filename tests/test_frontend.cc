@@ -13666,6 +13666,29 @@ route GET "/search" {
         lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
             "list before wait")));
 
+    const char* match_arm_alias = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    wait(1ms)
+    match req.http11 {
+        true => {
+            let copy = tags
+            if copy.len > 0 { return 204 } else { return 404 }
+        }
+        _ => return 400
+    }
+}
+)rut";
+    lexed = lex(lit(match_arm_alias));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
+
     const char* scoped_alias = R"rut(
 route GET "/search" {
     let tags = req.queryAll("tag")
