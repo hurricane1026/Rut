@@ -115,6 +115,7 @@ struct Http2Conn {
     bool pending_has_content_length;
     bool pending_buffer_body;
     bool pending_request_forwardable;
+    bool pending_prepared_forward;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
     // Snapshot of matched route decisions at END_HEADERS time for deferred
     // requests. This keeps delayed DATA handlers stable when config changes
@@ -123,6 +124,7 @@ struct Http2Conn {
     const RouteEntry* pending_route;
     RouteAction pending_route_action;
     u16 pending_static_status;
+    u16 pending_forward_upstream_id;
     jit::HandlerFn pending_jit_fn;
     // Route param VALUES the matcher produced point into hdr_scratch, which the
     // engine reuses for the next decoded header block. The snapshot re-anchors
