@@ -6684,6 +6684,17 @@ chain access { after observe(resp) }
 route GET "/users" use chain access { return 200 }
 )rut",
          "chain after currently supports Response header effects only"},
+        {R"rut(
+let flags = Cache<IP, i64>(capacity: 16)
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    flags.set(req.remoteAddr, 1)
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(req, resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "Response supports set/add/remove"},
     };
     for (const auto& c : cases) {
         auto lexed = lex(lit(c.src));

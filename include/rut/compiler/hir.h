@@ -533,6 +533,10 @@ struct HirFunction {
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
     FixedVec<ParamDecl, kMaxParams> params;
     FixedVec<HirExpr, kMaxExprs> exprs;
+    // Chain-after currently replays only Response header mutations. Remember
+    // whether the source helper also contained another statement effect so a
+    // call site cannot silently drop it during expansion.
+    bool has_non_response_statement_effect = false;
     struct RespondHeader {
         Str key{};
         Str value{};
@@ -566,6 +570,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          has_non_response_statement_effect(other.has_non_response_statement_effect),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -603,6 +608,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        has_non_response_statement_effect = other.has_non_response_statement_effect;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);

@@ -5191,8 +5191,14 @@ static bool collect_function_response_effects(HirFunction* fn,
                                               const HirLocal* all_locals,
                                               u32 all_local_count,
                                               u32 param_count) {
+    fn->has_non_response_statement_effect = false;
     for (u32 li = 0; li < scratch.locals.len; li++) {
         const auto kind = scratch.locals[li].init.kind;
+        if (kind == HirExprKind::CacheSet || kind == HirExprKind::ReqSetHeader ||
+            kind == HirExprKind::ReqAddHeader) {
+            fn->has_non_response_statement_effect = true;
+            continue;
+        }
         if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
             kind != HirExprKind::RespRemoveHeader)
             continue;
@@ -14438,6 +14444,11 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             FrontendError::UnsupportedSyntax,
             use_span,
             lit_str("chain after currently supports Response header effects only"));
+    if (fn.has_non_response_statement_effect)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            use_span,
+            lit_str("chain after helpers may contain only Response header effects"));
     if (route->waits.len != 0 || route->for_loops.len != 0)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
