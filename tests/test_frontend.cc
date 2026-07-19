@@ -32664,6 +32664,8 @@ TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {
         "route GET \"/admin\" { reload() wait(1) return 204 }\n",
         "route GET \"/admin\" { let x = any(1, error(500)) reload() guard let value = x "
         "else { return 400 } return 204 }\n",
+        "func check() { guard false else { respond 503 } 0 }\n"
+        "route GET \"/admin\" { let value = check() reload() return 204 }\n",
     };
     for (const char* src : cases) {
         auto lexed = lex(lit(src));

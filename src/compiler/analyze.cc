@@ -3546,6 +3546,40 @@ static bool hir_contains_admin_snapshot(const HirExpr* expr) {
         if (hir_contains_admin_snapshot(expr->field_inits[fi].value)) return true;
     return false;
 }
+
+static bool hir_contains_admin_effect(const HirExpr* expr) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::AdminReload || expr->kind == HirExprKind::AdminUpstreamMark ||
+        expr->kind == HirExprKind::AdminJson || expr->kind == HirExprKind::StatsSnapshot ||
+        expr->kind == HirExprKind::MetricsSnapshot)
+        return true;
+    if (hir_contains_admin_effect(expr->lhs) || hir_contains_admin_effect(expr->rhs)) return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_contains_admin_effect(expr->args[ai])) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_contains_admin_effect(expr->field_inits[fi].value)) return true;
+    return false;
+}
+
+static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route) {
+    if (!route.is_ws_terminate) return {};
+    for (u32 li = 0; li < route.locals.len; li++) {
+        if (hir_contains_admin_effect(&route.locals[li].init))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                route.locals[li].span,
+                lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+    }
+    for (u32 gi = 0; gi < route.guards.len; gi++) {
+        const auto body_type = route.guards[gi].fail_term.runtime_response_body_type;
+        if (body_type == HirTypeKind::Stats || body_type == HirTypeKind::Metrics)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                route.guards[gi].fail_term.span,
+                lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+    }
+    return {};
+}
 static bool const_eval_expr(
     const HirExpr& expr, const HirLocal* locals, u32 local_count, ConstValue* out, u32 depth);
 static KnownErrorCase known_error_case(const HirExpr& expr,
@@ -10417,13 +10451,18 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 if (body_arg.kind == AstExprKind::Ident || body_arg.kind == AstExprKind::Call) {
                     // Use the ordinary expression analyzer so helper-returned
                     // snapshots behave exactly like json(snapshot()) in a let.
-                    // The scratch arena owns only transient expression nodes;
-                    // the terminator retains the opaque type and, for a direct
-                    // local operand, its stable route-local identity.
-                    HirRoute body_scratch{};
-                    body_scratch.is_helper_scratch = true;
-                    HirRoute* body_route =
-                        runtime_body_route != nullptr ? runtime_body_route : &body_scratch;
+                    // A fallback scratch arena owns only transient expression
+                    // nodes; keep this large fixed-capacity route off the
+                    // compiler worker stack.
+                    std::unique_ptr<HirRoute> body_scratch;
+                    HirRoute* body_route = runtime_body_route;
+                    if (body_route == nullptr) {
+                        body_scratch = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+                        if (!body_scratch)
+                            return frontend_error(FrontendError::OutOfMemory, body_arg.span);
+                        body_scratch->is_helper_scratch = true;
+                        body_route = body_scratch.get();
+                    }
                     const bool saved_allow_respond_effects = body_route->allow_respond_effects;
                     if (runtime_body_route != nullptr) body_route->allow_respond_effects = true;
                     auto snapshot =
@@ -19085,7 +19124,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     stmt.expr.lhs->kind == AstExprKind::Ident &&
                     stmt.expr.lhs->name.eq({"upstream", 8}) && stmt.expr.name.eq({"mark", 4});
                 if (reload_syntax || mark_syntax) {
-                    if (control_plane_entry_effect_blocked)
+                    if (control_plane_entry_effect_blocked || route.guards.len > 0)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
                     for (u32 li = 0; li < route.locals.len; li++) {
@@ -19430,7 +19469,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
-                if ((seen_guard || route.guards.len > 0) &&
+                if ((seen_for || seen_guard || route.guards.len > 0) &&
                     hir_contains_admin_snapshot(&init.value()))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
@@ -19675,28 +19714,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             break;
         }
 
-        if (route.is_ws_terminate) {
-            for (u32 li = 0; li < route.locals.len; li++) {
-                const auto kind = route.locals[li].init.kind;
-                if (kind == HirExprKind::AdminReload || kind == HirExprKind::AdminUpstreamMark ||
-                    kind == HirExprKind::StatsSnapshot || kind == HirExprKind::MetricsSnapshot ||
-                    kind == HirExprKind::AdminJson)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        route.locals[li].span,
-                        lit_str("control-plane effects are not supported on WebSocket terminate "
-                                "routes"));
-            }
-            for (u32 gi = 0; gi < route.guards.len; gi++) {
-                const auto body_type = route.guards[gi].fail_term.runtime_response_body_type;
-                if (body_type == HirTypeKind::Stats || body_type == HirTypeKind::Metrics)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        route.guards[gi].fail_term.span,
-                        lit_str("control-plane effects are not supported on WebSocket terminate "
-                                "routes"));
-            }
-        }
+        auto ws_admin_ok = reject_websocket_admin_effects(route);
+        if (!ws_admin_ok) return core::make_unexpected(ws_admin_ok.error());
 
         bool has_chain_after_response_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
@@ -20480,6 +20499,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!route.decorators.push(ref))
                 return frontend_error(FrontendError::TooManyItems, ast_deco.span);
         }
+
+        // Decorator expansion appends synthetic locals after the first
+        // WebSocket check. Revalidate the completed route so an inlined
+        // snapshot/control-plane expression cannot be skipped by MIR's
+        // terminate-mode WebSocket path.
+        ws_admin_ok = reject_websocket_admin_effects(route);
+        if (!ws_admin_ok) return core::make_unexpected(ws_admin_ok.error());
 
         // Decorator guards must run BEFORE any user-written top-level guard so a
         // rejected decorator short-circuits before user logic. We appended them
