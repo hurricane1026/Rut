@@ -13777,6 +13777,48 @@ route GET "/search" {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, request_string_list_matches_explicit_str_array_helper_signature) {
+    const char* src = R"rut(
+func identity(values: [str]) -> [str] => values
+route GET "/search" {
+    let tags = identity(req.queryAll("tag"))
+    if tags.isEmpty { return 404 } else { return 204 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::StrList);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, request_string_list_rejected_in_composite_carriers) {
+    const char* cases[] = {
+        "struct Box<T> { value: T }\n"
+        "route GET \"/search\" { let boxed = Box(value: req.queryAll(\"tag\")) return 200 }\n",
+        "variant Wrap<T> { some(T), none }\n"
+        "route GET \"/search\" { let wrapped = Wrap.some(req.queryAll(\"tag\")) return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
 TEST(frontend, req_query_string_flows_as_optional_str) {
     const char* src =
         "route GET \"/search\" { let raw = req.queryString let value = any(raw, \"\") if value == "

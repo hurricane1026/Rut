@@ -300,6 +300,8 @@ constexpr Str kCacheWaitDetail = lit_str(
 constexpr Str kStrListWaitDetail = lit_str(
     "request string-list locals cannot cross a wait boundary yet — bind and "
     "consume the list before wait");
+constexpr Str kStrListCompositeDetail =
+    lit_str("request string-list values cannot be stored in struct fields or variant payloads yet");
 constexpr Str kCacheNameCollisionDetail = lit_str(
     "Cache declaration name collides with another binding or a builtin "
     "receiver (req/resp/time/bitwise) — the cache would be unreachable");
@@ -2063,6 +2065,16 @@ static AstTypeRef get_ast_type_arg_ref(const AstTypeRef& ref, u32 index) {
     if (index < ref.type_arg_names.len) out.name = ref.type_arg_names[index];
     if (index < ref.type_arg_namespaces.len) out.namespace_name = ref.type_arg_namespaces[index];
     return out;
+}
+
+static bool ast_type_ref_is_str_list_spelling(const AstTypeRef& ref) {
+    if (ref.is_tuple || ref.namespace_name.len != 0 || !ref.name.eq({"Array", 5})) return false;
+    const u32 arg_count =
+        ref.type_args.len > ref.type_arg_names.len ? ref.type_args.len : ref.type_arg_names.len;
+    if (arg_count != 1) return false;
+    const AstTypeRef elem = get_ast_type_arg_ref(ref, 0);
+    return !elem.is_tuple && elem.namespace_name.len == 0 && elem.name.eq({"str", 3}) &&
+           elem.type_args.len == 0 && elem.type_arg_names.len == 0;
 }
 
 static AstTypeRef get_ast_tuple_elem_ref(const AstTypeRef& ref, u32 index) {
@@ -7069,6 +7081,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             auto field_value =
                 analyze_expr(*expr.field_inits[fi].value, route, mod, locals, local_count, binding);
             if (!field_value) return core::make_unexpected(field_value.error());
+            if (field_value->type == HirTypeKind::StrList)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.field_inits[fi].value->span,
+                                      kStrListCompositeDetail);
             if (field_value->may_nil || field_value->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
@@ -7519,6 +7535,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
             auto payload = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
             if (!payload) return core::make_unexpected(payload.error());
+            if (payload->type == HirTypeKind::StrList)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.lhs->span, kStrListCompositeDetail);
             if (payload->may_nil || payload->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
             const auto expected = make_expected_type_expr(case_decl.payload_type,
@@ -7759,6 +7778,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 auto field_value = analyze_expr(
                     *expr.field_inits[fi].value, route, mod, locals, local_count, binding);
                 if (!field_value) return core::make_unexpected(field_value.error());
+                if (field_value->type == HirTypeKind::StrList)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.field_inits[fi].value->span,
+                                          kStrListCompositeDetail);
                 if (field_value->may_nil || field_value->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
@@ -15957,7 +15980,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax,
                     span,
                     lit_str("Response is only supported as a chain after parameter"));
-            if (!ret_ref.is_tuple && ret_ref.type_arg_names.len != 0) {
+            if (ast_type_ref_is_str_list_spelling(ret_ref)) {
+                fn.return_type = HirTypeKind::StrList;
+            } else if (!ret_ref.is_tuple && ret_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
                 const auto named_kind = resolve_named_type(
@@ -16112,7 +16137,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax,
                     span,
                     lit_str("Response is only supported as a chain after parameter"));
-            if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
+            if (ast_type_ref_is_str_list_spelling(param_ref)) {
+                param.type = HirTypeKind::StrList;
+            } else if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
                 const auto named_kind = resolve_named_type(
@@ -16912,7 +16939,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax,
                     item.func.span,
                     lit_str("Response is only supported as a chain after parameter"));
-            if (!ret_ref.is_tuple && ret_ref.type_arg_names.len != 0) {
+            if (ast_type_ref_is_str_list_spelling(ret_ref)) {
+                fn.return_type = HirTypeKind::StrList;
+            } else if (!ret_ref.is_tuple && ret_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
                 const auto named_kind = resolve_named_type(
@@ -17068,7 +17097,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     FrontendError::UnsupportedSyntax,
                     item.func.span,
                     lit_str("Response is only supported as a chain after parameter"));
-            if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
+            if (ast_type_ref_is_str_list_spelling(param_ref)) {
+                param.type = HirTypeKind::StrList;
+            } else if (!param_ref.is_tuple && param_ref.type_arg_names.len != 0) {
                 u32 template_variant_index = 0xffffffffu;
                 u32 template_struct_index = 0xffffffffu;
                 const auto named_kind = resolve_named_type(
@@ -19205,6 +19236,31 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         return true;
                 return false;
             };
+            auto terminator_reads_after_wait =
+                [](const HirTerminator& term, u32 ref_index, u32 wait_start) {
+                    return term.source_kind == HirTerminatorSourceKind::LocalRef &&
+                           term.local_ref_index == ref_index && term.span.start > wait_start;
+                };
+            auto guard_terminator_reads_after_wait =
+                [&](const HirGuard& guard, u32 ref_index, u32 wait_start) {
+                    if (guard.fail_kind == HirGuard::FailKind::Term)
+                        return terminator_reads_after_wait(guard.fail_term, ref_index, wait_start);
+                    if (guard.fail_kind == HirGuard::FailKind::Body) {
+                        if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If)
+                            return terminator_reads_after_wait(
+                                       guard.fail_body.then_term, ref_index, wait_start) ||
+                                   terminator_reads_after_wait(
+                                       guard.fail_body.else_term, ref_index, wait_start);
+                        return terminator_reads_after_wait(
+                            guard.fail_body.direct_term, ref_index, wait_start);
+                    }
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                        const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
+                        if (terminator_reads_after_wait(arm.direct_term, ref_index, wait_start))
+                            return true;
+                    }
+                    return false;
+                };
             for (u32 li = 0; li < route.locals.len; li++) {
                 const auto& local = route.locals[li];
                 if (!list_dependent[li]) continue;
@@ -19244,6 +19300,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                            local.ref_index,
                                                            next_wait_start);
                 }
+                for (u32 gi = 0; gi < route.guards.len && !read_after; gi++)
+                    read_after = guard_terminator_reads_after_wait(
+                        route.guards[gi], local.ref_index, next_wait_start);
                 if (!read_after && route.control.kind == HirControlKind::If)
                     read_after = reads_list_after_wait(reads_list_after_wait,
                                                        route.control.cond,
@@ -19288,7 +19347,31 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                    local.ref_index,
                                                                    next_wait_start);
                         }
+                        for (u32 gi = 0; gi < arm.guards.len && !read_after; gi++)
+                            read_after = guard_terminator_reads_after_wait(
+                                arm.guards[gi], local.ref_index, next_wait_start);
+                        if (!read_after) {
+                            if (arm.body_kind == HirMatchArm::BodyKind::If)
+                                read_after = terminator_reads_after_wait(
+                                                 arm.then_term, local.ref_index, next_wait_start) ||
+                                             terminator_reads_after_wait(
+                                                 arm.else_term, local.ref_index, next_wait_start);
+                            else
+                                read_after = terminator_reads_after_wait(
+                                    arm.direct_term, local.ref_index, next_wait_start);
+                        }
                     }
+                }
+                if (!read_after) {
+                    if (route.control.kind == HirControlKind::Direct)
+                        read_after = terminator_reads_after_wait(
+                            route.control.direct_term, local.ref_index, next_wait_start);
+                    else if (route.control.kind == HirControlKind::If)
+                        read_after =
+                            terminator_reads_after_wait(
+                                route.control.then_term, local.ref_index, next_wait_start) ||
+                            terminator_reads_after_wait(
+                                route.control.else_term, local.ref_index, next_wait_start);
                 }
                 if (read_after)
                     return frontend_error(
