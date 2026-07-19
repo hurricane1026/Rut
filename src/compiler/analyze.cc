@@ -19223,6 +19223,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                        route.guards[gi].cond,
                                                        local.ref_index,
                                                        next_wait_start);
+                for (u32 gi = 0; gi < route.guards.len && !read_after; gi++) {
+                    const auto& guard = route.guards[gi];
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       guard.fail_match_expr,
+                                                       local.ref_index,
+                                                       next_wait_start) ||
+                                 reads_list_after_wait(reads_list_after_wait,
+                                                       guard.fail_body.cond,
+                                                       local.ref_index,
+                                                       next_wait_start);
+                    for (u32 si = 0; si < guard.fail_body.locals.len && !read_after; si++)
+                        read_after = reads_list_after_wait(reads_list_after_wait,
+                                                           guard.fail_body.locals[si].init,
+                                                           local.ref_index,
+                                                           next_wait_start);
+                }
                 if (!read_after && route.control.kind == HirControlKind::If)
                     read_after = reads_list_after_wait(reads_list_after_wait,
                                                        route.control.cond,
@@ -19233,6 +19249,42 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                        route.control.match_expr,
                                                        local.ref_index,
                                                        next_wait_start);
+                if (route.control.kind == HirControlKind::Match) {
+                    for (u32 ai = 0; ai < route.control.match_arms.len && !read_after; ai++) {
+                        const auto& arm = route.control.match_arms[ai];
+                        read_after =
+                            reads_list_after_wait(reads_list_after_wait,
+                                                  arm.pattern,
+                                                  local.ref_index,
+                                                  next_wait_start) ||
+                            reads_list_after_wait(reads_list_after_wait,
+                                                  arm.arm_guard,
+                                                  local.ref_index,
+                                                  next_wait_start) ||
+                            reads_list_after_wait(
+                                reads_list_after_wait, arm.cond, local.ref_index, next_wait_start);
+                        for (u32 gi = 0; gi < arm.guards.len && !read_after; gi++) {
+                            const auto& guard = arm.guards[gi];
+                            read_after = reads_list_after_wait(reads_list_after_wait,
+                                                               guard.cond,
+                                                               local.ref_index,
+                                                               next_wait_start) ||
+                                         reads_list_after_wait(reads_list_after_wait,
+                                                               guard.fail_match_expr,
+                                                               local.ref_index,
+                                                               next_wait_start) ||
+                                         reads_list_after_wait(reads_list_after_wait,
+                                                               guard.fail_body.cond,
+                                                               local.ref_index,
+                                                               next_wait_start);
+                            for (u32 si = 0; si < guard.fail_body.locals.len && !read_after; si++)
+                                read_after = reads_list_after_wait(reads_list_after_wait,
+                                                                   guard.fail_body.locals[si].init,
+                                                                   local.ref_index,
+                                                                   next_wait_start);
+                        }
+                    }
+                }
                 if (read_after)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, local.span, kStrListWaitDetail);
