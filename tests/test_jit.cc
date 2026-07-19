@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include <llvm-c/Core.h>
 #include <pthread.h>
 #include <stdio.h>
 
@@ -1693,6 +1694,35 @@ TEST(jit, frontend_request_multi_value_lists_execute) {
         handler(nullptr, nullptr, reinterpret_cast<const u8*>(miss), sizeof(miss) - 1, nullptr));
     CHECK_EQ(result.status_code, 400u);
     engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, request_multi_value_lists_use_bounded_shared_pool) {
+    const char* src =
+        "route GET \"/search\" { let tags = req.queryAll(\"tag\") let accepts = "
+        "req.getAll(\"Accept\") if tags.len > 0 && accepts.len > 0 { return 204 } else { "
+        "return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    char* text = LLVMPrintModuleToString(cg.mod);
+    REQUIRE(text != nullptr);
+    const std::string llvm_ir(text);
+    CHECK(llvm_ir.find("str_list.pool") != std::string::npos);
+    CHECK(llvm_ir.find("str_list.alloc_count") == std::string::npos);
+    LLVMDisposeMessage(text);
+    LLVMDisposeModule(cg.mod);
+    LLVMContextDispose(cg.ctx);
     rir.destroy();
 }
 

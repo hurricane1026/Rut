@@ -12,6 +12,8 @@
 
 namespace rut::jit {
 
+static constexpr u32 kMaxRuntimeStrListItems = 8192;
+
 u32 format_handler_symbol(Str name, char* out, u32 out_size) {
     if (!out || out_size == 0) return 0;
 
@@ -83,6 +85,11 @@ struct Ctx {
     LLVMValueRef param_req_data;
     LLVMValueRef param_req_len;
     LLVMValueRef param_arena;
+
+    // One bounded, invocation-local pool shared by every req.queryAll/getAll
+    // expression. The extra item is an initialized empty-list sentinel.
+    LLVMValueRef str_list_items;
+    LLVMValueRef str_list_used;
 
     // Lazily declared runtime helpers
     LLVMValueRef fn_req_path;
@@ -1226,26 +1233,29 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 c.param_req_data, c.param_req_len, name_ptr, name_len, null_out, zero};
             LLVMValueRef count =
                 LLVMBuildCall2(c.builder, helper_ty, helper, count_args, 6, "str_list.count");
-            LLVMValueRef one = LLVMConstInt(c.i32_ty, 1, 0);
-            LLVMValueRef alloc_count =
-                LLVMBuildSelect(c.builder,
-                                LLVMBuildICmp(c.builder, LLVMIntEQ, count, zero, "str_list.empty"),
-                                one,
-                                count,
-                                "str_list.alloc_count");
+            LLVMValueRef used =
+                LLVMBuildLoad2(c.builder, c.i32_ty, c.str_list_used, "str_list.used");
+            LLVMValueRef limit = LLVMConstInt(c.i32_ty, kMaxRuntimeStrListItems, 0);
+            LLVMValueRef remaining = LLVMBuildSub(c.builder, limit, used, "str_list.remaining");
+            LLVMValueRef fits =
+                LLVMBuildICmp(c.builder, LLVMIntULE, count, remaining, "str_list.fits");
+            LLVMValueRef written =
+                LLVMBuildSelect(c.builder, fits, count, remaining, "str_list.written");
             LLVMValueRef items =
-                LLVMBuildArrayAlloca(c.builder, c.str_ty, alloc_count, "str_list.items");
+                LLVMBuildGEP2(c.builder, c.str_ty, c.str_list_items, &used, 1, "str_list.items");
             LLVMValueRef empty_item = LLVMGetUndef(c.str_ty);
             empty_item = LLVMBuildInsertValue(
                 c.builder, empty_item, LLVMConstNull(c.ptr_ty), 0, "str_list.empty.ptr");
             empty_item = LLVMBuildInsertValue(c.builder, empty_item, zero, 1, "str_list.empty.len");
             LLVMBuildStore(c.builder, empty_item, items);
             LLVMValueRef fill_args[] = {
-                c.param_req_data, c.param_req_len, name_ptr, name_len, items, count};
+                c.param_req_data, c.param_req_len, name_ptr, name_len, items, written};
             LLVMBuildCall2(c.builder, helper_ty, helper, fill_args, 6, "");
+            LLVMValueRef next_used = LLVMBuildAdd(c.builder, used, written, "str_list.next_used");
+            LLVMBuildStore(c.builder, next_used, c.str_list_used);
             LLVMValueRef list = LLVMGetUndef(c.str_list_ty);
             list = LLVMBuildInsertValue(c.builder, list, items, 0, "str_list.ptr");
-            list = LLVMBuildInsertValue(c.builder, list, count, 1, "str_list.len");
+            list = LLVMBuildInsertValue(c.builder, list, written, 1, "str_list.len");
             c.set_value(inst.result, list);
             break;
         }
@@ -1968,6 +1978,32 @@ static bool rir_function_uses_time(const rir::Function& fn) {
     return false;
 }
 
+static bool rir_function_uses_str_lists(const rir::Function& fn) {
+    if (!fn.blocks) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        if (!blk.insts) continue;
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            if (blk.insts[ii].op == rir::Opcode::ReqQueryAll ||
+                blk.insts[ii].op == rir::Opcode::ReqHeaderAll)
+                return true;
+        }
+    }
+    return false;
+}
+
+static void emit_str_list_pool_init(Ctx& c, bool needed) {
+    c.str_list_items = nullptr;
+    c.str_list_used = nullptr;
+    if (!needed) return;
+    c.str_list_items = LLVMBuildArrayAlloca(c.builder,
+                                            c.str_ty,
+                                            LLVMConstInt(c.i32_ty, kMaxRuntimeStrListItems + 1, 0),
+                                            "str_list.pool");
+    c.str_list_used = LLVMBuildAlloca(c.builder, c.i32_ty, "str_list.used.ptr");
+    LLVMBuildStore(c.builder, LLVMConstInt(c.i32_ty, 0, 0), c.str_list_used);
+}
+
 static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
     c.ctx_store_sink = nullptr;
@@ -2021,6 +2057,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // Time-only handlers still need their per-invocation latch reset; when
     // kNeedsParse is true, parse_prime already resets it (skip the extra call).
     const bool kNeedsTimeUnlatch = !kNeedsParse && rir_function_uses_time(fn);
+    const bool kNeedsStrListPool = rir_function_uses_str_lists(fn);
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
@@ -2053,6 +2090,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        emit_str_list_pool_init(c, kNeedsStrListPool);
         // Parse-once: prime the per-thread parse cache before any state runs,
         // so every req_* helper in this invocation shares one parse. Skipped
         // for handlers that never read the request (status/forward only).
@@ -2111,6 +2149,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        emit_str_list_pool_init(c, kNeedsStrListPool);
         // Parse-once: prime the per-thread parse cache at handler entry,
         // unless the handler never reads the request.
         if (kNeedsParse) c.emit_parse_prime();
