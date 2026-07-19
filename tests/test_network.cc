@@ -16177,6 +16177,31 @@ TEST(response_headers, content_type_removal_suppresses_direct_response_default) 
     CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
 }
 
+TEST(response_headers, committed_after_header_preserves_status_reason_body) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    RouteConfig cfg{};
+    conn->request_config = &cfg;
+    auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-After", 7};
+    mutation.value = {"yes", 3};
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+    const char* response = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(response, conn->send_buf.len(), "X-After: yes\r\n", 14));
+    CHECK(buf_contains(response, conn->send_buf.len(), "Content-Length: 2\r\n", 19));
+    CHECK(buf_contains(response, conn->send_buf.len(), "\r\n\r\nOK", 6));
+}
+
 TEST(response_headers, removing_last_header_preserves_headers_only_body_mode) {
     RouteConfig cfg{};
     const char* keys[] = {"X-Test"};

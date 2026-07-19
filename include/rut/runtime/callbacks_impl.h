@@ -1819,11 +1819,10 @@ void handle_jit_outcome(Loop* loop,
                     const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                     body_data = body.data;
                     body_len = body.len;
-                } else if (body_idx_invalid) {
-                    // Out-of-range body_idx + headers present: render
-                    // the default reason-phrase as body so the
-                    // fallback matches the no-headers path's "fall
-                    // back rather than render garbage" rule. Flag it
+                } else if (body_idx_invalid || !has_header_set) {
+                    // A status-only response that gained runtime headers, or
+                    // an out-of-range body_idx, still uses the default
+                    // reason-phrase body just like the no-headers path. Flag it
                     // so the formatter suppresses the default
                     // Content-Type (format_static_response doesn't
                     // advertise one for reason-phrase bodies either).

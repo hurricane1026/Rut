@@ -141,7 +141,7 @@ bool account_terminal_output(const HarnessSpec& spec,
             const auto& body = config->response_bodies[terminal.upstream_id - 1];
             body_data = body.data;
             body_len = body.len;
-        } else if (terminal.upstream_id != 0) {
+        } else if (terminal.upstream_id != 0 || !has_header_set) {
             body_data = status_reason(terminal.status_code);
             while (body_data[body_len] != '\0') body_len++;
             fallback_body = true;
