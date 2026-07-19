@@ -444,7 +444,7 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
 void capture_request_metadata(Connection& conn);
 u32 pipeline_leftover(const Connection& conn);
 bool pipeline_shift(Connection& conn);
-void pipeline_stash(Connection& conn);
+bool pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
@@ -2761,7 +2761,10 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.retry_req_send_len = conn.req_initial_send_len;
             conn.retry_req_snapshot_replayable = true;
         }
-        pipeline_stash(conn);
+        if (!pipeline_stash(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
         // recv_buf is released: pipelined downstream bytes read during the upstream wait
         // then land at offset 0 and flow through pipeline_recover, and the just-sent
         // request can never leak into the next request's parse.
@@ -3779,7 +3782,10 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (body_done) {
-        pipeline_stash(conn);
+        if (!pipeline_stash(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
         conn.recv_buf.reset();
         conn.upstream_start_us = monotonic_us();
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();

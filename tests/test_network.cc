@@ -7776,6 +7776,35 @@ TEST(streaming, request_body_sent_body_done_cl) {
     CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
+TEST(streaming, request_body_sent_closes_when_snapshot_leaves_no_pipeline_space) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->send_buf.reset();
+    const u32 snapshot_len = c->send_buf.capacity() - 4;
+    __builtin_memset(c->send_buf.write_ptr(), 'S', snapshot_len);
+    c->send_buf.commit(snapshot_len);
+    c->response_mutations_snapshotted = true;
+    c->retry_req_send_len = snapshot_len;
+
+    c->recv_buf.reset();
+    static const char final_body_and_pipeline[] = "tailGET /next HTTP/1.1\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(final_body_and_pipeline),
+                                 sizeof(final_body_and_pipeline) - 1),
+               sizeof(final_body_and_pipeline) - 1);
+    c->req_initial_send_len = 4;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
+
+    const u32 cid = c->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, 4));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
 TEST(streaming, request_body_recvd_cl_forwards) {
     SmallLoop loop;
     loop.setup();

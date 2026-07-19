@@ -281,21 +281,22 @@ bool pipeline_shift(Connection& conn) {
     return true;
 }
 
-void pipeline_stash(Connection& conn) {
+bool pipeline_stash(Connection& conn) {
     const u32 kLeftover = pipeline_leftover(conn);
     if (kLeftover == 0) {
         conn.pipeline_stash_len = 0;
-        return;
+        return true;
     }
     const u32 kStashOff = conn.retry_req_send_len;
     if (kStashOff == 0) conn.send_buf.reset();
     if (kLeftover > conn.send_buf.write_avail()) {
         conn.pipeline_stash_len = 0;
-        return;
+        return false;
     }
     const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
     conn.send_buf.write(src, kLeftover);
     conn.pipeline_stash_len = static_cast<u16>(kLeftover);
+    return true;
 }
 
 bool pipeline_recover(Connection& conn) {
@@ -707,7 +708,7 @@ void prepare_early_response_state(Connection& conn) {
         conn.recv_buf.reset();
         conn.keep_alive = false;
     } else {
-        pipeline_stash(conn);
+        if (!pipeline_stash(conn)) conn.keep_alive = false;
         conn.recv_buf.reset();
     }
     if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();
