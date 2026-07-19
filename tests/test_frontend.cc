@@ -32433,7 +32433,7 @@ TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary)
     const char* mark_src =
         "upstream primary at \"127.0.0.1:8080\"\n"
         "upstream api at \"127.0.0.1:8081\"\n"
-        "timer health, every: 1s { upstream.mark(api, true) return 200 }\n";
+        "timer health, every: 1s { upstream.mark(api, healthy: true) return 200 }\n";
     auto mark_lexed = lex(lit(mark_src));
     REQUIRE(mark_lexed);
     auto mark_ast = parse_file_heap(mark_lexed.value());
@@ -32443,11 +32443,38 @@ TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary)
     REQUIRE_EQ(mark_hir->routes[0].locals.len, 1u);
     CHECK_EQ(mark_hir->routes[0].locals[0].init.kind, HirExprKind::AdminUpstreamMark);
     CHECK_EQ(mark_hir->routes[0].locals[0].init.upstream_index, 1u);
+    CHECK_EQ(mark_hir->routes[0].locals[0].init.server_index, 0u);
     auto mark_mir = build_mir_heap(mark_hir.value());
     REQUIRE_FALSE(mark_mir.has_value());
     CHECK(mark_mir.error().detail.eq(
         lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
             "connected yet")));
+}
+
+TEST(frontend, upstream_mark_rejects_ambiguous_multi_backend_target) {
+    const char* src =
+        "upstream api { backends: [\"127.0.0.1:8080\", \"127.0.0.1:8081\"] }\n"
+        "timer health, every: 1s { upstream.mark(api, healthy: true) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, upstream_mark_requires_healthy_argument_label) {
+    const char* src =
+        "upstream api at \"127.0.0.1:8080\"\n"
+        "timer health, every: 1s { upstream.mark(api, true) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, direct_admin_json_response_reaches_runtime_lowering_boundary) {
@@ -32472,6 +32499,25 @@ route GET "/admin" {
     CHECK(mir.error().detail.eq(
         lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
             "connected yet")));
+}
+
+TEST(frontend, direct_admin_json_rejects_optional_snapshot_local) {
+    const char* src = R"rut(
+func maybe_stats(_ enabled: bool) {
+    if enabled { stats() } else { nil }
+}
+route GET "/admin" {
+    let snapshot = maybe_stats(req.http11)
+    return 200, json(snapshot)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
 TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {

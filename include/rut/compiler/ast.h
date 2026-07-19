@@ -201,6 +201,9 @@ struct AstExpr {
     FixedVec<FieldInit, kMaxFieldInits> field_inits;
     FixedVec<AstTypeRef, kMaxTypeArgs> type_args;
     FixedVec<AstExpr*, kMaxArgs> args;
+    // Present only for call surfaces that explicitly support labels. Entries
+    // run parallel to args; an empty Str denotes a positional argument.
+    FixedVec<Str, kMaxArgs> arg_labels;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_ms = 0;
 };

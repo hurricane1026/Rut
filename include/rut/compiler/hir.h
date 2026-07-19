@@ -471,6 +471,9 @@ struct HirExpr {
     u32 cache_index = 0xffffffffu;
     // AdminUpstreamMark: resolved target in HirModule::upstreams.
     u32 upstream_index = 0xffffffffu;
+    // Backend within the selected upstream. The declaration-only slice accepts
+    // only an upstream with one server, whose stable index is zero.
+    u32 server_index = 0xffffffffu;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     bool is_pipe_conditional = false;

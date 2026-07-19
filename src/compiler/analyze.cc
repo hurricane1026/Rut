@@ -4048,6 +4048,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         expr.lhs->name.eq({"upstream", 8}) && expr.name.eq({"mark", 4}) &&
         !user_bound_ident_name(mod, locals, local_count, binding, {"upstream", 8})) {
         if (!route->control_plane_stmt_ok || !route->is_timer || expr.args.len != 2 ||
+            expr.arg_labels.len != 2 || expr.arg_labels[0].len != 0 ||
+            !expr.arg_labels[1].eq({"healthy", 7}) ||
             expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::Ident ||
             expr.args[1] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -4059,7 +4061,9 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             }
         }
         auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
-        if (upstream_index == mod.upstreams.len || !healthy || healthy->type != HirTypeKind::Bool ||
+        if (upstream_index == mod.upstreams.len ||
+            (upstream_index < mod.upstreams.len && mod.upstreams[upstream_index].extra_count != 0) ||
+            !healthy || healthy->type != HirTypeKind::Bool ||
             healthy->may_nil || healthy->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         route->control_plane_stmt_ok = false;
@@ -4068,6 +4072,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         out.type = HirTypeKind::Unknown;
         out.span = expr.span;
         out.upstream_index = upstream_index;
+        out.server_index = 0;
         if (!route->exprs.push(healthy.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
@@ -10378,8 +10383,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 } else if (body_arg.kind == AstExprKind::Ident) {
                     for (u32 li = local_count; li > 0; li--) {
                         if (!locals[li - 1].name.eq(body_arg.name)) continue;
-                        if (locals[li - 1].type == HirTypeKind::Stats ||
-                            locals[li - 1].type == HirTypeKind::Metrics) {
+                        if ((locals[li - 1].type == HirTypeKind::Stats ||
+                             locals[li - 1].type == HirTypeKind::Metrics) &&
+                            !locals[li - 1].may_nil && !locals[li - 1].may_error) {
                             term.runtime_response_body_type = locals[li - 1].type;
                             term.runtime_response_body_local_ref_index =
                                 locals[li - 1].ref_index;

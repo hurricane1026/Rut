@@ -883,11 +883,25 @@ struct Parser {
                     method.span = field.span;
                     if (!take(TokenType::RParen)) {
                         while (true) {
+                            Str arg_label{};
+                            if (cur().type == TokenType::Ident && peek().type == TokenType::Colon) {
+                                const bool mark_label = lhs_ptr.value()->kind == AstExprKind::Ident &&
+                                                        lhs_ptr.value()->name.eq({"upstream", 8}) &&
+                                                        field.name.eq({"mark", 4});
+                                if (!mark_label)
+                                    return frontend_error(
+                                        FrontendError::UnsupportedSyntax, span_from(cur()));
+                                arg_label = cur().text;
+                                pos++;
+                                pos++;  // ':'
+                            }
                             auto arg = parse_call_arg();
                             if (!arg) return core::make_unexpected(arg.error());
                             auto arg_ptr = alloc_expr(arg.value());
                             if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
                             if (!method.args.push(arg_ptr.value()))
+                                return frontend_error(FrontendError::TooManyItems, arg->span);
+                            if (!method.arg_labels.push(arg_label))
                                 return frontend_error(FrontendError::TooManyItems, arg->span);
                             if (take(TokenType::RParen)) break;
                             auto comma = expect(TokenType::Comma);
