@@ -309,6 +309,9 @@ constexpr Str kStrListWaitDetail = lit_str(
     "consume the list before wait");
 constexpr Str kStrListCompositeDetail =
     lit_str("request string-list values cannot be stored in struct fields or variant payloads yet");
+constexpr Str kAdminSnapshotWaitDetail = lit_str(
+    "control-plane snapshots in routes containing wait are not supported yet — "
+    "snapshots do not have a carrier that survives suspension");
 constexpr Str kCacheNameCollisionDetail = lit_str(
     "Cache declaration name collides with another binding or a builtin "
     "receiver (req/resp/time/bitwise) — the cache would be unreachable");
@@ -5588,6 +5591,20 @@ static FrontendResult<void> instantiate_function_respond_guards(
         guard.fail_term.status_code = src_guard.status_code;
         guard.fail_term.span = call_span;
         guard.fail_term.response_body = src_guard.response_body;
+        if (src_guard.runtime_response_body.type == HirTypeKind::Stats ||
+            src_guard.runtime_response_body.type == HirTypeKind::Metrics) {
+            auto body = instantiate_function_expr(src_guard.runtime_response_body,
+                                                  route,
+                                                  mod,
+                                                  args,
+                                                  arg_count,
+                                                  generic_bindings,
+                                                  generic_binding_count);
+            if (!body) return core::make_unexpected(body.error());
+            guard.fail_term.runtime_response_body_type = body->type;
+            if (body->kind == HirExprKind::LocalRef)
+                guard.fail_term.runtime_response_body_local_ref_index = body->local_index;
+        }
         for (u32 hi = 0; hi < src_guard.response_headers.len; hi++) {
             const auto& hdr = src_guard.response_headers[hi];
             if (!guard.fail_term.response_headers.push({hdr.key, hdr.value}))
@@ -10375,21 +10392,23 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
                 const AstExpr& body_arg = *stmt.expr.args[0];
-                if (body_arg.kind == AstExprKind::Call && body_arg.args.len == 0 &&
-                    (body_arg.name.eq({"stats", 5}) || body_arg.name.eq({"metrics", 7})) &&
-                    !user_bound_ident_name(mod, locals, local_count, binding, body_arg.name)) {
-                    term.runtime_response_body_type =
-                        body_arg.name.eq({"stats", 5}) ? HirTypeKind::Stats : HirTypeKind::Metrics;
-                } else if (body_arg.kind == AstExprKind::Ident) {
-                    for (u32 li = local_count; li > 0; li--) {
-                        if (!locals[li - 1].name.eq(body_arg.name)) continue;
-                        if ((locals[li - 1].type == HirTypeKind::Stats ||
-                             locals[li - 1].type == HirTypeKind::Metrics) &&
-                            !locals[li - 1].may_nil && !locals[li - 1].may_error) {
-                            term.runtime_response_body_type = locals[li - 1].type;
-                            term.runtime_response_body_local_ref_index = locals[li - 1].ref_index;
-                        }
-                        break;
+                if (body_arg.kind == AstExprKind::Ident || body_arg.kind == AstExprKind::Call) {
+                    // Use the ordinary expression analyzer so helper-returned
+                    // snapshots behave exactly like json(snapshot()) in a let.
+                    // The scratch arena owns only transient expression nodes;
+                    // the terminator retains the opaque type and, for a direct
+                    // local operand, its stable route-local identity.
+                    HirRoute body_scratch{};
+                    body_scratch.is_helper_scratch = true;
+                    auto snapshot =
+                        analyze_expr(body_arg, &body_scratch, mod, locals, local_count, binding);
+                    if (snapshot &&
+                        (snapshot->type == HirTypeKind::Stats ||
+                         snapshot->type == HirTypeKind::Metrics) &&
+                        !snapshot->may_nil && !snapshot->may_error) {
+                        term.runtime_response_body_type = snapshot->type;
+                        if (snapshot->kind == HirExprKind::LocalRef)
+                            term.runtime_response_body_local_ref_index = snapshot->local_index;
                     }
                 }
                 if (term.runtime_response_body_type == HirTypeKind::Unknown) {
@@ -16998,6 +17017,23 @@ static FrontendResult<HirModule*> analyze_file_internal(
             respond_guard.cond = normalized_cond.value();
             respond_guard.status_code = guard.fail_term.status_code;
             respond_guard.response_body = guard.fail_term.response_body;
+            if (guard.fail_term.runtime_response_body_type == HirTypeKind::Stats ||
+                guard.fail_term.runtime_response_body_type == HirTypeKind::Metrics) {
+                HirExpr source{};
+                source.type = guard.fail_term.runtime_response_body_type;
+                source.span = guard.fail_term.span;
+                if (guard.fail_term.runtime_response_body_local_ref_index != 0xffffffffu) {
+                    source.kind = HirExprKind::LocalRef;
+                    source.local_index = guard.fail_term.runtime_response_body_local_ref_index;
+                } else {
+                    source.kind = source.type == HirTypeKind::Stats ? HirExprKind::StatsSnapshot
+                                                                    : HirExprKind::MetricsSnapshot;
+                }
+                auto normalized_body = normalize_function_expr(
+                    source, &fn, all_locals, all_local_count, fn.params.len);
+                if (!normalized_body) return core::make_unexpected(normalized_body.error());
+                respond_guard.runtime_response_body = normalized_body.value();
+            }
             for (u32 hi = 0; hi < guard.fail_term.response_headers.len; hi++) {
                 const auto& hdr = guard.fail_term.response_headers[hi];
                 if (!respond_guard.response_headers.push({hdr.key, hdr.value}))
@@ -18585,6 +18621,23 @@ static FrontendResult<HirModule*> analyze_file_internal(
             respond_guard.cond = normalized_cond.value();
             respond_guard.status_code = guard.fail_term.status_code;
             respond_guard.response_body = guard.fail_term.response_body;
+            if (guard.fail_term.runtime_response_body_type == HirTypeKind::Stats ||
+                guard.fail_term.runtime_response_body_type == HirTypeKind::Metrics) {
+                HirExpr source{};
+                source.type = guard.fail_term.runtime_response_body_type;
+                source.span = guard.fail_term.span;
+                if (guard.fail_term.runtime_response_body_local_ref_index != 0xffffffffu) {
+                    source.kind = HirExprKind::LocalRef;
+                    source.local_index = guard.fail_term.runtime_response_body_local_ref_index;
+                } else {
+                    source.kind = source.type == HirTypeKind::Stats ? HirExprKind::StatsSnapshot
+                                                                    : HirExprKind::MetricsSnapshot;
+                }
+                auto normalized_body = normalize_function_expr(
+                    source, &fn, all_locals, all_local_count, fn.params.len);
+                if (!normalized_body) return core::make_unexpected(normalized_body.error());
+                respond_guard.runtime_response_body = normalized_body.value();
+            }
             for (u32 hi = 0; hi < guard.fail_term.response_headers.len; hi++) {
                 const auto& hdr = guard.fail_term.response_headers[hi];
                 if (!respond_guard.response_headers.push({hdr.key, hdr.value}))
@@ -19630,6 +19683,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
+                if (e.kind == HirExprKind::StatsSnapshot || e.kind == HirExprKind::MetricsSnapshot)
+                    return kAdminSnapshotWaitDetail;
                 return Str{};
             };
             const HirExpr* found = nullptr;

@@ -577,6 +577,10 @@ struct HirFunction {
         HirExpr cond{};
         i32 status_code = 0;
         Str response_body{};
+        // Normalized snapshot operand for dynamic json(...) response bodies.
+        // Local helper bindings are inlined here; parameter references are
+        // instantiated at the call site before reaching HirTerminator.
+        HirExpr runtime_response_body{};
         static constexpr u32 kMaxHeaders = 16;
         FixedVec<RespondHeader, kMaxHeaders> response_headers;
     };
@@ -733,6 +737,7 @@ private:
 
     void rebase_respond_guard(RespondGuard& guard, const HirFunction& other) {
         rebase_expr(guard.cond, other);
+        rebase_expr(guard.runtime_response_body, other);
     }
 
     void rebase_from(const HirFunction& other) {

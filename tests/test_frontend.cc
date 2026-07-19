@@ -6416,6 +6416,34 @@ route {
     rir.destroy();
 }
 
+TEST(frontend, respond_helper_preserves_admin_json_runtime_body) {
+    const char* src = R"rut(
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 503, json(stats()) }
+    7
+}
+chain health {
+    before check(req)
+}
+route GET "/admin" use chain health {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.runtime_response_body_type, HirTypeKind::Stats);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
 // Bool predicates keep the explicit `else <status>` requirement — it is the
 // only rejection channel they have.
 TEST(frontend, analyze_rejects_bool_chain_step_without_else) {
@@ -32499,6 +32527,46 @@ route GET "/admin" {
     CHECK(mir.error().detail.eq(
         lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
             "connected yet")));
+}
+
+TEST(frontend, direct_admin_json_accepts_helper_returned_snapshot) {
+    const char* src = R"rut(
+func snapshot() => stats()
+route GET "/admin" {
+    return 200, json(snapshot())
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, control_plane_snapshot_cannot_cross_wait_boundary) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let before = stats()
+    wait(1ms)
+    return 200, json(before)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots in routes containing wait are not supported yet — snapshots "
+            "do not have a carrier that survives suspension")));
 }
 
 TEST(frontend, direct_admin_json_rejects_optional_snapshot_local) {
