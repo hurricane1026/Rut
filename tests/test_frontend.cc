@@ -32625,6 +32625,29 @@ route GET "/admin" {
             "guard/wait/for")));
 }
 
+TEST(frontend, control_plane_snapshot_rejects_match_arm_local_materialization) {
+    const char* src = R"rut(
+route GET "/admin" {
+    match req.path {
+        "/admin" => {
+            let snapshot = stats()
+            return 200, json(snapshot)
+        }
+        _ => return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots are not supported in branch-local bindings until lowering "
+            "preserves arm ordering")));
+}
+
 TEST(frontend, control_plane_builtins_reject_type_arguments) {
     const char* cases[] = {
         "route GET \"/admin\" { let snapshot = stats<i32>() return 200 }\n",

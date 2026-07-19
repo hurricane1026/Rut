@@ -10993,6 +10993,12 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 auto init = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_contains_admin_snapshot(&init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.span,
+                        lit_str("control-plane snapshots are not supported in branch-local "
+                                "bindings until lowering preserves arm ordering"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
