@@ -1579,8 +1579,60 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
     auto write = [&](const void* src, u32 len) {
         return conn.response_header_buf.write(static_cast<const u8*>(src), len) == len;
     };
+    auto connection_value_nominates =
+        [&](const u8* value, u32 value_len, const char* name, u32 name_len) {
+            u32 pos = 0;
+            while (pos < value_len) {
+                while (pos < value_len &&
+                       (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\t'))
+                    pos++;
+                const u32 start = pos;
+                while (pos < value_len && value[pos] != ',') pos++;
+                u32 end = pos;
+                while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
+                if (end > start &&
+                    http_header_name_eq_ci(
+                        reinterpret_cast<const char*>(value + start), end - start, name, name_len))
+                    return true;
+            }
+            return false;
+        };
+    auto upstream_connection_nominates = [&](const char* name, u32 name_len) {
+        // A successful 101 switches to a raw tunnel, whose Connection/Upgrade
+        // handshake must remain byte-compatible with the upstream response.
+        if (conn.resp_status == 101) return false;
+        u32 line_start = 0;
+        while (line_start + 1 < header_len &&
+               (data[line_start] != '\r' || data[line_start + 1] != '\n'))
+            line_start++;
+        line_start += 2;
+        while (line_start + 1 < header_len &&
+               (data[line_start] != '\r' || data[line_start + 1] != '\n')) {
+            u32 line_end = line_start;
+            while (line_end + 1 < header_len &&
+                   (data[line_end] != '\r' || data[line_end + 1] != '\n'))
+                line_end++;
+            if (line_end + 1 >= header_len) return false;
+            u32 colon = line_start;
+            while (colon < line_end && data[colon] != ':') colon++;
+            if (colon == line_end) return false;
+            u32 field_name_end = colon;
+            while (field_name_end > line_start &&
+                   (data[field_name_end - 1] == ' ' || data[field_name_end - 1] == '\t'))
+                field_name_end--;
+            if (http_header_name_eq_ci(reinterpret_cast<const char*>(data + line_start),
+                                       field_name_end - line_start,
+                                       "connection",
+                                       10) &&
+                connection_value_nominates(data + colon + 1, line_end - colon - 1, name, name_len))
+                return true;
+            line_start = line_end + 2;
+        }
+        return false;
+    };
     auto base_suppressed = [&](const char* name, u32 name_len) {
         if (draining && http_header_name_eq_ci(name, name_len, "connection", 10)) return true;
+        if (upstream_connection_nominates(name, name_len)) return true;
         for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
             const auto& mutation = conn.resp_header_mutations[i];
             if (mutation.mode != Connection::RespHeaderMutationMode::Add &&
