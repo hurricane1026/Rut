@@ -19125,6 +19125,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!same_hir_type_shape(mod, arg.value(), expected))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, step.call.args[ai]->span, fn.name);
+                if (hir_contains_admin_effect(&arg.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        step.call.args[ai]->span,
+                        lit_str("control-plane snapshot arguments are not supported in chain "
+                                "steps until runtime lowering is connected"));
                 args[ai] = arg.value();
             }
 

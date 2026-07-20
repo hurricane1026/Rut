@@ -253,8 +253,11 @@ static const HirExpr* find_unsupported_admin_expr(const HirExpr* expr) {
 
 static FrontendResult<void> reject_route_admin_exprs_before_mir(const HirRoute& route) {
     const HirExpr* found = nullptr;
-    for (u32 ei = 0; ei < route.exprs.len && found == nullptr; ei++)
-        found = find_unsupported_admin_expr(&route.exprs[ei]);
+    // `exprs` is an arena, not a root set: constant/lazy folds may leave
+    // discarded nodes in it. Live expression roots are lowered through their
+    // owning locals, guards, controls, and loop bodies, where mir_value rejects
+    // admin nodes directly. Scan retained locals here because even unreferenced
+    // locals are eagerly materialized and therefore remain observable.
     for (u32 li = 0; li < route.locals.len && found == nullptr; li++)
         found = find_unsupported_admin_expr(&route.locals[li].init);
     if (found != nullptr)

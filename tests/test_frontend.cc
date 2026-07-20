@@ -32738,6 +32738,45 @@ route GET "/admin" {
             "connected yet")));
 }
 
+TEST(frontend, dead_lazy_branch_does_not_retain_admin_arena_nodes) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let ok = true || (json(stats()) == "{}")
+    if ok { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
+TEST(frontend, chain_before_rejects_unused_snapshot_argument) {
+    const char* src = R"rut(
+func check(_ value: Stats) -> i32 {
+    guard false else { respond 403 }
+    1
+}
+chain audit { before check(stats()) }
+route GET "/admin" use chain audit {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshot arguments are not supported in chain steps until runtime "
+            "lowering is connected")));
+}
+
 TEST(frontend, nested_snapshot_helper_avoids_parameter_slot_collision) {
     const char* src = R"rut(
 func ignore(_ value: Stats) -> i32 => 1
