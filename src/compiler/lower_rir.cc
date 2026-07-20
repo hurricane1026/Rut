@@ -3101,6 +3101,7 @@ bool FrontendRirModule::init(u32 func_cap, u32 struct_cap) {
 
 void FrontendRirModule::destroy() {
     arena.destroy();
+    owned_strings.reset();
     auto saved_source_name = source_name;
     module = {};
     source_name = saved_source_name;
@@ -3110,6 +3111,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     if (!out.init(mir.functions.len == 0 ? 1 : mir.functions.len,
                   mir.variants.len * 2 + mir.structs.len + 8))
         return frontend_error(FrontendError::OutOfMemory);
+    out.owned_strings = mir.owned_strings;
 
     rir::Builder b;
     b.init(&out.module);

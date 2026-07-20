@@ -31857,6 +31857,38 @@ TEST(frontend, copied_hir_keeps_generated_json_storage_alive) {
     rir.destroy();
 }
 
+TEST(frontend, rir_keeps_generated_json_storage_alive_after_mir_destroyed) {
+    const char* src = "route GET \"/x\" { let payload = json({ ok: true }) return 200 }\n";
+    FrontendRirModule rir{};
+    {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir.owned_strings);
+    }
+
+    bool found_generated_json = false;
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if (inst.op == rir::Opcode::ConstStr && inst.imm.str_val.eq(lit("{\"ok\":true}"))) {
+                found_generated_json = true;
+                break;
+            }
+        }
+    }
+    CHECK(found_generated_json);
+    rir.destroy();
+}
+
 TEST(frontend, json_rejects_malformed_utf8_string_literals) {
     std::string src = "route GET \"/x\" { return 200, json(\"a";
     src.push_back(static_cast<char>(0x80));
