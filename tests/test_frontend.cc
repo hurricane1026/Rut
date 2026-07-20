@@ -8898,6 +8898,31 @@ route GET "/users" { if pick(proto.Result<i32>.ok(1)) == 1 { return 200 } else {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+
+TEST(frontend, import_namespace_call_preserves_explicit_type_arguments) {
+    const std::string dir = "/tmp/rut_import_namespace_generic_call_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/helpers.rut", std::ios::binary);
+        out << "func make<T>() -> T => nil\n";
+    }
+    const auto src = R"rut(
+import * as helpers from "helpers.rut"
+route GET "/users" {
+    let code = any(helpers.make<i32>(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+}
+
 TEST(frontend, import_namespace_nested_generic_payload_lowering_path_is_supported) {
     const std::string dir = "/tmp/rut_import_namespace_nested_generic_type_arg_frontend";
     std::filesystem::create_directories(dir);
@@ -32647,6 +32672,49 @@ route GET "/admin" {
     CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
 }
 
+TEST(frontend, snapshot_respond_body_rejects_discarded_nested_helper_guard) {
+    const char* src = R"rut(
+func nested() -> Stats {
+    guard false else { respond 502 }
+    stats()
+}
+func outer() -> Stats {
+    guard false else { respond 503, json(nested()) }
+    stats()
+}
+route GET "/admin" { return 200, json(outer()) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("snapshot response helpers cannot discard nested response guards")));
+}
+
+TEST(frontend, unused_snapshot_helper_argument_reaches_runtime_lowering_boundary) {
+    const char* src = R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+route GET "/admin" {
+    let ignored = ignore(stats())
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
 TEST(frontend, direct_admin_json_rejects_unretained_snapshot_expression_tree) {
     const char* src = R"rut(
 func choose<T>(cond: bool, first: T, second: T) -> T {
@@ -32682,7 +32750,12 @@ route GET "/admin" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::AdminJson);
+    const auto& payload = hir->routes[0].locals[0].init;
+    REQUIRE(payload.kind == HirExprKind::AdminJson);
+    REQUIRE(payload.lhs != nullptr);
+    REQUIRE(payload.lhs->kind == HirExprKind::ScopedLet);
+    REQUIRE(payload.lhs->lhs != nullptr);
+    CHECK_EQ(payload.lhs->lhs->kind, HirExprKind::StatsSnapshot);
 }
 
 TEST(frontend, control_plane_snapshot_cannot_cross_wait_boundary) {
@@ -32691,6 +32764,24 @@ route GET "/admin" {
     let before = stats()
     wait(1ms)
     return 200, json(before)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots in routes containing wait are not supported yet — snapshots "
+            "do not have a carrier that survives suspension")));
+}
+
+TEST(frontend, direct_control_plane_snapshot_body_cannot_cross_wait_boundary) {
+    const char* src = R"rut(
+route GET "/admin" {
+    wait(1ms)
+    return 200, json(stats())
 }
 )rut";
     auto lexed = lex(lit(src));

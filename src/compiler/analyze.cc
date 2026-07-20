@@ -4157,6 +4157,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         call_expr.span = expr.span;
         call_expr.name = qualified_member;
         call_expr.args = expr.args;
+        call_expr.type_args = expr.type_args;
         return analyze_call_expr(call_expr, route, mod, locals, local_count, binding, nullptr);
     }
     Str qualified_type_name{};
@@ -10254,31 +10255,34 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
-    struct ScopedListBinding {
+    struct ScopedArgBinding {
         u32 ref_index = 0xffffffffu;
         HirExpr init{};
     };
-    FixedVec<ScopedListBinding, AstExpr::kMaxArgs> scoped_list_bindings;
+    FixedVec<ScopedArgBinding, AstExpr::kMaxArgs> scoped_arg_bindings;
     u32 next_scoped_ref = 0;
     for (u32 li = 0; li < local_count; li++)
         if (locals[li].ref_index >= next_scoped_ref) next_scoped_ref = locals[li].ref_index + 1;
     for (u32 li = 0; li < route->locals.len; li++)
         if (route->locals[li].ref_index >= next_scoped_ref)
             next_scoped_ref = route->locals[li].ref_index + 1;
-    // Function bodies are inlined. Bind a direct runtime-list argument once
-    // inside the inlined expression so multiple parameter reads share it while
-    // an enclosing lazy boolean can still skip the whole call. Respond-capable
-    // helpers keep route-local materialization because their guards are hoisted
-    // into the route guard sequence and therefore intentionally execute there.
+    // Function bodies are inlined. Bind invocation-scoped values once inside
+    // the inlined expression so multiple parameter reads share a runtime list,
+    // eagerly evaluated snapshot arguments remain visible even when unused,
+    // and an enclosing lazy boolean can still skip the whole call.
+    // Respond-capable helpers keep route-local materialization because their
+    // guards are hoisted into the route guard sequence and intentionally run
+    // there.
     for (u32 i = 0; i < effective_arg_count; i++) {
-        if (analyzed_args[i].type != HirTypeKind::StrList ||
-            analyzed_args[i].kind == HirExprKind::LocalRef)
-            continue;
+        const bool needs_materialization = analyzed_args[i].type == HirTypeKind::StrList ||
+                                           analyzed_args[i].type == HirTypeKind::Stats ||
+                                           analyzed_args[i].type == HirTypeKind::Metrics;
+        if (!needs_materialization || analyzed_args[i].kind == HirExprKind::LocalRef) continue;
         const u32 ref_index = next_scoped_ref++;
         if (ref_index >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.span);
         if (fn.respond_guards.len == 0) {
-            if (!scoped_list_bindings.push({ref_index, analyzed_args[i]}))
+            if (!scoped_arg_bindings.push({ref_index, analyzed_args[i]}))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         } else {
             HirLocal materialized{};
@@ -10321,8 +10325,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     auto return_typed = apply_return_type(inlined.value(), "direct");
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
-    for (u32 bi = scoped_list_bindings.len; bi > 0; bi--) {
-        const auto& binding = scoped_list_bindings[bi - 1];
+    for (u32 bi = scoped_arg_bindings.len; bi > 0; bi--) {
+        const auto& binding = scoped_arg_bindings[bi - 1];
         if (!route->exprs.push(binding.init) || !route->exprs.push(inlined.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr scoped = inlined.value();
@@ -10582,10 +10586,15 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 const u32 saved_guards = body_route->guards.len;
                 const u32 saved_locals = body_route->locals.len;
                 const bool saved_allow_respond_effects = body_route->allow_respond_effects;
-                if (runtime_body_route != nullptr) body_route->allow_respond_effects = true;
+                body_route->allow_respond_effects = true;
                 auto snapshot =
                     analyze_expr(body_arg, body_route, mod, locals, local_count, binding);
                 body_route->allow_respond_effects = saved_allow_respond_effects;
+                if (runtime_body_route == nullptr && body_route->guards.len != saved_guards)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        body_arg.span,
+                        lit_str("snapshot response helpers cannot discard nested response guards"));
                 const bool stable_snapshot_operand =
                     snapshot && (snapshot->kind == HirExprKind::LocalRef ||
                                  snapshot->kind == HirExprKind::StatsSnapshot ||
@@ -19935,6 +19944,50 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     probe(route.guards[g].fail_body.locals[li].init);
             if (found != nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, found->span, detail);
+
+            Span blocked_term_span{};
+            bool has_blocked_term = false;
+            const auto probe_term = [&](const HirTerminator& term) {
+                if (has_blocked_term) return;
+                if (term.runtime_response_body_type == HirTypeKind::Stats ||
+                    term.runtime_response_body_type == HirTypeKind::Metrics) {
+                    has_blocked_term = true;
+                    blocked_term_span = term.span;
+                }
+            };
+            const auto probe_guard_terms = [&](const HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term) {
+                    probe_term(guard.fail_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                    probe_term(guard.fail_body.direct_term);
+                    probe_term(guard.fail_body.then_term);
+                    probe_term(guard.fail_body.else_term);
+                } else {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                        const u32 arm_index = guard.fail_match_start + ai;
+                        if (arm_index < mod.guard_match_arms.len)
+                            probe_term(mod.guard_match_arms[arm_index].direct_term);
+                    }
+                }
+            };
+            for (u32 gi = 0; gi < route.guards.len; gi++) probe_guard_terms(route.guards[gi]);
+            if (route.control.kind == HirControlKind::Direct) {
+                probe_term(route.control.direct_term);
+            } else if (route.control.kind == HirControlKind::If) {
+                probe_term(route.control.then_term);
+                probe_term(route.control.else_term);
+            } else {
+                for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                    const auto& arm = route.control.match_arms[ai];
+                    probe_term(arm.direct_term);
+                    probe_term(arm.then_term);
+                    probe_term(arm.else_term);
+                    for (u32 gi = 0; gi < arm.guards.len; gi++) probe_guard_terms(arm.guards[gi]);
+                }
+            }
+            if (has_blocked_term)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, blocked_term_span, kAdminSnapshotWaitDetail);
 
             // Request multi-value lists are backed by an invocation-local
             // bounded pool and lower to SSA aggregates. Values derived from a

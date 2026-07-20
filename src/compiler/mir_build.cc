@@ -1269,6 +1269,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!out->forward_set_headers.push({p.key, p.value})) __builtin_trap();
             }
         };
+        const auto reject_unsupported_admin_term = [&]() -> FrontendResult<void> {
+            if (!unsupported_admin_term) return {};
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                fn.span,
+                lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                        "is not connected yet"));
+        };
         auto set_arm_effects = [&](MirBlock* out, const HirMatchArm& arm) -> FrontendResult<void> {
             for (u32 ei = 0; ei < arm.effect_expr_indices.len; ei++) {
                 const u32 expr_index = arm.effect_expr_indices[ei];
@@ -1815,6 +1823,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            auto admin_term_ok = reject_unsupported_admin_term();
+            if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2699,6 +2709,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            auto admin_term_ok = reject_unsupported_admin_term();
+            if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2760,6 +2772,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = terminal_index;
+            auto admin_term_ok = reject_unsupported_admin_term();
+            if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -3307,12 +3321,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
-        if (unsupported_admin_term)
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                fn.span,
-                lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
-                        "is not connected yet"));
+        auto admin_term_ok = reject_unsupported_admin_term();
+        if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 
