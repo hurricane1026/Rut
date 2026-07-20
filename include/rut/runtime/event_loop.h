@@ -7,6 +7,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/drain.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/http2_conn.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
@@ -945,7 +946,15 @@ public:
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
                         if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
-                            respond_upstream_timeout(this, *c);  // upstream stalled → 504
+                            // A genuine in-flight h2 proxy stream must be
+                            // answered with h2 frames and release its async
+                            // stream/epoch slots; raw HTTP/1 bytes would corrupt
+                            // the connection.
+                            if (c->protocol == ConnProtocol::Http2 && c->h2 != nullptr &&
+                                c->h2->async_stream != 0)
+                                h2_proxy_fail<EventLoop<Backend>>(this, *c, 504);
+                            else
+                                respond_upstream_timeout(this, *c);  // upstream stalled → 504
                         } else if (c->throttle_paused) {
                             throttle_resume(this, *c);  // @throttle: resume next window
 #if RUT_ENABLE_WEBSOCKET

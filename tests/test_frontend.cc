@@ -32593,6 +32593,29 @@ timer health, every: 1s {
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
 }
 
+TEST(frontend, upstream_import_namespace_rejects_builtin_mark_labels) {
+    const std::string dir = "/tmp/rut_upstream_import_label_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/upstream.rut", std::ios::binary);
+        out << "func mark(value: i32, healthy: bool) -> i32 => value\n";
+    }
+    const auto src = R"rut(
+import "upstream.rut"
+route GET "/admin" {
+    let result = upstream.mark(1, nonsense: true)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
 TEST(frontend, upstream_mark_requires_healthy_argument_label) {
     const char* src =
         "upstream api at \"127.0.0.1:8080\"\n"
@@ -32713,6 +32736,66 @@ route GET "/admin" {
     CHECK(mir.error().detail.eq(
         lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
             "connected yet")));
+}
+
+TEST(frontend, nested_snapshot_helper_avoids_parameter_slot_collision) {
+    const char* src = R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+func preserve(value: i32) -> i32 {
+    let ignored = ignore(stats())
+    value
+}
+route GET "/admin" {
+    let result = preserve(7)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir) {
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        return;
+    }
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, snapshot_helper_arguments_preserve_guard_ordering) {
+    const char* cases[] = {
+        R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+route GET "/admin" {
+    guard req.http11 else { return 403 }
+    let result = ignore(stats())
+    return 200
+}
+)rut",
+        R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+route GET "/admin" {
+    guard req.http11 else {
+        let result = ignore(stats())
+        return 403
+    }
+    return 200
+}
+)rut",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
 }
 
 TEST(frontend, direct_admin_json_rejects_unretained_snapshot_expression_tree) {

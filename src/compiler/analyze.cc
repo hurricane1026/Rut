@@ -4144,6 +4144,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         has_import_namespace(mod, expr.lhs->name)) {
+        for (u32 i = 0; i < expr.arg_labels.len; i++) {
+            if (expr.arg_labels[i].len != 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
         Str qualified_member{};
         AstExpr ns_field{};
         ns_field.kind = AstExprKind::Field;
