@@ -148,6 +148,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqQuery:
             buf.put_cstr("req.query");
             break;
+        case Opcode::ReqQueryAll:
+            buf.put_cstr("req.query_all");
+            break;
+        case Opcode::ReqHeaderAll:
+            buf.put_cstr("req.header_all");
+            break;
         case Opcode::ReqQueryString:
             buf.put_cstr("req.queryString");
             break;
@@ -334,6 +340,15 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ArrayGet:
             buf.put_cstr("array.get");
             break;
+        case Opcode::StrListLen:
+            buf.put_cstr("str_list.len");
+            break;
+        case Opcode::StrListIsEmpty:
+            buf.put_cstr("str_list.is_empty");
+            break;
+        case Opcode::StrListGet:
+            buf.put_cstr("str_list.get");
+            break;
         case Opcode::OptIsNil:
             buf.put_cstr("opt.is_nil");
             break;
@@ -342,6 +357,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::Select:
             buf.put_cstr("select");
+            break;
+        case Opcode::Phi:
+            buf.put_cstr("phi");
             break;
         case Opcode::TraceFuncEnter:
             buf.put_cstr("trace.func_enter");
@@ -465,6 +483,9 @@ void print_type(PrintBuf& buf, const Type* type) {
             print_type(buf, type->inner);
             buf.put(')');
             break;
+        case TypeKind::StrList:
+            buf.put_cstr("StrList");
+            break;
     }
 }
 
@@ -564,6 +585,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqHeader:
         case Opcode::ReqParam:
         case Opcode::ReqQuery:
+        case Opcode::ReqQueryAll:
+        case Opcode::ReqHeaderAll:
         case Opcode::ReqCookie:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
@@ -672,6 +695,17 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[1]);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[2]);
+            break;
+        case Opcode::Phi:
+            buf.put_cstr(" [");
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", block");
+            buf.put_u32(inst.imm.block_targets[0].id);
+            buf.put_cstr("], [");
+            print_value_ref(buf, inst.operands[1]);
+            buf.put_cstr(", block");
+            buf.put_u32(inst.imm.block_targets[1].id);
+            buf.put(']');
             break;
         case Opcode::StructCreate:
             buf.put(' ');

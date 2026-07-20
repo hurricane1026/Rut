@@ -48,16 +48,78 @@ inline void h2_reset_request_mutations(Connection& conn) {
 
 inline bool h2_prepare_forward_request(
     Connection& conn, const u8* synth, u32 synth_len, u8* out, u32 out_cap, u32* out_len) {
-    if (synth_len > out_cap) return false;
-    __builtin_memmove(out, synth, synth_len);
-    u32 header_end = 0;
-    for (u32 i = 0; i + 3 < synth_len; i++) {
-        if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' && out[i + 3] == '\n') {
-            header_end = i + 4;
-            break;
+    // JIT inspection intentionally receives one Cookie line per HTTP/2 field
+    // so req.getAll("Cookie") can observe the split representation. Before a
+    // Forward outcome crosses into HTTP/1, rebuild those lines as the RFC 6265
+    // single-field form used by the direct proxy path.
+    u32 request_line_end = 0;
+    while (request_line_end + 1 < synth_len &&
+           (synth[request_line_end] != '\r' || synth[request_line_end + 1] != '\n'))
+        request_line_end++;
+    if (request_line_end + 1 >= synth_len) return false;
+
+    auto append = [&](const u8* data, u32 len, u32* written) {
+        if (*written > out_cap || len > out_cap - *written) return false;
+        __builtin_memmove(out + *written, data, len);
+        *written += len;
+        return true;
+    };
+    u32 written = 0;
+    if (!append(synth, request_line_end + 2, &written)) return false;
+    bool wrote_cookie = false;
+    u32 pos = request_line_end + 2;
+    while (pos + 1 < synth_len && (synth[pos] != '\r' || synth[pos + 1] != '\n')) {
+        u32 line_end = pos;
+        while (line_end + 1 < synth_len && (synth[line_end] != '\r' || synth[line_end + 1] != '\n'))
+            line_end++;
+        if (line_end + 1 >= synth_len) return false;
+        u32 colon = pos;
+        while (colon < line_end && synth[colon] != ':') colon++;
+        if (colon == line_end) return false;
+        const bool is_cookie = http_header_name_eq_ci(
+            reinterpret_cast<const char*>(synth + pos), colon - pos, "cookie", 6);
+        if (!is_cookie) {
+            if (!append(synth + pos, line_end + 2 - pos, &written)) return false;
+        } else {
+            wrote_cookie = true;
         }
+        pos = line_end + 2;
     }
-    if (header_end == 0) return false;
+    if (pos + 1 >= synth_len) return false;
+    if (wrote_cookie) {
+        static constexpr u8 kCookie[] = {'c', 'o', 'o', 'k', 'i', 'e', ':', ' '};
+        static constexpr u8 kSep[] = {';', ' '};
+        if (!append(kCookie, sizeof(kCookie), &written)) return false;
+        bool first_value = true;
+        u32 cookie_pos = request_line_end + 2;
+        while (cookie_pos < pos) {
+            u32 line_end = cookie_pos;
+            while (line_end + 1 < pos && (synth[line_end] != '\r' || synth[line_end + 1] != '\n'))
+                line_end++;
+            u32 colon = cookie_pos;
+            while (colon < line_end && synth[colon] != ':') colon++;
+            if (colon == line_end) return false;
+            if (http_header_name_eq_ci(reinterpret_cast<const char*>(synth + cookie_pos),
+                                       colon - cookie_pos,
+                                       "cookie",
+                                       6)) {
+                u32 value_start = colon + 1;
+                while (value_start < line_end &&
+                       (synth[value_start] == ' ' || synth[value_start] == '\t'))
+                    value_start++;
+                if (!first_value && !append(kSep, sizeof(kSep), &written)) return false;
+                if (!append(synth + value_start, line_end - value_start, &written)) return false;
+                first_value = false;
+            }
+            cookie_pos = line_end + 2;
+        }
+        static constexpr u8 kCrLf[] = {'\r', '\n'};
+        if (!append(kCrLf, sizeof(kCrLf), &written)) return false;
+    }
+    const u32 body_start = pos + 2;
+    if (!append(synth + pos, synth_len - pos, &written)) return false;
+    const u32 header_end = written - (synth_len - body_start);
+    synth_len = written;
 
     u8* saved_slice = conn.recv_slice;
     Buffer saved_buf = static_cast<Buffer&&>(conn.recv_buf);
@@ -184,7 +246,8 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
 // handler's parse-cache prime (which parses raw HTTP/1 bytes) sees the request.
 // Returns the byte length, or 0 on missing pseudo-headers / overflow.
-inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap) {
+inline u32 h2_synth_h1_request(
+    const hpack::Header* hs, u32 n, u8* out, u32 cap, bool preserve_split_cookies = false) {
     Str method{nullptr, 0};
     Str path{nullptr, 0};
     Str authority{nullptr, 0};
@@ -211,8 +274,8 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
         (!put("host: ", 6) || !put(authority.ptr, authority.len) || !put("\r\n", 2)))
         return 0;
     for (u32 i = 0; i < n; i++) {
-        if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') continue;  // pseudo-headers
-        if (hs[i].name.eq(Str{"cookie", 6})) continue;                 // combined below
+        if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') continue;              // pseudo-headers
+        if (!preserve_split_cookies && hs[i].name.eq(Str{"cookie", 6})) continue;  // combined below
         // When :authority is present it already produced the Host line above; drop
         // a regular `host` field so the synthesized request (and any upstream we
         // proxy it to) doesn't carry two conflicting Host headers (:authority is
@@ -227,15 +290,17 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     // downstream — routing, handler parsing, cookie rate-limit keys — sees the
     // full value instead of just the first field. Emitted after the other headers
     // (a second pass) so an interleaved header can't split the cookie line.
-    bool cookie_open = false;
-    for (u32 i = 0; i < n; i++) {
-        if (!hs[i].name.eq(Str{"cookie", 6})) continue;
-        if (!put(cookie_open ? "; " : "cookie: ", cookie_open ? 2 : 8) ||
-            !put(hs[i].value.ptr, hs[i].value.len))
-            return 0;
-        cookie_open = true;
+    if (!preserve_split_cookies) {
+        bool cookie_open = false;
+        for (u32 i = 0; i < n; i++) {
+            if (!hs[i].name.eq(Str{"cookie", 6})) continue;
+            if (!put(cookie_open ? "; " : "cookie: ", cookie_open ? 2 : 8) ||
+                !put(hs[i].value.ptr, hs[i].value.len))
+                return 0;
+            cookie_open = true;
+        }
+        if (cookie_open && !put("\r\n", 2)) return 0;
     }
-    if (cookie_open && !put("\r\n", 2)) return 0;
     if (!put("\r\n", 2)) return 0;
     return o;
 }
@@ -397,8 +462,11 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     // large-but-legal h2 header block exceeds the HTTP/1 synth cap.
     u32 synth_len = 0;
     if (action == RouteAction::JitHandler) {
-        synth_len =
-            h2_synth_h1_request(headers, nheaders, h2->pending_synth, Http2Conn::kBodySynthCap);
+        synth_len = h2_synth_h1_request(headers,
+                                        nheaders,
+                                        h2->pending_synth,
+                                        Http2Conn::kHeaderSynthCap,
+                                        /*preserve_split_cookies=*/true);
         if (synth_len == 0) {
             h2_emit_status(d, stream_id, 400);
             return false;
@@ -475,7 +543,7 @@ bool h2_defer_prepared_forward(H2Dispatch<Loop>& d,
     const bool async_conflict =
         h2->async_stream != 0 && (!replace_owned_async || h2->async_stream != stream_id);
     if (h2->pending_stream != 0 || async_conflict || d.conn->h2_proxy_synth_quarantined ||
-        synth_len > Http2Conn::kBodySynthCap)
+        synth_len > Http2Conn::kRequestSynthCap)
         return false;
     for (u32 i = 0; i < synth_len; i++) h2->pending_synth[i] = synth[i];
     h2->pending_stream = stream_id;
@@ -620,7 +688,8 @@ inline void h2_clear_async(Http2Conn& h2) {
 // buffer) so it survives a suspension. Clamps to the buffer; a no-op when the
 // source already is pending_synth (the deferred-body path). Returns the length.
 inline u32 h2_stash_synth(Http2Conn& h2, const u8* synth, u32 synth_len) {
-    const u32 kN = synth_len <= Http2Conn::kBodySynthCap ? synth_len : Http2Conn::kBodySynthCap;
+    const u32 kN =
+        synth_len <= Http2Conn::kRequestSynthCap ? synth_len : Http2Conn::kRequestSynthCap;
     if (synth != h2.pending_synth)
         for (u32 i = 0; i < kN; i++) h2.pending_synth[i] = synth[i];
     return kN;
@@ -764,7 +833,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         const bool stable = d.conn->resp_header_mutation_count == 0 ||
                             (d.loop->alloc_response_header_buf(*d.conn) &&
                              d.conn->stabilize_response_mutations(synth, synth_len));
-        u8 forward_synth[Http2Conn::kBodySynthCap];
+        u8 forward_synth[Http2Conn::kRequestSynthCap];
         u32 forward_len = 0;
         const bool prepared =
             stable &&
@@ -855,7 +924,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
                                   &h2->pending_synth_len,
                                   h2->pending_body_start,
                                   h2->pending_body_len,
-                                  Http2Conn::kBodySynthCap)) {
+                                  Http2Conn::kRequestSynthCap)) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 413);
         return;
@@ -1061,8 +1130,9 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 return;
             }
             // No body dependency to wait for — invoke now.
-            u8 synth[Http2Conn::kBodySynthCap];
-            const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
+            u8 synth[Http2Conn::kHeaderSynthCap];
+            const u32 kSynthLen = h2_synth_h1_request(
+                headers, nheaders, synth, sizeof(synth), /*preserve_split_cookies=*/true);
             if (kSynthLen == 0) {
                 h2_emit_status(d, stream_id, 400);
                 return;
@@ -1115,7 +1185,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     h2_emit_status(d, stream_id, 400);
                     return;
                 }
-                u8 synth[Http2Conn::kBodySynthCap];
+                u8 synth[Http2Conn::kHeaderSynthCap];
                 const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
                 if (kSynthLen == 0) {
                     h2_emit_status(d, stream_id, 400);
@@ -1148,7 +1218,8 @@ void h2_on_data_cb(
     } else {
         c.pending_body_len += len;
     }
-    if (c.pending_buffer_body && c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+    if (c.pending_buffer_body && (c.pending_body_len > Http2Conn::kBodySynthCap ||
+                                  c.pending_synth_len + len > Http2Conn::kRequestSynthCap)) {
         c.pending_overflow = true;
     } else if (c.pending_buffer_body) {
         for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
@@ -1427,7 +1498,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             failure_status = 503;
         }
 
-        u8 forward_synth[Http2Conn::kBodySynthCap];
+        u8 forward_synth[Http2Conn::kRequestSynthCap];
         u32 forward_len = 0;
         if (failure_status == 0) {
             const bool stable =

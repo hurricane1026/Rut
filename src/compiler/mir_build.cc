@@ -53,6 +53,7 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
            : kind == HirTypeKind::Method   ? MirTypeKind::Method
            : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
            : kind == HirTypeKind::IP       ? MirTypeKind::IP
+           : kind == HirTypeKind::StrList  ? MirTypeKind::StrList
            : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
            : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
            : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
@@ -442,6 +443,40 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
+    if (expr.kind == HirExprKind::ReqQueryAll || expr.kind == HirExprKind::ReqHeaderAll) {
+        v.kind = expr.kind == HirExprKind::ReqQueryAll ? MirValueKind::ReqQueryAll
+                                                       : MirValueKind::ReqHeaderAll;
+        v.type = MirTypeKind::StrList;
+        v.str_value = expr.str_value;
+        return v;
+    }
+    if (expr.kind == HirExprKind::StrListLen || expr.kind == HirExprKind::StrListIsEmpty) {
+        auto list = mir_value(*expr.lhs, module, fn, ctx);
+        if (!list) return core::make_unexpected(list.error());
+        if (!fn->values.push(list.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = expr.kind == HirExprKind::StrListLen ? MirValueKind::StrListLen
+                                                      : MirValueKind::StrListIsEmpty;
+        v.type = expr.kind == HirExprKind::StrListLen ? MirTypeKind::I32 : MirTypeKind::Bool;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::StrListGet) {
+        auto list = mir_value(*expr.lhs, module, fn, ctx);
+        if (!list) return core::make_unexpected(list.error());
+        if (!fn->values.push(list.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
+        auto index = mir_value(*expr.rhs, module, fn, ctx);
+        if (!index) return core::make_unexpected(index.error());
+        if (!fn->values.push(index.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.kind = MirValueKind::StrListGet;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqQueryString) {
         v.kind = MirValueKind::ReqQueryString;
         v.type = MirTypeKind::Str;
@@ -657,6 +692,31 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.cache_index = expr.cache_index;
         v.lhs = key_ptr;
         v.rhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
+    if (expr.kind == HirExprKind::ScopedLet) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr ||
+            expr.local_index >= MirFunction::kMaxLocals)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto init = mir_value(*expr.lhs, module, fn, ctx);
+        if (!init) return core::make_unexpected(init.error());
+        auto body = mir_value(*expr.rhs, module, fn, ctx);
+        if (!body) return core::make_unexpected(body.error());
+        if (!fn->values.push(init.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        MirValue* init_ptr = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(body.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::ScopedLet;
+        v.type = mir_type_kind(expr.type);
+        v.local_index = expr.local_index;
+        v.lhs = init_ptr;
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.variant_index = expr.variant_index;
+        v.struct_index = expr.struct_index;
+        v.error_struct_index = expr.error_struct_index;
+        v.error_variant_index = expr.error_variant_index;
+        apply_expr_shape_if_available(module, expr, &v);
         return v;
     }
     if (expr.kind == HirExprKind::IfElse) {
@@ -1065,6 +1125,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // (unnameable by design) but their init is the side effect itself —
             // dropping one would silently delete the write.
             if (module.routes[i].locals[li].name.len == 0 &&
+                module.routes[i].locals[li].type != HirTypeKind::StrList &&
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
@@ -1098,6 +1159,22 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.wait_payload = module.routes[i].locals[li].wait_payload;
             local.wait_arm_mask = module.routes[i].locals[li].wait_arm_mask;
             local.wait_index = module.routes[i].locals[li].wait_index;
+            // Wait and statically-unrolled routes use separate state/step CFG
+            // builders; keep their established initialization model until
+            // those builders carry per-block local ownership too.
+            if (fn.waits.len == 0 && module.routes[i].for_loops.len == 0 && !local.may_error &&
+                module.routes[i].control.kind == HirControlKind::Match) {
+                for (u32 ai = 0; ai < module.routes[i].control.match_arms.len; ai++) {
+                    const auto& arm = module.routes[i].control.match_arms[ai];
+                    for (u32 si = 0; si < arm.scoped_locals.len; si++) {
+                        if (arm.scoped_locals[si].ref_index == local.ref_index) {
+                            local.deferred_to_block = true;
+                            break;
+                        }
+                    }
+                    if (local.deferred_to_block) break;
+                }
+            }
             auto init = mir_value(module.routes[i].locals[li].init, module, &fn);
             if (!init) return core::make_unexpected(init.error());
             local.init = init.value();
@@ -1156,6 +1233,21 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!out->effects.push(
                         {fn.values.len - 1, module.routes[i].exprs[expr_index].span}))
                     return frontend_error(FrontendError::TooManyItems, arm.span);
+            }
+            return {};
+        };
+        auto set_arm_local_inits =
+            [&](MirBlock* out, const HirMatchArm& arm, u32 stage) -> FrontendResult<void> {
+            for (u32 si = 0; si < arm.scoped_locals.len; si++) {
+                if (arm.scoped_locals[si].stage != stage) continue;
+                const u32 ref_index = arm.scoped_locals[si].ref_index;
+                for (u32 li = 0; li < fn.locals.len; li++) {
+                    if (fn.locals[li].ref_index != ref_index || !fn.locals[li].deferred_to_block)
+                        continue;
+                    if (!out->local_init_refs.push(ref_index))
+                        return frontend_error(FrontendError::TooManyItems, arm.span);
+                    break;
+                }
             }
             return {};
         };
@@ -1312,6 +1404,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             for (u32 gi = first_guard_index; gi < arm.guards.len; gi++) {
                 MirBlock guard_block{};
                 guard_block.label = cont_label();
+                auto local_inits = set_arm_local_inits(&guard_block, arm, gi);
+                if (!local_inits) return core::make_unexpected(local_inits.error());
                 auto cond = mir_value(arm.guards[gi].cond, module, &fn);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard_block.term.kind = MirTerminatorKind::Branch;
@@ -2834,6 +2928,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     MirBlock case_block{};
                     const auto& arm = module.routes[i].control.match_arms[ai];
                     case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
+                    if (!arm.has_arm_guard) {
+                        auto local_inits = set_arm_local_inits(&case_block, arm, 0);
+                        if (!local_inits) return core::make_unexpected(local_inits.error());
+                    }
                     if (arm.has_arm_guard) {
                         auto guarded = set_match_arm_guard_branch(
                             case_block, arm, arm_guard_index[ai][0], arm_body_index[ai], [&] {
@@ -2872,6 +2970,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (arm.guards.len != 0 || arm.has_arm_guard) {
                         MirBlock body_block{};
                         body_block.label = cont_label();
+                        auto local_inits = set_arm_local_inits(&body_block, arm, arm.guards.len);
+                        if (!local_inits) return core::make_unexpected(local_inits.error());
                         if (arm.body_kind == HirMatchArm::BodyKind::If) {
                             body_block.term.kind = MirTerminatorKind::Branch;
                             body_block.term.span = arm.cond.span;
@@ -2978,6 +3078,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 MirBlock case_block{};
                 const auto& arm = module.routes[i].control.match_arms[0];
                 case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
+                if (!arm.has_arm_guard) {
+                    auto local_inits = set_arm_local_inits(&case_block, arm, 0);
+                    if (!local_inits) return core::make_unexpected(local_inits.error());
+                }
                 if (arm.has_arm_guard) {
                     auto guarded = set_match_arm_guard_branch(
                         case_block, arm, arm_guard_index[0][0], arm_body_index[0], [&] {
@@ -3016,6 +3120,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (arm.guards.len != 0 || arm.has_arm_guard) {
                     MirBlock body_block{};
                     body_block.label = cont_label();
+                    auto local_inits = set_arm_local_inits(&body_block, arm, arm.guards.len);
+                    if (!local_inits) return core::make_unexpected(local_inits.error());
                     if (arm.body_kind == HirMatchArm::BodyKind::If) {
                         body_block.term.kind = MirTerminatorKind::Branch;
                         body_block.term.span = arm.cond.span;
@@ -3071,6 +3177,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     MirBlock case_block{};
                     const auto& arm = module.routes[i].control.match_arms[ai];
                     case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
+                    if (!arm.has_arm_guard) {
+                        auto local_inits = set_arm_local_inits(&case_block, arm, 0);
+                        if (!local_inits) return core::make_unexpected(local_inits.error());
+                    }
                     if (arm.has_arm_guard) {
                         auto guarded = set_match_arm_guard_branch(
                             case_block, arm, arm_guard_index[ai][0], arm_body_index[ai], [&] {
@@ -3109,6 +3219,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     if (arm.guards.len != 0 || arm.has_arm_guard) {
                         MirBlock body_block{};
                         body_block.label = cont_label();
+                        auto local_inits = set_arm_local_inits(&body_block, arm, arm.guards.len);
+                        if (!local_inits) return core::make_unexpected(local_inits.error());
                         if (arm.body_kind == HirMatchArm::BodyKind::If) {
                             body_block.term.kind = MirTerminatorKind::Branch;
                             body_block.term.span = arm.cond.span;

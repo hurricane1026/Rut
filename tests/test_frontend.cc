@@ -13596,6 +13596,329 @@ TEST(frontend, req_query_flows_as_optional_str) {
     rir.destroy();
 }
 
+TEST(frontend, request_multi_values_lower_as_runtime_string_lists) {
+    const char* src =
+        "route GET \"/search\" { let tags: [str] = req.queryAll(\"tag\") let accepts = "
+        "req.getAll(\"Accept\") let second = tags.at(1).or(\"\") if tags.len == 2 && "
+        "accepts.isEmpty == false && second == \"b\" { return 204 } else { return 400 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].type), static_cast<u8>(HirTypeKind::StrList));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqQueryAll));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].type), static_cast<u8>(HirTypeKind::StrList));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::ReqHeaderAll));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqQueryAll));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::ReqHeaderAll));
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool saw_query_all = false;
+    bool saw_header_all = false;
+    bool saw_len = false;
+    bool saw_is_empty = false;
+    bool saw_get = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            saw_query_all |= block.insts[ii].op == rir::Opcode::ReqQueryAll;
+            saw_header_all |= block.insts[ii].op == rir::Opcode::ReqHeaderAll;
+            saw_len |= block.insts[ii].op == rir::Opcode::StrListLen;
+            saw_is_empty |= block.insts[ii].op == rir::Opcode::StrListIsEmpty;
+            saw_get |= block.insts[ii].op == rir::Opcode::StrListGet;
+        }
+    }
+    CHECK(saw_query_all);
+    CHECK(saw_header_all);
+    CHECK(saw_len);
+    CHECK(saw_is_empty);
+    CHECK(saw_get);
+    rir.destroy();
+}
+
+TEST(frontend, request_string_list_local_cannot_cross_wait_boundary) {
+    const char* src = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    wait(1ms)
+    if tags.len > 0 { return 204 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
+
+    const char* match_arm_alias = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    wait(1ms)
+    match req.http11 {
+        true => {
+            let copy = tags
+            if copy.len > 0 { return 204 } else { return 404 }
+        }
+        _ => return 400
+    }
+}
+)rut";
+    lexed = lex(lit(match_arm_alias));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
+
+    const char* scoped_alias = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    wait(1ms)
+    guard false else {
+        let copy = tags
+        if copy.len > 0 { return 204 } else { return 404 }
+    }
+    return 200
+}
+)rut";
+    lexed = lex(lit(scoped_alias));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
+
+    const char* pre_wait_only = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    guard tags.len > 0 else { return 404 }
+    wait(1ms)
+    return 204
+}
+)rut";
+    lexed = lex(lit(pre_wait_only));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char* derived_value = R"rut(
+route GET "/search" {
+    let tags = req.queryAll("tag")
+    let count = tags.len
+    wait(1ms)
+    if count > 0 { return 204 } else { return 404 }
+}
+)rut";
+    lexed = lex(lit(derived_value));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
+
+    const char* inline_producer = R"rut(
+route GET "/search" {
+    let count = req.queryAll("tag").len
+    wait(1ms)
+    if count > 0 { return 204 } else { return 404 }
+}
+)rut";
+    lexed = lex(lit(inline_producer));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("request string-list locals cannot cross a wait boundary yet — bind and consume the "
+            "list before wait")));
+
+    const char* second_wait = R"rut(
+route GET "/search" {
+    wait(1ms)
+    let tags = req.queryAll("tag")
+    wait(1ms)
+    if tags.len > 0 { return 204 } else { return 404 }
+}
+)rut";
+    lexed = lex(lit(second_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, request_string_list_matches_explicit_str_array_helper_signature) {
+    const char* src = R"rut(
+func identity(values: [str]) -> [str] => values
+route GET "/search" {
+    let tags = identity(req.queryAll("tag"))
+    if tags.isEmpty { return 404 } else { return 204 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::StrList);
+    REQUIRE(hir->routes[0].locals[0].init.kind == HirExprKind::ScopedLet);
+    REQUIRE(hir->routes[0].locals[0].init.lhs != nullptr);
+    CHECK_EQ(hir->routes[0].locals[0].init.lhs->type, HirTypeKind::StrList);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, request_string_list_rejected_in_composite_carriers) {
+    const char* cases[] = {
+        "struct Box<T> { value: T }\n"
+        "route GET \"/search\" { let boxed = Box(value: req.queryAll(\"tag\")) return 200 }\n",
+        "variant Wrap<T> { some(T), none }\n"
+        "route GET \"/search\" { let wrapped = Wrap.some(req.queryAll(\"tag\")) return 200 }\n",
+        "struct Box<T> { value: T }\n"
+        "route GET \"/search\" { let boxed = Box(value: (req.queryAll(\"tag\"), 1)) return "
+        "200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, static_string_arrays_remain_valid_through_str_array_helpers) {
+    const char* src = R"rut(
+func names() -> [str] => ["a", "b"]
+func identity(values: [str]) -> [str] => values
+route GET "/search" {
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[0].return_type, HirTypeKind::Array);
+    CHECK_EQ(hir->functions[1].params[0].type, HirTypeKind::Array);
+    CHECK_EQ(hir->functions[1].return_type, HirTypeKind::Array);
+}
+
+TEST(frontend, string_list_helper_signatures_resolve_type_aliases) {
+    const char* src = R"rut(
+type Values = [str]
+func nonempty(values: Values) -> bool => values.len > 0
+route GET "/search" {
+    if nonempty(req.queryAll("tag")) { return 204 } else { return 404 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    CHECK(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, optional_and_fallible_string_list_helpers_are_rejected_during_analysis) {
+    const char* cases[] = {
+        "func maybe(values: [str], ok: bool) -> [str] { if ok { values } else { nil } }\n",
+        "func maybe(values: [str], ok: bool) -> [str] { if ok { values } else { "
+        "error(.missing) } }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK(hir.error().detail.eq(
+            lit("optional or fallible runtime string lists are not supported")));
+    }
+}
+
+TEST(frontend, runtime_string_list_equality_is_rejected_during_analysis) {
+    const char* src =
+        "route GET \"/search\" { if req.queryAll(\"x\") == req.queryAll(\"x\") { return 204 "
+        "} else { return 404 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(hir.error().detail.eq(lit("runtime string-list equality is not supported")));
+}
+
+TEST(frontend, helper_and_scoped_string_list_reads_after_wait_are_rejected) {
+    const char* cases[] = {
+        "func nonempty(values: [str]) -> bool => values.len > 0\n"
+        "route GET \"/search\" { let tags = req.queryAll(\"x\") wait(1ms) if "
+        "nonempty(tags) { return 204 } else { return 404 } }\n",
+        "route GET \"/search\" { wait(1ms) match req.http11 { true => { let tags = "
+        "req.queryAll(\"x\") if tags.len > 0 { return 204 } else { return 404 } } _ => return "
+        "400 } }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK(hir.error().detail.eq(
+            lit("request string-list locals cannot cross a wait boundary yet — bind and consume "
+                "the list before wait")));
+    }
+}
+
 TEST(frontend, req_query_string_flows_as_optional_str) {
     const char* src =
         "route GET \"/search\" { let raw = req.queryString let value = any(raw, \"\") if value == "

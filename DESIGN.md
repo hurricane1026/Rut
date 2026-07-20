@@ -570,6 +570,11 @@ req.ctx.userId          // fields from user-declared Ctx struct
 req.ctx.startTime       // set by decorators, read by handler
 ```
 
+Request multi-value results are runtime string-list views. They preserve wire
+order, use an empty list for no matches, and expose `.len`, `.isEmpty`,
+`.first() -> string?`, and `.at(i32) -> string?`. Safe access returns nil for a
+negative or out-of-range index; it never traps or silently truncates the list.
+
 The request context `req.ctx` requires a user-declared `Ctx` struct:
 
 ```swift

@@ -12,6 +12,8 @@
 
 namespace rut::jit {
 
+static constexpr u32 kMaxRuntimeStrListItems = 8192;
+
 u32 format_handler_symbol(Str name, char* out, u32 out_size) {
     if (!out || out_size == 0) return 0;
 
@@ -59,6 +61,9 @@ struct Ctx {
     // Str type: {ptr, i32} — matches rut::Str layout
     LLVMTypeRef str_ty;
 
+    // Runtime string-list view: {Str* items, i32 len}.
+    LLVMTypeRef str_list_ty;
+
     // Optional(Str): {i8, ptr, i32} — has_value byte + ptr + len
     LLVMTypeRef opt_str_ty;
 
@@ -81,6 +86,11 @@ struct Ctx {
     LLVMValueRef param_req_len;
     LLVMValueRef param_arena;
 
+    // One bounded, invocation-local pool shared by every req.queryAll/getAll
+    // expression. The extra item is an initialized empty-list sentinel.
+    LLVMValueRef str_list_items;
+    LLVMValueRef str_list_used;
+
     // Lazily declared runtime helpers
     LLVMValueRef fn_req_path;
     LLVMValueRef fn_req_path_only;
@@ -91,6 +101,8 @@ struct Ctx {
     LLVMValueRef fn_req_header;
     LLVMValueRef fn_req_cookie;
     LLVMValueRef fn_req_query;
+    LLVMValueRef fn_req_query_all;
+    LLVMValueRef fn_req_header_all;
     LLVMValueRef fn_req_query_string;
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
@@ -152,6 +164,8 @@ struct Ctx {
         // Str: {ptr, i32}
         LLVMTypeRef str_fields[] = {ptr_ty, i32_ty};
         str_ty = LLVMStructTypeInContext(llvm_ctx, str_fields, 2, 0);
+        LLVMTypeRef str_list_fields[] = {ptr_ty, i32_ty};
+        str_list_ty = LLVMStructTypeInContext(llvm_ctx, str_list_fields, 2, 0);
 
         // Optional(Str): {i8, ptr, i32}
         LLVMTypeRef opt_str_fields[] = {i8_ty, ptr_ty, i32_ty};
@@ -405,6 +419,24 @@ struct Ctx {
             fn_req_query = LLVMAddFunction(llvm_mod, "rut_helper_req_query", ft);
         }
         return fn_req_query;
+    }
+
+    LLVMValueRef get_req_query_all() {
+        if (!fn_req_query_all) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_req_query_all = LLVMAddFunction(
+                llvm_mod, "rut_helper_req_query_all", LLVMFunctionType(i32_ty, params, 6, 0));
+        }
+        return fn_req_query_all;
+    }
+
+    LLVMValueRef get_req_header_all() {
+        if (!fn_req_header_all) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_req_header_all = LLVMAddFunction(
+                llvm_mod, "rut_helper_req_header_all", LLVMFunctionType(i32_ty, params, 6, 0));
+        }
+        return fn_req_header_all;
     }
 
     // void rut_helper_req_query_string(ptr, i32, ptr, ptr, ptr)
@@ -686,6 +718,8 @@ struct Ctx {
                 return LLVMDoubleTypeInContext(llvm_ctx);
             case rir::TypeKind::Str:
                 return str_ty;
+            case rir::TypeKind::StrList:
+                return str_list_ty;
             case rir::TypeKind::ByteSize:
             case rir::TypeKind::Duration:
             case rir::TypeKind::Time:
@@ -1184,6 +1218,100 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, opt);
             break;
         }
+        case rir::Opcode::ReqQueryAll:
+        case rir::Opcode::ReqHeaderAll: {
+            const bool query = inst.op == rir::Opcode::ReqQueryAll;
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr =
+                c.make_global_str(name, query ? "query_all.name" : "header_all.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef helper = query ? c.get_req_query_all() : c.get_req_header_all();
+            LLVMTypeRef helper_ty = LLVMGlobalGetValueType(helper);
+            LLVMValueRef null_out = LLVMConstNull(c.ptr_ty);
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMValueRef count_args[] = {
+                c.param_req_data, c.param_req_len, name_ptr, name_len, null_out, zero};
+            LLVMValueRef count =
+                LLVMBuildCall2(c.builder, helper_ty, helper, count_args, 6, "str_list.count");
+            LLVMValueRef used =
+                LLVMBuildLoad2(c.builder, c.i32_ty, c.str_list_used, "str_list.used");
+            LLVMValueRef limit = LLVMConstInt(c.i32_ty, kMaxRuntimeStrListItems, 0);
+            LLVMValueRef remaining = LLVMBuildSub(c.builder, limit, used, "str_list.remaining");
+            LLVMValueRef fits =
+                LLVMBuildICmp(c.builder, LLVMIntULE, count, remaining, "str_list.fits");
+            LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+            LLVMBasicBlockRef fill_block =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "str_list.fill");
+            LLVMBasicBlockRef overflow_block =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "str_list.overflow");
+            LLVMBuildCondBr(c.builder, fits, fill_block, overflow_block);
+            LLVMPositionBuilderAtEnd(c.builder, overflow_block);
+            c.emit_parse_unprime();
+            LLVMBuildRet(c.builder, c.make_result_status(500));
+            LLVMPositionBuilderAtEnd(c.builder, fill_block);
+            LLVMValueRef items =
+                LLVMBuildGEP2(c.builder, c.str_ty, c.str_list_items, &used, 1, "str_list.items");
+            LLVMValueRef empty_item = LLVMGetUndef(c.str_ty);
+            empty_item = LLVMBuildInsertValue(
+                c.builder, empty_item, LLVMConstNull(c.ptr_ty), 0, "str_list.empty.ptr");
+            empty_item = LLVMBuildInsertValue(c.builder, empty_item, zero, 1, "str_list.empty.len");
+            LLVMBuildStore(c.builder, empty_item, items);
+            LLVMValueRef fill_args[] = {
+                c.param_req_data, c.param_req_len, name_ptr, name_len, items, count};
+            LLVMBuildCall2(c.builder, helper_ty, helper, fill_args, 6, "");
+            LLVMValueRef next_used = LLVMBuildAdd(c.builder, used, count, "str_list.next_used");
+            LLVMBuildStore(c.builder, next_used, c.str_list_used);
+            LLVMValueRef list = LLVMGetUndef(c.str_list_ty);
+            list = LLVMBuildInsertValue(c.builder, list, items, 0, "str_list.ptr");
+            list = LLVMBuildInsertValue(c.builder, list, count, 1, "str_list.len");
+            c.set_value(inst.result, list);
+            break;
+        }
+        case rir::Opcode::StrListLen:
+        case rir::Opcode::StrListIsEmpty: {
+            LLVMValueRef list = c.get_value(inst.operands[0]);
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, list, 1, "str_list.len");
+            c.set_value(inst.result,
+                        inst.op == rir::Opcode::StrListLen
+                            ? len
+                            : LLVMBuildICmp(c.builder,
+                                            LLVMIntEQ,
+                                            len,
+                                            LLVMConstInt(c.i32_ty, 0, 0),
+                                            "str_list.is_empty"));
+            break;
+        }
+        case rir::Opcode::StrListGet: {
+            LLVMValueRef list = c.get_value(inst.operands[0]);
+            LLVMValueRef index = c.get_value(inst.operands[1]);
+            LLVMValueRef items = LLVMBuildExtractValue(c.builder, list, 0, "str_list.items");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, list, 1, "str_list.len");
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMValueRef nonnegative =
+                LLVMBuildICmp(c.builder, LLVMIntSGE, index, zero, "str_list.index.nonnegative");
+            LLVMValueRef below =
+                LLVMBuildICmp(c.builder, LLVMIntSLT, index, len, "str_list.index.below");
+            LLVMValueRef valid =
+                LLVMBuildAnd(c.builder, nonnegative, below, "str_list.index.valid");
+            LLVMValueRef safe_index =
+                LLVMBuildSelect(c.builder, valid, index, zero, "str_list.index.safe");
+            LLVMValueRef item_ptr =
+                LLVMBuildGEP2(c.builder, c.str_ty, items, &safe_index, 1, "str_list.item.ptr");
+            LLVMValueRef item = LLVMBuildLoad2(c.builder, c.str_ty, item_ptr, "str_list.item");
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, item, 0, "str_list.item.data");
+            LLVMValueRef item_len = LLVMBuildExtractValue(c.builder, item, 1, "str_list.item.len");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt =
+                LLVMBuildInsertValue(c.builder,
+                                     opt,
+                                     LLVMBuildZExt(c.builder, valid, c.i8_ty, "str_list.item.has"),
+                                     0,
+                                     "str_list.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, ptr, 1, "str_list.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, item_len, 2, "str_list.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::ReqQueryString: {
             LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "query_string.has");
             LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "query_string.ptr");
@@ -1638,6 +1766,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::Phi: {
+            LLVMValueRef phi = c.get_value(inst.result);
+            LLVMValueRef incoming_values[2] = {c.get_value(inst.operands[0]),
+                                               c.get_value(inst.operands[1])};
+            LLVMBasicBlockRef incoming_blocks[2] = {c.block_map[inst.imm.block_targets[0].id],
+                                                    c.block_map[inst.imm.block_targets[1].id]};
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            c.set_value(inst.result, phi);
+            break;
+        }
         case rir::Opcode::CtxStoreSlotI32: {
             const u32 slot = static_cast<u32>(inst.imm.i32_val);
             LLVMValueRef count_off =
@@ -1817,6 +1955,8 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
             switch (blk.insts[ii].op) {
                 case rir::Opcode::ReqHeader:
                 case rir::Opcode::ReqQuery:
+                case rir::Opcode::ReqQueryAll:
+                case rir::Opcode::ReqHeaderAll:
                 case rir::Opcode::ReqQueryString:
                 case rir::Opcode::ReqMethod:
                 case rir::Opcode::ReqPath:
@@ -1854,6 +1994,32 @@ static bool rir_function_uses_time(const rir::Function& fn) {
         }
     }
     return false;
+}
+
+static bool rir_function_uses_str_lists(const rir::Function& fn) {
+    if (!fn.blocks) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        if (!blk.insts) continue;
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            if (blk.insts[ii].op == rir::Opcode::ReqQueryAll ||
+                blk.insts[ii].op == rir::Opcode::ReqHeaderAll)
+                return true;
+        }
+    }
+    return false;
+}
+
+static void emit_str_list_pool_init(Ctx& c, bool needed) {
+    c.str_list_items = nullptr;
+    c.str_list_used = nullptr;
+    if (!needed) return;
+    c.str_list_items = LLVMBuildArrayAlloca(c.builder,
+                                            c.str_ty,
+                                            LLVMConstInt(c.i32_ty, kMaxRuntimeStrListItems + 1, 0),
+                                            "str_list.pool");
+    c.str_list_used = LLVMBuildAlloca(c.builder, c.i32_ty, "str_list.used.ptr");
+    LLVMBuildStore(c.builder, LLVMConstInt(c.i32_ty, 0, 0), c.str_list_used);
 }
 
 static bool emit_function(Ctx& c, const rir::Function& fn) {
@@ -1900,6 +2066,19 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         const char* label = blk.label.ptr ? blk.label.ptr : "bb";
         c.block_map[blk.id.id] = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, label);
     }
+    // Phi results may be referenced by blocks that appear earlier in the RIR
+    // storage order. Create every LLVM phi node up front; incoming values are
+    // attached when the owning RIR block is emitted after its predecessors.
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            const auto& inst = blk.insts[ii];
+            if (inst.op != rir::Opcode::Phi) continue;
+            LLVMPositionBuilderAtEnd(c.builder, c.block_map[blk.id.id]);
+            LLVMTypeRef ty = c.map_type(fn.values[inst.result.id].type);
+            c.set_value(inst.result, LLVMBuildPhi(c.builder, ty, "phi"));
+        }
+    }
 
     // Whether this handler reads the request at all — gates the one-time
     // parse-prime call emitted in the prologue below and the parse-unprime
@@ -1909,6 +2088,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // Time-only handlers still need their per-invocation latch reset; when
     // kNeedsParse is true, parse_prime already resets it (skip the extra call).
     const bool kNeedsTimeUnlatch = !kNeedsParse && rir_function_uses_time(fn);
+    const bool kNeedsStrListPool = rir_function_uses_str_lists(fn);
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
@@ -1941,6 +2121,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        emit_str_list_pool_init(c, kNeedsStrListPool);
         // Parse-once: prime the per-thread parse cache before any state runs,
         // so every req_* helper in this invocation shares one parse. Skipped
         // for handlers that never read the request (status/forward only).
@@ -1999,6 +2180,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        emit_str_list_pool_init(c, kNeedsStrListPool);
         // Parse-once: prime the per-thread parse cache at handler entry,
         // unless the handler never reads the request.
         if (kNeedsParse) c.emit_parse_prime();
@@ -2044,6 +2226,8 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_header = nullptr;
     c.fn_req_cookie = nullptr;
     c.fn_req_query = nullptr;
+    c.fn_req_query_all = nullptr;
+    c.fn_req_header_all = nullptr;
     c.fn_req_query_string = nullptr;
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;

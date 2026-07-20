@@ -107,6 +107,13 @@ struct Http2Conn {
     // A route snapshot is captured at END_HEADERS so delayed DATA handling does not
     // re-match if config swaps between HEADERS and DATA.
     static constexpr u32 kBodySynthCap = 16384;
+    // The decoded HPACK bytes do not include the HTTP/1 separators synthesized
+    // for JIT handlers. In particular, preserving split Cookie fields adds a
+    // separate `: ` + CRLF for every field. Keep header serialization capacity
+    // independent from the body budget so a legal near-limit header set cannot
+    // either fail synthesis or steal space from a 16 KiB deferred body.
+    static constexpr u32 kHeaderSynthCap = kHeaderScratchCap + 4 * kMaxHeadersPerReq + 64;
+    static constexpr u32 kRequestSynthCap = kHeaderSynthCap + kBodySynthCap;
     u32 pending_stream;
     u32 pending_body_start;
     u32 pending_synth_len;
@@ -134,7 +141,7 @@ struct Http2Conn {
     // NAMES point into the snapshotted RouteConfig and stay valid.
     H2RouteParam pending_route_params[kMaxRouteParams];
     u32 pending_route_param_count;
-    u8 pending_synth[kBodySynthCap];
+    u8 pending_synth[kRequestSynthCap];
 
     // One suspended async (wait/timer) stream at a time, mirroring the
     // pending_stream body constraint. When a JIT handler yields on a timer the

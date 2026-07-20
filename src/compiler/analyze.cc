@@ -297,6 +297,11 @@ constexpr Str kCacheWaitDetail = lit_str(
     "cache ops in routes containing wait are not supported yet — locals "
     "re-materialize on resume, so the op would run after the wait instead "
     "of at its source position");
+constexpr Str kStrListWaitDetail = lit_str(
+    "request string-list locals cannot cross a wait boundary yet — bind and "
+    "consume the list before wait");
+constexpr Str kStrListCompositeDetail =
+    lit_str("request string-list values cannot be stored in struct fields or variant payloads yet");
 constexpr Str kCacheNameCollisionDetail = lit_str(
     "Cache declaration name collides with another binding or a builtin "
     "receiver (req/resp/time/bitwise) — the cache would be unreachable");
@@ -2641,6 +2646,35 @@ static bool same_hir_type_shape(const HirModule& mod, const HirExpr& lhs, const 
     return same_hir_type_shape(lhs, rhs);
 }
 
+static bool hir_shape_contains_str_list(const HirModule& mod, u32 shape_index, u32 depth = 0) {
+    if (shape_index >= mod.type_shapes.len || depth > kMaxTupleSlots) return false;
+    const auto& shape = mod.type_shapes[shape_index];
+    if (shape.type == HirTypeKind::StrList) return true;
+    if (shape.type == HirTypeKind::Array)
+        return hir_shape_contains_str_list(mod, shape.array_elem_shape_index, depth + 1);
+    if (shape.type != HirTypeKind::Tuple) return false;
+    for (u32 i = 0; i < shape.tuple_len; i++)
+        if (hir_shape_contains_str_list(mod, shape.tuple_elem_shape_indices[i], depth + 1))
+            return true;
+    return false;
+}
+
+static bool hir_expr_contains_str_list_shape(const HirModule& mod, const HirExpr& expr) {
+    return expr.type == HirTypeKind::StrList || hir_shape_contains_str_list(mod, expr.shape_index);
+}
+
+static bool hir_shape_is_str_array(const HirModule& mod, u32 shape_index) {
+    if (shape_index >= mod.type_shapes.len) return false;
+    const auto& array_shape = mod.type_shapes[shape_index];
+    return array_shape.type == HirTypeKind::Array &&
+           array_shape.array_elem_shape_index < mod.type_shapes.len &&
+           mod.type_shapes[array_shape.array_elem_shape_index].type == HirTypeKind::Str;
+}
+
+static bool hir_expr_is_str_array(const HirModule& mod, const HirExpr& expr) {
+    return expr.type == HirTypeKind::Array && hir_shape_is_str_array(mod, expr.shape_index);
+}
+
 static bool replace_protocol_self_associated_type(HirExpr* expected, const HirImpl& impl) {
     if (expected->type != HirTypeKind::Associated) return true;
     if (expected->generic_index != 0xffffffffu) return true;
@@ -2803,6 +2837,10 @@ static FrontendResult<void> concretize_named_instance_shape(HirExpr* expr,
         }
     }
     if (expr->type != HirTypeKind::Unknown) {
+        u32 array_elem_shape_index = 0xffffffffu;
+        if (expr->type == HirTypeKind::Array && expr->shape_index < mod.type_shapes.len &&
+            mod.type_shapes[expr->shape_index].type == HirTypeKind::Array)
+            array_elem_shape_index = mod.type_shapes[expr->shape_index].array_elem_shape_index;
         auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                            expr->type,
                                            expr->generic_index,
@@ -2812,7 +2850,8 @@ static FrontendResult<void> concretize_named_instance_shape(HirExpr* expr,
                                            expr->tuple_types,
                                            expr->tuple_variant_indices,
                                            expr->tuple_struct_indices,
-                                           expr->span);
+                                           expr->span,
+                                           array_elem_shape_index);
         if (!shape) return core::make_unexpected(shape.error());
         expr->shape_index = shape.value();
     }
@@ -3390,6 +3429,13 @@ static FrontendResult<void> apply_declared_type_to_expr(HirExpr* expr,
             expr->tuple_struct_indices[i] = tuple_struct_indices[i];
         }
     }
+    // Runtime request multi-values use the internal StrList carrier, while
+    // their source spelling remains `[str]`. Accept exactly that declared
+    // array shape; other Array<T> annotations keep the static-array rules.
+    if (expr->type == HirTypeKind::StrList && declared.value() == HirTypeKind::Array &&
+        array_elem_shape_index < mod.type_shapes.len &&
+        mod.type_shapes[array_elem_shape_index].type == HirTypeKind::Str)
+        return {};
     const auto expected = make_expected_type_expr(declared.value(),
                                                   variant_index,
                                                   struct_index,
@@ -3497,6 +3543,13 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
                                             const HirLocal* locals,
                                             u32 local_count,
                                             const MatchPayloadBinding* binding);
+static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
+                                                 HirRoute* route,
+                                                 const HirModule& mod,
+                                                 const HirLocal* locals,
+                                                 u32 local_count,
+                                                 const MatchPayloadBinding* binding,
+                                                 bool allow_array_lit);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -4199,15 +4252,17 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
     if (receiver_override == nullptr &&
         magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
-        (expr.name.eq({"header", 6}) || expr.name.eq({"param", 5}) || expr.name.eq({"cookie", 6}) ||
-         expr.name.eq({"query", 5}))) {
+        (expr.name.eq({"header", 6}) || expr.name.eq({"getAll", 6}) || expr.name.eq({"param", 5}) ||
+         expr.name.eq({"cookie", 6}) || expr.name.eq({"query", 5}) ||
+         expr.name.eq({"queryAll", 8}))) {
         if (expr.args.len != 1 || expr.args[0] == nullptr ||
             expr.args[0]->kind != AstExprKind::StrLit) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         }
         HirExpr out{};
         out.span = expr.span;
-        out.type = HirTypeKind::Str;
+        const bool all_values = expr.name.eq({"getAll", 6}) || expr.name.eq({"queryAll", 8});
+        out.type = all_values ? HirTypeKind::StrList : HirTypeKind::Str;
         out.str_value = expr.args[0]->str_value;
         if (expr.name.eq({"param", 5})) {
             out.kind = HirExprKind::ReqParam;
@@ -4217,6 +4272,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         } else if (expr.name.eq({"query", 5})) {
             out.kind = HirExprKind::ReqQuery;
             out.may_nil = true;
+        } else if (expr.name.eq({"queryAll", 8})) {
+            out.kind = HirExprKind::ReqQueryAll;
+        } else if (expr.name.eq({"getAll", 6})) {
+            out.kind = HirExprKind::ReqHeaderAll;
         } else {
             out.kind = HirExprKind::ReqHeader;
             out.may_nil = true;
@@ -4353,6 +4412,39 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+
+    if (recv.type == HirTypeKind::StrList &&
+        (expr.name.eq({"first", 5}) || expr.name.eq({"at", 2}))) {
+        if ((expr.name.eq({"first", 5}) && expr.args.len != 0) ||
+            (expr.name.eq({"at", 2}) && expr.args.len != 1))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        HirExpr out{};
+        out.kind = HirExprKind::StrListGet;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.span = expr.span;
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        HirExpr index{};
+        if (expr.name.eq({"first", 5})) {
+            index.kind = HirExprKind::IntLit;
+            index.type = HirTypeKind::I32;
+            index.int_value = 0;
+            index.span = expr.span;
+        } else {
+            auto analyzed_index =
+                analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!analyzed_index) return core::make_unexpected(analyzed_index.error());
+            if (analyzed_index->type != HirTypeKind::I32 || analyzed_index->may_nil ||
+                analyzed_index->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.args[0]->span);
+            index = analyzed_index.value();
+        }
+        if (!route->exprs.push(index))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
 
     if (expr.name.eq({"matches", 7}) && recv.type == HirTypeKind::Str && expr.args.len == 1 &&
         expr.args[0]->kind == AstExprKind::RegexLit) {
@@ -4985,6 +5077,32 @@ static u8 route_method_key_from_token(u8 token_type) {
     }
 }
 
+static void seed_local_ref_args(const HirExpr& expr, HirExpr* args, u32 cap, u32* count) {
+    if (expr.kind == HirExprKind::LocalRef && expr.local_index < cap) {
+        args[expr.local_index] = expr;
+        if (*count <= expr.local_index) *count = expr.local_index + 1;
+    }
+    if (expr.lhs != nullptr) seed_local_ref_args(*expr.lhs, args, cap, count);
+    if (expr.rhs != nullptr) seed_local_ref_args(*expr.rhs, args, cap, count);
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr) seed_local_ref_args(*expr.args[i], args, cap, count);
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr)
+            seed_local_ref_args(*expr.field_inits[i].value, args, cap, count);
+}
+
+static void bump_next_local_ref(const HirExpr& expr, u32* next) {
+    if (expr.kind == HirExprKind::LocalRef && *next <= expr.local_index)
+        *next = expr.local_index + 1;
+    if (expr.lhs != nullptr) bump_next_local_ref(*expr.lhs, next);
+    if (expr.rhs != nullptr) bump_next_local_ref(*expr.rhs, next);
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr) bump_next_local_ref(*expr.args[i], next);
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr)
+            bump_next_local_ref(*expr.field_inits[i].value, next);
+}
+
 static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          HirRoute* route,
                                                          const HirModule& mod,
@@ -5014,11 +5132,36 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     out.field_inits.len = 0;
     out.args.len = 0;
 
+    if (expr.kind == HirExprKind::ScopedLet) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr || expr.local_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto init = instantiate_function_expr(
+            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        if (!init) return core::make_unexpected(init.error());
+        HirExpr extended_args[HirRoute::kMaxLocals]{};
+        u32 extended_count = 0;
+        seed_local_ref_args(*expr.rhs, extended_args, HirRoute::kMaxLocals, &extended_count);
+        for (u32 i = 0; i < arg_count && i < HirRoute::kMaxLocals; i++) extended_args[i] = args[i];
+        if (extended_count <= expr.local_index) extended_count = expr.local_index + 1;
+        auto body = instantiate_function_expr(*expr.rhs,
+                                              route,
+                                              mod,
+                                              extended_args,
+                                              extended_count,
+                                              generic_bindings,
+                                              generic_binding_count);
+        if (!body) return core::make_unexpected(body.error());
+        if (!route->exprs.push(init.value()) || !route->exprs.push(body.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 2];
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     if (expr.kind == HirExprKind::LocalRef) {
         if (expr.local_index >= arg_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         HirExpr arg = args[expr.local_index];
-        arg.span = expr.span;
         auto concretized =
             concretize_named_instance_shape(&arg, mod, generic_bindings, generic_binding_count);
         if (!concretized) return core::make_unexpected(concretized.error());
@@ -5221,6 +5364,113 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         auto lhs = instantiate_function_expr(
             *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!lhs) return core::make_unexpected(lhs.error());
+        // A `[str]` helper parameter is analyzed as the runtime string-list
+        // view so the same body can accept req.queryAll()/req.headers.getAll().
+        // Calls are inlined, though, and the accepted argument may instead be
+        // a compile-time Array (for example another helper returning `[str]`).
+        // Specialize list operations after substitution instead of sending a
+        // StrList opcode an Array carrier during MIR lowering.
+        if ((expr.kind == HirExprKind::StrListLen || expr.kind == HirExprKind::StrListIsEmpty) &&
+            lhs->type == HirTypeKind::Array) {
+            HirExpr folded{};
+            folded.span = expr.span;
+            if (expr.kind == HirExprKind::StrListLen) {
+                folded.kind = HirExprKind::IntLit;
+                folded.type = HirTypeKind::I32;
+                folded.int_value = lhs->array_len;
+            } else {
+                folded.kind = HirExprKind::BoolLit;
+                folded.type = HirTypeKind::Bool;
+                folded.bool_value = lhs->array_len == 0;
+            }
+            return folded;
+        }
+        if (expr.kind == HirExprKind::StrListGet && lhs->type == HirTypeKind::Array) {
+            if (expr.rhs == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            auto index = instantiate_function_expr(
+                *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+            if (!index) return core::make_unexpected(index.error());
+            if (index->kind == HirExprKind::IntLit) {
+                const u32 slot =
+                    index->int_value < 0 ? lhs->args.len : static_cast<u32>(index->int_value);
+                if (slot < lhs->args.len && lhs->args[slot] != nullptr) {
+                    HirExpr elem = *lhs->args[slot];
+                    elem.span = expr.span;
+                    return elem;
+                }
+                HirExpr missing{};
+                missing.kind = HirExprKind::Nil;
+                missing.type = HirTypeKind::Str;
+                missing.may_nil = true;
+                missing.span = expr.span;
+                return missing;
+            }
+
+            u32 ref_index = 0;
+            for (u32 li = 0; li < route->locals.len; li++)
+                if (route->locals[li].ref_index >= ref_index)
+                    ref_index = route->locals[li].ref_index + 1;
+            for (u32 ai = 0; ai < arg_count; ai++) bump_next_local_ref(args[ai], &ref_index);
+            if (ref_index >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+
+            HirExpr missing{};
+            missing.kind = HirExprKind::Nil;
+            missing.type = HirTypeKind::Str;
+            missing.may_nil = true;
+            missing.span = expr.span;
+            HirExpr selected = missing;
+            for (u32 i = lhs->args.len; i > 0; i--) {
+                HirExpr index_ref{};
+                index_ref.kind = HirExprKind::LocalRef;
+                index_ref.type = HirTypeKind::I32;
+                index_ref.local_index = ref_index;
+                index_ref.span = expr.span;
+                if (!route->exprs.push(index_ref))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr slot{};
+                slot.kind = HirExprKind::IntLit;
+                slot.type = HirTypeKind::I32;
+                slot.int_value = i - 1;
+                slot.span = expr.span;
+                if (!route->exprs.push(slot))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr eq{};
+                eq.kind = HirExprKind::Eq;
+                eq.type = HirTypeKind::Bool;
+                eq.span = expr.span;
+                eq.lhs = &route->exprs[route->exprs.len - 2];
+                eq.rhs = &route->exprs[route->exprs.len - 1];
+                if (!route->exprs.push(eq))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                if (lhs->args[i - 1] == nullptr || !route->exprs.push(*lhs->args[i - 1]))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                if (!route->exprs.push(selected))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr branch{};
+                branch.kind = HirExprKind::IfElse;
+                branch.type = HirTypeKind::Str;
+                branch.may_nil = true;
+                branch.span = expr.span;
+                branch.lhs = &route->exprs[route->exprs.len - 3];
+                branch.rhs = &route->exprs[route->exprs.len - 2];
+                if (!branch.args.push(&route->exprs[route->exprs.len - 1]))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                selected = branch;
+            }
+            if (!route->exprs.push(index.value()) || !route->exprs.push(selected))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr scoped{};
+            scoped.kind = HirExprKind::ScopedLet;
+            scoped.type = HirTypeKind::Str;
+            scoped.may_nil = true;
+            scoped.span = expr.span;
+            scoped.local_index = ref_index;
+            scoped.lhs = &route->exprs[route->exprs.len - 2];
+            scoped.rhs = &route->exprs[route->exprs.len - 1];
+            return scoped;
+        }
         if (!route->exprs.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
@@ -5312,6 +5562,11 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
                                                        const HirLocal* locals,
                                                        u32 local_count,
                                                        u32 param_count) {
+    if (expr.type == HirTypeKind::StrList && (expr.may_nil || expr.may_error))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("optional or fallible runtime string lists are not supported"));
     HirExpr out = expr;
     out.lhs = nullptr;
     out.rhs = nullptr;
@@ -5636,10 +5891,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             u32 cur_local_count,
             const MatchPayloadBinding* cur_binding) -> FrontendResult<HirExpr> {
         if (allow_respond_guards)
-            return analyze_expr(expr, scratch, mod, cur_locals, cur_local_count, cur_binding);
+            return analyze_expr_impl(
+                expr, scratch, mod, cur_locals, cur_local_count, cur_binding, true);
         const bool saved_allow_respond_effects = scratch->allow_respond_effects;
         scratch->allow_respond_effects = false;
-        auto result = analyze_expr(expr, scratch, mod, cur_locals, cur_local_count, cur_binding);
+        auto result =
+            analyze_expr_impl(expr, scratch, mod, cur_locals, cur_local_count, cur_binding, true);
         scratch->allow_respond_effects = saved_allow_respond_effects;
         return result;
     };
@@ -7020,6 +7277,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             auto field_value =
                 analyze_expr(*expr.field_inits[fi].value, route, mod, locals, local_count, binding);
             if (!field_value) return core::make_unexpected(field_value.error());
+            if (hir_expr_contains_str_list_shape(mod, field_value.value()))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.field_inits[fi].value->span,
+                                      kStrListCompositeDetail);
             if (field_value->may_nil || field_value->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
@@ -7213,6 +7474,17 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         }
         auto base = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!base) return core::make_unexpected(base.error());
+        if (base->type == HirTypeKind::StrList && !base->may_nil && !base->may_error &&
+            (expr.name.eq({"len", 3}) || expr.name.eq({"isEmpty", 7}))) {
+            out.kind =
+                expr.name.eq({"len", 3}) ? HirExprKind::StrListLen : HirExprKind::StrListIsEmpty;
+            out.type = expr.name.eq({"len", 3}) ? HirTypeKind::I32 : HirTypeKind::Bool;
+            out.span = expr.span;
+            if (!route->exprs.push(base.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
         if (base->is_wait_result) {
             if (base->kind != HirExprKind::LocalRef)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -7459,6 +7731,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
             auto payload = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
             if (!payload) return core::make_unexpected(payload.error());
+            if (hir_expr_contains_str_list_shape(mod, payload.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.lhs->span, kStrListCompositeDetail);
             if (payload->may_nil || payload->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
             const auto expected = make_expected_type_expr(case_decl.payload_type,
@@ -7699,6 +7974,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 auto field_value = analyze_expr(
                     *expr.field_inits[fi].value, route, mod, locals, local_count, binding);
                 if (!field_value) return core::make_unexpected(field_value.error());
+                if (hir_expr_contains_str_list_shape(mod, field_value.value()))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.field_inits[fi].value->span,
+                                          kStrListCompositeDetail);
                 if (field_value->may_nil || field_value->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           expr.field_inits[fi].value->span);
@@ -8294,6 +8573,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                   mixed_int ? kArithMixedWidthDetail : Str{});
         }
         if (expr.kind == AstExprKind::Eq) {
+            if (lhs->type == HirTypeKind::StrList)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("runtime string-list equality is not supported"));
             if (lhs->type == HirTypeKind::Generic && !lhs->generic_has_eq_constraint)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         } else {
@@ -9271,10 +9554,20 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         (void)context;
         auto ret = concrete_return_expr();
         if (!ret) return core::make_unexpected(ret.error());
-        if (!same_hir_type_shape(mod, target, ret.value())) {
+        if (target.type == HirTypeKind::StrList && hir_expr_is_str_array(mod, ret.value()) &&
+            (target.may_nil || target.may_error || ret->may_nil || ret->may_error))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                target.span,
+                lit_str("optional or fallible runtime string lists are not supported"));
+        const bool runtime_str_list_compat =
+            target.type == HirTypeKind::StrList && hir_expr_is_str_array(mod, ret.value()) &&
+            !target.may_nil && !target.may_error && !ret->may_nil && !ret->may_error;
+        if (!runtime_str_list_compat && !same_hir_type_shape(mod, target, ret.value())) {
             auto mismatch = fail_call(expr.span, "return type mismatch", nullptr);
             return core::make_unexpected(mismatch.error());
         }
+        if (runtime_str_list_compat) return {};
         target.type = ret->type;
         target.associated_name = ret->associated_name;
         target.generic_index = ret->generic_index;
@@ -9396,7 +9689,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         } else {
             auto expected = concrete_param_expr(fn.params[param_index]);
             if (!expected) return core::make_unexpected(expected.error());
-            if (!same_hir_type_shape(mod, analyzed_arg, expected.value()))
+            const bool runtime_str_list_compat = analyzed_arg.type == HirTypeKind::StrList &&
+                                                 hir_expr_is_str_array(mod, expected.value()) &&
+                                                 !analyzed_arg.may_nil && !analyzed_arg.may_error &&
+                                                 !expected->may_nil && !expected->may_error;
+            if (!runtime_str_list_compat &&
+                !same_hir_type_shape(mod, analyzed_arg, expected.value()))
                 return core::make_unexpected(
                     fail_call(span, "concrete param shape mismatch", nullptr).error());
         }
@@ -9673,6 +9971,51 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
+    struct ScopedListBinding {
+        u32 ref_index = 0xffffffffu;
+        HirExpr init{};
+    };
+    FixedVec<ScopedListBinding, AstExpr::kMaxArgs> scoped_list_bindings;
+    u32 next_scoped_ref = 0;
+    for (u32 li = 0; li < local_count; li++)
+        if (locals[li].ref_index >= next_scoped_ref) next_scoped_ref = locals[li].ref_index + 1;
+    for (u32 li = 0; li < route->locals.len; li++)
+        if (route->locals[li].ref_index >= next_scoped_ref)
+            next_scoped_ref = route->locals[li].ref_index + 1;
+    // Function bodies are inlined. Bind a direct runtime-list argument once
+    // inside the inlined expression so multiple parameter reads share it while
+    // an enclosing lazy boolean can still skip the whole call. Respond-capable
+    // helpers keep route-local materialization because their guards are hoisted
+    // into the route guard sequence and therefore intentionally execute there.
+    for (u32 i = 0; i < effective_arg_count; i++) {
+        if (analyzed_args[i].type != HirTypeKind::StrList ||
+            analyzed_args[i].kind == HirExprKind::LocalRef)
+            continue;
+        const u32 ref_index = next_scoped_ref++;
+        if (ref_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (fn.respond_guards.len == 0) {
+            if (!scoped_list_bindings.push({ref_index, analyzed_args[i]}))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        } else {
+            HirLocal materialized{};
+            materialized.span = analyzed_args[i].span;
+            materialized.ref_index = ref_index;
+            materialized.type = analyzed_args[i].type;
+            materialized.shape_index = analyzed_args[i].shape_index;
+            materialized.init = analyzed_args[i];
+            if (!route->locals.push(materialized))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
+        HirExpr ref = analyzed_args[i];
+        ref.kind = HirExprKind::LocalRef;
+        ref.local_index = ref_index;
+        ref.lhs = nullptr;
+        ref.rhs = nullptr;
+        ref.args.len = 0;
+        ref.field_inits.len = 0;
+        analyzed_args[i] = ref;
+    }
     auto respond_guards = instantiate_function_respond_guards(fn,
                                                               route,
                                                               mod,
@@ -9695,6 +10038,19 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     auto return_typed = apply_return_type(inlined.value(), "direct");
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
+    for (u32 bi = scoped_list_bindings.len; bi > 0; bi--) {
+        const auto& binding = scoped_list_bindings[bi - 1];
+        if (!route->exprs.push(binding.init) || !route->exprs.push(inlined.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr scoped = inlined.value();
+        scoped.kind = HirExprKind::ScopedLet;
+        scoped.local_index = binding.ref_index;
+        scoped.lhs = &route->exprs[route->exprs.len - 2];
+        scoped.rhs = &route->exprs[route->exprs.len - 1];
+        scoped.args.len = 0;
+        scoped.field_inits.len = 0;
+        inlined = scoped;
+    }
     // Same rule as the any/all gates: a fallible i64 has no error carrier
     // yet, and an annotation-less helper body like
     // `if ok { 2147483648 } else { error(500) }` infers exactly that.
@@ -10484,6 +10840,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 HirLocal local{};
+                const u32 arm_locals_start = route->locals.len;
                 local.span = inner.span;
                 local.name = inner.name;
                 local.ref_index =
@@ -10522,6 +10879,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 local.init = init.value();
                 if (!route->locals.push(local))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
+                for (u32 li = arm_locals_start; li < route->locals.len; li++) {
+                    if (!arm->scoped_locals.push({route->locals[li].ref_index, arm->guards.len}))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                }
                 if (local.ref_index >= HirRoute::kMaxLocals)
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 if (scoped_locals.len <= local.ref_index) scoped_locals.len = local.ref_index + 1;
@@ -10533,6 +10894,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 HirGuard guard{};
+                const u32 guard_locals_start = route->locals.len;
                 guard.span = inner.span;
                 auto bound = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
@@ -10585,6 +10947,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         if (!fail_body) return core::make_unexpected(fail_body.error());
                     }
                 }
+                // Materializations introduced while evaluating the guard must
+                // live in the block that evaluates this guard, not at route
+                // entry. The narrowed binding itself becomes live only on the
+                // success edge and is recorded below at the next stage.
+                for (u32 li = guard_locals_start; li < route->locals.len; li++) {
+                    if (!arm->scoped_locals.push({route->locals[li].ref_index, arm->guards.len}))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                }
                 if (!arm->guards.push(guard))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 // A known-error OR known-nil init folds the guard condition to
@@ -10631,6 +11001,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     if (!init) return core::make_unexpected(init.error());
                     local.init = init.value();
                     if (!route->locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                    if (!arm->scoped_locals.push({local.ref_index, arm->guards.len}))
                         return frontend_error(FrontendError::TooManyItems, inner.span);
                     if (local.ref_index >= HirRoute::kMaxLocals)
                         return frontend_error(FrontendError::TooManyItems, inner.span);
@@ -14504,6 +14876,8 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqParam:
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
+        case HirExprKind::ReqQueryAll:
+        case HirExprKind::ReqHeaderAll:
         case HirExprKind::ReqQueryString:
         case HirExprKind::ReqPath:
         case HirExprKind::ReqPathOnly:
@@ -15991,7 +16365,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                               fn.return_tuple_variant_indices,
                                                               fn.return_tuple_struct_indices,
                                                               span,
-                                                              nullptr,
+                                                              &fn.return_array_elem_shape_index,
                                                               &fn.return_associated_name);
                         if (!ret_type) return core::make_unexpected(ret_type.error());
                         fn.return_type = ret_type.value();
@@ -16008,7 +16382,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_variant_indices,
                                                           fn.return_tuple_struct_indices,
                                                           span,
-                                                          nullptr,
+                                                          &fn.return_array_elem_shape_index,
                                                           &fn.return_associated_name);
                     if (!ret_type) return core::make_unexpected(ret_type.error());
                     fn.return_type = ret_type.value();
@@ -16025,7 +16399,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
                                                       span,
-                                                      nullptr,
+                                                      &fn.return_array_elem_shape_index,
                                                       &fn.return_associated_name);
                 if (!ret_type) return core::make_unexpected(ret_type.error());
                 fn.return_type = ret_type.value();
@@ -16146,7 +16520,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                 param.tuple_variant_indices,
                                                                 param.tuple_struct_indices,
                                                                 span,
-                                                                nullptr,
+                                                                &param.array_elem_shape_index,
                                                                 &param.associated_name);
                         if (!param_type) return core::make_unexpected(param_type.error());
                         param.type = param_type.value();
@@ -16163,7 +16537,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                             param.tuple_variant_indices,
                                                             param.tuple_struct_indices,
                                                             span,
-                                                            nullptr,
+                                                            &param.array_elem_shape_index,
                                                             &param.associated_name);
                     if (!param_type) return core::make_unexpected(param_type.error());
                     param.type = param_type.value();
@@ -16180,7 +16554,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                         param.tuple_variant_indices,
                                                         param.tuple_struct_indices,
                                                         span,
-                                                        nullptr,
+                                                        &param.array_elem_shape_index,
                                                         &param.associated_name);
                 if (!param_type) return core::make_unexpected(param_type.error());
                 param.type = param_type.value();
@@ -16217,7 +16591,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_types,
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
-                                                      span);
+                                                      span,
+                                                      fn.return_array_elem_shape_index);
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
@@ -16231,7 +16606,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                      fn.params[pi].tuple_types,
                                                      fn.params[pi].tuple_variant_indices,
                                                      fn.params[pi].tuple_struct_indices,
-                                                     span);
+                                                     span,
+                                                     fn.params[pi].array_elem_shape_index);
             if (!param_shape) return core::make_unexpected(param_shape.error());
             fn.params[pi].shape_index = param_shape.value();
         }
@@ -16266,10 +16642,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         HirLocal param_locals[AstFunctionDecl::kMaxParams]{};
         for (u32 pi = 0; pi < fn.params.len; pi++) {
+            const bool runtime_str_list_param =
+                fn.params[pi].type == HirTypeKind::Array &&
+                hir_shape_is_str_array(mod, fn.params[pi].shape_index);
             param_locals[pi].span = span;
             param_locals[pi].name = fn.params[pi].name;
             param_locals[pi].ref_index = pi;
-            param_locals[pi].type = fn.params[pi].type;
+            param_locals[pi].type =
+                runtime_str_list_param ? HirTypeKind::StrList : fn.params[pi].type;
             param_locals[pi].generic_index = fn.params[pi].generic_index;
             param_locals[pi].associated_name = fn.params[pi].associated_name;
             param_locals[pi].generic_has_error_constraint =
@@ -16283,7 +16663,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     fn.params[pi].generic_protocol_indices[cpi];
             param_locals[pi].variant_index = fn.params[pi].variant_index;
             param_locals[pi].struct_index = fn.params[pi].struct_index;
-            param_locals[pi].shape_index = fn.params[pi].shape_index;
+            param_locals[pi].shape_index =
+                runtime_str_list_param ? 0xffffffffu : fn.params[pi].shape_index;
             param_locals[pi].tuple_len = fn.params[pi].tuple_len;
             for (u32 ti = 0; ti < fn.params[pi].tuple_len; ti++) {
                 param_locals[pi].tuple_types[ti] = fn.params[pi].tuple_types[ti];
@@ -16292,7 +16673,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 param_locals[pi].tuple_struct_indices[ti] = fn.params[pi].tuple_struct_indices[ti];
             }
             param_locals[pi].init.kind = HirExprKind::LocalRef;
-            param_locals[pi].init.type = fn.params[pi].type;
+            param_locals[pi].init.type =
+                runtime_str_list_param ? HirTypeKind::StrList : fn.params[pi].type;
             param_locals[pi].init.generic_index = fn.params[pi].generic_index;
             param_locals[pi].init.associated_name = fn.params[pi].associated_name;
             param_locals[pi].init.generic_has_error_constraint =
@@ -16309,7 +16691,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].init.local_index = pi;
             param_locals[pi].init.variant_index = fn.params[pi].variant_index;
             param_locals[pi].init.struct_index = fn.params[pi].struct_index;
-            param_locals[pi].init.shape_index = fn.params[pi].shape_index;
+            param_locals[pi].init.shape_index =
+                runtime_str_list_param ? 0xffffffffu : fn.params[pi].shape_index;
             param_locals[pi].init.tuple_len = fn.params[pi].tuple_len;
             for (u32 ti = 0; ti < fn.params[pi].tuple_len; ti++) {
                 param_locals[pi].init.tuple_types[ti] = fn.params[pi].tuple_types[ti];
@@ -16443,7 +16826,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     expected.generic_protocol_indices[cpi] =
                         fn.type_params[fn.return_generic_index].custom_protocol_indices[cpi];
             }
-            if (!same_hir_type_shape(mod, body.value(), expected))
+            const bool runtime_str_list_compat =
+                body->type == HirTypeKind::StrList && hir_expr_is_str_array(mod, expected);
+            if (runtime_str_list_compat && (body->may_nil || body->may_error))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    body->span,
+                    lit_str("optional or fallible runtime string lists are not supported"));
+            if (!runtime_str_list_compat && !same_hir_type_shape(mod, body.value(), expected))
                 return frontend_error(FrontendError::UnsupportedSyntax, ast_func.body->span);
             if (body->type == HirTypeKind::Variant &&
                 body->variant_index != fn.return_variant_index)
@@ -16459,7 +16849,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_types,
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
-                                                      span);
+                                                      span,
+                                                      fn.return_array_elem_shape_index);
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
@@ -16946,7 +17337,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                               fn.return_tuple_variant_indices,
                                                               fn.return_tuple_struct_indices,
                                                               item.func.span,
-                                                              nullptr,
+                                                              &fn.return_array_elem_shape_index,
                                                               &fn.return_associated_name);
                         if (!ret_type) return core::make_unexpected(ret_type.error());
                         fn.return_type = ret_type.value();
@@ -16963,7 +17354,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           fn.return_tuple_variant_indices,
                                                           fn.return_tuple_struct_indices,
                                                           item.func.span,
-                                                          nullptr,
+                                                          &fn.return_array_elem_shape_index,
                                                           &fn.return_associated_name);
                     if (!ret_type) return core::make_unexpected(ret_type.error());
                     fn.return_type = ret_type.value();
@@ -16980,7 +17371,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
                                                       item.func.span,
-                                                      nullptr,
+                                                      &fn.return_array_elem_shape_index,
                                                       &fn.return_associated_name);
                 if (!ret_type) return core::make_unexpected(ret_type.error());
                 fn.return_type = ret_type.value();
@@ -17102,7 +17493,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                 param.tuple_variant_indices,
                                                                 param.tuple_struct_indices,
                                                                 item.func.span,
-                                                                nullptr,
+                                                                &param.array_elem_shape_index,
                                                                 &param.associated_name);
                         if (!param_type) return core::make_unexpected(param_type.error());
                         param.type = param_type.value();
@@ -17119,7 +17510,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                             param.tuple_variant_indices,
                                                             param.tuple_struct_indices,
                                                             item.func.span,
-                                                            nullptr,
+                                                            &param.array_elem_shape_index,
                                                             &param.associated_name);
                     if (!param_type) return core::make_unexpected(param_type.error());
                     param.type = param_type.value();
@@ -17136,7 +17527,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                         param.tuple_variant_indices,
                                                         param.tuple_struct_indices,
                                                         item.func.span,
-                                                        nullptr,
+                                                        &param.array_elem_shape_index,
                                                         &param.associated_name);
                 if (!param_type) return core::make_unexpected(param_type.error());
                 param.type = param_type.value();
@@ -17170,7 +17561,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                      param.tuple_types,
                                                      param.tuple_variant_indices,
                                                      param.tuple_struct_indices,
-                                                     item.func.span);
+                                                     item.func.span,
+                                                     param.array_elem_shape_index);
             if (!param_shape) return core::make_unexpected(param_shape.error());
             param.shape_index = param_shape.value();
             if (!fn.params.push(param))
@@ -17186,7 +17578,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       fn.return_tuple_types,
                                                       fn.return_tuple_variant_indices,
                                                       fn.return_tuple_struct_indices,
-                                                      item.func.span);
+                                                      item.func.span,
+                                                      fn.return_array_elem_shape_index);
             if (!return_shape) return core::make_unexpected(return_shape.error());
             fn.return_shape_index = return_shape.value();
         }
@@ -17847,10 +18240,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         HirLocal param_locals[AstFunctionDecl::kMaxParams]{};
         for (u32 pi = 0; pi < fn.params.len; pi++) {
+            const bool runtime_str_list_param =
+                fn.params[pi].type == HirTypeKind::Array &&
+                hir_shape_is_str_array(mod, fn.params[pi].shape_index);
             param_locals[pi].span = item.func.span;
             param_locals[pi].name = fn.params[pi].name;
             param_locals[pi].ref_index = pi;
-            param_locals[pi].type = fn.params[pi].type;
+            param_locals[pi].type =
+                runtime_str_list_param ? HirTypeKind::StrList : fn.params[pi].type;
             param_locals[pi].is_magic_request_proxy =
                 is_route_decorator_function_name(fn.name) && pi == 0 &&
                 fn.params[pi].has_underscore_label && fn.params[pi].name.eq({"req", 3});
@@ -17867,7 +18264,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     fn.params[pi].generic_protocol_indices[cpi];
             param_locals[pi].variant_index = fn.params[pi].variant_index;
             param_locals[pi].struct_index = fn.params[pi].struct_index;
-            param_locals[pi].shape_index = fn.params[pi].shape_index;
+            param_locals[pi].shape_index =
+                runtime_str_list_param ? 0xffffffffu : fn.params[pi].shape_index;
             param_locals[pi].tuple_len = fn.params[pi].tuple_len;
             for (u32 ti = 0; ti < fn.params[pi].tuple_len; ti++) {
                 param_locals[pi].tuple_types[ti] = fn.params[pi].tuple_types[ti];
@@ -17876,7 +18274,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 param_locals[pi].tuple_struct_indices[ti] = fn.params[pi].tuple_struct_indices[ti];
             }
             param_locals[pi].init.kind = HirExprKind::LocalRef;
-            param_locals[pi].init.type = fn.params[pi].type;
+            param_locals[pi].init.type =
+                runtime_str_list_param ? HirTypeKind::StrList : fn.params[pi].type;
             param_locals[pi].init.generic_index = fn.params[pi].generic_index;
             param_locals[pi].init.associated_name = fn.params[pi].associated_name;
             param_locals[pi].init.generic_has_error_constraint =
@@ -17893,7 +18292,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             param_locals[pi].init.local_index = pi;
             param_locals[pi].init.variant_index = fn.params[pi].variant_index;
             param_locals[pi].init.struct_index = fn.params[pi].struct_index;
-            param_locals[pi].init.shape_index = fn.params[pi].shape_index;
+            param_locals[pi].init.shape_index =
+                runtime_str_list_param ? 0xffffffffu : fn.params[pi].shape_index;
             param_locals[pi].init.tuple_len = fn.params[pi].tuple_len;
             for (u32 ti = 0; ti < fn.params[pi].tuple_len; ti++) {
                 param_locals[pi].init.tuple_types[ti] = fn.params[pi].tuple_types[ti];
@@ -18027,7 +18427,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     expected.generic_protocol_indices[cpi] =
                         fn.type_params[fn.return_generic_index].custom_protocol_indices[cpi];
             }
-            if (!same_hir_type_shape(mod, body.value(), expected))
+            const bool runtime_str_list_compat =
+                body->type == HirTypeKind::StrList && hir_expr_is_str_array(mod, expected);
+            if (runtime_str_list_compat && (body->may_nil || body->may_error))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    body->span,
+                    lit_str("optional or fallible runtime string lists are not supported"));
+            if (!runtime_str_list_compat && !same_hir_type_shape(mod, body.value(), expected))
                 return frontend_error(FrontendError::UnsupportedSyntax, item.func.body->span);
             if (body->type == HirTypeKind::Variant &&
                 body->variant_index != fn.return_variant_index)
@@ -19081,6 +19488,213 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     probe(route.guards[g].fail_body.locals[li].init);
             if (found != nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, found->span, detail);
+
+            // Request multi-value lists are backed by an invocation-local
+            // bounded pool and lower to SSA aggregates. Values derived from a
+            // list (for example `let count = tags.len`) are per-invocation SSA
+            // values too, so they cannot be consumed after a later resume.
+            // Propagate both named and inline producers through local
+            // initializers, then check each local against the first wait that
+            // follows its own definition (not merely the route's first wait).
+            bool list_dependent[HirRoute::kMaxLocals]{};
+            auto expr_depends_on_list = [&](const auto& self, const HirExpr& expr) -> bool {
+                if (expr.kind == HirExprKind::ReqQueryAll || expr.kind == HirExprKind::ReqHeaderAll)
+                    return true;
+                if (expr.kind == HirExprKind::LocalRef) {
+                    for (u32 li = 0; li < route.locals.len; li++)
+                        if (route.locals[li].ref_index == expr.local_index)
+                            return list_dependent[li];
+                }
+                if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
+                if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
+                for (u32 ai = 0; ai < expr.args.len; ai++)
+                    if (expr.args[ai] != nullptr && self(self, *expr.args[ai])) return true;
+                for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+                    if (expr.field_inits[fi].value != nullptr &&
+                        self(self, *expr.field_inits[fi].value))
+                        return true;
+                return false;
+            };
+            for (u32 li = 0; li < route.locals.len; li++)
+                list_dependent[li] =
+                    route.locals[li].type == HirTypeKind::StrList ||
+                    expr_depends_on_list(expr_depends_on_list, route.locals[li].init);
+            for (u32 pass = 0; pass < route.locals.len; pass++) {
+                bool changed = false;
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    const auto& local = route.locals[li];
+                    if (list_dependent[li]) continue;
+                    if (expr_depends_on_list(expr_depends_on_list, local.init)) {
+                        list_dependent[li] = true;
+                        changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
+            auto reads_list_after_wait =
+                [&](const auto& self, const HirExpr& expr, u32 ref_index, u32 wait_start) -> bool {
+                if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index &&
+                    expr.span.start > wait_start)
+                    return true;
+                if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index, wait_start))
+                    return true;
+                if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index, wait_start))
+                    return true;
+                for (u32 ai = 0; ai < expr.args.len; ai++)
+                    if (expr.args[ai] != nullptr &&
+                        self(self, *expr.args[ai], ref_index, wait_start))
+                        return true;
+                for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+                    if (expr.field_inits[fi].value != nullptr &&
+                        self(self, *expr.field_inits[fi].value, ref_index, wait_start))
+                        return true;
+                return false;
+            };
+            auto terminator_reads_after_wait =
+                [](const HirTerminator& term, u32 ref_index, u32 wait_start) {
+                    return term.source_kind == HirTerminatorSourceKind::LocalRef &&
+                           term.local_ref_index == ref_index && term.span.start > wait_start;
+                };
+            auto guard_terminator_reads_after_wait =
+                [&](const HirGuard& guard, u32 ref_index, u32 wait_start) {
+                    if (guard.fail_kind == HirGuard::FailKind::Term)
+                        return terminator_reads_after_wait(guard.fail_term, ref_index, wait_start);
+                    if (guard.fail_kind == HirGuard::FailKind::Body) {
+                        if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If)
+                            return terminator_reads_after_wait(
+                                       guard.fail_body.then_term, ref_index, wait_start) ||
+                                   terminator_reads_after_wait(
+                                       guard.fail_body.else_term, ref_index, wait_start);
+                        return terminator_reads_after_wait(
+                            guard.fail_body.direct_term, ref_index, wait_start);
+                    }
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                        const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
+                        if (terminator_reads_after_wait(arm.direct_term, ref_index, wait_start))
+                            return true;
+                    }
+                    return false;
+                };
+            for (u32 li = 0; li < route.locals.len; li++) {
+                const auto& local = route.locals[li];
+                if (!list_dependent[li]) continue;
+                for (u32 wi = 0; wi < route.waits.len; wi++)
+                    if (route.waits[wi].span.start < local.span.start)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, local.span, kStrListWaitDetail);
+                u32 next_wait_start = 0xffffffffu;
+                for (u32 wi = 0; wi < route.waits.len; wi++)
+                    if (route.waits[wi].span.start > local.span.start &&
+                        route.waits[wi].span.start < next_wait_start)
+                        next_wait_start = route.waits[wi].span.start;
+                if (next_wait_start == 0xffffffffu) continue;
+                bool read_after = false;
+                for (u32 ei = 0; ei < route.exprs.len && !read_after; ei++)
+                    read_after = reads_list_after_wait(
+                        reads_list_after_wait, route.exprs[ei], local.ref_index, next_wait_start);
+                for (u32 ri = 0; ri < route.locals.len && !read_after; ri++)
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.locals[ri].init,
+                                                       local.ref_index,
+                                                       next_wait_start);
+                for (u32 gi = 0; gi < route.guards.len && !read_after; gi++)
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.guards[gi].cond,
+                                                       local.ref_index,
+                                                       next_wait_start);
+                for (u32 gi = 0; gi < route.guards.len && !read_after; gi++) {
+                    const auto& guard = route.guards[gi];
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       guard.fail_match_expr,
+                                                       local.ref_index,
+                                                       next_wait_start) ||
+                                 reads_list_after_wait(reads_list_after_wait,
+                                                       guard.fail_body.cond,
+                                                       local.ref_index,
+                                                       next_wait_start);
+                    for (u32 si = 0; si < guard.fail_body.locals.len && !read_after; si++)
+                        read_after = reads_list_after_wait(reads_list_after_wait,
+                                                           guard.fail_body.locals[si].init,
+                                                           local.ref_index,
+                                                           next_wait_start);
+                }
+                for (u32 gi = 0; gi < route.guards.len && !read_after; gi++)
+                    read_after = guard_terminator_reads_after_wait(
+                        route.guards[gi], local.ref_index, next_wait_start);
+                if (!read_after && route.control.kind == HirControlKind::If)
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.control.cond,
+                                                       local.ref_index,
+                                                       next_wait_start);
+                if (!read_after && route.control.kind == HirControlKind::Match)
+                    read_after = reads_list_after_wait(reads_list_after_wait,
+                                                       route.control.match_expr,
+                                                       local.ref_index,
+                                                       next_wait_start);
+                if (route.control.kind == HirControlKind::Match) {
+                    for (u32 ai = 0; ai < route.control.match_arms.len && !read_after; ai++) {
+                        const auto& arm = route.control.match_arms[ai];
+                        read_after =
+                            reads_list_after_wait(reads_list_after_wait,
+                                                  arm.pattern,
+                                                  local.ref_index,
+                                                  next_wait_start) ||
+                            reads_list_after_wait(reads_list_after_wait,
+                                                  arm.arm_guard,
+                                                  local.ref_index,
+                                                  next_wait_start) ||
+                            reads_list_after_wait(
+                                reads_list_after_wait, arm.cond, local.ref_index, next_wait_start);
+                        for (u32 gi = 0; gi < arm.guards.len && !read_after; gi++) {
+                            const auto& guard = arm.guards[gi];
+                            read_after = reads_list_after_wait(reads_list_after_wait,
+                                                               guard.cond,
+                                                               local.ref_index,
+                                                               next_wait_start) ||
+                                         reads_list_after_wait(reads_list_after_wait,
+                                                               guard.fail_match_expr,
+                                                               local.ref_index,
+                                                               next_wait_start) ||
+                                         reads_list_after_wait(reads_list_after_wait,
+                                                               guard.fail_body.cond,
+                                                               local.ref_index,
+                                                               next_wait_start);
+                            for (u32 si = 0; si < guard.fail_body.locals.len && !read_after; si++)
+                                read_after = reads_list_after_wait(reads_list_after_wait,
+                                                                   guard.fail_body.locals[si].init,
+                                                                   local.ref_index,
+                                                                   next_wait_start);
+                        }
+                        for (u32 gi = 0; gi < arm.guards.len && !read_after; gi++)
+                            read_after = guard_terminator_reads_after_wait(
+                                arm.guards[gi], local.ref_index, next_wait_start);
+                        if (!read_after) {
+                            if (arm.body_kind == HirMatchArm::BodyKind::If)
+                                read_after = terminator_reads_after_wait(
+                                                 arm.then_term, local.ref_index, next_wait_start) ||
+                                             terminator_reads_after_wait(
+                                                 arm.else_term, local.ref_index, next_wait_start);
+                            else
+                                read_after = terminator_reads_after_wait(
+                                    arm.direct_term, local.ref_index, next_wait_start);
+                        }
+                    }
+                }
+                if (!read_after) {
+                    if (route.control.kind == HirControlKind::Direct)
+                        read_after = terminator_reads_after_wait(
+                            route.control.direct_term, local.ref_index, next_wait_start);
+                    else if (route.control.kind == HirControlKind::If)
+                        read_after =
+                            terminator_reads_after_wait(
+                                route.control.then_term, local.ref_index, next_wait_start) ||
+                            terminator_reads_after_wait(
+                                route.control.else_term, local.ref_index, next_wait_start);
+                }
+                if (read_after)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, local.span, kStrListWaitDetail);
+            }
         }
 
         // A ws-terminate route carries a HirWsHandler, not a direct_term, so its empty

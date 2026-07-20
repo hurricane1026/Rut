@@ -460,6 +460,7 @@ void rut_helper_req_query(const u8* req_data,
     u32 pos = 0;
     while (pos < query_len) {
         while (pos < query_len && query[pos] == '&') pos++;
+        if (pos == query_len) break;
         const u32 key_start = pos;
         while (pos < query_len && query[pos] != '&' && query[pos] != '=') pos++;
         const u32 key_end = pos;
@@ -479,6 +480,66 @@ void rut_helper_req_query(const u8* req_data,
             return;
         }
     }
+}
+
+u32 rut_helper_req_query_all(
+    const u8* req_data, u32 req_len, const char* name, u32 name_len, Str* out, u32 cap) {
+    if (!name && name_len != 0) return 0;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok || pc.req.path.len == 0) return 0;
+
+    const char* path = pc.req.path.ptr;
+    const u32 path_len = pc.req.path.len;
+    u32 path_pos = 0;
+    while (path_pos < path_len && path[path_pos] != '?' && path[path_pos] != '#') path_pos++;
+    if (path_pos >= path_len || path[path_pos] != '?' || path_pos + 1 >= path_len) return 0;
+
+    const char* query = path + path_pos + 1;
+    u32 query_len = path_len - path_pos - 1;
+    for (u32 i = 0; i < query_len; i++) {
+        if (query[i] == '#') {
+            query_len = i;
+            break;
+        }
+    }
+
+    u32 count = 0;
+    u32 pos = 0;
+    while (pos < query_len) {
+        while (pos < query_len && query[pos] == '&') pos++;
+        if (pos == query_len) break;
+        const u32 key_start = pos;
+        while (pos < query_len && query[pos] != '&' && query[pos] != '=') pos++;
+        const u32 key_end = pos;
+        u32 val_start = key_end;
+        u32 val_end = key_end;
+        if (pos < query_len && query[pos] == '=') {
+            val_start = ++pos;
+            while (pos < query_len && query[pos] != '&') pos++;
+            val_end = pos;
+        }
+        if (key_end - key_start == name_len &&
+            (name_len == 0 || memcmp(query + key_start, name, name_len) == 0)) {
+            if (out && count < cap) out[count] = {query + val_start, val_end - val_start};
+            count++;
+        }
+    }
+    return count;
+}
+
+u32 rut_helper_req_header_all(
+    const u8* req_data, u32 req_len, const char* name, u32 name_len, Str* out, u32 cap) {
+    if (!name || name_len == 0) return 0;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return 0;
+    u32 count = 0;
+    for (u32 i = 0; i < pc.req.header_count; i++) {
+        const auto& header = pc.req.headers[i];
+        if (!ascii_header_name_eq(header.name, name, name_len)) continue;
+        if (out && count < cap) out[count] = header.value;
+        count++;
+    }
+    return count;
 }
 
 void rut_helper_req_query_string(

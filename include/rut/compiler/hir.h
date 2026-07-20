@@ -103,6 +103,11 @@ enum class HirExprKind : u8 {
     TupleSlot,
     VariantCase,
     IfElse,
+    // Expression-scoped single evaluation. `lhs` is the initializer, `rhs` is
+    // the body, and LocalRef(local_index) references the bound value only
+    // inside that body. Used by inlined helpers so direct runtime-list
+    // arguments remain lazy without being evaluated once per parameter read.
+    ScopedLet,
     Call,
     StructInit,
     Field,
@@ -125,7 +130,12 @@ enum class HirExprKind : u8 {
     ReqParam,
     ReqCookie,
     ReqQuery,
+    ReqQueryAll,
+    ReqHeaderAll,
     ReqQueryString,
+    StrListLen,
+    StrListIsEmpty,
+    StrListGet,
     ReqPath,
     ReqPathOnly,
     ReqBody,
@@ -216,6 +226,9 @@ enum class HirTypeKind : u8 {
     // reference the shape through their existing `shape_index` rather than
     // mirroring inline fields.
     Array,
+    // Runtime view over ordered string slices. Unlike Array, this has a
+    // MIR/RIR carrier and may be stored in route locals.
+    StrList,
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
@@ -510,6 +523,7 @@ struct HirFunction {
         u32 tuple_variant_indices[kMaxTupleSlots]{};
         u32 tuple_struct_indices[kMaxTupleSlots]{};
         u32 shape_index = 0xffffffffu;
+        u32 array_elem_shape_index = 0xffffffffu;
         bool has_underscore_label = false;
     };
 
@@ -529,6 +543,7 @@ struct HirFunction {
     u32 return_tuple_variant_indices[kMaxTupleSlots]{};
     u32 return_tuple_struct_indices[kMaxTupleSlots]{};
     u32 return_shape_index = 0xffffffffu;
+    u32 return_array_elem_shape_index = 0xffffffffu;
     static constexpr u32 kMaxParams = 8;
     static constexpr u32 kMaxExprs = 64;
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
@@ -568,6 +583,7 @@ struct HirFunction {
           return_struct_index(other.return_struct_index),
           return_tuple_len(other.return_tuple_len),
           return_shape_index(other.return_shape_index),
+          return_array_elem_shape_index(other.return_array_elem_shape_index),
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
@@ -598,6 +614,7 @@ struct HirFunction {
         return_struct_index = other.return_struct_index;
         return_tuple_len = other.return_tuple_len;
         return_shape_index = other.return_shape_index;
+        return_array_elem_shape_index = other.return_array_elem_shape_index;
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -628,6 +645,7 @@ struct HirFunction {
           return_struct_index(other.return_struct_index),
           return_tuple_len(other.return_tuple_len),
           return_shape_index(other.return_shape_index),
+          return_array_elem_shape_index(other.return_array_elem_shape_index),
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
@@ -658,6 +676,7 @@ struct HirFunction {
         return_struct_index = other.return_struct_index;
         return_tuple_len = other.return_tuple_len;
         return_shape_index = other.return_shape_index;
+        return_array_elem_shape_index = other.return_array_elem_shape_index;
         for (u32 i = 0; i < other.return_tuple_len; i++) {
             return_tuple_types[i] = other.return_tuple_types[i];
             return_tuple_variant_indices[i] = other.return_tuple_variant_indices[i];
@@ -861,6 +880,15 @@ struct HirMatchArm {
     FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
+    struct ScopedLocal {
+        u32 ref_index = 0xffffffffu;
+        // Number of body-prelude guards already analyzed when this local
+        // becomes live. The value selects the guard block (or terminal body)
+        // that owns its initializer.
+        u32 stage = 0;
+    };
+    static constexpr u32 kMaxScopedLocals = 16;
+    FixedVec<ScopedLocal, kMaxScopedLocals> scoped_locals;
     HirExpr cond{};
     HirTerminator then_term{};
     HirTerminator else_term{};

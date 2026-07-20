@@ -16842,6 +16842,30 @@ TEST(http2, forward_request_applies_jit_path_and_header_overrides) {
     CHECK(rewritten.find("X-Added: yes\r\n") != std::string::npos);
 }
 
+TEST(http2, forward_request_recombines_split_cookie_fields) {
+    Connection conn;
+    conn.reset();
+    static const char request[] =
+        "GET / HTTP/1.1\r\n"
+        "cookie: a=1\r\n"
+        "x-test: retained\r\n"
+        "cookie: sid=xyz\r\n"
+        "\r\n";
+    u8 out[256]{};
+    u32 out_len = 0;
+
+    REQUIRE(h2_prepare_forward_request(conn,
+                                       reinterpret_cast<const u8*>(request),
+                                       sizeof(request) - 1,
+                                       out,
+                                       sizeof(out),
+                                       &out_len));
+    const std::string rewritten(reinterpret_cast<const char*>(out), out_len);
+    CHECK(rewritten.find("x-test: retained\r\n") != std::string::npos);
+    CHECK(rewritten.find("cookie: a=1; sid=xyz\r\n") != std::string::npos);
+    CHECK_EQ(rewritten.find("cookie:"), rewritten.rfind("cookie:"));
+}
+
 TEST(http2, forward_request_rejects_unrepresentable_overrides) {
     Connection conn;
     conn.reset();

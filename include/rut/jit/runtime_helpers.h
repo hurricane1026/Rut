@@ -89,6 +89,25 @@ void rut_helper_req_query(const rut::u8* req_data,
                           const char** out_ptr,
                           rut::u32* out_len);
 
+// Collect every matching query value, preserving request order. Passing a
+// null output or cap=0 performs a count-only pass. Returns the total count;
+// when out is non-null, writes min(total, cap) string views into it.
+rut::u32 rut_helper_req_query_all(const rut::u8* req_data,
+                                  rut::u32 req_len,
+                                  const char* name,
+                                  rut::u32 name_len,
+                                  rut::Str* out,
+                                  rut::u32 cap);
+
+// Collect every matching request-header field, case-insensitively and in wire
+// order. Supports the same count-only contract as req_query_all.
+rut::u32 rut_helper_req_header_all(const rut::u8* req_data,
+                                   rut::u32 req_len,
+                                   const char* name,
+                                   rut::u32 name_len,
+                                   rut::Str* out,
+                                   rut::u32 cap);
+
 // Extract the raw query string from request target, excluding '?' and '#fragment'.
 // Returns Optional(Str): *out_has_value = 1 if a query component exists.
 // If found, *out_ptr / *out_len point into req_data.
