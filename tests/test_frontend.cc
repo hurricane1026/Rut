@@ -33106,6 +33106,24 @@ route GET "/ws" use chain health {
     CHECK(hir.error().detail.eq(
         lit("control-plane effects are not supported on WebSocket terminate routes")));
 }
+
+TEST(frontend, dead_lazy_admin_branch_allowed_on_websocket_terminate_route) {
+    const char* src = R"rut(
+upstream ws
+route GET "/ws" {
+    let ok = true || (json(stats()) == "{}")
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
 #endif
 
 TEST(frontend, control_plane_snapshot_declarations_validate_arity) {

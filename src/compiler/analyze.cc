@@ -3635,8 +3635,6 @@ static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route
             span,
             lit_str("control-plane effects are not supported on WebSocket terminate routes"));
     };
-    for (u32 ei = 0; ei < route.exprs.len; ei++)
-        if (hir_contains_admin_effect(&route.exprs[ei])) return reject(route.exprs[ei].span);
     for (u32 li = 0; li < route.locals.len; li++) {
         if (hir_contains_admin_effect(&route.locals[li].init)) return reject(route.locals[li].span);
     }
