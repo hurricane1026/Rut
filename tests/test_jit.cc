@@ -1893,6 +1893,72 @@ TEST(jit, untaken_control_arm_does_not_materialize_string_list_locals) {
     rir.destroy();
 }
 
+TEST(jit, untaken_control_arm_does_not_materialize_optional_list_local) {
+    const char* src =
+        "route GET \"/search\" { let base = req.queryAll(\"x\") if req.http11 { if base.len > "
+        "0 { return 204 } else { return 400 } } else { let first = "
+        "req.queryAll(\"x\").first() if first == nil { return 404 } else { return 400 } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    std::string request = "GET /search?";
+    for (u32 i = 0; i < 4500; i++) request += i == 0 ? "x=a" : "&x=a";
+    request += " HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request.data()), request.size(), nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, lazy_helper_call_does_not_materialize_direct_list_argument) {
+    const char* src =
+        "func sameLength(values: [str]) -> bool => values.len == values.len\n"
+        "route GET \"/search\" { let base = req.queryAll(\"x\") if base.len > 0 && "
+        "req.http10 && sameLength(req.queryAll(\"x\")) { return 400 } else { return 204 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    std::string request = "GET /search?";
+    for (u32 i = 0; i < 4500; i++) request += i == 0 ? "x=a" : "&x=a";
+    request += " HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request.data()), request.size(), nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, string_list_helper_specializes_static_array_arguments) {
     const char* src =
         "func names() -> [str] => [\"a\", \"b\"]\n"
@@ -1916,6 +1982,37 @@ TEST(jit, string_list_helper_specializes_static_array_arguments) {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
     static const char request[] = "GET /array HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, string_list_helper_static_array_supports_dynamic_at_index) {
+    const char* src =
+        "func names() -> [str] => [\"a\", \"b\"]\n"
+        "func pick(values: [str], index: i32) => values.at(index).or(\"\")\n"
+        "route GET \"/array\" { let tags = req.queryAll(\"tag\") if pick(names(), tags.len - "
+        "1) == \"b\" { return 204 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    static const char request[] = "GET /array?tag=x&tag=y HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const auto result = HandlerResult::unpack(handler(
         nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
     CHECK_EQ(result.status_code, 204u);

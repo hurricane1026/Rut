@@ -5077,6 +5077,32 @@ static u8 route_method_key_from_token(u8 token_type) {
     }
 }
 
+static void seed_local_ref_args(const HirExpr& expr, HirExpr* args, u32 cap, u32* count) {
+    if (expr.kind == HirExprKind::LocalRef && expr.local_index < cap) {
+        args[expr.local_index] = expr;
+        if (*count <= expr.local_index) *count = expr.local_index + 1;
+    }
+    if (expr.lhs != nullptr) seed_local_ref_args(*expr.lhs, args, cap, count);
+    if (expr.rhs != nullptr) seed_local_ref_args(*expr.rhs, args, cap, count);
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr) seed_local_ref_args(*expr.args[i], args, cap, count);
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr)
+            seed_local_ref_args(*expr.field_inits[i].value, args, cap, count);
+}
+
+static void bump_next_local_ref(const HirExpr& expr, u32* next) {
+    if (expr.kind == HirExprKind::LocalRef && *next <= expr.local_index)
+        *next = expr.local_index + 1;
+    if (expr.lhs != nullptr) bump_next_local_ref(*expr.lhs, next);
+    if (expr.rhs != nullptr) bump_next_local_ref(*expr.rhs, next);
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr) bump_next_local_ref(*expr.args[i], next);
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr)
+            bump_next_local_ref(*expr.field_inits[i].value, next);
+}
+
 static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          HirRoute* route,
                                                          const HirModule& mod,
@@ -5105,6 +5131,32 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
     out.rhs = nullptr;
     out.field_inits.len = 0;
     out.args.len = 0;
+
+    if (expr.kind == HirExprKind::ScopedLet) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr || expr.local_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto init = instantiate_function_expr(
+            *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        if (!init) return core::make_unexpected(init.error());
+        HirExpr extended_args[HirRoute::kMaxLocals]{};
+        u32 extended_count = 0;
+        seed_local_ref_args(*expr.rhs, extended_args, HirRoute::kMaxLocals, &extended_count);
+        for (u32 i = 0; i < arg_count && i < HirRoute::kMaxLocals; i++) extended_args[i] = args[i];
+        if (extended_count <= expr.local_index) extended_count = expr.local_index + 1;
+        auto body = instantiate_function_expr(*expr.rhs,
+                                              route,
+                                              mod,
+                                              extended_args,
+                                              extended_count,
+                                              generic_bindings,
+                                              generic_binding_count);
+        if (!body) return core::make_unexpected(body.error());
+        if (!route->exprs.push(init.value()) || !route->exprs.push(body.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 2];
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
 
     if (expr.kind == HirExprKind::LocalRef) {
         if (expr.local_index >= arg_count)
@@ -5339,20 +5391,85 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             auto index = instantiate_function_expr(
                 *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
             if (!index) return core::make_unexpected(index.error());
-            if (index->kind != HirExprKind::IntLit || index->int_value < 0)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-            const u32 slot = static_cast<u32>(index->int_value);
-            if (slot < lhs->args.len && lhs->args[slot] != nullptr) {
-                HirExpr elem = *lhs->args[slot];
-                elem.span = expr.span;
-                return elem;
+            if (index->kind == HirExprKind::IntLit) {
+                const u32 slot =
+                    index->int_value < 0 ? lhs->args.len : static_cast<u32>(index->int_value);
+                if (slot < lhs->args.len && lhs->args[slot] != nullptr) {
+                    HirExpr elem = *lhs->args[slot];
+                    elem.span = expr.span;
+                    return elem;
+                }
+                HirExpr missing{};
+                missing.kind = HirExprKind::Nil;
+                missing.type = HirTypeKind::Str;
+                missing.may_nil = true;
+                missing.span = expr.span;
+                return missing;
             }
+
+            u32 ref_index = 0;
+            for (u32 li = 0; li < route->locals.len; li++)
+                if (route->locals[li].ref_index >= ref_index)
+                    ref_index = route->locals[li].ref_index + 1;
+            for (u32 ai = 0; ai < arg_count; ai++) bump_next_local_ref(args[ai], &ref_index);
+            if (ref_index >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+
             HirExpr missing{};
             missing.kind = HirExprKind::Nil;
             missing.type = HirTypeKind::Str;
             missing.may_nil = true;
             missing.span = expr.span;
-            return missing;
+            HirExpr selected = missing;
+            for (u32 i = lhs->args.len; i > 0; i--) {
+                HirExpr index_ref{};
+                index_ref.kind = HirExprKind::LocalRef;
+                index_ref.type = HirTypeKind::I32;
+                index_ref.local_index = ref_index;
+                index_ref.span = expr.span;
+                if (!route->exprs.push(index_ref))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr slot{};
+                slot.kind = HirExprKind::IntLit;
+                slot.type = HirTypeKind::I32;
+                slot.int_value = i - 1;
+                slot.span = expr.span;
+                if (!route->exprs.push(slot))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr eq{};
+                eq.kind = HirExprKind::Eq;
+                eq.type = HirTypeKind::Bool;
+                eq.span = expr.span;
+                eq.lhs = &route->exprs[route->exprs.len - 2];
+                eq.rhs = &route->exprs[route->exprs.len - 1];
+                if (!route->exprs.push(eq))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                if (lhs->args[i - 1] == nullptr || !route->exprs.push(*lhs->args[i - 1]))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                if (!route->exprs.push(selected))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                HirExpr branch{};
+                branch.kind = HirExprKind::IfElse;
+                branch.type = HirTypeKind::Str;
+                branch.may_nil = true;
+                branch.span = expr.span;
+                branch.lhs = &route->exprs[route->exprs.len - 3];
+                branch.rhs = &route->exprs[route->exprs.len - 2];
+                if (!branch.args.push(&route->exprs[route->exprs.len - 1]))
+                    return frontend_error(FrontendError::TooManyItems, expr.span);
+                selected = branch;
+            }
+            if (!route->exprs.push(index.value()) || !route->exprs.push(selected))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr scoped{};
+            scoped.kind = HirExprKind::ScopedLet;
+            scoped.type = HirTypeKind::Str;
+            scoped.may_nil = true;
+            scoped.span = expr.span;
+            scoped.local_index = ref_index;
+            scoped.lhs = &route->exprs[route->exprs.len - 2];
+            scoped.rhs = &route->exprs[route->exprs.len - 1];
+            return scoped;
         }
         if (!route->exprs.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -9854,25 +9971,42 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
-    // Function bodies are inlined. Materialize a direct runtime-list argument
-    // once before substitution so multiple parameter references do not repeat
-    // queryAll/getAll and consume the bounded list pool more than once.
+    struct ScopedListBinding {
+        u32 ref_index = 0xffffffffu;
+        HirExpr init{};
+    };
+    FixedVec<ScopedListBinding, AstExpr::kMaxArgs> scoped_list_bindings;
+    u32 next_scoped_ref = 0;
+    for (u32 li = 0; li < local_count; li++)
+        if (locals[li].ref_index >= next_scoped_ref) next_scoped_ref = locals[li].ref_index + 1;
+    for (u32 li = 0; li < route->locals.len; li++)
+        if (route->locals[li].ref_index >= next_scoped_ref)
+            next_scoped_ref = route->locals[li].ref_index + 1;
+    // Function bodies are inlined. Bind a direct runtime-list argument once
+    // inside the inlined expression so multiple parameter reads share it while
+    // an enclosing lazy boolean can still skip the whole call. Respond-capable
+    // helpers keep route-local materialization because their guards are hoisted
+    // into the route guard sequence and therefore intentionally execute there.
     for (u32 i = 0; i < effective_arg_count; i++) {
         if (analyzed_args[i].type != HirTypeKind::StrList ||
             analyzed_args[i].kind == HirExprKind::LocalRef)
             continue;
-        u32 ref_index = 0;
-        for (u32 li = 0; li < route->locals.len; li++)
-            if (route->locals[li].ref_index >= ref_index)
-                ref_index = route->locals[li].ref_index + 1;
-        HirLocal materialized{};
-        materialized.span = analyzed_args[i].span;
-        materialized.ref_index = ref_index;
-        materialized.type = analyzed_args[i].type;
-        materialized.shape_index = analyzed_args[i].shape_index;
-        materialized.init = analyzed_args[i];
-        if (!route->locals.push(materialized))
+        const u32 ref_index = next_scoped_ref++;
+        if (ref_index >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.span);
+        if (fn.respond_guards.len == 0) {
+            if (!scoped_list_bindings.push({ref_index, analyzed_args[i]}))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        } else {
+            HirLocal materialized{};
+            materialized.span = analyzed_args[i].span;
+            materialized.ref_index = ref_index;
+            materialized.type = analyzed_args[i].type;
+            materialized.shape_index = analyzed_args[i].shape_index;
+            materialized.init = analyzed_args[i];
+            if (!route->locals.push(materialized))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
         HirExpr ref = analyzed_args[i];
         ref.kind = HirExprKind::LocalRef;
         ref.local_index = ref_index;
@@ -9904,6 +10038,19 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     auto return_typed = apply_return_type(inlined.value(), "direct");
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
+    for (u32 bi = scoped_list_bindings.len; bi > 0; bi--) {
+        const auto& binding = scoped_list_bindings[bi - 1];
+        if (!route->exprs.push(binding.init) || !route->exprs.push(inlined.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        HirExpr scoped = inlined.value();
+        scoped.kind = HirExprKind::ScopedLet;
+        scoped.local_index = binding.ref_index;
+        scoped.lhs = &route->exprs[route->exprs.len - 2];
+        scoped.rhs = &route->exprs[route->exprs.len - 1];
+        scoped.args.len = 0;
+        scoped.field_inits.len = 0;
+        inlined = scoped;
+    }
     // Same rule as the any/all gates: a fallible i64 has no error carrier
     // yet, and an annotation-less helper body like
     // `if ok { 2147483648 } else { error(500) }` infers exactly that.

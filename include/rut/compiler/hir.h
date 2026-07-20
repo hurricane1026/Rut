@@ -103,6 +103,11 @@ enum class HirExprKind : u8 {
     TupleSlot,
     VariantCase,
     IfElse,
+    // Expression-scoped single evaluation. `lhs` is the initializer, `rhs` is
+    // the body, and LocalRef(local_index) references the bound value only
+    // inside that body. Used by inlined helpers so direct runtime-list
+    // arguments remain lazy without being evaluated once per parameter read.
+    ScopedLet,
     Call,
     StructInit,
     Field,

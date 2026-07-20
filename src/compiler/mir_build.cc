@@ -694,6 +694,31 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.rhs = &fn->values[fn->values.len - 1];
         return v;
     }
+    if (expr.kind == HirExprKind::ScopedLet) {
+        if (expr.lhs == nullptr || expr.rhs == nullptr ||
+            expr.local_index >= MirFunction::kMaxLocals)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto init = mir_value(*expr.lhs, module, fn, ctx);
+        if (!init) return core::make_unexpected(init.error());
+        auto body = mir_value(*expr.rhs, module, fn, ctx);
+        if (!body) return core::make_unexpected(body.error());
+        if (!fn->values.push(init.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        MirValue* init_ptr = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(body.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = MirValueKind::ScopedLet;
+        v.type = mir_type_kind(expr.type);
+        v.local_index = expr.local_index;
+        v.lhs = init_ptr;
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.variant_index = expr.variant_index;
+        v.struct_index = expr.struct_index;
+        v.error_struct_index = expr.error_struct_index;
+        v.error_variant_index = expr.error_variant_index;
+        apply_expr_shape_if_available(module, expr, &v);
+        return v;
+    }
     if (expr.kind == HirExprKind::IfElse) {
         auto cond = mir_value(*expr.lhs, module, fn, ctx);
         if (!cond) return core::make_unexpected(cond.error());
@@ -1137,8 +1162,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // Wait and statically-unrolled routes use separate state/step CFG
             // builders; keep their established initialization model until
             // those builders carry per-block local ownership too.
-            if (fn.waits.len == 0 && module.routes[i].for_loops.len == 0 && !local.may_nil &&
-                !local.may_error && module.routes[i].control.kind == HirControlKind::Match) {
+            if (fn.waits.len == 0 && module.routes[i].for_loops.len == 0 && !local.may_error &&
+                module.routes[i].control.kind == HirControlKind::Match) {
                 for (u32 ai = 0; ai < module.routes[i].control.match_arms.len; ai++) {
                     const auto& arm = module.routes[i].control.match_arms[ai];
                     for (u32 si = 0; si < arm.scoped_locals.len; si++) {

@@ -29,6 +29,7 @@ enum class MirValueKind : u8 {
     TupleSlot,
     VariantCase,
     IfElse,
+    ScopedLet,
     StructInit,
     Field,
     ReqHeader,

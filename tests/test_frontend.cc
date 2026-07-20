@@ -13791,9 +13791,11 @@ route GET "/search" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::StrList);
-    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::StrList);
+    REQUIRE(hir->routes[0].locals[0].init.kind == HirExprKind::ScopedLet);
+    REQUIRE(hir->routes[0].locals[0].init.lhs != nullptr);
+    CHECK_EQ(hir->routes[0].locals[0].init.lhs->type, HirTypeKind::StrList);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};

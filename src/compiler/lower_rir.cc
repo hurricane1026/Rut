@@ -1206,6 +1206,42 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
     };
 
+    if (value.kind == MirValueKind::ScopedLet) {
+        if (value.lhs == nullptr || value.rhs == nullptr || value.local_index >= local_count ||
+            local_count > MirFunction::kMaxLocals)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto init = materialize_value(*value.lhs,
+                                      mir,
+                                      variant_infos,
+                                      tuple_infos,
+                                      tuple_info_count,
+                                      error_scalar_infos,
+                                      error_variant_infos,
+                                      error_struct_infos,
+                                      user_struct_defs,
+                                      b,
+                                      locals,
+                                      local_count,
+                                      span);
+        if (!init) return core::make_unexpected(init.error());
+        rir::ValueId scoped_locals[MirFunction::kMaxLocals]{};
+        for (u32 i = 0; i < local_count; i++) scoped_locals[i] = locals[i];
+        scoped_locals[value.local_index] = init.value();
+        return materialize_value(*value.rhs,
+                                 mir,
+                                 variant_infos,
+                                 tuple_infos,
+                                 tuple_info_count,
+                                 error_scalar_infos,
+                                 error_variant_infos,
+                                 error_struct_infos,
+                                 user_struct_defs,
+                                 b,
+                                 scoped_locals,
+                                 local_count,
+                                 span);
+    }
+
     if (value.kind == MirValueKind::BoolConst) {
         auto v = b.emit_const_bool(value.bool_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
