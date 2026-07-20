@@ -913,6 +913,26 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_phi(ValueId first,
+                             BlockId first_block,
+                             ValueId second,
+                             BlockId second_block,
+                             SourceLoc loc = {}) {
+        if (!valid_val(first) || !valid_val(second) || first_block.id >= cur_func->block_count ||
+            second_block.id >= cur_func->block_count)
+            return err(RirError::InvalidState);
+        auto* first_ty = cur_func->values[first.id].type;
+        auto* second_ty = cur_func->values[second.id].type;
+        if (!types_equal(first_ty, second_ty)) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::Phi, first_ty, loc));
+        inst->operands[0] = first;
+        inst->operands[1] = second;
+        inst->operand_count = 2;
+        inst->imm.block_targets[0] = first_block;
+        inst->imm.block_targets[1] = second_block;
+        return vid;
+    }
+
     Result<ValueId> emit_opt_unwrap(ValueId opt, const Type* inner_type, SourceLoc loc = {}) {
         if (!valid_val(opt) || !inner_type) return err(RirError::InvalidState);
         // Verify operand is Optional and inner_type matches the payload.

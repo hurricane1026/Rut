@@ -244,6 +244,7 @@ enum class Opcode : u8 {
 
     // ── Value selection ──
     Select,  // %r = select %cond, %then, %else  → T
+    Phi,     // %r = phi [%a, block_a], [%b, block_b] → T
 
     // ── Instrumentation (compiler-inserted) ──
     TraceFuncEnter,

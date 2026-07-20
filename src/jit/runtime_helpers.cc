@@ -460,6 +460,7 @@ void rut_helper_req_query(const u8* req_data,
     u32 pos = 0;
     while (pos < query_len) {
         while (pos < query_len && query[pos] == '&') pos++;
+        if (pos == query_len) break;
         const u32 key_start = pos;
         while (pos < query_len && query[pos] != '&' && query[pos] != '=') pos++;
         const u32 key_end = pos;
@@ -506,6 +507,7 @@ u32 rut_helper_req_query_all(
     u32 pos = 0;
     while (pos < query_len) {
         while (pos < query_len && query[pos] == '&') pos++;
+        if (pos == query_len) break;
         const u32 key_start = pos;
         while (pos < query_len && query[pos] != '&' && query[pos] != '=') pos++;
         const u32 key_end = pos;

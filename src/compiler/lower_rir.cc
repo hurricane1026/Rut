@@ -2576,6 +2576,156 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     return locals[value.local_index];
 }
 
+static FrontendResult<void> emit_lazy_bool_branch(const MirValue& value,
+                                                  const MirModule& mir,
+                                                  const VariantLoweringInfo* variant_infos,
+                                                  TupleLoweringInfo* tuple_infos,
+                                                  u32* tuple_info_count,
+                                                  ErrorLoweringInfo* error_scalar_infos,
+                                                  ErrorLoweringInfo* error_variant_infos,
+                                                  ErrorLoweringInfo* error_struct_infos,
+                                                  const rir::StructDef* const* user_struct_defs,
+                                                  rir::Builder& b,
+                                                  rir::Function* fn,
+                                                  rir::BlockId true_block,
+                                                  rir::BlockId false_block,
+                                                  const rir::ValueId* locals,
+                                                  u32 local_count,
+                                                  Span span) {
+    if (value.kind == MirValueKind::IfElse && value.type == MirTypeKind::Bool && !value.may_error &&
+        !value.is_eager_fallback && !value.is_pipe_conditional && value.lhs != nullptr &&
+        value.rhs != nullptr && value.args.len == 1 && value.args[0] != nullptr) {
+        auto then_eval = b.create_block(fn, lit("lazy_bool_then"));
+        auto else_eval = b.create_block(fn, lit("lazy_bool_else"));
+        if (!then_eval || !else_eval) return frontend_error(FrontendError::OutOfMemory, span);
+        auto cond = emit_lazy_bool_branch(*value.lhs,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          fn,
+                                          then_eval.value(),
+                                          else_eval.value(),
+                                          locals,
+                                          local_count,
+                                          span);
+        if (!cond) return core::make_unexpected(cond.error());
+        b.set_insert_point(fn, then_eval.value());
+        auto then_result = emit_lazy_bool_branch(*value.rhs,
+                                                 mir,
+                                                 variant_infos,
+                                                 tuple_infos,
+                                                 tuple_info_count,
+                                                 error_scalar_infos,
+                                                 error_variant_infos,
+                                                 error_struct_infos,
+                                                 user_struct_defs,
+                                                 b,
+                                                 fn,
+                                                 true_block,
+                                                 false_block,
+                                                 locals,
+                                                 local_count,
+                                                 span);
+        if (!then_result) return core::make_unexpected(then_result.error());
+        b.set_insert_point(fn, else_eval.value());
+        return emit_lazy_bool_branch(*value.args[0],
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     fn,
+                                     true_block,
+                                     false_block,
+                                     locals,
+                                     local_count,
+                                     span);
+    }
+    auto cond = materialize_value(value,
+                                  mir,
+                                  variant_infos,
+                                  tuple_infos,
+                                  tuple_info_count,
+                                  error_scalar_infos,
+                                  error_variant_infos,
+                                  error_struct_infos,
+                                  user_struct_defs,
+                                  b,
+                                  locals,
+                                  local_count,
+                                  span);
+    if (!cond) return core::make_unexpected(cond.error());
+    if (!b.emit_br(cond.value(), true_block, false_block, {span.line, span.col}))
+        return frontend_error(FrontendError::OutOfMemory, span);
+    return {};
+}
+
+static FrontendResult<rir::ValueId> materialize_lazy_bool_value(
+    const MirValue& value,
+    const MirModule& mir,
+    const VariantLoweringInfo* variant_infos,
+    TupleLoweringInfo* tuple_infos,
+    u32* tuple_info_count,
+    ErrorLoweringInfo* error_scalar_infos,
+    ErrorLoweringInfo* error_variant_infos,
+    ErrorLoweringInfo* error_struct_infos,
+    const rir::StructDef* const* user_struct_defs,
+    rir::Builder& b,
+    rir::Function* fn,
+    const rir::ValueId* locals,
+    u32 local_count,
+    Span span) {
+    auto true_block = b.create_block(fn, lit("lazy_bool_value_true"));
+    auto false_block = b.create_block(fn, lit("lazy_bool_value_false"));
+    auto merge_block = b.create_block(fn, lit("lazy_bool_value_merge"));
+    if (!true_block || !false_block || !merge_block)
+        return frontend_error(FrontendError::OutOfMemory, span);
+    auto branched = emit_lazy_bool_branch(value,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          fn,
+                                          true_block.value(),
+                                          false_block.value(),
+                                          locals,
+                                          local_count,
+                                          span);
+    if (!branched) return core::make_unexpected(branched.error());
+
+    b.set_insert_point(fn, true_block.value());
+    auto true_value = b.emit_const_bool(true, {span.line, span.col});
+    if (!true_value || !b.emit_jmp(merge_block.value(), {span.line, span.col}))
+        return frontend_error(FrontendError::OutOfMemory, span);
+    b.set_insert_point(fn, false_block.value());
+    auto false_value = b.emit_const_bool(false, {span.line, span.col});
+    if (!false_value || !b.emit_jmp(merge_block.value(), {span.line, span.col}))
+        return frontend_error(FrontendError::OutOfMemory, span);
+    b.set_insert_point(fn, merge_block.value());
+    auto phi = b.emit_phi(true_value.value(),
+                          true_block.value(),
+                          false_value.value(),
+                          false_block.value(),
+                          {span.line, span.col});
+    if (!phi) return frontend_error(FrontendError::OutOfMemory, span);
+    return phi.value();
+}
+
 static FrontendResult<rir::ValueId> materialize_local_init(
     const MirLocal& local,
     const MirModule& mir,
@@ -2588,11 +2738,29 @@ static FrontendResult<rir::ValueId> materialize_local_init(
     const rir::StructDef* error_struct_def,
     const rir::StructDef* const* user_struct_defs,
     rir::Builder& b,
+    rir::Function* fn,
     const rir::ValueId* locals,
     u32 local_count,
     Str func_name,
     Str source_name) {
     const auto local_shape = resolved_shape(mir, local);
+    if (!local.may_error && !local.may_nil && local_shape.type == MirTypeKind::Bool &&
+        local.init.kind == MirValueKind::IfElse && !local.init.is_eager_fallback &&
+        !local.init.is_pipe_conditional)
+        return materialize_lazy_bool_value(local.init,
+                                           mir,
+                                           variant_infos,
+                                           tuple_infos,
+                                           tuple_info_count,
+                                           error_scalar_infos,
+                                           error_variant_infos,
+                                           error_struct_infos,
+                                           user_struct_defs,
+                                           b,
+                                           fn,
+                                           locals,
+                                           local_count,
+                                           local.span);
     auto make_inner_type = [&](const FlatMirShape& shape,
                                Span span) -> FrontendResult<const rir::Type*> {
         if (shape.type == MirTypeKind::Variant) {
@@ -2855,64 +3023,22 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
     if (term.kind == MirTerminatorKind::Branch) {
         if (!term.use_cmp && term.cond.kind == MirValueKind::IfElse &&
             term.cond.type == MirTypeKind::Bool && !term.cond.may_error) {
-            std::function<FrontendResult<void>(const MirValue&, rir::BlockId, rir::BlockId)>
-                emit_lazy_bool_branch;
-            emit_lazy_bool_branch = [&](const MirValue& value,
-                                        rir::BlockId true_block,
-                                        rir::BlockId false_block) -> FrontendResult<void> {
-                if (value.kind == MirValueKind::IfElse && value.type == MirTypeKind::Bool &&
-                    !value.may_error && value.lhs != nullptr && value.rhs != nullptr &&
-                    value.args.len == 1 && value.args[0] != nullptr) {
-                    auto cond = materialize_value(*value.lhs,
-                                                  mir,
-                                                  variant_infos,
-                                                  tuple_infos,
-                                                  tuple_info_count,
-                                                  error_scalar_infos,
-                                                  error_variant_infos,
-                                                  error_struct_infos,
-                                                  user_struct_defs,
-                                                  b,
-                                                  locals,
-                                                  local_count,
-                                                  term.span);
-                    if (!cond) return core::make_unexpected(cond.error());
-                    auto then_eval = b.create_block(fn, lit("lazy_bool_then"));
-                    auto else_eval = b.create_block(fn, lit("lazy_bool_else"));
-                    if (!then_eval || !else_eval)
-                        return frontend_error(FrontendError::OutOfMemory, term.span);
-                    if (!b.emit_br(cond.value(),
-                                   then_eval.value(),
-                                   else_eval.value(),
-                                   {term.span.line, term.span.col}))
-                        return frontend_error(FrontendError::OutOfMemory, term.span);
-                    b.set_insert_point(fn, then_eval.value());
-                    auto then_result = emit_lazy_bool_branch(*value.rhs, true_block, false_block);
-                    if (!then_result) return core::make_unexpected(then_result.error());
-                    b.set_insert_point(fn, else_eval.value());
-                    return emit_lazy_bool_branch(*value.args[0], true_block, false_block);
-                }
-                auto cond = materialize_value(value,
-                                              mir,
-                                              variant_infos,
-                                              tuple_infos,
-                                              tuple_info_count,
-                                              error_scalar_infos,
-                                              error_variant_infos,
-                                              error_struct_infos,
-                                              user_struct_defs,
-                                              b,
-                                              locals,
-                                              local_count,
-                                              term.span);
-                if (!cond) return core::make_unexpected(cond.error());
-                if (!b.emit_br(
-                        cond.value(), true_block, false_block, {term.span.line, term.span.col}))
-                    return frontend_error(FrontendError::OutOfMemory, term.span);
-                return {};
-            };
-            return emit_lazy_bool_branch(
-                term.cond, block_ids[term.then_block], block_ids[term.else_block]);
+            return emit_lazy_bool_branch(term.cond,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         fn,
+                                         block_ids[term.then_block],
+                                         block_ids[term.else_block],
+                                         locals,
+                                         local_count,
+                                         term.span);
         }
         rir::ValueId cond_id{};
         if (term.use_cmp) {
@@ -4492,8 +4618,15 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         };
 
         u32 error_local_count = 0;
+        bool has_lazy_bool_local = false;
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
             if (local_needs_error_prelude(mir.functions[i].locals[li])) error_local_count++;
+            const auto& local = mir.functions[i].locals[li];
+            const auto shape = resolved_shape(mir, local);
+            if (!local.may_error && !local.may_nil && shape.type == MirTypeKind::Bool &&
+                local.init.kind == MirValueKind::IfElse && !local.init.is_eager_fallback &&
+                !local.init.is_pipe_conditional)
+                has_lazy_bool_local = true;
         }
         const bool has_error_prelude = error_local_count != 0;
         rir::BlockId prelude_block{};
@@ -4504,6 +4637,15 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
             }
             prelude_block = block.value();
+        }
+        rir::BlockId local_init_block{};
+        if (!has_error_prelude && has_lazy_bool_local) {
+            auto block = b.create_block(fn.value(), lit("local_init"));
+            if (!block) {
+                out.destroy();
+                return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+            }
+            local_init_block = block.value();
         }
 
         rir::BlockId block_ids[MirFunction::kMaxBlocks]{};
@@ -4532,7 +4674,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 }
                 resume_blocks[ri] = block_ids[mir.functions[i].resume_blocks[ri]];
             }
-            if (has_error_prelude) resume_blocks[0] = prelude_block;
+            if (has_error_prelude)
+                resume_blocks[0] = prelude_block;
+            else if (has_lazy_bool_local)
+                resume_blocks[0] = local_init_block;
             if (!b.set_explicit_resume_blocks(
                     fn.value(), resume_blocks, mir.functions[i].waits.len + 1)) {
                 out.destroy();
@@ -4542,7 +4687,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             if (mir.functions[i].resume_terminal_block >= mir.functions[i].blocks.len ||
                 !b.set_state_zero_entry_resume(fn.value(),
                                                block_ids[mir.functions[i].resume_terminal_block],
-                                               has_error_prelude ? prelude_block : block_ids[0])) {
+                                               has_error_prelude     ? prelude_block
+                                               : has_lazy_bool_local ? local_init_block
+                                                                     : block_ids[0])) {
                 out.destroy();
                 return frontend_error(FrontendError::UnsupportedSyntax, mir.functions[i].span);
             }
@@ -4566,7 +4713,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
         }
 
-        b.set_insert_point(fn.value(), has_error_prelude ? prelude_block : block_ids[0]);
+        b.set_insert_point(fn.value(),
+                           has_error_prelude     ? prelude_block
+                           : has_lazy_bool_local ? local_init_block
+                                                 : block_ids[0]);
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
@@ -4581,6 +4731,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                                               error_struct_def.value(),
                                               user_struct_defs,
                                               b,
+                                              fn.value(),
                                               local_vals,
                                               MirFunction::kMaxLocals,
                                               mir.functions[i].name,
@@ -4590,6 +4741,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return core::make_unexpected(val.error());
             }
             local_vals[mir.functions[i].locals[li].ref_index] = val.value();
+        }
+
+        if (!has_error_prelude && has_lazy_bool_local &&
+            !b.emit_jmp(block_ids[0], {mir.functions[i].span.line, mir.functions[i].span.col})) {
+            out.destroy();
+            return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
 
         if (has_error_prelude) {

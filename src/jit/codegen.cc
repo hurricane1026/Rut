@@ -1766,6 +1766,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::Phi: {
+            LLVMValueRef phi = c.get_value(inst.result);
+            LLVMValueRef incoming_values[2] = {c.get_value(inst.operands[0]),
+                                               c.get_value(inst.operands[1])};
+            LLVMBasicBlockRef incoming_blocks[2] = {c.block_map[inst.imm.block_targets[0].id],
+                                                    c.block_map[inst.imm.block_targets[1].id]};
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            c.set_value(inst.result, phi);
+            break;
+        }
         case rir::Opcode::CtxStoreSlotI32: {
             const u32 slot = static_cast<u32>(inst.imm.i32_val);
             LLVMValueRef count_off =
@@ -2055,6 +2065,19 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         auto& blk = fn.blocks[i];
         const char* label = blk.label.ptr ? blk.label.ptr : "bb";
         c.block_map[blk.id.id] = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, label);
+    }
+    // Phi results may be referenced by blocks that appear earlier in the RIR
+    // storage order. Create every LLVM phi node up front; incoming values are
+    // attached when the owning RIR block is emitted after its predecessors.
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            const auto& inst = blk.insts[ii];
+            if (inst.op != rir::Opcode::Phi) continue;
+            LLVMPositionBuilderAtEnd(c.builder, c.block_map[blk.id.id]);
+            LLVMTypeRef ty = c.map_type(fn.values[inst.result.id].type);
+            c.set_value(inst.result, LLVMBuildPhi(c.builder, ty, "phi"));
+        }
     }
 
     // Whether this handler reads the request at all — gates the one-time

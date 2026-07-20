@@ -358,6 +358,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::Select:
             buf.put_cstr("select");
             break;
+        case Opcode::Phi:
+            buf.put_cstr("phi");
+            break;
         case Opcode::TraceFuncEnter:
             buf.put_cstr("trace.func_enter");
             break;
@@ -692,6 +695,17 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[1]);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[2]);
+            break;
+        case Opcode::Phi:
+            buf.put_cstr(" [");
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", block");
+            buf.put_u32(inst.imm.block_targets[0].id);
+            buf.put_cstr("], [");
+            print_value_ref(buf, inst.operands[1]);
+            buf.put_cstr(", block");
+            buf.put_u32(inst.imm.block_targets[1].id);
+            buf.put(']');
             break;
         case Opcode::StructCreate:
             buf.put(' ');

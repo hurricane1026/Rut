@@ -1826,6 +1826,39 @@ TEST(jit, string_list_producers_respect_lazy_boolean_branches) {
     rir.destroy();
 }
 
+TEST(jit, lazy_boolean_local_does_not_materialize_untaken_string_list_branch) {
+    const char* src =
+        "route GET \"/search\" { let ok = req.http10 && req.queryAll(\"x\").len > 0 if ok { "
+        "return 400 } else { return 204 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    std::string request = "GET /search?";
+    for (u32 i = 0; i < 9000; i++) request += i == 0 ? "x=a" : "&x=a";
+    request += " HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request.data()), request.size(), nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 204u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_query_string_any_fallback) {
     const char* src =
         "route GET \"/search\" { let raw = any(req.queryString, \"\") if raw == "
@@ -7922,6 +7955,20 @@ TEST(helpers, request_multi_values_preserve_empty_query_names) {
     CHECK_EQ(rut_helper_req_query_all(bytes, sizeof(req) - 1, "", 0, values, 2), 2u);
     CHECK(values[0].eq({"a", 1}));
     CHECK(values[1].eq({"b", 1}));
+}
+
+TEST(helpers, request_multi_values_ignore_trailing_query_separators) {
+    static const char one[] = "GET /search?=a& HTTP/1.1\r\nHost: x\r\n\r\n";
+    Str value{};
+    CHECK_EQ(rut_helper_req_query_all(
+                 reinterpret_cast<const u8*>(one), sizeof(one) - 1, "", 0, &value, 1),
+             1u);
+    CHECK(value.eq({"a", 1}));
+
+    static const char none[] = "GET /search?& HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK_EQ(rut_helper_req_query_all(
+                 reinterpret_cast<const u8*>(none), sizeof(none) - 1, "", 0, nullptr, 0),
+             0u);
 }
 
 TEST(helpers, req_query_ignores_fragment_suffix) {
