@@ -146,6 +146,7 @@ bool reject_route_selection(void*, const harness::Observation& event) {
 struct ResponseObservation {
     bool seen = false;
     u64 status = 0;
+    u64 timestamp_us = 0;
 };
 
 bool capture_response_observation(void* context, const harness::Observation& event) {
@@ -153,6 +154,7 @@ bool capture_response_observation(void* context, const harness::Observation& eve
     auto* captured = static_cast<ResponseObservation*>(context);
     captured->seen = true;
     captured->status = event.value0;
+    captured->timestamp_us = event.timestamp_us;
     return true;
 }
 
@@ -606,8 +608,12 @@ TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
     scenario.now_us = 999;
     scenario.environment = &environment;
     scenario.expected = {true, jit::HandlerAction::ReturnStatus, 204};
+    ResponseObservation observed{};
+    auto spec = scripted_scenario_harness();
+    spec.observations.context = &observed;
+    spec.observations.observe = &capture_response_observation;
 
-    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    const auto result = harness::drive_scenario(scenario, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 204);
@@ -616,6 +622,8 @@ TEST(harness_scenario, drives_real_source_with_scripted_upstream_completion) {
     CHECK_EQ(result.harness.fault_points_reached, 1u);
     CHECK_EQ(result.harness.faults_injected, 0u);
     CHECK_EQ(result.connection_invariant_violations, 0u);
+    REQUIRE(observed.seen);
+    CHECK_EQ(observed.timestamp_us, result.harness.virtual_time_us);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

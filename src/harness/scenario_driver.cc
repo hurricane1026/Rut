@@ -454,7 +454,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         (void)account_terminal_output(harness, out.harness, connection.connection, out.terminal);
 
     if (out.has_terminal && out.harness.outcome == Outcome::Passed)
-        (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);
+        (void)publish_terminal(harness, out.harness, out.terminal, out.harness.virtual_time_us);
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal &&
         !expectation_matches(scenario.expected, out.terminal)) {
