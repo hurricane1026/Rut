@@ -184,7 +184,8 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
 // handler's parse-cache prime (which parses raw HTTP/1 bytes) sees the request.
 // Returns the byte length, or 0 on missing pseudo-headers / overflow.
-inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap) {
+inline u32 h2_synth_h1_request(
+    const hpack::Header* hs, u32 n, u8* out, u32 cap, bool preserve_split_cookies = false) {
     Str method{nullptr, 0};
     Str path{nullptr, 0};
     Str authority{nullptr, 0};
@@ -211,8 +212,8 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
         (!put("host: ", 6) || !put(authority.ptr, authority.len) || !put("\r\n", 2)))
         return 0;
     for (u32 i = 0; i < n; i++) {
-        if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') continue;  // pseudo-headers
-        if (hs[i].name.eq(Str{"cookie", 6})) continue;                 // combined below
+        if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') continue;              // pseudo-headers
+        if (!preserve_split_cookies && hs[i].name.eq(Str{"cookie", 6})) continue;  // combined below
         // When :authority is present it already produced the Host line above; drop
         // a regular `host` field so the synthesized request (and any upstream we
         // proxy it to) doesn't carry two conflicting Host headers (:authority is
@@ -227,15 +228,17 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
     // downstream — routing, handler parsing, cookie rate-limit keys — sees the
     // full value instead of just the first field. Emitted after the other headers
     // (a second pass) so an interleaved header can't split the cookie line.
-    bool cookie_open = false;
-    for (u32 i = 0; i < n; i++) {
-        if (!hs[i].name.eq(Str{"cookie", 6})) continue;
-        if (!put(cookie_open ? "; " : "cookie: ", cookie_open ? 2 : 8) ||
-            !put(hs[i].value.ptr, hs[i].value.len))
-            return 0;
-        cookie_open = true;
+    if (!preserve_split_cookies) {
+        bool cookie_open = false;
+        for (u32 i = 0; i < n; i++) {
+            if (!hs[i].name.eq(Str{"cookie", 6})) continue;
+            if (!put(cookie_open ? "; " : "cookie: ", cookie_open ? 2 : 8) ||
+                !put(hs[i].value.ptr, hs[i].value.len))
+                return 0;
+            cookie_open = true;
+        }
+        if (cookie_open && !put("\r\n", 2)) return 0;
     }
-    if (cookie_open && !put("\r\n", 2)) return 0;
     if (!put("\r\n", 2)) return 0;
     return o;
 }
@@ -397,8 +400,11 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     // large-but-legal h2 header block exceeds the HTTP/1 synth cap.
     u32 synth_len = 0;
     if (action == RouteAction::JitHandler) {
-        synth_len =
-            h2_synth_h1_request(headers, nheaders, h2->pending_synth, Http2Conn::kBodySynthCap);
+        synth_len = h2_synth_h1_request(headers,
+                                        nheaders,
+                                        h2->pending_synth,
+                                        Http2Conn::kBodySynthCap,
+                                        /*preserve_split_cookies=*/true);
         if (synth_len == 0) {
             h2_emit_status(d, stream_id, 400);
             return false;
@@ -1062,7 +1068,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             }
             // No body dependency to wait for — invoke now.
             u8 synth[Http2Conn::kBodySynthCap];
-            const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
+            const u32 kSynthLen = h2_synth_h1_request(
+                headers, nheaders, synth, sizeof(synth), /*preserve_split_cookies=*/true);
             if (kSynthLen == 0) {
                 h2_emit_status(d, stream_id, 400);
                 return;

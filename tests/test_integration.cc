@@ -8,6 +8,7 @@
 #if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/jit/runtime_helpers.h"
 #endif
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
@@ -1648,8 +1649,7 @@ TEST(rate_limit, needs_req_buf_only_for_buffer_keys) {
 }
 
 // HTTP/2 may split Cookie into multiple `cookie` fields; the HTTP/1 synthesis
-// must join them into one `cookie:` header so cookie rate-limit keys (and the
-// handler) see the full value rather than only the first field.
+// must join them into one `cookie:` header for proxy and rate-limit consumers.
 TEST(http2_synth, combines_split_cookie_fields) {
     using namespace rut;
     hpack::Header hs[] = {
@@ -1682,6 +1682,33 @@ TEST(http2_synth, combines_split_cookie_fields) {
     CHECK_EQ(count("cookie: a=1; sid=xyz\r\n"), 1);  // values joined, RFC 6265 form
     CHECK_EQ(count("x-test: y\r\n"), 1);             // interleaved header preserved
 }
+
+#if RUT_ENABLE_JIT_TESTS
+TEST(http2_synth, jit_view_preserves_split_cookie_fields_for_get_all) {
+    using namespace rut;
+    hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":path", 5}, {"/api", 4}},
+        {{"cookie", 6}, {"a=1", 3}},
+        {{"x-test", 6}, {"y", 1}},
+        {{"cookie", 6}, {"sid=xyz", 7}},
+    };
+    u8 out[512];
+    const u32 kLen = h2_synth_h1_request(hs, 5, out, sizeof(out), /*preserve_split_cookies=*/true);
+    REQUIRE(kLen > 0);
+    Str cookies[2]{};
+    REQUIRE_EQ(rut_helper_req_header_all(out, kLen, "cookie", 6, cookies, 2), 2u);
+    CHECK(cookies[0].eq(Str{"a=1", 3}));
+    CHECK(cookies[1].eq(Str{"sid=xyz", 7}));
+
+    u8 has_value = 0;
+    const char* value = nullptr;
+    u32 value_len = 0;
+    rut_helper_req_cookie(out, kLen, "sid", 3, &has_value, &value, &value_len);
+    CHECK_EQ(has_value, 1u);
+    CHECK((Str{value, value_len}.eq(Str{"xyz", 3})));
+}
+#endif
 
 // A single `by:` source (no list) and the param/query/cookie sources parse.
 TEST(rate_limit_dsl, by_single_source) {
