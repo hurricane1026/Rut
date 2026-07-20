@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir_builder.h"
 #include "rut/jit/handler_abi.h"
+#include <functional>
 
 namespace rut {
 
@@ -2852,6 +2853,67 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                       const rir::ValueId* locals,
                                       u32 local_count) {
     if (term.kind == MirTerminatorKind::Branch) {
+        if (!term.use_cmp && term.cond.kind == MirValueKind::IfElse &&
+            term.cond.type == MirTypeKind::Bool && !term.cond.may_error) {
+            std::function<FrontendResult<void>(const MirValue&, rir::BlockId, rir::BlockId)>
+                emit_lazy_bool_branch;
+            emit_lazy_bool_branch = [&](const MirValue& value,
+                                        rir::BlockId true_block,
+                                        rir::BlockId false_block) -> FrontendResult<void> {
+                if (value.kind == MirValueKind::IfElse && value.type == MirTypeKind::Bool &&
+                    !value.may_error && value.lhs != nullptr && value.rhs != nullptr &&
+                    value.args.len == 1 && value.args[0] != nullptr) {
+                    auto cond = materialize_value(*value.lhs,
+                                                  mir,
+                                                  variant_infos,
+                                                  tuple_infos,
+                                                  tuple_info_count,
+                                                  error_scalar_infos,
+                                                  error_variant_infos,
+                                                  error_struct_infos,
+                                                  user_struct_defs,
+                                                  b,
+                                                  locals,
+                                                  local_count,
+                                                  term.span);
+                    if (!cond) return core::make_unexpected(cond.error());
+                    auto then_eval = b.create_block(fn, lit("lazy_bool_then"));
+                    auto else_eval = b.create_block(fn, lit("lazy_bool_else"));
+                    if (!then_eval || !else_eval)
+                        return frontend_error(FrontendError::OutOfMemory, term.span);
+                    if (!b.emit_br(cond.value(),
+                                   then_eval.value(),
+                                   else_eval.value(),
+                                   {term.span.line, term.span.col}))
+                        return frontend_error(FrontendError::OutOfMemory, term.span);
+                    b.set_insert_point(fn, then_eval.value());
+                    auto then_result = emit_lazy_bool_branch(*value.rhs, true_block, false_block);
+                    if (!then_result) return core::make_unexpected(then_result.error());
+                    b.set_insert_point(fn, else_eval.value());
+                    return emit_lazy_bool_branch(*value.args[0], true_block, false_block);
+                }
+                auto cond = materialize_value(value,
+                                              mir,
+                                              variant_infos,
+                                              tuple_infos,
+                                              tuple_info_count,
+                                              error_scalar_infos,
+                                              error_variant_infos,
+                                              error_struct_infos,
+                                              user_struct_defs,
+                                              b,
+                                              locals,
+                                              local_count,
+                                              term.span);
+                if (!cond) return core::make_unexpected(cond.error());
+                if (!b.emit_br(
+                        cond.value(), true_block, false_block, {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::OutOfMemory, term.span);
+                return {};
+            };
+            return emit_lazy_bool_branch(
+                term.cond, block_ids[term.then_block], block_ids[term.else_block]);
+        }
         rir::ValueId cond_id{};
         if (term.use_cmp) {
             const auto lhs_shape = resolved_shape(mir, term.lhs);

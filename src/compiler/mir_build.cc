@@ -1100,6 +1100,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // (unnameable by design) but their init is the side effect itself —
             // dropping one would silently delete the write.
             if (module.routes[i].locals[li].name.len == 0 &&
+                module.routes[i].locals[li].type != HirTypeKind::StrList &&
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&

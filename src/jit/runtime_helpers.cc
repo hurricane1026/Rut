@@ -483,7 +483,7 @@ void rut_helper_req_query(const u8* req_data,
 
 u32 rut_helper_req_query_all(
     const u8* req_data, u32 req_len, const char* name, u32 name_len, Str* out, u32 cap) {
-    if (!name || name_len == 0) return 0;
+    if (!name && name_len != 0) return 0;
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok || pc.req.path.len == 0) return 0;
 
@@ -516,7 +516,8 @@ u32 rut_helper_req_query_all(
             while (pos < query_len && query[pos] != '&') pos++;
             val_end = pos;
         }
-        if (key_end - key_start == name_len && memcmp(query + key_start, name, name_len) == 0) {
+        if (key_end - key_start == name_len &&
+            (name_len == 0 || memcmp(query + key_start, name, name_len) == 0)) {
             if (out && count < cap) out[count] = {query + val_start, val_end - val_start};
             count++;
         }
