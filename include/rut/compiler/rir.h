@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/rate_limit_key_spec.h"
+#include "rut/common/response_limits.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 
@@ -442,6 +443,7 @@ struct Module {
     static constexpr u32 kMaxResponseBodies = 128;
     Str response_bodies[kMaxResponseBodies];
     u32 response_body_count = 0;
+    u32 response_body_pool_used = 0;
 
     // Response header sets collected from RetStatus terminators. Shape
     // is the flat-pool design (decision B2): all (key, value) pairs

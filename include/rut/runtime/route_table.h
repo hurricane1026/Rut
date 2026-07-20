@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/response_limits.h"
 #include "rut/common/types.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -130,7 +131,7 @@ struct RouteConfig {
     // HandlerResult.upstream_id for ReturnStatus (0 = no custom body,
     // use the default status reason phrase).
     static constexpr u32 kMaxResponseBodies = 128;
-    static constexpr u32 kResponseBodyPoolBytes = 8 * 1024;
+    static constexpr u32 kResponseBodyPoolBytes = rut::kResponseBodyPoolBytes;
     // Response-headers tables. Parallel to response_bodies but
     // independently indexed (JIT handlers pack a separate `headers_idx`
     // into HandlerResult.next_state for ReturnStatus, 0 = no custom

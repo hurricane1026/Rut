@@ -50,7 +50,8 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
-json({ users: [], total: 0 })           // object literal syntax ✅; json() lowering/runtime ⏳
+json({ users: [], total: 0 })           // literal object/array serialization ✅
+json({ path: req.path })                // dynamic/runtime serialization ⏳
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
@@ -223,6 +224,7 @@ resp.header("Retry-After")        // ✅ str?; observes prior set/add/remove mut
 resp.body = json(data)            // body
 resp.status                       // StatusCode, read/write
 return resp
+return 200, json({ ok: true, items: [] }) // ✅ compact literal JSON body
 ```
 
 Dynamic handler-local Response mutations require a direct route with no guards,

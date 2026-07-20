@@ -5,6 +5,7 @@
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include <deque>
+#include <memory>
 #include <string>
 
 namespace rut {
@@ -1383,7 +1384,14 @@ struct HirModule {
     // Holds HTTP routes (≤kMaxRoutes) plus synthesized timer routes (≤kMaxTimers).
     FixedVec<HirRoute, kMaxRoutes + kMaxTimers> routes;
     FixedVec<HirTypeShape, kMaxTypeShapes> type_shapes;
-    std::deque<std::string> owned_strings;
+    // Shared across HirModule copies so every copied Str view continues to
+    // reference stable bytes after the source module is destroyed.
+    mutable std::shared_ptr<std::deque<std::string>> owned_strings =
+        std::make_shared<std::deque<std::string>>();
+    // Recursive import analysis points this at the root module's storage so
+    // generated Str views copied out of an imported HIR remain valid. It is an
+    // analysis-only target; copied modules use their shared owned_strings.
+    mutable std::deque<std::string>* analysis_owned_strings = nullptr;
     bool has_package_decl = false;
     Span package_span{};
     Str package_name{};
@@ -1429,6 +1437,7 @@ struct HirModule {
         routes = other.routes;
         type_shapes = other.type_shapes;
         owned_strings = other.owned_strings;
+        analysis_owned_strings = nullptr;
         has_package_decl = other.has_package_decl;
         package_span = other.package_span;
         package_name = other.package_name;

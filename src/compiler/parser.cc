@@ -38,6 +38,10 @@ struct Parser {
     // scoped to arm bodies only).
     bool arm_body_stops_cross_line_dot = false;
     bool in_function_body = false;
+    // Object literals are expression-like only while parsing a call
+    // argument. A depth counter (rather than a one-token special case) keeps
+    // that context through transparent parentheses and nested arrays.
+    u32 object_call_arg_depth = 0;
     // Depth of enclosing `(...)` / `[...]` while parsing an arm body. The
     // newline-dot boundary only applies at the top level of the arm body: a
     // line-broken member access inside a call argument or group (e.g.
@@ -54,6 +58,14 @@ struct Parser {
         ~NestedDelimiterGuard() { parser->arm_body_dot_stop_depth--; }
         NestedDelimiterGuard(const NestedDelimiterGuard&) = delete;
         NestedDelimiterGuard& operator=(const NestedDelimiterGuard&) = delete;
+    };
+
+    struct CallArgGuard {
+        Parser* parser;
+        explicit CallArgGuard(Parser* p) : parser(p) { parser->object_call_arg_depth++; }
+        ~CallArgGuard() { parser->object_call_arg_depth--; }
+        CallArgGuard(const CallArgGuard&) = delete;
+        CallArgGuard& operator=(const CallArgGuard&) = delete;
     };
 
     const Token& cur() const { return toks->tokens[pos]; }
@@ -325,7 +337,7 @@ struct Parser {
             if (!field_name) return core::make_unexpected(field_name.error());
             auto colon = expect(TokenType::Colon);
             if (!colon) return core::make_unexpected(colon.error());
-            auto field_value = parse_expr();
+            auto field_value = parse_call_arg();
             if (!field_value) return core::make_unexpected(field_value.error());
             auto field_value_ptr = alloc_expr(field_value.value());
             if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -343,35 +355,46 @@ struct Parser {
         return object;
     }
 
+    FrontendResult<AstExpr> parse_array_literal(bool objects_allowed) {
+        const Token start = cur();
+        auto lbracket = expect(TokenType::LBracket);
+        if (!lbracket) return core::make_unexpected(lbracket.error());
+        NestedDelimiterGuard nested(this);
+        AstExpr arr{};
+        arr.kind = AstExprKind::ArrayLit;
+        while (!take(TokenType::RBracket)) {
+            // Preserve the surrounding expression context recursively: object
+            // literals are accepted in arrays only when the array itself is a
+            // call argument (or nested inside one).
+            auto elem = objects_allowed ? parse_call_arg() : parse_expr();
+            if (!elem) return core::make_unexpected(elem.error());
+            auto elem_ptr = alloc_expr(elem.value());
+            if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
+            if (!arr.args.push(elem_ptr.value()))
+                return frontend_error(FrontendError::TooManyItems, elem->span);
+            if (take(TokenType::RBracket)) break;
+            auto comma = expect(TokenType::Comma);
+            if (!comma) return core::make_unexpected(comma.error());
+        }
+        arr.span = Span{start.start, prev().end, start.line, start.col};
+        return arr;
+    }
+
     FrontendResult<AstExpr> parse_call_arg() {
-        if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        CallArgGuard call_arg(this);
         return parse_expr();
     }
 
     FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
+        if (cur().type == TokenType::LBrace && object_call_arg_depth != 0)
+            return parse_object_call_arg();
         if (cur().type == TokenType::LBrace)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(cur()), kObjectCallArgDetail);
-        if (take(TokenType::LBracket)) {
-            NestedDelimiterGuard nested(this);
-            AstExpr arr{};
-            arr.kind = AstExprKind::ArrayLit;
-            while (!take(TokenType::RBracket)) {
-                auto elem = parse_expr();
-                if (!elem) return core::make_unexpected(elem.error());
-                auto elem_ptr = alloc_expr(elem.value());
-                if (!elem_ptr) return core::make_unexpected(elem_ptr.error());
-                if (!arr.args.push(elem_ptr.value()))
-                    return frontend_error(FrontendError::TooManyItems, elem->span);
-                if (take(TokenType::RBracket)) break;
-                auto comma = expect(TokenType::Comma);
-                if (!comma) return core::make_unexpected(comma.error());
-            }
-            arr.span = Span{start.start, prev().end, start.line, start.col};
-            return arr;
-        }
+        if (cur().type == TokenType::LBracket)
+            return parse_array_literal(object_call_arg_depth != 0);
         if (take(TokenType::LParen)) {
             NestedDelimiterGuard nested(this);
             auto first = parse_expr();
@@ -1381,11 +1404,16 @@ struct Parser {
             stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             if (take(TokenType::Comma)) {
-                auto body_tok = expect(TokenType::StringLit);
-                if (!body_tok) return core::make_unexpected(body_tok.error());
-                stmt.response_body = body_tok.value()->text;
+                if (const Token* body = take(TokenType::StringLit)) {
+                    stmt.response_body = body->text;
+                    stmt.span.end = body->end;
+                } else {
+                    auto body_expr = parse_expr();
+                    if (!body_expr) return core::make_unexpected(body_expr.error());
+                    stmt.expr = body_expr.value();
+                    stmt.span.end = body_expr->span.end;
+                }
                 stmt.has_response_body = true;
-                stmt.span.end = body_tok.value()->end;
             }
             return stmt;
         }
@@ -1758,6 +1786,18 @@ struct Parser {
             if (!parsed) return core::make_unexpected(parsed.error());
             stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
+            if (take(TokenType::Comma)) {
+                if (const Token* body = take(TokenType::StringLit)) {
+                    stmt.response_body = body->text;
+                    stmt.span.end = body->end;
+                } else {
+                    auto body_expr = parse_expr();
+                    if (!body_expr) return core::make_unexpected(body_expr.error());
+                    stmt.expr = body_expr.value();
+                    stmt.span.end = body_expr->span.end;
+                }
+                stmt.has_response_body = true;
+            }
             return stmt;
         }
         if (take(TokenType::KwWait)) {

@@ -846,6 +846,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
 
 FrontendResult<MirModule*> build_mir(const HirModule& module) {
     auto* mir = new MirModule{};
+    mir->owned_strings = module.owned_strings;
 
     for (u32 i = 0; i < module.type_shapes.len; i++) {
         MirTypeShape shape{};

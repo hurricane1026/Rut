@@ -5,6 +5,9 @@
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
+#include <deque>
+#include <memory>
+#include <string>
 
 namespace rut {
 
@@ -499,6 +502,9 @@ struct MirModule {
     FixedVec<MirVariant, kMaxVariants> variants;
     FixedVec<MirFunction, kMaxFunctions> functions;
     FixedVec<MirTypeShape, kMaxTypeShapes> type_shapes;
+    // Retains storage for generated Str views copied from HIR (for example,
+    // serialized JSON response bodies) through MIR-to-RIR lowering.
+    std::shared_ptr<std::deque<std::string>> owned_strings;
 
     MirModule() = default;
     MirModule(const MirModule& other)
@@ -507,7 +513,8 @@ struct MirModule {
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
-          type_shapes(other.type_shapes) {}
+          type_shapes(other.type_shapes),
+          owned_strings(other.owned_strings) {}
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
@@ -516,6 +523,7 @@ struct MirModule {
         variants = other.variants;
         functions = other.functions;
         type_shapes = other.type_shapes;
+        owned_strings = other.owned_strings;
         return *this;
     }
     MirModule(MirModule&& other) noexcept
@@ -524,7 +532,8 @@ struct MirModule {
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
-          type_shapes(other.type_shapes) {}
+          type_shapes(other.type_shapes),
+          owned_strings(std::move(other.owned_strings)) {}
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
         upstreams = other.upstreams;
@@ -533,6 +542,7 @@ struct MirModule {
         variants = other.variants;
         functions = other.functions;
         type_shapes = other.type_shapes;
+        owned_strings = std::move(other.owned_strings);
         return *this;
     }
 };
