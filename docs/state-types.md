@@ -37,8 +37,9 @@ returns `-E2BIG`; `LRU_HASH` evicts). We adopt the split: the lossy
 slot table is named **`Cache`** — the universal prior for a cache
 ("entries may vanish; a miss is normal; always handle it") produces
 exactly the right calling code, including from LLMs trained on that
-prior. **`Hash` is reserved** for a possible future strict table
-(visible failure when full) and until then is not a Rut name at all.
+prior. **`Hash` is reserved** for the accepted strict-table design in
+`docs/hash-state.md` (visible failure when full, plus owner-shard atomic
+`update`) and until its implementation lands is not a Rut name at all.
 A type named `Hash` must honor the lossless prior or must not exist.
 
 The user-facing red line that follows (normative, DESIGN.md §3.3.6):

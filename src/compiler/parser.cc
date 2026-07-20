@@ -880,14 +880,30 @@ struct Parser {
                     method.kind = AstExprKind::MethodCall;
                     method.lhs = lhs_ptr.value();
                     method.name = field.name;
+                    method.type_args = field.type_args;
                     method.span = field.span;
                     if (!take(TokenType::RParen)) {
                         while (true) {
+                            Str arg_label{};
+                            if (cur().type == TokenType::Ident && peek().type == TokenType::Colon) {
+                                const bool mark_label =
+                                    lhs_ptr.value()->kind == AstExprKind::Ident &&
+                                    lhs_ptr.value()->name.eq({"upstream", 8}) &&
+                                    field.name.eq({"mark", 4});
+                                if (!mark_label)
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(cur()));
+                                arg_label = cur().text;
+                                pos++;
+                                pos++;  // ':'
+                            }
                             auto arg = parse_call_arg();
                             if (!arg) return core::make_unexpected(arg.error());
                             auto arg_ptr = alloc_expr(arg.value());
                             if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
                             if (!method.args.push(arg_ptr.value()))
+                                return frontend_error(FrontendError::TooManyItems, arg->span);
+                            if (!method.arg_labels.push(arg_label))
                                 return frontend_error(FrontendError::TooManyItems, arg->span);
                             if (take(TokenType::RParen)) break;
                             auto comma = expect(TokenType::Comma);
@@ -2037,14 +2053,15 @@ struct Parser {
         // explicit and consistent with `return response(...)`.
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
-        // Bare method-call statement (`buckets.set(k, v)`): the only
-        // expression form accepted in statement position. Analyze restricts
-        // it further (cache state writes only, before guards/waits).
-        if (cur().type == TokenType::Ident) {
+        // Bare effect statement. Receiver calls cover state/header mutations
+        // and upstream.mark(...); reload() is the sole receiver-less form.
+        // Analyze performs the context and statement-only checks.
+        if (cur().type == TokenType::Ident || cur().type == TokenType::KwUpstream) {
             const Token start_tok = cur();
             auto expr = parse_expr();
             if (!expr) return core::make_unexpected(expr.error());
-            if (expr->kind == AstExprKind::MethodCall) {
+            if (expr->kind == AstExprKind::MethodCall ||
+                (expr->kind == AstExprKind::Call && expr->name.eq({"reload", 6}))) {
                 AstStatement stmt{};
                 stmt.kind = AstStmtKind::Expr;
                 stmt.expr = expr.value();

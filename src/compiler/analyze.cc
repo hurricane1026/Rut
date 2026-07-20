@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/response_limits.h"
 #include "rut/common/shard_limits.h"
+#include "rut/compiler/builtin_decls.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/route_method.h"
@@ -35,6 +36,8 @@ constexpr Str kJsonLiteralDetail =
     lit_str("json currently accepts only literal bool/int/string/nil/array/object values");
 constexpr Str kReturnBodyExprDetail =
     lit_str("return body expressions currently support json(literal) only");
+constexpr Str kControlPlaneOrderDetail = lit_str(
+    "control-plane statements currently require a straight-line route without guard/wait/for");
 
 static constexpr u32 kMaxJsonLiteralBytes = 64 * 1024;
 
@@ -280,6 +283,10 @@ constexpr Str kStateDeclDetail = lit_str(
 constexpr Str kCacheCapacityDetail = lit_str(
     "Cache capacity must be a positive int literal (slot count, rounded up "
     "to a power of two; capacity is capped at 4194304 slots)");
+constexpr Str kCacheBackendReservedDetail = lit_str(
+    "backend: on Cache is reserved — lossy Cache has no cross-node read "
+    "freshness/invalidation or atomic-update contract; keep source-of-truth "
+    "state external until backend state semantics are implemented");
 constexpr Str kCacheDupNameDetail = lit_str("duplicate Cache declaration name");
 constexpr Str kCacheGetDetail =
     lit_str("cache.get(key) expects exactly one plain IP key (e.g. req.remoteAddr)");
@@ -302,6 +309,9 @@ constexpr Str kStrListWaitDetail = lit_str(
     "consume the list before wait");
 constexpr Str kStrListCompositeDetail =
     lit_str("request string-list values cannot be stored in struct fields or variant payloads yet");
+constexpr Str kAdminSnapshotWaitDetail = lit_str(
+    "control-plane snapshots in routes containing wait are not supported yet — "
+    "snapshots do not have a carrier that survives suspension");
 constexpr Str kCacheNameCollisionDetail = lit_str(
     "Cache declaration name collides with another binding or a builtin "
     "receiver (req/resp/time/bitwise) — the cache would be unreachable");
@@ -374,6 +384,8 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Stats:
+        case HirTypeKind::Metrics:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
             return true;
@@ -468,7 +480,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
                         type == HirTypeKind::I64 || type == HirTypeKind::Str ||
                         type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-                        type == HirTypeKind::IP || type == HirTypeKind::Response;
+                        type == HirTypeKind::IP || type == HirTypeKind::Response ||
+                        type == HirTypeKind::Stats || type == HirTypeKind::Metrics;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -2020,6 +2033,8 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq({"Stats", 5})) return HirTypeKind::Stats;
+    if (name.eq({"Metrics", 7})) return HirTypeKind::Metrics;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
@@ -2032,6 +2047,10 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
         return HirTypeKind::Struct;
     }
     return HirTypeKind::Unknown;
+}
+
+static bool is_reserved_snapshot_type_name(Str name) {
+    return name.eq({"Stats", 5}) || name.eq({"Metrics", 7});
 }
 
 static bool ast_type_ref_contains_response(const AstTypeRef& ref) {
@@ -3523,6 +3542,136 @@ static bool hir_contains_fallible_has_value(const HirExpr* expr) {
         if (hir_contains_fallible_has_value(expr->field_inits[fi].value)) return true;
     return false;
 }
+
+static bool hir_contains_admin_snapshot(const HirExpr* expr) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::StatsSnapshot || expr->kind == HirExprKind::MetricsSnapshot)
+        return true;
+    if (hir_contains_admin_snapshot(expr->lhs) || hir_contains_admin_snapshot(expr->rhs))
+        return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_contains_admin_snapshot(expr->args[ai])) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_contains_admin_snapshot(expr->field_inits[fi].value)) return true;
+    return false;
+}
+
+static bool hir_contains_admin_effect(const HirExpr* expr) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::AdminReload || expr->kind == HirExprKind::AdminUpstreamMark ||
+        expr->kind == HirExprKind::AdminJson || expr->kind == HirExprKind::StatsSnapshot ||
+        expr->kind == HirExprKind::MetricsSnapshot)
+        return true;
+    if (hir_contains_admin_effect(expr->lhs) || hir_contains_admin_effect(expr->rhs)) return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_contains_admin_effect(expr->args[ai])) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_contains_admin_effect(expr->field_inits[fi].value)) return true;
+    return false;
+}
+
+static bool hir_references_local(const HirExpr* expr, u32 ref_index) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::LocalRef && expr->local_index == ref_index) return true;
+    if (hir_references_local(expr->lhs, ref_index) || hir_references_local(expr->rhs, ref_index))
+        return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_references_local(expr->args[ai], ref_index)) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_references_local(expr->field_inits[fi].value, ref_index)) return true;
+    return false;
+}
+
+static FrontendResult<void> reject_unretained_helper_admin_locals(const HirRoute& scratch,
+                                                                  const HirExpr& body,
+                                                                  Span span) {
+    const auto is_retained_statement_effect = [](HirExprKind kind) {
+        return kind == HirExprKind::CacheSet || kind == HirExprKind::ReqSetHeader ||
+               kind == HirExprKind::ReqAddHeader || kind == HirExprKind::RespSetHeader ||
+               kind == HirExprKind::RespAddHeader || kind == HirExprKind::RespRemoveHeader ||
+               kind == HirExprKind::AdminReload || kind == HirExprKind::AdminUpstreamMark;
+    };
+    bool live[HirRoute::kMaxLocals]{};
+    for (u32 li = 0; li < scratch.locals.len; li++) {
+        const u32 ref_index = scratch.locals[li].ref_index;
+        live[li] = is_retained_statement_effect(scratch.locals[li].init.kind) ||
+                   hir_references_local(&body, ref_index);
+        for (u32 gi = 0; gi < scratch.guards.len && !live[li]; gi++) {
+            const auto& guard = scratch.guards[gi];
+            live[li] = hir_references_local(&guard.cond, ref_index) ||
+                       (guard.fail_term.runtime_response_body_local_ref_index == ref_index);
+        }
+    }
+    for (u32 pass = 0; pass < scratch.locals.len; pass++) {
+        bool changed = false;
+        for (u32 li = 0; li < scratch.locals.len; li++) {
+            if (!live[li]) continue;
+            for (u32 dep = 0; dep < scratch.locals.len; dep++) {
+                if (!live[dep] &&
+                    hir_references_local(&scratch.locals[li].init, scratch.locals[dep].ref_index)) {
+                    live[dep] = true;
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) break;
+    }
+    for (u32 li = 0; li < scratch.locals.len; li++)
+        if (!live[li] && hir_contains_admin_effect(&scratch.locals[li].init))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                scratch.locals[li].span,
+                lit_str("control-plane expressions in helper locals must be retained by the "
+                        "helper result or response guard"));
+    return {};
+}
+
+static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route,
+                                                           const HirModule& mod) {
+    if (!route.is_ws_terminate) return {};
+    const auto reject = [&](Span span) -> FrontendResult<void> {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            span,
+            lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+    };
+    for (u32 li = 0; li < route.locals.len; li++) {
+        if (hir_contains_admin_effect(&route.locals[li].init)) return reject(route.locals[li].span);
+    }
+    auto terminator_has_snapshot_body = [](const HirTerminator& term) {
+        return term.runtime_response_body_type == HirTypeKind::Stats ||
+               term.runtime_response_body_type == HirTypeKind::Metrics;
+    };
+    for (u32 gi = 0; gi < route.guards.len; gi++) {
+        const auto& guard = route.guards[gi];
+        if (hir_contains_admin_effect(&guard.cond)) return reject(guard.span);
+        bool has_snapshot_body = terminator_has_snapshot_body(guard.fail_term);
+        if (guard.fail_kind == HirGuard::FailKind::Body) {
+            if (hir_contains_admin_effect(&guard.fail_body.cond)) return reject(guard.span);
+            for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+                if (hir_contains_admin_effect(&guard.fail_body.locals[li].init))
+                    return reject(guard.fail_body.locals[li].span);
+            has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.direct_term);
+            has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.then_term);
+            has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.else_term);
+        } else if (guard.fail_kind == HirGuard::FailKind::Match) {
+            if (hir_contains_admin_effect(&guard.fail_match_expr)) return reject(guard.span);
+            for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                const u32 arm_index = guard.fail_match_start + ai;
+                if (arm_index >= mod.guard_match_arms.len) return reject(guard.span);
+                const auto& arm = mod.guard_match_arms[arm_index];
+                if (hir_contains_admin_effect(&arm.pattern)) return reject(arm.span);
+                has_snapshot_body |= terminator_has_snapshot_body(arm.direct_term);
+            }
+        }
+        if (has_snapshot_body) return reject(guard.span);
+    }
+    if (route.ws_handler.has_forward_payload &&
+        (route.ws_handler.forward_payload_expr >= route.exprs.len ||
+         hir_contains_admin_effect(&route.exprs[route.ws_handler.forward_payload_expr])))
+        return reject(route.ws_handler.span);
+    return {};
+}
 static bool const_eval_expr(
     const HirExpr& expr, const HirLocal* locals, u32 local_count, ConstValue* out, u32 depth);
 static KnownErrorCase known_error_case(const HirExpr& expr,
@@ -3993,6 +4142,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         has_import_namespace(mod, expr.lhs->name)) {
+        for (u32 i = 0; i < expr.arg_labels.len; i++) {
+            if (expr.arg_labels[i].len != 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        }
         Str qualified_member{};
         AstExpr ns_field{};
         ns_field.kind = AstExprKind::Field;
@@ -4006,6 +4159,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         call_expr.span = expr.span;
         call_expr.name = qualified_member;
         call_expr.args = expr.args;
+        call_expr.type_args = expr.type_args;
         return analyze_call_expr(call_expr, route, mod, locals, local_count, binding, nullptr);
     }
     Str qualified_type_name{};
@@ -4035,6 +4189,44 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         !user_bound_ident_name(mod, locals, local_count, binding, {"bitwise", 7})) {
         return analyze_bitwise_namespace_call(
             expr, route, mod, locals, local_count, binding, nullptr);
+    }
+
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq({"upstream", 8}) && expr.name.eq({"mark", 4}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, {"upstream", 8})) {
+        if (!route->control_plane_stmt_ok || !route->is_timer || expr.type_args.len != 0 ||
+            expr.args.len != 2 || expr.arg_labels.len != 2 || expr.arg_labels[0].len != 0 ||
+            !expr.arg_labels[1].eq({"healthy", 7}) || expr.args[0] == nullptr ||
+            expr.args[0]->kind != AstExprKind::Ident || expr.args[1] == nullptr ||
+            user_bound_ident_name(mod, locals, local_count, binding, expr.args[0]->name))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        u32 upstream_index = mod.upstreams.len;
+        for (u32 ui = 0; ui < mod.upstreams.len; ui++) {
+            if (mod.upstreams[ui].name.eq(expr.args[0]->name)) {
+                upstream_index = ui;
+                break;
+            }
+        }
+        const u32 saved_guard_count = route->guards.len;
+        auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (upstream_index == mod.upstreams.len ||
+            (upstream_index < mod.upstreams.len &&
+             (!mod.upstreams[upstream_index].has_address ||
+              mod.upstreams[upstream_index].extra_count != 0)) ||
+            !healthy || healthy->type != HirTypeKind::Bool || healthy->may_nil ||
+            healthy->may_error || route->guards.len != saved_guard_count)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        route->control_plane_stmt_ok = false;
+        HirExpr out{};
+        out.kind = HirExprKind::AdminUpstreamMark;
+        out.type = HirTypeKind::Unknown;
+        out.span = expr.span;
+        out.upstream_index = upstream_index;
+        out.server_index = 0;
+        if (!route->exprs.push(healthy.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
     }
 
     // Cache<K, i64> instance receiver (DESIGN.md §3.3.6): an Ident
@@ -5546,6 +5738,26 @@ static FrontendResult<void> instantiate_function_respond_guards(
         guard.fail_term.status_code = src_guard.status_code;
         guard.fail_term.span = call_span;
         guard.fail_term.response_body = src_guard.response_body;
+        if (src_guard.runtime_response_body.type == HirTypeKind::Stats ||
+            src_guard.runtime_response_body.type == HirTypeKind::Metrics) {
+            auto body = instantiate_function_expr(src_guard.runtime_response_body,
+                                                  route,
+                                                  mod,
+                                                  args,
+                                                  arg_count,
+                                                  generic_bindings,
+                                                  generic_binding_count);
+            if (!body) return core::make_unexpected(body.error());
+            if (body->kind != HirExprKind::LocalRef && body->kind != HirExprKind::StatsSnapshot &&
+                body->kind != HirExprKind::MetricsSnapshot)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    call_span,
+                    lit_str("dynamic snapshot response bodies must retain a stable operand"));
+            guard.fail_term.runtime_response_body_type = body->type;
+            if (body->kind == HirExprKind::LocalRef)
+                guard.fail_term.runtime_response_body_local_ref_index = body->local_index;
+        }
         for (u32 hi = 0; hi < src_guard.response_headers.len; hi++) {
             const auto& hdr = src_guard.response_headers[hi];
             if (!guard.fail_term.response_headers.push({hdr.key, hdr.value}))
@@ -5665,10 +5877,11 @@ static bool collect_function_response_effects(HirFunction* fn,
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
-                                                  const HirLocal* locals,
-                                                  u32 local_count,
-                                                  const MatchPayloadBinding* binding,
-                                                  Str scoped_binding_name);
+                                                  const HirLocal* locals = nullptr,
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr,
+                                                  Str scoped_binding_name = {},
+                                                  HirRoute* runtime_body_route = nullptr);
 
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
                                                           HirRoute* scratch,
@@ -8577,8 +8790,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.span,
                                       lit_str("runtime string-list equality is not supported"));
-            if (lhs->type == HirTypeKind::Generic && !lhs->generic_has_eq_constraint)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (lhs->type == HirTypeKind::Generic) {
+                if (!lhs->generic_has_eq_constraint)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            } else {
+                bool struct_visiting[HirModule::kMaxStructs]{};
+                bool variant_visiting[HirModule::kMaxVariants]{};
+                if (!hir_type_shape_satisfies_eq_constraint(mod,
+                                                            lhs->type,
+                                                            lhs->variant_index,
+                                                            lhs->struct_index,
+                                                            lhs->tuple_len,
+                                                            lhs->tuple_types,
+                                                            lhs->tuple_variant_indices,
+                                                            lhs->tuple_struct_indices,
+                                                            struct_visiting,
+                                                            variant_visiting))
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            }
         } else {
             if (lhs->type == HirTypeKind::Generic) {
                 if (!lhs->generic_has_ord_constraint)
@@ -9041,11 +9270,68 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return {};
     };
 
+    // Control-plane snapshot declarations are checker-visible before their
+    // HandlerCtx/runtime lowering lands. This preserves distinct Stats and
+    // Metrics types instead of pretending either snapshot is a string.
+    if ((expr.name.eq({"stats", 5}) || expr.name.eq({"metrics", 7})) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        const BuiltinDecl* decl = find_control_plane_builtin(BuiltinReceiver::None, expr.name);
+        if (decl == nullptr || pipe_lhs != nullptr || first_arg_override != nullptr ||
+            expr.type_args.len != 0 || expr.args.len != decl->param_count)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("stats() and metrics() take no arguments"));
+        HirExpr out{};
+        out.kind =
+            expr.name.eq({"stats", 5}) ? HirExprKind::StatsSnapshot : HirExprKind::MetricsSnapshot;
+        out.type =
+            decl->return_type == BuiltinDeclType::Stats ? HirTypeKind::Stats : HirTypeKind::Metrics;
+        out.span = expr.span;
+        return out;
+    }
+
+    if (expr.name.eq({"reload", 6}) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (!route->control_plane_stmt_ok || route->is_timer || pipe_lhs != nullptr ||
+            first_arg_override != nullptr || expr.type_args.len != 0 || expr.args.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        route->control_plane_stmt_ok = false;
+        HirExpr out{};
+        out.kind = HirExprKind::AdminReload;
+        out.type = HirTypeKind::Unknown;
+        out.span = expr.span;
+        return out;
+    }
+
     if (expr.name.eq({"json", 4}) &&
         !user_bound_ident_name(mod, locals, local_count, binding, {"json", 4})) {
         if (pipe_lhs != nullptr || first_arg_override != nullptr || expr.args.len != 1 ||
             expr.args[0] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
+        // Dynamic JSON is limited to the two declared snapshot types. Analyze
+        // the operand so bindings (and eventually helper returns) retain the
+        // same behavior as an immediate stats()/metrics() call.
+        const u32 saved_exprs = route->exprs.len;
+        const u32 saved_guards = route->guards.len;
+        const u32 saved_locals = route->locals.len;
+        auto snapshot = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (snapshot &&
+            (snapshot->type == HirTypeKind::Stats || snapshot->type == HirTypeKind::Metrics) &&
+            !snapshot->may_nil && !snapshot->may_error) {
+            if (!route->exprs.push(snapshot.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirExpr out{};
+            out.kind = HirExprKind::AdminJson;
+            out.type = HirTypeKind::Str;
+            out.span = expr.span;
+            out.lhs = &route->exprs[route->exprs.len - 1];
+            return out;
+        }
+        // Literal JSON is serialized below. Discard any speculative HIR that
+        // ordinary expression analysis appended while probing its result type.
+        route->exprs.len = saved_exprs;
+        route->guards.len = saved_guards;
+        route->locals.len = saved_locals;
         std::string serialized;
         auto encoded = serialize_json_literal(*expr.args[0], serialized);
         if (!encoded) return core::make_unexpected(encoded.error());
@@ -9102,7 +9388,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // the fallback operand is EAGERLY evaluated, so a presence test
         // inside it must be kept (it consumes its carrier's runtime error).
         if (!lhs->may_nil && !lhs->may_error && !rhs->may_error &&
-            !hir_contains_fallible_has_value(rhs)) {
+            !hir_contains_fallible_has_value(rhs) && !hir_contains_admin_effect(rhs)) {
             HirExpr folded = *lhs;
             folded.span = expr.span;
             return folded;
@@ -9245,7 +9531,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // Same eager-evaluation rule as any(): dropping the never-missing
         // lhs must not discard a presence test it contains.
         if (!lhs->may_nil && !lhs->may_error && !rhs->may_error &&
-            !hir_contains_fallible_has_value(lhs)) {
+            !hir_contains_fallible_has_value(lhs) && !hir_contains_admin_effect(lhs)) {
             HirExpr folded = *rhs;
             folded.span = expr.span;
             return folded;
@@ -9971,31 +10257,34 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
-    struct ScopedListBinding {
+    struct ScopedArgBinding {
         u32 ref_index = 0xffffffffu;
         HirExpr init{};
     };
-    FixedVec<ScopedListBinding, AstExpr::kMaxArgs> scoped_list_bindings;
+    FixedVec<ScopedArgBinding, AstExpr::kMaxArgs> scoped_arg_bindings;
     u32 next_scoped_ref = 0;
     for (u32 li = 0; li < local_count; li++)
         if (locals[li].ref_index >= next_scoped_ref) next_scoped_ref = locals[li].ref_index + 1;
     for (u32 li = 0; li < route->locals.len; li++)
         if (route->locals[li].ref_index >= next_scoped_ref)
             next_scoped_ref = route->locals[li].ref_index + 1;
-    // Function bodies are inlined. Bind a direct runtime-list argument once
-    // inside the inlined expression so multiple parameter reads share it while
-    // an enclosing lazy boolean can still skip the whole call. Respond-capable
-    // helpers keep route-local materialization because their guards are hoisted
-    // into the route guard sequence and therefore intentionally execute there.
+    // Function bodies are inlined. Bind invocation-scoped values once inside
+    // the inlined expression so multiple parameter reads share a runtime list,
+    // eagerly evaluated snapshot arguments remain visible even when unused,
+    // and an enclosing lazy boolean can still skip the whole call.
+    // Respond-capable helpers keep route-local materialization because their
+    // guards are hoisted into the route guard sequence and intentionally run
+    // there.
     for (u32 i = 0; i < effective_arg_count; i++) {
-        if (analyzed_args[i].type != HirTypeKind::StrList ||
-            analyzed_args[i].kind == HirExprKind::LocalRef)
-            continue;
+        const bool needs_materialization = analyzed_args[i].type == HirTypeKind::StrList ||
+                                           analyzed_args[i].type == HirTypeKind::Stats ||
+                                           analyzed_args[i].type == HirTypeKind::Metrics;
+        if (!needs_materialization || analyzed_args[i].kind == HirExprKind::LocalRef) continue;
         const u32 ref_index = next_scoped_ref++;
         if (ref_index >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.span);
         if (fn.respond_guards.len == 0) {
-            if (!scoped_list_bindings.push({ref_index, analyzed_args[i]}))
+            if (!scoped_arg_bindings.push({ref_index, analyzed_args[i]}))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
         } else {
             HirLocal materialized{};
@@ -10038,8 +10327,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     auto return_typed = apply_return_type(inlined.value(), "direct");
     if (!return_typed) return core::make_unexpected(return_typed.error());
     inlined->span = expr.span;
-    for (u32 bi = scoped_list_bindings.len; bi > 0; bi--) {
-        const auto& binding = scoped_list_bindings[bi - 1];
+    for (u32 bi = scoped_arg_bindings.len; bi > 0; bi--) {
+        const auto& binding = scoped_arg_bindings[bi - 1];
         if (!route->exprs.push(binding.init) || !route->exprs.push(inlined.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         HirExpr scoped = inlined.value();
@@ -10249,10 +10538,11 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
-                                                  const HirLocal* locals = nullptr,
-                                                  u32 local_count = 0,
-                                                  const MatchPayloadBinding* binding = nullptr,
-                                                  Str scoped_binding_name = {}) {
+                                                  const HirLocal* locals,
+                                                  u32 local_count,
+                                                  const MatchPayloadBinding* binding,
+                                                  Str scoped_binding_name,
+                                                  HirRoute* runtime_body_route) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -10281,11 +10571,55 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     stmt.expr.args.len != 1 || stmt.expr.args[0] == nullptr)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
-                std::string serialized;
-                auto encoded =
-                    serialize_json_literal(*stmt.expr.args[0], serialized, kResponseBodyPoolBytes);
-                if (!encoded) return core::make_unexpected(encoded.error());
-                term.response_body = intern_module_string(mod, serialized);
+                const AstExpr& body_arg = *stmt.expr.args[0];
+                // Probe every expression shape through the ordinary analyzer;
+                // pipelines and other normalized forms can resolve to the same
+                // stable snapshot operands as direct calls and identifiers.
+                std::unique_ptr<HirRoute> body_scratch;
+                HirRoute* body_route = runtime_body_route;
+                if (body_route == nullptr) {
+                    body_scratch = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+                    if (!body_scratch)
+                        return frontend_error(FrontendError::OutOfMemory, body_arg.span);
+                    body_scratch->is_helper_scratch = true;
+                    body_route = body_scratch.get();
+                }
+                const u32 saved_exprs = body_route->exprs.len;
+                const u32 saved_guards = body_route->guards.len;
+                const u32 saved_locals = body_route->locals.len;
+                const bool saved_allow_respond_effects = body_route->allow_respond_effects;
+                body_route->allow_respond_effects = true;
+                auto snapshot =
+                    analyze_expr(body_arg, body_route, mod, locals, local_count, binding);
+                body_route->allow_respond_effects = saved_allow_respond_effects;
+                if (runtime_body_route == nullptr && body_route->guards.len != saved_guards)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        body_arg.span,
+                        lit_str("snapshot response helpers cannot discard nested response guards"));
+                const bool stable_snapshot_operand =
+                    snapshot && (snapshot->kind == HirExprKind::LocalRef ||
+                                 snapshot->kind == HirExprKind::StatsSnapshot ||
+                                 snapshot->kind == HirExprKind::MetricsSnapshot);
+                if (stable_snapshot_operand &&
+                    (snapshot->type == HirTypeKind::Stats ||
+                     snapshot->type == HirTypeKind::Metrics) &&
+                    !snapshot->may_nil && !snapshot->may_error) {
+                    term.runtime_response_body_type = snapshot->type;
+                    if (snapshot->kind == HirExprKind::LocalRef)
+                        term.runtime_response_body_local_ref_index = snapshot->local_index;
+                } else {
+                    body_route->exprs.len = saved_exprs;
+                    body_route->guards.len = saved_guards;
+                    body_route->locals.len = saved_locals;
+                }
+                if (term.runtime_response_body_type == HirTypeKind::Unknown) {
+                    std::string serialized;
+                    auto encoded =
+                        serialize_json_literal(body_arg, serialized, kResponseBodyPoolBytes);
+                    if (!encoded) return core::make_unexpected(encoded.error());
+                    term.response_body = intern_module_string(mod, serialized);
+                }
                 if (!term.response_headers.push(
                         {lit_str("Content-Type"), lit_str("application/json")}))
                     return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
@@ -10848,6 +11182,12 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 auto init = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_contains_admin_snapshot(&init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.span,
+                        lit_str("control-plane snapshots are not supported in branch-local "
+                                "bindings until lowering preserves arm ordering"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -11032,15 +11372,19 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         req_mutation_syntax ? kReqHeaderMutationOrderDetail : kCacheStmtDetail);
                 route->cache_set_stmt_ok = !req_mutation_syntax;
                 route->req_header_mutation_stmt_ok = req_mutation_syntax;
+                route->control_plane_stmt_ok = true;
                 const u32 guards_before_set = route->guards.len;
                 auto value = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 route->cache_set_stmt_ok = false;
                 route->req_header_mutation_stmt_ok = false;
+                route->control_plane_stmt_ok = false;
                 if (!value) return core::make_unexpected(value.error());
                 const bool supported_effect = value->kind == HirExprKind::CacheSet ||
                                               value->kind == HirExprKind::ReqSetHeader ||
-                                              value->kind == HirExprKind::ReqAddHeader;
+                                              value->kind == HirExprKind::ReqAddHeader ||
+                                              value->kind == HirExprKind::AdminReload ||
+                                              value->kind == HirExprKind::AdminUpstreamMark;
                 if (route->guards.len > guards_before_set || !supported_effect)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, inner.span, kCacheStmtDetail);
@@ -11130,6 +11474,12 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 auto init = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!init) return core::make_unexpected(init.error());
+                if (hir_contains_admin_snapshot(&init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        inner.span,
+                        lit_str("control-plane snapshots are not supported in guard-failure "
+                                "bindings until lowering preserves branch ordering"));
                 // Mirror the route-level let handler's ArrayLit-at-RHS gate
                 // (MIR has no ArrayLit lowering yet).
                 if (init->kind == HirExprKind::ArrayLit)
@@ -12193,7 +12543,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod, route->locals.data, route->locals.len, binding);
+    auto term = analyze_term(stmt, mod, route->locals.data, route->locals.len, binding, {}, route);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
     return {};
@@ -15156,6 +15506,7 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             if (expr.kind == HirExprKind::TimeNowMicros || expr.kind == HirExprKind::CacheGet ||
                 expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::RespHeader)
                 return true;
+            if (hir_contains_admin_effect(&expr)) return true;
             if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
             if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
             for (u32 i = 0; i < expr.args.len; i++)
@@ -15170,8 +15521,8 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 effect->lhs->span,
-                lit_str("chain after Response header values cannot read time, cache, or response "
-                        "state until effects execute at response time"));
+                lit_str("chain after Response header values cannot read time, cache, response, or "
+                        "control-plane state until effects execute at response time"));
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
@@ -15257,6 +15608,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (!args_ok)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.state.span, kStateDeclDetail);
+        for (u32 field_i = 0; field_i < init->field_inits.len; field_i++) {
+            if (init->field_inits[field_i].name.eq({"backend", 7}))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      init->field_inits[field_i].value != nullptr
+                                          ? init->field_inits[field_i].value->span
+                                          : item.state.span,
+                                      kCacheBackendReservedDetail);
+        }
         constexpr i64 kMaxCacheCapacity = 1 << 22;  // 4M slots = 64 MB/instance/shard
         if (init->field_inits.len != 1 || !init->field_inits[0].name.eq({"capacity", 8}) ||
             init->field_inits[0].value == nullptr ||
@@ -15509,6 +15868,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Protocol) continue;
+        if (is_reserved_snapshot_type_name(item.protocol.name))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.protocol.span, item.protocol.name);
         if (find_protocol_index(mod, item.protocol.name) < mod.protocols.len)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.protocol.span, item.protocol.name);
@@ -15547,7 +15909,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Struct) continue;
-        if (item.struct_decl.name.eq({"Error", 5}))
+        if (item.struct_decl.name.eq({"Error", 5}) ||
+            is_reserved_snapshot_type_name(item.struct_decl.name))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.struct_decl.span, item.struct_decl.name);
         if (find_struct_index(mod, item.struct_decl.name) != mod.structs.len)
@@ -15564,6 +15927,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Variant) continue;
+        if (is_reserved_snapshot_type_name(item.variant.name))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.variant.span, item.variant.name);
         if (find_variant_index(mod, item.variant.name) != mod.variants.len)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.variant.span, item.variant.name);
@@ -15578,7 +15944,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::TypeAlias) continue;
-        if (find_type_alias(mod, item.type_alias.name) != nullptr ||
+        if (is_reserved_snapshot_type_name(item.type_alias.name) ||
+            find_type_alias(mod, item.type_alias.name) != nullptr ||
             find_struct_index(mod, item.type_alias.name) < mod.structs.len ||
             find_variant_index(mod, item.type_alias.name) < mod.variants.len ||
             find_protocol_index(mod, item.type_alias.name) < mod.protocols.len)
@@ -16856,6 +17223,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (scratch->guards.len != 0 && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax, ast_func.body->span);
+        auto retained_admin =
+            reject_unretained_helper_admin_locals(*scratch, body.value(), ast_func.body->span);
+        if (!retained_admin) return core::make_unexpected(retained_admin.error());
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
@@ -16873,6 +17243,23 @@ static FrontendResult<HirModule*> analyze_file_internal(
             respond_guard.cond = normalized_cond.value();
             respond_guard.status_code = guard.fail_term.status_code;
             respond_guard.response_body = guard.fail_term.response_body;
+            if (guard.fail_term.runtime_response_body_type == HirTypeKind::Stats ||
+                guard.fail_term.runtime_response_body_type == HirTypeKind::Metrics) {
+                HirExpr source{};
+                source.type = guard.fail_term.runtime_response_body_type;
+                source.span = guard.fail_term.span;
+                if (guard.fail_term.runtime_response_body_local_ref_index != 0xffffffffu) {
+                    source.kind = HirExprKind::LocalRef;
+                    source.local_index = guard.fail_term.runtime_response_body_local_ref_index;
+                } else {
+                    source.kind = source.type == HirTypeKind::Stats ? HirExprKind::StatsSnapshot
+                                                                    : HirExprKind::MetricsSnapshot;
+                }
+                auto normalized_body = normalize_function_expr(
+                    source, &fn, all_locals, all_local_count, fn.params.len);
+                if (!normalized_body) return core::make_unexpected(normalized_body.error());
+                respond_guard.runtime_response_body = normalized_body.value();
+            }
             for (u32 hi = 0; hi < guard.fail_term.response_headers.len; hi++) {
                 const auto& hdr = guard.fail_term.response_headers[hi];
                 if (!respond_guard.response_headers.push({hdr.key, hdr.value}))
@@ -18443,6 +18830,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (scratch.guards.len != 0 && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax, item.func.body->span);
+        auto retained_admin =
+            reject_unretained_helper_admin_locals(scratch, body.value(), item.func.body->span);
+        if (!retained_admin) return core::make_unexpected(retained_admin.error());
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
@@ -18460,6 +18850,23 @@ static FrontendResult<HirModule*> analyze_file_internal(
             respond_guard.cond = normalized_cond.value();
             respond_guard.status_code = guard.fail_term.status_code;
             respond_guard.response_body = guard.fail_term.response_body;
+            if (guard.fail_term.runtime_response_body_type == HirTypeKind::Stats ||
+                guard.fail_term.runtime_response_body_type == HirTypeKind::Metrics) {
+                HirExpr source{};
+                source.type = guard.fail_term.runtime_response_body_type;
+                source.span = guard.fail_term.span;
+                if (guard.fail_term.runtime_response_body_local_ref_index != 0xffffffffu) {
+                    source.kind = HirExprKind::LocalRef;
+                    source.local_index = guard.fail_term.runtime_response_body_local_ref_index;
+                } else {
+                    source.kind = source.type == HirTypeKind::Stats ? HirExprKind::StatsSnapshot
+                                                                    : HirExprKind::MetricsSnapshot;
+                }
+                auto normalized_body = normalize_function_expr(
+                    source, &fn, all_locals, all_local_count, fn.params.len);
+                if (!normalized_body) return core::make_unexpected(normalized_body.error());
+                respond_guard.runtime_response_body = normalized_body.value();
+            }
             for (u32 hi = 0; hi < guard.fail_term.response_headers.len; hi++) {
                 const auto& hdr = guard.fail_term.response_headers[hi];
                 if (!respond_guard.response_headers.push({hdr.key, hdr.value}))
@@ -18716,6 +19123,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!same_hir_type_shape(mod, arg.value(), expected))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, step.call.args[ai]->span, fn.name);
+                if (hir_contains_admin_effect(&arg.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        step.call.args[ai]->span,
+                        lit_str("control-plane snapshot arguments are not supported in chain "
+                                "steps until runtime lowering is connected"));
                 args[ai] = arg.value();
             }
 
@@ -18845,6 +19258,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // rejected (see kTimeWaitDetail) — the flag must be set before any
         // statement is analyzed so pre-wait bindings are caught too.
         bool response_runtime_mutation_blocked = seen_guard;
+        bool control_plane_entry_effect_blocked = seen_guard;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
@@ -18854,12 +19268,48 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             if (s.kind == AstStmtKind::Guard || s.kind == AstStmtKind::Wait ||
                 s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For ||
-                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
+                (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait)) {
                 response_runtime_mutation_blocked = true;
+                control_plane_entry_effect_blocked = true;
+            }
         }
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
             if (stmt.kind == AstStmtKind::Expr) {
+                const bool reload_syntax =
+                    stmt.expr.kind == AstExprKind::Call && stmt.expr.name.eq({"reload", 6});
+                const bool mark_syntax =
+                    stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
+                    stmt.expr.lhs->kind == AstExprKind::Ident &&
+                    stmt.expr.lhs->name.eq({"upstream", 8}) && stmt.expr.name.eq({"mark", 4});
+                if (reload_syntax || mark_syntax) {
+                    if (control_plane_entry_effect_blocked || route.guards.len > 0)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].init.may_error)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  stmt.span,
+                                                  kControlPlaneOrderDetail);
+                    }
+                    route.control_plane_stmt_ok = true;
+                    auto value = analyze_expr(
+                        stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                    route.control_plane_stmt_ok = false;
+                    if (!value) return core::make_unexpected(value.error());
+                    if (value->kind != HirExprKind::AdminReload &&
+                        value->kind != HirExprKind::AdminUpstreamMark)
+                        return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                    HirLocal local{};
+                    local.span = stmt.span;
+                    local.ref_index =
+                        next_local_ref_index(&route, route.locals.data, route.locals.len);
+                    local.type = value->type;
+                    local.init = value.value();
+                    if (!route.locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, stmt.span);
+                    continue;
+                }
                 // Response builder mutation. Literal-only prefixes fold into
                 // the terminator's static header set. At the first dynamic
                 // value, this and every subsequent mutation becomes an ordered
@@ -19178,6 +19628,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
+                if ((seen_for || seen_guard || route.guards.len > 0) &&
+                    hir_contains_admin_snapshot(&init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.span, kControlPlaneOrderDetail);
                 if (init.value().type == HirTypeKind::Array) {
                     if (!used_for_iter || !is_static_for_iter_expr(
                                               init.value(), route.locals.data, route.locals.len, 0))
@@ -19419,6 +19873,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             break;
         }
 
+        auto ws_admin_ok = reject_websocket_admin_effects(route, mod);
+        if (!ws_admin_ok) return core::make_unexpected(ws_admin_ok.error());
+
         bool has_chain_after_response_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
             const auto& chain_use = route_decl.chains[ci];
@@ -19474,6 +19931,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
+                if (e.kind == HirExprKind::StatsSnapshot || e.kind == HirExprKind::MetricsSnapshot)
+                    return kAdminSnapshotWaitDetail;
                 return Str{};
             };
             const HirExpr* found = nullptr;
@@ -19493,6 +19952,50 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     probe(route.guards[g].fail_body.locals[li].init);
             if (found != nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, found->span, detail);
+
+            Span blocked_term_span{};
+            bool has_blocked_term = false;
+            const auto probe_term = [&](const HirTerminator& term) {
+                if (has_blocked_term) return;
+                if (term.runtime_response_body_type == HirTypeKind::Stats ||
+                    term.runtime_response_body_type == HirTypeKind::Metrics) {
+                    has_blocked_term = true;
+                    blocked_term_span = term.span;
+                }
+            };
+            const auto probe_guard_terms = [&](const HirGuard& guard) {
+                if (guard.fail_kind == HirGuard::FailKind::Term) {
+                    probe_term(guard.fail_term);
+                } else if (guard.fail_kind == HirGuard::FailKind::Body) {
+                    probe_term(guard.fail_body.direct_term);
+                    probe_term(guard.fail_body.then_term);
+                    probe_term(guard.fail_body.else_term);
+                } else {
+                    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                        const u32 arm_index = guard.fail_match_start + ai;
+                        if (arm_index < mod.guard_match_arms.len)
+                            probe_term(mod.guard_match_arms[arm_index].direct_term);
+                    }
+                }
+            };
+            for (u32 gi = 0; gi < route.guards.len; gi++) probe_guard_terms(route.guards[gi]);
+            if (route.control.kind == HirControlKind::Direct) {
+                probe_term(route.control.direct_term);
+            } else if (route.control.kind == HirControlKind::If) {
+                probe_term(route.control.then_term);
+                probe_term(route.control.else_term);
+            } else {
+                for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                    const auto& arm = route.control.match_arms[ai];
+                    probe_term(arm.direct_term);
+                    probe_term(arm.then_term);
+                    probe_term(arm.else_term);
+                    for (u32 gi = 0; gi < arm.guards.len; gi++) probe_guard_terms(arm.guards[gi]);
+                }
+            }
+            if (has_blocked_term)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, blocked_term_span, kAdminSnapshotWaitDetail);
 
             // Request multi-value lists are backed by an invocation-local
             // bounded pool and lower to SSA aggregates. Values derived from a
@@ -20199,6 +20702,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!route.decorators.push(ref))
                 return frontend_error(FrontendError::TooManyItems, ast_deco.span);
         }
+
+        // Decorator expansion appends synthetic locals after the first
+        // WebSocket check. Revalidate the completed route so an inlined
+        // snapshot/control-plane expression cannot be skipped by MIR's
+        // terminate-mode WebSocket path.
+        ws_admin_ok = reject_websocket_admin_effects(route, mod);
+        if (!ws_admin_ok) return core::make_unexpected(ws_admin_ok.error());
 
         // Decorator guards must run BEFORE any user-written top-level guard so a
         // rejected decorator short-circuits before user logic. We appended them

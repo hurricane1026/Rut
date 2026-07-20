@@ -235,10 +235,53 @@ struct ForLoopCtx {
     FixedVec<LocalBinding, HirRoute::kMaxLocals> locals;
 };
 
+static const HirExpr* find_unsupported_admin_expr(const HirExpr* expr) {
+    if (expr == nullptr) return nullptr;
+    if (expr->kind == HirExprKind::StatsSnapshot || expr->kind == HirExprKind::MetricsSnapshot ||
+        expr->kind == HirExprKind::AdminJson || expr->kind == HirExprKind::AdminReload ||
+        expr->kind == HirExprKind::AdminUpstreamMark)
+        return expr;
+    if (const auto* found = find_unsupported_admin_expr(expr->lhs)) return found;
+    if (const auto* found = find_unsupported_admin_expr(expr->rhs)) return found;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (const auto* found = find_unsupported_admin_expr(expr->args[ai])) return found;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (const auto* found = find_unsupported_admin_expr(expr->field_inits[fi].value))
+            return found;
+    return nullptr;
+}
+
+static FrontendResult<void> reject_route_admin_exprs_before_mir(const HirRoute& route) {
+    const HirExpr* found = nullptr;
+    // `exprs` is an arena, not a root set: constant/lazy folds may leave
+    // discarded nodes in it. Live expression roots are lowered through their
+    // owning locals, guards, controls, and loop bodies, where mir_value rejects
+    // admin nodes directly. Scan retained locals here because even unreferenced
+    // locals are eagerly materialized and therefore remain observable.
+    for (u32 li = 0; li < route.locals.len && found == nullptr; li++)
+        found = find_unsupported_admin_expr(&route.locals[li].init);
+    if (found != nullptr)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            found->span,
+            lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                    "is not connected yet"));
+    return {};
+}
+
 static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                                           const HirModule& module,
                                           MirFunction* fn,
                                           const ForLoopCtx* ctx = nullptr) {
+    if (expr.kind == HirExprKind::StatsSnapshot || expr.kind == HirExprKind::MetricsSnapshot ||
+        expr.kind == HirExprKind::AdminJson || expr.kind == HirExprKind::AdminReload ||
+        expr.kind == HirExprKind::AdminUpstreamMark) {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                    "is not connected yet"));
+    }
     MirValue v{};
     v.shape_index = expr.shape_index;
     v.may_nil = expr.may_nil;
@@ -1071,6 +1114,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
     }
 
     for (u32 i = 0; i < module.routes.len; i++) {
+        auto admin_preflight = reject_route_admin_exprs_before_mir(module.routes[i]);
+        if (!admin_preflight) return core::make_unexpected(admin_preflight.error());
 #if RUT_ENABLE_WEBSOCKET
         // WebSocket terminate-mode frame handlers don't go through the HTTP MIR/RIR pipeline —
         // a constant verdict needs no request parsing / response building / state machine. The
@@ -1131,7 +1176,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespAddHeader &&
-                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader)
+                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::AdminReload &&
+                module.routes[i].locals[li].init.kind != HirExprKind::AdminUpstreamMark)
                 continue;
             if (module.routes[i].locals[li].is_wait_result) continue;
             MirLocal local{};
@@ -1182,7 +1229,11 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
+        bool unsupported_admin_term = false;
+        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
+            if (term.runtime_response_body_type == HirTypeKind::Stats ||
+                term.runtime_response_body_type == HirTypeKind::Metrics)
+                unsupported_admin_term = true;
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
@@ -1220,6 +1271,14 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const auto& p = term.forward_set_headers[i];
                 if (!out->forward_set_headers.push({p.key, p.value})) __builtin_trap();
             }
+        };
+        const auto reject_unsupported_admin_term = [&]() -> FrontendResult<void> {
+            if (!unsupported_admin_term) return {};
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                fn.span,
+                lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                        "is not connected yet"));
         };
         auto set_arm_effects = [&](MirBlock* out, const HirMatchArm& arm) -> FrontendResult<void> {
             for (u32 ei = 0; ei < arm.effect_expr_indices.len; ei++) {
@@ -1767,6 +1826,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            auto admin_term_ok = reject_unsupported_admin_term();
+            if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2651,6 +2712,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            auto admin_term_ok = reject_unsupported_admin_term();
+            if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -2712,6 +2775,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = terminal_index;
+            auto admin_term_ok = reject_unsupported_admin_term();
+            if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
             if (!mir->functions.push(fn))
                 return frontend_error(FrontendError::TooManyItems, fn.span);
             continue;
@@ -3259,6 +3324,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        auto admin_term_ok = reject_unsupported_admin_term();
+        if (!admin_term_ok) return core::make_unexpected(admin_term_ok.error());
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 

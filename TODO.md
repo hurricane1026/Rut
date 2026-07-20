@@ -83,7 +83,11 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   (needs a resumable, stream-owned runtime Response); [x] runtime `[str]`
   request views with ordered `req.queryAll`/`req.getAll`, `.len`, `.isEmpty`,
   `.first()`, and bounds-safe `.at(i)`;
-  `stats()/metrics()/reload()/upstream.mark()` declarations.
+  [x] checker-level `stats()/metrics()/reload()/upstream.mark()` declarations
+  (opaque Stats/Metrics types, JSON-serializable metadata, parameter labels,
+  statement/value and route/timer context contracts). Runtime lowering remains
+  pending: HandlerCtx does not yet expose control-plane services, so MIR rejects
+  snapshot values instead of compiling a fake result.
 - Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
   guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match
   arms; [x] middleware status-`return` and handler `respond` context errors
@@ -104,11 +108,15 @@ without presenting lossy or per-shard state as exact shared state.
 - [x] Lower `Cache.set` at its branch position instead of only in the route-entry
   prelude. This enables a Rut limiter to commit the successor only on its
   accepted branch; the shipped example now demonstrates that policy.
-- Design the strict, visible-failure `Hash` table and an owner-shard atomic
+- [x] Design the strict, visible-failure `Hash` table and an owner-shard atomic
   update primitive before offering exact cross-shard rate limiting or state
-  whose absence would be incorrect.
-- Keep cross-node `backend:` syntax reserved until reads have an explicit
+  whose absence would be incorrect. The accepted, not-yet-implemented contract
+  is in `docs/hash-state.md`: no eviction, per-key owner linearization, pure
+  bounded updater, definite-not-applied failures, and reload ownership rules.
+- [x] Keep cross-node `backend:` syntax reserved until reads have an explicit
   freshness/invalidation contract; do not describe Cache as a source of truth.
+  The analyzer now rejects `Cache(..., backend: ...)` with that exact reason,
+  independent of named-argument order.
 
 **Acceptance**:
 - A rate-limit test demonstrates both meter-every-attempt and meter-on-accept
@@ -189,7 +197,7 @@ without presenting lossy or per-shard state as exact shared state.
 **Why**: Baseline slot/state invariant coverage is now in place for representative static, proxy, body-streaming, JIT-yield, idle, and 502 dispatch transitions. The remaining work is to widen that coverage so new paths do not drift from the same debug/metrics expectations.
 
 **Work**:
-- Add follow-up tests for less-common or newly introduced transitions not yet covered by the representative dispatch cases.
+- [x] Add follow-up tests for less-common or newly introduced transitions not yet covered by the representative dispatch cases.
 - Reuse the existing invariant helper/check pattern when adding new dispatch paths or callback-slot combinations.
 - Audit future state-machine changes for:
   - new `conn.state` values or transitions that need invariant assertions,
@@ -197,7 +205,7 @@ without presenting lossy or per-shard state as exact shared state.
   - teardown/reset flows where callback slots should be cleared before returning to idle/free states.
 
 **Acceptance**:
-- The backlog item is complete when remaining uncovered transitions have explicit invariant assertions or are documented as intentionally exempt.
+- [x] Remaining uncovered transitions have explicit invariant assertions or are documented as intentionally exempt in `docs/runtime-state-invariants.md`.
 
 ## P1: Rut Core Syntax Reduction
 

@@ -1,4 +1,5 @@
 #include "rut/compiler/analyze.h"
+#include "rut/compiler/builtin_decls.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
 #include "rut/compiler/mir_build.h"
@@ -1669,6 +1670,28 @@ TEST(frontend, cache_decl_validation_errors) {
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.len != 0);
+    }
+}
+
+TEST(frontend, cache_backend_stays_reserved_until_freshness_contract_exists) {
+    const char* cases[] = {
+        "let b = Cache<IP, i64>(capacity: 64, backend: .redis(\"127.0.0.1:6379\"))\n"
+        "route GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(backend: .redis(\"127.0.0.1:6379\"), capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n",
+    };
+    const auto expected =
+        lit("backend: on Cache is reserved — lossy Cache has no cross-node read "
+            "freshness/invalidation or atomic-update contract; keep source-of-truth "
+            "state external until backend state semantics are implemented");
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(expected));
     }
 }
 
@@ -6393,6 +6416,34 @@ route {
     rir.destroy();
 }
 
+TEST(frontend, respond_helper_preserves_admin_json_runtime_body) {
+    const char* src = R"rut(
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 503, json(stats()) }
+    7
+}
+chain health {
+    before check(req)
+}
+route GET "/admin" use chain health {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.runtime_response_body_type, HirTypeKind::Stats);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
 // Bool predicates keep the explicit `else <status>` requirement — it is the
 // only rejection channel they have.
 TEST(frontend, analyze_rejects_bool_chain_step_without_else) {
@@ -6678,6 +6729,16 @@ route GET "/users" use chain access { return 200 }
 )rut",
          "chain after helper must have exactly one Response parameter"},
         {R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Snapshot", json(stats()))
+    0
+}
+chain access { after mutate(resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after Response header values cannot read time, cache, response, or control-plane "
+         "state until effects execute at response time"},
+        {R"rut(
 func mutate(_ first: Response, _ second: Response) -> i32 {
     first.set("X-Test", "yes")
     0
@@ -6793,9 +6854,9 @@ route GET "/users" use chain access { return 200 }
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "chain after Response header values cannot read time, cache, or response state until "
-            "effects execute at response time")));
+        CHECK(hir.error().detail.eq(
+            lit("chain after Response header values cannot read time, cache, response, or "
+                "control-plane state until effects execute at response time")));
     }
 }
 
@@ -8837,6 +8898,31 @@ route GET "/users" { if pick(proto.Result<i32>.ok(1)) == 1 { return 200 } else {
     auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
     REQUIRE(hir);
 }
+
+TEST(frontend, import_namespace_call_preserves_explicit_type_arguments) {
+    const std::string dir = "/tmp/rut_import_namespace_generic_call_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/helpers.rut", std::ios::binary);
+        out << "func make<T>() -> T => nil\n";
+    }
+    const auto src = R"rut(
+import * as helpers from "helpers.rut"
+route GET "/users" {
+    let code = any(helpers.make<i32>(), 200)
+    if code == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::I32);
+}
+
 TEST(frontend, import_namespace_nested_generic_payload_lowering_path_is_supported) {
     const std::string dir = "/tmp/rut_import_namespace_nested_generic_type_arg_frontend";
     std::filesystem::create_directories(dir);
@@ -32332,6 +32418,723 @@ TEST(frontend, json_rejects_dynamic_values_until_runtime_serializer_exists) {
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
         lit("json currently accepts only literal bool/int/string/nil/array/object values")));
+}
+
+TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
+    const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
+    const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));
+    const BuiltinDecl* reload = find_control_plane_builtin(BuiltinReceiver::None, lit("reload"));
+    const BuiltinDecl* mark = find_control_plane_builtin(BuiltinReceiver::Upstream, lit("mark"));
+    REQUIRE(stats != nullptr);
+    REQUIRE(metrics != nullptr);
+    REQUIRE(reload != nullptr);
+    REQUIRE(mark != nullptr);
+    CHECK_EQ(stats->return_type, BuiltinDeclType::Stats);
+    CHECK(stats->json_serializable);
+    CHECK_EQ(metrics->return_type, BuiltinDeclType::Metrics);
+    CHECK(metrics->json_serializable);
+    CHECK(reload->statement_only);
+    CHECK_EQ(reload->contexts, static_cast<u8>(BuiltinInRoute));
+    CHECK(mark->statement_only);
+    CHECK_EQ(mark->contexts, static_cast<u8>(BuiltinInTimer));
+    REQUIRE_EQ(mark->param_count, 2u);
+    CHECK_EQ(mark->params[0].type, BuiltinDeclType::Server);
+    CHECK(mark->params[0].label.len == 0);
+    CHECK(mark->params[1].label.eq(lit("healthy")));
+    CHECK_EQ(mark->params[1].type, BuiltinDeclType::Bool);
+}
+
+TEST(frontend, stats_and_metrics_are_typed_opaque_json_values) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let snapshot = stats()
+    let statsBody = json(snapshot)
+    let metricSnapshot = metrics()
+    let metricsBody = json(metricSnapshot)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK_EQ(hir->routes[0].locals[0].type, HirTypeKind::Stats);
+    CHECK_EQ(hir->routes[0].locals[0].init.kind, HirExprKind::StatsSnapshot);
+    CHECK_EQ(hir->routes[0].locals[1].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[1].init.kind, HirExprKind::AdminJson);
+    CHECK_EQ(hir->routes[0].locals[2].type, HirTypeKind::Metrics);
+    CHECK_EQ(hir->routes[0].locals[2].init.kind, HirExprKind::MetricsSnapshot);
+    CHECK_EQ(hir->routes[0].locals[3].type, HirTypeKind::Str);
+    CHECK_EQ(hir->routes[0].locals[3].init.kind, HirExprKind::AdminJson);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, snapshot_types_are_valid_explicit_helper_contracts) {
+    const char* src = R"rut(
+func encodeStats(value: Stats) -> str => json(value)
+func encodeMetrics(value: Metrics) -> str => json(value)
+route GET "/admin" {
+    let statsBody = encodeStats(stats())
+    let metricsBody = encodeMetrics(metrics())
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 2u);
+    CHECK_EQ(hir->functions[0].params[0].type, HirTypeKind::Stats);
+    CHECK_EQ(hir->functions[1].params[0].type, HirTypeKind::Metrics);
+}
+
+TEST(frontend, opaque_snapshots_reject_direct_equality) {
+    const char* cases[] = {
+        "route GET \"/admin\" { if stats() == stats() { return 200 } else { return 204 } }\n",
+        "route GET \"/admin\" { if metrics() == metrics() { return 200 } else { return 204 } }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, control_plane_statement_builtins_reach_runtime_lowering_boundary) {
+    const char* reload_src = "route GET \"/admin\" { reload() return 204 }\n";
+    auto reload_lexed = lex(lit(reload_src));
+    REQUIRE(reload_lexed);
+    auto reload_ast = parse_file_heap(reload_lexed.value());
+    REQUIRE(reload_ast);
+    auto reload_hir = analyze_file_heap(reload_ast.value());
+    REQUIRE(reload_hir);
+    REQUIRE_EQ(reload_hir->routes[0].locals.len, 1u);
+    CHECK_EQ(reload_hir->routes[0].locals[0].init.kind, HirExprKind::AdminReload);
+    auto reload_mir = build_mir_heap(reload_hir.value());
+    REQUIRE_FALSE(reload_mir.has_value());
+    CHECK(reload_mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+
+    const char* mark_src =
+        "upstream primary at \"127.0.0.1:8080\"\n"
+        "upstream api at \"127.0.0.1:8081\"\n"
+        "timer health, every: 1s { upstream.mark(api, healthy: true) return 200 }\n";
+    auto mark_lexed = lex(lit(mark_src));
+    REQUIRE(mark_lexed);
+    auto mark_ast = parse_file_heap(mark_lexed.value());
+    REQUIRE(mark_ast);
+    auto mark_hir = analyze_file_heap(mark_ast.value());
+    REQUIRE(mark_hir);
+    REQUIRE_EQ(mark_hir->routes[0].locals.len, 1u);
+    CHECK_EQ(mark_hir->routes[0].locals[0].init.kind, HirExprKind::AdminUpstreamMark);
+    CHECK_EQ(mark_hir->routes[0].locals[0].init.upstream_index, 1u);
+    CHECK_EQ(mark_hir->routes[0].locals[0].init.server_index, 0u);
+    auto mark_mir = build_mir_heap(mark_hir.value());
+    REQUIRE_FALSE(mark_mir.has_value());
+    CHECK(mark_mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, upstream_mark_rejects_ambiguous_multi_backend_target) {
+    const char* src =
+        "upstream api { backends: [\"127.0.0.1:8080\", \"127.0.0.1:8081\"] }\n"
+        "timer health, every: 1s { upstream.mark(api, healthy: true) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+
+    const char* externally_bound =
+        "upstream api\n"
+        "timer health, every: 1s { upstream.mark(api, healthy: true) return 200 }\n";
+    lexed = lex(lit(externally_bound));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, upstream_mark_honors_local_target_shadowing) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:8080"
+timer health, every: 1s {
+    let api = false
+    upstream.mark(api, healthy: true)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, upstream_import_namespace_rejects_builtin_mark_labels) {
+    const std::string dir = "/tmp/rut_upstream_import_label_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/upstream.rut", std::ios::binary);
+        out << "func mark(value: i32, healthy: bool) -> i32 => value\n";
+    }
+    const auto src = R"rut(
+import "upstream.rut"
+route GET "/admin" {
+    let result = upstream.mark(1, nonsense: true)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, upstream_mark_requires_healthy_argument_label) {
+    const char* src =
+        "upstream api at \"127.0.0.1:8080\"\n"
+        "timer health, every: 1s { upstream.mark(api, true) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, direct_admin_json_response_reaches_runtime_lowering_boundary) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let first = stats()
+    let selected = stats()
+    return 200, json(selected)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_local_ref_index,
+             hir->routes[0].locals[1].ref_index);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, direct_admin_json_accepts_helper_returned_snapshot) {
+    const char* src = R"rut(
+func snapshot() => stats()
+route GET "/admin" {
+    return 200, json(snapshot())
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, direct_admin_json_preserves_snapshot_helper_respond_guard) {
+    const char* src = R"rut(
+func snapshot() {
+    guard false else { respond 503 }
+    stats()
+}
+route GET "/admin" {
+    return 200, json(snapshot())
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 503);
+    CHECK_EQ(hir->routes[0].control.direct_term.runtime_response_body_type, HirTypeKind::Stats);
+}
+
+TEST(frontend, snapshot_respond_body_rejects_discarded_nested_helper_guard) {
+    const char* src = R"rut(
+func nested() -> Stats {
+    guard false else { respond 502 }
+    stats()
+}
+func outer() -> Stats {
+    guard false else { respond 503, json(nested()) }
+    stats()
+}
+route GET "/admin" { return 200, json(outer()) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("snapshot response helpers cannot discard nested response guards")));
+}
+
+TEST(frontend, unused_snapshot_helper_argument_reaches_runtime_lowering_boundary) {
+    const char* src = R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+route GET "/admin" {
+    let ignored = ignore(stats())
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, dead_lazy_branch_does_not_retain_admin_arena_nodes) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let ok = true || (json(stats()) == "{}")
+    if ok { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+
+TEST(frontend, chain_before_rejects_unused_snapshot_argument) {
+    const char* src = R"rut(
+func check(_ value: Stats) -> i32 {
+    guard false else { respond 403 }
+    1
+}
+chain audit { before check(stats()) }
+route GET "/admin" use chain audit {
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshot arguments are not supported in chain steps until runtime "
+            "lowering is connected")));
+}
+
+TEST(frontend, nested_snapshot_helper_avoids_parameter_slot_collision) {
+    const char* src = R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+func preserve(value: i32) -> i32 {
+    let ignored = ignore(stats())
+    value
+}
+route GET "/admin" {
+    let result = preserve(7)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir) {
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        return;
+    }
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE_FALSE(mir.has_value());
+    CHECK(mir.error().detail.eq(
+        lit("control-plane builtin is declared and type-checked, but runtime lowering is not "
+            "connected yet")));
+}
+
+TEST(frontend, snapshot_helper_arguments_preserve_guard_ordering) {
+    const char* cases[] = {
+        R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+route GET "/admin" {
+    guard req.http11 else { return 403 }
+    let result = ignore(stats())
+    return 200
+}
+)rut",
+        R"rut(
+func ignore(_ value: Stats) -> i32 => 1
+route GET "/admin" {
+    guard req.http11 else {
+        let result = ignore(stats())
+        return 403
+    }
+    return 200
+}
+)rut",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, direct_admin_json_rejects_unretained_snapshot_expression_tree) {
+    const char* src = R"rut(
+func choose<T>(cond: bool, first: T, second: T) -> T {
+    if cond { first } else { second }
+}
+route GET "/admin" {
+    let first = stats()
+    let second = stats()
+    return 200, json(choose(req.http11, first, second))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, admin_json_analyzes_pipeline_snapshot_operand) {
+    const char* src = R"rut(
+func identity<T>(value: T) -> T => value
+route GET "/admin" {
+    let payload = json(stats() | identity(_))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    const auto& payload = hir->routes[0].locals[0].init;
+    REQUIRE(payload.kind == HirExprKind::AdminJson);
+    REQUIRE(payload.lhs != nullptr);
+    REQUIRE(payload.lhs->kind == HirExprKind::ScopedLet);
+    REQUIRE(payload.lhs->lhs != nullptr);
+    CHECK_EQ(payload.lhs->lhs->kind, HirExprKind::StatsSnapshot);
+}
+
+TEST(frontend, control_plane_snapshot_cannot_cross_wait_boundary) {
+    const char* src = R"rut(
+route GET "/admin" {
+    let before = stats()
+    wait(1ms)
+    return 200, json(before)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots in routes containing wait are not supported yet — snapshots "
+            "do not have a carrier that survives suspension")));
+}
+
+TEST(frontend, direct_control_plane_snapshot_body_cannot_cross_wait_boundary) {
+    const char* src = R"rut(
+route GET "/admin" {
+    wait(1ms)
+    return 200, json(stats())
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots in routes containing wait are not supported yet — snapshots "
+            "do not have a carrier that survives suspension")));
+}
+
+TEST(frontend, direct_admin_json_rejects_optional_snapshot_local) {
+    const char* src = R"rut(
+func maybe_stats(_ enabled: bool) {
+    if enabled { stats() } else { nil }
+}
+route GET "/admin" {
+    let snapshot = maybe_stats(req.http11)
+    return 200, json(snapshot)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, control_plane_statements_reject_unrepresentable_route_ordering) {
+    const char* cases[] = {
+        "route GET \"/admin\" { guard req.http11 else { return 505 } reload() return 204 }\n",
+        "route GET \"/admin\" { reload() wait(1) return 204 }\n",
+        "route GET \"/admin\" { let x = any(1, error(500)) reload() guard let value = x "
+        "else { return 400 } return 204 }\n",
+        "func check() { guard false else { respond 503 } 0 }\n"
+        "route GET \"/admin\" { let value = check() reload() return 204 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("control-plane statements currently require a straight-line route without "
+                "guard/wait/for")));
+    }
+}
+
+TEST(frontend, control_plane_snapshot_rejects_post_guard_materialization) {
+    const char* src = R"rut(
+route GET "/admin" {
+    guard req.http11 else { return 505 }
+    let snapshot = stats()
+    return 200, json(snapshot)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane statements currently require a straight-line route without "
+            "guard/wait/for")));
+}
+
+TEST(frontend, control_plane_snapshot_rejects_match_arm_local_materialization) {
+    const char* src = R"rut(
+route GET "/admin" {
+    match req.path {
+        "/admin" => {
+            let snapshot = stats()
+            return 200, json(snapshot)
+        }
+        _ => return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots are not supported in branch-local bindings until lowering "
+            "preserves arm ordering")));
+}
+
+TEST(frontend, control_plane_snapshot_rejects_guard_failure_local_materialization) {
+    const char* src = R"rut(
+route GET "/admin" {
+    guard req.http11 else {
+        let snapshot = stats()
+        return 503, json(snapshot)
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane snapshots are not supported in guard-failure bindings until lowering "
+            "preserves branch ordering")));
+}
+
+TEST(frontend, control_plane_builtins_reject_type_arguments) {
+    const char* cases[] = {
+        "route GET \"/admin\" { let snapshot = stats<i32>() return 200 }\n",
+        "route GET \"/admin\" { let snapshot = metrics<i32>() return 200 }\n",
+        "route GET \"/admin\" { reload<i32>() return 204 }\n",
+        "upstream api at \"127.0.0.1:8080\"\n"
+        "timer health, every: 1s { upstream.mark<i32>(api, healthy: true) return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, control_plane_effect_rejected_on_websocket_terminate_route) {
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { reload() return websocket(ws) { frame in "
+        "frame.forward() } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+
+    const char* guard_condition = R"rut(
+upstream ws
+route GET "/ws" {
+    guard json(stats()) == "{}" else { return 503 }
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    lexed = lex(lit(guard_condition));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+
+    const char* block_guard_body = R"rut(
+upstream ws
+route GET "/ws" {
+    guard req.http11 else { return 503, json(stats()) }
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    lexed = lex(lit(block_guard_body));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+
+    const char* guard_body = R"rut(
+upstream ws
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 503, json(stats()) }
+    7
+}
+chain health { before check(req) }
+route GET "/ws" use chain health {
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    lexed = lex(lit(guard_body));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("control-plane effects are not supported on WebSocket terminate routes")));
+}
+
+TEST(frontend, dead_lazy_admin_branch_allowed_on_websocket_terminate_route) {
+    const char* src = R"rut(
+upstream ws
+route GET "/ws" {
+    let ok = true || (json(stats()) == "{}")
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+}
+#endif
+
+TEST(frontend, control_plane_snapshot_declarations_validate_arity) {
+    const char* src = "route GET \"/admin\" { let snapshot = stats(1) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("stats() and metrics() take no arguments")));
 }
 
 TEST(frontend, json_rejects_duplicate_object_fields) {

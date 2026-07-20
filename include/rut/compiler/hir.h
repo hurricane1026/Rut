@@ -199,6 +199,13 @@ enum class HirExprKind : u8 {
     // the value in rhs and echoes it (type I64).
     CacheGet,
     CacheSet,
+    // Checker-level control-plane snapshots. They deliberately have no MIR
+    // carrier until HandlerCtx exposes the corresponding runtime services.
+    StatsSnapshot,
+    MetricsSnapshot,
+    AdminJson,
+    AdminReload,
+    AdminUpstreamMark,
 };
 
 enum class HirTypeKind : u8 {
@@ -232,6 +239,9 @@ enum class HirTypeKind : u8 {
     // A bounded response builder local. It is consumed by `return <local>` and
     // does not have a runtime MIR carrier in the initial literal-only slice.
     Response,
+    // Opaque, json()-serializable control-plane snapshot types.
+    Stats,
+    Metrics,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -459,6 +469,11 @@ struct HirExpr {
     u32 array_len = 0;
     // CacheGet/CacheSet: index into HirModule::caches.
     u32 cache_index = 0xffffffffu;
+    // AdminUpstreamMark: resolved target in HirModule::upstreams.
+    u32 upstream_index = 0xffffffffu;
+    // Backend within the selected upstream. The declaration-only slice accepts
+    // only an upstream with one server, whose stable index is zero.
+    u32 server_index = 0xffffffffu;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     bool is_pipe_conditional = false;
@@ -562,6 +577,10 @@ struct HirFunction {
         HirExpr cond{};
         i32 status_code = 0;
         Str response_body{};
+        // Normalized snapshot operand for dynamic json(...) response bodies.
+        // Local helper bindings are inlined here; parameter references are
+        // instantiated at the call site before reaching HirTerminator.
+        HirExpr runtime_response_body{};
         static constexpr u32 kMaxHeaders = 16;
         FixedVec<RespondHeader, kMaxHeaders> response_headers;
     };
@@ -718,6 +737,7 @@ private:
 
     void rebase_respond_guard(RespondGuard& guard, const HirFunction& other) {
         rebase_expr(guard.cond, other);
+        rebase_expr(guard.runtime_response_body, other);
     }
 
     void rebase_from(const HirFunction& other) {
@@ -797,6 +817,13 @@ struct HirTerminator {
     // had `has_response_body == true`, so the sentinel is preserved
     // end-to-end.
     Str response_body{};
+    // Opaque admin snapshots cannot be serialized until MIR/runtime support
+    // lands. Preserve their type so MIR reports the declared boundary instead
+    // of rejecting the source as a literal-only JSON body in analysis.
+    HirTypeKind runtime_response_body_type = HirTypeKind::Unknown;
+    // For json(snapshotLocal), retain the exact selected snapshot rather than
+    // collapsing all values of the same opaque type into one marker.
+    u32 runtime_response_body_local_ref_index = 0xffffffffu;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0
@@ -1099,6 +1126,9 @@ struct HirRoute {
     // One-shot permission for a bare `req.set(...)` statement. Like Cache.set,
     // request mutation cannot escape into an eager/lazy value expression.
     bool req_header_mutation_stmt_ok = false;
+    // One-shot permission for checker-visible, statement-only control-plane
+    // builtins such as reload() and upstream.mark(...).
+    bool control_plane_stmt_ok = false;
     // Analysis-only (never serialized): the route body contains a wait, so
     // time.nowMicros() is rejected — locals re-materialize on resume, and a
     // pre-wait timestamp binding would sample after the wait.
