@@ -875,6 +875,15 @@ struct HirMatchArm {
     FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
+    struct ScopedLocal {
+        u32 ref_index = 0xffffffffu;
+        // Number of body-prelude guards already analyzed when this local
+        // becomes live. The value selects the guard block (or terminal body)
+        // that owns its initializer.
+        u32 stage = 0;
+    };
+    static constexpr u32 kMaxScopedLocals = 16;
+    FixedVec<ScopedLocal, kMaxScopedLocals> scoped_locals;
     HirExpr cond{};
     HirTerminator then_term{};
     HirTerminator else_term{};

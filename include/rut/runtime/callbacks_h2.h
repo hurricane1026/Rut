@@ -465,7 +465,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
         synth_len = h2_synth_h1_request(headers,
                                         nheaders,
                                         h2->pending_synth,
-                                        Http2Conn::kBodySynthCap,
+                                        Http2Conn::kHeaderSynthCap,
                                         /*preserve_split_cookies=*/true);
         if (synth_len == 0) {
             h2_emit_status(d, stream_id, 400);
@@ -543,7 +543,7 @@ bool h2_defer_prepared_forward(H2Dispatch<Loop>& d,
     const bool async_conflict =
         h2->async_stream != 0 && (!replace_owned_async || h2->async_stream != stream_id);
     if (h2->pending_stream != 0 || async_conflict || d.conn->h2_proxy_synth_quarantined ||
-        synth_len > Http2Conn::kBodySynthCap)
+        synth_len > Http2Conn::kRequestSynthCap)
         return false;
     for (u32 i = 0; i < synth_len; i++) h2->pending_synth[i] = synth[i];
     h2->pending_stream = stream_id;
@@ -688,7 +688,8 @@ inline void h2_clear_async(Http2Conn& h2) {
 // buffer) so it survives a suspension. Clamps to the buffer; a no-op when the
 // source already is pending_synth (the deferred-body path). Returns the length.
 inline u32 h2_stash_synth(Http2Conn& h2, const u8* synth, u32 synth_len) {
-    const u32 kN = synth_len <= Http2Conn::kBodySynthCap ? synth_len : Http2Conn::kBodySynthCap;
+    const u32 kN =
+        synth_len <= Http2Conn::kRequestSynthCap ? synth_len : Http2Conn::kRequestSynthCap;
     if (synth != h2.pending_synth)
         for (u32 i = 0; i < kN; i++) h2.pending_synth[i] = synth[i];
     return kN;
@@ -832,7 +833,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         const bool stable = d.conn->resp_header_mutation_count == 0 ||
                             (d.loop->alloc_response_header_buf(*d.conn) &&
                              d.conn->stabilize_response_mutations(synth, synth_len));
-        u8 forward_synth[Http2Conn::kBodySynthCap];
+        u8 forward_synth[Http2Conn::kRequestSynthCap];
         u32 forward_len = 0;
         const bool prepared =
             stable &&
@@ -923,7 +924,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
                                   &h2->pending_synth_len,
                                   h2->pending_body_start,
                                   h2->pending_body_len,
-                                  Http2Conn::kBodySynthCap)) {
+                                  Http2Conn::kRequestSynthCap)) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 413);
         return;
@@ -1129,7 +1130,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 return;
             }
             // No body dependency to wait for — invoke now.
-            u8 synth[Http2Conn::kBodySynthCap];
+            u8 synth[Http2Conn::kHeaderSynthCap];
             const u32 kSynthLen = h2_synth_h1_request(
                 headers, nheaders, synth, sizeof(synth), /*preserve_split_cookies=*/true);
             if (kSynthLen == 0) {
@@ -1184,7 +1185,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     h2_emit_status(d, stream_id, 400);
                     return;
                 }
-                u8 synth[Http2Conn::kBodySynthCap];
+                u8 synth[Http2Conn::kHeaderSynthCap];
                 const u32 kSynthLen = h2_synth_h1_request(headers, nheaders, synth, sizeof(synth));
                 if (kSynthLen == 0) {
                     h2_emit_status(d, stream_id, 400);
@@ -1217,7 +1218,8 @@ void h2_on_data_cb(
     } else {
         c.pending_body_len += len;
     }
-    if (c.pending_buffer_body && c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+    if (c.pending_buffer_body && (c.pending_body_len > Http2Conn::kBodySynthCap ||
+                                  c.pending_synth_len + len > Http2Conn::kRequestSynthCap)) {
         c.pending_overflow = true;
     } else if (c.pending_buffer_body) {
         for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
@@ -1496,7 +1498,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             failure_status = 503;
         }
 
-        u8 forward_synth[Http2Conn::kBodySynthCap];
+        u8 forward_synth[Http2Conn::kRequestSynthCap];
         u32 forward_len = 0;
         if (failure_status == 0) {
             const bool stable =

@@ -1708,6 +1708,27 @@ TEST(http2_synth, jit_view_preserves_split_cookie_fields_for_get_all) {
     CHECK_EQ(has_value, 1u);
     CHECK((Str{value, value_len}.eq(Str{"xyz", 3})));
 }
+
+TEST(http2_synth, split_cookie_expansion_keeps_full_deferred_body_budget) {
+    using namespace rut;
+    static constexpr u32 kCookieCount = Http2Conn::kMaxHeadersPerReq - 2;
+    std::string values[kCookieCount];
+    hpack::Header hs[Http2Conn::kMaxHeadersPerReq]{};
+    hs[0] = {{":method", 7}, {"GET", 3}};
+    hs[1] = {{":path", 5}, {"/api", 4}};
+    for (u32 i = 0; i < kCookieCount; i++) {
+        values[i].assign(257, static_cast<char>('a' + i % 26));
+        hs[i + 2] = {{"cookie", 6}, {values[i].data(), static_cast<u32>(values[i].size())}};
+    }
+    u8 out[Http2Conn::kHeaderSynthCap];
+    const u32 kLen = h2_synth_h1_request(hs,
+                                         Http2Conn::kMaxHeadersPerReq,
+                                         out,
+                                         sizeof(out),
+                                         /*preserve_split_cookies=*/true);
+    REQUIRE(kLen > Http2Conn::kBodySynthCap);
+    CHECK(kLen + Http2Conn::kBodySynthCap <= Http2Conn::kRequestSynthCap);
+}
 #endif
 
 // A single `by:` source (no list) and the param/query/cookie sources parse.

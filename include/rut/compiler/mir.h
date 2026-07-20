@@ -241,6 +241,7 @@ struct MirLocal {
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
+    bool deferred_to_block = false;
     MirValue init{};
 };
 
@@ -299,6 +300,8 @@ struct MirBlock {
     // Each entry indexes the owning MirFunction::values pool.
     static constexpr u32 kMaxEffects = 2;
     FixedVec<Effect, kMaxEffects> effects;
+    static constexpr u32 kMaxLocalInits = 16;
+    FixedVec<u32, kMaxLocalInits> local_init_refs;
     MirTerminator term{};
 };
 

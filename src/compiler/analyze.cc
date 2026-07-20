@@ -5312,6 +5312,48 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         auto lhs = instantiate_function_expr(
             *expr.lhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
         if (!lhs) return core::make_unexpected(lhs.error());
+        // A `[str]` helper parameter is analyzed as the runtime string-list
+        // view so the same body can accept req.queryAll()/req.headers.getAll().
+        // Calls are inlined, though, and the accepted argument may instead be
+        // a compile-time Array (for example another helper returning `[str]`).
+        // Specialize list operations after substitution instead of sending a
+        // StrList opcode an Array carrier during MIR lowering.
+        if ((expr.kind == HirExprKind::StrListLen || expr.kind == HirExprKind::StrListIsEmpty) &&
+            lhs->type == HirTypeKind::Array) {
+            HirExpr folded{};
+            folded.span = expr.span;
+            if (expr.kind == HirExprKind::StrListLen) {
+                folded.kind = HirExprKind::IntLit;
+                folded.type = HirTypeKind::I32;
+                folded.int_value = lhs->array_len;
+            } else {
+                folded.kind = HirExprKind::BoolLit;
+                folded.type = HirTypeKind::Bool;
+                folded.bool_value = lhs->array_len == 0;
+            }
+            return folded;
+        }
+        if (expr.kind == HirExprKind::StrListGet && lhs->type == HirTypeKind::Array) {
+            if (expr.rhs == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            auto index = instantiate_function_expr(
+                *expr.rhs, route, mod, args, arg_count, generic_bindings, generic_binding_count);
+            if (!index) return core::make_unexpected(index.error());
+            if (index->kind != HirExprKind::IntLit || index->int_value < 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            const u32 slot = static_cast<u32>(index->int_value);
+            if (slot < lhs->args.len && lhs->args[slot] != nullptr) {
+                HirExpr elem = *lhs->args[slot];
+                elem.span = expr.span;
+                return elem;
+            }
+            HirExpr missing{};
+            missing.kind = HirExprKind::Nil;
+            missing.type = HirTypeKind::Str;
+            missing.may_nil = true;
+            missing.span = expr.span;
+            return missing;
+        }
         if (!route->exprs.push(lhs.value()))
             return frontend_error(FrontendError::TooManyItems, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
@@ -10651,6 +10693,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 HirLocal local{};
+                const u32 arm_locals_start = route->locals.len;
                 local.span = inner.span;
                 local.name = inner.name;
                 local.ref_index =
@@ -10689,6 +10732,10 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 local.init = init.value();
                 if (!route->locals.push(local))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
+                for (u32 li = arm_locals_start; li < route->locals.len; li++) {
+                    if (!arm->scoped_locals.push({route->locals[li].ref_index, arm->guards.len}))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                }
                 if (local.ref_index >= HirRoute::kMaxLocals)
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 if (scoped_locals.len <= local.ref_index) scoped_locals.len = local.ref_index + 1;
@@ -10700,6 +10747,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 if (is_last) return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
                 HirGuard guard{};
+                const u32 guard_locals_start = route->locals.len;
                 guard.span = inner.span;
                 auto bound = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
@@ -10752,6 +10800,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         if (!fail_body) return core::make_unexpected(fail_body.error());
                     }
                 }
+                // Materializations introduced while evaluating the guard must
+                // live in the block that evaluates this guard, not at route
+                // entry. The narrowed binding itself becomes live only on the
+                // success edge and is recorded below at the next stage.
+                for (u32 li = guard_locals_start; li < route->locals.len; li++) {
+                    if (!arm->scoped_locals.push({route->locals[li].ref_index, arm->guards.len}))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                }
                 if (!arm->guards.push(guard))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 // A known-error OR known-nil init folds the guard condition to
@@ -10798,6 +10854,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     if (!init) return core::make_unexpected(init.error());
                     local.init = init.value();
                     if (!route->locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                    if (!arm->scoped_locals.push({local.ref_index, arm->guards.len}))
                         return frontend_error(FrontendError::TooManyItems, inner.span);
                     if (local.ref_index >= HirRoute::kMaxLocals)
                         return frontend_error(FrontendError::TooManyItems, inner.span);
