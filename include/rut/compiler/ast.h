@@ -19,6 +19,9 @@ enum class AstItemKind : u8 {
     Chain,
     Route,
     Timer,
+    // Top-level `let <name> = <expr>` — state declaration (currently only
+    // `Cache<IP, i64>(capacity: N)` inits are accepted; analyze validates).
+    State,
 };
 
 enum class AstStmtKind : u8 {
@@ -116,6 +119,11 @@ enum class AstExprKind : u8 {
     // errors.  Surface `[T]` type syntax desugars to
     // `AstTypeRef{name="Array", type_args=[T]}` in parse_func_type_ref.
     ArrayLit,
+    // Anonymous object literal `{ key: value, ... }`. The parser creates this
+    // kind only through a call's argument parser; it is deliberately absent
+    // from the general primary-expression grammar so a bare `{ ... }` always
+    // remains a statement block. Fields are stored in `field_inits`.
+    ObjectLit,
     StructInit,
     Placeholder,
     VariantCase,
@@ -138,6 +146,14 @@ enum class AstExprKind : u8 {
     Eq,
     Lt,
     Gt,
+    // Arithmetic operators — binary, lhs/rhs operands. Unary minus never
+    // reaches the AST: the parser fuses `-<intlit>` into a negative IntLit
+    // and desugars other `-x` to Sub(IntLit 0, x).
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
     And,
     Or,
     Pipe,
@@ -167,7 +183,7 @@ struct AstExpr {
     AstExprKind kind = AstExprKind::BoolLit;
     Span span{};
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     Str msg{};
     Str name{};
@@ -217,6 +233,10 @@ struct AstStatement {
     // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
     bool has_response_body = false;
+    // `return <ident>` / `respond <ident>` where the identifier names a local
+    // created by `response(status)`. Kept distinct from the literal-status
+    // form while reusing ReturnStatus as the control-flow terminator kind.
+    bool returns_response_local = false;
     // Response headers from `response(N, headers: { "K": "V", ... })`.
     // Inline-stored (no external pool) so analyze/lowering don't need
     // the AstFile handle. `response_headers.len == 0` means "no kwarg";
@@ -491,7 +511,10 @@ struct AstRouteDecl {
     Span body_span{};
     u8 method = 0;
     Str path{};
-    static constexpr u32 kMaxStatements = 16;
+    // A Response builder may need one declaration, 16 header mutations, and
+    // its final return. Keep a little headroom above that established header
+    // limit so statement capacity does not become the accidental lower cap.
+    static constexpr u32 kMaxStatements = 20;
     // Statements live in AstFile::stmt_pool (alloc_stmt) — storing them
     // inline made sizeof(AstItem) ~485KB (AstStatement is ~23KB) and the
     // recursive-descent parser's by-value AstItem frames overflowed the 8MB
@@ -521,9 +544,16 @@ struct AstTimerDecl {
     i32 shard = -1;
 };
 
+struct AstStateDecl {
+    Span span{};
+    Str name{};
+    AstExpr* init = nullptr;  // pooled via alloc_expr
+};
+
 struct AstItem {
     AstItemKind kind = AstItemKind::Upstream;
     Span span{};
+    AstStateDecl state{};
     AstUpstreamDecl upstream{};
     AstImportDecl import_decl{};
     AstFunctionDecl func{};
@@ -545,7 +575,7 @@ struct AstFile {
     // stored them inline (512 fully-loaded match statements at kMaxMatchArms).
     static constexpr u32 kMaxExprPool = 4096;
     // Route statements moved out of AstRouteDecl into this pool; sized to keep
-    // the pre-pool capacity of kMaxItems routes at kMaxStatements each (2048)
+    // the pre-pool capacity of kMaxItems routes at kMaxStatements each (2560)
     // plus nested block bodies. AstFile is heap-only (parse_file_heap), so the
     // pools cost heap, not stack.
     static constexpr u32 kMaxStmtPool = 4096;
@@ -752,6 +782,11 @@ private:
                     for (u32 j = 0; j < items[i].timer.statements.len; j++) {
                         rebase_stmt_ptr(other, items[i].timer.statements[j]);
                     }
+                    break;
+                case AstItemKind::State:
+                    // The init expression is pooled (bulk-rebased above);
+                    // only the pointer itself needs relocation.
+                    rebase_expr_ptr(other, items[i].state.init);
                     break;
                 default:
                     break;

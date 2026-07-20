@@ -200,6 +200,35 @@ TEST(RirBuilder, RequestAccess) {
     ctx.destroy();
 }
 
+TEST(RirBuilder, InitClearsCachedCacheGetOptionalType) {
+    TestContext first;
+    TestContext second;
+    REQUIRE(first.init());
+    REQUIRE(second.init());
+
+    Builder b;
+    b.init(&first.mod);
+    auto* first_fn = V(b.create_function(lit("first"), lit("/first"), 1));
+    auto first_entry = V(b.create_block(first_fn, lit("entry")));
+    b.set_insert_point(first_fn, first_entry);
+    auto first_get = V(b.emit_cache_get(0, V(b.emit_req_remote_addr())));
+    const Type* first_type = first_fn->values[first_get.id].type;
+
+    b.init(&second.mod);
+    auto* second_fn = V(b.create_function(lit("second"), lit("/second"), 1));
+    auto second_entry = V(b.create_block(second_fn, lit("entry")));
+    b.set_insert_point(second_fn, second_entry);
+    auto second_get = V(b.emit_cache_get(0, V(b.emit_req_remote_addr())));
+    const Type* second_type = second_fn->values[second_get.id].type;
+
+    CHECK(first_type != second_type);
+    CHECK_EQ(static_cast<u8>(second_type->kind), static_cast<u8>(TypeKind::Optional));
+    CHECK_EQ(static_cast<u8>(second_type->inner->kind), static_cast<u8>(TypeKind::I64));
+
+    first.destroy();
+    second.destroy();
+}
+
 TEST(RirBuilder, BinaryOperations) {
     TestContext ctx;
     REQUIRE(ctx.init());
@@ -371,9 +400,13 @@ TEST(RirIntegration, AuthHandlerFromDesignDoc) {
     auto sub = V(b.emit_const_str(lit("user-123")));
     VOK(b.emit_req_set_header(lit("X-User-ID"), sub));
     auto remote_addr = V(b.emit_req_remote_addr());
-    auto count = V(b.emit_counter_incr(remote_addr, 60));
-    auto limit = V(b.emit_const_i32(100));
-    auto over = V(b.emit_cmp(Opcode::CmpGt, count, limit));
+    auto* t_i64 = V(b.make_type(TypeKind::I64));
+    auto prev_opt = V(b.emit_cache_get(0, remote_addr));
+    auto prev = V(b.emit_opt_unwrap(prev_opt, t_i64));
+    auto next = V(b.emit_arith(Opcode::Add, prev, V(b.emit_const_i64(1))));
+    (void)V(b.emit_cache_set(0, remote_addr, next));
+    auto limit = V(b.emit_const_i64(100));
+    auto over = V(b.emit_cmp(Opcode::CmpGt, next, limit));
     VOK(b.emit_br(over, blk_reject_429, blk_proxy));
 
     // block_proxy
@@ -1507,12 +1540,14 @@ TEST(RirBuilder, DomainOps) {
     auto entry = V(b.create_block(fn, lit("entry")));
     b.set_insert_point(fn, entry);
 
-    auto now = V(b.emit_time_now());
-    CHECK_EQ(static_cast<u8>(fn->values[now.id].type->kind), static_cast<u8>(TypeKind::Time));
+    auto now = V(b.emit_time_now_micros());
+    CHECK_EQ(static_cast<u8>(fn->values[now.id].type->kind), static_cast<u8>(TypeKind::I64));
 
-    auto prev = V(b.emit_time_now());
-    auto diff = V(b.emit_time_diff(now, prev));
-    CHECK_EQ(static_cast<u8>(fn->values[diff.id].type->kind), static_cast<u8>(TypeKind::Duration));
+    auto prev = V(b.emit_time_now_micros());
+    auto diff = V(b.emit_arith(Opcode::Sub, now, prev));
+    CHECK_EQ(static_cast<u8>(fn->values[diff.id].type->kind), static_cast<u8>(TypeKind::I64));
+    auto biggest = V(b.emit_arith(Opcode::MaxInt, now, prev));
+    CHECK_EQ(static_cast<u8>(fn->values[biggest.id].type->kind), static_cast<u8>(TypeKind::I64));
 
     auto ip = V(b.emit_req_remote_addr());
     auto in_cidr = V(b.emit_ip_in_cidr(ip, lit("10.0.0.0/8")));
@@ -1656,6 +1691,30 @@ TEST(RirModule, MultipleFunctions) {
     auto e2 = V(b.create_block(fn2, lit("entry")));
     CHECK_EQ(e1.id, 0u);
     CHECK_EQ(e2.id, 0u);
+
+    ctx.destroy();
+}
+
+TEST(RirBuilder, ResponseHeaderOperandsRequireStringShapes) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("response_headers"), lit("/x"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+
+    auto integer = V(b.emit_const_i32(42));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_set_header(lit("X-Test"), integer)));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_add_header(lit("X-Test"), integer)));
+    CHECK_FALSE(static_cast<bool>(b.emit_resp_header(lit("X-Test"), integer)));
+
+    auto string = V(b.emit_const_str(lit("value")));
+    auto optional_string = V(b.emit_opt_wrap(string));
+    VOK(b.emit_resp_set_header(lit("X-Test"), string));
+    VOK(b.emit_resp_add_header(lit("X-Test"), string));
+    (void)V(b.emit_resp_header(lit("X-Test"), optional_string));
 
     ctx.destroy();
 }

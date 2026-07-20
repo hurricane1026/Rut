@@ -39,11 +39,14 @@ void Http2Conn::init() {
     pending_content_length = 0;
     pending_has_content_length = false;
     pending_buffer_body = false;
+    pending_request_forwardable = false;
+    pending_prepared_forward = false;
     pending_overflow = false;
     pending_route_config = nullptr;
     pending_route = nullptr;
     pending_route_action = RouteAction::Static;
     pending_static_status = 200;
+    pending_forward_upstream_id = 0;
     pending_jit_fn = nullptr;
     pending_route_param_count = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {
@@ -54,10 +57,15 @@ void Http2Conn::init() {
     async_cfg = nullptr;
     async_synth_len = 0;
     async_synth_sent = 0;
+    async_request_body_followed = false;
+    async_request_stream_open = false;
+    async_request_forwardable = false;
+    async_request_has_content_length = false;
+    async_request_content_length = 0;
     async_timer_ms = 0;
     async_fn = nullptr;
     async_state = 0;
-    async_route = nullptr;
+    async_upstream_id = 0;
     async_resp_len = 0;
 }
 
@@ -458,11 +466,14 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     c.pending_content_length = 0;
     c.pending_has_content_length = false;
     c.pending_buffer_body = false;
+    c.pending_request_forwardable = false;
+    c.pending_prepared_forward = false;
     c.pending_overflow = false;
     c.pending_route_config = nullptr;
     c.pending_route = nullptr;
     c.pending_route_action = RouteAction::Static;
     c.pending_static_status = 200;
+    c.pending_forward_upstream_id = 0;
     c.pending_jit_fn = nullptr;
     c.pending_route_param_count = 0;
     for (u32 i = 0; i < kMaxRouteParams; i++) {

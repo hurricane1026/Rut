@@ -1,7 +1,11 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/common/shard_limits.h"
+#include "rut/runtime/access_log.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include <new>
 #include <unordered_map>
 
 #include <hs.h>
@@ -43,6 +47,19 @@ struct ParseCache {
 
 thread_local ParseCache t_parse_cache;
 
+// `time.nowMicros()` is latched per handler invocation: MIR substitutes a
+// local's init tree at every use site, so without the latch each use of a
+// now-bound local would re-read the clock and see a different value —
+// silently wrong for GCRA-style code. The latch resets at parse_prime
+// (one per invocation, emitted at handler entry) so "now" is stable
+// within a request and fresh across requests.
+struct TimeCache {
+    i64 value = 0;
+    bool valid = false;
+};
+thread_local TimeCache t_time_cache;
+thread_local const u64* t_virtual_time_us = nullptr;
+
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
 // pc.primed untouched — callers set it.
 void parse_into(ParseCache& pc, const u8* data, u32 len) {
@@ -75,6 +92,7 @@ const ParseCache& parse_cached(const u8* data, u32 len) {
 }  // namespace
 
 void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
+    t_time_cache.valid = false;  // fresh "now" per invocation
     // Parse once for this invocation and mark the cache primed so the
     // following req_* helper calls reuse it.
     ParseCache& pc = t_parse_cache;
@@ -83,6 +101,7 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
 }
 
 void rut_helper_parse_unprime() {
+    t_time_cache.valid = false;
     // Called at handler exit so the primed parse never outlives the
     // invocation that created it. Without this, a direct caller of
     // rut_helper_req_* on the same thread that happens to reuse the
@@ -246,7 +265,8 @@ void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
     c->req_path_override = Str{path, len};
 }
 
-void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+static void record_req_header(
+    void* conn, const char* name, u32 nlen, const char* val, u32 vlen, bool append) {
     auto* c = static_cast<ConnectionBase*>(conn);
     // Bounded record. The DSL frontend caps + dedupes entries so overflow is
     // unreachable from compiled .rut, but a direct-RIR route can emit more than the
@@ -256,9 +276,23 @@ void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const cha
         c->req_header_override_overflow = true;
         return;
     }
-    auto& o = c->req_header_overrides[c->req_header_override_count++];
+    const u8 index = c->req_header_override_count++;
+    auto& o = c->req_header_overrides[index];
     o.name = Str{name, nlen};
     o.value = Str{val, vlen};
+    const u16 bit = static_cast<u16>(1u << index);
+    if (append)
+        c->req_header_append_mask |= bit;
+    else
+        c->req_header_append_mask &= static_cast<u16>(~bit);
+}
+
+void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_req_header(conn, name, nlen, val, vlen, false);
+}
+
+void rut_helper_req_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_req_header(conn, name, nlen, val, vlen, true);
 }
 
 static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
@@ -271,6 +305,72 @@ static bool ascii_header_name_eq(Str h, const char* name, u32 name_len) {
         if (a != b) return false;
     }
     return true;
+}
+
+static void record_resp_header(void* conn,
+                               const char* name,
+                               u32 nlen,
+                               const char* val,
+                               u32 vlen,
+                               Connection::RespHeaderMutationMode mode) {
+    if (conn == nullptr) return;
+    auto* c = static_cast<Connection*>(conn);
+    if (c->resp_header_mutation_pending_count >= Connection::kMaxRespHeaderMutations) {
+        c->resp_header_mutation_pending_overflow = true;
+        return;
+    }
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_pending_count++];
+    mutation.name = {name, nlen};
+    mutation.value = {val, vlen};
+    mutation.mode = mode;
+}
+
+void rut_helper_resp_set_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Set);
+}
+
+void rut_helper_resp_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_resp_header(conn, name, nlen, val, vlen, Connection::RespHeaderMutationMode::Add);
+}
+
+void rut_helper_resp_remove_header(void* conn, const char* name, u32 nlen) {
+    record_resp_header(conn, name, nlen, nullptr, 0, Connection::RespHeaderMutationMode::Remove);
+}
+
+void rut_helper_resp_commit_headers(void* conn) {
+    if (conn == nullptr) return;
+    auto* c = static_cast<Connection*>(conn);
+    c->resp_header_mutation_count = c->resp_header_mutation_pending_count;
+    c->resp_header_mutation_overflow = c->resp_header_mutation_pending_overflow;
+}
+
+void rut_helper_resp_header(void* conn,
+                            const char* name,
+                            u32 nlen,
+                            u8 fallback_has,
+                            const char* fallback_ptr,
+                            u32 fallback_len,
+                            u8* out_has,
+                            const char** out_ptr,
+                            u32* out_len) {
+    *out_has = fallback_has;
+    *out_ptr = fallback_has ? fallback_ptr : nullptr;
+    *out_len = fallback_has ? fallback_len : 0;
+    if (conn == nullptr) return;
+    auto* c = static_cast<Connection*>(conn);
+    for (u32 i = 0; i < c->resp_header_mutation_pending_count; i++) {
+        const auto& mutation = c->resp_header_mutations[i];
+        if (!ascii_header_name_eq(mutation.name, name, nlen)) continue;
+        if (mutation.mode == Connection::RespHeaderMutationMode::Remove) {
+            *out_has = 0;
+            *out_ptr = nullptr;
+            *out_len = 0;
+        } else if (mutation.mode == Connection::RespHeaderMutationMode::Set || !*out_has) {
+            *out_has = 1;
+            *out_ptr = mutation.value.ptr;
+            *out_len = mutation.value.len;
+        }
+    }
 }
 
 void rut_helper_req_cookie(const u8* req_data,
@@ -442,10 +542,220 @@ u32 rut_helper_req_remote_addr(void* conn) {
     return c->peer_addr;
 }
 
+i64 rut_helper_time_now_micros() {
+    TimeCache& tc = t_time_cache;
+    if (!tc.valid) {
+        tc.value = static_cast<i64>(t_virtual_time_us != nullptr ? *t_virtual_time_us
+                                                                 : rut::monotonic_us());
+        tc.valid = true;
+    }
+    return tc.value;
+}
+
+const u64* rut_helper_time_set_virtual_clock(const u64* now_us) {
+    const u64* previous = t_virtual_time_us;
+    t_virtual_time_us = now_us;
+    t_time_cache.valid = false;
+    return previous;
+}
+
+void rut_helper_time_unlatch() {
+    t_time_cache.valid = false;
+}
+
 u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return 0;
     return pc.req.has_content_length ? pc.req.content_length : 0;
+}
+
+// ── Cache state ────────────────────────────────────────────────────
+// One thread == one shard, so `thread_local` gives per-shard tables that
+// both backends and direct-call tests reach without touching the handler
+// ABI (the RateLimiter precedent). Tables (re)build lazily against the
+// process registry: first touch allocates; a hot-reload capacity change is
+// detected by the rounded-capacity compare and resets that instance's state
+// (documented); an unchanged capacity persists across config swaps because
+// the swap never touches thread-locals.
+// Owns the per-shard tables so thread exit unmaps them — a bare
+// thread_local CacheTable array has a trivial destructor and would leak
+// the mmaps on shard stop/join/restart flows.
+namespace rut {
+struct CacheLocalState {
+    struct ShardTables {
+        CacheTable tables[CacheRegistry::kMaxInstances];
+        u64 identities[CacheRegistry::kMaxInstances] = {};
+        u32 birth_generations[CacheRegistry::kMaxInstances] = {};
+        u32 generation = 0;
+        bool alloc_failed_logged[CacheRegistry::kMaxInstances] = {};
+        void reset() {
+            for (auto& t : tables) t.destroy();
+            for (u32 i = 0; i < CacheRegistry::kMaxInstances; i++) {
+                identities[i] = 0;
+                birth_generations[i] = 0;
+                alloc_failed_logged[i] = false;
+            }
+            generation = 0;
+        }
+        ~ShardTables() { reset(); }
+    };
+
+    ShardTables shards[kMaxShards];
+};
+}  // namespace rut
+
+namespace {
+
+thread_local rut::CacheLocalState t_default_cache_state;
+thread_local rut::CacheLocalState* t_active_cache_state = &t_default_cache_state;
+thread_local rut::u32 t_active_cache_shard = 0;
+
+rut::CacheLocalState::ShardTables& shard_cache_tables() {
+    return t_active_cache_state->shards[t_active_cache_shard];
+}
+
+rut::CacheTable* cache_table_for(rut::u32 instance) {
+    rut::CacheLocalState::ShardTables& t_state = shard_cache_tables();
+    auto* t_tables = t_state.tables;
+    auto* t_identities = t_state.identities;
+    auto* t_birth_generations = t_state.birth_generations;
+    rut::u32& t_generation = t_state.generation;
+    auto* t_alloc_failed_logged = t_state.alloc_failed_logged;
+    auto& reg = rut::cache_registry();
+    // Seqlock-style snapshot: the acquire on `generation` orders the
+    // descriptor loads AFTER the bump we observed, but a publish running
+    // concurrently could still overwrite them before we read — so re-check
+    // the generation after reading and retry. Without this, a reader could
+    // pair the old generation with the NEXT publish's half-written
+    // descriptors (e.g. observe count == 0 mid-publish and degrade a live
+    // handler to miss/no-op, or build a table against a future capacity).
+    rut::u32 gen = 0;
+    rut::u32 live_count = 0;
+    rut::u64 snap_seed = 0;
+    rut::u32 snap_caps[rut::CacheRegistry::kMaxInstances];
+    rut::u64 snap_idents[rut::CacheRegistry::kMaxInstances];
+    rut::u32 snap_births[rut::CacheRegistry::kMaxInstances];
+    for (int tries = 0;; tries++) {
+        gen = reg.generation.load(std::memory_order_acquire);
+        if (gen == 0) return nullptr;  // nothing published yet
+        if ((gen & 1u) == 0) {         // odd = publish in progress, retry
+            live_count = reg.count.load(std::memory_order_relaxed);
+            snap_seed = reg.seed.load(std::memory_order_relaxed);
+            for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+                snap_caps[i] = reg.capacities[i].load(std::memory_order_relaxed);
+                snap_idents[i] = reg.identities[i].load(std::memory_order_relaxed);
+                snap_births[i] = reg.birth_generations[i].load(std::memory_order_relaxed);
+            }
+            // A seqlock reader needs a read barrier before validation. The
+            // release half keeps the descriptor reads above the fence; the
+            // acquire half keeps the validation read below it. Otherwise a
+            // weak CPU/compiler may validate the old even generation first
+            // and only then consume descriptors from the next publication.
+            std::atomic_thread_fence(std::memory_order_acq_rel);
+            if (reg.generation.load(std::memory_order_acquire) == gen) break;
+        }
+        if (tries >= 8) return nullptr;  // publish storm — treat as miss
+    }
+    if (gen != t_generation) {
+        // A publish happened since this shard last looked. Drop tables
+        // whose instance disappeared, moved (identity change from a
+        // rename/reorder), or resized — reusing them would read another
+        // logical cache's entries; keeping stale ones would leak the mmap.
+        // Identical declarations keep their table (state persists across
+        // reloads, documented).
+        for (rut::u32 i = 0; i < rut::CacheRegistry::kMaxInstances; i++) {
+            if (t_tables[i].slots == nullptr) continue;
+            // Birth-generation compare closes the skipped-generation hole:
+            // if the instance was removed and re-added while this shard was
+            // idle (A→B→C), C's birth differs from the birth this table was
+            // built under, even though identity and capacity match A's.
+            const bool live =
+                i < live_count && snap_idents[i] == t_identities[i] &&
+                snap_births[i] == t_birth_generations[i] &&
+                rut::CacheTable::round_capacity(snap_caps[i]) == t_tables[i].slot_count;
+            if (!live) {
+                t_tables[i].destroy();
+                t_identities[i] = 0;
+                t_birth_generations[i] = 0;
+            }
+        }
+        t_generation = gen;
+    }
+    if (instance >= live_count) return nullptr;
+    const rut::u32 cap = snap_caps[instance];
+    if (cap == 0) return nullptr;
+    rut::CacheTable& t = t_tables[instance];
+    if (t.slot_count != rut::CacheTable::round_capacity(cap)) {
+        if (!t.init(cap, snap_seed)) {
+            // Fail VISIBLY (fixed-capacity axiom): a silent nullptr would
+            // degrade every cache op on this shard to miss/no-op — for a
+            // rate limit that silently admits all traffic. Fail-closed
+            // needs an error path in the handler ABI; recorded follow-up.
+            if (!t_alloc_failed_logged[instance]) {
+                t_alloc_failed_logged[instance] = true;
+                fprintf(stderr,
+                        "rut: cache table mmap failed (instance %u, capacity %u) — cache ops "
+                        "degrade to miss/no-op on this shard\n",
+                        instance,
+                        cap);
+            }
+            return nullptr;
+        }
+        t_identities[instance] = snap_idents[instance];
+        t_birth_generations[instance] = snap_births[instance];
+        t_alloc_failed_logged[instance] = false;
+    }
+    return &t;
+}
+}  // namespace
+
+void rut_helper_cache_get(u32 instance, u32 key_ip, u8* out_has, i64* out_val) {
+    rut::CacheTable* t = cache_table_for(instance);
+    i64 v = 0;
+    if (t != nullptr && t->get(key_ip, &v)) {
+        *out_has = 1;
+        *out_val = v;
+        return;
+    }
+    *out_has = 0;
+    *out_val = 0;
+}
+
+void rut_helper_cache_set(u32 instance, u32 key_ip, i64 val) {
+    rut::CacheTable* t = cache_table_for(instance);
+    if (t != nullptr) t->set(key_ip, val);
+}
+
+u32 rut_helper_cache_select_local_shard(u32 shard_id) {
+    const u32 previous = t_active_cache_shard;
+    if (shard_id < rut::kMaxShards) t_active_cache_shard = shard_id;
+    return previous;
+}
+
+rut::CacheLocalState* rut_helper_cache_select_local_state(rut::CacheLocalState* state) {
+    rut::CacheLocalState* previous =
+        t_active_cache_state == &t_default_cache_state ? nullptr : t_active_cache_state;
+    t_active_cache_state = state != nullptr ? state : &t_default_cache_state;
+    return previous;
+}
+
+rut::CacheLocalState* rut_helper_cache_create_local_state() {
+    return new (std::nothrow) rut::CacheLocalState{};
+}
+
+void rut_helper_cache_destroy_local_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    if (t_active_cache_state == state) t_active_cache_state = &t_default_cache_state;
+    delete state;
+}
+
+void rut_helper_cache_reset_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    for (auto& shard : state->shards) shard.reset();
+}
+
+void rut_helper_cache_reset_local_state() {
+    for (auto& state : t_active_cache_state->shards) state.reset();
 }
 
 // ── String Operations ──────────────────────────────────────────────

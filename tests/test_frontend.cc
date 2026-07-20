@@ -10,6 +10,19 @@
 #include <fstream>
 #include <string>
 using namespace rut;
+
+TEST(hir, function_moves_preserve_non_response_statement_effect) {
+    HirFunction source;
+    source.has_non_response_statement_effect = true;
+
+    HirFunction moved(static_cast<HirFunction&&>(source));
+    CHECK(moved.has_non_response_statement_effect);
+
+    HirFunction assigned;
+    assigned = static_cast<HirFunction&&>(moved);
+    CHECK(assigned.has_non_response_statement_effect);
+}
+
 static Str lit(const char* s) {
     u32 n = 0;
     while (s[n]) n++;
@@ -1271,7 +1284,9 @@ TEST(frontend, bitwise_pipe_stage_requires_placeholder) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(lit("pipe call missing placeholder")));
+    CHECK(hir.error().detail.eq(
+        lit("right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
+            "where the value lands")));
 }
 
 TEST(frontend, using_alias_named_bitwise_shadows_builtin_namespace) {
@@ -1299,6 +1314,1363 @@ TEST(frontend, user_binding_named_bitwise_shadows_builtin_namespace) {
     // The local shadows the namespace, so `.and` is an unknown method on i32
     // rather than the builtin — the program is rejected, not silently folded.
     REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_constant_folds_arith_literals) {
+    const char* src =
+        "route GET \"/x\" { let a = 2 + 3 let s = 2 - 5 let m = 6 * 7 let d = 7 / 2 let r = "
+        "7 % 2 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    const i64 expected[5] = {5, -3, 42, 3, 1};
+    for (u32 i = 0; i < 5; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_arith_fold_wraps_on_overflow) {
+    const char* src =
+        "route GET \"/x\" { let a = 2147483647 + 1 let b = -2147483648 - 1 let c = 65536 * "
+        "65536 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, -2147483648);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 2147483647);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 0);
+}
+
+TEST(frontend, parse_negative_int_literals_and_unary_minus) {
+    const char* src =
+        "route GET \"/x\" { let x = -2147483648 let y = - -5 let z = 2 - -3 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, -2147483648);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 5);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 5);
+}
+
+TEST(frontend, int_literal_widening_thresholds) {
+    // Literal auto-widening: fits i32 → I32; fits i64 → I64; beyond → error.
+    const char* widen =
+        "route GET \"/x\" { let a = 2147483647 let b = 2147483648 let c = "
+        "9223372036854775807 let d = -2147483648 let e = -2147483649 let f = "
+        "-9223372036854775808 return 200 }\n";
+    auto lexed = lex(lit(widen));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 6u);
+    const HirTypeKind expected_types[6] = {HirTypeKind::I32,
+                                           HirTypeKind::I64,
+                                           HirTypeKind::I64,
+                                           HirTypeKind::I32,
+                                           HirTypeKind::I64,
+                                           HirTypeKind::I64};
+    const i64 expected_values[6] = {2147483647LL,
+                                    2147483648LL,
+                                    9223372036854775807LL,
+                                    -2147483648LL,
+                                    -2147483649LL,
+                                    static_cast<i64>(0x8000000000000000ull)};
+    for (u32 i = 0; i < 6; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(expected_types[i]));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected_values[i]);
+    }
+
+    const char* over = "route GET \"/x\" { let x = 9223372036854775808 return 200 }\n";
+    lexed = lex(lit(over));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+
+    const char* under = "route GET \"/x\" { let x = -9223372036854775809 return 200 }\n";
+    lexed = lex(lit(under));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+}
+
+TEST(frontend, analyze_i64_builtin_folds_literals_and_identity) {
+    const char* src =
+        "route GET \"/x\" { let a = i64(5) let b = i64(-3) let c = i64(i64(7)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    const i64 expected[3] = {5, -3, 7};
+    for (u32 i = 0; i < 3; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(HirTypeKind::I64));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_i64_builtin_widens_runtime_i32_through_pipeline) {
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) if w == i64(5) { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_user_func_named_i64_shadows_builtin) {
+    // A user function named i64 wins over the conversion builtin — the call
+    // resolves to the function (wrong arg type here → its own error, not
+    // the builtin's kI64ArgDetail path succeeding).
+    const char* src =
+        "func i64(_ s: str) -> i32 => 1\n"
+        "route GET \"/x\" { let v = i64(\"a\") if v == 1 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_i64_arith_folds_at_boundaries) {
+    const char* src =
+        "route GET \"/x\" { let a = 9223372036854775807 + 1 let b = -9223372036854775808 - 1 "
+        "let d = -9223372036854775808 / -1 let m = -9223372036854775808 % -1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, static_cast<i64>(0x8000000000000000ull));
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 9223372036854775807LL);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, static_cast<i64>(0x8000000000000000ull));
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 0);
+
+    const char* div_zero = "route GET \"/x\" { let v = i64(7) / 0 return 200 }\n";
+    lexed = lex(lit(div_zero));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, analyze_arith_literal_adopts_i64_operand) {
+    // A bare i32-typed int literal next to an i64 operand adopts I64 —
+    // required for `-i64(x)` (parser desugars to Sub(0, x)) and `i64(x) + 1`.
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) let p = w + 1 let q = 1 + w let n = -w "
+        "if p == i64(6) && q == i64(6) && n == -5 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_mixed_width_arith_and_cmp) {
+    const char* arith = "route GET \"/x\" { let a = 5 let w = i64(9) let v = a + w return 200 }\n";
+    auto lexed = lex(lit(arith));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+
+    const char* cmp =
+        "route GET \"/x\" { let a = 5 let w = i64(9) if a < w { return 200 } "
+        "else { return 500 } }\n";
+    lexed = lex(lit(cmp));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, const_eval_i64_in_if_const) {
+    const char* src =
+        "route GET \"/x\" { let n = 2147483648 if const n + 2 == 2147483650 { return 200 } "
+        "else { return 500 } }\n"
+        "route GET \"/y\" { let w = i64(2) if const w + 2147483648 == 2147483650 { return 204 "
+        "} else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_match_on_i64_subject) {
+    // Route control match.
+    const char* route_match = "route GET \"/x\" { let w = i64(5) match w { _ => return 500 } }\n";
+    auto lexed = lex(lit(route_match));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Function-body match.
+    const char* func_match =
+        "func pick(_ a: i32) -> i32 { match i64(a) { _ => 0 } }\n"
+        "route GET \"/x\" { if pick(5) == 0 { return 200 } else { return 500 } }\n";
+    lexed = lex(lit(func_match));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Const match.
+    const char* const_match =
+        "route GET \"/x\" { let w = i64(5) match const w { _ => return 500 } }\n";
+    lexed = lex(lit(const_match));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_decl_and_ops_analyze_and_lower) {
+    // Happy path: declaration registered (surviving the heap pipeline —
+    // HirModule's hand-written ctors must copy `caches`), get/set analyze
+    // with the right types, .or(0) adopts i64, whole program lowers.
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 1024)
+
+route GET "/x" {
+    let prev = buckets.get(req.remoteAddr).or(0)
+    buckets.set(req.remoteAddr, prev + 1)
+    if prev + 1 > 2 { return 429 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->caches.len, 1u);
+    CHECK(hir->caches[0].name.eq(lit("buckets")));
+    CHECK_EQ(hir->caches[0].capacity, 1024u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->caches.len, 1u);
+    CHECK_EQ(mir->caches[0].capacity, 1024u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    CHECK_EQ(rir.module.cache_instance_count, 1u);
+    CHECK_EQ(rir.module.cache_instances[0].capacity, 1024u);
+    rir.destroy();
+}
+
+TEST(frontend, cache_get_feeds_guard_let_and_nil_test) {
+    const auto src = R"rut(
+let seen = Cache<IP, i64>(capacity: 64)
+
+route GET "/a" {
+    guard let n = seen.get(req.remoteAddr) else { return 404 }
+    if n > 0 { return 200 } else { return 204 }
+}
+route GET "/b" {
+    let n = seen.get(req.remoteAddr)
+    if n == nil { return 404 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, cache_decl_validation_errors) {
+    const char* cases[] = {
+        "let b = Cache<str, i64>(capacity: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i32>(capacity: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP>(capacity: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>()\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(capacity: 0)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(capacity: 8388608)\nroute GET \"/x\" { return 200 }\n",
+        "let b = Cache<IP, i64>(size: 64)\nroute GET \"/x\" { return 200 }\n",
+        "let x = 1\nroute GET \"/x\" { return 200 }\n",
+        ("let b = Cache<IP, i64>(capacity: 64)\nlet b = Cache<IP, i64>(capacity: 64)\n"
+         "route GET \"/x\" { return 200 }\n"),
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.len != 0);
+    }
+}
+
+TEST(frontend, cache_op_gates_and_shadowing) {
+    // Wrong key type.
+    const char* bad_key =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let n = b.get(1).or(0) if n > 0 { return 200 } else { return 204 } "
+        "}\n";
+    auto lexed = lex(lit(bad_key));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Runtime i32 value needs i64(x).
+    const char* bad_val =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let v = 1 b.set(req.remoteAddr, v) return 200 }\n";
+    lexed = lex(lit(bad_val));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Unknown method.
+    const char* bad_method =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { b.incr(req.remoteAddr) return 200 }\n";
+    lexed = lex(lit(bad_method));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // (`delete` is the HTTP-method keyword, so `b.delete(...)` is a parse
+    // error rather than an analyze rejection — `incr` covers the
+    // unknown-method analyze path above.)
+    // A local named like the instance shadows it — `.get` then resolves as
+    // an unknown method on i32 and is rejected.
+    const char* shadowed =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let b = 1 let n = b.get(req.remoteAddr).or(0) if n > 0 { return "
+        "200 } else { return 204 } }\n";
+    lexed = lex(lit(shadowed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_statement_rules) {
+    // Accepted in the leading let-region (covered by the happy-path test);
+    // rejected after a guard (state writes run at handler entry).
+    const char* after_guard =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { guard req.http11 else { return 505 } b.set(req.remoteAddr, 1) "
+        "return 200 }\n";
+    auto lexed = lex(lit(after_guard));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // A bare get (no side effect) is not a statement.
+    const char* bare_get =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { b.get(req.remoteAddr) return 200 }\n";
+    lexed = lex(lit(bare_get));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A bare non-cache method call is not a statement either.
+    const char* bare_other = "route GET \"/x\" { req.header(\"Host\") return 200 }\n";
+    lexed = lex(lit(bare_other));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_set_is_lowered_on_the_selected_if_branch) {
+    const char* src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    let prev = buckets.get(req.remoteAddr).or(0)
+    if prev < 2 {
+        buckets.set(req.remoteAddr, prev + 1)
+        return 200
+    } else {
+        return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& control = hir->routes[0].control;
+    CHECK_EQ(static_cast<u8>(control.kind), static_cast<u8>(HirControlKind::Match));
+    REQUIRE_EQ(control.match_arms.len, 2u);
+    REQUIRE_EQ(control.match_arms[0].effect_expr_indices.len, 1u);
+    CHECK_EQ(control.match_arms[1].effect_expr_indices.len, 0u);
+    const u32 effect_index = control.match_arms[0].effect_expr_indices[0];
+    REQUIRE_LT(effect_index, hir->routes[0].exprs.len);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].exprs[effect_index].kind),
+             static_cast<u8>(HirExprKind::CacheSet));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions.len, 1u);
+    u32 effect_count = 0;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& block = mir->functions[0].blocks[bi];
+        effect_count += block.effects.len;
+        for (u32 ei = 0; ei < block.effects.len; ei++) {
+            REQUIRE_LT(block.effects[ei].value_index, mir->functions[0].values.len);
+            CHECK_EQ(static_cast<u8>(mir->functions[0].values[block.effects[ei].value_index].kind),
+                     static_cast<u8>(MirValueKind::CacheSet));
+        }
+    }
+    CHECK_EQ(effect_count, 1u);
+}
+
+TEST(frontend, cache_set_is_accepted_in_a_match_arm_body) {
+    const char* src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    match req.http11 {
+        true => {
+            buckets.set(req.remoteAddr, 1)
+            return 200
+        }
+        _ => return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& arms = hir->routes[0].control.match_arms;
+    REQUIRE_EQ(arms.len, 2u);
+    CHECK_EQ(arms[0].effect_expr_indices.len, 1u);
+    CHECK_EQ(arms[1].effect_expr_indices.len, 0u);
+}
+
+TEST(frontend, cache_set_is_statement_only_no_expression_escape) {
+    // `let _ = b.set(...)` after a guard would materialize at handler entry
+    // and write on rejected requests — set is not an expression anywhere.
+    const char* let_escape =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { guard req.http11 else { return 505 } "
+        "let w = b.set(req.remoteAddr, 1) if w == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(let_escape));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // .or() lowers its fallback eagerly — a set inside would run on hits too.
+    const char* or_escape =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let n = b.get(req.remoteAddr).or(b.set(req.remoteAddr, 1)) "
+        "if n > 0 { return 200 } else { return 204 } }\n";
+    lexed = lex(lit(or_escape));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Even in the leading statement region a let-bound set is rejected.
+    const char* leading_let =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let w = b.set(req.remoteAddr, 1) return 200 }\n";
+    lexed = lex(lit(leading_let));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_ops_rejected_in_wait_routes) {
+    // Wait routes re-materialize locals on resume — a pre-wait get would
+    // read post-wait state, and a pre-wait bare set would write after the
+    // wait. Both rejected while the route contains any wait.
+    const char* get_before_wait =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let p = b.get(req.remoteAddr).or(0) wait(1000) "
+        "if p > 0 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(get_before_wait));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* branch_set_after_wait =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { wait(1000) if req.http11 { b.set(req.remoteAddr, 1) return "
+        "200 } else { return 505 } }\n";
+    lexed = lex(lit(branch_set_after_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* set_before_wait =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, 1) wait(1000) return 200 }\n";
+    lexed = lex(lit(set_before_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A helper body is analyzed against a scratch route (flag off) and
+    // inlined as an already-built CacheGet tree — the post-analysis scan
+    // must still reject it in a wait route.
+    const char* via_helper =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func peek(_ k: IP) => b.get(k).or(0)\n"
+        "route GET \"/x\" { let p = peek(req.remoteAddr) wait(1000) "
+        "if p > 0 { return 200 } else { return 204 } }\n";
+    lexed = lex(lit(via_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // wait any populates route.waits like a plain wait — also rejected.
+    const char* wait_any =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let p = b.get(req.remoteAddr).or(0) "
+        "wait any { timer(1000) => { return 200 } } }\n";
+    lexed = lex(lit(wait_any));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Match-arm block lets are stored in route.locals, so the same scan must
+    // catch helper-inlined cache reads there too.
+    const char* arm_helper =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func peek(_ k: IP) => b.get(k).or(0)\n"
+        "route GET \"/x\" { wait(1000) match req.http11 { true => { let p = "
+        "peek(req.remoteAddr) if p > 0 { return 200 } else { return 204 } } "
+        "_ => return 404 } }\n";
+    lexed = lex(lit(arm_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, cache_bare_set_rejected_on_pre_guarded_routes) {
+    // A chain `before` step has already appended its guard to route.guards
+    // before the body statements are analyzed — a leading bare set would
+    // still write on requests the chain rejects.
+    const char* chained =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func check(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 0 }\n"
+        "chain auth { before check(req) }\n"
+        "route {\n"
+        " use chain auth\n"
+        " GET \"/x\" { b.set(req.remoteAddr, 1) return 200 }\n"
+        "}\n";
+    auto lexed = lex(lit(chained));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // (@rateLimit/@throttle routes are NOT treated as guarded — the runtime
+    // enforces them outside the handler; see
+    // cache_bare_set_allowed_on_ratelimit_throttle_routes.)
+}
+
+TEST(frontend, cache_bare_set_rejected_after_fallible_local) {
+    // Locals materialize before the automatic error prelude — a set after a
+    // fallible binding would also run on the error path.
+    const char* fallible_then_set =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { let x = any(1, error(500)) "
+        "b.set(req.remoteAddr, 1) guard let v = x else { return 400 } "
+        "if v == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(fallible_then_set));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, cache_decl_name_collisions_rejected) {
+    // Collides with a function declared later in the file.
+    const char* vs_func =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func buckets(_ a: i32) -> i32 => a\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(vs_func));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Collides with a builtin receiver — the cache would be unreachable
+    // (bitwise namespace resolution runs before cache lookup).
+    const char* vs_bitwise =
+        "let bitwise = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    lexed = lex(lit(vs_bitwise));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    const char* vs_req =
+        "let req = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    lexed = lex(lit(vs_req));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_rejected_after_helper_appended_guards) {
+    // Respond-capable helpers are chain-step-only today: a direct call from
+    // a route body is rejected at the helper's guard, so a mid-statement
+    // guard append cannot currently reach the bare-set gate from the
+    // surface. The gate still consults route.guards LIVE (and re-checks
+    // after analyzing the set's own arguments) so enabling direct
+    // respond-capable calls later cannot turn this into a write-before-
+    // guard bypass. Both spellings must stay rejected either way.
+    const char* helper_before =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func require(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 1 }\n"
+        "route GET \"/x\" { let code = require(req) b.set(req.remoteAddr, 1) "
+        "if code == 1 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(helper_before));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // Same helper inside the set's own arguments.
+    const char* helper_inside =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "func require(_ req: i32) -> i32 { guard req.http11 else { respond 505 } 1 }\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, i64(require(req))) return 200 }\n";
+    lexed = lex(lit(helper_inside));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, cache_bare_set_allowed_on_ratelimit_throttle_routes) {
+    // @rateLimit is enforced by the runtime BEFORE the handler runs (a
+    // limited request never executes the write) and @throttle shapes the
+    // response — neither guards inside the handler, so cache-backed
+    // handlers compose with both.
+    const char* rate_limited =
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "@rateLimit(limit: 2, window: 1m)\n"
+        "route GET \"/x\" { b.set(req.remoteAddr, 1) return 200 }\n";
+    auto lexed = lex(lit(rate_limited));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, cache_decl_rejects_overlong_name) {
+    // The runtime descriptor truncates names at 31 bytes and the reload
+    // identity hashes the stored name — overlong names are rejected.
+    const char* overlong =
+        "let abcdefghijklmnopqrstuvwxyz123456 = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(overlong));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, cache_decl_rejects_qualified_constructor) {
+    // A qualified spelling must not silently discard the qualifier and
+    // create live state.
+    const char* qualified =
+        "let b = foo.Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(qualified));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_bitwise_i64_folds_and_adopts_literals) {
+    // Same-width rule over {i32, i64}: bare literals adopt the i64 side
+    // (incl. flip's synthesized -1); folds run at 64-bit width. The packed
+    // sliding-window shape (window_index << 32 | counts) is the motivating
+    // use (DESIGN.md §3.3.6).
+    const char* src =
+        "route GET \"/x\" { let a = bitwise.and(i64(6), 3) let s = "
+        "bitwise.shiftLeft(i64(1), 40) let f = bitwise.flip(i64(0)) let p = "
+        "bitwise.or(bitwise.shiftLeft(i64(7), 32), 9) let r = "
+        "bitwise.shiftRight(bitwise.flip(i64(0)), 70) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    const i64 expected[5] = {2, 1099511627776LL, -1, (7LL << 32) | 9, -1 /* shr >= 64 sign fill */};
+    for (u32 i = 0; i < 5; i++) {
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.kind),
+                 static_cast<u8>(HirExprKind::IntLit));
+        CHECK_EQ(static_cast<u8>(hir->routes[0].locals[i].init.type),
+                 static_cast<u8>(HirTypeKind::I64));
+        CHECK_EQ(hir->routes[0].locals[i].init.int_value, expected[i]);
+    }
+}
+
+TEST(frontend, analyze_bitwise_i64_runtime_operands_lower) {
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(a) let v = bitwise.or("
+        "bitwise.shiftLeft(w, 32), 1) if v > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_bitwise_mixed_width) {
+    // Mixed non-literal widths keep the arithmetic fix-it.
+    const char* src =
+        "route GET \"/x\" { let a = 5 let w = i64(9) let v = bitwise.and(a, w) return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_time_now_micros_and_minmax) {
+    // time.nowMicros() types I64 plain; max/min fold at both widths and
+    // adopt bare literals next to an i64 side.
+    const char* src =
+        "route GET \"/x\" { let t = time.nowMicros() let a = max(3, 5) let b = min(3, 5) "
+        "let c = max(i64(7), 2) let d = min(2147483648, 4) if t > 0 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 5u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::TimeNowMicros));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 5);
+    CHECK_EQ(hir->routes[0].locals[2].init.int_value, 3);
+    // max(i64(7), 2): both sides fold to literals → the whole call folds.
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.kind),
+             static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[3].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    CHECK_EQ(hir->routes[0].locals[3].init.int_value, 7);
+    CHECK_EQ(hir->routes[0].locals[4].init.int_value, 4);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[4].init.type),
+             static_cast<u8>(HirTypeKind::I64));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_time_and_minmax_gates_and_shadowing) {
+    // Unknown time member gets the fix-it.
+    const char* bad_member = "route GET \"/x\" { let t = time.now() return 200 }\n";
+    auto lexed = lex(lit(bad_member));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // Mixed non-literal widths rejected.
+    const char* mixed =
+        "route GET \"/x\" { let a = 5 let w = i64(9) let v = max(a, w) return 200 }\n";
+    lexed = lex(lit(mixed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // A user func named max shadows the builtin (arity 1 — the builtin
+    // would reject it; the user function resolves instead).
+    const char* shadowed =
+        "func max(_ s: str) -> i32 => 1\n"
+        "route GET \"/x\" { let v = max(\"a\") if v == 1 { return 200 } else "
+        "{ return 500 } }\n";
+    lexed = lex(lit(shadowed));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    // A local named time shadows the namespace.
+    const char* time_shadow =
+        "route GET \"/x\" { let time = 1 let t = time.nowMicros() return 200 }\n";
+    lexed = lex(lit(time_shadow));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_time_rejected_in_wait_routes) {
+    // Wait routes re-materialize locals on resume — a pre-wait
+    // `let start = time.nowMicros()` would sample after the wait. Rejected
+    // anywhere in a route containing wait.
+    const char* pre_wait =
+        "route GET \"/x\" { let start = time.nowMicros() wait(1000) "
+        "if start > 0 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(pre_wait));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    const char* post_wait =
+        "route GET \"/x\" { wait(1000) if time.nowMicros() > 0 { return 200 } else { "
+        "return 500 } }\n";
+    lexed = lex(lit(post_wait));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A helper body is analyzed against a scratch route (flag off) and
+    // inlined as an already-built TimeNowMicros tree — the post-analysis
+    // scan must still reject it in a wait route.
+    const char* via_helper =
+        "func now(_ x: i32) => time.nowMicros()\n"
+        "route GET \"/x\" { let start = now(1) wait(1000) "
+        "if start > 0 { return 200 } else { return 500 } }\n";
+    lexed = lex(lit(via_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // wait any populates route.waits like a plain wait — also rejected.
+    const char* wait_any =
+        "route GET \"/x\" { let start = time.nowMicros() "
+        "wait any { timer(1000) => { return 200 } } }\n";
+    lexed = lex(lit(wait_any));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+
+    // A time-returning helper bound inside a terminal match arm's block —
+    // the inlined tree's nodes land in storage the backstop scan reaches.
+    const char* arm_helper =
+        "func now(_ x: i32) => time.nowMicros()\n"
+        "route GET \"/x\" { wait(1000) match req.http11 { true => { let t = now(1) "
+        "if t > 0 { return 200 } else { return 500 } } _ => return 404 } }\n";
+    lexed = lex(lit(arm_helper));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_minmax_pipe_stage_requires_placeholder) {
+    // `x | max(1, 2)` must not silently drop x — a builtin pipe stage needs
+    // an explicit placeholder, same rule as ordinary pipe calls.
+    const char* dropped = "route GET \"/x\" { let a = 5 let v = a | max(1, 2) return 200 }\n";
+    auto lexed = lex(lit(dropped));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.len != 0);
+
+    // With the placeholder the piped value participates normally.
+    const char* piped =
+        "route GET \"/x\" { let a = 5 let v = a | max(_, 3) if v == 5 { return 200 } else { "
+        "return 500 } }\n";
+    lexed = lex(lit(piped));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_minmax_const_evals_over_const_locals) {
+    // max/min over compile-time locals participate in `if const`, matching
+    // the arithmetic operators.
+    const char* src =
+        "route GET \"/x\" { let a = 3 let b = 5 if const max(a, b) == 5 { return 200 } "
+        "else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+
+    const char* min_src =
+        "route GET \"/x\" { let a = 3 if const min(a, 7) == 3 { return 200 } "
+        "else { return 500 } }\n";
+    lexed = lex(lit(min_src));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, analyze_wait_timer_rejects_oversized_ms) {
+    const char* src = "route GET \"/x\" { wait(timer(4294967296)) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, analyze_folds_int_min_div_and_mod_guards) {
+    const char* src =
+        "route GET \"/x\" { let d = -2147483648 / -1 let m = -2147483648 % -1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, -2147483648);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 0);
+}
+
+TEST(frontend, analyze_rejects_literal_zero_divisor_with_fixit) {
+    const char* div = "route GET \"/x\" { let a = 6 let v = a / 0 return 200 }\n";
+    auto lexed = lex(lit(div));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+
+    const char* mod = "route GET \"/x\" { let v = 7 % 0 return 200 }\n";
+    lexed = lex(lit(mod));
+    REQUIRE(lexed);
+    ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, parse_precedence_mul_over_add_over_cmp) {
+    const char* src =
+        "route GET \"/x\" { let p = 2 + 3 * 4 let q = 2 * 3 + 4 guard 1 + 2 < 4 else { "
+        "return 500 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 14);
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 10);
+}
+
+TEST(frontend, analyze_arith_runtime_operands_lower_through_pipeline) {
+    const char* src =
+        "route GET \"/x\" { let a = 6 let v = a * 7 - 2 if v == 40 { return 200 } else { "
+        "return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_arith_non_i32_operand) {
+    const char* src = "route GET \"/x\" { let v = \"a\" + 1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.len != 0);
+}
+
+TEST(frontend, analyze_rejects_arith_optional_operand) {
+    const char* src = "route GET \"/x\" { let h = req.header(\"X-N\") let v = h + 1 return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+}
+
+TEST(frontend, parse_rejects_duration_literal_arith) {
+    const char* src = "route GET \"/x\" { let x = 5s - 1s return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+}
+
+TEST(frontend, lex_minus_vs_thin_arrow_and_slash_vs_comment) {
+    const char* src =
+        "func dec(_ a: i32) -> i32 => a - 1\n"
+        "route GET \"/x\" { let x = 6 / 3 // half\n return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 2);
+}
+
+TEST(frontend, arith_expr_as_pipe_lhs_and_call_arg) {
+    const char* src =
+        "route GET \"/x\" { let a = 6 let v = a + 1 | bitwise.and(_, 3) let w = "
+        "bitwise.and(a + 1, 3) if v == 3 && w == 3 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, match_arm_negative_int_literal_patterns) {
+    // Negative int literals are valid arm patterns, and a line-initial `-`
+    // after a bare-expression/`return <expr>` arm body starts the next
+    // arm's pattern instead of continuing as subtraction (the newline-dot
+    // arm-boundary rule, mirrored for minus).
+    const auto src = R"rut(
+route GET "/x" {
+    let code = -1
+    match code {
+        200 => return 200
+        -1 => return 204
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& route = ast->items[0].route;
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->kind), static_cast<u8>(AstStmtKind::Match));
+    REQUIRE_EQ(route.statements[1]->match_arms.len, 3u);
+    REQUIRE(route.statements[1]->match_arms[1].pattern != nullptr);
+    CHECK_EQ(route.statements[1]->match_arms[1].pattern->int_value, -1);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, const_if_folds_arithmetic_over_const_locals) {
+    // `if const` evaluates arithmetic over compile-time locals via
+    // const_eval_expr (fold_arith_i32 keeps semantics identical to the
+    // analyze fold / compiled code). A const 0 divisor takes the
+    // defined-0 path — only a directly spelled `/ 0` is a compile error.
+    const auto src = R"rut(
+route GET "/x" {
+    let n = 1
+    if const n + 1 == 2 { return 200 } else { return 500 }
+}
+route GET "/y" {
+    let z = 0
+    if const 7 / z == 0 && 7 % z == 0 { return 204 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bare_match_arm_body_keeps_line_wrapped_subtraction) {
+    // A line-initial `-` in a bare-expression arm body only ends the arm
+    // when it is an actual negative-literal pattern boundary
+    // (`- IntLit =>` / `- IntLit if`). Here the wrapped `- 1` IS
+    // Minus+IntLit but is followed by `_`, not `=>`, so the 3-token
+    // lookahead keeps it as the subtraction `a - 1`.
+    const auto src = R"rut(
+func pick(_ a: i32) -> i32 {
+    match a {
+        5 => a
+            - 1
+        _ => 0
+    }
+}
+route GET "/x" { if pick(5) == 4 { return 204 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, bare_match_arm_negative_pattern_after_value_body) {
+    // The boundary DOES fire for a real negative-literal pattern after a
+    // bare value body: `5 => a` newline `-1 => 99` splits into two arms.
+    const auto src = R"rut(
+func pick(_ a: i32) -> i32 {
+    match a {
+        5 => a
+        -1 => 99
+        _ => 0
+    }
+}
+route GET "/x" { if pick(0 - 1) == 99 { return 204 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, braced_match_arm_body_keeps_cross_line_subtraction) {
+    // Inside a braced arm body the arm-boundary rule is suspended (same as
+    // for the newline-dot rule), so a cross-line `- 1` continues the
+    // previous expression as subtraction.
+    const auto src = R"rut(
+route GET "/x" {
+    let a = 5
+    match a {
+        5 => {
+            let v = a
+                - 1
+            if v == 4 { return 204 } else { return 500 }
+        }
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, arith_in_guard_if_and_match_scrutinee) {
+    // A match nested inside an if branch is an unsupported route-control
+    // shape independent of arithmetic, so match gets its own route.
+    const char* src =
+        "route GET \"/x\" { let a = 5 guard a - 1 > 0 else { return 400 } match a % 3 { 2 "
+        "=> return 204 _ => return 500 } }\n"
+        "route GET \"/y\" { let b = 5 if b % 2 == 1 { return 200 } else { return 500 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    CHECK(lowered);
+    rir.destroy();
 }
 
 TEST(frontend, nil_presence_test_on_optional_header_lowers) {
@@ -1477,27 +2849,128 @@ TEST(frontend, parse_return_response_status_only) {
     CHECK_EQ(hir_route.control.direct_term.status_code, 200);
 }
 
-TEST(frontend, parse_respond_status_with_body) {
-    const char* src = "route GET \"/x\" { respond 401, \"denied\" }\n";
+TEST(frontend, respond_status_in_handler_rejected_with_fixit) {
+    const char* src = "route GET \"/x\" { respond 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(
+        lit("a handler's return value is its response; replace `respond` with `return`")));
+    CHECK_EQ(ast.error().span.start, 17u);
+}
+
+TEST(frontend, respond_response_local_in_handler_rejected_with_fixit) {
+    const char* src = "route GET \"/x\" { let resp = response(418) respond resp }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(
+        lit("a handler's return value is its response; replace `respond` with `return`")));
+}
+
+TEST(frontend, nested_respond_in_handler_rejected_with_fixit) {
+    const char* src = "route GET \"/x\" { guard req.http11 else { respond 505 } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(
+        lit("a handler's return value is its response; replace `respond` with `return`")));
+}
+
+TEST(frontend, status_return_in_middleware_rejected_with_fixit) {
+    const char* src =
+        "func check(ok: bool) -> i32 { guard ok else { return 401 } 7 }\n"
+        "route GET \"/x\" { let value = check(req.http11) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit(
+        "middleware short-circuits with `respond <status>`; `return` is only for the function's "
+        "value")));
+}
+
+TEST(frontend, direct_status_return_in_middleware_rejected_with_fixit) {
+    const char* src = "func check() -> i32 { return 401 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(!ast);
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit(
+        "middleware short-circuits with `respond <status>`; `return` is only for the function's "
+        "value")));
+}
+
+TEST(frontend, helper_respond_response_local_propagates_guard) {
+    const char* src = R"rut(
+func check(ok: bool) -> i32 {
+    let resp = response(401)
+    resp.set("X-Discard", "first")
+    resp.add("X-Discard", "second")
+    resp.remove("X-Discard")
+    resp.set("X-Reason", "auth")
+    guard ok else { respond resp }
+    7
+}
+route GET "/x" { let value = check(req.http11) return 200 }
+)rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
-    REQUIRE_EQ(ast->items.len, 1u);
-    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
-    const AstStatement& stmt = *ast->items[0].route.statements[0];
-    CHECK_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::RespondStatus));
-    CHECK_EQ(stmt.status_code, 401u);
-    CHECK(stmt.has_response_body);
-    CHECK(stmt.response_body.eq(lit("denied")));
-
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    REQUIRE_EQ(hir->functions[0].respond_guards.len, 1u);
+    CHECK_EQ(hir->functions[0].respond_guards[0].status_code, 401);
+    REQUIRE_EQ(hir->functions[0].respond_guards[0].response_headers.len, 1u);
+    CHECK(hir->functions[0].respond_guards[0].response_headers[0].key.eq(lit("X-Reason")));
+    CHECK(hir->functions[0].respond_guards[0].response_headers[0].value.eq(lit("auth")));
     REQUIRE_EQ(hir->routes.len, 1u);
-    const auto& term = hir->routes[0].control.direct_term;
-    CHECK_EQ(static_cast<u8>(term.kind), static_cast<u8>(HirTerminatorKind::ReturnStatus));
-    CHECK_EQ(term.status_code, 401);
-    CHECK(term.response_body.eq(lit("denied")));
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(hir->routes[0].guards[0].fail_term.status_code, 401);
+    REQUIRE_EQ(hir->routes[0].guards[0].fail_term.response_headers.len, 1u);
+    CHECK(hir->routes[0].guards[0].fail_term.response_headers[0].key.eq(lit("X-Reason")));
+}
+
+TEST(frontend, respond_identifier_must_name_response_builder) {
+    const char* src =
+        "func check(ok: bool) -> i32 { let value = 401 guard ok else { respond value } 7 }\n"
+        "route GET \"/x\" { let value = check(req.http11) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(static_cast<u16>(hir.error().code),
+             static_cast<u16>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(lit("identifier must name a Response builder")));
+}
+
+TEST(frontend, helper_respond_response_rejects_dynamic_mutation) {
+    const char* src =
+        "func check(ok: bool, reason: str) -> i32 { let resp = response(401) "
+        "resp.set(\"X-Reason\", reason) guard ok else { respond resp } 7 }\n"
+        "route GET \"/x\" { let value = check(req.http11, \"auth\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(!hir);
+    CHECK_EQ(static_cast<u16>(hir.error().code),
+             static_cast<u16>(FrontendError::UnsupportedSyntax));
+    CHECK(hir.error().detail.eq(
+        lit("middleware Response mutations require literal names and values")));
 }
 
 TEST(frontend, respond_is_contextual_keyword_outside_statements) {
@@ -2294,12 +3767,12 @@ TEST(frontend, parse_return_websocket_bare_is_passthrough) {
 }
 
 TEST(frontend, parse_return_websocket_block_is_terminate) {
-    // A trailing `{ ... }` block turns it into TERMINATE mode (WsTerminate) — the block is the
-    // per-message frame handler, parsed onto `then_stmt`. Frame verdicts are bare method calls
+    // A trailing `{ frame in ... }` block turns it into TERMINATE mode (WsTerminate) — the block is
+    // the per-message frame handler, parsed onto `then_stmt`. Frame verdicts are bare method calls
     // (`frame.forward()`), parsed by the dedicated frame-body parser (parse_ws_frame_body), so
     // the one-statement body unwraps to an Expr/MethodCall statement.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2315,11 +3788,26 @@ TEST(frontend, parse_return_websocket_block_is_terminate) {
     CHECK_EQ(static_cast<u8>(stmt.then_stmt->expr.kind), static_cast<u8>(AstExprKind::MethodCall));
 }
 
+TEST(frontend, parse_rejects_websocket_block_without_frame_binding) {
+    const char* sources[] = {
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n",
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { message in "
+        "message.forward() } }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK(ast.error().detail.eq(lit("websocket trailing blocks require `{ frame in ... }`")));
+    }
+}
+
 TEST(frontend, analyze_accepts_websocket_forward_only) {
     // Slice B: the forward-only frame handler `frame.forward()` analyzes into a HirWsHandler
     // on the route (verdict Forward) instead of an HTTP terminator.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2334,7 +3822,8 @@ TEST(frontend, analyze_accepts_websocket_forward_only) {
 
 TEST(frontend, analyze_accepts_websocket_drop) {
     // `frame.drop()` → Drop verdict.
-    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop() } }\n";
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.drop() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2348,10 +3837,10 @@ TEST(frontend, analyze_accepts_websocket_drop) {
 }
 
 TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
-    // `websocket(ws, maxMessageSize: 4kb) { ... }` → ByteSize lexes as IntLit + unit Ident;
-    // 4kb = 4096 bytes carried onto the handler.
+    // `websocket(ws, maxMessageSize: 4kb) { frame in ... }` → ByteSize lexes as IntLit + unit
+    // Ident; 4kb = 4096 bytes carried onto the handler.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 4kb) { frame in\n"
         "  frame.forward()\n"
         "} }\n";
     auto lexed = lex(lit(src));
@@ -2366,7 +3855,7 @@ TEST(frontend, analyze_accepts_websocket_max_message_size_kwarg) {
 TEST(frontend, analyze_websocket_max_message_size_omitted_is_zero) {
     // Omitting the kwarg leaves max_message_size 0 (the loader then uses the engine default).
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2389,7 +3878,8 @@ TEST(frontend, parse_rejects_websocket_max_message_size_without_block) {
 
 TEST(frontend, analyze_accepts_websocket_close_default_code) {
     // `frame.close()` → Close verdict, default code 1000.
-    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close() } }\n";
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2404,7 +3894,7 @@ TEST(frontend, analyze_accepts_websocket_close_default_code) {
 TEST(frontend, analyze_accepts_websocket_close_with_code) {
     // `frame.close(1008)` → Close verdict, policy-violation code.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close(1008) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1008) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2419,7 +3909,7 @@ TEST(frontend, analyze_accepts_websocket_close_with_code) {
 TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
     // 1006 (abnormal closure) must never be sent on the wire → rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close(1006) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.close(1006) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2430,7 +3920,8 @@ TEST(frontend, analyze_rejects_websocket_close_reserved_code) {
 
 TEST(frontend, analyze_rejects_websocket_drop_with_args) {
     // drop takes no arguments.
-    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop(1) } }\n";
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.drop(1) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2441,7 +3932,8 @@ TEST(frontend, analyze_rejects_websocket_drop_with_args) {
 
 TEST(frontend, analyze_rejects_websocket_unknown_verdict) {
     // Only forward/drop/close are verdicts; an unknown frame method is rejected.
-    const char* src = "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.bogus() } }\n";
+    const char* src =
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.bogus() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2454,7 +3946,7 @@ TEST(frontend, analyze_accepts_websocket_len_guard) {
     // `guard frame.len < 4096 else { frame.drop() }` then forward → one len-guard (Lt, 4096,
     // Drop) plus the default Forward verdict. (Rut's comparison ops are < > ==; there is no <=.)
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
         "  guard frame.len < 4096 else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
@@ -2478,7 +3970,7 @@ TEST(frontend, analyze_accepts_websocket_opcode_guard) {
     // `guard frame.isText else { frame.drop() }` then forward → one opcode guard (Opcode, Eq,
     // Text=1, Drop) plus the default Forward verdict — a text-only handler.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
         "  guard frame.isText else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
@@ -2501,7 +3993,7 @@ TEST(frontend, analyze_accepts_websocket_direction_guard) {
     // `guard frame.fromClient else { frame.forward() }` then drop → one direction guard
     // (FromClient, Eq, 1, Forward) plus the default Drop verdict — police only the client leg.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
         "  guard frame.fromClient else { frame.forward() }\n"
         "  frame.drop()\n"
         "} }\n";
@@ -2525,7 +4017,7 @@ TEST(frontend, analyze_accepts_websocket_text_match_guard) {
     // `guard !frame.text.matches(re"badword") else { frame.drop() }` then forward → one
     // TextMatch guard (negated, pattern "badword", Drop) — a content blocklist.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
         "  guard !frame.text.matches(re\"badword\") else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
@@ -2548,7 +4040,7 @@ TEST(frontend, analyze_accepts_websocket_text_match_guard) {
 TEST(frontend, analyze_accepts_websocket_text_match_guard_positive) {
     // The non-negated allowlist form: `guard frame.text.matches(re"^ok$") else { frame.drop() }`.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
         "  guard frame.text.matches(re\"^ok$\") else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
@@ -2569,7 +4061,7 @@ TEST(frontend, analyze_rejects_websocket_non_len_guard) {
     // Only `frame.len <cmp> N` guard conditions are supported for now; other accessors are a
     // follow-up, so a non-frame.len guard condition is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) {\n"
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in\n"
         "  guard frame.opcode == 1 else { frame.drop() }\n"
         "  frame.forward()\n"
         "} }\n";
@@ -2586,7 +4078,7 @@ TEST(frontend, build_mir_skips_ws_terminate_route) {
     // the HTTP MIR/RIR pipeline, so build_mir SKIPS it (rather than rejecting): a ws-only
     // program produces a valid MIR module with zero HTTP functions.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward() } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2605,7 +4097,8 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
     // a Str payload, recording has_forward_payload. (Runtime emit is Phase 4b; build_mir
     // still rejects.)
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(\"hi\") } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(\"hi\") } "
+        "}\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2631,7 +4124,7 @@ TEST(frontend, analyze_accepts_websocket_forward_payload) {
 TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
     // The modify payload must be a Str (text-frame content). A non-Str arg is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(123) } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(123) } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -2643,7 +4136,8 @@ TEST(frontend, analyze_rejects_websocket_forward_nonstring_payload) {
 TEST(frontend, analyze_rejects_websocket_forward_two_args) {
     // forward takes at most one payload; two args is rejected.
     const char* src =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward(\"a\", \"b\") } }\n";
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in frame.forward(\"a\", "
+        "\"b\") } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -5037,15 +6531,24 @@ chain secure {
              static_cast<u8>(MirTerminatorKind::YieldTimer));
 }
 
-TEST(frontend, analyze_chain_after_is_reserved_until_lowering_exists) {
+TEST(frontend, analyze_chain_after_lowers_ordered_response_effects) {
     const char* src = R"rut(
-func access_log(_ req: i32) -> bool => true
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+    let path = req.path
+    resp.set("X-Path", path)
+    resp.add("X-Stage", "after")
+    resp.remove("Server")
+    0
+}
 chain access {
-    after access_log(req)
+    after response_headers(req, resp)
 }
 route {
     use chain access
-    GET "/users" { return 200 }
+    GET "/users" {
+        guard req.http11 else { return 505 }
+        return 200
+    }
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -5053,8 +6556,408 @@ route {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(!hir);
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    u32 function_effects = 0;
+    for (u32 i = 0; i < hir->functions[0].exprs.len; i++) {
+        const auto kind = hir->functions[0].exprs[i].kind;
+        function_effects += kind == HirExprKind::RespSetHeader ||
+                            kind == HirExprKind::RespAddHeader ||
+                            kind == HirExprKind::RespRemoveHeader;
+        if (kind == HirExprKind::RespSetHeader) {
+            REQUIRE(hir->functions[0].exprs[i].lhs != nullptr);
+            CHECK_EQ(hir->functions[0].exprs[i].lhs->kind, HirExprKind::ReqPath);
+        }
+    }
+    REQUIRE_EQ(function_effects, 3u);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
+    REQUIRE(hir->routes[0].locals[0].init.lhs != nullptr);
+    CHECK_EQ(hir->routes[0].locals[0].init.lhs->kind, HirExprKind::ReqPath);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    CHECK_FALSE(hir->routes[0].guards[0].fail_term.commit_response_mutations);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK(mir->functions[0].blocks[1].term.commit_response_mutations);
+    CHECK_FALSE(mir->functions[0].blocks[2].term.commit_response_mutations);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    u32 sets = 0;
+    u32 adds = 0;
+    u32 removes = 0;
+    u32 commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            sets += block.insts[ii].op == rir::Opcode::RespSetHeader;
+            adds += block.insts[ii].op == rir::Opcode::RespAddHeader;
+            removes += block.insts[ii].op == rir::Opcode::RespRemoveHeader;
+            commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(sets, 1u);
+    CHECK_EQ(adds, 1u);
+    CHECK_EQ(removes, 1u);
+    CHECK_EQ(commits, 1u);
+    rir.destroy();
 }
+
+TEST(frontend, response_builder_alias_is_not_the_chain_response_parameter) {
+    const char* src = R"rut(
+func build_local(_ resp: Response) -> i32 {
+    let local = response(200)
+    let alias = local
+    alias.set("X-Local", "yes")
+    0
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->functions.len, 1u);
+    u32 response_effects = 0;
+    for (u32 i = 0; i < hir->functions[0].exprs.len; i++) {
+        const auto kind = hir->functions[0].exprs[i].kind;
+        response_effects += kind == HirExprKind::RespSetHeader ||
+                            kind == HirExprKind::RespAddHeader ||
+                            kind == HirExprKind::RespRemoveHeader;
+    }
+    CHECK_EQ(response_effects, 0u);
+}
+
+TEST(frontend, chain_after_commits_response_effects_before_forward) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+func response_headers(_ resp: Response) -> i32 {
+    resp.set("X-Proxy", "rut")
+    0
+}
+chain access { after response_headers(resp) }
+route GET "/users" use chain access { return forward(api) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    const auto& block = rir.module.functions[0].blocks[0];
+    REQUIRE(block.inst_count >= 3u);
+    CHECK_EQ(static_cast<u8>(block.insts[block.inst_count - 2].op),
+             static_cast<u8>(rir::Opcode::RespCommitHeaders));
+    CHECK_EQ(static_cast<u8>(block.insts[block.inst_count - 1].op),
+             static_cast<u8>(rir::Opcode::RetForward));
+    rir.destroy();
+}
+
+TEST(frontend, chain_after_rejects_invalid_response_helpers) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {R"rut(
+func observe(_ req: i32) -> bool => req.http11
+chain access { after observe(req) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after helper must have exactly one Response parameter"},
+        {R"rut(
+func mutate(_ first: Response, _ second: Response) -> i32 {
+    first.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(resp, resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after helper must have exactly one Response parameter"},
+        {R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(req) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after passes the runtime Response as `resp`"},
+        {R"rut(
+func observe(_ resp: Response) -> i32 => 0
+chain access { after observe(resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "chain after currently supports Response header effects only"},
+        {R"rut(
+let flags = Cache<IP, i64>(capacity: 16)
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    flags.set(req.remoteAddr, 1)
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(req, resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+         "non-response statement effects are not supported in helpers"},
+    };
+    for (const auto& c : cases) {
+        auto lexed = lex(lit(c.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(static_cast<u8>(hir.error().code),
+                 static_cast<u8>(FrontendError::UnsupportedSyntax));
+        CHECK(hir.error().detail.eq(lit(c.detail)));
+    }
+}
+
+TEST(frontend, chain_after_rejects_wait_routes_until_effects_are_resumable) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(resp) }
+route GET "/users" use chain access {
+    wait(1)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain after Response effects cannot be combined with wait/for yet")));
+}
+
+TEST(frontend, chain_after_rejects_nested_helper_with_non_response_statement_effect) {
+    const char* src = R"rut(
+let flags = Cache<IP, i64>(capacity: 16)
+func value(_ req: i32) -> str {
+    flags.set(req.remoteAddr, 1)
+    "set"
+}
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Test", value(req))
+    0
+}
+chain access { after mutate(req, resp) }
+route GET "/users" use chain access { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("non-response statement effects are not supported in helpers")));
+    REQUIRE(hir.error().span.start + 5 <= lit(src).len);
+    CHECK((Str{src + hir.error().span.start, 5}.eq(lit("flags"))));
+}
+
+TEST(frontend, chain_after_rejects_response_time_state_evaluated_at_request_dispatch) {
+    const char* sources[] = {
+        R"rut(
+func phase() -> str { if time.nowMicros() > 0 { "late" } else { "early" } }
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Phase", phase())
+    0
+}
+chain access { after mutate(resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+            "chain after Response header values cannot read time, cache, or response state until "
+            "effects execute at response time")));
+    }
+}
+
+TEST(frontend, chain_after_rejects_conditional_response_effects) {
+    const char* src = R"rut(
+func mutate(_ req: i32, _ resp: Response) -> i32 {
+    if req.http11 { {
+        resp.set("X-Test", "yes")
+        0
+    } } else { 0 }
+}
+chain access { after mutate(req, resp) }
+route GET "/users" use chain access { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("chain after Response mutations must be unconditional")));
+}
+
+TEST(frontend, chain_after_rejects_fallible_and_responding_arguments) {
+    const char* sources[] = {
+        R"rut(
+func mutate(_ value: str, _ resp: Response) -> i32 {
+    resp.set("X-Test", value)
+    0
+}
+chain access { after mutate(req.header("X-Test"), resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+        R"rut(
+func check(_ req: i32) -> i32 {
+    guard req.http11 else { respond 401 }
+    1
+}
+func mutate(_ value: i32, _ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    value
+}
+chain access { after mutate(check(req), resp) }
+route GET "/users" use chain access { return 200 }
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, response_type_is_not_an_aggregate_payload) {
+    const char* sources[] = {
+        "struct Box { value: Response }\n",
+        "variant Box { value(Response) }\n",
+        "type Box = Response\n",
+        "func boxed(_ value: (Response, i32)) -> i32 => 0\n",
+        "func boxed() -> (Response, i32) => (response(200), 0)\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("Response is only supported as a chain after parameter")));
+    }
+}
+
+TEST(frontend, response_mutating_helper_rejects_ordinary_calls) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+route GET "/users" {
+    let resp = response(200)
+    let ignored = mutate(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("Response-mutating helpers are only callable from chain after")));
+}
+
+TEST(frontend, response_mutating_protocol_method_rejects_generic_dispatch) {
+    const char* src = R"rut(
+protocol Mutator {
+    func mutate(resp: Response) -> i32
+}
+struct Box { value: i32 }
+Box impl Mutator {
+    func mutate(self: Box, resp: Response) -> i32 {
+        resp.set("X-Test", "yes")
+        0
+    }
+}
+func run<T: Mutator>(value: T, resp: Response) -> i32 => value.mutate(resp)
+chain access { after run(Box(value: 0), resp) }
+route GET "/users" use chain access { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(
+        hir.error().detail.eq(lit("Response-mutating helpers are only callable from chain after")));
+}
+
+TEST(frontend, global_chain_after_cannot_capture_route_local) {
+    const char* src = R"rut(
+func mutate(_ value: str, _ resp: Response) -> i32 {
+    resp.set("X-Test", value)
+    0
+}
+chain access { after mutate(value, resp) }
+route GET "/users" use chain access {
+    let value = req.path
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(frontend, chain_after_rejects_websocket_terminate_routes) {
+    const char* src = R"rut(
+upstream ws at "127.0.0.1:9000"
+func mutate(_ resp: Response) -> i32 {
+    resp.set("X-Test", "yes")
+    0
+}
+chain access { after mutate(resp) }
+route GET "/ws" use chain access {
+    return websocket(ws) { frame in frame.forward() }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain after Response effects are not supported on WebSocket routes")));
+}
+#endif
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
@@ -6885,6 +8788,26 @@ route GET "/users" {
 }
 
 #endif
+
+TEST(frontend, namespaced_response_is_not_the_builtin_response_type) {
+    const std::string dir = "/tmp/rut_import_namespace_response_type_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/proto.rut", std::ios::binary);
+        out << "struct Response { value: i32 }\n";
+    }
+    const auto src = R"rut(
+import "proto.rut"
+func read(_ x: proto.Response) -> i32 => 1
+route GET "/users" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+}
 
 TEST(frontend, import_namespace_generic_type_ref_is_supported) {
     const std::string dir = "/tmp/rut_import_namespace_generic_type_ref_frontend";
@@ -12317,8 +14240,6 @@ TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
         "route GET \"/search\" {\n"
         "  let host = req.header(\"Host\") | any(_, \"missing\")\n"
         "  let gated = req.header(\"Host\") | all(_, \"present\")\n"
-        "  let injected_host = req.header(\"Host\") | any(\"missing\")\n"
-        "  let injected_gated = req.header(\"Host\") | all(\"present\")\n"
         "  return 200\n"
         "}\n";
 
@@ -12328,7 +14249,7 @@ TEST(frontend, any_all_builtin_pipe_placeholders_use_pipe_lhs) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 4u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -12352,7 +14273,9 @@ TEST(frontend, any_all_builtin_pipe_rejects_placeholder_free_extra_args) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(hir.error().detail.eq(lit("pipe call missing placeholder")));
+    CHECK(hir.error().detail.eq(
+        lit("right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
+            "where the value lands")));
 }
 
 TEST(frontend, any_all_builtin_pipe_rejects_numbered_placeholder_for_conditional_tuple_source) {
@@ -20957,7 +22880,7 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
 }
-TEST(frontend, source_pipe_placeholder_free_stage_injects_lhs_as_first_arg) {
+TEST(frontend, source_pipe_rejects_placeholder_free_nullary_stage) {
     const auto src = R"(
 func id(x: i32) -> i32 => x
 route GET "/users" {
@@ -20970,13 +22893,12 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
-    CHECK_FALSE(hir->routes[0].locals[0].may_nil);
-    CHECK_FALSE(hir->routes[0].locals[0].may_error);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
+            "where the value lands")));
 }
-TEST(frontend, source_pipe_placeholder_free_stage_keeps_explicit_args_after_lhs) {
+TEST(frontend, source_pipe_rejects_placeholder_free_stage_with_arguments) {
     const auto src = R"(
 func second(a: i32, b: i32) -> i32 => b
 route GET "/users" {
@@ -20989,9 +22911,10 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].type == HirTypeKind::I32);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
+            "where the value lands")));
 }
 TEST(frontend, source_pipe_accepts_placeholder_slot_one_alias) {
     const auto src = R"(
@@ -21076,7 +22999,7 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 
-TEST(frontend, source_pipe_placeholder_free_runtime_optional_lhs_flows_via_any) {
+TEST(frontend, source_pipe_rejects_placeholder_free_runtime_optional_stage) {
     const auto src = R"(
 func id(x: str) -> str => x
 route GET "/users" {
@@ -21090,14 +23013,10 @@ route GET "/users" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
-    CHECK(hir->routes[0].locals[0].type == HirTypeKind::Str);
-    CHECK(hir->routes[0].locals[0].may_nil);
-    CHECK_FALSE(hir->routes[0].locals[0].may_error);
-    CHECK(hir->routes[0].locals[1].type == HirTypeKind::Str);
-    CHECK_FALSE(hir->routes[0].locals[1].may_nil);
-    CHECK_FALSE(hir->routes[0].locals[1].may_error);
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("right side of | must be a call with a _ placeholder; write f(y, _) or f(_, y) to show "
+            "where the value lands")));
 }
 
 TEST(frontend, analyze_rejects_conditional_pipe_respond_capable_stage_argument) {
@@ -29019,6 +30938,38 @@ TEST(frontend, guard_let_recovered_fallible_local_drops_error_prelude) {
     rir.destroy();
 }
 
+TEST(frontend, branch_cache_effects_recover_fallible_local_on_all_paths) {
+    // Branch-local effects are part of error-recovery analysis. Both selected
+    // paths coalesce the fallible carrier before storing it, so the automatic
+    // state-0 500 prelude must not intercept the programmed returns.
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(1, fallback()) "
+        "if req.http11 { buckets.set(req.remoteAddr, i64(value.or(0))) return 200 } "
+        "else { buckets.set(req.remoteAddr, i64(value.or(0))) return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, conditional_branch_cache_recovery_keeps_prelude_for_uncovered_sibling) {
+    // Recovery in only one selected effect is not enough: the sibling can
+    // return success without consuming the carrier's error, so the prelude
+    // remains. This guards the all-control-path requirement.
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 64)\n"
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(1, fallback()) "
+        "if req.http11 { buckets.set(req.remoteAddr, i64(value.or(0))) return 200 } "
+        "else { return 204 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
 TEST(frontend, mixed_branch_fallible_local_keeps_error_prelude_for_compare_only_path) {
     // Mixed case: the SAME error-carrier local is guard-let-recovered in one
     // branch but only COMPARED in a sibling branch. The prelude is emitted once
@@ -29050,6 +31001,36 @@ TEST(frontend, conditional_guard_keeps_error_prelude_on_unguarded_sibling) {
         "route GET \"/search\" { let value = any(200, fallback()) "
         "if req.http11 { guard let checked = value else { return 401 } return 204 } "
         "else { return 200 } }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, fail_closed_pre_reject_before_recovery_drops_error_prelude) {
+    // The first guard can reject with 403 before the fallible carrier is
+    // recovered. That exit is fail-closed; every continuing path reaches the
+    // guard-let recovery, so the state-0 500 prelude is unnecessary.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "guard req.http11 else { return 403 } "
+        "wait(1ms) guard let checked = value else { return 401 } return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
+    rir.destroy();
+}
+
+TEST(frontend, redirect_pre_exit_before_recovery_keeps_error_prelude) {
+    // A redirect is not fail-closed: without the prelude an unrecovered error
+    // could masquerade as a programmed 302. Only literal 4xx/5xx exits may
+    // satisfy exit-dominance before the later recovery.
+    const char* src =
+        "func fallback() -> i32 => error(.timeout)\n"
+        "route GET \"/search\" { let value = any(200, fallback()) "
+        "guard req.http11 else { return 302 } "
+        "guard let checked = value else { return 401 } return 200 }\n";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
     CHECK(rir_has_prelude_block(rir));
@@ -29241,23 +31222,19 @@ TEST(frontend, if_let_folded_false_route_block_else_dead_then_references_binding
     rir.destroy();
 }
 
-TEST(frontend, if_let_folded_false_route_block_else_nested_recovery_lowers) {
-    // Finding 3 + safety: the live Block else itself performs an error recovery
-    // (a nested if-let over a fallible `any(...)` local, else `return 401`). The
-    // folded-false rewrite routes the Block else through the two-arm Match builder,
-    // so the nested recovery lands in a conditionally-reached arm block — NOT
-    // linearly dominated — and its state-0 error prelude is conservatively KEPT.
-    // This matches the non-folded if-let (whose else arm is likewise conditional),
-    // and is the safe over-keep direction (a spurious prelude returns the default
-    // error; it never lets an error masquerade as success). The point of the test
-    // is that the Block else compiles AND lowers rather than being rejected.
+TEST(frontend, if_let_folded_false_route_block_else_nested_recovery_drops_prelude) {
+    // The live Block else performs an error recovery (a nested if-let over a
+    // fallible `any(...)` local, else `return 401`). Its recovery is reached
+    // through one arm of the folded outer match; the other arm terminates with
+    // a literal fail-closed 500. Per-local exit-dominance therefore proves every
+    // path safe and drops the formerly conservative state-0 prelude.
     const char* src =
         "func fallback() -> i32 => error(.timeout)\n"
         "route GET \"/u\" { if let x = error(7) { return 500 } else { let v = any(200, fallback()) "
         "if let y = v { return 200 } else { return 401 } } }\n";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
-    CHECK(rir_has_prelude_block(rir));
+    CHECK_FALSE(rir_has_prelude_block(rir));
     rir.destroy();
 }
 
@@ -29782,6 +31759,450 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+}
+
+TEST(frontend, parse_object_literal_as_call_argument) {
+    const char* src =
+        "route GET \"/x\" { let payload = json({ users: [], total: 0, }) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const AstStatement& let_stmt = *ast->items[0].route.statements[0];
+    REQUIRE_EQ(static_cast<u8>(let_stmt.expr.kind), static_cast<u8>(AstExprKind::Call));
+    CHECK(let_stmt.expr.name.eq(lit("json")));
+    REQUIRE_EQ(let_stmt.expr.args.len, 1u);
+    const AstExpr& object = *let_stmt.expr.args[0];
+    REQUIRE_EQ(static_cast<u8>(object.kind), static_cast<u8>(AstExprKind::ObjectLit));
+    REQUIRE_EQ(object.field_inits.len, 2u);
+    CHECK(object.field_inits[0].name.eq(lit("users")));
+    CHECK_EQ(static_cast<u8>(object.field_inits[0].value->kind),
+             static_cast<u8>(AstExprKind::ArrayLit));
+    CHECK(object.field_inits[1].name.eq(lit("total")));
+    CHECK_EQ(object.field_inits[1].value->int_value, 0);
+}
+
+TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
+    const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const AstExpr& call = ast->items[0].route.statements[0]->expr;
+    REQUIRE_EQ(static_cast<u8>(call.kind), static_cast<u8>(AstExprKind::MethodCall));
+    REQUIRE_EQ(call.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(call.args[0]->kind), static_cast<u8>(AstExprKind::ObjectLit));
+    CHECK_EQ(call.args[0]->field_inits.len, 0u);
+}
+
+TEST(frontend, parse_rejects_object_literal_as_general_expression) {
+    const char* src = "route GET \"/x\" { let payload = { users: [] } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
+    CHECK(ast.error().detail.eq(lit("object literals are only allowed as call arguments")));
+}
+
+TEST(frontend, analyze_rejects_object_literal_after_empty_name_effect_local) {
+    const char* src = R"rut(
+func accept(value: str) -> str => value
+route GET "/x" {
+    req.set("X-Mode", "replace")
+    let payload = accept({ value: 1 })
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
+    const char* src =
+        "route GET \"/x\" { req.set(\"X-Mode\", \"replace\") req.add(\"X-Tag\", \"a\") "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ReqSetHeader));
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit("X-Mode")));
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::ReqAddHeader));
+    CHECK(hir->routes[0].locals[1].init.str_value.eq(lit("X-Tag")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
+             static_cast<u8>(MirValueKind::ReqSetHeader));
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
+             static_cast<u8>(MirValueKind::ReqAddHeader));
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqSetHeader));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqAddHeader));
+    rir.destroy();
+}
+
+TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
+    const char* cases[] = {
+        "route GET \"/x\" { let v = req.set(\"X-Test\", \"v\") return 200 }\n",
+        "route GET \"/x\" { req.set(\"Content-Length\", \"1\") return 200 }\n",
+        "route GET \"/x\" { req.set(\"Bad Header\", \"v\") return 200 }\n",
+        "route GET \"/x\" { req.set(\"X-Test\", req.header(\"Maybe\")) return 200 }\n",
+        "route GET \"/x\" { req.add(\"X-Test\", req.path) return 200 }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+            "req.set/add expect literal safe header name and value strings, and may only be used "
+            "as a statement")));
+    }
+}
+
+TEST(frontend, req_set_after_guard_is_rejected_until_ordered_effect_lowering) {
+    const char* src =
+        "route GET \"/x\" { guard req.http11 else { return 400 } "
+        "req.set(\"X-Test\", \"v\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("req.set/add are currently supported only before guards/waits/for loops, or inside a "
+            "selected match arm")));
+}
+
+TEST(frontend, req_set_in_selected_match_arm_is_a_block_effect) {
+    const char* src = R"rut(
+route GET "/x" {
+    match req.path {
+        "/x" => { req.set("X-Matched", "yes") return 200 }
+        _ => return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].control.match_arms.len, 2u);
+    REQUIRE_EQ(hir->routes[0].control.match_arms[0].effect_expr_indices.len, 1u);
+    const u32 effect_index = hir->routes[0].control.match_arms[0].effect_expr_indices[0];
+    REQUIRE(effect_index < hir->routes[0].exprs.len);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].exprs[effect_index].kind),
+             static_cast<u8>(HirExprKind::ReqSetHeader));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    bool saw_effect = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        if (mir->functions[0].blocks[bi].effects.len != 0) saw_effect = true;
+    }
+    CHECK(saw_effect);
+}
+
+TEST(frontend, response_local_literal_header_mutations_lower_to_existing_header_set) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(429)
+    resp.add("Set-Cookie", "a=1")
+    resp.add("Set-Cookie", "b=2")
+    resp.set("X-Mode", "old")
+    resp.set("x-mode", "new")
+    resp.add("X-Removed", "gone")
+    resp.remove("x-removed")
+    let observed = resp.header("X-Mode")
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
+             static_cast<u8>(HirExprKind::ResponseInit));
+    CHECK_EQ(hir->routes[0].locals[0].init.int_value, 429);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].locals[1].init.kind),
+             static_cast<u8>(HirExprKind::StrLit));
+    CHECK(hir->routes[0].locals[1].init.str_value.eq(lit("new")));
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK_EQ(term.status_code, 429);
+    REQUIRE_EQ(term.response_headers.len, 3u);
+    CHECK(term.response_headers[0].key.eq(lit("Set-Cookie")));
+    CHECK(term.response_headers[0].value.eq(lit("a=1")));
+    CHECK(term.response_headers[1].key.eq(lit("Set-Cookie")));
+    CHECK(term.response_headers[1].value.eq(lit("b=2")));
+    CHECK(term.response_headers[2].key.eq(lit("x-mode")));
+    CHECK(term.response_headers[2].value.eq(lit("new")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].locals.len, 1u);  // Response is compile-time-only.
+    REQUIRE_EQ(mir->functions[0].blocks[0].term.response_headers.len, 3u);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    REQUIRE_EQ(rir.module.header_pool_used, 3u);
+    CHECK(rir.module.header_keys[0].eq(lit("Set-Cookie")));
+    CHECK(rir.module.header_keys[1].eq(lit("Set-Cookie")));
+    CHECK(rir.module.header_keys[2].eq(lit("x-mode")));
+    rir.destroy();
+}
+
+TEST(frontend, response_local_named_response_can_be_returned) {
+    const char* src = R"rut(
+route GET "/x" {
+    let response = response(201)
+    response.set("X-Mode", "builder")
+    return response
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 3u);
+    const auto& returned = *ast->items[0].route.statements[2];
+    CHECK(returned.returns_response_local);
+    CHECK(returned.name.eq(lit("response")));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.status_code, 201);
+    REQUIRE_EQ(hir->routes[0].control.direct_term.response_headers.len, 1u);
+}
+
+TEST(frontend, response_literal_builder_accepts_existing_sixteen_header_limit) {
+    auto source_with_headers = [](u32 count) {
+        std::string src = "route GET \"/x\" { let r = response(200) ";
+        for (u32 i = 0; i < count; i++) src += "r.add(\"X-" + std::to_string(i) + "\", \"v\") ";
+        src += "return r }\n";
+        return src;
+    };
+
+    const std::string accepted = source_with_headers(16);
+    auto accepted_lexed = lex(Str{accepted.data(), static_cast<u32>(accepted.size())});
+    REQUIRE(accepted_lexed);
+    auto accepted_ast = parse_file_heap(accepted_lexed.value());
+    REQUIRE(accepted_ast);
+    auto accepted_hir = analyze_file_heap(accepted_ast.value());
+    REQUIRE(accepted_hir);
+    CHECK_EQ(accepted_hir->routes[0].control.direct_term.response_headers.len, 16u);
+
+    const std::string rejected = source_with_headers(17);
+    auto rejected_lexed = lex(Str{rejected.data(), static_cast<u32>(rejected.size())});
+    REQUIRE(rejected_lexed);
+    auto rejected_ast = parse_file_heap(rejected_lexed.value());
+    REQUIRE(rejected_ast);
+    auto rejected_hir = analyze_file_heap(rejected_ast.value());
+    REQUIRE_FALSE(rejected_hir.has_value());
+}
+
+TEST(frontend, response_local_dynamic_header_mutations_lower_to_runtime_ops) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.add("X-Base", "static")
+    resp.set("X-Path", req.path)
+    resp.add("X-Path", "tail")
+    let observed = resp.header("X-Path").or("missing")
+    resp.set("X-Observed", observed)
+    resp.remove("X-Base")
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    u32 header_reads = 0;
+    u32 sets = 0;
+    u32 adds = 0;
+    u32 removes = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            switch (block.insts[ii].op) {
+                case rir::Opcode::RespHeader:
+                    header_reads++;
+                    break;
+                case rir::Opcode::RespSetHeader:
+                    sets++;
+                    break;
+                case rir::Opcode::RespAddHeader:
+                    adds++;
+                    break;
+                case rir::Opcode::RespRemoveHeader:
+                    removes++;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    CHECK_EQ(header_reads, 1u);
+    CHECK_EQ(sets, 2u);
+    CHECK_EQ(adds, 1u);
+    CHECK_EQ(removes, 1u);
+    REQUIRE_EQ(rir.module.header_set_count, 1u);
+    REQUIRE_EQ(rir.module.header_sets[0].count, 1u);
+    CHECK(rir.module.header_keys[0].eq(lit("X-Base")));
+    CHECK(rir.module.header_values[0].eq(lit("static")));
+    rir.destroy();
+}
+
+TEST(frontend, response_local_dynamic_mutation_before_guard_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Path", req.path)
+    guard resp.header("X-Path") == "expected" else { return resp }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("dynamic response header mutations cannot be combined with guards/waits/for loops "
+            "yet")));
+}
+
+TEST(frontend, response_header_lookup_respects_nearest_shadowing_local) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    r.set("X-Mode", "builder")
+    let r = "shadow"
+    let seen = r.header("X-Mode")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutator_lookup_respects_nearest_shadowing_local) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    let r = "shadow"
+    r.set("X-Mode", "builder")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_local_mutators_validate_literal_and_direct_return_limits) {
+    const char* cases[] = {
+        "route GET \"/x\" { let r = response(99) return r }\n",
+        "route GET \"/x\" { let r = response(200) r.set(\"Content-Length\", \"1\") return r }\n",
+        "route GET \"/x\" { return missing }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, dynamic_response_headers_reject_multiple_response_builders) {
+    const char* cases[] = {
+        "route GET \"/x\" { let a = response(200) let b = response(201) "
+        "a.set(\"X\", req.path) return a }\n",
+        "route GET \"/x\" { let a = response(200) a.set(\"X\", req.path) "
+        "let b = response(201) return b }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
+    const char* cases[] = {
+        "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) return 204 }\n",
+        "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) "
+        "return response(204) }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, dynamic_response_headers_reject_bound_wait_routes) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    r.set("X-Path", req.path)
+    let ev = wait(timer(1000))
+    return r
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 int main(int argc, char** argv) {

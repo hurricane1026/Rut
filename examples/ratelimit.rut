@@ -1,0 +1,52 @@
+// Rate limiting written in Rut — the blessed patterns (DESIGN.md §3.3.6).
+//
+// These are ordinary language constructs, not built-ins: per-key state lives
+// in a Cache slot, the algorithm is inline arithmetic. The compiler inlines
+// everything into the route's flat state machine. Each request performs a
+// Cache get and set (two hash/probe operations), while the C++ @rateLimit
+// path updates one RateLimiter slot; measure before choosing on a hot path.
+//
+// Semantics to know:
+//  - time.nowMicros() is LATCHED per request: every use sees the same value.
+//  - Cache is lossy per-key state: a miss means never-seen OR evicted — the
+//    .or(0) fallback treats both as "fresh key", which is self-healing here.
+//  - A leading Cache.set meters every attempt. A set in a selected if/match
+//    branch runs only on that branch; both examples below commit only accepted
+//    requests, matching the built-in limiter's rejection behavior.
+//  - Per-shard state: the effective limit is ≈ limit × shard count.
+
+let buckets = Cache<IP, i64>(capacity: 100000)
+
+// Token bucket (GCRA): steady rate = 1 request / emit period.
+// emit = 600000µs → 100 req/min; tolerance tau = emit → burst of ~2.
+// Tune by editing the two constants (i64 params on funcs arrive later).
+route GET "/api" {
+    let now = time.nowMicros()
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    if tat - now <= 600000 {
+        buckets.set(req.remoteAddr, tat + 600000)
+        return 200
+    } else {
+        return 429
+    }
+}
+
+// Fixed-window counter, packed into one i64 slot:
+// high 32 bits = window index (now / window length), low 32 = count.
+// Window rollover is the lazy-expiry comparison — no TTL machinery. This
+// deliberately permits boundary bursts; it is not a sliding-window limit.
+let hits = Cache<IP, i64>(capacity: 100000)
+
+route GET "/search" {
+    let now = time.nowMicros()
+    let win = now / 60000000
+    let packed = hits.get(req.remoteAddr).or(0)
+    let same = bitwise.shiftRight(packed, 32) - win
+    let count = max(bitwise.and(packed, 4294967295) * min(same + 1, 1), 0)
+    if count + 1 <= 100 {
+        hits.set(req.remoteAddr, bitwise.or(bitwise.shiftLeft(win, 32), count + 1))
+        return 200
+    } else {
+        return 429
+    }
+}

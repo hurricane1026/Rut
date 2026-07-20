@@ -9,6 +9,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
 #endif
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/compile_to_config.h"
@@ -1173,6 +1174,25 @@ TEST(timer_dsl, rejects_req_access_in_body) {
             86}));
 }
 
+TEST(timer_dsl, rejects_req_header_mutation_in_body) {
+    using namespace rut;
+    for (const char* method : {"set", "add"}) {
+        const std::string src = std::string("timer t, every: 1s { req.") + method +
+                                "(\"X-Timer\", \"v\") return 200 }\n";
+        auto lexed = lex(Str{src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file(lexed.value());
+        REQUIRE(ast);
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        REQUIRE(!hir);
+        CHECK(hir.error().detail.eq(
+            Str{"timers run outside a request; req access and forward are not available "
+                "in a timer body",
+                86}));
+    }
+}
+
 // wait needs a Connection to yield/resume on; the timer invocation has none.
 TEST(timer_dsl, rejects_wait_in_body) {
     using namespace rut;
@@ -1291,7 +1311,7 @@ TEST(timer_dsl, rejects_websocket_terminate_in_body) {
     using namespace rut;
     const char* src =
         "upstream ws at \"10.0.0.1:8080\"\n"
-        "timer t, every: 1s { return websocket(ws) { frame.forward() } }\n";
+        "timer t, every: 1s { return websocket(ws) { frame in frame.forward() } }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -8890,6 +8910,79 @@ static u64 forward_upstream_0_handler(void* /*conn*/,
     return r.pack();
 }
 
+// Mirrors a compiled chain that mutates response headers and then forwards.
+// X-Path deliberately borrows the synthesized request target so the h2 proxy
+// must keep it stable after pending_synth is reused for response frames.
+static u64 forward_with_response_mutations_handler(
+    void* raw_conn, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    if (len < 8) return rut::jit::HandlerResult::make_status(500).pack();
+    auto add = [&](rut::ConnectionBase::RespHeaderMutationMode mode,
+                   const char* name,
+                   u32 name_len,
+                   const char* value,
+                   u32 value_len) {
+        auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, name_len};
+        mutation.value = {value, value_len};
+    };
+    add(rut::ConnectionBase::RespHeaderMutationMode::Set,
+        "X-Path",
+        6,
+        reinterpret_cast<const char*>(req + 4),
+        4);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Set,
+        "X-Folded",
+        8,
+        reinterpret_cast<const char*>(req + 4),
+        4);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Set, "X-Folded", 8, "final", 5);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Remove, "X-Remove", 8, nullptr, 0);
+    add(rut::ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+    return rut::jit::HandlerResult::make_forward(0).pack();
+}
+
+// Mirrors a chain-after mutation whose value is req.params.id. The matcher
+// originally exposes the value from Http2Conn::hdr_scratch; the serving layer
+// must re-anchor it before the upstream response reuses pending_synth.
+static u64 forward_with_param_mutation_handler(
+    void* raw_conn, rut::jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx == nullptr || ctx->route_param_count != 1)
+        return rut::jit::HandlerResult::make_status(500).pack();
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+    mutation.mode = rut::ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Param", 7};
+    mutation.value = {ctx->route_params[0].value, ctx->route_params[0].value_len};
+    return rut::jit::HandlerResult::make_forward(0).pack();
+}
+
+static u64 wait_then_forward_with_request_overrides_handler(
+    void* raw_conn, rut::jit::HandlerCtx* ctx, const u8* req, u32 len, void*) {
+    if (ctx != nullptr && ctx->state == 7) return rut::jit::HandlerResult::make_forward(0).pack();
+    auto find_value = [&](const char* prefix, u32 prefix_len, u32 value_len) -> const char* {
+        for (u32 i = 0; i + prefix_len + value_len <= len; i++) {
+            if (__builtin_memcmp(req + i, prefix, prefix_len) == 0)
+                return reinterpret_cast<const char*>(req + i + prefix_len);
+        }
+        return nullptr;
+    };
+    const char* path = find_value("x-new-path: ", 12, 10);
+    const char* token = find_value("x-token: ", 9, 7);
+    if (path == nullptr || token == nullptr)
+        return rut::jit::HandlerResult::make_status(500).pack();
+    auto* conn = static_cast<rut::Connection*>(raw_conn);
+    conn->req_path_overridden = true;
+    conn->req_path_override = {path, 10};
+    conn->req_header_override_count = 1;
+    conn->req_header_overrides[0] = {{"X-Copied", 8}, {token, 7}};
+    conn->req_header_append_mask = 0;
+    return rut::jit::HandlerResult::make_yield_payload(
+               7, rut::jit::YieldKind::Timer, /*milliseconds=*/20)
+        .pack();
+}
+
 // End-to-end: a JIT handler returning Forward must kick off the same
 // proxy flow as a RouteAction::Proxy match. Before the JIT forward wire-up,
 // handle_jit_outcome::Forward returned 500; this test guards against that
@@ -9239,6 +9332,8 @@ struct ScriptedUpstreamServer {
     const char* response = nullptr;
     u32 response_len = 0;
     bool keep_open = false;  // hold the connection open after replying (HTTP keep-alive)
+    char request[1024]{};
+    std::atomic<u32> request_len{0};
     std::atomic<bool> running{false};
     bool started = false;
     pthread_t thread{};
@@ -9264,8 +9359,10 @@ struct ScriptedUpstreamServer {
         }
         if (client >= 0) {
             if (set_blocking(client)) {
-                char req[1024];
-                (void)recv_timeout(client, req, sizeof(req), 1000);
+                const i32 got =
+                    recv_timeout(client, server->request, sizeof(server->request), 1000);
+                if (got > 0)
+                    server->request_len.store(static_cast<u32>(got), std::memory_order_release);
                 if (server->response != nullptr && server->response_len > 0) {
                     (void)send_all(client, server->response, server->response_len);
                 }
@@ -9861,6 +9958,188 @@ TEST(shard, serves_http2_proxy) {
     close(lfd);
 }
 
+TEST(shard, serves_http2_jit_forward_with_response_mutations) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "X-Path: origin\r\n"
+        "X-Remove: origin\r\n"
+        "X-Multi: first\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_with_response_mutations_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/api", 4);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "x-path", "/api"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-folded", "final"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-path", "origin"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-remove", "origin"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-multi", "first"));
+    CHECK(h2_response_has_header(resp, total, 1, "x-multi", "second"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_stabilizes_route_param_mutation) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "X-Param: origin\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    REQUIRE(cfg.use_segment_trie());
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/users/:id", 'G', &forward_with_param_mutation_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/users/alice", 12);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "x-param", "alice"));
+    CHECK(!h2_response_has_header(resp, total, 1, "x-param", "origin"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_after_timer_resume) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &wait_then_forward_with_request_overrides_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"x-new-path", 10}, {"/rewritten", 10}},
+        {{"x-token", 7}, {"trusted", 7}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 6, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>(""), 0, true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    u8 body[16];
+    u32 body_len = 0;
+    for (int attempt = 0; attempt < 12 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        body_len = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+        if (h2_status_for_stream(resp, total, 1) != 0 && body_len == 2) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    REQUIRE_EQ(body_len, 2u);
+    CHECK_EQ(body[0], static_cast<u8>('o'));
+    CHECK_EQ(body[1], static_cast<u8>('k'));
+    const u32 request_len = backend.request_len.load(std::memory_order_acquire);
+    const std::string forwarded(backend.request, request_len);
+    CHECK(forwarded.starts_with("GET /rewritten HTTP/1.1\r\n"));
+    CHECK(forwarded.find("X-Copied: trusted\r\n") != std::string::npos);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 // Upstream declares Content-Length: 100 but sends a 2-byte body then closes.
 // The h2 proxy must fail the stream with 502 (truncated) rather than re-arm a
 // recv that never completes. Regression for the truncated-CL fix.
@@ -9960,6 +10239,160 @@ TEST(shard, serves_http2_proxy_rejects_request_body) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 503u);  // rejected pre-forward, not 502
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+// A JIT Forward outcome must obey the same no-request-body limitation as a
+// direct h2 proxy route. Drain DATA and answer 503 instead of sending only the
+// synthesized headers and leaving the h1 upstream waiting for a missing body.
+TEST(shard, serves_http2_jit_forward_rejects_request_body) {
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'P', &forward_upstream_0_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("body"), 4, true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 503u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_accepts_deferred_empty_data) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "ok";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("b", 0x7F000001, backend.port);
+    REQUIRE(id.has_value());
+    REQUIRE_EQ(id.value(), 0u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_0_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>(""), 0, true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_jit_forward_rejects_non_forwardable_headers) {
+    RouteConfig cfg;
+    auto id = cfg.add_upstream("dead", 0x7F000001, 9);
+    REQUIRE(id.has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_0_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/api", 4}},
+    };
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 3, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 10 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 400u);
 
     close(c);
     shard.stop();
@@ -10840,6 +11273,80 @@ static void dump_ws_flake_evidence(RealLoop* loop, const rut::u8* acc, rut::u32 
     }
 }
 
+// Setup-path evidence for the sweep tests below. Three CI strikes on
+// 2026-07-13 failed `!setup_failed`, which recorded nothing — not even which
+// step died. Capture the step name, errno, and the gateway's HTTP response
+// bytes so the next strike distinguishes connect-refused / handshake-timeout
+// (recv_http_headers already allows 10s per read) / non-101 / send-reset.
+struct WsSweepSetupEvidence {
+    const char* step = "";  // failure site; empty = setup OK
+    rut::i32 err = 0;       // errno captured at the failing call
+    char resp[128] = {};    // gateway HTTP response bytes (upgrade step)
+    rut::u32 resp_len = 0;
+};
+
+// Connect + upgrade + send stream[0,split). Returns the connected fd, or -1
+// (fd already closed) with the failing step recorded in *ev.
+static rut::i32 ws_sweep_open_and_send_seg1(rut::u16 port,
+                                            const rut::u8* stream,
+                                            rut::u32 split,
+                                            WsSweepSetupEvidence* ev) {
+    using namespace rut;
+    errno = 0;
+    i32 c = connect_to(port);
+    if (c < 0) {
+        ev->step = "connect";
+        ev->err = errno;
+        return -1;
+    }
+    const char kUpgrade[] =
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    errno = 0;
+    if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1)) {
+        ev->step = "send-upgrade";
+        ev->err = errno;
+        close(c);
+        return -1;
+    }
+    char buf[1024];
+    errno = 0;
+    u32 n = recv_http_headers(c, buf, sizeof(buf));
+    if (n == 0 || !buf_contains(buf, n, "101", 3)) {
+        // errno distinguishes the n == 0 cause: EAGAIN = SO_RCVTIMEO expired,
+        // 0 with an orderly close = gateway hung up before responding.
+        ev->step = n == 0 ? "recv-101-nothing" : "recv-101-not-101";
+        ev->err = errno;
+        ev->resp_len = n < sizeof(ev->resp) ? n : static_cast<u32>(sizeof(ev->resp));
+        memcpy(ev->resp, buf, ev->resp_len);
+        close(c);
+        return -1;
+    }
+    errno = 0;
+    if (!send_all(c, reinterpret_cast<const char*>(stream), split)) {
+        ev->step = "send-seg1";
+        ev->err = errno;
+        close(c);
+        return -1;
+    }
+    return c;
+}
+
+static void dump_ws_setup_evidence(RealLoop* loop, const WsSweepSetupEvidence& ev, rut::u32 split) {
+    fprintf(stderr,
+            "[ws-flake] SETUP failed step=%s split=%u errno=%d resp_len=%u resp:",
+            ev.step,
+            split,
+            ev.err,
+            ev.resp_len);
+    for (rut::u32 i = 0; i < ev.resp_len && i < 64; i++) {
+        const unsigned char ch = static_cast<unsigned char>(ev.resp[i]);
+        fprintf(stderr, ch >= 0x20 && ch < 0x7F ? "%c" : "\\x%02x", ch);
+    }
+    fprintf(stderr, "\n");
+    dump_ws_flake_evidence(loop, reinterpret_cast<const rut::u8*>(ev.resp), 0);
+}
+
 // Deterministic sweep over TCP segmentation of a DROP+PONG byte stream: the
 // CI flake family fails only under runner-dependent recv segmentation, so
 // enumerate EVERY split point (client sends bytes [0,k) then [k,total) with a
@@ -10887,6 +11394,7 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
     bool setup_failed = false;
     bool lost_pong = false;
     u32 failed_split = 0;
+    WsSweepSetupEvidence sev;
     u8 racc[512];
     u32 rhave = 0;
     // Representative split points instead of the full sweep: frame boundaries
@@ -10897,29 +11405,22 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
          si++) {
         const u32 split = kSplits[si];
         if (split >= total) continue;
-        i32 c = connect_to(port);
+        i32 c = ws_sweep_open_and_send_seg1(port, stream, split, &sev);
         if (c < 0) {
             setup_failed = true;
-            break;
-        }
-        const char kUpgrade[] =
-            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        char buf[1024];
-        u32 n = 0;
-        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
-            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
-            !send_all(c, reinterpret_cast<char*>(stream), split)) {
-            setup_failed = true;
-            close(c);
+            failed_split = split;
             break;
         }
         // Best-effort segmentation: the pause usually lets the gateway drain
         // segment 1 alone; on a loaded machine some splits may still coalesce
         // (redundant coverage, never a false positive).
         usleep(30000);
+        errno = 0;
         if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
             setup_failed = true;
+            sev.step = "send-seg2";
+            sev.err = errno;
+            failed_split = split;
             close(c);
             break;
         }
@@ -10949,6 +11450,7 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
     }
 
     lt.stop();  // join the loop thread before asserting/dumping (no data race)
+    if (setup_failed) dump_ws_setup_evidence(loop, sev, failed_split);
     if (lost_pong) {
         fprintf(stderr, "[ws-flake] segmentation split=%u/%u LOST the PONG\n", failed_split, total);
         dump_ws_flake_evidence(loop, racc, rhave);
@@ -11003,6 +11505,7 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
     bool echo_failed = false;
     u32 failed_split = 0;
     u32 failed_frames = 0;
+    WsSweepSetupEvidence sev;
     u8 racc[512];
     u32 rhave = 0;
     // Representative splits (see the sweep above): each frame boundary +/-1
@@ -11012,26 +11515,19 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
          si++) {
         const u32 split = kSplits[si];
         if (split >= total) continue;
-        i32 c = connect_to(port);
+        i32 c = ws_sweep_open_and_send_seg1(port, stream, split, &sev);
         if (c < 0) {
             setup_failed = true;
-            break;
-        }
-        const char kUpgrade[] =
-            "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-        char buf[1024];
-        u32 n = 0;
-        if (!send_all(c, kUpgrade, sizeof(kUpgrade) - 1) ||
-            (n = recv_http_headers(c, buf, sizeof(buf))) == 0 || !buf_contains(buf, n, "101", 3) ||
-            !send_all(c, reinterpret_cast<char*>(stream), split)) {
-            setup_failed = true;
-            close(c);
+            failed_split = split;
             break;
         }
         usleep(10000);  // best-effort split; coalescing is redundant coverage
+        errno = 0;
         if (!send_all(c, reinterpret_cast<char*>(stream + split), total - split)) {
             setup_failed = true;
+            sev.step = "send-seg2";
+            sev.err = errno;
+            failed_split = split;
             close(c);
             break;
         }
@@ -11068,6 +11564,7 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
     }
 
     lt.stop();  // join before asserting/dumping (race-free evidence)
+    if (setup_failed) dump_ws_setup_evidence(loop, sev, failed_split);
     if (echo_failed) {
         fprintf(stderr,
                 "[ws-flake] interleave split=%u/%u got %u/2 frames\n",
@@ -11453,7 +11950,10 @@ TEST(route, jit_handler_unknown_body_idx_falls_back) {
     u16 port = get_port(lfd);
     REQUIRE(loop->init(0, lfd).has_value());
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 100};
+    // Time-based hang-guard, not an iteration cap: under a loaded CI runner
+    // spurious wakeups can burn a 100-iteration cap before the request even
+    // lands (the #175 flake class), killing the loop mid-scenario.
+    LoopThread lt = {loop, {}, 0, 15000};
     lt.start();
 
     i32 c = connect_to(port);
@@ -11614,6 +12114,19 @@ static u64 h2_ignore_body_handler(void* /*conn*/,
                                   void* /*arena*/) {
     rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
                               200,
+                              /*upstream_id=*/0,
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
+static u64 h2_reject_body_handler(void* /*conn*/,
+                                  rut::jit::HandlerCtx* /*ctx*/,
+                                  const u8* /*req*/,
+                                  u32 /*len*/,
+                                  void* /*arena*/) {
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              401,
                               /*upstream_id=*/0,
                               /*next_state=*/0,
                               rut::jit::YieldKind::HttpGet};
@@ -11786,6 +12299,59 @@ TEST(shard, serves_http2_request_body_with_synthesized_content_length) {
     close(lfd);
 }
 
+// A handler that does not read req.body can reject an open request from HEADERS
+// alone when the client did not declare a Content-Length.
+TEST(shard, serves_http2_body_agnostic_jit_before_body_end) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload",
+                                'P',
+                                &h2_reject_body_handler,
+                                /*needs_req_body=*/false));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"POST", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 401u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
 // An h2 request body larger than the engine's per-connection buffer → 413.
 TEST(shard, serves_http2_request_body_too_large) {
     using namespace rut;
@@ -11886,6 +12452,55 @@ TEST(shard, serves_http2_large_body_for_jit_that_ignores_body) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, rejects_http2_content_length_mismatch_on_body_agnostic_jit_route) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_ignore_body_handler, /*needs_req_body=*/false));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("abc"), 3, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 400u);
 
     close(c);
     shard.stop();
@@ -12042,19 +12657,18 @@ TEST(route, add_response_header_set_rejects_count_over_per_set_cap) {
         1u);
 }
 
-TEST(route, add_response_header_set_rejects_case_insensitive_duplicate) {
+TEST(route, add_response_header_set_preserves_case_insensitive_duplicate) {
     using namespace rut;
-    // Manual RouteConfig path must reject duplicate names the same
-    // way the DSL parser does, case-insensitively. Two entries with
-    // "X-Foo" / "x-foo" would produce ambiguous singleton headers on
-    // the wire, so registration fails up front.
+    // Ordered response builders use duplicates for multi-value fields such as
+    // Set-Cookie. Map-literal syntax continues to reject duplicates earlier.
     RouteConfig cfg{};
     const char* keys[2] = {"X-Foo", "x-foo"};
     u32 key_lens[2] = {5, 5};
     const char* vals[2] = {"1", "2"};
     u32 val_lens[2] = {1, 1};
-    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 2), 0u);
-    CHECK_EQ(cfg.response_header_set_count, 0u);
+    CHECK_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 2), 1u);
+    CHECK_EQ(cfg.response_header_set_count, 1u);
+    CHECK_EQ(cfg.response_header_sets[0].count, 2u);
 }
 
 TEST(route, add_response_header_set_rejects_malformed_headers) {
@@ -12465,14 +13079,21 @@ TEST(route, dsl_response_headers_real_socket) {
     rir.destroy();
 }
 
-// Redirect-style: headers without body. Verify Content-Length: 0,
-// the Location header is emitted, and no body bytes follow.
+// Redirect-style Response local: set replacement, add multi-value fields, and
+// return the builder through the real HTTP/1 socket path.
 TEST(route, dsl_response_headers_only_real_socket) {
     using namespace rut;
 
-    const char* src =
-        "route GET \"/old\" { return response(301, headers: "
-        "{ \"Location\": \"/new\" }) }\n";
+    const char* src = R"rut(
+route GET "/old" {
+    let resp = response(301)
+    resp.set("Location", "/first")
+    resp.set("location", "/new")
+    resp.add("Set-Cookie", "a=1")
+    resp.add("Set-Cookie", "b=2")
+    return resp
+}
+)rut";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -12539,7 +13160,10 @@ TEST(route, dsl_response_headers_only_real_socket) {
     };
     CHECK(has("301 ", 4));
     CHECK(has("Content-Length: 0\r\n", 19));
-    CHECK(has("Location: /new\r\n", 16));
+    CHECK(has("location: /new\r\n", 16));
+    CHECK(!has("Location: /first\r\n", 18));
+    CHECK(has("Set-Cookie: a=1\r\n", 17));
+    CHECK(has("Set-Cookie: b=2\r\n", 17));
     // Response must terminate exactly at the blank line — the last
     // four bytes must be "\r\n\r\n" and nothing else should follow.
     // Substring-containment alone wouldn't catch a stray body payload
@@ -13194,6 +13818,9 @@ static bool run_jit_real_socket_status_cases(const char* src,
         rir.destroy();
         return false;
     }
+    // Mirror the production activation boundary: Cache descriptors must
+    // come from the config produced by compilation, not test-side injection.
+    cache_registry_publish_config(cfg);
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
@@ -13567,6 +14194,42 @@ TEST(route, req_cookie_all_requires_present_value_real_socket) {
         {kMissingReq, sizeof(kMissingReq) - 1, "401"},
     };
     REQUIRE(run_jit_real_socket_status_cases(src, cases, 3));
+}
+
+TEST(route, rut_gcra_matches_ratelimit_decorator_real_socket) {
+    // Capstone e2e: the Rut-written GCRA (examples/ratelimit.rut pattern)
+    // and the C++ @rateLimit decorator serve side by side over a real
+    // socket and produce the same immediate admission pattern through the
+    // first rejection for an equivalent config (2 back-to-back then reject:
+    // Rut emit == tau; decorator
+    // limit: 2, window: 1m ⇒ emit 30s, burst defaults to limit ⇒
+    // tau (burst-1)·emit = 30s).
+    using namespace rut;
+    cache_registry_set_seed(0x6CFAu);
+
+    const char* src =
+        "let buckets = Cache<IP, i64>(capacity: 4096)\n"
+        "route GET \"/rut\" {\n"
+        "    let now = time.nowMicros()\n"
+        "    let tat = max(buckets.get(req.remoteAddr).or(0), now)\n"
+        "    if tat - now <= 30000000 {\n"
+        "        buckets.set(req.remoteAddr, tat + 30000000)\n"
+        "        return 200\n"
+        "    } else { return 429 }\n"
+        "}\n"
+        "@rateLimit(limit: 2, window: 1m)\n"
+        "route GET \"/deco\" { return 200 }\n";
+    const char kRutReq[] = "GET /rut HTTP/1.1\r\nHost: x\r\n\r\n";
+    const char kDecoReq[] = "GET /deco HTTP/1.1\r\nHost: x\r\n\r\n";
+    const RealSocketStatusCase cases[] = {
+        {kRutReq, sizeof(kRutReq) - 1, "200"},
+        {kRutReq, sizeof(kRutReq) - 1, "200"},
+        {kRutReq, sizeof(kRutReq) - 1, "429"},
+        {kDecoReq, sizeof(kDecoReq) - 1, "200"},
+        {kDecoReq, sizeof(kDecoReq) - 1, "200"},
+        {kDecoReq, sizeof(kDecoReq) - 1, "429"},
+    };
+    REQUIRE(run_jit_real_socket_status_cases(src, cases, 6));
 }
 
 TEST(route, req_header_all_requires_present_value_real_socket) {

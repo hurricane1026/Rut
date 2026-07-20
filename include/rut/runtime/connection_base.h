@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
@@ -198,11 +199,100 @@ struct ConnectionBase {
     };
     ReqHeaderOverride req_header_overrides[kMaxReqHeaderOverrides];
     u8 req_header_override_count;
+    // Bit i selects append semantics (`req.add`) for override slot i; clear
+    // means replace/dedupe (`req.set`).
+    u16 req_header_append_mask;
     // Set when rut_helper_req_set_header is called past kMaxReqHeaderOverrides
     // (reachable only via direct RIR — the DSL caps + dedupes entries). The apply
     // path fails the request closed so a dropped override can't be forwarded as a
     // silent no-op. Reset per request alongside the count.
     bool req_header_override_overflow;
+    // Ordered response-header mutations recorded by compiled Response builders.
+    // Forward paths re-anchor request-backed values into a stable request snapshot
+    // before recv_buf is released.
+    static constexpr u32 kMaxRespHeaderMutations = 16;
+    enum class RespHeaderMutationMode : u8 { Set, Add, Remove };
+    struct RespHeaderMutation {
+        Str name;
+        Str value;
+        RespHeaderMutationMode mode;
+    };
+    RespHeaderMutation resp_header_mutations[kMaxRespHeaderMutations];
+    // Helpers append to the pending builder-local prefix so resp.header() can
+    // observe source order. Only return of that builder publishes it.
+    u8 resp_header_mutation_pending_count;
+    bool resp_header_mutation_pending_overflow;
+    u8 resp_header_mutation_count;
+    bool resp_header_mutation_overflow;
+    // Lazy slice used to serialize mutated forwarded response headers separately
+    // from upstream_recv_buf. Keeping the header block independent lets a full
+    // upstream body buffer stream normally even when mutations grow the headers.
+    u8* response_header_slice;
+    Buffer response_header_buf;
+
+    void reanchor_request_overrides(const u8* old_base, u32 old_len, const u8* new_base) {
+        auto reanchor = [&](Str& value) {
+            if (value.ptr == nullptr) return;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr < old_base || ptr + value.len > old_base + old_len) return;
+            value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
+        };
+        reanchor(req_path_override);
+        for (u32 i = 0; i < req_header_override_count; i++) {
+            reanchor(req_header_overrides[i].name);
+            reanchor(req_header_overrides[i].value);
+        }
+    }
+
+    void reanchor_response_mutations(const u8* old_base, u32 old_len, const u8* new_base) {
+        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            auto& value = resp_header_mutations[i].value;
+            if (value.ptr == nullptr) continue;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr < old_base || ptr + value.len > old_base + old_len) continue;
+            value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
+        }
+    }
+
+    // Copy request-backed mutation values out of a synthesized request before
+    // HTTP/2 reuses its request scratch for the encoded response. Literal values
+    // already live in JIT-owned storage and do not need copying.
+    bool stabilize_response_mutations(const u8* source, u32 source_len) {
+        auto survives_folding = [&](u32 index) {
+            const auto& current = resp_header_mutations[index];
+            if (current.mode == RespHeaderMutationMode::Remove) return false;
+            for (u32 later_index = index + 1; later_index < resp_header_mutation_count;
+                 later_index++) {
+                const auto& later = resp_header_mutations[later_index];
+                if (later.mode != RespHeaderMutationMode::Add &&
+                    http_header_name_eq_ci(
+                        current.name.ptr, current.name.len, later.name.ptr, later.name.len))
+                    return false;
+            }
+            return true;
+        };
+        u32 needed = 0;
+        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            if (!survives_folding(i)) continue;
+            const auto& value = resp_header_mutations[i].value;
+            if (value.ptr == nullptr) continue;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr >= source && ptr + value.len <= source + source_len) needed += value.len;
+        }
+        if (needed > response_header_buf.capacity()) return false;
+        response_header_buf.reset();
+        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+            if (!survives_folding(i)) continue;
+            auto& value = resp_header_mutations[i].value;
+            if (value.ptr == nullptr) continue;
+            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
+            if (ptr < source || ptr + value.len > source + source_len) continue;
+            const u32 offset = response_header_buf.len();
+            if (response_header_buf.write(ptr, value.len) != value.len) return false;
+            value.ptr = reinterpret_cast<const char*>(response_header_buf.data() + offset);
+        }
+        return true;
+    }
     // Upstream concurrency slot: set true between try_acquire and release so the
     // slot is freed exactly once, on whatever exit path runs (completion, failure,
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
@@ -232,9 +322,13 @@ struct ConnectionBase {
     // the submitted prefix and preserve later buffered bytes.
     u32 ws_client_send_len;
     u32 ws_upstream_send_len;
-    // Bytes of the 101 Switching Protocols response sent before entering
-    // tunnel mode (HTTP headers only, excluding any early upstream bytes).
+    // Bytes in the upstream's original 101 header block. This is the prefix
+    // consumed from upstream_recv_buf after the (possibly rewritten) response
+    // reaches the client.
     u32 ws_upgrade_response_len;
+    // Bytes actually sent for the 101 header block after response mutations.
+    // Access logging and capture account this length, not the upstream prefix.
+    u32 ws_upgrade_sent_len;
     // Upstream closed during pre-tunnel 101 handling and should be closed once
     // tunnel mode is fully entered (after preserving buffered early bytes).
     bool ws_pre_tunnel_upstream_closed;
@@ -407,6 +501,11 @@ struct ConnectionBase {
     // [0, retry_req_send_len) instead of recv_buf. Reset at the per-request boundary
     // like the reuse flags.
     u32 retry_req_send_len;
+    // A response mutation may pin the pre-override request in send_buf. Such a
+    // snapshot still reserves the retry prefix for pipeline_stash layout, but it
+    // is not replayable when the upstream received rewritten request bytes.
+    bool retry_req_snapshot_replayable;
+    bool response_mutations_snapshotted;
     bool req_malformed;  // true if request body is malformed (reject)
     // Request-side keep-alive intent of the CURRENT request, as parsed from its
     // request line + Connection header (HTTP/1.1 default true, HTTP/1.0 default
@@ -574,7 +673,14 @@ struct ConnectionBase {
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
         req_header_override_count = 0;
+        req_header_append_mask = 0;
         req_header_override_overflow = false;
+        resp_header_mutation_pending_count = 0;
+        resp_header_mutation_pending_overflow = false;
+        resp_header_mutation_count = 0;
+        resp_header_mutation_overflow = false;
+        response_header_slice = nullptr;
+        response_header_buf.bind(nullptr, 0);
         upstream_slot_held = false;
         upstream_slot_uid = 0;
         throttle_down_bps = 0;
@@ -587,6 +693,7 @@ struct ConnectionBase {
         ws_client_send_len = 0;
         ws_upstream_send_len = 0;
         ws_upgrade_response_len = 0;
+        ws_upgrade_sent_len = 0;
         ws_pre_tunnel_upstream_closed = false;
         ws_client_eof = false;
         ws_upstream_eof = false;
@@ -653,6 +760,8 @@ struct ConnectionBase {
         req_content_length = 0;
         req_initial_send_len = 0;
         retry_req_send_len = 0;
+        retry_req_snapshot_replayable = true;
+        response_mutations_snapshotted = false;
         req_malformed = false;
         req_keep_alive = false;
         req_wants_upgrade = false;

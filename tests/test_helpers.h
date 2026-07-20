@@ -49,6 +49,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 response_header_storage[kMaxConns][kBufSize];
     u8 capture_storage[kMaxConns][CaptureEntry::kMaxHeaderLen];
 
     bool set_capture(CaptureRing* ring) {
@@ -127,6 +128,13 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return true;
     }
 
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        c.response_header_slice = response_header_storage[c.id];
+        c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
+        return true;
+    }
+
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
         u32 id = free_stack[--free_top];
@@ -136,6 +144,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        conns[id].response_header_slice = response_header_storage[id];
+        conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
         if (capture_ring) conns[id].capture_buf = capture_storage[id];
         return &conns[id];
     }
@@ -460,6 +470,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 response_header_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -489,6 +500,13 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         if (id >= kMaxConns) return false;
         c.upstream_recv_slice = upstream_recv_storage[id];
         c.upstream_recv_buf.bind(upstream_recv_storage[id], kBufSize);
+        return true;
+    }
+
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        c.response_header_slice = response_header_storage[c.id];
+        c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
         return true;
     }
 
@@ -523,6 +541,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        conns[id].response_header_slice = response_header_storage[id];
+        conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
         return &conns[id];
     }
 
@@ -807,6 +827,7 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     u8 recv_storage[kMaxConns][kBufSize];
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
+    u8 response_header_storage[kMaxConns][kBufSize];
 
     bool is_draining() const { return draining; }
 
@@ -837,6 +858,13 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         return true;
     }
 
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        c.response_header_slice = response_header_storage[c.id];
+        c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
+        return true;
+    }
+
     void setup() {
         running = true;
         draining = false;
@@ -864,6 +892,8 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
         conns[id].send_slice = send_storage[id];
         conns[id].recv_buf.bind(recv_storage[id], kBufSize);
         conns[id].send_buf.bind(send_storage[id], kBufSize);
+        conns[id].response_header_slice = response_header_storage[id];
+        conns[id].response_header_buf.bind(response_header_storage[id], kBufSize);
         return &conns[id];
     }
 
@@ -1030,13 +1060,37 @@ inline bool send_all(i32 fd, const char* d, u32 len) {
     return true;
 }
 
+inline i64 test_mono_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+}
+
 inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
-    struct timeval tv;
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = static_cast<long>(ms % 1000) * 1000L;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ssize_t n = recv(fd, buf, len, 0);
-    return static_cast<i32>(n < 0 ? -errno : n);
+    // SO_RCVTIMEO makes recv() non-restartable (man 7 signal): a stop/cont
+    // cycle on a loaded CI runner interrupts it with EINTR even though no
+    // handler exists. Field evidence (PR #186 dump): step=recv-101-nothing
+    // errno=4. Retry with the remaining budget instead of surfacing a
+    // spurious failure; a genuinely expired budget still returns -EAGAIN.
+    const i64 deadline = test_mono_ms() + ms;
+    for (;;) {
+        i64 left = deadline - test_mono_ms();
+        if (left < 1) left = 1;
+        struct timeval tv;
+        tv.tv_sec = left / 1000;
+        tv.tv_usec = static_cast<long>(left % 1000) * 1000L;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, buf, len, 0);
+        if (n >= 0) return static_cast<i32>(n);
+        if (errno != EINTR) return -errno;
+        if (test_mono_ms() >= deadline) {
+            // Leave errno matching the synthetic timeout: callers that
+            // record errno (the ws-flake setup evidence) must see EAGAIN,
+            // not the last EINTR this loop absorbed.
+            errno = EAGAIN;
+            return -EAGAIN;
+        }
+    }
 }
 
 inline bool has_200(const char* buf, i32 n) {

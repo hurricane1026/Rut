@@ -2,6 +2,7 @@
 // compiles a source file end to end (lex -> parse -> analyze -> MIR -> RIR ->
 // JIT) into a RouteConfig, plus its fail-closed error reporting.
 
+#include "rut/runtime/cache_table.h"
 #include "rut/serve_loader.h"
 #include "test.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -49,15 +50,15 @@ TEST(serve_loader, status_routes_load) {
 
 #if RUT_ENABLE_WEBSOCKET
 TEST(serve_loader, websocket_terminate_route_registers_and_runs) {
-    // End-to-end (Phase 4 D/E): a `websocket(x){ frame.drop() }` route compiles, its constant
-    // verdict is JIT'd, and it's published as a terminate route whose frame handler — when
+    // End-to-end (Phase 4 D/E): a `websocket(x){ frame in frame.drop() }` route compiles, its
+    // constant verdict is JIT'd, and it's published as a terminate route whose frame handler — when
     // called — returns the compiled verdict.
     const std::string dir = "/tmp/rut_serve_loader_ws";
     const std::string path =
         write_file(dir,
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) { frame.drop() } }\n");
+                   "route GET \"/ws\" { return websocket(backend) { frame in frame.drop() } }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -86,7 +87,7 @@ TEST(serve_loader, websocket_terminate_len_guard_branches_on_length) {
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
                                         "  guard frame.len < 4096 else { frame.drop() }\n"
                                         "  frame.forward()\n"
                                         "} }\n");
@@ -120,7 +121,7 @@ TEST(serve_loader, websocket_terminate_opcode_guard_drops_binary) {
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
                                         "  guard frame.isText else { frame.drop() }\n"
                                         "  frame.forward()\n"
                                         "} }\n");
@@ -151,7 +152,7 @@ TEST(serve_loader, websocket_terminate_direction_guard_polices_client_leg) {
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
                                         "  guard frame.fromClient else { frame.forward() }\n"
                                         "  frame.drop()\n"
                                         "} }\n");
@@ -183,7 +184,7 @@ TEST(serve_loader, websocket_terminate_close_code_reaches_route) {
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
                                         "  frame.close(1008)\n"
                                         "} }\n");
 
@@ -211,7 +212,7 @@ TEST(serve_loader, websocket_terminate_default_close_code_is_1000) {
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
                                         "  frame.close()\n"
                                         "} }\n");
 
@@ -238,7 +239,7 @@ TEST(serve_loader, websocket_terminate_max_message_size_kwarg_reaches_route) {
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
                                         "route GET \"/ws\" { return websocket(backend, "
-                                        "maxMessageSize: 4kb) {\n"
+                                        "maxMessageSize: 4kb) { frame in\n"
                                         "  frame.forward()\n"
                                         "} }\n");
     LoadedProgram program;
@@ -260,7 +261,7 @@ TEST(serve_loader, websocket_terminate_default_max_message_size) {
     const std::string path = write_file(dir,
                                         "app.rut",
                                         "upstream backend at \"127.0.0.1:9999\"\n"
-                                        "route GET \"/ws\" { return websocket(backend) {\n"
+                                        "route GET \"/ws\" { return websocket(backend) { frame in\n"
                                         "  frame.forward()\n"
                                         "} }\n");
     LoadedProgram program;
@@ -310,7 +311,7 @@ TEST(serve_loader, websocket_terminate_text_match_guard_filters_content) {
         write_file(dir,
                    "app.rut",
                    "upstream backend at \"127.0.0.1:9999\"\n"
-                   "route GET \"/ws\" { return websocket(backend) {\n"
+                   "route GET \"/ws\" { return websocket(backend) { frame in\n"
                    "  guard !frame.text.matches(re\".*badword.*\") else { frame.drop() }\n"
                    "  frame.forward()\n"
                    "} }\n");
@@ -357,6 +358,33 @@ TEST(serve_loader, empty_program_loads_routeless) {
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
     CHECK_EQ(program.config.route_count, 0u);
+    program.destroy();
+}
+
+TEST(serve_loader, cache_registry_changes_only_at_activation) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 old_caps[1] = {64};
+    const u64 old_ids[1] = {cache_instance_identity("old", 3)};
+    cache_registry_publish(old_caps, old_ids, 1);
+
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_cache_activation",
+                   "app.rut",
+                   "let buckets = Cache<IP, i64>(capacity: 128)\n"
+                   "route GET \"/\" { let n = buckets.get(req.remoteAddr).or(0) "
+                   "buckets.set(req.remoteAddr, n + 1) return 200 }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+
+    auto& reg = cache_registry();
+    CHECK_EQ(reg.capacities[0].load(std::memory_order_relaxed), 64u);
+    CHECK_EQ(reg.identities[0].load(std::memory_order_relaxed), old_ids[0]);
+
+    activate_rut_program(program);
+    CHECK_EQ(reg.capacities[0].load(std::memory_order_relaxed), 128u);
+    CHECK_EQ(reg.identities[0].load(std::memory_order_relaxed),
+             cache_instance_identity("buckets", 7));
     program.destroy();
 }
 

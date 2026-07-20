@@ -53,6 +53,12 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_req_header", reinterpret_cast<void*>(&rut_helper_req_header)},
     {"rut_helper_req_set_path", reinterpret_cast<void*>(&rut_helper_req_set_path)},
     {"rut_helper_req_set_header", reinterpret_cast<void*>(&rut_helper_req_set_header)},
+    {"rut_helper_req_add_header", reinterpret_cast<void*>(&rut_helper_req_add_header)},
+    {"rut_helper_resp_set_header", reinterpret_cast<void*>(&rut_helper_resp_set_header)},
+    {"rut_helper_resp_add_header", reinterpret_cast<void*>(&rut_helper_resp_add_header)},
+    {"rut_helper_resp_remove_header", reinterpret_cast<void*>(&rut_helper_resp_remove_header)},
+    {"rut_helper_resp_commit_headers", reinterpret_cast<void*>(&rut_helper_resp_commit_headers)},
+    {"rut_helper_resp_header", reinterpret_cast<void*>(&rut_helper_resp_header)},
     {"rut_helper_req_cookie", reinterpret_cast<void*>(&rut_helper_req_cookie)},
     {"rut_helper_req_query", reinterpret_cast<void*>(&rut_helper_req_query)},
     {"rut_helper_req_query_string", reinterpret_cast<void*>(&rut_helper_req_query_string)},
@@ -66,6 +72,10 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_str_cmp", reinterpret_cast<void*>(&rut_helper_str_cmp)},
     {"rut_helper_str_regex_match", reinterpret_cast<void*>(&rut_helper_str_regex_match)},
     {"rut_helper_str_trim_prefix", reinterpret_cast<void*>(&rut_helper_str_trim_prefix)},
+    {"rut_helper_cache_get", reinterpret_cast<void*>(&rut_helper_cache_get)},
+    {"rut_helper_cache_set", reinterpret_cast<void*>(&rut_helper_cache_set)},
+    {"rut_helper_time_now_micros", reinterpret_cast<void*>(&rut_helper_time_now_micros)},
+    {"rut_helper_time_unlatch", reinterpret_cast<void*>(&rut_helper_time_unlatch)},
     {nullptr, nullptr},
 };
 

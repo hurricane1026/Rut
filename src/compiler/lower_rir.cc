@@ -545,6 +545,11 @@ static FrontendResult<const rir::Type*> rir_type_for_shape(
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
         return ty.value();
     }
+    if (type == MirTypeKind::I64) {
+        auto ty = b.make_type(rir::TypeKind::I64);
+        if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
+        return ty.value();
+    }
     if (type == MirTypeKind::Str) {
         auto ty = b.make_type(rir::TypeKind::Str);
         if (!ty) return frontend_error(FrontendError::OutOfMemory, span);
@@ -708,8 +713,9 @@ static FrontendResult<rir::ValueId> emit_eq_for_shape(MirTypeKind type,
                                                       const rir::StructDef* const* user_struct_defs,
                                                       rir::Builder& b,
                                                       Span span) {
-    if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::Str ||
-        type == MirTypeKind::Method || type == MirTypeKind::ByteSize || type == MirTypeKind::IP) {
+    if (type == MirTypeKind::Bool || type == MirTypeKind::I32 || type == MirTypeKind::I64 ||
+        type == MirTypeKind::Str || type == MirTypeKind::Method || type == MirTypeKind::ByteSize ||
+        type == MirTypeKind::IP) {
         auto cmp = b.emit_cmp(rir::Opcode::CmpEq, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
         return cmp.value();
@@ -942,7 +948,7 @@ static FrontendResult<rir::ValueId> emit_ord_for_shape(
     rir::Builder& b,
     Span span,
     bool less_than) {
-    if (type == MirTypeKind::I32 || type == MirTypeKind::Str) {
+    if (type == MirTypeKind::I32 || type == MirTypeKind::I64 || type == MirTypeKind::Str) {
         auto op = less_than ? rir::Opcode::CmpLt : rir::Opcode::CmpGt;
         auto cmp = b.emit_cmp(op, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
@@ -1200,7 +1206,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::IntConst) {
-        auto v = b.emit_const_i32(value.int_value, {span.line, span.col});
+        auto v = value.type == MirTypeKind::I64
+                     ? b.emit_const_i64(value.int_value, {span.line, span.col})
+                     : b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
@@ -1317,11 +1325,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             }
         }
         if (!has_any_payload && variant_infos[variant_index].struct_type == nullptr) {
-            auto v = b.emit_const_i32(value.int_value, {span.line, span.col});
+            auto v = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
             if (!v) return frontend_error(FrontendError::OutOfMemory, span);
             return v.value();
         }
-        auto tag = b.emit_const_i32(value.int_value, {span.line, span.col});
+        auto tag = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!tag) return frontend_error(FrontendError::OutOfMemory, span);
         rir::ValueId payload_bool{};
         rir::ValueId payload_i32{};
@@ -1507,6 +1515,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
+    if (value.kind == MirValueKind::TimeNowMicros) {
+        auto out = b.emit_time_now_micros({span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
     if (value.kind == MirValueKind::ReqRemoteAddr) {
         auto v = b.emit_req_remote_addr({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
@@ -1612,7 +1625,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::Error) {
-        auto v = b.emit_const_i32(value.int_value, {span.line, span.col});
+        auto v = b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
@@ -1844,7 +1857,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                     if (branch.kind != MirValueKind::Error) return branch_id;
                     const i32 tag_value = branch.error_variant_index != 0xffffffffu
                                               ? static_cast<i32>(branch.error_case_index)
-                                              : branch.int_value;
+                                              : static_cast<i32>(branch.int_value);
                     auto code = b.emit_const_i32(tag_value, {span.line, span.col});
                     if (!code) return frontend_error(FrontendError::OutOfMemory, span);
                     auto msg = b.emit_const_str(branch.msg, {span.line, span.col});
@@ -2220,7 +2233,10 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::BitAnd || value.kind == MirValueKind::BitOr ||
         value.kind == MirValueKind::BitXor || value.kind == MirValueKind::BitShl ||
-        value.kind == MirValueKind::BitShr) {
+        value.kind == MirValueKind::BitShr || value.kind == MirValueKind::Add ||
+        value.kind == MirValueKind::Sub || value.kind == MirValueKind::Mul ||
+        value.kind == MirValueKind::Div || value.kind == MirValueKind::Mod ||
+        value.kind == MirValueKind::MaxInt || value.kind == MirValueKind::MinInt) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
                                      variant_infos,
@@ -2258,7 +2274,169 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             op = rir::Opcode::BitShl;
         else if (value.kind == MirValueKind::BitShr)
             op = rir::Opcode::BitShr;
-        auto out = b.emit_bit(op, lhs.value(), rhs.value(), {span.line, span.col});
+        else if (value.kind == MirValueKind::Add)
+            op = rir::Opcode::Add;
+        else if (value.kind == MirValueKind::Sub)
+            op = rir::Opcode::Sub;
+        else if (value.kind == MirValueKind::Mul)
+            op = rir::Opcode::Mul;
+        else if (value.kind == MirValueKind::Div)
+            op = rir::Opcode::Div;
+        else if (value.kind == MirValueKind::Mod)
+            op = rir::Opcode::Mod;
+        else if (value.kind == MirValueKind::MaxInt)
+            op = rir::Opcode::MaxInt;
+        else if (value.kind == MirValueKind::MinInt)
+            op = rir::Opcode::MinInt;
+        auto out = rir::Builder::is_arith_opcode(op)
+                       ? b.emit_arith(op, lhs.value(), rhs.value(), {span.line, span.col})
+                       : b.emit_bit(op, lhs.value(), rhs.value(), {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
+    if (value.kind == MirValueKind::CacheGet || value.kind == MirValueKind::CacheSet) {
+        auto key = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!key) return core::make_unexpected(key.error());
+        if (value.kind == MirValueKind::CacheGet) {
+            auto out = b.emit_cache_get(value.cache_index, key.value(), {span.line, span.col});
+            if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+            return out.value();
+        }
+        auto val = materialize_value(*value.rhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!val) return core::make_unexpected(val.error());
+        auto out =
+            b.emit_cache_set(value.cache_index, key.value(), val.value(), {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
+    if (value.kind == MirValueKind::ReqSetHeader || value.kind == MirValueKind::ReqAddHeader) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto val = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!val) return core::make_unexpected(val.error());
+        const bool emitted = value.kind == MirValueKind::ReqAddHeader
+                                 ? static_cast<bool>(b.emit_req_add_header(
+                                       value.str_value, val.value(), {span.line, span.col}))
+                                 : static_cast<bool>(b.emit_req_set_header(
+                                       value.str_value, val.value(), {span.line, span.col}));
+        if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);
+        return val.value();
+    }
+    if (value.kind == MirValueKind::RespHeader) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto str_ty_result = b.make_type(rir::TypeKind::Str);
+        if (!str_ty_result) return frontend_error(FrontendError::OutOfMemory, span);
+        auto* str_ty = str_ty_result.value();
+        rir::ValueId fallback{};
+        if (value.lhs->kind == MirValueKind::Nil) {
+            auto nil = b.emit_opt_nil(str_ty, {span.line, span.col});
+            if (!nil) return frontend_error(FrontendError::OutOfMemory, span);
+            fallback = nil.value();
+        } else {
+            auto raw = materialize_value(*value.lhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+            if (!raw) return core::make_unexpected(raw.error());
+            auto wrapped = b.emit_opt_wrap(raw.value(), {span.line, span.col});
+            if (!wrapped) return frontend_error(FrontendError::OutOfMemory, span);
+            fallback = wrapped.value();
+        }
+        auto out = b.emit_resp_header(value.str_value, fallback, {span.line, span.col});
+        if (!out) return frontend_error(FrontendError::OutOfMemory, span);
+        return out.value();
+    }
+    if (value.kind == MirValueKind::RespSetHeader || value.kind == MirValueKind::RespAddHeader) {
+        if (value.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto val = materialize_value(*value.lhs,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        if (!val) return core::make_unexpected(val.error());
+        const bool emitted = value.kind == MirValueKind::RespAddHeader
+                                 ? static_cast<bool>(b.emit_resp_add_header(
+                                       value.str_value, val.value(), {span.line, span.col}))
+                                 : static_cast<bool>(b.emit_resp_set_header(
+                                       value.str_value, val.value(), {span.line, span.col}));
+        if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);
+        return val.value();
+    }
+    if (value.kind == MirValueKind::RespRemoveHeader) {
+        if (!b.emit_resp_remove_header(value.str_value, {span.line, span.col}))
+            return frontend_error(FrontendError::OutOfMemory, span);
+        auto zero = b.emit_const_str({"", 0}, {span.line, span.col});
+        if (!zero) return frontend_error(FrontendError::OutOfMemory, span);
+        return zero.value();
+    }
+    if (value.kind == MirValueKind::WidenI64) {
+        auto operand = materialize_value(*value.lhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+        if (!operand) return core::make_unexpected(operand.error());
+        auto out = b.emit_sext_i64(operand.value(), {span.line, span.col});
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
@@ -2368,6 +2546,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
         }
         const rir::TypeKind inner_kind = shape.type == MirTypeKind::Bool  ? rir::TypeKind::Bool
                                          : shape.type == MirTypeKind::Str ? rir::TypeKind::Str
+                                         : shape.type == MirTypeKind::I64 ? rir::TypeKind::I64
                                                                           : rir::TypeKind::I32;
         auto inner = b.make_type(inner_kind);
         if (!inner) return frontend_error(FrontendError::OutOfMemory, span);
@@ -2375,6 +2554,13 @@ static FrontendResult<rir::ValueId> materialize_local_init(
     };
 
     if (local.may_error) {
+        // I64 is deliberately NOT admitted here: the __error_unknown scalar
+        // carrier's payload field is Optional<i32>, so a fallible i64 local
+        // would fail deep in emit_struct_create. Analysis rejects every
+        // fallible-i64 producer (kI64FallibleDetail); this is the
+        // defense-in-depth backstop — when an i64 error carrier exists, add
+        // I64 back alongside it. (may_nil I64 IS supported — the Optional
+        // carrier is width-generic.)
         if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
             local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
             local_shape.type != MirTypeKind::Struct && local_shape.type != MirTypeKind::Unknown)
@@ -2412,7 +2598,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
         if (local.init.kind == MirValueKind::Error) {
             const i32 tag_value = local.init.error_variant_index != 0xffffffffu
                                       ? static_cast<i32>(local.init.error_case_index)
-                                      : local.init.int_value;
+                                      : static_cast<i32>(local.init.int_value);
             auto code = b.emit_const_i32(tag_value, {local.span.line, local.span.col});
             if (!code) return frontend_error(FrontendError::OutOfMemory, local.span);
             auto msg = b.emit_const_str(local.init.msg, {local.span.line, local.span.col});
@@ -2549,8 +2735,8 @@ static FrontendResult<rir::ValueId> materialize_local_init(
                                  local.span);
 
     if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
-        local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
-        local_shape.type != MirTypeKind::Struct)
+        local_shape.type != MirTypeKind::I64 && local_shape.type != MirTypeKind::Str &&
+        local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct)
         return frontend_error(FrontendError::UnsupportedSyntax, local.span);
 
     auto inner = make_inner_type(local_shape, local.span);
@@ -2789,6 +2975,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::ReturnStatus) {
+        if (term.commit_response_mutations &&
+            !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
         if (term.source_kind == MirTerminatorSourceKind::LocalRef) {
             if (term.local_ref_index >= local_count)
                 return frontend_error(FrontendError::UnsupportedSyntax, term.span);
@@ -2862,7 +3051,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         const u16 upstream_id = mir.upstreams[term.upstream_index].id;
         auto upstream =
             b.emit_const_i32(static_cast<i32>(upstream_id), {term.span.line, term.span.col});
-        if (!upstream || !b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
+        if (!upstream) return frontend_error(FrontendError::OutOfMemory, term.span);
+        if (term.commit_response_mutations &&
+            !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        if (!b.emit_ret_forward(upstream.value(), {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -2961,6 +3154,24 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
     }
     out.module.upstream_count = mir.upstreams.len;
+
+    // Cache instance descriptors, names arena-copied like upstream names.
+    if (mir.caches.len > rir::Module::kMaxCacheInstances) {
+        return frontend_error(FrontendError::TooManyItems,
+                              mir.caches.len > 0 ? mir.caches[0].span : Span{});
+    }
+    for (u32 i = 0; i < mir.caches.len; i++) {
+        const Str src_name = mir.caches[i].name;
+        char* name_buf = nullptr;
+        if (src_name.len > 0) {
+            name_buf = out.module.arena->alloc_array<char>(src_name.len);
+            if (!name_buf) return frontend_error(FrontendError::OutOfMemory, mir.caches[i].span);
+            for (u32 k = 0; k < src_name.len; k++) name_buf[k] = src_name.ptr[k];
+        }
+        out.module.cache_instances[i].name = {name_buf, src_name.len};
+        out.module.cache_instances[i].capacity = mir.caches[i].capacity;
+    }
+    out.module.cache_instance_count = mir.caches.len;
 
     VariantLoweringInfo variant_infos[MirModule::kMaxVariants]{};
     TupleLoweringInfo tuple_infos[64]{};
@@ -3841,16 +4052,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 return false;
             }
         };
-        // Blocks reached from the entry block (0) through ONLY unconditional
-        // control transfers: a `wait` yield's linear continuation, or a
-        // degenerate Branch whose two arms coincide. A guard-let / if-let
-        // recovery condition sitting in such a block still dominates every exit
-        // of the local — exactly like a condition in block 0 — so its else/false
-        // arm is guaranteed to intercept the error before it can escape as a
-        // success. A block reached only through a CONDITIONAL branch is NOT
-        // included: a sibling arm could return success without recovering, so
-        // the prelude must stay there (masquerade guard). This set only widens
-        // recovery RECOGNITION; it never on its own suppresses a prelude.
+        // Cheap dominance set for unconditional entry continuations. The full
+        // per-local exit analysis below additionally handles conditional paths
+        // that either recover the carrier or terminate fail-closed.
         bool linearly_dominated[MirFunction::kMaxBlocks]{};
         if (mir.functions[i].blocks.len != 0) {
             linearly_dominated[0] = true;
@@ -3872,18 +4076,10 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     next = term.then_block;
                     has_next = true;
                 }
-                // NOT extended to single-continuation conditional branches
-                // (one arm terminating, the other continuing): a terminating
-                // sibling arm can return a SUCCESS status while the local
-                // still carries an unrecovered error (see
-                // conditional_guard_keeps_error_prelude_on_unguarded_sibling),
-                // so treating the continuation as dominating would let an
-                // error masquerade as success. Distinguishing a benign
-                // pre-recovery reject (`guard ok else { return 403 }`) from
-                // that masquerade needs real per-local exit-dominance
-                // analysis — tracked in TODO.md. Until then the prelude is
-                // conservatively kept (worst case: generic 500 instead of the
-                // programmed else — never a wrong-direction result).
+                // Single-continuation conditional branches are intentionally
+                // excluded here: their terminating sibling may return success.
+                // The exit-aware walk below distinguishes that case from a
+                // fail-closed pre-reject before a later recovery.
                 if (!has_next || next >= mir.functions[i].blocks.len || linearly_dominated[next])
                     break;
                 linearly_dominated[next] = true;
@@ -3929,24 +4125,43 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             if (term.use_cmp && RecoveryScan::is_guard_condition(&term.lhs, ci)) return true;
             return false;
         };
-        // Recovery split across paths: every control path from the entry
-        // evaluates its own recovering branch (a guard/presence condition, or
-        // a condition whose every result path evaluates a presence test —
-        // recovers_on_all_paths). Subsumes the single-dominating-branch rule:
-        // dominance is just the case where one branch covers all paths. A
-        // path that exits (return/forward) before any recovering branch does
-        // NOT recover — the sibling-escape masquerade stays guarded exactly
-        // as before.
-        auto all_paths_recover = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
+        // Per-local exit-dominance: every control path from entry must either
+        // recover the carrier or terminate with a literal fail-closed HTTP
+        // response. A 4xx/5xx pre-reject is safe without observing the carrier;
+        // a 2xx/3xx, dynamic status, forward, or unknown exit is not — accepting
+        // it would let an error masquerade as a successful/redirected request.
+        // This subsumes the single-dominating-branch rule and recognizes split
+        // recovery across sibling paths.
+        auto all_error_paths_safe = [&](const RecoveryScan::CarrierInfo& ci) -> bool {
             i8 memo[MirFunction::kMaxBlocks];
             for (u32 bi = 0; bi < MirFunction::kMaxBlocks; bi++) memo[bi] = -1;
             auto rec = [&](auto&& self, u32 bi) -> bool {
                 if (bi >= mir.functions[i].blocks.len) return false;
                 if (memo[bi] != -1) return memo[bi] == 1;
                 memo[bi] = 0;  // revisit-while-computing reads as false
-                const auto& term = mir.functions[i].blocks[bi].term;
+                const auto& block = mir.functions[i].blocks[bi];
+                const auto& term = block.term;
                 bool covered = false;
-                if (term.kind == MirTerminatorKind::Branch) {
+                // Effects execute whenever their owning block is selected. A
+                // recovering effect therefore covers this path before the
+                // terminator; sibling blocks are handled independently by the
+                // recursive all-paths check.
+                for (u32 ei = 0; ei < block.effects.len; ei++) {
+                    const u32 value_index = block.effects[ei].value_index;
+                    if (value_index >= mir.functions[i].values.len) continue;
+                    const auto* effect = &mir.functions[i].values[value_index];
+                    if (RecoveryScan::contains_recovering_use(
+                            effect, ci, /*match_presence=*/true) ||
+                        RecoveryScan::recovers_on_all_paths(effect, ci)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered && term.kind == MirTerminatorKind::ReturnStatus &&
+                    term.source_kind == MirTerminatorSourceKind::Literal &&
+                    term.status_code >= 400 && term.status_code <= 599)
+                    covered = true;
+                if (!covered && term.kind == MirTerminatorKind::Branch) {
                     // A match/use_cmp SUBJECT recovers the same way a plain
                     // condition does — directly guard-shaped or covered on
                     // every evaluation path.
@@ -3957,7 +4172,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         covered = true;
                     else
                         covered = self(self, term.then_block) && self(self, term.else_block);
-                } else if (term.kind == MirTerminatorKind::YieldTimer &&
+                } else if (!covered && term.kind == MirTerminatorKind::YieldTimer &&
                            mir.functions[i].has_explicit_resume_blocks &&
                            term.yield_next_state <= mir.functions[i].waits.len) {
                     covered = self(self, mir.functions[i].resume_blocks[term.yield_next_state]);
@@ -3981,7 +4196,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 if (RecoveryScan::recovers_on_all_paths(&mir.functions[i].locals[li].init, ci))
                     return true;
             }
-            if (all_paths_recover(ci)) return true;
+            if (all_error_paths_safe(ci)) return true;
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 const auto& term = mir.functions[i].blocks[bi].term;
                 // A top-level guard/if-let condition (plain-branch cond OR match
@@ -4094,7 +4309,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
                 if (!error_reachable[bi]) continue;
-                const auto& term = mir.functions[i].blocks[bi].term;
+                const auto& block = mir.functions[i].blocks[bi];
+                for (u32 ei = 0; ei < block.effects.len; ei++) {
+                    const u32 value_index = block.effects[ei].value_index;
+                    if (value_index >= mir.functions[i].values.len) continue;
+                    if (RecoveryScan::contains_non_recovering_use(
+                            &mir.functions[i].values[value_index],
+                            ci,
+                            /*top_level_cond=*/false))
+                        return true;
+                }
+                const auto& term = block.term;
                 // The complex if-let form lowers to a match whose usable-value
                 // test is the match SUBJECT (`use_cmp && term.lhs =
                 // HasValue(local)`). Like a plain guard condition, that subject
@@ -4302,6 +4527,30 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         out.destroy();
                         return frontend_error(FrontendError::OutOfMemory, store_span);
                     }
+                }
+            }
+            for (u32 ei = 0; ei < mir.functions[i].blocks[bi].effects.len; ei++) {
+                const auto& effect = mir.functions[i].blocks[bi].effects[ei];
+                if (effect.value_index >= mir.functions[i].values.len) {
+                    out.destroy();
+                    return frontend_error(FrontendError::UnsupportedSyntax, effect.span);
+                }
+                auto emitted = materialize_value(mir.functions[i].values[effect.value_index],
+                                                 mir,
+                                                 variant_infos,
+                                                 tuple_infos,
+                                                 &tuple_info_count,
+                                                 error_scalar_infos,
+                                                 error_variant_infos,
+                                                 error_struct_infos,
+                                                 user_struct_defs,
+                                                 b,
+                                                 local_vals,
+                                                 MirFunction::kMaxLocals,
+                                                 effect.span);
+                if (!emitted) {
+                    out.destroy();
+                    return core::make_unexpected(emitted.error());
                 }
             }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,

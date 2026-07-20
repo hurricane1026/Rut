@@ -9,6 +9,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #if RUT_ENABLE_WEBSOCKET
@@ -483,6 +484,580 @@ TEST(jit, frontend_bitwise_shift_saturation_executes) {
     rir.destroy();
 }
 
+TEST(jit, frontend_arith_ops_execute) {
+    const char* src =
+        "route GET \"/users\" { let a = 7 let b = 3 if a + b == 10 && a - b == 4 && "
+        "a * b == 21 && a / b == 2 && a % b == 1 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_arith_div_mod_guards_execute) {
+    // Runtime operands (locals don't fold at use sites), so the codegen
+    // select guards — not the analyze fold — produce these results.
+    const char* src =
+        "route GET \"/users\" { let z = 0 let a = 7 let m = -2147483648 let n = -1 "
+        "if a / z == 0 && a % z == 0 && m / n == -2147483648 && m % n == 0 { return 200 } "
+        "else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_match_negative_pattern_executes) {
+    const char* src =
+        "route GET \"/users\" { let a = 0 - 1 match a { -1 => return 204 _ => return 500 } "
+        "}\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 204);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_i64_arith_and_compares_execute) {
+    // Runtime i64 values crossing the i32 boundary: widen, arithmetic, and
+    // ordered compares all at 64-bit width.
+    const char* src =
+        "route GET \"/users\" { let a = 2147483647 let w = i64(a) let big = w + 1 "
+        "if big == 2147483648 && big > w && w < big && big * 2 == 4294967296 "
+        "{ return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_i64_div_mod_guards_and_wrap_execute) {
+    // Runtime operands (locals don't fold at use sites): the width-aware
+    // codegen guards must produce the defined results at INT64 boundaries,
+    // and overflow must wrap at 64 bits.
+    const char* src =
+        "route GET \"/users\" { let z = i64(0) let a = i64(7) "
+        "let max = 9223372036854775807 let one = i64(1) let m = max + one let n = i64(0) - one "
+        "if a / z == z && a % z == z && m / n == m && m % n == z && max + one == m "
+        "{ return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_i64_runtime_widen_across_wait_executes) {
+    // A RUNTIME-widened i64 (WidenI64/sext, not a folded literal) used
+    // after a wait. MIR substitutes LocalRefs with the local's init tree at
+    // each use site and lowering re-materializes that tree inside the block
+    // that uses it, so the resume block re-executes the sext locally —
+    // there is no cross-block SSA reference back into the entry block.
+    const auto src = R"rut(
+route GET "/sleep" { let a = 5 let w = i64(a) wait(1000) if w == i64(5) { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
+    ctx.state = 0;
+    ctx.handler_idx = 0;
+
+    auto r0 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r0.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(r0.next_state, 1);
+
+    ctx.state = 1;
+    auto r1 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r1.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r1.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_bitwise_i64_pack_unpack_executes) {
+    // The packed fixed-window shape end-to-end at runtime: pack a window
+    // index and a count into one i64, unpack both, and check 64-bit shift
+    // saturation with a runtime amount.
+    const char* src =
+        "route GET \"/users\" { let a = 7 let win = i64(a) let cnt = i64(9) "
+        "let packed = bitwise.or(bitwise.shiftLeft(win, 32), cnt) "
+        "let win2 = bitwise.shiftRight(packed, 32) "
+        "let cnt2 = bitwise.and(packed, 4294967295) "
+        "let big = i64(70) "
+        "if win2 == win && cnt2 == cnt && bitwise.shiftLeft(win, big) == i64(0) "
+        "{ return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_time_minmax_gcra_shape_executes) {
+    // The full GCRA expression shape at runtime: latched now, i64
+    // arithmetic, max() over (stored tat, now). Pins the per-invocation
+    // time latch: every use of a now-bound local sees the SAME value
+    // (without the latch, init-tree re-materialization would re-read the
+    // clock per use).
+    const char* src =
+        "route GET \"/a\" { let t1 = time.nowMicros() let t2 = time.nowMicros() "
+        "if t2 == t1 { return 200 } else { return 500 } }\n"
+        "route GET \"/b\" { let t1 = time.nowMicros() "
+        "if t1 > 0 { return 200 } else { return 500 } }\n"
+        "route GET \"/c\" { let t1 = time.nowMicros() let tat = max(t1 + 5, t1) "
+        "if tat - t1 == 5 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto call_route = [&](const char* sym) {
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(sym));
+        if (handler == nullptr) return 0u;
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        return static_cast<u32>(r.status_code);
+    };
+    CHECK_EQ(call_route("handler_route_0"), 200u);  // t2 == t1 (latched now)
+    CHECK_EQ(call_route("handler_route_1"), 200u);  // t1 > 0
+    CHECK_EQ(call_route("handler_route_2"), 200u);  // max/sub shape
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_time_latch_resets_per_invocation_without_parse) {
+    // A handler that samples time.nowMicros() but never reads the request
+    // gets no parse_prime (the usual latch reset), so it needs the dedicated
+    // prologue unlatch — without it the thread's clock freezes at the first
+    // sampled value and GCRA-style buckets never observe elapsed time.
+    // Observed via the helper: after each invocation the latch still holds
+    // that invocation's value, so two spaced invocations must differ.
+    const char* src =
+        "route GET \"/t\" { let t1 = time.nowMicros() "
+        "if t1 > 0 { return 200 } else { return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    auto invoke = [&] {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(kGetApiRequest),
+                                               sizeof(kGetApiRequest) - 1,
+                                               nullptr));
+        CHECK_EQ(r.status_code, 200);
+        return rut_helper_time_now_micros();  // latch still holds this invocation's value
+    };
+    const i64 first = invoke();
+    usleep(2000);
+    const i64 second = invoke();
+    CHECK_GT(second, first);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_rut_gcra_token_bucket_executes) {
+    // THE capstone: the complete GCRA token bucket from
+    // examples/ratelimit.rut, written entirely in Rut, executing under the
+    // JIT. emit == tau → two conforming requests, third rejected; another
+    // IP has independent state. The successor is committed only in the
+    // conforming branch, matching the built-in limiter on rejection.
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 4096)
+
+route GET "/users" {
+    let now = time.nowMicros()
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    if tat - now <= 600000000 {
+        buckets.set(req.remoteAddr, tat + 600000000)
+        return 200
+    } else {
+        return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    cache_registry_set_seed(0x6CFAu);
+    const u32 caps[1] = {4096};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0A0000FE;
+
+    auto call = [&]() {
+        return static_cast<u32>(
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(kGetApiRequest),
+                                          sizeof(kGetApiRequest) - 1,
+                                          nullptr))
+                .status_code);
+    };
+    CHECK_EQ(call(), 200u);
+    CHECK_EQ(call(), 200u);
+    CHECK_EQ(call(), 429u);
+
+    conn.peer_addr = 0x0A0000FF;  // fresh IP → fresh bucket
+    CHECK_EQ(call(), 200u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_i64_local_across_wait_executes) {
+    // Locals re-materialize fresh in resume states (no ctx slots involved),
+    // so an i64 local crosses a wait exactly like an i32 — this pins the
+    // deferred CtxLoad/StoreSlotI64 decision.
+    const auto src = R"rut(
+route GET "/sleep" { let big = 2147483648 wait(1000) if big == 2147483648 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame frame{};
+    HandlerCtx& ctx = frame.ctx;
+    ctx.state = 0;
+    ctx.handler_idx = 0;
+
+    auto r0 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r0.action), static_cast<u8>(HandlerAction::Yield));
+    CHECK_EQ(r0.next_state, 1);
+
+    ctx.state = 1;
+    auto r1 = HandlerResult::unpack(handler(nullptr,
+                                            &ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr));
+    CHECK_EQ(static_cast<u8>(r1.action), static_cast<u8>(HandlerAction::ReturnStatus));
+    CHECK_EQ(r1.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_arith_overflow_wraps_executes) {
+    const char* src =
+        "route GET \"/users\" { let big = 2147483647 let one = 1 "
+        "if big + one == -2147483648 && (0 - big) - 2 == 2147483647 { return 200 } else { "
+        "return 500 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(kGetApiRequest),
+                                           sizeof(kGetApiRequest) - 1,
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK(r.status_code == 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_header_all_requires_present_value_present_or_missing) {
     const char* src =
         "route GET \"/users\" { let host = all(req.header(\"Host\"), \"fallback\") if host == "
@@ -621,6 +1196,408 @@ TEST(jit, frontend_req_remote_addr_read) {
 
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, frontend_cache_counter_pattern_executes) {
+    // The first real algorithm-in-Rut: a per-IP request counter. Three
+    // invocations of the same handler → 200, 200, 429; a different IP
+    // starts its own count. Exercises CacheGet miss → .or(0), literal
+    // adoption in prev + 1, the bare CacheSet statement, and the
+    // thread_local table publish/rebuild path.
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 1024)
+
+route GET "/users" {
+    let prev = buckets.get(req.remoteAddr).or(0)
+    buckets.set(req.remoteAddr, prev + 1)
+    if prev + 1 > 2 { return 429 } else { return 200 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    // Publish the instance descriptors (the loader's job in production) with
+    // a deterministic seed and a distinct capacity so this test's tables
+    // rebuild fresh even if another test touched the registry.
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {1024};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0A00002A;  // 10.0.0.42
+
+    auto call = [&]() {
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(kGetApiRequest),
+                                             sizeof(kGetApiRequest) - 1,
+                                             nullptr));
+    };
+    auto r1 = call();
+    CHECK(r1.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r1.status_code, 200);
+    // Probe the table directly: call 1 must have stored count 1.
+    u8 probe_has = 0;
+    i64 probe_val = 0;
+    rut_helper_cache_get(0, 0x0A00002A, &probe_has, &probe_val);
+    CHECK_EQ(probe_has, 1);
+    CHECK_EQ(probe_val, 1);
+    auto r2 = call();
+    CHECK_EQ(r2.status_code, 200);
+    auto r3 = call();
+    CHECK_EQ(r3.status_code, 429);
+
+    // A different IP has independent state.
+    conn.peer_addr = 0x0A000001;
+    auto other = call();
+    CHECK_EQ(other.status_code, 200);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_cache_branch_write_only_meters_accepted_requests) {
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 1024)
+
+route GET "/users" {
+    guard req.http11 else { return 505 }
+    let prev = buckets.get(req.remoteAddr).or(0)
+    if prev < 2 {
+        guard req.http11 else { return 505 }
+        buckets.set(req.remoteAddr, prev + 1)
+        return 200
+    } else {
+        return 429
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    cache_registry_set_seed(0xB4A4C4u);
+    const u32 caps[1] = {1024};
+    const u64 idents[1] = {cache_instance_identity("branch-buckets", 14)};
+    cache_registry_publish(caps, idents, 1);
+
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0A00002Bu;
+    auto call = [&]() {
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(kGetApiRequest),
+                                             sizeof(kGetApiRequest) - 1,
+                                             nullptr));
+    };
+    CHECK_EQ(call().status_code, 200);
+    CHECK_EQ(call().status_code, 200);
+    CHECK_EQ(call().status_code, 429);
+    CHECK_EQ(call().status_code, 429);
+
+    // Rejected calls do not execute the accepted branch's CacheSet.
+    u8 probe_has = 0;
+    i64 probe_val = 0;
+    rut_helper_cache_get(0, conn.peer_addr, &probe_has, &probe_val);
+    CHECK_EQ(probe_has, 1);
+    CHECK_EQ(probe_val, 2);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_req_set_and_add_record_request_header_modes) {
+    const auto src = R"rut(
+route GET "/users" {
+    req.set("X-Mode", "replace")
+    req.add("X-Tag", "tail")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+    REQUIRE_EQ(conn.req_header_override_count, 2u);
+    CHECK(conn.req_header_overrides[0].name.eq(lit("X-Mode")));
+    CHECK(conn.req_header_overrides[0].value.eq(lit("replace")));
+    CHECK(conn.req_header_overrides[1].name.eq(lit("X-Tag")));
+    CHECK(conn.req_header_overrides[1].value.eq(lit("tail")));
+    CHECK_EQ(conn.req_header_append_mask, 2u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    let resp = response(200)
+    resp.add("X-Base", "static")
+    resp.set("X-Path", req.path)
+    resp.add("X-Path", "tail")
+    let observed = resp.header("X-Path").or("missing")
+    resp.set("X-Observed", observed)
+    resp.remove("X-Base")
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 4u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("tail")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[2].name.eq(lit("X-Observed")));
+    CHECK(conn.resp_header_mutations[2].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[3].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[3].name.eq(lit("X-Base")));
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    conn.reset();
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, chain_after_response_headers_commit_only_on_success) {
+    const auto src = R"rut(
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Path", req.path)
+    resp.add("X-Stage", "after")
+    resp.remove("Server")
+    0
+}
+chain access { after response_headers(req, resp) }
+route GET "/api/users" use chain access {
+    guard req.http11 else { return 505 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(&conn,
+                                                        nullptr,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    CHECK(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+
+    conn.reset();
+    const auto result = HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(kGetApiRequest),
+                                                      sizeof(kGetApiRequest) - 1,
+                                                      nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 3u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].name.eq(lit("X-Path")));
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("/api/users")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].name.eq(lit("X-Stage")));
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("after")));
+    CHECK(conn.resp_header_mutations[2].mode == ConnectionBase::RespHeaderMutationMode::Remove);
+    CHECK(conn.resp_header_mutations[2].name.eq(lit("Server")));
+    CHECK_FALSE(conn.resp_header_mutation_overflow);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, cache_helpers_miss_and_out_of_range) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {64};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+
+    u8 has = 0xff;
+    i64 val = -1;
+    rut_helper_cache_get(0, 0x7F000001u, &has, &val);
+    CHECK_EQ(has, 0);
+    CHECK_EQ(val, 0);
+
+    rut_helper_cache_set(0, 0x7F000001u, 77);
+    rut_helper_cache_get(0, 0x7F000001u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 77);
+
+    // Out-of-range instance: get misses, set is a no-op.
+    rut_helper_cache_get(7, 0x7F000001u, &has, &val);
+    CHECK_EQ(has, 0);
+    rut_helper_cache_set(7, 0x7F000001u, 1);
+}
+
+TEST(jit, cache_get_optionals_from_two_instances_merge_and_verify) {
+    // Two cache instances' Optional<I64> results flowing through nested .or
+    // fallbacks must produce ONE LLVM carrier type — pins the canonical
+    // Optional<I64> in emit_cache_get (and that LLVM literal-struct
+    // uniquing keeps the select well-typed under JIT verification).
+    const char* src =
+        "let a = Cache<IP, i64>(capacity: 64)\n"
+        "let b = Cache<IP, i64>(capacity: 64)\n"
+        "route GET \"/x\" { "
+        "let n = a.get(req.remoteAddr).or(b.get(req.remoteAddr).or(0)) "
+        "if n > 0 { return 200 } else { return 204 } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));  // JIT verification passes
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, cache_registry_identity_governs_persistence_across_publish) {
+    cache_registry_set_seed(0x5EEDu);
+    const u32 caps[1] = {64};
+    const u64 ident_a[1] = {cache_instance_identity("alpha", 5)};
+    const u64 ident_b[1] = {cache_instance_identity("beta", 4)};
+    cache_registry_publish(caps, ident_a, 1);
+    rut_helper_cache_set(0, 0x01020304u, 42);
+    u8 has = 0;
+    i64 val = 0;
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 42);
+
+    // Identical re-publish (same name, same capacity) → state persists
+    // across the config swap (documented).
+    cache_registry_publish(caps, ident_a, 1);
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 1);
+    CHECK_EQ(val, 42);
+
+    // Same capacity but a different declaration at this index (rename /
+    // reorder) → different logical cache: the old entries must NOT bleed
+    // through; the shard drops and rebuilds the table.
+    cache_registry_publish(caps, ident_b, 1);
+    rut_helper_cache_get(0, 0x01020304u, &has, &val);
+    CHECK_EQ(has, 0);
 }
 
 TEST(jit, frontend_req_route_param_field_guard) {
@@ -18544,9 +19521,9 @@ TEST(jit_dispatch, null_handler_returns_error_outcome) {
 }
 
 #if RUT_ENABLE_WEBSOCKET
-// Compile a `websocket(x){ frame.<verdict>() }` program end-to-end through the constant-verdict
-// frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL), and return
-// the verdict the compiled function actually produces. Returns 255 on any failure.
+// Compile a `websocket(x){ frame in frame.<verdict>() }` program end-to-end through the
+// constant-verdict frame-handler JIT path (analyze -> codegen_ws_handler -> JIT -> lookup -> CALL),
+// and return the verdict the compiled function actually produces. Returns 255 on any failure.
 static WsFrameAction jit_ws_verdict(const char* src) {
     constexpr auto kFail = static_cast<WsFrameAction>(255);
     auto lexed = lex(lit(src));
@@ -18570,21 +19547,18 @@ static WsFrameAction jit_ws_verdict(const char* src) {
 
 TEST(jit, ws_handler_forward_returns_forward) {
     // frame.forward() compiles to a verdict function that, when called, returns Forward.
-    CHECK(jit_ws_verdict(
-              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.forward() } }\n") ==
-          WsFrameAction::Forward);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
+                         "frame.forward() } }\n") == WsFrameAction::Forward);
 }
 
 TEST(jit, ws_handler_drop_returns_drop) {
-    CHECK(jit_ws_verdict(
-              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.drop() } }\n") ==
-          WsFrameAction::Drop);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
+                         "frame.drop() } }\n") == WsFrameAction::Drop);
 }
 
 TEST(jit, ws_handler_close_returns_close) {
-    CHECK(jit_ws_verdict(
-              "upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame.close() } }\n") ==
-          WsFrameAction::Close);
+    CHECK(jit_ws_verdict("upstream ws\nroute GET \"/ws\" { return websocket(ws) { frame in "
+                         "frame.close() } }\n") == WsFrameAction::Close);
 }
 #endif  // RUT_ENABLE_WEBSOCKET
 
@@ -18641,6 +19615,50 @@ TEST(jit, chain_respond_capable_step_short_circuits) {
     rir.destroy();
 }
 
+TEST(jit, chain_respond_response_local_short_circuits) {
+    const char* src =
+        "func check(_ req: i32) -> i32 { let resp = response(401) "
+        "resp.set(\"X-Reason\", \"auth\") guard req.http11 else { respond resp } 7 }\n"
+        "chain auth { before check(req) }\n"
+        "route { use chain auth GET \"/version\" { return 200 } }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char http11[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http11), sizeof(http11) - 1, nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 200);
+
+    static const char http10[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(http10), sizeof(http10) - 1, nullptr));
+    CHECK(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 401);
+    CHECK_NE(result.next_state, 0u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
     // Spec 3.3.7: guard let binds the usable value or takes else at RUNTIME.
     // The guard's HasValue cond consumes the error, so the state-0 error
@@ -18687,6 +19705,54 @@ TEST(jit, guard_let_takes_else_branch_on_runtime_error) {
         nullptr, nullptr, reinterpret_cast<const u8*>(without_q), sizeof(without_q) - 1, nullptr));
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, fail_closed_pre_reject_runs_before_later_error_recovery) {
+    // The carrier errors whenever X-Pick is absent. HTTP/1.0 takes a benign
+    // 403 pre-reject before recovery; HTTP/1.1 continues to guard-let, which
+    // turns that same error into 401. Neither path may be intercepted by the
+    // automatic state-0 500 prelude.
+    const char* src =
+        "func pick(ok: bool) -> i32 { if ok { 7 } else { error(.timeout) } }\n"
+        "route GET \"/version\" { let value = any(200, pick(req.header(\"X-Pick\") == \"ok\")) "
+        "guard req.http11 else { return 403 } "
+        "guard let value else { return 401 } return 200 }\n";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char rejected[] = "GET /version HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(rejected), sizeof(rejected) - 1, nullptr));
+    CHECK_EQ(r.status_code, 403);
+
+    static const char recovered[] = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(recovered), sizeof(recovered) - 1, nullptr));
+    CHECK_EQ(r.status_code, 401);
+
+    static const char accepted[] = "GET /version HTTP/1.1\r\nHost: localhost\r\nX-Pick: ok\r\n\r\n";
+    r = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(accepted), sizeof(accepted) - 1, nullptr));
+    CHECK_EQ(r.status_code, 200);
 
     engine.shutdown();
     rir.destroy();

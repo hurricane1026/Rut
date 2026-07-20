@@ -71,6 +71,7 @@ struct Builder {
         cur_func = nullptr;
         cur_block_id = kNoBlock;
         cur_block = nullptr;
+        opt_i64_cache = nullptr;
         for (u32 i = 0; i < kTypeKindCount; i++) type_cache[i] = nullptr;
     }
 
@@ -580,6 +581,58 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_add_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqAddHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    Result<ValueId> emit_resp_header(Str name, ValueId fallback, SourceLoc loc = {}) {
+        if (!val_has_type(fallback, TypeKind::Optional) ||
+            cur_func->values[fallback.id].type->inner == nullptr ||
+            cur_func->values[fallback.id].type->inner->kind != TypeKind::Str)
+            return err(RirError::InvalidState);
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto r = TRY(emit(Opcode::RespHeader, ty, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = fallback;
+        r.inst->operand_count = 1;
+        return r.vid;
+    }
+
+    VoidResult emit_resp_set_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_resp_add_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespAddHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
+    VoidResult emit_resp_remove_header(Str name, SourceLoc loc = {}) {
+        auto r = TRY(emit(Opcode::RespRemoveHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        return {};
+    }
+
+    VoidResult emit_resp_commit_headers(SourceLoc loc = {}) {
+        TRY_VOID(emit(Opcode::RespCommitHeaders, nullptr, loc));
+        return {};
+    }
+
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
@@ -700,9 +753,12 @@ struct Builder {
     Result<ValueId> emit_bit(Opcode bit_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
         if (!is_bit_opcode(bit_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
-        if (!val_has_type(lhs, TypeKind::I32) || !val_has_type(rhs, TypeKind::I32))
-            return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
+        // Same-width integer operands only: both i32 or both i64 (shift
+        // amounts share the operand width).
+        const bool both_i32 = val_has_type(lhs, TypeKind::I32) && val_has_type(rhs, TypeKind::I32);
+        const bool both_i64 = val_has_type(lhs, TypeKind::I64) && val_has_type(rhs, TypeKind::I64);
+        if (!both_i32 && !both_i64) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
         auto [inst, vid] = TRY(emit(bit_op, ty, loc));
         inst->operands[0] = lhs;
         inst->operands[1] = rhs;
@@ -710,22 +766,52 @@ struct Builder {
         return vid;
     }
 
-    // ── Domain operations ───────────────────────────────────────────
+    // ── Arithmetic ──────────────────────────────────────────────────
 
-    Result<ValueId> emit_time_now(SourceLoc loc = {}) {
-        auto* ty = TRY(make_type(TypeKind::Time));
-        return TRY(emit(Opcode::TimeNow, ty, loc)).vid;
+    static bool is_arith_opcode(Opcode op) {
+        switch (op) {
+            case Opcode::Add:
+            case Opcode::Sub:
+            case Opcode::Mul:
+            case Opcode::Div:
+            case Opcode::Mod:
+            case Opcode::MaxInt:
+            case Opcode::MinInt:
+                return true;
+            default:
+                return false;
+        }
     }
 
-    Result<ValueId> emit_time_diff(ValueId a, ValueId b, SourceLoc loc = {}) {
-        if (!val_has_type(a, TypeKind::Time) || !val_has_type(b, TypeKind::Time))
+    Result<ValueId> emit_arith(Opcode arith_op, ValueId lhs, ValueId rhs, SourceLoc loc = {}) {
+        if (!is_arith_opcode(arith_op) || !valid_val(lhs) || !valid_val(rhs))
             return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::Duration));
-        auto [inst, vid] = TRY(emit(Opcode::TimeDiff, ty, loc));
-        inst->operands[0] = a;
-        inst->operands[1] = b;
+        // Same-width integer operands only: both i32 or both i64.
+        const bool both_i32 = val_has_type(lhs, TypeKind::I32) && val_has_type(rhs, TypeKind::I32);
+        const bool both_i64 = val_has_type(lhs, TypeKind::I64) && val_has_type(rhs, TypeKind::I64);
+        if (!both_i32 && !both_i64) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
+        auto [inst, vid] = TRY(emit(arith_op, ty, loc));
+        inst->operands[0] = lhs;
+        inst->operands[1] = rhs;
         inst->operand_count = 2;
         return vid;
+    }
+
+    Result<ValueId> emit_sext_i64(ValueId v, SourceLoc loc = {}) {
+        if (!valid_val(v) || !val_has_type(v, TypeKind::I32)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I64));
+        auto [inst, vid] = TRY(emit(Opcode::SextI64, ty, loc));
+        inst->operands[0] = v;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    // ── Domain operations ───────────────────────────────────────────
+
+    Result<ValueId> emit_time_now_micros(SourceLoc loc = {}) {
+        auto* ty = TRY(make_type(TypeKind::I64));
+        return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;
     }
 
     Result<ValueId> emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {
@@ -865,15 +951,38 @@ struct Builder {
         return vid;
     }
 
-    // ── Counter ─────────────────────────────────────────────────────
+    // ── Cache state ─────────────────────────────────────────────────
 
-    Result<ValueId> emit_counter_incr(ValueId key, i64 window_seconds, SourceLoc loc = {}) {
-        if (!valid_val(key)) return err(RirError::InvalidState);
-        auto* ty = TRY(make_type(TypeKind::I32));
-        auto [inst, vid] = TRY(emit(Opcode::CounterIncr, ty, loc));
+    // One canonical Optional<I64> for every cache.get result: LLVM literal
+    // structs are structurally uniqued so fresh types WOULD map to one LLVM
+    // type, but a single rir::Type* keeps identity-based comparisons (and
+    // the codegen type cache) trivially correct as well.
+    const Type* opt_i64_cache = nullptr;
+
+    Result<ValueId> emit_cache_get(u32 instance, ValueId key, SourceLoc loc = {}) {
+        if (!valid_val(key) || !val_has_type(key, TypeKind::IP)) return err(RirError::InvalidState);
+        if (opt_i64_cache == nullptr) {
+            auto* inner = TRY(make_type(TypeKind::I64));
+            opt_i64_cache = TRY(make_type(TypeKind::Optional, inner));
+        }
+        auto* ty = opt_i64_cache;
+        auto [inst, vid] = TRY(emit(Opcode::CacheGet, ty, loc));
         inst->operands[0] = key;
         inst->operand_count = 1;
-        inst->imm.i64_val = window_seconds;
+        inst->imm.i32_val = static_cast<i32>(instance);
+        return vid;
+    }
+
+    Result<ValueId> emit_cache_set(u32 instance, ValueId key, ValueId value, SourceLoc loc = {}) {
+        if (!valid_val(key) || !val_has_type(key, TypeKind::IP) || !valid_val(value) ||
+            !val_has_type(value, TypeKind::I64))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::I64));
+        auto [inst, vid] = TRY(emit(Opcode::CacheSet, ty, loc));
+        inst->operands[0] = key;
+        inst->operands[1] = value;
+        inst->operand_count = 2;
+        inst->imm.i32_val = static_cast<i32>(instance);
         return vid;
     }
 

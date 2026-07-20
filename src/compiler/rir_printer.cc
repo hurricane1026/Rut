@@ -202,6 +202,24 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqSetHeader:
             buf.put_cstr("req.set_header");
             break;
+        case Opcode::ReqAddHeader:
+            buf.put_cstr("req.add_header");
+            break;
+        case Opcode::RespHeader:
+            buf.put_cstr("resp.header");
+            break;
+        case Opcode::RespSetHeader:
+            buf.put_cstr("resp.set_header");
+            break;
+        case Opcode::RespAddHeader:
+            buf.put_cstr("resp.add_header");
+            break;
+        case Opcode::RespRemoveHeader:
+            buf.put_cstr("resp.remove_header");
+            break;
+        case Opcode::RespCommitHeaders:
+            buf.put_cstr("resp.commit_headers");
+            break;
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
@@ -229,6 +247,30 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BitXor:
             buf.put_cstr("bit.xor");
             break;
+        case Opcode::Add:
+            buf.put_cstr("arith.add");
+            break;
+        case Opcode::Sub:
+            buf.put_cstr("arith.sub");
+            break;
+        case Opcode::Mul:
+            buf.put_cstr("arith.mul");
+            break;
+        case Opcode::Div:
+            buf.put_cstr("arith.div");
+            break;
+        case Opcode::Mod:
+            buf.put_cstr("arith.mod");
+            break;
+        case Opcode::MaxInt:
+            buf.put_cstr("arith.max");
+            break;
+        case Opcode::MinInt:
+            buf.put_cstr("arith.min");
+            break;
+        case Opcode::SextI64:
+            buf.put_cstr("sext.i64");
+            break;
         case Opcode::BitShl:
             buf.put_cstr("bit.shl");
             break;
@@ -253,11 +295,8 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CmpGe:
             buf.put_cstr("cmp.ge");
             break;
-        case Opcode::TimeNow:
-            buf.put_cstr("time.now");
-            break;
-        case Opcode::TimeDiff:
-            buf.put_cstr("time.diff");
+        case Opcode::TimeNowMicros:
+            buf.put_cstr("time.now_micros");
             break;
         case Opcode::IpInCidr:
             buf.put_cstr("ip.in_cidr");
@@ -268,8 +307,11 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BytesHex:
             buf.put_cstr("bytes.hex");
             break;
-        case Opcode::CounterIncr:
-            buf.put_cstr("counter.incr");
+        case Opcode::CacheGet:
+            buf.put_cstr("cache.get");
+            break;
+        case Opcode::CacheSet:
+            buf.put_cstr("cache.set");
             break;
         case Opcode::StructField:
             buf.put_cstr("struct.field");
@@ -534,6 +576,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqHttpVersion:
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:
+        case Opcode::RespCommitHeaders:
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');
@@ -541,16 +584,25 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
-        case Opcode::TimeNow:
+        case Opcode::TimeNowMicros:
             // No operands.
             break;
         case Opcode::ReqSetHeader:
+        case Opcode::ReqAddHeader:
+        case Opcode::RespHeader:
+        case Opcode::RespSetHeader:
+        case Opcode::RespAddHeader:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::RespRemoveHeader:
+            buf.put(' ');
+            print_quoted_str(buf, inst.imm.str_val);
+            break;
         case Opcode::ReqSetPath:
+        case Opcode::SextI64:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
             break;
@@ -573,7 +625,13 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::BitXor:
         case Opcode::BitShl:
         case Opcode::BitShr:
-        case Opcode::TimeDiff:
+        case Opcode::Add:
+        case Opcode::Sub:
+        case Opcode::Mul:
+        case Opcode::Div:
+        case Opcode::Mod:
+        case Opcode::MaxInt:
+        case Opcode::MinInt:
             // Binary: %a, %b
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
@@ -639,12 +697,16 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put(' ');
             print_type(buf, inst.imm.struct_ref.type);
             break;
-        case Opcode::CounterIncr:
+        case Opcode::CacheGet:
+        case Opcode::CacheSet:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
-            buf.put_cstr(", ");
-            buf.put_i64(inst.imm.i64_val);
-            buf.put('s');
+            if (inst.op == Opcode::CacheSet) {
+                buf.put_cstr(", ");
+                print_value_ref(buf, inst.operands[1]);
+            }
+            buf.put_cstr(", inst=");
+            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
             break;
         case Opcode::HashHmacSha256:
             buf.put(' ');

@@ -13,11 +13,19 @@ constexpr Str kGuardMatchArmIfDetail = lit_str("guard match arms do not support 
 constexpr Str kEmptyBlockDetail = lit_str("empty block is not supported");
 constexpr Str kCaseDetail = lit_str("match arms do not use `case`; write `pattern => ...`");
 constexpr Str kMatchColonDetail = lit_str("match arms use `=>`, not `:`");
+constexpr Str kWsTrailingBlockDetail =
+    lit_str("websocket trailing blocks require `{ frame in ... }`");
+constexpr Str kObjectCallArgDetail = lit_str("object literals are only allowed as call arguments");
 // The words lex as plain identifiers (so `.or(default)` / `bitwise.and(...)`
 // member names work); the parser rejects them in operator/operand positions.
 constexpr Str kAndDetail = lit_str("`and` is not Rut syntax; use `&&`");
 constexpr Str kOrDetail = lit_str("`or` is not Rut syntax; use `||`");
 constexpr Str kNotDetail = lit_str("`not` is not Rut syntax; use `!`");
+constexpr Str kRespondInHandlerDetail =
+    lit_str("a handler's return value is its response; replace `respond` with `return`");
+constexpr Str kStatusReturnInMiddlewareDetail = lit_str(
+    "middleware short-circuits with `respond <status>`; `return` is only for the function's "
+    "value");
 
 struct Parser {
     const LexedTokens* toks = nullptr;
@@ -29,6 +37,7 @@ struct Parser {
     // position is the only boundary signal (Swift-style newline sensitivity,
     // scoped to arm bodies only).
     bool arm_body_stops_cross_line_dot = false;
+    bool in_function_body = false;
     // Depth of enclosing `(...)` / `[...]` while parsing an arm body. The
     // newline-dot boundary only applies at the top level of the arm body: a
     // line-broken member access inside a call argument or group (e.g.
@@ -130,7 +139,7 @@ struct Parser {
     }
 
 #if RUT_ENABLE_WEBSOCKET
-    // Parse a WebSocket terminate-mode frame-handler body `{ ... }`. Distinct from
+    // Parse a WebSocket terminate-mode frame-handler body after `{ frame in`. Distinct from
     // parse_braced_stmt_body because frame verdicts are **bare method-call statements**
     // (`frame.forward()`), which the general statement parser (parse_stmt) deliberately
     // rejects — its only statements are keyword-led (let/guard/return/if/match/...). Slice B
@@ -250,7 +259,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -297,9 +306,54 @@ struct Parser {
         return stmt;
     }
 
+    FrontendResult<AstExpr> parse_object_call_arg() {
+        const Token start = cur();
+        auto lbrace = expect(TokenType::LBrace);
+        if (!lbrace) return core::make_unexpected(lbrace.error());
+        NestedDelimiterGuard nested(this);
+
+        AstExpr object{};
+        object.kind = AstExprKind::ObjectLit;
+        object.span = span_from(start);
+        if (take(TokenType::RBrace)) {
+            object.span.end = prev().end;
+            return object;
+        }
+
+        while (true) {
+            auto field_name = expect_field_name();
+            if (!field_name) return core::make_unexpected(field_name.error());
+            auto colon = expect(TokenType::Colon);
+            if (!colon) return core::make_unexpected(colon.error());
+            auto field_value = parse_expr();
+            if (!field_value) return core::make_unexpected(field_value.error());
+            auto field_value_ptr = alloc_expr(field_value.value());
+            if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
+            AstExpr::FieldInit field_init{};
+            field_init.name = field_name.value()->text;
+            field_init.value = field_value_ptr.value();
+            if (!object.field_inits.push(field_init))
+                return frontend_error(FrontendError::TooManyItems, field_value->span);
+            if (take(TokenType::RBrace)) break;
+            auto comma = expect(TokenType::Comma);
+            if (!comma) return core::make_unexpected(comma.error());
+            if (take(TokenType::RBrace)) break;
+        }
+        object.span.end = prev().end;
+        return object;
+    }
+
+    FrontendResult<AstExpr> parse_call_arg() {
+        if (cur().type == TokenType::LBrace) return parse_object_call_arg();
+        return parse_expr();
+    }
+
     FrontendResult<AstExpr> parse_primary_atom() {
         const Token start = cur();
         AstExpr expr{};
+        if (cur().type == TokenType::LBrace)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span_from(cur()), kObjectCallArgDetail);
         if (take(TokenType::LBracket)) {
             NestedDelimiterGuard nested(this);
             AstExpr arr{};
@@ -506,12 +560,14 @@ struct Parser {
         if (cur().type == TokenType::IntLit) {
             const Token tok = cur();
             pos++;
-            i32 value = 0;
+            // Literals accumulate to i64 (cap INT64_MAX); analyze types the
+            // result I32 when it fits i32, else I64 (oversized auto-widening).
+            i64 value = 0;
             for (u32 i = 0; i < tok.text.len; i++) {
-                const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
-                if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
+                const i64 digit = static_cast<i64>(tok.text.ptr[i] - '0');
+                if (value > (static_cast<i64>(0x7fffffffffffffff) - digit) / 10)
                     return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
-                value = value * 10 + static_cast<i32>(digit);
+                value = value * 10 + digit;
             }
             expr.kind = AstExprKind::IntLit;
             expr.int_value = value;
@@ -664,7 +720,7 @@ struct Parser {
                         if (!field_name) return core::make_unexpected(field_name.error());
                         auto colon = expect(TokenType::Colon);
                         if (!colon) return core::make_unexpected(colon.error());
-                        auto field_value = parse_expr();
+                        auto field_value = parse_call_arg();
                         if (!field_value) return core::make_unexpected(field_value.error());
                         auto field_value_ptr = alloc_expr(field_value.value());
                         if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -687,7 +743,7 @@ struct Parser {
                     call.span = expr.span;
                     if (prev().type != TokenType::RParen) {
                         while (true) {
-                            auto arg = parse_expr();
+                            auto arg = parse_call_arg();
                             if (!arg) return core::make_unexpected(arg.error());
                             auto arg_ptr = alloc_expr(arg.value());
                             if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
@@ -714,7 +770,9 @@ struct Parser {
             // so the WebSocket frame verdict can be spelled `frame.forward()` even though
             // `forward` is the proxy-terminator keyword (the `frame.` receiver disambiguates).
             if (cur().type == TokenType::Ident || cur().type == TokenType::KwFunc ||
-                cur().type == TokenType::KwForward) {
+                cur().type == TokenType::KwForward || cur().type == TokenType::KwGet) {
+                // KwGet: `get` doubles as the HTTP-method keyword, but after
+                // `.` it is unambiguously a member name (`buckets.get(k)`).
                 field_name = &cur();
                 pos++;
             } else {
@@ -778,7 +836,7 @@ struct Parser {
                         if (!field_name) return core::make_unexpected(field_name.error());
                         auto colon = expect(TokenType::Colon);
                         if (!colon) return core::make_unexpected(colon.error());
-                        auto field_value = parse_expr();
+                        auto field_value = parse_call_arg();
                         if (!field_value) return core::make_unexpected(field_value.error());
                         auto field_value_ptr = alloc_expr(field_value.value());
                         if (!field_value_ptr) return core::make_unexpected(field_value_ptr.error());
@@ -802,7 +860,7 @@ struct Parser {
                     method.span = field.span;
                     if (!take(TokenType::RParen)) {
                         while (true) {
-                            auto arg = parse_expr();
+                            auto arg = parse_call_arg();
                             if (!arg) return core::make_unexpected(arg.error());
                             auto arg_ptr = alloc_expr(arg.value());
                             if (!arg_ptr) return core::make_unexpected(arg_ptr.error());
@@ -845,7 +903,10 @@ struct Parser {
 
     // An arm body that starts with a statement keyword (or a brace) is
     // self-delimiting — only bare-expression bodies (and `return <expr>`
-    // tails) need the newline-dot arm boundary.
+    // tails) need the newline-dot arm boundary. Of the arithmetic operators
+    // only `-` can begin a pattern (a negative int literal), so
+    // parse_add_expr mirrors the newline-dot rule for a line-initial `-`;
+    // `+ * / %` always continue the previous expression.
     bool arm_body_needs_dot_stop() const {
         const TokenType t = cur().type;
         if (t == TokenType::LBrace) return false;
@@ -870,23 +931,149 @@ struct Parser {
         return true;
     }
 
+    // `-<intlit>` fusion shared by unary parsing and match-arm patterns. The
+    // caller has consumed the `-`; cur() must be the IntLit. The magnitude
+    // accumulates in u64 with cap 2^63 so INT64_MIN is representable;
+    // `(i64)(0ull - mag)` wraps correctly for mag == 2^63.
+    FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
+        const Token tok = cur();
+        pos++;
+        u64 mag = 0;
+        for (u32 i = 0; i < tok.text.len; i++) {
+            const u64 digit = static_cast<u64>(tok.text.ptr[i] - '0');
+            if (mag > (9223372036854775808ull - digit) / 10ull)
+                return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
+            mag = mag * 10ull + digit;
+        }
+        AstExpr lit{};
+        lit.kind = AstExprKind::IntLit;
+        lit.int_value = static_cast<i64>(0ull - mag);
+        lit.span = Span{minus.start, tok.end, minus.line, minus.col};
+        return lit;
+    }
+
+    // Match-arm pattern position: a negative int literal (`-1 => ...`) is a
+    // valid pattern; anything else parses as a primary expression. Kept
+    // separate from parse_unary_expr so patterns never grow full unary
+    // parsing (`- -x`, `!x`) by accident.
+    FrontendResult<AstExpr> parse_arm_pattern_expr() {
+        if (cur().type == TokenType::Minus && peek().type == TokenType::IntLit) {
+            const Token minus = cur();
+            pos++;
+            return parse_fused_negative_int_lit(minus);
+        }
+        return parse_primary_expr();
+    }
+
     // Prefix `!` — Swift-identical logical not, binds tighter than comparisons.
+    // Prefix `-` — either fuses with an immediately following int literal
+    // (`-2147483648` is a valid literal; the positive-path cap in
+    // parse_primary_atom rejects 2147483648 on its own) or desugars to
+    // `Sub(IntLit 0, operand)` so MIR/RIR/codegen only see five binary ops.
     FrontendResult<AstExpr> parse_unary_expr() {
         auto word_check = reject_word_operator_operand();
         if (!word_check) return core::make_unexpected(word_check.error());
         const Token* bang = take(TokenType::Bang);
-        if (!bang) return parse_primary_expr();
+        if (bang) {
+            auto operand = parse_unary_expr();
+            if (!operand) return core::make_unexpected(operand.error());
+            auto expr = make_eq_false(operand.value());
+            if (!expr) return core::make_unexpected(expr.error());
+            AstExpr out = expr.value();
+            out.span = Span{bang->start, operand->span.end, bang->line, bang->col};
+            return out;
+        }
+        const Token* minus = take(TokenType::Minus);
+        if (!minus) return parse_primary_expr();
+        if (cur().type == TokenType::IntLit) return parse_fused_negative_int_lit(*minus);
         auto operand = parse_unary_expr();
         if (!operand) return core::make_unexpected(operand.error());
-        auto expr = make_eq_false(operand.value());
-        if (!expr) return core::make_unexpected(expr.error());
-        AstExpr out = expr.value();
-        out.span = Span{bang->start, operand->span.end, bang->line, bang->col};
-        return out;
+        AstExpr zero{};
+        zero.kind = AstExprKind::IntLit;
+        zero.int_value = 0;
+        zero.span = span_from(*minus);
+        auto zero_ptr = alloc_expr(zero);
+        if (!zero_ptr) return core::make_unexpected(zero_ptr.error());
+        auto operand_ptr = alloc_expr(operand.value());
+        if (!operand_ptr) return core::make_unexpected(operand_ptr.error());
+        AstExpr expr{};
+        expr.kind = AstExprKind::Sub;
+        expr.lhs = zero_ptr.value();
+        expr.rhs = operand_ptr.value();
+        expr.span = Span{minus->start, operand->span.end, minus->line, minus->col};
+        return expr;
+    }
+
+    // `* / %` — left-associative, binds tighter than `+ -`.
+    FrontendResult<AstExpr> parse_mul_expr() {
+        auto lhs = parse_unary_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (true) {
+            AstExprKind kind = AstExprKind::Ident;
+            if (take(TokenType::Star))
+                kind = AstExprKind::Mul;
+            else if (take(TokenType::Slash))
+                kind = AstExprKind::Div;
+            else if (take(TokenType::Percent))
+                kind = AstExprKind::Mod;
+            else
+                break;
+            auto rhs = parse_unary_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = kind;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
+    }
+
+    // `+ -` — left-associative, binds tighter than comparisons.
+    FrontendResult<AstExpr> parse_add_expr() {
+        auto lhs = parse_mul_expr();
+        if (!lhs) return core::make_unexpected(lhs.error());
+        while (true) {
+            AstExprKind kind = AstExprKind::Ident;
+            // A line-initial `-` ends the arm body ONLY when it actually
+            // starts the next arm's pattern — a negative int literal
+            // followed by `=>` (or an `if` arm guard). A line-wrapped
+            // subtraction before anything else (`a\n- b`) keeps parsing.
+            if (arm_body_stops_cross_line_dot && arm_body_dot_stop_depth == 0 &&
+                cur().type == TokenType::Minus && pos > 0 && cur().line != prev().line &&
+                peek(1).type == TokenType::IntLit &&
+                (peek(2).type == TokenType::Arrow || peek(2).type == TokenType::KwIf)) {
+                break;
+            }
+            if (take(TokenType::Plus))
+                kind = AstExprKind::Add;
+            else if (take(TokenType::Minus))
+                kind = AstExprKind::Sub;
+            else
+                break;
+            auto rhs = parse_mul_expr();
+            if (!rhs) return core::make_unexpected(rhs.error());
+            auto lhs_ptr = alloc_expr(lhs.value());
+            if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+            auto rhs_ptr = alloc_expr(rhs.value());
+            if (!rhs_ptr) return core::make_unexpected(rhs_ptr.error());
+            AstExpr expr{};
+            expr.kind = kind;
+            expr.lhs = lhs_ptr.value();
+            expr.rhs = rhs_ptr.value();
+            expr.span = Span{lhs->span.start, rhs->span.end, lhs->span.line, lhs->span.col};
+            lhs = expr;
+        }
+        return lhs.value();
     }
 
     FrontendResult<AstExpr> parse_eq_expr() {
-        auto lhs = parse_unary_expr();
+        auto lhs = parse_add_expr();
         if (!lhs) return core::make_unexpected(lhs.error());
         TokenType op = TokenType::Error;
         if (take(TokenType::EqEq))
@@ -903,7 +1090,7 @@ struct Parser {
             op = TokenType::Gt;
         else
             return lhs.value();
-        auto rhs = parse_unary_expr();
+        auto rhs = parse_add_expr();
         if (!rhs) return core::make_unexpected(rhs.error());
         auto lhs_ptr = alloc_expr(lhs.value());
         if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
@@ -1109,7 +1296,7 @@ struct Parser {
                     if (take(TokenType::Underscore)) {
                         arm.is_wildcard = true;
                     } else {
-                        auto pattern = parse_primary_expr();
+                        auto pattern = parse_arm_pattern_expr();
                         if (!pattern) return core::make_unexpected(pattern.error());
                         auto pattern_ptr = alloc_expr(pattern.value());
                         if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -1158,10 +1345,22 @@ struct Parser {
             return stmt;
         }
         if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
-            peek().type == TokenType::IntLit) {
+            (peek().type == TokenType::IntLit || peek().type == TokenType::Ident)) {
+            if (!in_function_body)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span_from(cur()), kRespondInHandlerDetail);
             pos++;
             AstStatement stmt{};
             stmt.kind = AstStmtKind::RespondStatus;
+
+            if (cur().type == TokenType::Ident) {
+                const Token response_local = cur();
+                pos++;
+                stmt.name = response_local.text;
+                stmt.returns_response_local = true;
+                stmt.span = Span{start.start, response_local.end, start.line, start.col};
+                return stmt;
+            }
 
             auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
                 i32 value = 0;
@@ -1320,8 +1519,8 @@ struct Parser {
             // ForwardUpstream terminator as `forward`: the runtime auto-establishes the
             // full-duplex passthrough tunnel when the client requested an Upgrade and the
             // upstream answers 101 (a non-upgrade request just proxies normally, so the
-            // route is safe with no edge guard). Per-frame `{ frame ... }`, subprotocol/
-            // maxMessageSize kwargs, and a typed `req.upgrade` guard are later phases.
+            // route is safe with no edge guard). Terminate mode uses the contextual
+            // `{ frame in ... }` trailing block parsed below.
             // NOTE: for now `websocket(x)` is indistinguishable from `forward(x)` after
             // parse — the keyword is intent/documentation only. A distinct WS-only route
             // marker is a later phase if "a forward that must NOT tunnel" is ever needed.
@@ -1378,7 +1577,7 @@ struct Parser {
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.name = name.value()->text;
                 stmt.ws_max_message_size = ws_max_size;
-                // A trailing `{ ... }` block makes this TERMINATE mode (the gateway
+                // A trailing `{ frame in ... }` block makes this TERMINATE mode (the gateway
                 // parses/inspects each message); a bare `websocket(x)` stays the passthrough
                 // ForwardUpstream tunnel. The block is the per-message frame handler; its
                 // body is stored on then_stmt (reused like For), parsed by the general
@@ -1386,6 +1585,16 @@ struct Parser {
                 if (cur().type == TokenType::LBrace) {
                     auto lbrace = expect(TokenType::LBrace);
                     if (!lbrace) return core::make_unexpected(lbrace.error());
+                    if (cur().type != TokenType::Ident || !cur().text.eq({"frame", 5}))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(cur()),
+                                              kWsTrailingBlockDetail);
+                    pos++;  // consume the fixed frame-handler binding
+                    if (cur().type != TokenType::KwIn)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(cur()),
+                                              kWsTrailingBlockDetail);
+                    pos++;  // consume `in`
                     auto body = parse_ws_frame_body(*lbrace.value());
                     if (!body) return core::make_unexpected(body.error());
                     auto body_ptr = alloc_stmt(body.value());
@@ -1414,8 +1623,10 @@ struct Parser {
             // Peek for the response builder. We recognise `response`
             // by the literal identifier text; no dedicated keyword yet
             // because `response` is also a valid identifier elsewhere.
-            const Token& peek = cur();
-            const bool is_builder = peek.type == TokenType::Ident && peek.text.eq({"response", 8});
+            const Token& candidate = cur();
+            const bool is_builder = candidate.type == TokenType::Ident &&
+                                    candidate.text.eq({"response", 8}) &&
+                                    peek().type == TokenType::LParen;
             if (is_builder) {
                 pos++;  // consume `response`
                 auto lparen = expect(TokenType::LParen);
@@ -1525,6 +1736,18 @@ struct Parser {
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
                 stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
+                return stmt;
+            }
+
+            // Response builder local: `return resp`. Analyze verifies that the
+            // identifier was initialized by `response(status)` and folds its
+            // bounded header mutations into the ReturnStatus terminator.
+            if (cur().type == TokenType::Ident) {
+                const Token response_local = cur();
+                pos++;
+                stmt.name = response_local.text;
+                stmt.returns_response_local = true;
+                stmt.span = Span{start.start, response_local.end, start.line, start.col};
                 return stmt;
             }
 
@@ -1728,7 +1951,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -1774,7 +1997,45 @@ struct Parser {
         // explicit and consistent with `return response(...)`.
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        // Bare method-call statement (`buckets.set(k, v)`): the only
+        // expression form accepted in statement position. Analyze restricts
+        // it further (cache state writes only, before guards/waits).
+        if (cur().type == TokenType::Ident) {
+            const Token start_tok = cur();
+            auto expr = parse_expr();
+            if (!expr) return core::make_unexpected(expr.error());
+            if (expr->kind == AstExprKind::MethodCall) {
+                AstStatement stmt{};
+                stmt.kind = AstStmtKind::Expr;
+                stmt.expr = expr.value();
+                stmt.span = expr->span;
+                return stmt;
+            }
+            return frontend_error(
+                FrontendError::UnexpectedToken, span_from(start_tok), start_tok.text);
+        }
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+    }
+
+    FrontendResult<AstItem> parse_state_decl() {
+        auto kw = expect(TokenType::KwLet);
+        if (!kw) return core::make_unexpected(kw.error());
+        auto name = expect(TokenType::Ident);
+        if (!name) return core::make_unexpected(name.error());
+        auto eq = expect(TokenType::Eq);
+        if (!eq) return core::make_unexpected(eq.error());
+        auto init = parse_expr();
+        if (!init) return core::make_unexpected(init.error());
+        auto init_ptr = alloc_expr(init.value());
+        if (!init_ptr) return core::make_unexpected(init_ptr.error());
+        AstItem item{};
+        item.kind = AstItemKind::State;
+        item.state.name = name.value()->text;
+        item.state.init = init_ptr.value();
+        item.state.span =
+            Span{kw.value()->start, init->span.end, kw.value()->line, kw.value()->col};
+        item.span = item.state.span;
+        return item;
     }
 
     FrontendResult<AstItem> parse_upstream() {
@@ -2059,11 +2320,15 @@ struct Parser {
     }
 
     FrontendResult<AstStatement> parse_func_body_stmt() {
+        if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(cur()),
+                                  kStatusReturnInMiddlewareDetail);
         if (take(TokenType::KwGuard)) {
             return parse_func_guard_stmt(prev());
         }
         if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
-            peek().type == TokenType::IntLit) {
+            (peek().type == TokenType::IntLit || peek().type == TokenType::Ident)) {
             return parse_stmt();
         }
         if (take(TokenType::KwIf)) {
@@ -2131,7 +2396,7 @@ struct Parser {
                 if (take(TokenType::Underscore)) {
                     arm.is_wildcard = true;
                 } else {
-                    auto pattern = parse_primary_expr();
+                    auto pattern = parse_arm_pattern_expr();
                     if (!pattern) return core::make_unexpected(pattern.error());
                     auto pattern_ptr = alloc_expr(pattern.value());
                     if (!pattern_ptr) return core::make_unexpected(pattern_ptr.error());
@@ -2176,6 +2441,10 @@ struct Parser {
             AstStatement block{};
             block.kind = AstStmtKind::Block;
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+                if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(cur()),
+                                          kStatusReturnInMiddlewareDetail);
                 if (cur().type == TokenType::KwLet) {
                     auto inner = parse_stmt();
                     if (!inner) return core::make_unexpected(inner.error());
@@ -2223,6 +2492,12 @@ struct Parser {
                 if (!expr_ptr) return core::make_unexpected(expr_ptr.error());
                 if (!block.block_stmts.push(expr_ptr.value()))
                     return frontend_error(FrontendError::TooManyItems, expr->span);
+                const bool response_mutation =
+                    expr->kind == AstExprKind::MethodCall && expr->lhs != nullptr &&
+                    expr->lhs->kind == AstExprKind::Ident &&
+                    (expr->name.eq({"set", 3}) || expr->name.eq({"add", 3}) ||
+                     expr->name.eq({"remove", 6}));
+                if (response_mutation) continue;
                 break;
             }
             auto rbrace = expect(TokenType::RBrace);
@@ -2462,7 +2737,10 @@ struct Parser {
             body_stmt.expr = body.value();
             body_stmt.span = body->span;
         } else {
+            const bool saved_in_function_body = in_function_body;
+            in_function_body = true;
             auto body = parse_func_body_stmt();
+            in_function_body = saved_in_function_body;
             if (!body) return core::make_unexpected(body.error());
             body_stmt = body.value();
         }
@@ -2599,7 +2877,10 @@ struct Parser {
                 if (!body_ptr) return core::make_unexpected(body_ptr.error());
                 method.default_body = body_ptr.value();
             } else if (cur().type == TokenType::LBrace) {
+                const bool saved_in_function_body = in_function_body;
+                in_function_body = true;
                 auto body = parse_func_body_stmt();
+                in_function_body = saved_in_function_body;
                 if (!body) return core::make_unexpected(body.error());
                 auto body_ptr = alloc_stmt(body.value());
                 if (!body_ptr) return core::make_unexpected(body_ptr.error());
@@ -3265,7 +3546,8 @@ struct Parser {
             if (!item.route.statements.push(stmt_ptr.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
             if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
-                stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For)
+                stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For &&
+                stmt->kind != AstStmtKind::Expr)
                 break;
         }
         auto rbrace = expect(TokenType::RBrace);
@@ -3510,6 +3792,9 @@ FrontendResult<AstFile*> parse_file(const LexedTokens& tokens) {
                 break;
             case TokenType::KwVariant:
                 item = p.parse_variant();
+                break;
+            case TokenType::KwLet:
+                item = p.parse_state_decl();
                 break;
             case TokenType::KwRoute:
                 if (p.peek().type == TokenType::LBrace) {

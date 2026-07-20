@@ -17,7 +17,7 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
-import { rateLimit } from "stdlib/ratelimit.rut"   // selective import
+// PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
 
 listen :443                       // ⏳ ports (no top-level listen yet)
@@ -25,14 +25,14 @@ tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
 let users = upstream { "10.0.0.1:8080" }            // upstreams
-let limits = Counter<IP>(capacity: 100000, window: 1m)   // state (per-shard)
+let buckets = Cache<IP, i64>(capacity: 100000)     // lossy per-key state
 
 struct Ctx { userId: str }        // types
 func auth(_ req: Request, role: str) { ... }     // middleware/helpers
 timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no req/forward/wait)
 timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
 init { ... }    shutdown { ... }  // lifecycle hooks
-route { ... }                     // exactly one route block
+route GET "/health" { return 200 } // zero or more top-level route declarations
 ```
 
 `var` is allowed only inside func/handler bodies — never at top level.
@@ -50,19 +50,28 @@ route { ... }                     // exactly one route block
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
-json({ users: [], total: 0 })           // ⏳ object literal (no object-literal production yet)
+json({ users: [], total: 0 })           // object literal syntax ✅; json() lowering/runtime ⏳
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
 |                                       // pipeline ONLY (see below)
-+  -  *  /  %                           // ⏳ arithmetic (no arithmetic in lexer/parser yet)
++  -  *  /  %                           // arithmetic (i32/i64, same-width operands; wraps on
+                                        // overflow; x / 0 == 0, x % 0 == 0; literal / 0 is a
+                                        // compile error; -x OK)
+i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
+                                        // don't fit i32 are i64 automatically; no user i64
+                                        // annotations; Cache<K,i64> is fixed built-in grammar;
+                                        // typed route captures such as :id(i64) are ⏳;
+                                        // no narrowing or match on i64; bitwise.* works at
+                                        // both widths)
 ==  !=  <  >  <=  >=                    // comparison
 =>                                      // single-expression body / match arm
 ->                                      // function return type
 @                                       // decorator
 
-// Bitwise = named functions, never symbols (all i32; shift amounts
-// outside 0..31 saturate: shiftLeft → 0, shiftRight → sign fill)
+// Bitwise = named functions, never symbols (i32/i64 same-width, bare
+// literals adopt the i64 side; shift amounts share the operand width and
+// saturate out of range: shiftLeft → 0, shiftRight → sign fill)
 bitwise.and(a, b)  bitwise.or(a, b)  bitwise.xor(a, b)
 bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 ```
@@ -118,8 +127,10 @@ exceptions, no try/catch. `!` is logical not only.
   `return 200, body`, `return resp`, `return forward(x)`.
 - **Middleware/helper func**: `return` only produces the function's normal
   value (or passes through); to end the whole request immediately use
-  **`respond`**: `respond 401` / `respond 401, "expired"` (⏳ `respond resp`
-  with a Response value is pending — status must be a literal int today).
+  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
+  A helper-local Response may carry ordered literal `set`/`add`/`remove`
+  mutations. A `chain after` helper may receive the runtime `Response` and add
+  ordered header effects to a successful handler response.
 
 ```swift
 func auth(_ req: Request, role: str) -> User {
@@ -188,7 +199,9 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 
 // Raw headers — function access ONLY (never req.X-Foo property syntax)
 req.header("X-Request-ID")   // str?
-req.set("X-User-ID", "123")  req.add("X-Tag", "a")   req.getAll("Accept")   // ⏳ only req.header is wired up
+req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only
+req.add("X-Tag", "a")        // ✅ preserve existing fields and append
+req.getAll("Accept")         // ⏳ [str]
 
 // Route captures / query / cookies / body
 req.params.id                // from :id — captures NEVER shadow built-ins
@@ -200,67 +213,92 @@ req.bodyRaw                  // str, error-capable; assignable before forward
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
 
-// Response construction — ⏳ only `return response(...)` works today; locals + mutators pending
-let resp = response(429)          // ⏳ (no general response() builder; see note above)
-resp.set("Retry-After", "60")     // set/replace header
-resp.remove("Server")             // delete header
-resp.add("Set-Cookie", "a=1")     // append multi-value
+// Response construction — names are literal; values may be runtime strings
+let resp = response(429)          // ✅ literal status
+resp.set("Retry-After", "60")     // ✅ literal replace/dedupe
+resp.set("X-Request-Path", req.path) // ✅ dynamic value
+resp.remove("Server")             // ✅ literal delete
+resp.add("Set-Cookie", "a=1")     // ✅ literal append/multi-value
+resp.header("Retry-After")        // ✅ str?; observes prior set/add/remove mutations
 resp.body = json(data)            // body
 resp.status                       // StatusCode, read/write
 return resp
 ```
 
+Dynamic handler-local Response mutations require a direct route with no guards,
+decorators, `wait`, or `for`, exactly one builder, and that builder must be
+returned directly. A `chain after` helper must have exactly one `Response`
+parameter and may use `set`/`add`/`remove` with literal names and runtime string
+values; its effects apply to successful direct and forwarded responses on routes
+without `wait` or `for`. Pending mutations are published only by the selected
+success terminator, so guard and pre-middleware short circuits cannot inherit
+them. Reading or changing a buffered response body/status remains ⏳ and needs a
+resumable, stream-owned runtime Response object.
+
 ## State types (top-level, per-shard, bounded)
 
 ```swift
-let sessions  = Hash<str, Session>(capacity: 50000, ttl: 30m)
-let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)
-let blacklist = Set<IP>(capacity: 100000)          // Set<CIDR> = LPM trie
-let limits    = Counter<IP>(capacity: 100000, window: 1m)      // sliding window
-let bursts    = Counter<IP>(capacity: 100000, rate: 100, burst: 20) // token bucket
-let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)
-let flags     = Bitmap(size: 256)
+let buckets = Cache<IP, i64>(capacity: 100000)   // lossy per-key slots
+let tat = buckets.get(req.remoteAddr).or(0)      // i64? — miss = never-seen OR evicted; ALWAYS handle
+buckets.set(req.remoteAddr, v)                   // bare statement, before any guard/wait/for;
+                                                 // may evict a colliding neighbor
+// Never store anything whose absence yields a wrong answer (sessions,
+// in-flight counts). Rate limiting over Cache is implemented in
+// examples/ratelimit.rut;
+// Counter<K> is deleted; Hash is a RESERVED name (strict table, future).
+// A leading set is materialized in the entry prelude and meters every attempt.
+// A set inside a selected if/match branch executes on that branch immediately
+// before its terminal body, enabling meter-on-accept policies. Cache ops are
+// rejected in routes containing wait; branch-local writes are also rejected
+// in static-for routes until their unrolled step graph carries effects.
+// `return forward(...)` is a terminator, NOT a wait — the rate-limit-then-
+// forward proxy pattern composes fine. set is not an expression.
 
-sessions.set(k, v)  sessions.get(k) /*V?*/  sessions.delete(k)  sessions.contains(k)
-limits.incr(key)    limits.get(key)         bursts.take(key) /*bool*/
-guard limits.incr(req.remoteAddr) <= 1000 else { return 429 }
+let cache     = LRU<str, str>(capacity: 10000, ttl: 5m, coalesce: true)  // ⏳ pending
+let blacklist = Set<IP>(capacity: 100000)          // ⏳ pending (Set<CIDR> = LPM trie)
+let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ pending
+let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
 notify all blacklist.add(ip)      // fan-out to all shards (eventual)
-notify(key) counters.incr(key)    // to owner shard by key hash
-// strong consistency: declare state with consistent: true (+ // rut:allow(consistent))
-// cross-node: backend: .redis("redis:6379")
+notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
+                                  // bare-statement cache.set does not nest)
+// single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
+// remains lossy and separate get/set operations are not an atomic update.
+// ⏳ cross-node backend is unspecified until Cache has a freshness contract.
 ```
 
 ## Routing
 
 ```swift
-route {
-    // 1) middleware bindings first: @func[(args)] pattern   (* = all)
-    @requestId *
-    @waf *
-    @auth(role: "user") api.example.com
-    @if(env("ENABLE_CORS") == "true")     // compile-time conditional binding
-    @cors *
-
-    // 2) entries: method path => expr   |   method path { stmts }
-    get /health => 200
-    get /users/:id(i64) => forward(userService)   // :name(i32|i64|uuid) typed capture
-    get /files/*rest => read(root: "/var/www")    // *rest = catch-all, last segment
-    get|post /form { ... }                        // method union
-
-    api.example.com {                             // host group (nesting ok)
-        /v1 {                                     // path prefix group
-            get /users/:id => forward(usersV1)
-        }
-    }
-
-    _ => 404                                      // catch-all (any method/path)
+route GET "/health" { return 200 }
+route GET "/users/:id" {                         // capture: req.params.id
+    return forward(userService)
 }
+
+@rateLimit(limit: 1000, window: 1m)               // official decorator applies
+route POST "/form" { return 204 }                 // to this one route
 ```
 
+The shipped parser accepts repeated top-level `route METHOD "pattern"`
+declarations. The grouped `route { ... }` surface (middleware pattern
+bindings, host/path groups, method unions, typed captures, expression entries,
+and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
+
 Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
-Indistinguishable routes are a compile error. Middleware direction is inferred
-from signature: has `Response` param → post (forces buffered), else pre.
+Indistinguishable routes are a compile error. Stable middleware uses an explicit
+`chain` direction:
+
+```swift
+func add_trace(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Request-Path", req.path)
+    0
+}
+chain observability { after add_trace(req, resp) }
+route GET "/users" use chain observability { return forward(users) }
+```
+
+`before` helpers may gate a route; `after` currently supports Response header
+effects only. Full buffered body/status middleware remains ⏳.
 
 ## I/O
 
@@ -318,6 +356,54 @@ init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
 
+## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
+
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)
+
+route GET "/api" {                                   // GCRA token bucket
+    let now = time.nowMicros()                       // latched per request
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    if tat - now <= 600000 {                         // tau = emit
+        buckets.set(req.remoteAddr, tat + 600000)    // emit = 600ms/token
+        return 200
+    } else { return 429 }
+}
+```
+
+For equivalent parameters, this matches `@rateLimit`, including leaving TAT
+unchanged after a rejection (verified by JIT execution tests). Move the set to
+the leading statement region when a deliberately punitive policy should meter
+every attempt. The Rut form also supports custom policies such as per-tier
+limits and composite conditions. See
+examples/ratelimit.rut for the packed fixed-window variant, which permits
+boundary bursts and is not a sliding-window limit.
+
+## Cache state (per-key counters/timestamps — DESIGN.md §3.3.6)
+
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots
+
+route GET "/api" {
+    let prev = buckets.get(req.remoteAddr).or(0) // i64? — a MISS IS NORMAL
+    buckets.set(req.remoteAddr, prev + 1)        // bare set: before guards/for;
+                                                 // ALL cache ops reject wait routes
+    if prev + 1 > 100 { return 429 } else { return 200 }
+}
+```
+
+- `get -> i64?`: nil means never-seen OR evicted — the two are indistinguishable
+  by design; `.or(default)` / `guard let` are the only ways to consume it.
+- Entries may be evicted by colliding writes at any occupancy: never store
+  anything whose absence gives a wrong answer. Capacity = slot count (rounded
+  up to a power of two); provision ~2× your expected key count.
+- A leading state write runs at handler entry and must precede guards/for. A
+  write inside a selected `if`/`match` branch runs only on that branch, after
+  its local prelude guards and before its terminator. Routes containing
+  `wait`/`wait any` reject every cache op, including ops textually before the
+  wait; branch writes in static-for routes remain unsupported. Per-shard state:
+  effective limits ≈ limit × shard count.
+
 ## Built-ins (call them, never reimplement)
 
 ```
@@ -327,7 +413,9 @@ hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
 jwt:     jwtDecode(tok, secret:|publicKey:) jwtEncode(claims, ..., alg: .HS256)
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
-time:    now() time(s) — Time/Duration arithmetic: now() - t > 1h
+time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
+         uses in one request see the same value)  max(a, b)  min(a, b)
+         — now()/time(s)/Duration arithmetic still ⏳
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
 ```
@@ -359,21 +447,19 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 ```swift
 listen :80                         // ⏳ (no top-level listen yet)
 let users = upstream { "10.0.0.1:8080" }
-let limits = Counter<IP>(capacity: 100000, window: 1m)
+// A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
+// ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
+// is no shipped top-level catch-all syntax yet. Configure the surrounding
+// listener/proxy to return 404 for traffic outside these declared routes.
 
-func rateLimit(_ req: Request, max: i32) {
-    guard limits.incr(req.remoteAddr) <= max else { respond 429 }
-}
+route GET "/health" { return 200 }
 
-route {
-    @rateLimit(max: 1000) *
-    get /health => 200
-    get /users/:id(i64) => forward(users)
-    post /users {
-        guard let user = req.body(User) else { return 400 }
-        return forward(users)
-    }
-    _ => 404
+@rateLimit(limit: 1000, window: 1m)
+route GET "/users/:id" { return forward(users) }
+
+route POST "/users" {
+    guard let user = req.body(User) else { return 400 }
+    return forward(users)
 }
 
 struct User {

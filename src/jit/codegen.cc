@@ -95,8 +95,12 @@ struct Ctx {
     LLVMValueRef fn_req_param;
     LLVMValueRef fn_req_remote_addr;
     LLVMValueRef fn_req_content_length;
+    LLVMValueRef fn_cache_get;
+    LLVMValueRef fn_cache_set;
+    LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
+    LLVMValueRef fn_time_unlatch;
 
     // True while emitting a handler that reads the request (and therefore
     // primed the parse cache). Gates the parse-unprime calls at exits.
@@ -209,6 +213,29 @@ struct Ctx {
                        "");
     }
 
+    // void rut_helper_time_unlatch()
+    LLVMValueRef get_time_unlatch() {
+        if (!fn_time_unlatch) {
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
+            fn_time_unlatch = LLVMAddFunction(llvm_mod, "rut_helper_time_unlatch", ft);
+        }
+        return fn_time_unlatch;
+    }
+
+    // Reset the per-invocation time latch at handler entry. parse_prime
+    // already does this as a side effect, so this dedicated call is only
+    // emitted for handlers that use time.nowMicros() WITHOUT reading the
+    // request — otherwise their thread's latch would stay valid across
+    // invocations and the clock would freeze at the first sampled value.
+    void emit_time_unlatch() {
+        LLVMBuildCall2(builder,
+                       LLVMGlobalGetValueType(get_time_unlatch()),
+                       get_time_unlatch(),
+                       nullptr,
+                       0,
+                       "");
+    }
+
     // void rut_helper_req_path(ptr, i32, ptr, ptr)
     LLVMValueRef get_req_path() {
         if (!fn_req_path) {
@@ -301,6 +328,65 @@ struct Ctx {
         return fn_req_set_header;
     }
 
+    // void rut_helper_req_add_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
+    LLVMValueRef fn_req_add_header = nullptr;
+    LLVMValueRef get_req_add_header() {
+        if (!fn_req_add_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 5, 0);
+            fn_req_add_header = LLVMAddFunction(llvm_mod, "rut_helper_req_add_header", ft);
+        }
+        return fn_req_add_header;
+    }
+
+    LLVMValueRef fn_resp_set_header = nullptr;
+    LLVMValueRef fn_resp_add_header = nullptr;
+    LLVMValueRef fn_resp_remove_header = nullptr;
+    LLVMValueRef fn_resp_commit_headers = nullptr;
+    LLVMValueRef fn_resp_header = nullptr;
+    LLVMValueRef get_resp_set_header() {
+        if (!fn_resp_set_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_resp_set_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_set_header", LLVMFunctionType(void_ty, params, 5, 0));
+        }
+        return fn_resp_set_header;
+    }
+    LLVMValueRef get_resp_add_header() {
+        if (!fn_resp_add_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            fn_resp_add_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_add_header", LLVMFunctionType(void_ty, params, 5, 0));
+        }
+        return fn_resp_add_header;
+    }
+    LLVMValueRef get_resp_remove_header() {
+        if (!fn_resp_remove_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            fn_resp_remove_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_remove_header", LLVMFunctionType(void_ty, params, 3, 0));
+        }
+        return fn_resp_remove_header;
+    }
+    LLVMValueRef get_resp_commit_headers() {
+        if (!fn_resp_commit_headers) {
+            LLVMTypeRef params[] = {ptr_ty};
+            fn_resp_commit_headers = LLVMAddFunction(llvm_mod,
+                                                     "rut_helper_resp_commit_headers",
+                                                     LLVMFunctionType(void_ty, params, 1, 0));
+        }
+        return fn_resp_commit_headers;
+    }
+    LLVMValueRef get_resp_header() {
+        if (!fn_resp_header) {
+            LLVMTypeRef params[] = {
+                ptr_ty, ptr_ty, i32_ty, i8_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            fn_resp_header = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_header", LLVMFunctionType(void_ty, params, 9, 0));
+        }
+        return fn_resp_header;
+    }
+
     // void rut_helper_req_cookie(ptr, i32, ptr, i32, ptr, ptr, ptr)
     LLVMValueRef get_req_cookie() {
         if (!fn_req_cookie) {
@@ -349,6 +435,35 @@ struct Ctx {
             fn_req_remote_addr = LLVMAddFunction(llvm_mod, "rut_helper_req_remote_addr", ft);
         }
         return fn_req_remote_addr;
+    }
+
+    // void rut_helper_cache_get(i32, i32, ptr, ptr)
+    LLVMValueRef get_cache_get() {
+        if (!fn_cache_get) {
+            LLVMTypeRef params[] = {i32_ty, i32_ty, ptr_ty, ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 4, 0);
+            fn_cache_get = LLVMAddFunction(llvm_mod, "rut_helper_cache_get", ft);
+        }
+        return fn_cache_get;
+    }
+
+    // void rut_helper_cache_set(i32, i32, i64)
+    LLVMValueRef get_cache_set() {
+        if (!fn_cache_set) {
+            LLVMTypeRef params[] = {i32_ty, i32_ty, i64_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
+            fn_cache_set = LLVMAddFunction(llvm_mod, "rut_helper_cache_set", ft);
+        }
+        return fn_cache_set;
+    }
+
+    // i64 rut_helper_time_now_micros()
+    LLVMValueRef get_time_now_micros() {
+        if (!fn_time_now_micros) {
+            LLVMTypeRef ft = LLVMFunctionType(i64_ty, nullptr, 0, 0);
+            fn_time_now_micros = LLVMAddFunction(llvm_mod, "rut_helper_time_now_micros", ft);
+        }
+        return fn_time_now_micros;
     }
 
     // u64 rut_helper_req_content_length(ptr, i32)
@@ -906,6 +1021,98 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            "");
             break;
         }
+        case rir::Opcode::ReqAddHeader: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "addheader.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "addheader.vptr");
+            LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "addheader.vlen");
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_add_header()),
+                           c.get_req_add_header(),
+                           args,
+                           5,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespSetHeader:
+        case rir::Opcode::RespAddHeader: {
+            const bool add = inst.op == rir::Opcode::RespAddHeader;
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, add ? "respadd.name" : "respset.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "resp.vptr");
+            LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "resp.vlen");
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
+            LLVMValueRef helper = add ? c.get_resp_add_header() : c.get_resp_set_header();
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 5, "");
+            break;
+        }
+        case rir::Opcode::RespRemoveHeader: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "respremove.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef args[] = {c.param_conn, name_ptr, name_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_remove_header()),
+                           c.get_resp_remove_header(),
+                           args,
+                           3,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespCommitHeaders: {
+            LLVMValueRef args[] = {c.param_conn};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_commit_headers()),
+                           c.get_resp_commit_headers(),
+                           args,
+                           1,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespHeader: {
+            Str name = inst.imm.str_val;
+            LLVMValueRef name_ptr = c.make_global_str(name, "respheader.name");
+            LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
+            LLVMValueRef fallback = c.get_value(inst.operands[0]);
+            LLVMValueRef fallback_has =
+                LLVMBuildExtractValue(c.builder, fallback, 0, "resp.fb.has");
+            LLVMValueRef fallback_ptr =
+                LLVMBuildExtractValue(c.builder, fallback, 1, "resp.fb.ptr");
+            LLVMValueRef fallback_len =
+                LLVMBuildExtractValue(c.builder, fallback, 2, "resp.fb.len");
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "resp.hdr.has");
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "resp.hdr.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "resp.hdr.len");
+            LLVMValueRef args[] = {c.param_conn,
+                                   name_ptr,
+                                   name_len,
+                                   fallback_has,
+                                   fallback_ptr,
+                                   fallback_len,
+                                   out_has,
+                                   out_ptr,
+                                   out_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_header()),
+                           c.get_resp_header(),
+                           args,
+                           9,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "resp.h");
+            LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "resp.p");
+            LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "resp.l");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "resp.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "resp.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "resp.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::ReqParam: {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "param.name");
@@ -1097,28 +1304,167 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::BitShl:
         case rir::Opcode::BitShr: {
-            // Shift amounts outside 0..31 saturate (0 for shl, sign fill for
-            // arithmetic shr) instead of leaving LLVM poison / hardware
-            // masking semantics.
+            // Shift amounts outside 0..width-1 saturate (0 for shl, sign
+            // fill for arithmetic shr) instead of leaving LLVM poison /
+            // hardware masking semantics. Width follows the operand type
+            // (i32 or i64).
             LLVMValueRef a = c.get_value(inst.operands[0]);
             LLVMValueRef n = c.get_value(inst.operands[1]);
+            const rir::Type* lhs_ty = c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap
+                                          ? c.cur_fn->values[inst.operands[0].id].type
+                                          : nullptr;
+            const bool is64 = lhs_ty && lhs_ty->kind == rir::TypeKind::I64;
+            LLVMTypeRef w = is64 ? c.i64_ty : c.i32_ty;
+            const u64 width = is64 ? 64 : 32;
             LLVMValueRef in_range = LLVMBuildICmp(
-                c.builder, LLVMIntULT, n, LLVMConstInt(c.i32_ty, 32, 0), "bit.shift.inrange");
+                c.builder, LLVMIntULT, n, LLVMConstInt(w, width, 0), "bit.shift.inrange");
             LLVMValueRef safe_n = LLVMBuildSelect(
-                c.builder, in_range, n, LLVMConstInt(c.i32_ty, 31, 0), "bit.shift.n");
+                c.builder, in_range, n, LLVMConstInt(w, width - 1, 0), "bit.shift.n");
             if (inst.op == rir::Opcode::BitShl) {
                 LLVMValueRef shifted = LLVMBuildShl(c.builder, a, safe_n, "bit.shl.raw");
-                LLVMValueRef r = LLVMBuildSelect(
-                    c.builder, in_range, shifted, LLVMConstInt(c.i32_ty, 0, 0), "bit.shl");
+                LLVMValueRef r =
+                    LLVMBuildSelect(c.builder, in_range, shifted, LLVMConstInt(w, 0, 0), "bit.shl");
                 c.set_value(inst.result, r);
             } else {
                 LLVMValueRef shifted = LLVMBuildAShr(c.builder, a, safe_n, "bit.shr.raw");
                 LLVMValueRef sign_fill =
-                    LLVMBuildAShr(c.builder, a, LLVMConstInt(c.i32_ty, 31, 0), "bit.shr.sign");
+                    LLVMBuildAShr(c.builder, a, LLVMConstInt(w, width - 1, 0), "bit.shr.sign");
                 LLVMValueRef r =
                     LLVMBuildSelect(c.builder, in_range, shifted, sign_fill, "bit.shr");
                 c.set_value(inst.result, r);
             }
+            break;
+        }
+
+        // ── Arithmetic ──
+        // Semantics must match the analyze-time literal fold in
+        // analyze_arith_expr (analyze.cc): overflow wraps two's-complement,
+        // x / 0 and x % 0 are 0, INT_MIN / -1 is INT_MIN, INT_MIN % -1 is 0.
+        case rir::Opcode::Add:
+        case rir::Opcode::Sub:
+        case rir::Opcode::Mul: {
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            // Plain wrap forms — deliberately NOT the NSW variants.
+            LLVMValueRef r =
+                inst.op == rir::Opcode::Add
+                    ? LLVMBuildAdd(c.builder, a, b, "arith.add")
+                    : (inst.op == rir::Opcode::Sub ? LLVMBuildSub(c.builder, a, b, "arith.sub")
+                                                   : LLVMBuildMul(c.builder, a, b, "arith.mul"));
+            c.set_value(inst.result, r);
+            break;
+        }
+        case rir::Opcode::Div:
+        case rir::Opcode::Mod: {
+            // sdiv/srem are poison for b == 0 and INT_MIN / -1; feed them a
+            // safe divisor and select the defined results instead. Guard
+            // constants follow the operand width (i32 or i64).
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            const rir::Type* lhs_ty = c.cur_fn && inst.operands[0].id < c.cur_fn->value_cap
+                                          ? c.cur_fn->values[inst.operands[0].id].type
+                                          : nullptr;
+            const bool is64 = lhs_ty && lhs_ty->kind == rir::TypeKind::I64;
+            LLVMTypeRef w = is64 ? c.i64_ty : c.i32_ty;
+            LLVMValueRef zero = LLVMConstInt(w, 0, 0);
+            LLVMValueRef int_min =
+                LLVMConstInt(w, is64 ? 0x8000000000000000ull : static_cast<u64>(0x80000000u), 0);
+            LLVMValueRef neg_one = LLVMConstAllOnes(w);
+            LLVMValueRef is_zero = LLVMBuildICmp(c.builder, LLVMIntEQ, b, zero, "arith.div.zero");
+            LLVMValueRef is_min = LLVMBuildICmp(c.builder, LLVMIntEQ, a, int_min, "arith.div.min");
+            LLVMValueRef is_neg1 =
+                LLVMBuildICmp(c.builder, LLVMIntEQ, b, neg_one, "arith.div.negone");
+            LLVMValueRef ovf = LLVMBuildAnd(c.builder, is_min, is_neg1, "arith.div.ovf");
+            LLVMValueRef bad = LLVMBuildOr(c.builder, is_zero, ovf, "arith.div.bad");
+            LLVMValueRef safe_b =
+                LLVMBuildSelect(c.builder, bad, LLVMConstInt(w, 1, 0), b, "arith.div.safeb");
+            if (inst.op == rir::Opcode::Div) {
+                LLVMValueRef raw = LLVMBuildSDiv(c.builder, a, safe_b, "arith.div.raw");
+                LLVMValueRef ovf_val =
+                    LLVMBuildSelect(c.builder, ovf, int_min, raw, "arith.div.ovfval");
+                LLVMValueRef r = LLVMBuildSelect(c.builder, is_zero, zero, ovf_val, "arith.div");
+                c.set_value(inst.result, r);
+            } else {
+                LLVMValueRef raw = LLVMBuildSRem(c.builder, a, safe_b, "arith.mod.raw");
+                // Both guarded cases (b == 0 and INT_MIN % -1) yield 0.
+                LLVMValueRef r = LLVMBuildSelect(c.builder, bad, zero, raw, "arith.mod");
+                c.set_value(inst.result, r);
+            }
+            break;
+        }
+
+        case rir::Opcode::TimeNowMicros: {
+            LLVMValueRef v = LLVMBuildCall2(c.builder,
+                                            LLVMGlobalGetValueType(c.get_time_now_micros()),
+                                            c.get_time_now_micros(),
+                                            nullptr,
+                                            0,
+                                            "time.now_micros");
+            c.set_value(inst.result, v);
+            break;
+        }
+        case rir::Opcode::MaxInt:
+        case rir::Opcode::MinInt: {
+            // Signed select at the operand width — single evaluation of both
+            // operands (max/min are NOT an IfElse desugar: that would clone
+            // the operand trees and re-execute any effectful expression).
+            LLVMValueRef a = c.get_value(inst.operands[0]);
+            LLVMValueRef b = c.get_value(inst.operands[1]);
+            LLVMValueRef cond =
+                LLVMBuildICmp(c.builder,
+                              inst.op == rir::Opcode::MaxInt ? LLVMIntSGT : LLVMIntSLT,
+                              a,
+                              b,
+                              "minmax.cmp");
+            LLVMValueRef r = LLVMBuildSelect(c.builder, cond, a, b, "minmax");
+            c.set_value(inst.result, r);
+            break;
+        }
+        case rir::Opcode::SextI64: {
+            LLVMValueRef v =
+                LLVMBuildSExt(c.builder, c.get_value(inst.operands[0]), c.i64_ty, "sext.i64");
+            c.set_value(inst.result, v);
+            break;
+        }
+
+        // ── Cache state ──
+        case rir::Opcode::CacheGet: {
+            LLVMValueRef instance =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "cache.has");
+            LLVMValueRef out_val = LLVMBuildAlloca(c.builder, c.i64_ty, "cache.val");
+            LLVMValueRef args[] = {instance, key, out_has, out_val};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_cache_get()),
+                           c.get_cache_get(),
+                           args,
+                           4,
+                           "");
+            LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cache.h");
+            LLVMValueRef v = LLVMBuildLoad2(c.builder, c.i64_ty, out_val, "cache.v");
+            // Optional(i64) uses map_type's generic {i8, payload} layout.
+            LLVMTypeRef opt_ty = c.map_type(c.cur_fn->values[inst.result.id].type);
+            LLVMValueRef opt = LLVMGetUndef(opt_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "cache.opt.has");
+            opt = LLVMBuildInsertValue(c.builder, opt, v, 1, "cache.opt.val");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::CacheSet: {
+            LLVMValueRef instance =
+                LLVMConstInt(c.i32_ty, static_cast<u64>(static_cast<u32>(inst.imm.i32_val)), 0);
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef val = c.get_value(inst.operands[1]);
+            LLVMValueRef args[] = {instance, key, val};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_cache_set()),
+                           c.get_cache_set(),
+                           args,
+                           3,
+                           "");
+            // The instruction's value echoes the stored i64.
+            c.set_value(inst.result, val);
             break;
         }
 
@@ -1493,6 +1839,23 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
     return false;
 }
 
+// Whether the handler samples the monotonic clock. Time-using handlers that
+// never read the request get no parse_prime (which is what normally resets
+// the per-invocation time latch), so they need a dedicated latch reset in
+// the prologue — otherwise the thread's first sampled timestamp is returned
+// forever (frozen clock, silently wrong for GCRA-style elapsed-time logic).
+static bool rir_function_uses_time(const rir::Function& fn) {
+    if (!fn.blocks) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& blk = fn.blocks[bi];
+        if (!blk.insts) continue;
+        for (u32 ii = 0; ii < blk.inst_count; ii++) {
+            if (blk.insts[ii].op == rir::Opcode::TimeNowMicros) return true;
+        }
+    }
+    return false;
+}
+
 static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.cur_fn = &fn;
     c.ctx_store_sink = nullptr;
@@ -1543,6 +1906,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     // calls at the handler's returns.
     const bool kNeedsParse = rir_function_uses_parse(fn);
     c.cur_fn_needs_parse = kNeedsParse;
+    // Time-only handlers still need their per-invocation latch reset; when
+    // kNeedsParse is true, parse_prime already resets it (skip the extra call).
+    const bool kNeedsTimeUnlatch = !kNeedsParse && rir_function_uses_time(fn);
 
     // State-machine prologue. When the RIR function has yield points, the
     // handler is called multiple times (once per state) and the first
@@ -1579,6 +1945,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // so every req_* helper in this invocation shares one parse. Skipped
         // for handlers that never read the request (status/forward only).
         if (kNeedsParse) c.emit_parse_prime();
+        if (kNeedsTimeUnlatch) c.emit_time_unlatch();
         // HandlerCtx layout: state (u16) @ offset 0.
         LLVMValueRef state = LLVMBuildLoad2(c.builder, c.i16_ty, c.param_ctx, "state");
 
@@ -1635,6 +2002,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         // Parse-once: prime the per-thread parse cache at handler entry,
         // unless the handler never reads the request.
         if (kNeedsParse) c.emit_parse_prime();
+        if (kNeedsTimeUnlatch) c.emit_time_unlatch();
     }
 
     // Emit instructions block by block.
@@ -1680,6 +2048,9 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_req_param = nullptr;
     c.fn_req_remote_addr = nullptr;
     c.fn_req_content_length = nullptr;
+    c.fn_cache_get = nullptr;
+    c.fn_cache_set = nullptr;
+    c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
     c.fn_str_has_prefix = nullptr;

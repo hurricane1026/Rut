@@ -16,6 +16,7 @@
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
+#include <vector>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -111,6 +112,34 @@ TEST(set_header, replaces_all_duplicate_client_fields) {
     CHECK(!buf_has(d, n, "X-Dup: b"));
     CHECK(buf_has(d, n, "Host: client\r\n"));  // unrelated header untouched
     // req_header_end stays consistent with the rewritten block (ends in CRLFCRLF).
+    REQUIRE(c->req_header_end >= 4 && c->req_header_end <= n);
+    CHECK(__builtin_memcmp(d + c->req_header_end - 4, "\r\n\r\n", 4) == 0);
+}
+
+// Appending must preserve every client-supplied field and serialize one more
+// field before the terminating blank line.
+TEST(add_header, preserves_duplicate_client_fields_and_appends) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET / HTTP/1.1\r\nHost: client\r\nX-Tag: a\r\nX-Tag: b\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_header_overrides[0].name = Str{"X-Tag", 5};
+    c->req_header_overrides[0].value = Str{"tail", 4};
+    c->req_header_override_count = 1;
+    c->req_header_append_mask = 1;
+
+    CHECK(rut::apply_request_header_overrides(*c));
+    const u8* d = c->recv_buf.data();
+    const u32 n = c->recv_buf.len();
+    CHECK_EQ(count_occurrences(d, n, "X-Tag:"), 3u);
+    CHECK(buf_has(d, n, "X-Tag: a\r\n"));
+    CHECK(buf_has(d, n, "X-Tag: b\r\n"));
+    CHECK(buf_has(d, n, "X-Tag: tail\r\n\r\n"));
     REQUIRE(c->req_header_end >= 4 && c->req_header_end <= n);
     CHECK(__builtin_memcmp(d + c->req_header_end - 4, "\r\n\r\n", 4) == 0);
 }
@@ -245,6 +274,64 @@ TEST(set_header, fails_closed_on_record_overflow) {
     c->req_header_override_overflow = true;
     CHECK(!rut::apply_request_header_overrides(*c));
     CHECK_EQ(c->recv_buf.len(), kLen);  // untouched
+}
+
+TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "GET /original HTTP/1.1\r\nHost: client\r\n\r\n";
+    const u32 kLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kLen), kLen);
+    c->req_header_end = kLen;
+    c->req_initial_send_len = kLen;
+    c->req_path_overridden = true;
+    c->req_path_override = {"/forwarded", 10};
+    c->resp_header_mutations[0] = {{"X-Original", 10},
+                                   {reinterpret_cast<const char*>(c->recv_buf.data()) + 4, 9},
+                                   ConnectionBase::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE(rewrite_request_line_path(*c));
+
+    CHECK(c->resp_header_mutations[0].value.eq({"/original", 9}));
+    CHECK(buf_has(c->recv_buf.data(), c->recv_buf.len(), "GET /forwarded HTTP/1.1\r\n"));
+    CHECK_FALSE(c->retry_req_snapshot_replayable);
+}
+
+TEST(set_path, streamed_pipeline_stash_preserves_response_mutation_snapshot) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    const char kReq[] = "POST /original HTTP/1.1\r\nHost: client\r\n\r\nbody";
+    const u32 kReqLen = sizeof(kReq) - 1;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kReq), kReqLen), kReqLen);
+    c->req_initial_send_len = kReqLen;
+    c->resp_header_mutations[0] = {{"X-Original", 10},
+                                   {reinterpret_cast<const char*>(c->recv_buf.data()) + 5, 9},
+                                   ConnectionBase::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    reserve_response_mutation_snapshot(*c);
+    const u32 snapshot_len = c->retry_req_send_len;
+    REQUIRE_EQ(snapshot_len, kReqLen);
+
+    c->recv_buf.reset();
+    static const char final_body_and_pipeline[] = "tailGET /next HTTP/1.1\r\nHost: client\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(final_body_and_pipeline),
+                                 sizeof(final_body_and_pipeline) - 1),
+               sizeof(final_body_and_pipeline) - 1);
+    c->req_initial_send_len = 4;
+    pipeline_stash(*c);
+
+    CHECK(c->resp_header_mutations[0].value.eq({"/original", 9}));
+    REQUIRE_EQ(c->pipeline_stash_len, sizeof(final_body_and_pipeline) - 1 - 4);
+    CHECK(buf_has(
+        c->send_buf.data() + snapshot_len, c->pipeline_stash_len, "GET /next HTTP/1.1\r\n"));
 }
 
 // === Recv ===
@@ -1110,6 +1197,7 @@ TEST(websocket, upgrade_101_sent_preserves_early_only_upstream_bytes) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
 
     const u8 early_bytes[] = {'H', 'E', 'L', 'L', 'O'};
     REQUIRE_EQ(conn->upstream_recv_buf.write(early_bytes, sizeof(early_bytes)),
@@ -1414,6 +1502,7 @@ TEST(websocket, upgrade_101_sent_forwards_buffered_client_bytes) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
 
     const u8 cb[] = {'H', 'I'};
     REQUIRE_EQ(conn->recv_buf.write(cb, sizeof(cb)), sizeof(cb));
@@ -1443,6 +1532,7 @@ TEST(websocket, upgrade_101_sent_rearms_client_recv_when_no_buffered_bytes) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
     REQUIRE_EQ(conn->recv_buf.len(), 0u);  // no buffered client bytes -> the no-buffered path
     // Simulate ws_stop_client_poll having paused the client recv on the io_uring 101 path.
     conn->recv_paused_for_send = true;
@@ -1466,6 +1556,7 @@ TEST(websocket, upgrade_101_sent_drains_both_when_backend_closed_pretunnel) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
     conn->ws_pre_tunnel_upstream_closed = true;  // backend FIN during the 101 drain
     const u32 cid = conn->id;
 
@@ -1510,6 +1601,7 @@ TEST(websocket, upgrade_101_sent_releases_upstream_slot) {
     conn->upstream_fd = 43;
     conn->resp_status = 101;
     conn->ws_upgrade_response_len = 64;
+    conn->ws_upgrade_sent_len = 64;
     conn->upstream_slot_held = true;  // slot taken at proxy dispatch
 
     on_ws_101_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
@@ -3854,6 +3946,42 @@ TEST(upstream_reuse, request_sent_reused_snapshots_before_pipeline_stash) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// Dynamic response mutations may borrow req.path/req.header slices from recv_buf.
+// Even a fresh upstream must preserve those bytes before releasing recv_buf.
+TEST(response_headers, request_backed_forward_mutation_survives_recv_reuse) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char request[] = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(request) - 1;
+    c->recv_buf.write(reinterpret_cast<const u8*>(request), len);
+    c->req_initial_send_len = len;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+
+    REQUIRE_EQ(c->retry_req_send_len, len);
+    REQUIRE_EQ(c->recv_buf.len(), 0u);
+    CHECK(mutation.value.ptr == reinterpret_cast<const char*>(c->send_buf.data() + 4));
+    CHECK((mutation.value.eq(Str{"/path", 5})));
+    c->recv_buf.write(reinterpret_cast<const u8*>("overwritten"), 11);
+    CHECK((mutation.value.eq(Str{"/path", 5})));
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // Regression: retry_req_send_len is also the offset to the stashed pipelined
 // suffix. Receiving response bytes proves GET1 will not be retried, but the
 // marker must survive until pipeline_recover copies GET2 from after GET1.
@@ -4829,7 +4957,7 @@ TEST(slice_conn, real_eventloop_pool_init) {
 
     // Lazy commit: pool starts empty, max set to 5 * kMaxConns (recv + send + upstream +
     // the two WebSocket terminate-mode reassembly slices).
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 5);
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
     CHECK_EQ(loop->pool.count, 0u);
 
     // Alloc a connection — triggers lazy grow, consumes 2 slices
@@ -6345,9 +6473,15 @@ TEST(streaming, skip_1xx_continue_then_200) {
 TEST(streaming, _101_not_skipped) {
     SmallLoop loop;
     loop.setup();
+    AccessLogRing access_log;
+    access_log.init();
+    loop.access_log = &access_log;
     auto* conn = setup_proxy_conn(loop);
     REQUIRE(conn != nullptr);
     conn->req_wants_upgrade = true;  // client sent Connection: upgrade
+    conn->resp_header_mutations[0] = {
+        {"X-After", 7}, {"applied", 7}, ConnectionBase::RespHeaderMutationMode::Set};
+    conn->resp_header_mutation_count = 1;
 
     const char* resp =
         "HTTP/1.1 101 Switching Protocols\r\n"
@@ -6370,6 +6504,15 @@ TEST(streaming, _101_not_skipped) {
     // 101 is terminal — must NOT be skipped as an interim 1xx.
     CHECK_EQ(conn->resp_status, static_cast<u16>(101));
 #if RUT_ENABLE_WEBSOCKET
+    const MockOp* handshake_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(handshake_send != nullptr);
+    const u32 handshake_send_len = handshake_send->send_len;
+    const std::string handshake(reinterpret_cast<const char*>(handshake_send->send_buf),
+                                handshake_send_len);
+    CHECK(handshake.find("X-After: applied\r\n") != std::string::npos);
+    CHECK_NE(handshake_send_len, resp_len);
+    CHECK_EQ(conn->ws_upgrade_response_len, resp_len);
+    CHECK_EQ(conn->ws_upgrade_sent_len, handshake_send_len);
     // The idle-timeout exemption starts only after the 101 reaches the client.
     CHECK(!conn->is_ws_tunnel);
     REQUIRE(conn->on_send != nullptr);
@@ -6387,11 +6530,14 @@ TEST(streaming, _101_not_skipped) {
     CHECK(conn->upstream_recv_buf.len() == early_only_len ||
           conn->upstream_recv_buf.len() == header_plus_early_len);
     CHECK(!conn->is_ws_tunnel);
-    loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    loop.backend.inject(make_ev(conn->id, IoEventType::Send, static_cast<i32>(handshake_send_len)));
     loop.backend.op_count = 0;
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     CHECK(conn->is_ws_tunnel);
+    AccessLogEntry access_entry{};
+    REQUIRE(access_log.pop(access_entry));
+    CHECK_EQ(access_entry.resp_size, handshake_send_len);
     REQUIRE_EQ(loop.backend.op_count, 3u);
     CHECK_EQ(loop.backend.ops[0].type, MockOp::Recv);
     CHECK_EQ(loop.backend.ops[0].fd, 42);
@@ -7199,14 +7345,14 @@ TEST(buffer_isolation, client_data_during_proxy_ignored) {
 }
 
 // Pool sized for 3 slices per connection (recv + send + upstream_recv).
-TEST(buffer_isolation, pool_sized_for_five_slices) {
+TEST(buffer_isolation, pool_sized_for_six_slices) {
     RealLoop* loop = create_real_loop();
     REQUIRE(loop != nullptr);
     auto rc = loop->init(0, -1);
     REQUIRE(rc.has_value());
 
     // recv + send + upstream_recv + the two WebSocket terminate reassembly slices.
-    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 5);
+    CHECK_EQ(loop->pool.max_count, RealLoop::kMaxConns * 6);
 
     loop->shutdown();
     destroy_real_loop(loop);
@@ -7628,6 +7774,35 @@ TEST(streaming, request_body_sent_body_done_cl) {
     c->on_upstream_send = &on_request_body_sent<SmallLoop>;
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 100));
     CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+}
+
+TEST(streaming, request_body_sent_closes_when_snapshot_leaves_no_pipeline_space) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->send_buf.reset();
+    const u32 snapshot_len = c->send_buf.capacity() - 4;
+    __builtin_memset(c->send_buf.write_ptr(), 'S', snapshot_len);
+    c->send_buf.commit(snapshot_len);
+    c->response_mutations_snapshotted = true;
+    c->retry_req_send_len = snapshot_len;
+
+    c->recv_buf.reset();
+    static const char final_body_and_pipeline[] = "tailGET /next HTTP/1.1\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(final_body_and_pipeline),
+                                 sizeof(final_body_and_pipeline) - 1),
+               sizeof(final_body_and_pipeline) - 1);
+    c->req_initial_send_len = 4;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;
+    c->upstream_fd = 100;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
+
+    const u32 cid = c->id;
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::UpstreamSend, 4));
+    CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
 TEST(streaming, request_body_recvd_cl_forwards) {
@@ -8177,6 +8352,21 @@ TEST(proxy, proxy_response_sent_send_error) {
     c->req_start_us = monotonic_us();
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, -1));
+    CHECK_EQ(loop.conns[cid].fd, -1);
+}
+
+TEST(proxy, proxy_response_sent_closes_when_response_disabled_keepalive) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->on_send = &on_proxy_response_sent<SmallLoop>;
+    c->req_start_us = monotonic_us();
+    c->keep_alive = false;
+    const u32 cid = c->id;
+
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, 1));
     CHECK_EQ(loop.conns[cid].fd, -1);
 }
 
@@ -10608,6 +10798,82 @@ TEST(legacy_loop, alloc_upstream_buf) {
     loop->shutdown();
 }
 
+TEST(legacy_loop, lazy_aux_buffers_handle_exhaustion_atomically) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+
+    // Lazy buffers bind exactly once and are released with the connection.
+    CHECK(loop->alloc_response_header_buf(*c));
+    u8* response_headers = c->response_header_slice;
+    REQUIRE(response_headers != nullptr);
+    CHECK(loop->alloc_response_header_buf(*c));
+    CHECK_EQ(c->response_header_slice, response_headers);
+
+    CHECK(loop->alloc_ws_terminate_bufs(*c));
+    u8* ws_c2u = c->ws_c2u_msg;
+    u8* ws_u2c = c->ws_u2c_msg;
+    REQUIRE(ws_c2u != nullptr);
+    REQUIRE(ws_u2c != nullptr);
+    CHECK(loop->alloc_ws_terminate_bufs(*c));
+    CHECK_EQ(c->ws_c2u_msg, ws_c2u);
+    CHECK_EQ(c->ws_u2c_msg, ws_u2c);
+
+    c->fd = -1;
+    loop->free_conn(*c);
+
+    c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+
+    // Freeze growth at the currently committed size, then leave one slice.
+    // The two-slice WebSocket allocation must roll the first allocation back.
+    const u32 original_max = loop->pool.max_count;
+    loop->pool.max_count = loop->pool.count;
+    std::vector<u8*> held;
+    while (loop->pool.available() > 1) held.push_back(loop->pool.alloc());
+    REQUIRE_EQ(loop->pool.available(), 1u);
+    CHECK(!loop->alloc_ws_terminate_bufs(*c));
+    CHECK_EQ(c->ws_c2u_msg, nullptr);
+    CHECK_EQ(c->ws_u2c_msg, nullptr);
+    CHECK_EQ(loop->pool.available(), 1u);
+
+    u8* last = loop->pool.alloc();
+    REQUIRE(last != nullptr);
+    REQUIRE_EQ(loop->pool.available(), 0u);
+    CHECK(!loop->alloc_upstream_buf(*c));
+    CHECK(!loop->alloc_response_header_buf(*c));
+    CHECK(!loop->alloc_ws_terminate_bufs(*c));
+
+    loop->pool.max_count = original_max;
+    loop->pool.free(last);
+    for (u8* slice : held) loop->pool.free(slice);
+    c->fd = -1;
+    loop->free_conn(*c);
+    loop->shutdown();
+}
+
+TEST(legacy_async_loop, immediate_free_releases_all_lazy_buffers) {
+    auto loop = std::make_unique<EventLoop<AsyncMockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    REQUIRE(loop->alloc_response_header_buf(*c));
+    REQUIRE(loop->alloc_ws_terminate_bufs(*c));
+
+    c->fd = -1;
+    c->pending_ops = 0;
+    loop->free_conn(*c);
+    CHECK_EQ(c->recv_slice, nullptr);
+    CHECK_EQ(c->send_slice, nullptr);
+    CHECK_EQ(c->upstream_recv_slice, nullptr);
+    CHECK_EQ(c->response_header_slice, nullptr);
+    CHECK_EQ(c->ws_c2u_msg, nullptr);
+    CHECK_EQ(c->ws_u2c_msg, nullptr);
+    loop->shutdown();
+}
+
 static void legacy_noop_recv_cb(void*, rut::ConnectionBase&, rut::IoEvent) {}
 
 // Drives EventLoop<MockBackend>'s timer-tick ladder and the dispatch refresh
@@ -11237,6 +11503,91 @@ TEST(slot_state, send_inflight_defers_until_send_completes) {
     // UpstreamSend completion → now forwards
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
+}
+
+TEST(response_headers, early_response_reserves_snapshot_before_pipeline_stash) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->fd = 42;
+
+    static const char request[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char first[] = "GET /first HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char next[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    c->req_initial_send_len = sizeof(first) - 1;
+    c->req_body_mode = BodyMode::None;
+    c->keep_alive = true;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE_EQ(c->retry_req_send_len, 0u);
+
+    static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1),
+        sizeof(response) - 1);
+    on_body_send_with_early_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(sizeof(first) - 1)));
+
+    CHECK_EQ(c->retry_req_send_len, sizeof(first) - 1);
+    CHECK_EQ(c->pipeline_stash_len, sizeof(next) - 1);
+    CHECK(mutation.value.eq({"/first", 6}));
+    CHECK(
+        buf_has(c->response_header_buf.data(), c->response_header_buf.len(), "X-Path: /first\r\n"));
+    CHECK(__builtin_memcmp(c->send_buf.data() + c->retry_req_send_len, next, sizeof(next) - 1) ==
+          0);
+}
+
+TEST(response_headers, failed_initial_send_reserves_snapshot_before_pipeline_stash) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->fd = 42;
+
+    static const char request[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char first[] = "GET /first HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char next[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+               sizeof(request) - 1);
+    c->req_initial_send_len = sizeof(first) - 1;
+    c->req_body_mode = BodyMode::None;
+    c->keep_alive = true;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
+    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE_EQ(c->retry_req_send_len, 0u);
+
+    static const char response[] = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1),
+        sizeof(response) - 1);
+    on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamSend, -EPIPE));
+
+    CHECK(c->upstream_request_incomplete);
+    CHECK_EQ(c->retry_req_send_len, sizeof(first) - 1);
+    CHECK_EQ(c->pipeline_stash_len, sizeof(next) - 1);
+    CHECK(mutation.value.eq({"/first", 6}));
+    CHECK(
+        buf_has(c->response_header_buf.data(), c->response_header_buf.len(), "X-Path: /first\r\n"));
+    CHECK(__builtin_memcmp(c->send_buf.data() + c->retry_req_send_len, next, sizeof(next) - 1) ==
+          0);
 }
 
 // Verify initial send phase also sets on_upstream_recv for early response detection.
@@ -14014,6 +14365,38 @@ TEST(coverage, chunked_502_in_initial_buffer) {
     CHECK_EQ(c->resp_status, kStatusBadGateway);
 }
 
+TEST(response_headers, malformed_initial_chunk_is_rejected_before_mutated_headers) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->resp_header_mutations[0] = {
+        {"X-After", 7}, {"applied", 7}, ConnectionBase::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "XYZ\r\n";
+    const u32 kLen = sizeof(kResp) - 1;
+    c->upstream_recv_buf.reset();
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), kLen), kLen);
+
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kLen));
+    loop.backend.inject(ev);
+    IoEvent events[8];
+    const u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    const MockOp* send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send != nullptr);
+    CHECK(buf_has(send->send_buf, send->send_len, "502 Bad Gateway"));
+    CHECK_FALSE(buf_has(send->send_buf, send->send_len, "X-After: applied"));
+}
+
 // Chunked request body in on_request_body_recvd. Lines 1085-1103.
 TEST(coverage, chunked_request_body_streaming) {
     SmallLoop loop;
@@ -15845,6 +16228,671 @@ TEST(async_coverage, early_response_on_proxy) {
     // At this point, body streaming or upstream response paths are active
     // Just verify no crash and state is consistent
     CHECK(conn->state == ConnState::Proxying || conn->state == ConnState::ReadingHeader);
+}
+
+TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
+    RouteConfig cfg{};
+    const char* keys[] = {"X-Base", "X-Keep", "X-Multi"};
+    const u32 key_lens[] = {6, 6, 7};
+    const char* values[] = {"base", "keep", "first"};
+    const u32 value_lens[] = {4, 4, 5};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 3), 1u);
+
+    Connection conn;
+    conn.reset();
+    auto add_mutation = [&](ConnectionBase::RespHeaderMutationMode mode,
+                            const char* name,
+                            u32 name_len,
+                            const char* value,
+                            u32 value_len) {
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, name_len};
+        mutation.value = {value, value_len};
+    };
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Set, "x-base", 6, "new", 3);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Remove, "x-keep", 6, nullptr, 0);
+
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+    REQUIRE_EQ(count, 3u);
+    CHECK((Str{out[0].key_data, out[0].key_len}.eq(Str{"X-Multi", 7})));
+    CHECK((Str{out[0].value_data, out[0].value_len}.eq(Str{"first", 5})));
+    CHECK((Str{out[1].key_data, out[1].key_len}.eq(Str{"x-base", 6})));
+    CHECK((Str{out[1].value_data, out[1].value_len}.eq(Str{"new", 3})));
+    CHECK((Str{out[2].key_data, out[2].key_len}.eq(Str{"X-Multi", 7})));
+    CHECK((Str{out[2].value_data, out[2].value_len}.eq(Str{"second", 6})));
+
+    conn.resp_header_mutation_overflow = true;
+    CHECK_FALSE(collect_effective_response_headers(
+        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+}
+
+TEST(response_headers, content_type_removal_suppresses_direct_response_default) {
+    RouteConfig cfg{};
+    const char* keys[] = {"Content-Type"};
+    const u32 key_lens[] = {12};
+    const char* values[] = {"application/json"};
+    const u32 value_lens[] = {16};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+
+    Connection conn;
+    conn.reset();
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
+    mutation.name = {"content-type", 12};
+    mutation.value = {nullptr, 0};
+
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    u32 count = 0;
+    bool suppress_default_content_type = false;
+    REQUIRE(collect_effective_response_headers(conn,
+                                               &cfg,
+                                               1,
+                                               out,
+                                               static_cast<u32>(std::size(out)),
+                                               &count,
+                                               &suppress_default_content_type));
+    CHECK_EQ(count, 0u);
+    CHECK(suppress_default_content_type);
+
+    u8 send_storage[1024]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    format_response_with_body_and_headers(
+        conn, 200, "{}", 2, out, count, true, false, suppress_default_content_type);
+    const char* response = reinterpret_cast<const char*>(conn.send_buf.data());
+    CHECK(buf_contains(response, conn.send_buf.len(), "Content-Length: 2\r\n", 19));
+    CHECK_FALSE(buf_contains(response, conn.send_buf.len(), "Content-Type:", 13));
+    CHECK(buf_contains(response, conn.send_buf.len(), "\r\n\r\n{}", 6));
+}
+
+TEST(response_headers, committed_after_header_preserves_status_reason_body) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    RouteConfig cfg{};
+    conn->request_config = &cfg;
+    auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-After", 7};
+    mutation.value = {"yes", 3};
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+
+    const char* response = reinterpret_cast<const char*>(conn->send_buf.data());
+    CHECK(buf_contains(response, conn->send_buf.len(), "X-After: yes\r\n", 14));
+    CHECK(buf_contains(response, conn->send_buf.len(), "Content-Length: 2\r\n", 19));
+    CHECK(buf_contains(response, conn->send_buf.len(), "\r\n\r\nOK", 6));
+}
+
+TEST(response_headers, removing_last_header_preserves_headers_only_body_mode) {
+    RouteConfig cfg{};
+    const char* keys[] = {"X-Test"};
+    const u32 key_lens[] = {6};
+    const char* values[] = {"yes"};
+    const u32 value_lens[] = {3};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+
+    Connection conn;
+    conn.reset();
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
+    mutation.name = {"x-test", 6};
+    mutation.value = {nullptr, 0};
+    ResponseHeaderKV out[RouteConfig::kMaxHeadersPerSet + ConnectionBase::kMaxRespHeaderMutations];
+    u32 count = 0;
+    REQUIRE(collect_effective_response_headers(
+        conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+    REQUIRE_EQ(count, 0u);
+
+    u8 send_storage[1024]{};
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+    format_response_with_body_and_headers(conn, 200, nullptr, 0, out, count, true);
+    const char* response = reinterpret_cast<const char*>(conn.send_buf.data());
+    CHECK(buf_contains(response, conn.send_buf.len(), "Content-Length: 0\r\n", 19));
+    CHECK_FALSE(buf_contains(response, conn.send_buf.len(), "\r\n\r\nOK", 8));
+}
+
+TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[1024]{};
+    u8 response_header_storage[1024]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = response_header_storage;
+    conn.response_header_buf.bind(response_header_storage, sizeof(response_header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: origin\r\n"
+        "X-Base: old\r\n"
+        "X-Multi: first\r\n"
+        "Content-Length: 4\r\n"
+        "\r\n"
+        "body";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+
+    auto add_mutation = [&](ConnectionBase::RespHeaderMutationMode mode,
+                            const char* name,
+                            u32 name_len,
+                            const char* value,
+                            u32 value_len) {
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, name_len};
+        mutation.value = {value, value_len};
+    };
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Remove, "server", 6, nullptr, 0);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Set, "X-Base", 6, "new", 3);
+    add_mutation(ConnectionBase::RespHeaderMutationMode::Add, "X-Multi", 7, "second", 6);
+
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 4;
+    REQUIRE(build_h1_forward_response_headers(conn, kHeaderLen, false));
+    const std::string rewritten(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                                conn.response_header_buf.len());
+    CHECK(rewritten.find("Server:") == std::string::npos);
+    CHECK(rewritten.find("X-Base: old") == std::string::npos);
+    CHECK(rewritten.find("X-Base: new\r\n") != std::string::npos);
+    CHECK(rewritten.find("X-Multi: first\r\n") != std::string::npos);
+    CHECK(rewritten.find("X-Multi: second\r\n") != std::string::npos);
+    CHECK(rewritten.ends_with("\r\n\r\n"));
+    CHECK_EQ(conn.upstream_recv_buf.len(), sizeof(response) - 1);
+    CHECK(__builtin_memcmp(conn.upstream_recv_buf.data() + kHeaderLen, "body", 4) == 0);
+}
+
+TEST(response_headers, forwarded_mutations_fold_in_source_order) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] = "HTTP/1.1 200 OK\r\nX-Set: origin\r\nX-Gone: origin\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto add =
+        [&](ConnectionBase::RespHeaderMutationMode mode, const char* name, const char* value) {
+            auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+            mutation.mode = mode;
+            mutation.name = {name, static_cast<u32>(strlen(name))};
+            mutation.value = {value, value ? static_cast<u32>(strlen(value)) : 0u};
+        };
+    add(ConnectionBase::RespHeaderMutationMode::Set, "X-Set", "first");
+    add(ConnectionBase::RespHeaderMutationMode::Add, "X-Set", "added-before-last-set");
+    add(ConnectionBase::RespHeaderMutationMode::Set, "X-Set", "final");
+    add(ConnectionBase::RespHeaderMutationMode::Set, "X-Gone", "temporary");
+    add(ConnectionBase::RespHeaderMutationMode::Add, "X-Gone", "also-temporary");
+    add(ConnectionBase::RespHeaderMutationMode::Remove, "X-Gone", nullptr);
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("X-Set: origin") == std::string::npos);
+    CHECK(out.find("X-Set: first") == std::string::npos);
+    CHECK(out.find("added-before-last-set") == std::string::npos);
+    CHECK(out.find("X-Set: final\r\n") != std::string::npos);
+    CHECK(out.find("X-Gone") == std::string::npos);
+}
+
+TEST(response_headers, forwarded_header_growth_does_not_need_upstream_body_headroom) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[128]{};
+    u8 header_storage[256]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char prefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 90\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(prefix), sizeof(prefix) - 1);
+    while (conn.upstream_recv_buf.write_avail() != 0) {
+        static const u8 body = 'x';
+        conn.upstream_recv_buf.write(&body, 1);
+    }
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Expanded", 10};
+    static const char expanded[] = "a header that would not fit in the full upstream buffer";
+    mutation.value = {expanded, sizeof(expanded) - 1};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(prefix) - 1, false));
+    CHECK_EQ(conn.upstream_recv_buf.len(), conn.upstream_recv_buf.capacity());
+    CHECK(conn.response_header_buf.len() > sizeof(prefix) - 1);
+}
+
+TEST(response_headers, forwarded_mutations_keep_drain_close_signal) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[256]{};
+    u8 header_storage[256]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Test", 6};
+    mutation.value = {"yes", 3};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, true));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive") == std::string::npos);
+    CHECK(out.find("Connection: close\r\n") != std::string::npos);
+    CHECK(out.find("X-Test: yes\r\n") != std::string::npos);
+}
+
+TEST(response_headers, forwarded_mutations_reject_runtime_header_injection) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[256]{};
+    u8 header_storage[256]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Dynamic", 9};
+    mutation.value = {"safe\r\nInjected: yes", 19};
+
+    CHECK_FALSE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+}
+
+TEST(response_headers, forwarded_mutations_reject_framing_headers) {
+    auto rejected = [](ConnectionBase::RespHeaderMutationMode mode, const char* name) {
+        Connection conn;
+        conn.reset();
+        u8 upstream_storage[256]{};
+        u8 header_storage[256]{};
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+        conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, static_cast<u32>(strlen(name))};
+        mutation.value = {"100", 3};
+        const bool ok =
+            build_h1_forward_response_headers(conn, sizeof(response) - 1 - 4, /*draining=*/false);
+        return !ok && conn.response_header_buf.len() == 0;
+    };
+
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Content-Length"));
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Add, "content-length"));
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Transfer-Encoding"));
+    CHECK(rejected(ConnectionBase::RespHeaderMutationMode::Add, "transfer-encoding"));
+}
+
+TEST(response_headers, forwarded_mutations_remove_matching_connection_nominations) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: keep-alive, X-Security, upgrade\r\n"
+        "X-Security: origin\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Security", 10};
+    mutation.value = {"enforced", 8};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive, upgrade\r\n") != std::string::npos);
+    CHECK(out.find("Connection: keep-alive, X-Security") == std::string::npos);
+    CHECK(out.find("X-Security: origin") == std::string::npos);
+    CHECK(out.find("X-Security: enforced\r\n") != std::string::npos);
+}
+
+TEST(response_headers, forwarded_remove_strips_stale_connection_nomination) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: keep-alive, X-Internal\r\n"
+        "X-Internal: secret\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
+    mutation.name = {"X-Internal", 10};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive\r\n") != std::string::npos);
+    CHECK(out.find("X-Internal") == std::string::npos);
+}
+
+TEST(response_headers, forwarded_add_drops_upstream_connection_nominated_field) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: keep-alive, X-Internal\r\n"
+        "X-Internal: secret\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Internal", 10};
+    mutation.value = {"public", 6};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive\r\n") != std::string::npos);
+    CHECK(out.find("X-Internal: secret") == std::string::npos);
+    CHECK(out.find("X-Internal: public\r\n") != std::string::npos);
+}
+
+TEST(response_headers, forwarded_connection_nomination_preserves_body_framing) {
+    Connection conn;
+    conn.reset();
+    conn.keep_alive = true;
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: keep-alive, Content-Length\r\n"
+        "Content-Length: 4\r\n"
+        "\r\n"
+        "body";
+    constexpr u32 kHeaderLen = sizeof(response) - 1 - 4;
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
+    mutation.name = {"X-Test", 6};
+    mutation.value = {"yes", 3};
+
+    REQUIRE(build_h1_forward_response_headers(conn, kHeaderLen, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Content-Length: 4\r\n") != std::string::npos);
+    CHECK(out.find("Connection: close\r\n") != std::string::npos);
+    CHECK(out.find("Connection: keep-alive, Content-Length") == std::string::npos);
+    CHECK_FALSE(conn.keep_alive);
+}
+
+TEST(response_headers, forwarded_101_unrelated_mutation_preserves_upgrade_handshake) {
+    Connection conn;
+    conn.reset();
+    conn.resp_status = 101;
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Connection: keep-alive, Upgrade\r\n"
+        "Upgrade: h2c\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Trace", 7};
+    mutation.value = {"yes", 3};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive, Upgrade\r\n") != std::string::npos);
+    CHECK(out.find("Upgrade: h2c\r\n") != std::string::npos);
+    CHECK(out.find("X-Trace: yes\r\n") != std::string::npos);
+}
+
+TEST(response_headers, forwarded_101_rejects_destructive_handshake_mutations) {
+    auto rejected = [](ConnectionBase::RespHeaderMutationMode mode, const char* name) {
+        Connection conn;
+        conn.reset();
+        conn.resp_status = 101;
+        u8 upstream_storage[256]{};
+        u8 header_storage[256]{};
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        static const char response[] =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: websocket\r\n"
+            "\r\n";
+        conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        mutation.mode = mode;
+        mutation.name = {name, static_cast<u32>(strlen(name))};
+        mutation.value =
+            mode == ConnectionBase::RespHeaderMutationMode::Remove ? Str{} : Str{"close", 5};
+        return build_h1_forward_response_headers(conn, sizeof(response) - 1, false);
+    };
+
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Remove, "Upgrade"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Upgrade"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Add, "Upgrade"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Connection"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Set, "Sec-WebSocket-Protocol"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Add, "Sec-WebSocket-Extensions"));
+    CHECK_FALSE(rejected(ConnectionBase::RespHeaderMutationMode::Remove, "Sec-WebSocket-Accept"));
+}
+
+TEST(response_headers, stabilization_copies_only_mutations_that_survive_folding) {
+    Connection conn;
+    conn.reset();
+    u8 stable_storage[4]{};
+    conn.response_header_slice = stable_storage;
+    conn.response_header_buf.bind(stable_storage, sizeof(stable_storage));
+    static const char source[] = "discardedkept";
+    conn.resp_header_mutations[0] = {
+        {"X-Test", 6}, {source, 9}, ConnectionBase::RespHeaderMutationMode::Set};
+    conn.resp_header_mutations[1] = {
+        {"X-Test", 6}, {source + 9, 4}, ConnectionBase::RespHeaderMutationMode::Set};
+    conn.resp_header_mutation_count = 2;
+
+    REQUIRE(
+        conn.stabilize_response_mutations(reinterpret_cast<const u8*>(source), sizeof(source) - 1));
+    CHECK_EQ(conn.response_header_buf.len(), 4u);
+    CHECK(conn.resp_header_mutations[0].value.ptr == source);
+    CHECK(conn.resp_header_mutations[1].value.eq({"kept", 4}));
+}
+
+TEST(http2, proxy_forwardability_requires_scheme_and_usable_host) {
+    const hpack::Header authority[] = {
+        {{":scheme", 7}, {"https", 5}},
+        {{":authority", 10}, {"example.com", 11}},
+    };
+    CHECK(h2_proxy_request_forwardable(authority, 2));
+
+    const hpack::Header host[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{"host", 4}, {"example.com", 11}},
+    };
+    CHECK(h2_proxy_request_forwardable(host, 2));
+
+    const hpack::Header missing_scheme[] = {
+        {{":authority", 10}, {"example.com", 11}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(missing_scheme, 1));
+
+    const hpack::Header missing_host[] = {
+        {{":scheme", 7}, {"http", 4}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(missing_host, 1));
+
+    const hpack::Header empty_authority[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{":authority", 10}, {"", 0}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(empty_authority, 2));
+
+    const hpack::Header empty_host[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{"host", 4}, {"", 0}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(empty_host, 2));
+
+    const hpack::Header duplicate_host[] = {
+        {{":scheme", 7}, {"http", 4}},
+        {{"host", 4}, {"one.example", 11}},
+        {{"host", 4}, {"two.example", 11}},
+    };
+    CHECK_FALSE(h2_proxy_request_forwardable(duplicate_host, 3));
+}
+
+TEST(http2, timer_suspend_reanchors_request_overrides) {
+    struct EpochLoop {
+        void epoch_enter() {}
+    } loop;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init();
+    conn.h2 = &h2;
+
+    u8 synth[64]{};
+    conn.req_path_overridden = true;
+    conn.req_path_override = {reinterpret_cast<const char*>(synth + 4), 8};
+    conn.req_header_override_count = 1;
+    conn.req_header_overrides[0] = {
+        {reinterpret_cast<const char*>(synth + 16), 6},
+        {reinterpret_cast<const char*>(synth + 24), 7},
+    };
+    u8 response[1]{};
+    H2Dispatch<EpochLoop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    JitDispatchOutcome outcome;
+    outcome.timer_ms = 20;
+    outcome.next_state = 7;
+
+    REQUIRE(h2_suspend_timer(dispatch,
+                             1,
+                             /*fn=*/nullptr,
+                             outcome,
+                             /*cfg=*/nullptr,
+                             synth,
+                             sizeof(synth),
+                             /*request_body_followed=*/false,
+                             /*request_forwardable=*/true));
+    CHECK(conn.req_path_override.ptr == reinterpret_cast<const char*>(h2.pending_synth + 4));
+    CHECK(conn.req_header_overrides[0].name.ptr ==
+          reinterpret_cast<const char*>(h2.pending_synth + 16));
+    CHECK(conn.req_header_overrides[0].value.ptr ==
+          reinterpret_cast<const char*>(h2.pending_synth + 24));
+}
+
+TEST(http2, forward_request_applies_jit_path_and_header_overrides) {
+    Connection conn;
+    conn.reset();
+    conn.req_path_overridden = true;
+    conn.req_path_override = {"/new", 4};
+    conn.req_header_override_count = 2;
+    conn.req_header_overrides[0] = {{"X-Auth", 6}, {"trusted", 7}};
+    conn.req_header_overrides[1] = {{"X-Added", 7}, {"yes", 3}};
+    conn.req_header_append_mask = 1u << 1;
+    static const char request[] =
+        "GET /old HTTP/1.1\r\nHost: x\r\nX-Auth: client\r\nX-Auth: duplicate\r\n\r\n";
+    u8 out[512]{};
+    u32 out_len = 0;
+
+    REQUIRE(h2_prepare_forward_request(conn,
+                                       reinterpret_cast<const u8*>(request),
+                                       sizeof(request) - 1,
+                                       out,
+                                       sizeof(out),
+                                       &out_len));
+    const std::string rewritten(reinterpret_cast<const char*>(out), out_len);
+    CHECK(rewritten.starts_with("GET /new HTTP/1.1\r\n"));
+    CHECK(rewritten.find("X-Auth: trusted\r\n") != std::string::npos);
+    CHECK(rewritten.find("X-Auth: client") == std::string::npos);
+    CHECK(rewritten.find("X-Auth: duplicate") == std::string::npos);
+    CHECK(rewritten.find("X-Added: yes\r\n") != std::string::npos);
+}
+
+TEST(http2, forward_request_rejects_unrepresentable_overrides) {
+    Connection conn;
+    conn.reset();
+    static const char request[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 out[128]{};
+    u32 out_len = 0;
+
+    CHECK_FALSE(h2_prepare_forward_request(conn,
+                                           reinterpret_cast<const u8*>(request),
+                                           sizeof(request) - 1,
+                                           out,
+                                           sizeof(request) - 2,
+                                           &out_len));
+
+    static const char malformed[] = "GET / HTTP/1.1\r\nHost: x\r\n";
+    CHECK_FALSE(h2_prepare_forward_request(conn,
+                                           reinterpret_cast<const u8*>(malformed),
+                                           sizeof(malformed) - 1,
+                                           out,
+                                           sizeof(out),
+                                           &out_len));
+
+    conn.req_path_overridden = true;
+    conn.req_path_override = {"", 0};
+    CHECK_FALSE(h2_prepare_forward_request(conn,
+                                           reinterpret_cast<const u8*>(request),
+                                           sizeof(request) - 1,
+                                           out,
+                                           sizeof(out),
+                                           &out_len));
+}
+
+TEST(http2, new_request_reset_clears_connection_wide_mutations) {
+    Connection conn;
+    conn.reset();
+    u8 response_header_storage[64]{};
+    conn.response_header_slice = response_header_storage;
+    conn.response_header_buf.bind(response_header_storage, sizeof(response_header_storage));
+    conn.response_header_buf.write(reinterpret_cast<const u8*>("stale"), 5);
+    conn.req_path_overridden = true;
+    conn.req_header_override_count = 1;
+    conn.resp_header_mutation_pending_count = 1;
+    conn.resp_header_mutation_count = 1;
+
+    h2_reset_request_mutations(conn);
+
+    CHECK_FALSE(conn.req_path_overridden);
+    CHECK_EQ(conn.req_header_override_count, 0u);
+    CHECK_EQ(conn.resp_header_mutation_pending_count, 0u);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
 }
 
 int main(int argc, char** argv) {

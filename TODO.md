@@ -11,7 +11,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 **Work** (roughly in dependency order):
 - [x] Lexer: `&&` `||` `!` `!=` `<=` `>=` emitted; `and`/`or`/`not` lex to
   fix-it errors; lone `&`/`^`/`~` → bitwise.* fix-it; `?` → if-let fix-it
-  (commit: slice 1). `respond`/`break`/`continue` keywords still pending.
+  (commit: slice 1). `respond` is implemented as a contextual statement word
+  so user declarations and members may still use that name; `break`/`continue`
+  remain pending with runtime `for` loops.
 - [x] Parser: `!`/`!=`/`<=`/`>=` desugar to Eq/Lt/Gt (+ `== false` wrap);
   `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
   sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
@@ -24,12 +26,15 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   folding + pure-optional rejection reused) and injects a narrowed HirLocal
   (make_if_let_local → make_guard_bound_init) into the THEN-branch scope only
   (else/continuation never see it). Terminator-branch sites only swap the cond
-  (binding unreferenceable there). Pure-optional carrier still rejected (below).
-- [ ] `respond status[, body] | resp` statement — NEW semantics: today a
-  func's `=> 401`-style guard values are the *function's return value*, not
-  an HTTP short-circuit. respond needs an HIR terminal (like ReturnStatus)
-  legal inside funcs, carried through inlining so the inlined route sends the
-  response and stops. Design first: extend HirGuard::FailKind/Term reuse.
+  (binding unreferenceable there). Pure-optional carriers are covered by the
+  lowering item below.
+- [x] `respond status[, body]` statement — contextual parsing, literal-status
+  validation, HIR `ReturnStatus`, helper propagation, and respond-capable
+  `chain before` steps are implemented. `respond resp` accepts a Response
+  builder and preserves its ordered literal `set`/`add`/`remove` header prefix
+  through helper propagation. `chain after` helpers with exactly one `Response`
+  parameter can apply ordered runtime header mutations to successful direct and
+  forwarded responses; short-circuit branches do not publish those effects.
 - [x] `guard` condition bool-only check + fix-it; guard-let usable-value
   semantics: known nil/error inits fold the condition to false (else always
   runs, binding skipped for known error); runtime error-capable inits lower
@@ -47,7 +52,7 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   HasValue(LocalRef) guard condition as a recovering use, so the prelude
   skips locals whose error the guard consumes (e2e: pick(req.http11) ->
   200 / guard else 401).
-- [ ] Error-prelude suppression: upgrade the linear-dominance walk to real
+- [x] Error-prelude suppression: upgrade the linear-dominance walk to real
   per-local exit-dominance so a recovery behind a benign pre-reject
   (`guard ok else { return 403 }` before `wait`/recovery) can suppress the
   prelude WITHOUT letting a terminating sibling that returns success mask
@@ -55,22 +60,31 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   conditional_guard_keeps_error_prelude_on_unguarded_sibling — the two
   shapes are structurally identical to a single-continuation walk; only
   exit-dominance separates them). Until then: conservative over-keep.
-- [ ] websocket trailing block `{ frame in }`; object literal only in
-  call-argument position; pipeline RHS placeholder validation.
+- [x] WebSocket terminate trailing blocks require the explicit
+  `{ frame in ... }` binding; the legacy implicit-frame block is rejected.
+- [x] Object literal syntax is accepted only in call-argument position and
+  represented explicitly in the AST; bare/general-expression use is rejected.
+  Still pending: `json()` lowering and runtime serialization.
+- [x] Pipeline RHS validation requires a call stage with an explicit `_` / `_N`
+  placeholder and reports the canonical placement fix-it before call analysis.
 - Checker/builtins: [x] `.or(default)` (sugar for eager `any(value, default)`);
   [x] `req.params.*` capture namespace (flat `req.<capture>` is an error with a
   fix-it); [x] `bitwise.and/or/xor/flip/shiftLeft/shiftRight` namespace
-  (end-to-end: analyze fold + HIR/MIR/RIR Bit* ops + LLVM codegen; i32 only,
-  shifts saturate outside 0..31, `flip` desugars to `xor(a, -1)`; user
-  bindings named `bitwise` shadow the namespace). Still pending: `req.set/add`
-  + `resp.set/remove/add/header` write paths (resp needs a runtime mutable
-  response-header store — today response headers are compile-time const sets);
-  `req.queryAll` (needs a runtime [str] value type — none exists); `respond`
-  legality (middleware only) vs status-`return` (handler only);
+  (end-to-end: analyze fold + HIR/MIR/RIR Bit* ops + LLVM codegen; i32/i64
+  same-width operands, shifts saturate outside the width, `flip` desugars to
+  `xor(a, -1)`; user bindings named `bitwise` shadow the namespace). Still
+  [x] `Response` locals with ordered `set/remove/add/header`: literal prefixes
+  fold into response-header sets and dynamic string values lower through a
+  bounded per-request mutation log for direct routes; [x] `chain after`
+  response-header mutation for direct and forwarded responses. Still pending:
+  buffered body/status mutation and after middleware on `wait`/`for` routes
+  (needs a resumable, stream-owned runtime Response);
+  `req.queryAll` (needs a runtime [str] value type — none exists);
   `stats()/metrics()/reload()/upstream.mark()` declarations.
-- Diagnostics: implement the §3.6 fix-it rows for `?.`, `??`, postfix `!`,
-  truthiness guard, bitwise symbols, placeholder-less pipeline, `case`,
-  middleware/handler return-respond confusion.
+- Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
+  guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match
+  arms; [x] middleware status-`return` and handler `respond` context errors
+  with canonical replacement guidance.
 - Tests/examples: migrate `examples/*.rut`, test fixtures, and docs/ topic
   pages (match.md, pipe.md, decorators.md, for-loops.md, ...) to the new
   surface once the front-end accepts it.
@@ -78,22 +92,71 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 **Acceptance**: language-card examples all parse and type-check; old forms
 produce the documented fix-its; `./dev.sh test` green.
 
-## P1: Parser Stack-Frame Fragility — two slices DONE (PR #166)
+## P1: State and Rate-Limit Semantics
 
-Slice 1: route statements moved out of AstRouteDecl into
-AstFile::stmt_pool (pointers, alloc_stmt) — sizeof(AstItem) 485KB ->
-126KB; the gcc 16.1 Debug stack overflow
-(test_rate_limit_dsl_decorator_compiles_to_route_limit under
--DRUT_ENABLE_JIT=OFF) is fixed. Slice 2: MatchArm.pattern moved to
-expr_pool (nullptr for wildcard arms) — sizeof(AstStatement) 22976 ->
-4608. Pools sized 4096 to preserve pre-pool capacity. Full no-JIT suite
-passes under gcc 16. Invariant: wildcard arms carry a null pattern —
-guard `arm.pattern->` derefs with is_wildcard. Remaining slimming if
-frames grow again: impl (47.6KB) / protocol (36.6KB) / chain (18.7KB)
-inline decls in AstItem, or arena-allocate whole AstItems.
+**Goal**: Finish the state semantics exposed by the Cache/rate-limit slices
+without presenting lossy or per-shard state as exact shared state.
+
+**Work**:
+- [x] Lower `Cache.set` at its branch position instead of only in the route-entry
+  prelude. This enables a Rut limiter to commit the successor only on its
+  accepted branch; the shipped example now demonstrates that policy.
+- Design the strict, visible-failure `Hash` table and an owner-shard atomic
+  update primitive before offering exact cross-shard rate limiting or state
+  whose absence would be incorrect.
+- Keep cross-node `backend:` syntax reserved until reads have an explicit
+  freshness/invalidation contract; do not describe Cache as a source of truth.
+
+**Acceptance**:
+- A rate-limit test demonstrates both meter-every-attempt and meter-on-accept
+  policies without special C++ rate-limit logic.
+- Any exact shared-state surface specifies capacity failure, update atomicity,
+  shard ownership, and read freshness before parser/runtime implementation.
 
 ## Recently Completed
 
+- [x] Handler bodies reject `respond` with a `return` fix-it, while middleware
+  functions reject status-`return` with a `respond` fix-it; valid helper
+  `respond` propagation and ordinary function value expressions are unchanged.
+- [x] `chain after` supports ordered `Response` header `set`/`add`/`remove`
+  effects on successful direct and forwarded routes. Effects use the pending
+  response mutation log and commit only on the selected success terminator;
+  invalid helper shapes, empty-effect helpers, and wait/for routes are rejected
+  with targeted diagnostics.
+- [x] Dynamic direct-route Response mutations use a two-phase pending/commit
+  log: `resp.header()` observes ordered pending writes, while only `return resp`
+  publishes them. Guarded source-order lowering remains blocked until effects
+  and their dependent reads can move out of the function prelude together.
+- [x] Error-prelude exit-dominance now treats literal 4xx/5xx pre-rejects as
+  fail-closed while keeping the prelude for success, redirect, dynamic, and
+  forward exits that do not recover a fallible local.
+- [x] Parser stack-frame slimming moved route statements and match-arm patterns
+  into pools, fixing the gcc 16.1 Debug overflow; further slimming is only
+  needed if frames grow again (PR #166).
+- [x] `respond status[, body]` now short-circuits through helpers and
+  respond-capable `chain before` steps; `respond` remains contextual.
+- [x] `req.params.*` is the canonical route-capture namespace with a fix-it for
+  the removed flat spelling.
+- [x] `Cache<IP, i64>` provides bounded, lossy, per-shard state slots; i64
+  arithmetic/bitwise operations and `time.nowMicros()` support Rut-written
+  rate-limit algorithms.
+- [x] `req.set("Name", "value")` and `req.add("Name", "value")` lower through
+  HIR/MIR/RIR to the bounded request-header override runtime. `set` replaces and
+  deduplicates existing fields; `add` preserves them and appends a new field.
+  Both are statement-only, validate literal safe header names and values,
+  support leading route statements and selected match-arm effects, and fail
+  closed at runtime.
+- [x] `let resp = response(status)` creates a compile-time Response builder;
+  literal `resp.set/add/remove` mutations and `resp.header` reads fold in source
+  order, `return resp` reuses the existing response-header-set ABI, and ordered
+  duplicate names preserve multi-value fields such as `Set-Cookie`.
+- [x] Dynamic `str` values in `resp.set/add` and ordered dynamic
+  `resp.remove/header` lower through HIR/MIR/RIR/JIT into a bounded per-request
+  mutation log. HTTP/1 and HTTP/2 merge it with the literal header prefix;
+  invalid/overflowing mutations fail closed. Direct routes with guards,
+  decorators, `wait`, or `for` remain rejected until mutations are stream-owned.
+- [x] `examples/ratelimit.rut` demonstrates GCRA and fixed-window limiting over
+  `Cache`; branch-local conditional writes support meter-on-accept policies.
 - [x] epoll partial-send proactor semantics and recv-buffer integration.
 - [x] io_uring timerfd timeout events and provided-buffer return path.
 - [x] Shard runtime integration: per-core EventLoop, TimerWheel, route table, upstream pool, SlicePool, and SlabPool.
@@ -144,8 +207,9 @@ canonical spelling for common gateway tasks.
   before/after handler middleware model.
 - Keep pipe in core, but document generated code around direct function stages:
   `value | fn(_, arg)`.
-- Keep method-stage pipe syntax, placeholder-free pipe stages, and tuple-slot
-  pipe placeholders out of core examples unless compatibility requires them.
+- Keep method-stage pipe syntax and tuple-slot pipe placeholders out of core
+  examples unless compatibility requires them; placeholder-free stages are
+  rejected by the stable grammar.
 - Revisit protocol/impl exposure so protocol methods do not read like general
   structure member functions in generated Rut code.
 - Audit `match` and generic examples for constructs that should be core,
@@ -156,28 +220,6 @@ canonical spelling for common gateway tasks.
 - Generated examples use one canonical spelling for pipe, middleware, fallback,
   and async boundaries.
 - Compatibility syntax has a clear lowering or migration path to core forms.
-
-## P0: Fault Injection Harness
-
-**Goal**: Make OS-level edge cases cheap to add and hard to skip.
-
-**Why**: EINTR, mmap failure, partial I/O, and clock-boundary issues rarely happen on local loopback. Small local shims caught real gaps, but they are currently duplicated per test file.
-
-**Work**:
-- Extract reusable test shims for:
-  - `read` / `write` / `send` / `recv` one-shot and repeated EINTR.
-  - `mmap` / `mprotect` failure injection.
-  - deterministic `clock_gettime` boundary values.
-- Start with runtime modules that already have retry/failure branches:
-  - `traffic_capture`
-  - `access_log`
-  - `epoll_backend`
-  - `io_uring_backend`
-  - `SlicePool` / `Arena`
-
-**Acceptance**:
-- At least one shared helper replaces ad hoc EINTR counters.
-- New tests verify retry or fail-closed behavior without depending on real network permissions.
 
 ## P2: Coverage Tooling Hygiene
 

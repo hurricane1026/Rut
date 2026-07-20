@@ -29,6 +29,12 @@ enum class MirValueKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    ReqSetHeader,
+    ReqAddHeader,
+    RespHeader,
+    RespSetHeader,
+    RespAddHeader,
+    RespRemoveHeader,
     ReqParam,
     ReqCookie,
     ReqQuery,
@@ -59,6 +65,15 @@ enum class MirValueKind : u8 {
     BitXor,
     BitShl,
     BitShr,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    WidenI64,
+    TimeNowMicros,
+    MaxInt,
+    MinInt,
     Or,
     NoError,
     HasValue,
@@ -68,12 +83,15 @@ enum class MirValueKind : u8 {
     VariantTag,
     WaitResult,
     WaitField,
+    CacheGet,
+    CacheSet,
 };
 
 enum class MirTypeKind : u8 {
     Unknown,
     Bool,
     I32,
+    I64,
     Str,
     Variant,
     Tuple,
@@ -162,7 +180,7 @@ struct MirValue {
     bool may_nil = false;
     bool may_error = false;
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     Str msg{};
     u32 local_index = 0;
@@ -176,6 +194,8 @@ struct MirValue {
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
     u32 error_case_index = 0xffffffffu;
+    // CacheGet/CacheSet: index into MirModule::caches.
+    u32 cache_index = 0xffffffffu;
     MirValue* lhs = nullptr;
     MirValue* rhs = nullptr;
     bool is_pipe_conditional = false;
@@ -230,6 +250,7 @@ struct MirTerminator {
     Span span{};
     MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;
     i32 status_code = 0;
+    bool commit_response_mutations = false;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
     bool use_cmp = false;
@@ -260,7 +281,15 @@ struct MirTerminator {
 };
 
 struct MirBlock {
+    struct Effect {
+        u32 value_index = 0xffffffffu;
+        Span span{};
+    };
     Str label{};
+    // Side effects materialized in this block immediately before `term`.
+    // Each entry indexes the owning MirFunction::values pool.
+    static constexpr u32 kMaxEffects = 2;
+    FixedVec<Effect, kMaxEffects> effects;
     MirTerminator term{};
 };
 
@@ -446,8 +475,15 @@ struct MirUpstream {
     u16 hc_expected_status = 200;
 };
 
+struct MirCacheInstance {
+    Span span{};
+    Str name{};
+    u32 capacity = 0;
+};
+
 struct MirModule {
     static constexpr u32 kMaxUpstreams = 32;
+    static constexpr u32 kMaxCaches = 8;
     static constexpr u32 kMaxStructs = 64;
     static constexpr u32 kMaxVariants = 32;
     // One MirFunction per HIR route, INCLUDING synthesized timer routes, so this
@@ -458,6 +494,7 @@ struct MirModule {
     static constexpr u32 kMaxTypeShapes = 256;
 
     FixedVec<MirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<MirCacheInstance, kMaxCaches> caches;
     FixedVec<MirStruct, kMaxStructs> structs;
     FixedVec<MirVariant, kMaxVariants> variants;
     FixedVec<MirFunction, kMaxFunctions> functions;
@@ -466,6 +503,7 @@ struct MirModule {
     MirModule() = default;
     MirModule(const MirModule& other)
         : upstreams(other.upstreams),
+          caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
@@ -473,6 +511,7 @@ struct MirModule {
     MirModule& operator=(const MirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        caches = other.caches;
         structs = other.structs;
         variants = other.variants;
         functions = other.functions;
@@ -481,6 +520,7 @@ struct MirModule {
     }
     MirModule(MirModule&& other) noexcept
         : upstreams(other.upstreams),
+          caches(other.caches),
           structs(other.structs),
           variants(other.variants),
           functions(other.functions),
@@ -488,6 +528,7 @@ struct MirModule {
     MirModule& operator=(MirModule&& other) noexcept {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        caches = other.caches;
         structs = other.structs;
         variants = other.variants;
         functions = other.functions;

@@ -106,6 +106,21 @@ enum class HirExprKind : u8 {
     StructInit,
     Field,
     ReqHeader,
+    // `req.set("Name", value)` statement effect. `str_value` is the validated
+    // literal header name; `lhs` is the plain string value. The expression
+    // echoes the value internally so it can use the existing effect/value
+    // materialization pipeline, but analyze forbids value-position use.
+    ReqSetHeader,
+    // `req.add("Name", "value")`: preserves existing same-named fields and
+    // appends one new field line.
+    ReqAddHeader,
+    // Compile-time Response builder. int_value is the validated status code;
+    // field_inits stores ordered literal response headers.
+    ResponseInit,
+    RespHeader,
+    RespSetHeader,
+    RespAddHeader,
+    RespRemoveHeader,
     ReqParam,
     ReqCookie,
     ReqQuery,
@@ -139,6 +154,24 @@ enum class HirExprKind : u8 {
     BitXor,
     BitShl,
     BitShr,
+    // Arithmetic operators — binary i32 ops on lhs/rhs. Overflow wraps
+    // two's-complement; x / 0 and x % 0 are 0; INT_MIN / -1 is INT_MIN and
+    // INT_MIN % -1 is 0 (analyze fold and codegen agree by construction).
+    // Unary minus is Sub(IntLit 0, x) from the parser.
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    // Sign-extend a runtime i32 to i64 — produced only by the `i64(x)`
+    // builtin (literals fold at analyze time). Operand in lhs; result I64.
+    WidenI64,
+    // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
+    TimeNowMicros,
+    // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
+    // signed; single evaluation (real opcodes, not an IfElse desugar).
+    MaxInt,
+    MinInt,
     Or,
     NoError,
     HasValue,
@@ -149,12 +182,22 @@ enum class HirExprKind : u8 {
     ProtocolCall,
     WaitResult,
     WaitField,
+    // Cache<K, i64> state ops (DESIGN.md §3.3.6). cache_index selects
+    // the declared instance; key operand in lhs. CacheGet → I64 with
+    // may_nil=true (miss covers never-seen AND evicted); CacheSet carries
+    // the value in rhs and echoes it (type I64).
+    CacheGet,
+    CacheSet,
 };
 
 enum class HirTypeKind : u8 {
     Unknown,
     Bool,
     I32,
+    // 64-bit signed integer. Produced by the `i64(x)` conversion builtin and
+    // by int literals that don't fit i32; arithmetic/comparisons are
+    // same-type ({I32,I64}) — no implicit mixing.
+    I64,
     Str,
     Generic,
     Associated,
@@ -172,6 +215,9 @@ enum class HirTypeKind : u8 {
     // reference the shape through their existing `shape_index` rather than
     // mirroring inline fields.
     Array,
+    // A bounded response builder local. It is consumed by `return <local>` and
+    // does not have a runtime MIR carrier in the initial literal-only slice.
+    Response,
 };
 
 inline constexpr u32 kMaxTupleSlots = 10;
@@ -369,7 +415,7 @@ struct HirExpr {
     bool may_nil = false;
     bool may_error = false;
     bool bool_value = false;
-    i32 int_value = 0;
+    i64 int_value = 0;
     Str str_value{};
     Str msg{};
     u32 local_index = 0;
@@ -397,6 +443,8 @@ struct HirExpr {
     // For HirExprKind::ArrayLit: compile-time-known element count. Elements
     // themselves live in `args`. For non-Array exprs: 0.
     u32 array_len = 0;
+    // CacheGet/CacheSet: index into HirModule::caches.
+    u32 cache_index = 0xffffffffu;
     HirExpr* lhs = nullptr;
     HirExpr* rhs = nullptr;
     bool is_pipe_conditional = false;
@@ -406,7 +454,11 @@ struct HirExpr {
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
     u32 wait_index = 0xffffffffu;
-    static constexpr u32 kMaxFieldInits = 8;
+    // Struct/object construction is still capped by the AST at 8 fields, but
+    // ResponseInit also uses this storage for its ordered literal header prefix.
+    // Match the language's existing 16-header terminator limit so builder syntax
+    // does not impose a smaller, surprising cap.
+    static constexpr u32 kMaxFieldInits = 16;
     // HIR-level cap stays at 8 even though AstExpr::kMaxArgs = 32: HirRoute
     // sits at ~300 KB on stack and is copied on each recursive
     // analyze_file_internal call (via `HirRoute scratch{}`). A 32-wide cap
@@ -481,6 +533,10 @@ struct HirFunction {
     FixedVec<TypeParamDecl, kMaxTypeParams> type_params;
     FixedVec<ParamDecl, kMaxParams> params;
     FixedVec<HirExpr, kMaxExprs> exprs;
+    // Chain-after currently replays only Response header mutations. Remember
+    // whether the source helper also contained another statement effect so a
+    // call site cannot silently drop it during expansion.
+    bool has_non_response_statement_effect = false;
     struct RespondHeader {
         Str key{};
         Str value{};
@@ -514,6 +570,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          has_non_response_statement_effect(other.has_non_response_statement_effect),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -551,6 +608,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        has_non_response_statement_effect = other.has_non_response_statement_effect;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -572,6 +630,7 @@ struct HirFunction {
           type_params(other.type_params),
           params(other.params),
           exprs(other.exprs),
+          has_non_response_statement_effect(other.has_non_response_statement_effect),
           respond_guards(other.respond_guards),
           body(other.body) {
         for (u32 i = 0; i < other.return_tuple_len; i++) {
@@ -609,6 +668,7 @@ struct HirFunction {
         type_params = other.type_params;
         params = other.params;
         exprs = other.exprs;
+        has_non_response_statement_effect = other.has_non_response_statement_effect;
         respond_guards = other.respond_guards;
         body = other.body;
         rebase_from(other);
@@ -703,6 +763,9 @@ struct HirTerminator {
     Span span{};
     HirTerminatorSourceKind source_kind = HirTerminatorSourceKind::Literal;
     i32 status_code = 0;
+    // A dynamically mutated Response builder keeps its mutations pending until
+    // this exact return path commits them to the outgoing response.
+    bool commit_response_mutations = false;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
     // Optional response body literal (populated when the source was
@@ -790,6 +853,11 @@ struct HirMatchArm {
     bool has_arm_guard = false;
     HirExpr arm_guard{};
     BodyKind body_kind = BodyKind::Direct;
+    // Source-ordered side effects that execute after this arm's prelude
+    // guards and immediately before its terminal body. Entries index the
+    // owning HirRoute::exprs pool. CacheSet and request-header mutations are supported.
+    static constexpr u32 kMaxEffects = 2;
+    FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
     HirExpr cond{};
@@ -991,6 +1059,21 @@ struct HirRoute {
     // concrete attached route. NOT the same as a concrete route whose path
     // happens to be empty (PR #164 round 7).
     bool is_helper_scratch = false;
+    // Analysis-only flags (never serialized). cache_ops_blocked: the route
+    // body contains a wait, so CacheGet/CacheSet are rejected (locals
+    // re-materialize on resume — the op would run after the wait).
+    // cache_set_stmt_ok: one-shot permission set by a supported bare-statement
+    // path and consumed by the cache.set receiver. A set remains illegal in
+    // value position, where eager lowering could run it on non-taken paths.
+    bool cache_ops_blocked = false;
+    bool cache_set_stmt_ok = false;
+    // One-shot permission for a bare `req.set(...)` statement. Like Cache.set,
+    // request mutation cannot escape into an eager/lazy value expression.
+    bool req_header_mutation_stmt_ok = false;
+    // Analysis-only (never serialized): the route body contains a wait, so
+    // time.nowMicros() is rejected — locals re-materialize on resume, and a
+    // pre-wait timestamp binding would sample after the wait.
+    bool time_ops_blocked = false;
     struct DecoratorRef {
         Span span{};
         Str name{};
@@ -1253,6 +1336,12 @@ struct HirImpl {
     FixedVec<HirImplMethod, kMaxMethods> methods;
 };
 
+struct HirCacheDecl {
+    Span span{};
+    Str name{};
+    u32 capacity = 0;
+};
+
 struct HirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxImports = 64;
@@ -1274,8 +1363,12 @@ struct HirModule {
     static constexpr u32 kMaxTimers = 16;
     static constexpr u32 kMaxGuardMatchArms = 64;
     static constexpr u32 kMaxTypeShapes = 512;
+    // Must not exceed RouteConfig::kMaxCacheInstances (static_assert in
+    // compile_to_config.h).
+    static constexpr u32 kMaxCaches = 8;
 
     FixedVec<HirUpstream, kMaxUpstreams> upstreams;
+    FixedVec<HirCacheDecl, kMaxCaches> caches;
     FixedVec<HirImport, kMaxImports> imports;
     FixedVec<HirAlias, kMaxAliases> aliases;
     std::deque<AstTypeRef> type_ref_storage;
@@ -1298,6 +1391,7 @@ struct HirModule {
     HirModule() = default;
     HirModule(const HirModule& other)
         : upstreams(other.upstreams),
+          caches(other.caches),
           imports(other.imports),
           aliases(other.aliases),
           type_ref_storage(other.type_ref_storage),
@@ -1320,6 +1414,7 @@ struct HirModule {
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
         upstreams = other.upstreams;
+        caches = other.caches;
         imports = other.imports;
         aliases = other.aliases;
         type_ref_storage = other.type_ref_storage;

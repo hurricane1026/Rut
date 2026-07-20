@@ -493,7 +493,7 @@ public:
         }
         // Up to 5 slices per connection (lazy): recv + send + upstream_recv + the two
         // WebSocket terminate-mode reassembly slices. Matches the io_uring loop.
-        TRY_VOID(pool.init(kMaxConns * 5, pool_prealloc));
+        TRY_VOID(pool.init(kMaxConns * 6, pool_prealloc));
         auto be = backend.init(id, lfd);
         if (!be) {
             pool.destroy();
@@ -603,6 +603,10 @@ public:
             pool.free(conns[cid].upstream_recv_slice);
             conns[cid].upstream_recv_slice = nullptr;
         }
+        if (conns[cid].response_header_slice) {
+            pool.free(conns[cid].response_header_slice);
+            conns[cid].response_header_slice = nullptr;
+        }
         free_stack[free_top++] = cid;
         // Remove from pending_free (swap with last element).
         for (u32 i = 0; i < pending_free_count; i++) {
@@ -633,6 +637,10 @@ public:
                 if (conns[cid].upstream_recv_slice) {
                     pool.free(conns[cid].upstream_recv_slice);
                     conns[cid].upstream_recv_slice = nullptr;
+                }
+                if (conns[cid].response_header_slice) {
+                    pool.free(conns[cid].response_header_slice);
+                    conns[cid].response_header_slice = nullptr;
                 }
                 free_stack[free_top++] = cid;
             } else {
@@ -675,6 +683,15 @@ public:
         if (!s) return false;
         c.upstream_recv_slice = s;
         c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+        return true;
+    }
+
+    bool alloc_response_header_buf(ConnectionBase& c) {
+        if (c.response_header_slice) return true;
+        u8* s = pool.alloc();
+        if (!s) return false;
+        c.response_header_slice = s;
+        c.response_header_buf.bind(s, SlicePool::kSliceSize);
         return true;
     }
 
@@ -755,6 +772,7 @@ public:
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
                 if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+                if (c.response_header_slice) pool.free(c.response_header_slice);
                 c.reset();
                 free_stack[free_top++] = cid;
                 return;
@@ -764,11 +782,13 @@ public:
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
             u8* us = c.upstream_recv_slice;
+            u8* hs = c.response_header_slice;
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
             conns[cid].send_slice = ss;
             conns[cid].upstream_recv_slice = us;
+            conns[cid].response_header_slice = hs;
             conns[cid].pending_ops = ops;
             pending_free[pending_free_count++] = cid;
         } else {
@@ -777,6 +797,7 @@ public:
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+            if (c.response_header_slice) pool.free(c.response_header_slice);
             c.reset();
             free_stack[free_top++] = cid;
         }

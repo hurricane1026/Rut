@@ -35,6 +35,10 @@ struct RateLimiter {
     };
     Slot slots[kSlots];
 
+    void reset() {
+        for (u32 i = 0; i < kSlots; i++) slots[i] = {};
+    }
+
     // Record one request against a precomputed metering `key` and report whether
     // it conforms. `emit_us` = µs between tokens at the steady rate; `tau_us` =
     // burst tolerance in µs (both precomputed per rule from limit/window/burst).

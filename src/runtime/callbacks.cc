@@ -13,6 +13,10 @@
 
 namespace rut {
 
+bool h2_apply_forward_request_overrides(Connection& conn) {
+    return rewrite_request_line_path(conn) && apply_request_header_overrides(conn);
+}
+
 u8 map_log_method(HttpMethod method) {
     switch (method) {
         case HttpMethod::GET:
@@ -277,21 +281,22 @@ bool pipeline_shift(Connection& conn) {
     return true;
 }
 
-void pipeline_stash(Connection& conn) {
+bool pipeline_stash(Connection& conn) {
     const u32 kLeftover = pipeline_leftover(conn);
     if (kLeftover == 0) {
         conn.pipeline_stash_len = 0;
-        return;
+        return true;
     }
     const u32 kStashOff = conn.retry_req_send_len;
     if (kStashOff == 0) conn.send_buf.reset();
     if (kLeftover > conn.send_buf.write_avail()) {
         conn.pipeline_stash_len = 0;
-        return;
+        return false;
     }
     const u8* src = conn.recv_buf.data() + conn.req_initial_send_len;
     conn.send_buf.write(src, kLeftover);
     conn.pipeline_stash_len = static_cast<u16>(kLeftover);
+    return true;
 }
 
 bool pipeline_recover(Connection& conn) {
@@ -580,7 +585,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
                                            bool keep_alive,
-                                           bool body_is_fallback_reason_phrase) {
+                                           bool body_is_fallback_reason_phrase,
+                                           bool suppress_default_content_type) {
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
@@ -603,8 +609,9 @@ void format_response_with_body_and_headers(Connection& conn,
     // user content — format_static_response would have emitted no
     // Content-Type at all here, so suppressing it keeps the fallback
     // wire shape consistent regardless of whether headers are present.
-    const bool emit_default_content_type =
-        !user_has_content_type && body_len_emit > 0 && !body_is_fallback_reason_phrase;
+    const bool emit_default_content_type = !user_has_content_type &&
+                                           !suppress_default_content_type && body_len_emit > 0 &&
+                                           !body_is_fallback_reason_phrase;
 
     // Precompute the exact number of bytes we're about to write.
     // Buffer::write() silently truncates on capacity — if we ran past
@@ -703,7 +710,7 @@ void prepare_early_response_state(Connection& conn) {
         conn.recv_buf.reset();
         conn.keep_alive = false;
     } else {
-        pipeline_stash(conn);
+        if (!pipeline_stash(conn)) conn.keep_alive = false;
         conn.recv_buf.reset();
     }
     if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();

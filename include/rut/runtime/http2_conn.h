@@ -114,6 +114,8 @@ struct Http2Conn {
     u32 pending_content_length;
     bool pending_has_content_length;
     bool pending_buffer_body;
+    bool pending_request_forwardable;
+    bool pending_prepared_forward;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
     // Snapshot of matched route decisions at END_HEADERS time for deferred
     // requests. This keeps delayed DATA handlers stable when config changes
@@ -122,6 +124,7 @@ struct Http2Conn {
     const RouteEntry* pending_route;
     RouteAction pending_route_action;
     u16 pending_static_status;
+    u16 pending_forward_upstream_id;
     jit::HandlerFn pending_jit_fn;
     // Route param VALUES the matcher produced point into hdr_scratch, which the
     // engine reuses for the next decoded header block. The snapshot re-anchors
@@ -154,13 +157,21 @@ struct Http2Conn {
     // sends can complete short (full socket buffer, large header block), so the
     // proxy resubmits the remainder until async_synth_sent == async_synth_len.
     u32 async_synth_sent;
+    // Request properties captured before a timer yield. A resumed handler may
+    // return Forward, which must apply the same body/header validation as an
+    // immediate Forward outcome without consulting reused decoder scratch.
+    bool async_request_body_followed;
+    bool async_request_stream_open;
+    bool async_request_forwardable;
+    bool async_request_has_content_length;
+    u32 async_request_content_length;
     u32 async_timer_ms;
     jit::HandlerFn async_fn;
     u16 async_state;
-    // Proxy suspension only: the matched route (for upstream_id + inflight cap)
-    // and the running count of upstream h1 response bytes accumulated back into
-    // pending_synth (reused as the response buffer once the request is sent).
-    const RouteEntry* async_route;
+    // Proxy suspension only: selected upstream and the running count of upstream
+    // h1 response bytes accumulated back into pending_synth (reused as the
+    // response buffer once the request is sent).
+    u16 async_upstream_id;
     u32 async_resp_len;
 
     // Set callbacks (any may be null) then call init().

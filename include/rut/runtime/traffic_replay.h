@@ -13,13 +13,15 @@ namespace rut {
 
 // Result of replaying one captured request against a live event loop.
 struct ReplayResult {
-    u16 expected_status;  // from capture file
-    u16 actual_status;    // from replay
-    bool status_match;    // expected == actual
-    bool replayed;        // true if a static response was replayed; false
-                          // means either skipped or replay/injection failed
-    bool skipped;         // meaningful when replayed == false: true if
-                          // intentionally unsupported, false if failed
+    u16 expected_status;      // from capture file
+    u16 actual_status;        // from replay
+    bool status_match;        // expected == actual
+    bool replayed;            // true if a static response was replayed; false
+                              // means either skipped or replay/injection failed
+    bool skipped;             // meaningful when replayed == false: true if
+                              // intentionally unsupported, false if failed
+    u32 output_bytes;         // response bytes submitted for a replayed entry
+    u32 backend_completions;  // synthetic completions dispatched by this replay
 };
 
 // Summary of a full replay session.
@@ -141,6 +143,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    result.backend_completions += n;
 
     Connection* conn = nullptr;
     for (u32 i = 0; i < Loop::kMaxConns; i++) {
@@ -164,6 +167,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     loop.backend.inject(recv_ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    result.backend_completions += n;
 
     // Step 4: Proxy/forward routes are not replayable here. The replay
     // harness validates static response decisions only; proxy routes
@@ -190,9 +194,11 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
         return result;
     }
     const u16 actual_status = conn->resp_status;
+    result.output_bytes = send_len;
     const u32 conn_id = conn->id;
     IoEvent send_ev = {conn_id, static_cast<i32>(send_len), 0, 0, IoEventType::Send, 0};
     loop.inject_and_dispatch(send_ev);
+    result.backend_completions++;
 
     result.actual_status = actual_status;
     result.status_match = (result.expected_status == result.actual_status);
@@ -201,6 +207,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     // Step 6: Close connection (inject EOF to free slot)
     IoEvent eof_ev = {conn_id, 0, 0, 0, IoEventType::Recv, 0};
     loop.inject_and_dispatch(eof_ev);
+    result.backend_completions++;
 
     return result;
 }

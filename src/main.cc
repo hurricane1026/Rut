@@ -508,6 +508,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         route_config = &program.config;
+        // Loading is side-effect free with respect to live Cache state.
+        // This startup installation is the activation boundary (no shard
+        // exists yet); live reload must pair the same call with its config
+        // swap and RCU lifetime handoff.
+        activate_rut_program(program);
         write_str("Loaded program: ");
         write_str(config_path);
         write_str(" (opt O");
