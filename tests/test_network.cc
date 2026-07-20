@@ -16565,6 +16565,32 @@ TEST(response_headers, forwarded_mutations_remove_matching_connection_nomination
     CHECK(out.find("X-Security: enforced\r\n") != std::string::npos);
 }
 
+TEST(response_headers, forwarded_remove_strips_stale_connection_nomination) {
+    Connection conn;
+    conn.reset();
+    u8 upstream_storage[512]{};
+    u8 header_storage[512]{};
+    conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+    conn.response_header_slice = header_storage;
+    conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: keep-alive, X-Internal\r\n"
+        "X-Internal: secret\r\n"
+        "\r\n";
+    conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
+    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
+    mutation.name = {"X-Internal", 10};
+
+    REQUIRE(build_h1_forward_response_headers(conn, sizeof(response) - 1, false));
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK(out.find("Connection: keep-alive\r\n") != std::string::npos);
+    CHECK(out.find("X-Internal") == std::string::npos);
+}
+
 TEST(response_headers, forwarded_add_drops_upstream_connection_nominated_field) {
     Connection conn;
     conn.reset();

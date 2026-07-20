@@ -1665,8 +1665,13 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
     };
     auto nominated_mutation = [&](const u8* token, u32 token_len) {
         for (u32 i = 0; i < conn.resp_header_mutation_count; i++) {
-            if (!response_mutation_survives(conn, i)) continue;
             const auto& mutation = conn.resp_header_mutations[i];
+            // A final Remove has no emitted mutation, but it still removes the
+            // upstream field named by this Connection option. Strip that stale
+            // nomination along with nominations for surviving Set/Add entries.
+            if (mutation.mode != Connection::RespHeaderMutationMode::Remove &&
+                !response_mutation_survives(conn, i))
+                continue;
             if (http_header_name_eq_ci(reinterpret_cast<const char*>(token),
                                        token_len,
                                        mutation.name.ptr,

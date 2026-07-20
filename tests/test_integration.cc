@@ -12299,9 +12299,8 @@ TEST(shard, serves_http2_request_body_with_synthesized_content_length) {
     close(lfd);
 }
 
-// A handler that does not read req.body must be able to reject an upload from
-// HEADERS alone. The client intentionally stalls before sending any DATA; waiting
-// for END_STREAM here would delay the 401 indefinitely and occupy pending_stream.
+// A handler that does not read req.body can reject an open request from HEADERS
+// alone when the client did not declare a Content-Length.
 TEST(shard, serves_http2_body_agnostic_jit_before_body_end) {
     using namespace rut;
 
@@ -12331,9 +12330,8 @@ TEST(shard, serves_http2_body_agnostic_jit_before_body_end) {
         {{":scheme", 7}, {"http", 4}},
         {{":path", 5}, {"/upload", 7}},
         {{":authority", 10}, {"localhost", 9}},
-        {{"content-length", 14}, {"4", 1}},
     };
-    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 5, /*end_stream=*/false);
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
     REQUIRE(write_all_fd(c, out, n));
 
     u8 resp[4096];
@@ -12454,6 +12452,55 @@ TEST(shard, serves_http2_large_body_for_jit_that_ignores_body) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, rejects_http2_content_length_mismatch_on_body_agnostic_jit_route) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/upload", 'G', &h2_ignore_body_handler, /*needs_req_body=*/false));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/false);
+    n += http2_write_data(out + n, 1, reinterpret_cast<const u8*>("abc"), 3, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 400u);
 
     close(c);
     shard.stop();

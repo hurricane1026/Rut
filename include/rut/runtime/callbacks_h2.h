@@ -1041,11 +1041,11 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            // Only body-reading handlers need to wait for END_STREAM. A
-            // body-agnostic handler can reject an upload immediately; pass the
-            // open-body state into h2_invoke_emit so a Forward outcome is still
-            // rejected before opening an h1 upstream.
-            if (!end_stream && route->needs_req_body) {
+            // A declared Content-Length must be validated at END_STREAM even
+            // when the handler does not read req.body. Such handlers still
+            // avoid buffering DATA; requests without a declared length retain
+            // the immediate body-agnostic dispatch path below.
+            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
