@@ -235,6 +235,37 @@ struct ForLoopCtx {
     FixedVec<LocalBinding, HirRoute::kMaxLocals> locals;
 };
 
+static const HirExpr* find_unsupported_admin_expr(const HirExpr* expr) {
+    if (expr == nullptr) return nullptr;
+    if (expr->kind == HirExprKind::StatsSnapshot || expr->kind == HirExprKind::MetricsSnapshot ||
+        expr->kind == HirExprKind::AdminJson || expr->kind == HirExprKind::AdminReload ||
+        expr->kind == HirExprKind::AdminUpstreamMark)
+        return expr;
+    if (const auto* found = find_unsupported_admin_expr(expr->lhs)) return found;
+    if (const auto* found = find_unsupported_admin_expr(expr->rhs)) return found;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (const auto* found = find_unsupported_admin_expr(expr->args[ai])) return found;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (const auto* found = find_unsupported_admin_expr(expr->field_inits[fi].value))
+            return found;
+    return nullptr;
+}
+
+static FrontendResult<void> reject_route_admin_exprs_before_mir(const HirRoute& route) {
+    const HirExpr* found = nullptr;
+    for (u32 ei = 0; ei < route.exprs.len && found == nullptr; ei++)
+        found = find_unsupported_admin_expr(&route.exprs[ei]);
+    for (u32 li = 0; li < route.locals.len && found == nullptr; li++)
+        found = find_unsupported_admin_expr(&route.locals[li].init);
+    if (found != nullptr)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            found->span,
+            lit_str("control-plane builtin is declared and type-checked, but runtime lowering "
+                    "is not connected yet"));
+    return {};
+}
+
 static FrontendResult<MirValue> mir_value(const HirExpr& expr,
                                           const HirModule& module,
                                           MirFunction* fn,
@@ -1080,6 +1111,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
     }
 
     for (u32 i = 0; i < module.routes.len; i++) {
+        auto admin_preflight = reject_route_admin_exprs_before_mir(module.routes[i]);
+        if (!admin_preflight) return core::make_unexpected(admin_preflight.error());
 #if RUT_ENABLE_WEBSOCKET
         // WebSocket terminate-mode frame handlers don't go through the HTTP MIR/RIR pipeline —
         // a constant verdict needs no request parsing / response building / state machine. The

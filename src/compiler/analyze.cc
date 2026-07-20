@@ -384,6 +384,8 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Stats:
+        case HirTypeKind::Metrics:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
             return true;
@@ -2047,6 +2049,10 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     return HirTypeKind::Unknown;
 }
 
+static bool is_reserved_snapshot_type_name(Str name) {
+    return name.eq({"Stats", 5}) || name.eq({"Metrics", 7});
+}
+
 static bool ast_type_ref_contains_response(const AstTypeRef& ref) {
     if (!ref.is_tuple && ref.namespace_name.len == 0 && ref.name.eq({"Response", 8})) return true;
     const u32 arg_count =
@@ -3564,14 +3570,75 @@ static bool hir_contains_admin_effect(const HirExpr* expr) {
     return false;
 }
 
-static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route) {
-    if (!route.is_ws_terminate) return {};
-    for (u32 li = 0; li < route.locals.len; li++) {
-        if (hir_contains_admin_effect(&route.locals[li].init))
+static bool hir_references_local(const HirExpr* expr, u32 ref_index) {
+    if (expr == nullptr) return false;
+    if (expr->kind == HirExprKind::LocalRef && expr->local_index == ref_index) return true;
+    if (hir_references_local(expr->lhs, ref_index) || hir_references_local(expr->rhs, ref_index))
+        return true;
+    for (u32 ai = 0; ai < expr->args.len; ai++)
+        if (hir_references_local(expr->args[ai], ref_index)) return true;
+    for (u32 fi = 0; fi < expr->field_inits.len; fi++)
+        if (hir_references_local(expr->field_inits[fi].value, ref_index)) return true;
+    return false;
+}
+
+static FrontendResult<void> reject_unretained_helper_admin_locals(const HirRoute& scratch,
+                                                                  const HirExpr& body,
+                                                                  Span span) {
+    const auto is_retained_statement_effect = [](HirExprKind kind) {
+        return kind == HirExprKind::CacheSet || kind == HirExprKind::ReqSetHeader ||
+               kind == HirExprKind::ReqAddHeader || kind == HirExprKind::RespSetHeader ||
+               kind == HirExprKind::RespAddHeader || kind == HirExprKind::RespRemoveHeader ||
+               kind == HirExprKind::AdminReload || kind == HirExprKind::AdminUpstreamMark;
+    };
+    bool live[HirRoute::kMaxLocals]{};
+    for (u32 li = 0; li < scratch.locals.len; li++) {
+        const u32 ref_index = scratch.locals[li].ref_index;
+        live[li] = is_retained_statement_effect(scratch.locals[li].init.kind) ||
+                   hir_references_local(&body, ref_index);
+        for (u32 gi = 0; gi < scratch.guards.len && !live[li]; gi++) {
+            const auto& guard = scratch.guards[gi];
+            live[li] = hir_references_local(&guard.cond, ref_index) ||
+                       (guard.fail_term.runtime_response_body_local_ref_index == ref_index);
+        }
+    }
+    for (u32 pass = 0; pass < scratch.locals.len; pass++) {
+        bool changed = false;
+        for (u32 li = 0; li < scratch.locals.len; li++) {
+            if (!live[li]) continue;
+            for (u32 dep = 0; dep < scratch.locals.len; dep++) {
+                if (!live[dep] &&
+                    hir_references_local(&scratch.locals[li].init, scratch.locals[dep].ref_index)) {
+                    live[dep] = true;
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) break;
+    }
+    for (u32 li = 0; li < scratch.locals.len; li++)
+        if (!live[li] && hir_contains_admin_effect(&scratch.locals[li].init))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
-                route.locals[li].span,
-                lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+                scratch.locals[li].span,
+                lit_str("control-plane expressions in helper locals must be retained by the "
+                        "helper result or response guard"));
+    return {};
+}
+
+static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route,
+                                                           const HirModule& mod) {
+    if (!route.is_ws_terminate) return {};
+    const auto reject = [&](Span span) -> FrontendResult<void> {
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            span,
+            lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+    };
+    for (u32 ei = 0; ei < route.exprs.len; ei++)
+        if (hir_contains_admin_effect(&route.exprs[ei])) return reject(route.exprs[ei].span);
+    for (u32 li = 0; li < route.locals.len; li++) {
+        if (hir_contains_admin_effect(&route.locals[li].init)) return reject(route.locals[li].span);
     }
     auto terminator_has_snapshot_body = [](const HirTerminator& term) {
         return term.runtime_response_body_type == HirTypeKind::Stats ||
@@ -3579,23 +3646,32 @@ static FrontendResult<void> reject_websocket_admin_effects(const HirRoute& route
     };
     for (u32 gi = 0; gi < route.guards.len; gi++) {
         const auto& guard = route.guards[gi];
-        if (hir_contains_admin_effect(&guard.cond))
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                guard.span,
-                lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+        if (hir_contains_admin_effect(&guard.cond)) return reject(guard.span);
         bool has_snapshot_body = terminator_has_snapshot_body(guard.fail_term);
         if (guard.fail_kind == HirGuard::FailKind::Body) {
+            if (hir_contains_admin_effect(&guard.fail_body.cond)) return reject(guard.span);
+            for (u32 li = 0; li < guard.fail_body.locals.len; li++)
+                if (hir_contains_admin_effect(&guard.fail_body.locals[li].init))
+                    return reject(guard.fail_body.locals[li].span);
             has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.direct_term);
             has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.then_term);
             has_snapshot_body |= terminator_has_snapshot_body(guard.fail_body.else_term);
+        } else if (guard.fail_kind == HirGuard::FailKind::Match) {
+            if (hir_contains_admin_effect(&guard.fail_match_expr)) return reject(guard.span);
+            for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                const u32 arm_index = guard.fail_match_start + ai;
+                if (arm_index >= mod.guard_match_arms.len) return reject(guard.span);
+                const auto& arm = mod.guard_match_arms[arm_index];
+                if (hir_contains_admin_effect(&arm.pattern)) return reject(arm.span);
+                has_snapshot_body |= terminator_has_snapshot_body(arm.direct_term);
+            }
         }
-        if (has_snapshot_body)
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                guard.span,
-                lit_str("control-plane effects are not supported on WebSocket terminate routes"));
+        if (has_snapshot_body) return reject(guard.span);
     }
+    if (route.ws_handler.has_forward_payload &&
+        (route.ws_handler.forward_payload_expr >= route.exprs.len ||
+         hir_contains_admin_effect(&route.exprs[route.ws_handler.forward_payload_expr])))
+        return reject(route.ws_handler.span);
     return {};
 }
 static bool const_eval_expr(
@@ -4128,13 +4204,14 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                 break;
             }
         }
+        const u32 saved_guard_count = route->guards.len;
         auto healthy = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
         if (upstream_index == mod.upstreams.len ||
             (upstream_index < mod.upstreams.len &&
              (!mod.upstreams[upstream_index].has_address ||
               mod.upstreams[upstream_index].extra_count != 0)) ||
             !healthy || healthy->type != HirTypeKind::Bool || healthy->may_nil ||
-            healthy->may_error)
+            healthy->may_error || route->guards.len != saved_guard_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         route->control_plane_stmt_ok = false;
         HirExpr out{};
@@ -5668,6 +5745,12 @@ static FrontendResult<void> instantiate_function_respond_guards(
                                                   generic_bindings,
                                                   generic_binding_count);
             if (!body) return core::make_unexpected(body.error());
+            if (body->kind != HirExprKind::LocalRef && body->kind != HirExprKind::StatsSnapshot &&
+                body->kind != HirExprKind::MetricsSnapshot)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    call_span,
+                    lit_str("dynamic snapshot response bodies must retain a stable operand"));
             guard.fail_term.runtime_response_body_type = body->type;
             if (body->kind == HirExprKind::LocalRef)
                 guard.fail_term.runtime_response_body_local_ref_index = body->local_index;
@@ -9302,7 +9385,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // the fallback operand is EAGERLY evaluated, so a presence test
         // inside it must be kept (it consumes its carrier's runtime error).
         if (!lhs->may_nil && !lhs->may_error && !rhs->may_error &&
-            !hir_contains_fallible_has_value(rhs)) {
+            !hir_contains_fallible_has_value(rhs) && !hir_contains_admin_effect(rhs)) {
             HirExpr folded = *lhs;
             folded.span = expr.span;
             return folded;
@@ -9445,7 +9528,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // Same eager-evaluation rule as any(): dropping the never-missing
         // lhs must not discard a presence test it contains.
         if (!lhs->may_nil && !lhs->may_error && !rhs->may_error &&
-            !hir_contains_fallible_has_value(lhs)) {
+            !hir_contains_fallible_has_value(lhs) && !hir_contains_admin_effect(lhs)) {
             HirExpr folded = *rhs;
             folded.span = expr.span;
             return folded;
@@ -10483,38 +10566,41 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, kReturnBodyExprDetail);
                 const AstExpr& body_arg = *stmt.expr.args[0];
-                if (body_arg.kind == AstExprKind::Ident || body_arg.kind == AstExprKind::Call) {
-                    // Use the ordinary expression analyzer so helper-returned
-                    // snapshots behave exactly like json(snapshot()) in a let.
-                    // A fallback scratch arena owns only transient expression
-                    // nodes; keep this large fixed-capacity route off the
-                    // compiler worker stack.
-                    std::unique_ptr<HirRoute> body_scratch;
-                    HirRoute* body_route = runtime_body_route;
-                    if (body_route == nullptr) {
-                        body_scratch = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
-                        if (!body_scratch)
-                            return frontend_error(FrontendError::OutOfMemory, body_arg.span);
-                        body_scratch->is_helper_scratch = true;
-                        body_route = body_scratch.get();
-                    }
-                    const bool saved_allow_respond_effects = body_route->allow_respond_effects;
-                    if (runtime_body_route != nullptr) body_route->allow_respond_effects = true;
-                    auto snapshot =
-                        analyze_expr(body_arg, body_route, mod, locals, local_count, binding);
-                    body_route->allow_respond_effects = saved_allow_respond_effects;
-                    const bool stable_snapshot_operand =
-                        snapshot && (snapshot->kind == HirExprKind::LocalRef ||
-                                     snapshot->kind == HirExprKind::StatsSnapshot ||
-                                     snapshot->kind == HirExprKind::MetricsSnapshot);
-                    if (stable_snapshot_operand &&
-                        (snapshot->type == HirTypeKind::Stats ||
-                         snapshot->type == HirTypeKind::Metrics) &&
-                        !snapshot->may_nil && !snapshot->may_error) {
-                        term.runtime_response_body_type = snapshot->type;
-                        if (snapshot->kind == HirExprKind::LocalRef)
-                            term.runtime_response_body_local_ref_index = snapshot->local_index;
-                    }
+                // Probe every expression shape through the ordinary analyzer;
+                // pipelines and other normalized forms can resolve to the same
+                // stable snapshot operands as direct calls and identifiers.
+                std::unique_ptr<HirRoute> body_scratch;
+                HirRoute* body_route = runtime_body_route;
+                if (body_route == nullptr) {
+                    body_scratch = std::unique_ptr<HirRoute>(new (std::nothrow) HirRoute{});
+                    if (!body_scratch)
+                        return frontend_error(FrontendError::OutOfMemory, body_arg.span);
+                    body_scratch->is_helper_scratch = true;
+                    body_route = body_scratch.get();
+                }
+                const u32 saved_exprs = body_route->exprs.len;
+                const u32 saved_guards = body_route->guards.len;
+                const u32 saved_locals = body_route->locals.len;
+                const bool saved_allow_respond_effects = body_route->allow_respond_effects;
+                if (runtime_body_route != nullptr) body_route->allow_respond_effects = true;
+                auto snapshot =
+                    analyze_expr(body_arg, body_route, mod, locals, local_count, binding);
+                body_route->allow_respond_effects = saved_allow_respond_effects;
+                const bool stable_snapshot_operand =
+                    snapshot && (snapshot->kind == HirExprKind::LocalRef ||
+                                 snapshot->kind == HirExprKind::StatsSnapshot ||
+                                 snapshot->kind == HirExprKind::MetricsSnapshot);
+                if (stable_snapshot_operand &&
+                    (snapshot->type == HirTypeKind::Stats ||
+                     snapshot->type == HirTypeKind::Metrics) &&
+                    !snapshot->may_nil && !snapshot->may_error) {
+                    term.runtime_response_body_type = snapshot->type;
+                    if (snapshot->kind == HirExprKind::LocalRef)
+                        term.runtime_response_body_local_ref_index = snapshot->local_index;
+                } else {
+                    body_route->exprs.len = saved_exprs;
+                    body_route->guards.len = saved_guards;
+                    body_route->locals.len = saved_locals;
                 }
                 if (term.runtime_response_body_type == HirTypeKind::Unknown) {
                     std::string serialized;
@@ -15771,6 +15857,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Protocol) continue;
+        if (is_reserved_snapshot_type_name(item.protocol.name))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.protocol.span, item.protocol.name);
         if (find_protocol_index(mod, item.protocol.name) < mod.protocols.len)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.protocol.span, item.protocol.name);
@@ -15809,7 +15898,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Struct) continue;
-        if (item.struct_decl.name.eq({"Error", 5}))
+        if (item.struct_decl.name.eq({"Error", 5}) ||
+            is_reserved_snapshot_type_name(item.struct_decl.name))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.struct_decl.span, item.struct_decl.name);
         if (find_struct_index(mod, item.struct_decl.name) != mod.structs.len)
@@ -15826,6 +15916,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::Variant) continue;
+        if (is_reserved_snapshot_type_name(item.variant.name))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.variant.span, item.variant.name);
         if (find_variant_index(mod, item.variant.name) != mod.variants.len)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, item.variant.span, item.variant.name);
@@ -15840,7 +15933,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
     for (u32 i = 0; i < file.items.len; i++) {
         const auto& item = file.items[i];
         if (item.kind != AstItemKind::TypeAlias) continue;
-        if (find_type_alias(mod, item.type_alias.name) != nullptr ||
+        if (is_reserved_snapshot_type_name(item.type_alias.name) ||
+            find_type_alias(mod, item.type_alias.name) != nullptr ||
             find_struct_index(mod, item.type_alias.name) < mod.structs.len ||
             find_variant_index(mod, item.type_alias.name) < mod.variants.len ||
             find_protocol_index(mod, item.type_alias.name) < mod.protocols.len)
@@ -17118,6 +17212,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (scratch->guards.len != 0 && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax, ast_func.body->span);
+        auto retained_admin =
+            reject_unretained_helper_admin_locals(*scratch, body.value(), ast_func.body->span);
+        if (!retained_admin) return core::make_unexpected(retained_admin.error());
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
@@ -18722,6 +18819,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (scratch.guards.len != 0 && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax, item.func.body->span);
+        auto retained_admin =
+            reject_unretained_helper_admin_locals(scratch, body.value(), item.func.body->span);
+        if (!retained_admin) return core::make_unexpected(retained_admin.error());
         HirLocal all_locals[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
         u32 all_local_count = 0;
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
@@ -19756,7 +19856,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             break;
         }
 
-        auto ws_admin_ok = reject_websocket_admin_effects(route);
+        auto ws_admin_ok = reject_websocket_admin_effects(route, mod);
         if (!ws_admin_ok) return core::make_unexpected(ws_admin_ok.error());
 
         bool has_chain_after_response_effects = false;
@@ -20546,7 +20646,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // WebSocket check. Revalidate the completed route so an inlined
         // snapshot/control-plane expression cannot be skipped by MIR's
         // terminate-mode WebSocket path.
-        ws_admin_ok = reject_websocket_admin_effects(route);
+        ws_admin_ok = reject_websocket_admin_effects(route, mod);
         if (!ws_admin_ok) return core::make_unexpected(ws_admin_ok.error());
 
         // Decorator guards must run BEFORE any user-written top-level guard so a
