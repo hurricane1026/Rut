@@ -373,8 +373,17 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     }
     out.response_header_count = execution.frame.context.response_header_count;
     out.response_header_overflow = execution.frame.context.response_header_overflow;
-    for (u32 i = 0; i < out.response_header_count; i++)
+    for (u32 i = 0; i < out.response_header_count; i++) {
         out.response_header_mutations[i] = execution.frame.context.response_header_mutations[i];
+        auto& mutation = out.response_header_mutations[i];
+        if (mutation.value.len > jit::kMaxResponseBodyMutationBytes) {
+            out.response_header_overflow = true;
+            mutation.value = {};
+        } else if (mutation.value.len != 0 && mutation.value.ptr != nullptr) {
+            __builtin_memcpy(out.response_header_values[i], mutation.value.ptr, mutation.value.len);
+            mutation.value.ptr = out.response_header_values[i];
+        }
+    }
     if (!publisher.emit(ObservationKind::HandlerTerminated,
                         static_cast<u64>(result.action),
                         result.action == jit::HandlerAction::ReturnStatus ? result.status_code

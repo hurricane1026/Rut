@@ -140,6 +140,10 @@ void rut_helper_parse_prime(const rut::u8* req_data, rut::u32 req_len);
 // call before each terminal return of a request-reading handler.
 void rut_helper_parse_unprime();
 
+// Reset reusable-Json capture storage at every handler invocation, including
+// request-independent handlers that do not call parse_prime.
+void rut_helper_json_capture_reset();
+
 // Bounded per-shard JSON response serializer. reset starts one document;
 // append_* are no-ops after overflow; finish publishes an all-or-nothing view
 // through HandlerCtx. raw is compiler-owned JSON punctuation/key text only.
