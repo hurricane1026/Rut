@@ -101,10 +101,11 @@ struct Http2Conn {
     Http2Stream streams[kMaxStreams];
     u32 nstreams;
 
-    // Pending request awaiting DATA frames. For body-reading handlers the
-    // serving layer appends DATA after synthesized HTTP/1 request headers; for
-    // routes that only need Content-Length validation it keeps only the headers
-    // and counts DATA bytes. One at a time for now: pending_stream == 0 means none.
+    // Pending request awaiting DATA frames. JIT handlers retain DATA after the
+    // synthesized HTTP/1 headers because their terminal action may select a
+    // buffered forward even when the handler never reads req.body itself. Other
+    // routes may count only for Content-Length validation. One at a time for now:
+    // pending_stream == 0 means none.
     // A route snapshot is captured at END_HEADERS so delayed DATA handling does not
     // re-match if config swaps between HEADERS and DATA.
     static constexpr u32 kBodySynthCap = 16384;
@@ -115,6 +116,7 @@ struct Http2Conn {
     u32 pending_content_length;
     bool pending_has_content_length;
     bool pending_buffer_body;
+    bool pending_request_forwardable;
     bool pending_overflow;  // body exceeded kBodySynthCap → respond 413
     // Snapshot of matched route decisions at END_HEADERS time for deferred
     // requests. This keeps delayed DATA handlers stable when config changes
@@ -174,6 +176,7 @@ struct Http2Conn {
     u16 async_upstream_id;
     bool async_apply_response_mutations;
     bool async_capture_response;
+    bool async_request_forwardable;
     u32 async_resp_len;
 
     jit::HandlerCtx* async_jit_ctx() {

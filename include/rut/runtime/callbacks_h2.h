@@ -227,6 +227,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_content_length = 0;
     h2.pending_has_content_length = false;
     h2.pending_buffer_body = false;
+    h2.pending_request_forwardable = false;
     h2.pending_overflow = false;
     h2.pending_route_config = nullptr;
     h2.pending_route = nullptr;
@@ -320,6 +321,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     h2->pending_content_length = req.content_length;
     h2->pending_has_content_length = req.has_content_length;
     h2->pending_buffer_body = buffer_body;
+    h2->pending_request_forwardable = h2_proxy_request_forwardable(headers, nheaders);
     h2->pending_overflow = false;
     h2->pending_route_config = route_config;
     h2->pending_route = route;
@@ -496,6 +498,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_upstream_id = 0;
     h2.async_apply_response_mutations = false;
     h2.async_capture_response = false;
+    h2.async_request_forwardable = false;
     h2.async_resp_len = 0;
 }
 
@@ -594,7 +597,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       const JitDispatchOutcome& o,
                       const RouteConfig* cfg,
                       const u8* synth,
-                      u32 synth_len) {
+                      u32 synth_len,
+                      bool request_forwardable) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
@@ -615,6 +619,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_timer_ms = o.timer_ms;
     h2->async_fn = fn;
     h2->async_state = static_cast<u16>(o.next_state);
+    h2->async_request_forwardable = request_forwardable;
     return true;
 }
 
@@ -670,7 +675,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 param_count,
                     const RouteConfig* cfg,
                     const u8* synth,
-                    u32 synth_len) {
+                    u32 synth_len,
+                    bool request_forwardable) {
     auto* ctx = d.conn->reset_jit_ctx();
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
@@ -681,13 +687,25 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
-        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len))
+        if (!h2_suspend_timer(d,
+                              stream_id,
+                              route->fn,
+                              *ctx,
+                              kOutcome,
+                              cfg,
+                              synth,
+                              synth_len,
+                              request_forwardable))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
         kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
         const bool capture = kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture;
+        if (!request_forwardable) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
         if (!h2_suspend_proxy(d,
                               stream_id,
                               cfg,
@@ -719,10 +737,23 @@ template <typename Loop>
 void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     Http2Conn* h2 = d.conn->h2;
     if (h2->pending_overflow) {
-        const bool kBuffered = h2->pending_buffer_body;
-        h2_clear_pending(*h2);
-        h2_emit_status(d, stream_id, kBuffered ? 413 : 400);
-        return;
+        // A body-independent JIT handler may still return a local response even
+        // when the request body is too large to retain for a later buffered
+        // forward. Discard the partial body and run it against the synthesized
+        // headers; mark the request non-forwardable so a buffered/capture
+        // terminal fails closed instead of silently forwarding a prefix.
+        if (h2->pending_route_action == RouteAction::JitHandler &&
+            h2->pending_route != nullptr && !h2->pending_route->needs_req_body) {
+            h2->pending_synth_len = h2->pending_body_start;
+            h2->pending_buffer_body = false;
+            h2->pending_request_forwardable = false;
+            h2->pending_overflow = false;
+        } else {
+            const bool kBuffered = h2->pending_buffer_body;
+            h2_clear_pending(*h2);
+            h2_emit_status(d, stream_id, kBuffered ? 413 : 400);
+            return;
+        }
     }
     // A client-supplied Content-Length must equal the actual DATA octet count,
     // for every deferred action — not just body-reading handlers.
@@ -761,6 +792,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const RouteEntry* route = h2->pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
     const u32 kRouteParamCount = h2->pending_route_param_count;
+    const bool kRequestForwardable = h2->pending_request_forwardable;
     RouteParam route_params[kMaxRouteParams];
     for (u32 i = 0; i < kRouteParamCount; i++) {
         const H2RouteParam& p = h2->pending_route_params[i];
@@ -776,7 +808,15 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen);
+    h2_invoke_emit(d,
+                   stream_id,
+                   route,
+                   route_params,
+                   kRouteParamCount,
+                   cfg,
+                   synth,
+                   kLen,
+                   kRequestForwardable);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -914,16 +954,16 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            // Defer when a body still follows: needs_req_body handlers wait to
-            // read it; others wait only to consume / validate a declared
-            // Content-Length. buffer_body decides whether DATA is accumulated.
-            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
+            // A JIT route may select buffered forwarding even when it does not
+            // read req.body itself. Preserve all DATA until the handler's
+            // terminal action is known so forwarding cannot drop the payload.
+            if (!end_stream) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
                                         nheaders,
                                         req,
-                                        /*buffer_body=*/route->needs_req_body,
+                                        /*buffer_body=*/true,
                                         RouteAction::JitHandler,
                                         config,
                                         route,
@@ -946,7 +986,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 return;
             }
             h2_invoke_emit(
-                d, stream_id, route, anchored_params, param_count, config, synth, kSynthLen);
+                d,
+                stream_id,
+                route,
+                anchored_params,
+                param_count,
+                config,
+                synth,
+                kSynthLen,
+                h2_proxy_request_forwardable(headers, nheaders));
             return;
         }
         case RouteAction::Proxy:
@@ -1010,9 +1058,9 @@ void h2_on_headers_cb(
     h2_dispatch_request(*d, stream_id, hs, n, end);
 }
 
-// DATA frames for a deferred request: count every body octet, append only when
-// the matched handler reads req.body, and finalize at END_STREAM. DATA for any
-// other stream is ignored (flow control already ran).
+// DATA frames for a deferred request: count every body octet and append when the
+// matched JIT route may need to expose or forward it, then finalize at END_STREAM.
+// DATA for any other stream is ignored (flow control already ran).
 template <typename Loop>
 void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
@@ -1291,7 +1339,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered &&
+        h2->async_request_forwardable) {
         h2->async_kind = H2AsyncKind::Proxy;
         h2->async_upstream_id = kOutcome.upstream_id;
         h2->async_apply_response_mutations = true;
@@ -1300,7 +1349,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }
-    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
+    if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture &&
+        h2->async_request_forwardable) {
         h2->async_kind = H2AsyncKind::Proxy;
         h2->async_upstream_id = kOutcome.upstream_id;
         h2->async_apply_response_mutations = false;
@@ -1316,6 +1366,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
+    } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
+               kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
+        h2_emit_status(d, kStreamId, 400);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
     }

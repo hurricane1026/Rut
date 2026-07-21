@@ -13,6 +13,7 @@
 #include "rut/runtime/prometheus.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/rate_limit_enforce.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/slice_pool.h"   // SlicePool::kSliceSize (terminate reassembly cap)
 #include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
@@ -488,7 +489,9 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 header_count,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase = false,
-                                           bool preserve_content_length = false);
+                                           bool preserve_content_length = false,
+                                           u32 content_length_override = 0xffffffffu,
+                                           bool omit_content_length = false);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1538,6 +1541,29 @@ inline bool collect_effective_response_headers(const jit::HandlerCtx* response_c
     return apply_response_header_mutations(response_ctx, out, capacity, out_count);
 }
 
+inline bool snapshot_buffered_response_mutation_views(Connection& conn) {
+    auto* ctx = conn.jit_ctx();
+    if (ctx->response_header_count > jit::kMaxResponseHeaderMutations) return false;
+    const auto source_begin = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
+    const u32 source_len = conn.recv_buf.len();
+    auto snapshot = [&](Str& view) {
+        if (view.ptr == nullptr || view.len == 0) return true;
+        const auto ptr = reinterpret_cast<uintptr_t>(view.ptr);
+        if (ptr < source_begin || ptr - source_begin > source_len ||
+            view.len > source_len - (ptr - source_begin))
+            return true;
+        const char* stable = jit::snapshot_response_body(ctx, view.ptr, view.len);
+        if (stable == nullptr) return false;
+        view.ptr = stable;
+        return true;
+    };
+    for (u32 i = 0; i < ctx->response_header_count; i++) {
+        auto& mutation = ctx->response_header_mutations[i];
+        if (!snapshot(mutation.name) || !snapshot(mutation.value)) return false;
+    }
+    return true;
+}
+
 template <typename Loop>
 void handle_jit_outcome(Loop* loop,
                         Connection& conn,
@@ -1897,6 +1923,16 @@ void handle_jit_outcome(Loop* loop,
             if (capture) conn.handler_state = outcome.next_state;
             conn.proxy_response_buffered = outcome.kind != JitDispatchOutcome::Kind::Forward;
             conn.proxy_response_capture = capture;
+            if (conn.proxy_response_buffered &&
+                !snapshot_buffered_response_mutation_views(conn)) {
+                abandon_capture();
+                conn.resp_status = 500;
+                conn.keep_alive = false;
+                format_static_response(conn, 500, false);
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
             // pick up a post-swap config whose upstream table doesn't
@@ -4707,8 +4743,10 @@ void finish_buffered_forward(Loop* loop,
         body = response_ctx->response_body_mutation_storage;
         body_len = response_ctx->response_body_mutation_len;
     }
-    const bool no_body = status < 200 || status == 204 || status == 205 || status == 304 ||
-                         is_head;
+    const u32 representation_body_len = body_len;
+    const bool status_forbids_body =
+        status < 200 || status == 204 || status == 205 || status == 304;
+    const bool no_body = status_forbids_body || is_head;
     if (no_body) body_len = 0;
 
     conn.proxy_response_buffered = false;
@@ -4722,7 +4760,11 @@ void finish_buffered_forward(Loop* loop,
         header_count,
         conn.keep_alive,
         false,
-        is_head);
+        is_head && !response_ctx->response_body_mutation_set && !status_forbids_body,
+        is_head && response_ctx->response_body_mutation_set && !status_forbids_body
+            ? representation_body_len
+            : 0xffffffffu,
+        status_forbids_body);
     conn.resp_body_sent = conn.send_buf.len();
     conn.upstream_send_len = conn.upstream_recv_buf.len();
     conn.proxy_resp_started = true;

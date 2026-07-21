@@ -867,6 +867,45 @@ TEST(harness_scenario, dynamic_json_overflow_has_deterministic_500_observation) 
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, dynamic_json_failure_preserves_committed_body_mutation) {
+    std::string source =
+        "func rewrite(_ resp: Response) -> i32 { resp.body = \"fallback\" 0 }\n"
+        "chain rewrite_chain { after rewrite(resp) }\n"
+        "route GET \"/x\" use chain rewrite_chain { return 200, json({ path: req.path, value: \"";
+    source.append(jit::kMaxDynamicJsonResponseBytes, 'x');
+    source += "\" }) }\n";
+    TempSource file;
+    REQUIRE(file.write(source.c_str()));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({file.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    const char request[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/x", 2};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+
+    ResponseBodyObservation observed{};
+    auto spec = scripted_scenario_harness();
+    spec.required_capabilities =
+        harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations = {&observed, &capture_response_body_observation};
+    const auto result = harness::drive_scenario(scenario, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(result.terminal.status_code, 500);
+    REQUIRE(observed.seen);
+    CHECK_EQ(observed.full_len, 8u);
+    CHECK_EQ(observed.copied_len, 8u);
+    CHECK(__builtin_memcmp(observed.bytes, "fallback", 8) == 0);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, reusable_json_body_mutation_survives_resume) {
     TempSource source;
     REQUIRE(source.write(
