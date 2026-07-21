@@ -280,9 +280,13 @@ route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
 }
 
-@rateLimit(limit: 1000, window: 1m, scope: global) // retain for an exact cross-shard cap
+@rateLimit(limit: 1000, window: 1m, scope: global) // compatibility escape: exact cross-shard cap
 route POST "/form" { return 204 }
 ```
+
+The global decorator above is the documented generated-profile compatibility
+escape for an exact process-wide cap; no Core state spelling preserves that
+behavior. Non-IP or composite `by:` keys require the same escape.
 
 The shipped parser accepts repeated top-level `route METHOD "pattern"`
 declarations. Rut Core also accepts a literal-entry `route { ... }` group when
@@ -379,13 +383,13 @@ route GET "/api" {                                   // GCRA token bucket
 }
 ```
 
-For equivalent shard-scoped parameters, this matches shard-local `@rateLimit`,
-including leaving TAT unchanged after a rejection (verified by JIT execution
-tests). It does not replace `scope: global`: retain that compatibility decorator
-for the process-shared exact cross-shard cap. Move the set to
-the leading statement region when a deliberately punitive policy should meter
-every attempt. The Rut form also supports custom policies such as per-tier
-limits and composite conditions. See
+For equivalent IP-only shard-scoped parameters, this matches shard-local
+`@rateLimit`, including leaving TAT unchanged after a rejection (verified by
+JIT execution tests). It does not replace `scope: global` or a non-IP/composite
+`by:` key: retain the compatibility decorator for those policies. Move the set
+to the leading statement region when a deliberately punitive policy should
+meter every attempt. The Rut form also supports custom IP-keyed policies such
+as per-tier limits and composite conditions. See
 examples/ratelimit.rut for the packed fixed-window variant, which permits
 boundary bursts and is not a sliding-window limit.
 

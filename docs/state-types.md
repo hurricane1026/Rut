@@ -22,9 +22,10 @@ out of scope until a strict table + owner-shard atomic update exist
 fixed window, and gauge logic are `.rut` library code
 (`examples/ratelimit.rut`). `Counter<K>` is deleted from the taxonomy;
 Compatibility `@rateLimit`/`@throttle` remain accepted. Generated Rut Core may
-use explicit policy code for shard-scoped limits, but global-scope
-`@rateLimit` must stay on the compatibility path because per-shard lossy `Cache`
-cannot preserve one exact process-wide cap.
+use explicit policy code for IP-only shard-scoped limits. Global-scope and
+non-IP/composite-key `@rateLimit` must stay on the compatibility path because
+per-shard lossy `Cache<IP, i64>` cannot preserve an exact process-wide cap or
+those keying policies.
 
 ## D2. The fixed-capacity axiom, and why the type is named `Cache`
 

@@ -8,9 +8,10 @@ the parser does not make a spelling part of the stable core.
 
 - **Core**: recommended for new and generated code; has one canonical spelling,
   deterministic lowering, and runtime or frontend coverage.
-- **Compatibility**: accepted for existing human-written programs, but not used
-  in generated examples. It must lower to core machinery or have an explicit
-  source migration.
+- **Compatibility**: accepted for existing human-written programs. Generated
+  code may use it only as a documented semantics-preserving escape when the
+  requested behavior has no Core equivalent; otherwise it must lower to core
+  machinery or have an explicit source migration.
 - **Experimental**: partial or design-only behavior. It may change and must not
   be emitted without a project opting into that exact surface.
 
@@ -36,7 +37,8 @@ host/path grouping surface remain experimental.
 
 ## Canonical Generated Forms
 
-Generated code should use these spellings consistently.
+Generated code should use these spellings consistently, except for the required
+compatibility escapes documented below.
 
 Pipe the whole value through a direct function stage:
 
@@ -74,7 +76,7 @@ protocol method.
 | Existing spelling | Migration |
 |---|---|
 | custom `@auth` decorator | first convert its legacy `i32` status helper to a bool predicate or respond-capable helper, then call that helper from `chain auth` and `use chain auth` |
-| official `@rateLimit` | for shard-scoped rules, spell the policy explicitly with supported rate-limit state/helpers; retain the compatibility decorator for `scope: global` |
+| official `@rateLimit` | for IP-only shard-scoped rules, spell the policy explicitly with supported `Cache<IP, i64>` state/helpers; retain the compatibility decorator for `scope: global` and for non-IP or composite `by:` keys |
 | official `@throttle` | keep the compatibility decorator; no equivalent Core route call exists yet |
 | `any(value, default)` | for a missing-capable receiver with no applicable user `or` member, use `value.or(default)`; otherwise use an explicit presence branch so migration cannot change method dispatch; preserve eager default evaluation |
 | `all(value, next)` | preserve static selection: if `value` is known absent, remove the unevaluated `next`; otherwise evaluate `next` before explicit branching, and inline it only when pure |
@@ -87,6 +89,12 @@ protocol method.
 Official decorators lower to route metadata today; custom route decorators are
 already rejected. The migration target is explicit source, not a second hidden
 middleware model.
+
+The only generated-profile decorator escapes are the documented cases with no
+semantics-preserving Core spelling: `@rateLimit` for an exact global cap or a
+non-IP/composite key, and `@throttle` until a Core route operation exists. Keep
+these official decorators visibly annotated as compatibility. Their use does
+not promote them to Core or permit new generated decorator forms.
 
 Legacy custom decorator helpers use an `i32` convention: zero passes and a
 non-zero value rejects. A `chain before` step does not accept that contract. If
