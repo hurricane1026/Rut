@@ -85,6 +85,8 @@ struct JsonCaptureArena {
     char* data = nullptr;
     u32 used = 0;
     u32 last_capture_len = 0xffffffffu;
+
+    ~JsonCaptureArena() { free(data); }
 };
 thread_local JsonCaptureArena t_json_captures;
 
@@ -174,8 +176,10 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
 }
 
 void rut_helper_json_capture_reset() {
-    free(t_json_captures.data);
-    t_json_captures.data = nullptr;
+    // Keep the thread-local allocation between handler invocations. Captured
+    // views live only for the current invocation, so rewinding is sufficient;
+    // retaining the block avoids a 512 KiB malloc/free cycle on every JSON
+    // request. JsonCaptureArena releases it when the worker thread exits.
     t_json_captures.used = 0;
     t_json_captures.last_capture_len = 0xffffffffu;
 }
