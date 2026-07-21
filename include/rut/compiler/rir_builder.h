@@ -572,8 +572,24 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_req_query_all_array(Str name, SourceLoc loc = {}) {
+        auto* elem = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Array, elem));
+        auto [inst, vid] = TRY(emit(Opcode::ReqQueryAll, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
     Result<ValueId> emit_req_header_all(Str name, SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::StrList));
+        auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
+    Result<ValueId> emit_req_header_all_array(Str name, SourceLoc loc = {}) {
+        auto* elem = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Array, elem));
         auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
         inst->imm.str_val = name;
         return vid;

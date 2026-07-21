@@ -1825,6 +1825,43 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, helper_response_scalar_effects_precede_runtime_reads) {
+    const auto src = R"rut(
+func rewrite() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = rewrite()
+    if status == 201 { return 201 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    TestHandlerCtxFrame frame{};
+    const auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    REQUIRE(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 201u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, request_independent_json_captures_reset_per_invocation) {
     const auto src = R"rut(
 func choose(flag: bool, yes: Json, no: Json) -> Json {
@@ -2076,6 +2113,18 @@ TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) 
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+}
+
+TEST(jit, json_capture_arena_covers_every_route_expression) {
+    static char document[7 * 1024];
+    __builtin_memset(document, 'x', sizeof(document));
+    rut_helper_json_capture_reset();
+    for (u32 i = 0; i < 9; i++) {
+        rut_helper_json_reset();
+        rut_helper_json_append_raw(document, sizeof(document));
+        CHECK(rut_helper_json_capture_data() != nullptr);
+        CHECK_EQ(rut_helper_json_capture_len(), sizeof(document));
+    }
 }
 
 TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {

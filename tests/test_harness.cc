@@ -97,6 +97,15 @@ u64 snapshotted_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void
     return jit::HandlerResult::make_status(200).pack();
 }
 
+u64 long_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    static char value[5000];
+    __builtin_memset(value, 'v', sizeof(value));
+    static constexpr char kName[] = "X-Long";
+    rut_helper_resp_set_header(ctx, kName, sizeof(kName) - 1, value, sizeof(value));
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(200).pack();
+}
+
 u64 timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 25).pack();
@@ -283,6 +292,29 @@ TEST(harness_handler, owns_snapshotted_response_header_values_after_driver_retur
     REQUIRE_EQ(result.response_header_count, 1u);
     CHECK(result.response_header_mutations[0].name.eq({"X-Saved", 7}));
     CHECK(result.response_header_mutations[0].value.eq({"saved-body", 10}));
+}
+
+TEST(harness_handler, owns_long_response_headers_across_result_copies) {
+    harness::HandlerExecution execution{};
+    execution.init(&long_header_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_FALSE(result.response_header_overflow);
+    REQUIRE_EQ(result.response_header_count, 1u);
+    REQUIRE_EQ(result.response_header_mutations[0].value.len, 5000u);
+    CHECK(result.response_header_mutations[0].value.ptr == result.response_header_values[0].data());
+
+    auto copied = result;
+    CHECK(copied.response_header_mutations[0].value.ptr == copied.response_header_values[0].data());
+    CHECK(copied.response_header_mutations[0].value.ptr !=
+          result.response_header_mutations[0].value.ptr);
+    CHECK_EQ(copied.response_header_mutations[0].value.ptr[4999], 'v');
+
+    auto moved = static_cast<harness::HandlerExecutionResult&&>(copied);
+    CHECK(moved.response_header_mutations[0].value.ptr == moved.response_header_values[0].data());
+    CHECK_EQ(moved.response_header_mutations[0].value.ptr[4999], 'v');
 }
 
 TEST(harness_handler, copying_session_clones_mutated_response_body_storage) {
