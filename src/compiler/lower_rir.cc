@@ -3178,6 +3178,31 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
         if (term.has_dynamic_response_body) {
+            constexpr u32 kJsonLocalCount =
+                MirFunction::kMaxLocals + MirTerminator::kMaxJsonMaterializedValues;
+            rir::ValueId json_locals[kJsonLocalCount]{};
+            for (u32 li = 0; li < local_count && li < MirFunction::kMaxLocals; li++)
+                json_locals[li] = locals[li];
+            for (u32 li = 0; li < term.json_locals.len; li++) {
+                const auto& local = term.json_locals[li];
+                if (local.ref_index >= kJsonLocalCount)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                auto value = materialize_value(local.init,
+                                               mir,
+                                               variant_infos,
+                                               tuple_infos,
+                                               tuple_info_count,
+                                               error_scalar_infos,
+                                               error_variant_infos,
+                                               error_struct_infos,
+                                               user_struct_defs,
+                                               b,
+                                               json_locals,
+                                               kJsonLocalCount,
+                                               local.span);
+                if (!value) return core::make_unexpected(value.error());
+                json_locals[local.ref_index] = value.value();
+            }
             if (term.json_segments.len != term.json_value_ref_indices.len + 1 ||
                 !b.emit_json_reset({term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
@@ -3187,11 +3212,12 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     return frontend_error(FrontendError::OutOfMemory, term.span);
                 if (ji >= term.json_value_ref_indices.len) continue;
                 const u32 ref = term.json_value_ref_indices[ji];
-                if (ref >= local_count)
+                if (ref >= kJsonLocalCount)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-                if (locals[ref].id >= fn->value_count || fn->values[locals[ref].id].type == nullptr)
+                if (json_locals[ref].id >= fn->value_count ||
+                    fn->values[json_locals[ref].id].type == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-                const auto value_type = fn->values[locals[ref].id].type->kind;
+                const auto value_type = fn->values[json_locals[ref].id].type->kind;
                 const rir::Opcode op =
                     value_type == rir::TypeKind::Bool      ? rir::Opcode::JsonAppendBool
                     : value_type == rir::TypeKind::I32     ? rir::Opcode::JsonAppendI32
@@ -3201,7 +3227,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     : value_type == rir::TypeKind::Array   ? rir::Opcode::JsonAppendArray
                                                            : rir::Opcode::JsonFinish;
                 if (op == rir::Opcode::JsonFinish ||
-                    !b.emit_json_append(op, locals[ref], {term.span.line, term.span.col}))
+                    !b.emit_json_append(op, json_locals[ref], {term.span.line, term.span.col}))
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
             }
             if (!b.emit_json_finish({term.span.line, term.span.col}))
