@@ -8,7 +8,7 @@ Core contract: **Swift-exact or absent** — anything that looks like Swift
 behaves exactly like Swift; near-miss variants do not exist in this language.
 
 **Implementation status**: this card documents the target surface. The
-front-end migration is in progress (TODO.md → "Front-End Migration"); forms
+front-end migration is in progress (TODO.md → "Remaining syntax migration"); forms
 marked ⏳ are specified but **not yet accepted by the current compiler** —
 they fail to compile today rather than misbehave. Everything unmarked works.
 
