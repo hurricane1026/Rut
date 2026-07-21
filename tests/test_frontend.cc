@@ -31638,6 +31638,41 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, runtime_json_terminators_keep_route_context_in_control_flow) {
+    const char* src = R"rut(
+route GET "/if" {
+    if req.http11 {
+        return 200, json({ path: req.path })
+    } else {
+        return 400
+    }
+}
+route GET "/guard" {
+    guard req.http11 else {
+        return 400, json({ path: req.path })
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 2u);
+    CHECK(hir->routes[0].control.then_term.has_dynamic_response_body);
+    REQUIRE_EQ(hir->routes[1].guards.len, 1u);
+    CHECK(hir->routes[1].guards[0].fail_term.has_dynamic_response_body);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
 TEST(frontend, match_arm_runtime_json_rejects_sibling_arm_locals) {
     const char* src = R"rut(
 route GET "/x" {
