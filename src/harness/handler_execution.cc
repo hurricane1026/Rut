@@ -1,6 +1,7 @@
 #include "rut/harness/handler_execution.h"
 
 #include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/response_body_storage.h"
 
 namespace rut::harness {
 namespace {
@@ -47,8 +48,56 @@ struct EventPublisher {
 
 }  // namespace
 
+HandlerExecution::HandlerExecution(const HandlerExecution& other) {
+    *this = other;
+}
+
+HandlerExecution& HandlerExecution::operator=(const HandlerExecution& other) {
+    if (this == &other) return *this;
+    rut_helper_resp_release_body_storage(&frame.context);
+    frame = other.frame;
+    jit::retain_response_body_snapshot_storage(&frame.context);
+    frame.context.response_body_mutation_storage = nullptr;
+    if (other.frame.context.response_body_mutation_storage != nullptr) {
+        frame.context.response_body_mutation_storage =
+            jit::acquire_response_body_mutation_storage();
+        if (frame.context.response_body_mutation_storage == nullptr) {
+            frame.context.response_body_pending_overflow = true;
+            frame.context.response_body_mutation_overflow = true;
+            frame.context.response_body_pending_len = 0;
+            frame.context.response_body_mutation_len = 0;
+        } else {
+            const u32 copy_len = other.frame.context.response_body_pending_len >
+                                         other.frame.context.response_body_mutation_len
+                                     ? other.frame.context.response_body_pending_len
+                                     : other.frame.context.response_body_mutation_len;
+            if (copy_len > jit::kMaxResponseBodyMutationBytes) {
+                frame.context.response_body_pending_overflow = true;
+                frame.context.response_body_mutation_overflow = true;
+                frame.context.response_body_pending_len = 0;
+                frame.context.response_body_mutation_len = 0;
+            } else if (copy_len != 0) {
+                __builtin_memcpy(frame.context.response_body_mutation_storage,
+                                 other.frame.context.response_body_mutation_storage,
+                                 copy_len);
+            }
+        }
+    }
+    handler = other.handler;
+    connection = other.connection;
+    request_data = other.request_data;
+    request_len = other.request_len;
+    arena = other.arena;
+    return *this;
+}
+
+HandlerExecution::~HandlerExecution() {
+    rut_helper_resp_release_body_storage(&frame.context);
+}
+
 void HandlerExecution::init(
     jit::HandlerFn fn, void* conn, const u8* req_data, u32 req_len, void* scratch_arena) {
+    rut_helper_resp_release_body_storage(&frame.context);
     frame = HandlerFrame{};
     frame.context.state = 0;
     frame.context.handler_idx = 0;
@@ -301,14 +350,21 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     out.has_terminal = true;
     if (result.action == jit::HandlerAction::ReturnStatus &&
         result.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
+        const char* body = nullptr;
         if (response.response_body_mutation_set) {
-            out.dynamic_response_body = response.response_body_mutation_data;
+            body = response.response_body_mutation_storage;
             out.dynamic_response_body_len = response.response_body_mutation_len;
             out.dynamic_response_body_valid = !response.response_body_mutation_overflow;
         } else {
-            out.dynamic_response_body = response.response_body_data;
+            body = response.response_body_data;
             out.dynamic_response_body_len = response.response_body_len;
             out.dynamic_response_body_valid = response.response_body_valid != 0;
+        }
+        if (body == nullptr || out.dynamic_response_body_len > jit::kMaxDynamicResponseBodyBytes) {
+            out.dynamic_response_body_len = 0;
+            out.dynamic_response_body_valid = false;
+        } else if (out.dynamic_response_body_len != 0) {
+            __builtin_memcpy(out.dynamic_response_body, body, out.dynamic_response_body_len);
         }
     }
     out.response_header_count = execution.frame.context.response_header_count;
