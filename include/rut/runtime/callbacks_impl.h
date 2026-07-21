@@ -2559,6 +2559,33 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // forward(set_path:) and forward(set_header:) mutate recv_buf in place. On
     // retry replay the request bytes live in send_buf, while recv_buf may already
     // hold the next pipelined request, so only rewrite the initial forward buffer.
+    const bool rewrite_captured_request =
+        conn.retry_req_send_len == 0 && conn.request_capture_slice != nullptr;
+    u32 parked_recv_len = 0;
+    if (rewrite_captured_request) {
+        parked_recv_len = conn.recv_buf.len();
+        conn.upstream_recv_buf.reset();
+        if (conn.upstream_recv_buf.write(conn.recv_buf.data(), parked_recv_len) !=
+            parked_recv_len) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.recv_buf.reset();
+        if (conn.recv_buf.write(conn.request_capture_slice, conn.request_capture_len) !=
+            conn.request_capture_len) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+    const auto restore_captured_request = [&]() {
+        if (!rewrite_captured_request) return;
+        conn.request_capture_len = conn.recv_buf.len();
+        __builtin_memcpy(
+            conn.request_capture_slice, conn.recv_buf.data(), conn.request_capture_len);
+        conn.recv_buf.reset();
+        conn.recv_buf.write(conn.upstream_recv_buf.data(), parked_recv_len);
+        conn.upstream_recv_buf.reset();
+    };
     if (conn.retry_req_send_len == 0) {
         rewrite_request_line_path(conn);
         // forward(set_header:) — inject/replace request header lines (no-op unless
@@ -2567,6 +2594,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         // (oversized / no headroom) rather than forwarding the request with a
         // security-sensitive header silently dropped.
         if (!apply_request_header_overrides(conn)) {
+            restore_captured_request();
             // The upstream connected but no request will be sent. Release it now so a
             // client that stalls reading the 500 can't pin an idle upstream fd /
             // concurrency slot until keepalive/timeout (close_conn would otherwise only
@@ -2592,6 +2620,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
     }
+    restore_captured_request();
 #if RUT_ENABLE_WEBSOCKET
     // Terminate routes must not let the backend negotiate a per-message extension.
     if (conn.is_ws_terminate_route && conn.req_wants_upgrade) strip_ws_extensions(conn);
@@ -2980,7 +3009,13 @@ void h2_proxy_finish(Loop* loop,
             h2_proxy_fail(loop, conn, 502);
             return;
         }
-        if (body_len > SlicePool::kSliceSize - cursor) {
+        // A captured body is later serialized into another slice with an HTTP/1
+        // status line, framing headers, and per-header delimiters. Reserve that
+        // downstream overhead now so an accepted capture cannot fail only when
+        // the handler returns it.
+        constexpr u32 kDownstreamFramingReserve = 512;
+        if (cursor > SlicePool::kSliceSize - kDownstreamFramingReserve ||
+            body_len > SlicePool::kSliceSize - kDownstreamFramingReserve - cursor) {
             h2_proxy_fail(loop, conn, 502);
             return;
         }
@@ -5409,6 +5444,11 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
             loop->pool.free(conn.request_capture_slice);
         conn.request_capture_slice = nullptr;
         conn.request_capture_len = 0;
+    }
+
+    if (!conn.keep_alive) {
+        loop->close_conn(conn);
+        return;
     }
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {

@@ -423,7 +423,10 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                 !response.response_body_mutation_overflow && response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
         } else {
-            if (returned_captured_response) result.status_code = response.captured_response_status;
+            if (returned_captured_response) {
+                result.status_code = response.captured_response_status;
+                result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+            }
             if (response.response_status_set) result.status_code = response.response_status;
             if (response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
@@ -448,7 +451,8 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             out.dynamic_response_body_len = response.response_body_len;
             out.dynamic_response_body_valid = response.response_body_valid != 0;
         }
-        if (body == nullptr || out.dynamic_response_body_len > jit::kMaxDynamicResponseBodyBytes) {
+        if ((body == nullptr && out.dynamic_response_body_len != 0) ||
+            out.dynamic_response_body_len > jit::kMaxDynamicResponseBodyBytes) {
             out.dynamic_response_body_len = 0;
             out.dynamic_response_body_valid = false;
         } else if (out.dynamic_response_body_len != 0) {

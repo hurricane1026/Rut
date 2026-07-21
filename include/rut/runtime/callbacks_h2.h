@@ -373,7 +373,8 @@ template <typename Loop>
 void h2_emit_outcome(H2Dispatch<Loop>& d,
                      u32 stream_id,
                      const JitDispatchOutcome& o,
-                     const RouteConfig* cfg) {
+                     const RouteConfig* cfg,
+                     bool is_head) {
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.dynamic_response_body != nullptr) {
@@ -385,7 +386,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
-    if (o.status_code < 200 || o.status_code == 204 || o.status_code == 205 ||
+    if (is_head || o.status_code < 200 || o.status_code == 204 || o.status_code == 205 ||
         o.status_code == 304) {
         body = nullptr;
         body_len = 0;
@@ -731,7 +732,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
-    h2_emit_outcome(d, stream_id, kOutcome, cfg);
+    const bool is_head = synth_len >= 5 && __builtin_memcmp(synth, "HEAD ", 5) == 0;
+    h2_emit_outcome(d, stream_id, kOutcome, cfg, is_head);
 }
 
 // A deferred stream is complete. If the matched handler reads req.body,
@@ -1364,7 +1366,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     u8 resp[Http2Conn::kBodySynthCap];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
-        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
+        const bool is_head =
+            h2->async_synth_len >= 5 && __builtin_memcmp(h2->pending_synth, "HEAD ", 5) == 0;
+        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, is_head);
     } else if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered ||
                kOutcome.kind == JitDispatchOutcome::Kind::ForwardCapture) {
         h2_emit_status(d, kStreamId, 400);

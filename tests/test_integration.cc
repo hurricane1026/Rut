@@ -9520,7 +9520,7 @@ upstream first
 upstream second
 route GET "/capture" {
     let resp = forward(first, buffered: true)
-    return forward(second)
+    return forward(second, set_path: "/rewritten")
 }
 )rut";
 
@@ -10432,9 +10432,11 @@ TEST(shard, buffered_capture_followup_forward_reuses_owned_http1_request) {
     shard.shutdown();
     first.teardown();
     second.teardown();
-    CHECK(second.request_len >= sizeof(kReq) - 1);
-    CHECK(second.request_len >= sizeof(kReq) - 1 &&
-          ::memcmp(second.request, kReq, sizeof(kReq) - 1) == 0);
+    static const char kRewritten[] =
+        "GET /rewritten HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    CHECK_EQ(second.request_len, sizeof(kRewritten) - 1);
+    CHECK(second.request_len == sizeof(kRewritten) - 1 &&
+          ::memcmp(second.request, kRewritten, sizeof(kRewritten) - 1) == 0);
     close(lfd);
 }
 
@@ -10550,6 +10552,57 @@ TEST(shard, captured_http1_head_suppresses_mutated_body_without_headers) {
     const char* end = ::strstr(response, "\r\n\r\n");
     REQUIRE(end != nullptr);
     CHECK_EQ(static_cast<u32>(end + 4 - response), static_cast<u32>(got));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, captured_http2_head_suppresses_mutated_body) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedHeadHeaderlessBodyMutationSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'H', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    const hpack::Header headers[] = {
+        {{":method", 7}, {"HEAD", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/capture", 8}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    request_len += http2_write_headers(
+        request + request_len, sizeof(request) - request_len, 1, headers, 4, true);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) != 0) break;
+    }
+    u8 body[16];
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK_EQ(h2_body_for_stream(response, total, 1, body, sizeof(body)), 0u);
     close(client);
     shard.stop();
     shard.join();

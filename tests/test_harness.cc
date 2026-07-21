@@ -140,6 +140,14 @@ u64 captured_forward_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*)
     return jit::HandlerResult::make_status(0).pack();
 }
 
+u64 captured_empty_forward_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Forward, 7).pack();
+    if (!ctx->captured_response_valid || ctx->captured_response_body_len != 0)
+        return jit::HandlerResult::make_status(500).pack();
+    return jit::HandlerResult::make_status(0).pack();
+}
+
 u64 any_timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Any, 25).pack();
@@ -626,6 +634,7 @@ TEST(harness_handler, consumes_declared_completion_from_deterministic_environmen
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 206);
+    CHECK_EQ(result.terminal.upstream_id, jit::HandlerResult::kDynamicResponseBody);
     CHECK_EQ(result.consumed_events, 1u);
     CHECK_EQ(result.harness.virtual_time_us, 100u);
     // A run consumes an isolated copy, not the caller's reusable environment.
@@ -712,6 +721,39 @@ TEST(harness_handler, replays_owned_buffered_forward_response_fields) {
     REQUIRE(result.dynamic_response_body_valid);
     CHECK_EQ(result.dynamic_response_body_len, sizeof(kBody));
     CHECK(std::memcmp(result.dynamic_response_body, kBody, sizeof(kBody)) == 0);
+}
+
+TEST(harness_handler, accepts_empty_captured_response_body) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_empty_forward_handler, nullptr, nullptr, 0);
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        nullptr,
+        0,
+        false,
+        false,
+        204,
+        nullptr,
+        0,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 204);
+    CHECK(result.dynamic_response_body_valid);
+    CHECK_EQ(result.dynamic_response_body_len, 0u);
 }
 
 TEST(harness_handler, rejects_null_captured_response_header_views) {
