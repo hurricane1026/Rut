@@ -64,6 +64,10 @@ struct JitDispatchOutcome {
     const char* dynamic_response_body = nullptr;
     u32 dynamic_response_body_len = 0;
     const jit::HandlerCtx* response_ctx = nullptr;
+    // True only when ReturnStatus used the status-0 ABI sentinel to publish a
+    // captured upstream response. A merely valid-but-discarded capture must not
+    // contribute its body or headers to a later literal response.
+    bool uses_captured_response = false;
     // 1-based index into RouteConfig::response_header_sets for
     // Kind::ReturnStatus; 0 = no custom headers. Decoded from the
     // next_state slot per handler ABI (reused while action is
@@ -159,6 +163,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                     out.status_code = 500;
                     return out;
                 }
+                out.uses_captured_response = true;
                 out.status_code = ctx.captured_response_status;
                 out.dynamic_response_body = ctx.captured_response_body;
                 out.dynamic_response_body_len = ctx.captured_response_body_len;

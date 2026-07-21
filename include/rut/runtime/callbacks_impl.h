@@ -1512,9 +1512,10 @@ inline bool collect_effective_response_headers(const jit::HandlerCtx* response_c
                                                u16 static_set_index,
                                                ResponseHeaderKV* out,
                                                u32 capacity,
-                                               u32* out_count) {
+                                               u32* out_count,
+                                               bool include_captured = true) {
     *out_count = 0;
-    if (response_ctx != nullptr && response_ctx->captured_response_valid) {
+    if (include_captured && response_ctx != nullptr && response_ctx->captured_response_valid) {
         if (response_ctx->captured_response_header_count > capacity) return false;
         for (u32 i = 0; i < response_ctx->captured_response_header_count; i++) {
             const auto& header = response_ctx->captured_response_headers[i];
@@ -1552,15 +1553,20 @@ void handle_jit_outcome(Loop* loop,
                     loop->pool.free(conn.response_capture_slice);
                 conn.response_capture_slice = nullptr;
             };
+            const auto release_request_capture = [&]() {
+                if (conn.request_capture_slice == nullptr) return;
+                if constexpr (requires { loop->pool.free(conn.request_capture_slice); })
+                    loop->pool.free(conn.request_capture_slice);
+                conn.request_capture_slice = nullptr;
+                conn.request_capture_len = 0;
+            };
             conn.resp_status = outcome.status_code;
             // ABI: upstream_id is a 1-based index into the pinned
             // route config's response_bodies table (0 = use default
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
-            const bool has_dynamic_body =
-                outcome.dynamic_response_body != nullptr ||
-                (outcome.response_ctx != nullptr && outcome.response_ctx->captured_response_valid);
+            const bool has_dynamic_body = outcome.dynamic_response_body != nullptr;
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
             constexpr u32 kMaxEffectiveHeaders = RouteConfig::kMaxHeadersPerSet +
@@ -1573,11 +1579,13 @@ void handle_jit_outcome(Loop* loop,
                                                     outcome.response_headers_idx,
                                                     kvs,
                                                     kMaxEffectiveHeaders,
-                                                    &header_count)) {
+                                                    &header_count,
+                                                    outcome.uses_captured_response)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
                 format_static_response(conn, 500, false);
                 release_capture_slice();
+                release_request_capture();
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -1637,6 +1645,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, outcome.status_code, keep_alive);
             }
             release_capture_slice();
+            release_request_capture();
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -1877,6 +1886,12 @@ void handle_jit_outcome(Loop* loop,
                 conn.pending_handler_fn = nullptr;
                 conn.proxy_response_buffered = false;
                 conn.proxy_response_capture = false;
+                if (conn.request_capture_slice != nullptr) {
+                    if constexpr (requires { loop->pool.free(conn.request_capture_slice); })
+                        loop->pool.free(conn.request_capture_slice);
+                    conn.request_capture_slice = nullptr;
+                    conn.request_capture_len = 0;
+                }
             };
             conn.pending_handler_fn = capture ? fn : nullptr;
             if (capture) conn.handler_state = outcome.next_state;
@@ -1898,6 +1913,35 @@ void handle_jit_outcome(Loop* loop,
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
+            }
+            if (capture && conn.request_capture_slice == nullptr) {
+                const u32 request_len = conn.req_initial_send_len != 0
+                                            ? conn.req_initial_send_len
+                                            : conn.recv_buf.len();
+                if (request_len > SlicePool::kSliceSize) {
+                    abandon_capture();
+                    conn.resp_status = 500;
+                    format_static_response(conn, 500, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                if constexpr (requires { loop->pool.alloc(); })
+                    conn.request_capture_slice = loop->pool.alloc();
+                if (conn.request_capture_slice == nullptr) {
+                    abandon_capture();
+                    conn.resp_status = 500;
+                    format_static_response(conn, 500, /*keep_alive=*/false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                if (request_len != 0)
+                    __builtin_memcpy(
+                        conn.request_capture_slice, conn.recv_buf.data(), request_len);
+                conn.request_capture_len = request_len;
             }
             conn.state = ConnState::Proxying;
             auto& target = config->upstreams[outcome.upstream_id];
@@ -2031,11 +2075,17 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
     ctx->resume_event_result = conn.resume_event_result;
+    const u8* request_data = conn.request_capture_slice != nullptr
+                                 ? conn.request_capture_slice
+                                 : conn.recv_buf.data();
+    const u32 request_len = conn.request_capture_slice != nullptr
+                                ? conn.request_capture_len
+                                : conn.recv_buf.len();
     auto outcome = invoke_jit_handler(fn,
                                       static_cast<void*>(&conn),
                                       *ctx,
-                                      conn.recv_buf.data(),
-                                      conn.recv_buf.len(),
+                                      request_data,
+                                      request_len,
                                       /*arena=*/nullptr);
     handle_jit_outcome<Loop>(loop, conn, outcome, fn, conn.keep_alive);
 }
@@ -4876,6 +4926,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // response plus any bytes the backend already sent (early frames) to the
     // client, then run the connection as a transparent full-duplex tunnel.
     if (resp.status_code == 101) {
+        // Expression-form buffered forwarding promises to resume the handler
+        // with an ordinary captured response. A protocol switch cannot satisfy
+        // that contract: tunneling here would silently skip the continuation.
+        if (conn.proxy_response_capture) {
+            buffered_forward_fail(loop, conn, 502);
+            return;
+        }
         // The client→upstream request upload must be fully drained before we can
         // pivot the upstream send slot to the tunnel: otherwise a still-pending
         // request body send completion would be misread as a tunnel send (or

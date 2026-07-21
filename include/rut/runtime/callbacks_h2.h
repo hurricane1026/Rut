@@ -388,7 +388,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                          jit::kMaxResponseHeaderMutations;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
-    if (o.response_ctx != nullptr && o.response_ctx->captured_response_valid) {
+    if (o.uses_captured_response && o.response_ctx != nullptr &&
+        o.response_ctx->captured_response_valid) {
         for (u32 i = 0; i < o.response_ctx->captured_response_header_count; i++) {
             const auto& header = o.response_ctx->captured_response_headers[i];
             if (h2_is_prohibited_response_header(header.name.ptr, header.name.len)) continue;
@@ -1311,7 +1312,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         return;
     }
 
-    u8 resp[8192];
+    u8 resp[Http2Conn::kBodySynthCap];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);

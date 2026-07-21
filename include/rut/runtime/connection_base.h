@@ -559,6 +559,11 @@ struct ConnectionBase {
     // It remains stable across later handler yields and is returned with the
     // connection/request buffers.
     u8* response_capture_slice;
+    // Stable HTTP/1 request bytes for resuming an expression-form buffered
+    // forward. recv_buf is reused for pipelined input while the upstream is in
+    // flight, so post-capture req.* reads must not consult it.
+    u8* request_capture_slice;
+    u32 request_capture_len;
 
     void reset() {
         if (handler_ctx != nullptr) rut_helper_resp_release_body_storage(handler_ctx);
@@ -728,6 +733,8 @@ struct ConnectionBase {
         upstream_recv_slice = nullptr;
         upstream_recv_buf.bind(nullptr, 0);
         response_capture_slice = nullptr;
+        request_capture_slice = nullptr;
+        request_capture_len = 0;
     }
 };
 

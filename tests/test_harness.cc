@@ -137,12 +137,7 @@ u64 captured_forward_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*)
         ctx->captured_response_header_count != 1 ||
         !ctx->captured_response_headers[0].value.eq({"fixture", 7}))
         return jit::HandlerResult::make_status(500).pack();
-    ctx->response_body_data = ctx->captured_response_body;
-    ctx->response_body_len = ctx->captured_response_body_len;
-    ctx->response_body_valid = 1;
-    auto result = jit::HandlerResult::make_status(206);
-    result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
-    return result.pack();
+    return jit::HandlerResult::make_status(0).pack();
 }
 
 u64 any_timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {

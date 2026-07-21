@@ -742,6 +742,10 @@ public:
             pool.free(c.response_capture_slice);
             c.response_capture_slice = nullptr;
         }
+        if (c.request_capture_slice) {
+            pool.free(c.request_capture_slice);
+            c.request_capture_slice = nullptr;
+        }
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
         if (c.ws_c2u_msg) {

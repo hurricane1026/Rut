@@ -395,16 +395,22 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     }
 
     const auto& response = execution.frame.context;
+    bool returned_captured_response = false;
     if (result.action == jit::HandlerAction::ReturnStatus) {
+        returned_captured_response = result.status_code == 0;
         const bool returned_dynamic_json =
             result.upstream_id == jit::HandlerResult::kDynamicResponseBody;
         const bool dynamic_json_failed =
             returned_dynamic_json &&
             (response.response_body_valid == 0 || response.response_body_data == nullptr);
         if (response.response_status_invalid || response.response_body_mutation_overflow ||
-            dynamic_json_failed) {
+            dynamic_json_failed ||
+            (returned_captured_response && !response.captured_response_valid)) {
             result = jit::HandlerResult::make_status(500);
+            returned_captured_response = false;
         } else {
+            if (returned_captured_response)
+                result.status_code = response.captured_response_status;
             if (response.response_status_set) result.status_code = response.response_status;
             if (response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
@@ -413,12 +419,17 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     out.terminal = result;
     out.has_terminal = true;
     if (result.action == jit::HandlerAction::ReturnStatus &&
-        result.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
+        (result.upstream_id == jit::HandlerResult::kDynamicResponseBody ||
+         returned_captured_response)) {
         const char* body = nullptr;
         if (response.response_body_mutation_set) {
             body = response.response_body_mutation_storage;
             out.dynamic_response_body_len = response.response_body_mutation_len;
             out.dynamic_response_body_valid = !response.response_body_mutation_overflow;
+        } else if (returned_captured_response) {
+            body = response.captured_response_body;
+            out.dynamic_response_body_len = response.captured_response_body_len;
+            out.dynamic_response_body_valid = response.captured_response_valid;
         } else {
             body = response.response_body_data;
             out.dynamic_response_body_len = response.response_body_len;
