@@ -4597,6 +4597,12 @@ TEST(route, rir_function_needs_req_body_guard_paths) {
 
     insts[0].op = rir::Opcode::ReqBody;
     CHECK(rir_function_needs_req_body(fn));
+
+    insts[0].op = rir::Opcode::RetForward;
+    CHECK(!rir_function_needs_req_body(fn));
+
+    insts[0].op = rir::Opcode::RetForwardBuffered;
+    CHECK(rir_function_needs_req_body(fn));
 }
 
 TEST(route, populate_route_config_rejects_malformed_runtime_tables) {
@@ -5482,6 +5488,67 @@ TEST(buffered_forward, head_body_mutation_declares_replacement_length_without_bo
     const u32 wire_len = conn->send_buf.len();
     CHECK(buf_contains(wire, wire_len, "Content-Length: 9\r\n", 19));
     CHECK(!buf_contains(wire, wire_len, "rewritten", 9));
+}
+
+TEST(buffered_forward, preserves_upstream_content_length_on_304) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\nConnection: close\r\n\r\n";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "HTTP/1.1 304", 12));
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 123\r\n", 21));
+    CHECK(buf_contains(wire, wire_len, "\r\n\r\n", 4));
+}
+
+TEST(buffered_forward, drains_partial_client_sends_before_completion) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+    conn->reset_jit_ctx();
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    REQUIRE(conn->buffered_proxy_send_in_progress);
+    const u32 wire_len = conn->send_buf.len();
+    REQUIRE_GT(wire_len, 7u);
+    const u8* wire = conn->send_buf.data();
+    loop.backend.clear_ops();
+    on_proxy_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 7));
+
+    CHECK_EQ(conn->send_progress, 7u);
+    CHECK(conn->buffered_proxy_send_in_progress);
+    CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+    auto* retry = loop.backend.last_op(MockOp::Send);
+    REQUIRE(retry != nullptr);
+    CHECK_EQ(retry->send_buf, wire + 7);
+    CHECK_EQ(retry->send_len, wire_len - 7);
 }
 
 TEST(buffered_forward, snapshots_request_backed_header_mutation_values) {

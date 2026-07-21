@@ -202,6 +202,7 @@ bool capture_response_observation(void* context, const harness::Observation& eve
 struct ResponseBodyObservation {
     bool seen = false;
     bool truncated = false;
+    u64 timestamp_us = 0;
     u32 full_len = 0;
     u32 copied_len = 0;
     char bytes[4096]{};
@@ -212,6 +213,7 @@ bool capture_response_body_observation(void* context, const harness::Observation
     auto* captured = static_cast<ResponseBodyObservation*>(context);
     captured->seen = true;
     captured->truncated = event.value1 != 0;
+    captured->timestamp_us = event.timestamp_us;
     captured->full_len = static_cast<u32>(event.value0);
     captured->copied_len = event.label.len;
     if (event.label.len != 0) __builtin_memcpy(captured->bytes, event.label.ptr, event.label.len);
@@ -956,16 +958,22 @@ TEST(harness_scenario, reusable_json_body_mutation_survives_resume) {
     scenario.method = kRouteMethodGet;
     scenario.request_data = reinterpret_cast<const u8*>(request);
     scenario.request_len = sizeof(request) - 1;
+    scenario.now_us = 700;
     scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
 
     auto spec = scripted_scenario_harness();
     spec.required_capabilities =
         harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
     spec.environment_capabilities = spec.required_capabilities;
+    ResponseBodyObservation observed{};
+    spec.observations = {&observed, &capture_response_body_observation};
     const auto result = harness::drive_scenario(scenario, spec);
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     CHECK_EQ(result.terminal.status_code, 200);
     CHECK_EQ(result.harness.handler_resumes, 1u);
+    REQUIRE(observed.seen);
+    CHECK_EQ(observed.timestamp_us, result.harness.virtual_time_us);
+    CHECK_GT(observed.timestamp_us, scenario.now_us);
     CHECK_EQ(result.harness.output_bytes, 117u);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }

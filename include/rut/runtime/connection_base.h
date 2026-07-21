@@ -218,6 +218,8 @@ struct ConnectionBase {
     // Buffered proxy completion resumes the handler instead of publishing the
     // upstream response directly.
     bool proxy_response_capture;
+    // The completed buffered response is currently draining from send_buf.
+    bool buffered_proxy_send_in_progress;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -605,6 +607,7 @@ struct ConnectionBase {
         upstream_slot_uid = 0;
         proxy_response_buffered = false;
         proxy_response_capture = false;
+        buffered_proxy_send_in_progress = false;
         throttle_down_bps = 0;
         throttle_tat_ns = 0;
         throttle_paused = false;

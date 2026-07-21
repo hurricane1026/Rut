@@ -1552,10 +1552,10 @@ inline bool snapshot_buffered_response_mutation_views(Connection& conn) {
         const auto ptr = reinterpret_cast<uintptr_t>(view.ptr);
         const bool aliases_recv = ptr >= recv_begin && ptr - recv_begin <= recv_len &&
                                   view.len <= recv_len - (ptr - recv_begin);
-        const bool aliases_capture =
-            conn.response_capture_slice != nullptr && ptr >= capture_begin &&
-            ptr - capture_begin <= SlicePool::kSliceSize &&
-            view.len <= SlicePool::kSliceSize - (ptr - capture_begin);
+        const bool aliases_capture = conn.response_capture_slice != nullptr &&
+                                     ptr >= capture_begin &&
+                                     ptr - capture_begin <= SlicePool::kSliceSize &&
+                                     view.len <= SlicePool::kSliceSize - (ptr - capture_begin);
         if (!aliases_recv && !aliases_capture) return true;
         const char* stable = jit::snapshot_response_body(ctx, view.ptr, view.len);
         if (stable == nullptr) return false;
@@ -1613,6 +1613,7 @@ void handle_jit_outcome(Loop* loop,
                 if (captured_episode) {
                     conn.resp_body_sent = conn.send_buf.len();
                     conn.upstream_send_len = 0;
+                    conn.buffered_proxy_send_in_progress = true;
                     conn.proxy_resp_started = true;
                     conn.transition_to_sending(&on_proxy_response_sent<Loop>);
                 } else {
@@ -1657,14 +1658,12 @@ void handle_jit_outcome(Loop* loop,
             // falling back rather than rendering garbage.
             const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
             const bool captured_head = outcome.uses_captured_response &&
-                                       conn.req_method ==
-                                           static_cast<u8>(LogHttpMethod::Head);
-            const bool status_forbids_body = outcome.status_code < 200 ||
-                                             outcome.status_code == 204 ||
-                                             outcome.status_code == 205 ||
-                                             outcome.status_code == 304;
-            const bool body_mutated = outcome.response_ctx != nullptr &&
-                                      outcome.response_ctx->response_body_mutation_set;
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+            const bool status_forbids_body =
+                outcome.status_code < 200 || outcome.status_code == 204 ||
+                outcome.status_code == 205 || outcome.status_code == 304;
+            const bool body_mutated =
+                outcome.response_ctx != nullptr && outcome.response_ctx->response_body_mutation_set;
             // HEAD and bodyless statuses must take the header-aware formatter even
             // when mutations removed every effective header.  The simpler body
             // formatters below always write their supplied payload.
@@ -1694,21 +1693,18 @@ void handle_jit_outcome(Loop* loop,
                     body_len = reason_len;
                     body_is_fallback = true;
                 }
-                format_response_with_body_and_headers(conn,
-                                                      outcome.status_code,
-                                                      captured_head ? nullptr : body_data,
-                                                      captured_head ? 0 : body_len,
-                                                      kvs,
-                                                      header_count,
-                                                      keep_alive,
-                                                      body_is_fallback,
-                                                      captured_head && !body_mutated &&
-                                                          !status_forbids_body,
-                                                      captured_head && body_mutated &&
-                                                              !status_forbids_body
-                                                          ? body_len
-                                                          : 0xffffffffu,
-                                                      status_forbids_body);
+                format_response_with_body_and_headers(
+                    conn,
+                    outcome.status_code,
+                    captured_head ? nullptr : body_data,
+                    captured_head ? 0 : body_len,
+                    kvs,
+                    header_count,
+                    keep_alive,
+                    body_is_fallback,
+                    captured_head && !body_mutated && !status_forbids_body,
+                    captured_head && body_mutated && !status_forbids_body ? body_len : 0xffffffffu,
+                    status_forbids_body);
             } else if (has_dynamic_body) {
                 format_response_with_body(conn,
                                           outcome.status_code,
@@ -1975,8 +1971,7 @@ void handle_jit_outcome(Loop* loop,
             if (capture) conn.handler_state = outcome.next_state;
             conn.proxy_response_buffered = outcome.kind != JitDispatchOutcome::Kind::Forward;
             conn.proxy_response_capture = capture;
-            if (conn.proxy_response_buffered &&
-                !snapshot_buffered_response_mutation_views(conn)) {
+            if (conn.proxy_response_buffered && !snapshot_buffered_response_mutation_views(conn)) {
                 abandon_capture();
                 conn.resp_status = 500;
                 conn.keep_alive = false;
@@ -2008,9 +2003,8 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             if (capture && conn.request_capture_slice == nullptr) {
-                const u32 request_len = conn.req_initial_send_len != 0
-                                            ? conn.req_initial_send_len
-                                            : conn.recv_buf.len();
+                const u32 request_len = conn.req_initial_send_len != 0 ? conn.req_initial_send_len
+                                                                       : conn.recv_buf.len();
                 if (request_len > SlicePool::kSliceSize) {
                     abandon_capture();
                     conn.resp_status = 500;
@@ -2032,8 +2026,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 if (request_len != 0)
-                    __builtin_memcpy(
-                        conn.request_capture_slice, conn.recv_buf.data(), request_len);
+                    __builtin_memcpy(conn.request_capture_slice, conn.recv_buf.data(), request_len);
                 conn.request_capture_len = request_len;
             }
             conn.state = ConnState::Proxying;
@@ -2168,12 +2161,10 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
     ctx->resume_event_result = conn.resume_event_result;
-    const u8* request_data = conn.request_capture_slice != nullptr
-                                 ? conn.request_capture_slice
-                                 : conn.recv_buf.data();
-    const u32 request_len = conn.request_capture_slice != nullptr
-                                ? conn.request_capture_len
-                                : conn.recv_buf.len();
+    const u8* request_data =
+        conn.request_capture_slice != nullptr ? conn.request_capture_slice : conn.recv_buf.data();
+    const u32 request_len =
+        conn.request_capture_slice != nullptr ? conn.request_capture_len : conn.recv_buf.len();
     auto outcome = invoke_jit_handler(fn,
                                       static_cast<void*>(&conn),
                                       *ctx,
@@ -2984,8 +2975,7 @@ void h2_proxy_finish(Loop* loop,
         static constexpr u32 kH2HeaderBlockCap = 8192;
         static constexpr u32 kHpackFieldOverhead = 11;
         static constexpr u32 kStatusAndTableUpdateReserve = 32;
-        if (cursor + effective_count * kHpackFieldOverhead +
-                kStatusAndTableUpdateReserve >
+        if (cursor + effective_count * kHpackFieldOverhead + kStatusAndTableUpdateReserve >
             kH2HeaderBlockCap) {
             h2_proxy_fail(loop, conn, 502);
             return;
@@ -3026,9 +3016,10 @@ void h2_proxy_finish(Loop* loop,
         for (u32 i = 0; i < effective_count; i++) {
             // Mutations run after the upstream filter, so filter their final
             // result too: a Set must not reintroduce an HTTP/2-prohibited field.
-            if (h2_drop_response_header(
-                    {effective[i].key_data, effective[i].key_len}))
-                continue;
+            const Str name{effective[i].key_data, effective[i].key_len};
+            const bool retained_head_content_length =
+                is_head && http_header_name_eq_ci(name.ptr, name.len, "content-length", 14);
+            if (!retained_head_content_length && h2_drop_response_header(name)) continue;
             hdrs[nhdrs].name = {effective[i].key_data, effective[i].key_len};
             hdrs[nhdrs].value = {effective[i].value_data, effective[i].value_len};
             nhdrs++;
@@ -4710,6 +4701,7 @@ void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
     conn.proxy_response_buffered = false;
     conn.proxy_response_capture = false;
     conn.pending_handler_fn = nullptr;
+    conn.buffered_proxy_send_in_progress = true;
     conn.upstream_keep_alive = false;
     conn.resp_status = status;
     conn.keep_alive = false;
@@ -4735,9 +4727,10 @@ void finish_buffered_forward(Loop* loop,
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
         // Preserve Content-Length on HEAD: it describes the corresponding GET
-        // representation even though this response carries no body.
+        // representation even though this response carries no body. A 304 may
+        // likewise carry the selected representation's length.
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
-            if (!is_head) continue;
+            if (!is_head && resp.status_code != 304) continue;
         } else if (h2_drop_response_header(name)) {
             continue;
         }
@@ -4835,10 +4828,12 @@ void finish_buffered_forward(Loop* loop,
     const u32 representation_body_len = body_len;
     const bool status_forbids_body =
         status < 200 || status == 204 || status == 205 || status == 304;
+    const bool status_omits_content_length = status < 200 || status == 204 || status == 205;
     const bool no_body = status_forbids_body || is_head;
     if (no_body) body_len = 0;
 
     conn.proxy_response_buffered = false;
+    conn.buffered_proxy_send_in_progress = true;
     conn.resp_status = status;
     format_response_with_body_and_headers(
         conn,
@@ -4849,11 +4844,11 @@ void finish_buffered_forward(Loop* loop,
         header_count,
         conn.keep_alive,
         false,
-        is_head && !response_ctx->response_body_mutation_set && !status_forbids_body,
+        (is_head || status == 304) && !response_ctx->response_body_mutation_set,
         is_head && response_ctx->response_body_mutation_set && !status_forbids_body
             ? representation_body_len
             : 0xffffffffu,
-        status_forbids_body);
+        status_omits_content_length);
     conn.resp_body_sent = conn.send_buf.len();
     conn.upstream_send_len = conn.upstream_recv_buf.len();
     conn.proxy_resp_started = true;
@@ -5349,12 +5344,34 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    conn.clear_slots();
 
     if (ev.result < 0) {
         loop->close_conn(conn);
         return;
     }
+
+    const u32 send_len =
+        conn.buffered_proxy_send_in_progress ? conn.send_buf.len() : conn.upstream_send_len;
+    if (conn.send_progress > send_len ||
+        static_cast<u32>(ev.result) > send_len - conn.send_progress) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress += static_cast<u32>(ev.result);
+    if (conn.send_progress < send_len) {
+        if (ev.result == 0) {
+            loop->close_conn(conn);
+            return;
+        }
+        const u8* source = conn.buffered_proxy_send_in_progress ? conn.send_buf.data()
+                                                                : conn.upstream_recv_buf.data();
+        conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+        client_send(loop, conn, source + conn.send_progress, send_len - conn.send_progress);
+        return;
+    }
+    conn.send_progress = 0;
+    conn.buffered_proxy_send_in_progress = false;
+    conn.clear_slots();
 
     // One-shot proxy response complete (header-only / small Content-Length that
     // finished in the first read). Release the backend concurrency slot promptly

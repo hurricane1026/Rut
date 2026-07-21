@@ -3127,6 +3127,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
 
 static FrontendResult<void> emit_term(const MirTerminator& term,
                                       const MirModule& mir,
+                                      const MirFunction& mir_fn,
                                       const VariantLoweringInfo* variant_infos,
                                       TupleLoweringInfo* tuple_infos,
                                       u32* tuple_info_count,
@@ -4907,6 +4908,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+            if (mir.functions[i].locals[li].defer_to_terminator) continue;
             auto val = materialize_local_init(mir.functions[i].locals[li],
                                               mir,
                                               variant_infos,
@@ -5030,6 +5032,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,
+                                     mir.functions[i],
                                      variant_infos,
                                      tuple_infos,
                                      &tuple_info_count,

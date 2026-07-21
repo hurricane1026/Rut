@@ -67,7 +67,7 @@ inline bool publish_replay_result(const HarnessSpec& spec,
     Observation body{};
     body.kind = ObservationKind::ResponseBodyProduced;
     body.phase = Phase::Observe;
-    body.sequence = sequence;
+    body.sequence = result.semantic_events;
     body.value0 = replay.response_body_len;
     body.value1 = replay.response_body_truncated ? 1 : 0;
     body.label = {reinterpret_cast<const char*>(replay.observed_body), replay.observed_body_len};

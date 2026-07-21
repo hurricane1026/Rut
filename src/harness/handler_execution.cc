@@ -420,12 +420,10 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             result = jit::HandlerResult::make_status(500);
             returned_captured_response = false;
             if (dynamic_json_failed && !response.response_status_invalid &&
-                !response.response_body_mutation_overflow &&
-                response.response_body_mutation_set)
+                !response.response_body_mutation_overflow && response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
         } else {
-            if (returned_captured_response)
-                result.status_code = response.captured_response_status;
+            if (returned_captured_response) result.status_code = response.captured_response_status;
             if (response.response_status_set) result.status_code = response.response_status;
             if (response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;

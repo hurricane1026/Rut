@@ -1320,6 +1320,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.error_struct_index = module.routes[i].locals[li].error_struct_index;
             local.error_variant_index = module.routes[i].locals[li].error_variant_index;
             local.is_wait_result = module.routes[i].locals[li].is_wait_result;
+            local.defer_to_terminator = module.routes[i].locals[li].defer_to_terminator;
             local.wait_event_kind = module.routes[i].locals[li].wait_event_kind;
             local.wait_payload = module.routes[i].locals[li].wait_payload;
             local.wait_arm_mask = module.routes[i].locals[li].wait_arm_mask;
@@ -2000,8 +2001,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 // Clamp response effects to the capture's resume block.
                 for (u32 si = 0; si < step_count; si++) {
                     if (steps[si].kind == RouteStep::Kind::Wait &&
-                        fn.waits[steps[si].index].event_kind ==
-                            WaitEventKind::ForwardBuffered &&
+                        fn.waits[steps[si].index].event_kind == WaitEventKind::ForwardBuffered &&
                         target <= si) {
                         target = si + 1;
                         break;
