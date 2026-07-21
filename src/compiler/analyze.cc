@@ -10332,6 +10332,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             }
             folded.span = expr.span;
             folded.may_nil = true;
+            if (ret->type == HirTypeKind::Json ||
+                hir_type_shape_contains_json(mod, ret->shape_index))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kJsonOpaqueValueDetail);
             return folded;
         }
         if (lhs_state == KnownValueState::Error) {
@@ -10361,6 +10365,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             folded.span = expr.span;
             folded.may_nil = false;
             folded.may_error = true;
+            if (ret->type == HirTypeKind::Json ||
+                hir_type_shape_contains_json(mod, ret->shape_index))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.span, kJsonOpaqueValueDetail);
             return folded;
         }
         if (lhs_state == KnownValueState::Unknown && (pipe_lhs->may_nil || pipe_lhs->may_error)) {

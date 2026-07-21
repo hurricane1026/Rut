@@ -32579,7 +32579,7 @@ TEST(frontend, reusable_json_helper_materializes_struct_arguments_once) {
     rir.destroy();
 }
 
-TEST(frontend, conditional_json_locals_materialize_only_at_direct_sinks) {
+TEST(frontend, conditional_json_locals_capture_selection_at_initialization) {
     const char* src = R"rut(
 func choose(flag: bool, yes: Json, no: Json) -> Json {
     if flag { yes } else { no }
@@ -32598,7 +32598,7 @@ route GET "/x" {
     CHECK_FALSE(hir->routes[0].control.direct_term.commit_response_mutations);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
-    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    CHECK_EQ(mir->functions[0].locals.len, 1u);
     bool found_body_plan = false;
     for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
         const auto& term = mir->functions[0].blocks[bi].term;

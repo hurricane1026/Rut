@@ -1246,7 +1246,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // carriers. Materialize the selected plan only at its sink. Keep
             // the synthetic RespSetBody statement carrier: it is the sink.
             if (module.routes[i].locals[li].type == HirTypeKind::Json &&
-                module.routes[i].locals[li].init.kind != HirExprKind::RespSetBody)
+                module.routes[i].locals[li].init.kind != HirExprKind::RespSetBody &&
+                module.routes[i].locals[li].init.kind != HirExprKind::IfElse)
                 continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Array &&
                 module.routes[i].locals[li].ref_index < HirRoute::kMaxLocals &&
