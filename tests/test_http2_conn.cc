@@ -1547,7 +1547,6 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     CHECK(sp.value == reinterpret_cast<const char*>(h2.pending_synth + 4 + 7));
     CHECK(sp.value[0] == '4' && sp.value[1] == '2');  // pre-clobber bytes intact
     CHECK(sp.name == params[0].name);                 // name still points into stable config
-
 }
 
 TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {

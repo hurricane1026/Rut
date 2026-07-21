@@ -215,6 +215,8 @@ struct ConnectionBase {
     // Explicit `forward(..., buffered: true)`: accumulate the complete upstream
     // response, then apply the committed HandlerCtx Response mutations.
     bool proxy_response_buffered;
+    // The completed buffered response is currently draining from send_buf.
+    bool buffered_proxy_send_in_progress;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -592,6 +594,7 @@ struct ConnectionBase {
         upstream_slot_held = false;
         upstream_slot_uid = 0;
         proxy_response_buffered = false;
+        buffered_proxy_send_in_progress = false;
         throttle_down_bps = 0;
         throttle_tat_ns = 0;
         throttle_paused = false;

@@ -72,7 +72,9 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
         const auto& block = fn.blocks[bi];
         if (block.insts == nullptr) continue;
         for (u32 ii = 0; ii < block.inst_count; ii++) {
-            if (block.insts[ii].op == rir::Opcode::ReqBody) return true;
+            if (block.insts[ii].op == rir::Opcode::ReqBody ||
+                block.insts[ii].op == rir::Opcode::RetForwardBuffered)
+                return true;
         }
     }
     return false;

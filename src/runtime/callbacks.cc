@@ -602,8 +602,7 @@ void format_response_with_body_and_headers(Connection& conn,
         }
         if (!omit_content_length && preserve_content_length &&
             preserved_content_length == nullptr &&
-            header_name_eq_literal_ci(
-                headers[i].key_data, headers[i].key_len, "Content-Length"))
+            header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length"))
             preserved_content_length = &headers[i];
     }
     // Skip the default Content-Type when the body is a system-
@@ -629,15 +628,13 @@ void format_response_with_body_and_headers(Connection& conn,
         sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1;
     constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
-    const u32 declared_content_length = content_length_override != 0xffffffffu
-                                            ? content_length_override
-                                            : body_len_emit;
+    const u32 declared_content_length =
+        content_length_override != 0xffffffffu ? content_length_override : body_len_emit;
     const u32 content_length_len = preserved_content_length != nullptr
                                        ? preserved_content_length->value_len
                                        : decimal_digit_count(declared_content_length);
     u64 needed = kStatusLineFixed + reason_len;
-    if (!omit_content_length)
-        needed += kContentLengthPrefix + content_length_len + 2;
+    if (!omit_content_length) needed += kContentLengthPrefix + content_length_len + 2;
     if (emit_default_content_type) needed += kDefaultContentTypeLine;
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
