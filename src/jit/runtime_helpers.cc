@@ -12,6 +12,7 @@
 
 #include <hs.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,17 +78,17 @@ thread_local JsonResponseScratch t_json_response;
 
 // Reusable Json values may coexist within one handler invocation (for example,
 // the two eagerly lowered arms of an if-expression). Capture each completed
-// document into a distinct bounded slice so a later JsonBuild cannot overwrite
-// an earlier Str view before the select chooses between them.
+// document into distinct invocation-owned storage so a later JsonBuild cannot
+// overwrite an earlier Str view before the select chooses between them. The
+// linked arena is reset at the next handler entry and scales with the emitted
+// JsonCapture operations rather than an unrelated HIR expression count.
+struct JsonCaptureNode {
+    JsonCaptureNode* next = nullptr;
+    char data[1];
+};
+
 struct JsonCaptureArena {
-    // A route owns at most 64 HIR expressions. In the worst case each is a
-    // distinct eagerly materialized Json alternative, so reserve one bounded
-    // response slice per expression instead of coupling captures to the
-    // unrelated eight-leaf inline-template limit.
-    static constexpr u32 kMaxDocuments = 64;
-    static constexpr u32 kCapacity = kMaxDocuments * JsonResponseScratch::kCapacity;
-    char data[kCapacity]{};
-    u32 len = 0;
+    JsonCaptureNode* head = nullptr;
     u32 last_capture_len = 0xffffffffu;
 };
 thread_local JsonCaptureArena t_json_captures;
@@ -175,6 +176,17 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
     ParseCache& pc = t_parse_cache;
     parse_into(pc, req_data, req_len);
     pc.primed = true;
+}
+
+void rut_helper_json_capture_reset() {
+    auto* node = t_json_captures.head;
+    while (node != nullptr) {
+        auto* next = node->next;
+        free(node);
+        node = next;
+    }
+    t_json_captures.head = nullptr;
+    t_json_captures.last_capture_len = 0xffffffffu;
 }
 
 void rut_helper_parse_unprime() {
@@ -272,11 +284,28 @@ void rut_helper_json_append_bool(u8 value) {
 }
 
 const char* rut_helper_json_capture_data() {
-    return t_json_response.ok ? t_json_response.data : nullptr;
+    auto& captures = t_json_captures;
+    if (!t_json_response.ok) {
+        captures.last_capture_len = 0xffffffffu;
+        return nullptr;
+    }
+    const size_t allocation_size =
+        offsetof(JsonCaptureNode, data) + (t_json_response.len == 0 ? 1 : t_json_response.len);
+    auto* node = static_cast<JsonCaptureNode*>(malloc(allocation_size));
+    if (node == nullptr) {
+        captures.last_capture_len = 0xffffffffu;
+        return nullptr;
+    }
+    node->next = captures.head;
+    captures.head = node;
+    char* out = node->data;
+    if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
+    captures.last_capture_len = t_json_response.len;
+    return out;
 }
 
 u32 rut_helper_json_capture_len() {
-    return t_json_response.ok ? t_json_response.len : 0xffffffffu;
+    return t_json_captures.last_capture_len;
 }
 
 void rut_helper_json_finish(void* ctx) {
