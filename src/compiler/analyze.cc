@@ -4210,8 +4210,22 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     }
     auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
     if (!lhs) return core::make_unexpected(lhs.error());
+    const u32 locals_before_rhs = route->locals.len;
     auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
     if (!rhs) return core::make_unexpected(rhs.error());
+    if (hir_expr_reads_response_field(lhs.value())) {
+        for (u32 li = locals_before_rhs; li < route->locals.len; li++) {
+            const auto kind = route->locals[li].init.kind;
+            if (kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                kind == HirExprKind::RespSetBody)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.rhs->span,
+                    lit_str("a response-mutating right operand cannot follow a Response field "
+                            "read"));
+        }
+    }
     adopt_int_literal_type(&lhs.value(), &rhs.value());
     const bool int_typed = (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
                            (rhs->type == HirTypeKind::I32 || rhs->type == HirTypeKind::I64);
@@ -5678,6 +5692,25 @@ static bool function_has_response_effects(const HirFunction& fn) {
     return false;
 }
 
+static bool hir_expr_reads_response_field_before(const HirExpr& expr, u32 source_offset) {
+    if ((expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody) &&
+        expr.span.start < source_offset)
+        return true;
+    if (expr.lhs != nullptr && hir_expr_reads_response_field_before(*expr.lhs, source_offset))
+        return true;
+    if (expr.rhs != nullptr && hir_expr_reads_response_field_before(*expr.rhs, source_offset))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr &&
+            hir_expr_reads_response_field_before(*expr.args[i], source_offset))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_response_field_before(*expr.field_inits[i].value, source_offset))
+            return true;
+    return false;
+}
+
 static FrontendResult<void> instantiate_function_response_effects(
     const HirFunction& fn,
     HirRoute* route,
@@ -5689,15 +5722,17 @@ static FrontendResult<void> instantiate_function_response_effects(
     Span call_span) {
     if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
     if (!function_has_response_effects(fn)) return {};
-    u32 scalar_effect_count = 0;
-    for (u32 ei = 0; ei < fn.exprs.len; ei++)
-        scalar_effect_count += fn.exprs[ei].kind == HirExprKind::RespSetStatus ||
-                               fn.exprs[ei].kind == HirExprKind::RespSetBody;
-    if (scalar_effect_count > 1 && hir_expr_reads_response_field(fn.body))
-        return frontend_error(
-            FrontendError::UnsupportedSyntax,
-            call_span,
-            lit_str("helpers cannot read Response fields between multiple assignments"));
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        if (fn.exprs[ei].kind != HirExprKind::RespSetStatus &&
+            fn.exprs[ei].kind != HirExprKind::RespSetBody)
+            continue;
+        if (hir_expr_reads_response_field_before(fn.body, fn.exprs[ei].span.start))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                call_span,
+                lit_str("helper Response assignments cannot follow a captured Response field "
+                        "read"));
+    }
     if (fn.owns_response_builder) {
         for (u32 li = 0; li < route->locals.len; li++) {
             if (route->locals[li].init.kind == HirExprKind::ResponseInit ||
@@ -8944,8 +8979,22 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         expr.kind == AstExprKind::Gt) {
         auto lhs = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         if (!lhs) return core::make_unexpected(lhs.error());
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(lhs.value())) {
+            for (u32 li = locals_before_rhs; li < route->locals.len; li++) {
+                const auto kind = route->locals[li].init.kind;
+                if (kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                    kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                    kind == HirExprKind::RespSetBody)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.rhs->span,
+                        lit_str("a response-mutating right operand cannot follow a Response "
+                                "field read"));
+            }
+        }
         adopt_int_literal_type(&lhs.value(), &rhs.value());
         if (lhs->type == HirTypeKind::Json || rhs->type == HirTypeKind::Json)
             return frontend_error(
