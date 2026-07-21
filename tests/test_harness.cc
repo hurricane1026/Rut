@@ -712,6 +712,39 @@ TEST(harness_handler, replays_owned_buffered_forward_response_fields) {
     CHECK(std::memcmp(result.dynamic_response_body, kBody, sizeof(kBody)) == 0);
 }
 
+TEST(harness_handler, rejects_null_captured_response_header_views) {
+    harness::HandlerExecution execution{};
+    execution.init(&captured_forward_handler, nullptr, nullptr, 0);
+    const jit::CapturedResponseHeader headers[] = {
+        {{nullptr, 1}, {"fixture", 7}},
+    };
+    const harness::DeterministicCompletion completions[] = {{
+        jit::YieldKind::Forward,
+        0,
+        100,
+        1,
+        7,
+        nullptr,
+        0,
+        false,
+        false,
+        206,
+        headers,
+        1,
+    }};
+    harness::DeterministicEnvironment environment{};
+    environment.reset(completions, 1);
+    harness::DeterministicHandlerSpec driver{};
+    driver.execution = execution;
+    driver.environment = &environment;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Invalid);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_connection, reports_and_resets_cleanup_invariants) {
     harness::ConnectionExecution execution{};
     CHECK_EQ(execution.connection.fd, -1);

@@ -1544,14 +1544,19 @@ inline bool collect_effective_response_headers(const jit::HandlerCtx* response_c
 inline bool snapshot_buffered_response_mutation_views(Connection& conn) {
     auto* ctx = conn.jit_ctx();
     if (ctx->response_header_count > jit::kMaxResponseHeaderMutations) return false;
-    const auto source_begin = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
-    const u32 source_len = conn.recv_buf.len();
+    const auto recv_begin = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
+    const u32 recv_len = conn.recv_buf.len();
+    const auto capture_begin = reinterpret_cast<uintptr_t>(conn.response_capture_slice);
     auto snapshot = [&](Str& view) {
         if (view.ptr == nullptr || view.len == 0) return true;
         const auto ptr = reinterpret_cast<uintptr_t>(view.ptr);
-        if (ptr < source_begin || ptr - source_begin > source_len ||
-            view.len > source_len - (ptr - source_begin))
-            return true;
+        const bool aliases_recv = ptr >= recv_begin && ptr - recv_begin <= recv_len &&
+                                  view.len <= recv_len - (ptr - recv_begin);
+        const bool aliases_capture =
+            conn.response_capture_slice != nullptr && ptr >= capture_begin &&
+            ptr - capture_begin <= SlicePool::kSliceSize &&
+            view.len <= SlicePool::kSliceSize - (ptr - capture_begin);
+        if (!aliases_recv && !aliases_capture) return true;
         const char* stable = jit::snapshot_response_body(ctx, view.ptr, view.len);
         if (stable == nullptr) return false;
         view.ptr = stable;
@@ -1573,6 +1578,7 @@ void handle_jit_outcome(Loop* loop,
     switch (outcome.kind) {
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
+            const bool captured_episode = conn.request_capture_slice != nullptr;
             const auto release_capture_slice = [&]() {
                 if (conn.response_capture_slice == nullptr) return;
                 if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
@@ -1585,6 +1591,33 @@ void handle_jit_outcome(Loop* loop,
                     loop->pool.free(conn.request_capture_slice);
                 conn.request_capture_slice = nullptr;
                 conn.request_capture_len = 0;
+            };
+            if (captured_episode && conn.pipeline_stash_len > 0) {
+                if (!pipeline_recover(conn)) {
+                    conn.resp_status = 500;
+                    conn.keep_alive = false;
+                    format_static_response(conn, 500, false);
+                    release_capture_slice();
+                    release_request_capture();
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
+                if (conn.pipeline_depth > 0) {
+                    // Dispatch is deferred until this response drains; let the
+                    // completion path account for the recovered next request.
+                    conn.pipeline_depth--;
+                }
+            }
+            const auto transition_to_response_send = [&]() {
+                if (captured_episode) {
+                    conn.resp_body_sent = conn.send_buf.len();
+                    conn.upstream_send_len = 0;
+                    conn.proxy_resp_started = true;
+                    conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+                } else {
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                }
             };
             conn.resp_status = outcome.status_code;
             // ABI: upstream_id is a 1-based index into the pinned
@@ -1623,6 +1656,15 @@ void handle_jit_outcome(Loop* loop,
             // — matches the no-headers path's documented behavior of
             // falling back rather than rendering garbage.
             const bool body_idx_invalid = outcome.response_body_idx != 0 && !has_body;
+            const bool captured_head = outcome.uses_captured_response &&
+                                       conn.req_method ==
+                                           static_cast<u8>(LogHttpMethod::Head);
+            const bool status_forbids_body = outcome.status_code < 200 ||
+                                             outcome.status_code == 204 ||
+                                             outcome.status_code == 205 ||
+                                             outcome.status_code == 304;
+            const bool body_mutated = outcome.response_ctx != nullptr &&
+                                      outcome.response_ctx->response_body_mutation_set;
             if (header_count != 0) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
@@ -1651,12 +1693,19 @@ void handle_jit_outcome(Loop* loop,
                 }
                 format_response_with_body_and_headers(conn,
                                                       outcome.status_code,
-                                                      body_data,
-                                                      body_len,
+                                                      captured_head ? nullptr : body_data,
+                                                      captured_head ? 0 : body_len,
                                                       kvs,
                                                       header_count,
                                                       keep_alive,
-                                                      body_is_fallback);
+                                                      body_is_fallback,
+                                                      captured_head && !body_mutated &&
+                                                          !status_forbids_body,
+                                                      captured_head && body_mutated &&
+                                                              !status_forbids_body
+                                                          ? body_len
+                                                          : 0xffffffffu,
+                                                      status_forbids_body);
             } else if (has_dynamic_body) {
                 format_response_with_body(conn,
                                           outcome.status_code,
@@ -1672,7 +1721,7 @@ void handle_jit_outcome(Loop* loop,
             }
             release_capture_slice();
             release_request_capture();
-            conn.transition_to_sending(&on_response_sent<Loop>);
+            transition_to_response_send();
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
@@ -1932,6 +1981,11 @@ void handle_jit_outcome(Loop* loop,
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
+            }
+            if (conn.request_capture_slice != nullptr && conn.response_capture_slice != nullptr) {
+                if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
+                    loop->pool.free(conn.response_capture_slice);
+                conn.response_capture_slice = nullptr;
             }
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would
@@ -2557,6 +2611,9 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     if (conn.retry_req_send_len > 0) {
         req_src = conn.send_buf.data();
         req_send_len = conn.retry_req_send_len;
+    } else if (conn.request_capture_slice != nullptr) {
+        req_src = conn.request_capture_slice;
+        req_send_len = conn.request_capture_len;
     } else {
         req_src = conn.recv_buf.data();
         req_send_len =
@@ -2662,7 +2719,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // had no pipelined surplus), so the completion path dispatches recv_buf as the next
     // request (Case C: stash_len==0 && recv_buf.len()>0). This matches on_upstream_-
     // response's "recv_buf is NOT touched here" handling once a response byte arrives.
-    if (conn.retry_req_send_len == 0) {
+    const bool replaying_captured_request =
+        conn.request_capture_slice != nullptr && conn.jit_ctx()->captured_response_valid;
+    if (conn.retry_req_send_len == 0 && !replaying_captured_request) {
         // Snapshot the request for a reused pooled socket so the rare post-send dead-
         // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
         // replay it on a fresh connect even after recv_buf is reset below. Do this
@@ -2809,6 +2868,11 @@ template <typename Loop>
 void h2_proxy_fail(Loop* loop, Connection& conn, u16 status) {
     Http2Conn* h2 = conn.h2;
     const u32 kStreamId = h2->async_stream;
+    if (h2->async_capture_response && conn.response_capture_slice != nullptr) {
+        if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
+            loop->pool.free(conn.response_capture_slice);
+        conn.response_capture_slice = nullptr;
+    }
     h2_proxy_teardown_upstream(loop, conn);
     // Serialize the status-only response into a local scratch, NOT pending_synth:
     // on io_uring a timeout can fire while the upstream request send is still in
@@ -5294,6 +5358,16 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_recv_buf.reset();
 
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
+
+    // A handler may discard a captured response and start a second forwarding
+    // episode from the owned request snapshot. The snapshot is needed through
+    // that upstream send, but no longer after its terminal response drains.
+    if (conn.request_capture_slice != nullptr) {
+        if constexpr (requires { loop->pool.free(conn.request_capture_slice); })
+            loop->pool.free(conn.request_capture_slice);
+        conn.request_capture_slice = nullptr;
+        conn.request_capture_len = 0;
+    }
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
         const u16 kStashLen = conn.pipeline_stash_len;

@@ -341,6 +341,17 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
                             "forward completion requires a valid response fixture");
                 return out;
             }
+            for (u32 i = 0; i < event.response_header_count; i++) {
+                const auto& header = event.response_headers[i];
+                if ((header.name.len != 0 && header.name.ptr == nullptr) ||
+                    (header.value.len != 0 && header.value.ptr == nullptr)) {
+                    out.harness.outcome = Outcome::Invalid;
+                    copy_detail(out.harness.detail,
+                                sizeof(out.harness.detail),
+                                "forward completion requires valid response header views");
+                    return out;
+                }
+            }
             auto& response = execution.frame.context;
             response.captured_response_valid = true;
             response.captured_response_status = event.response_status;
