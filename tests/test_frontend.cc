@@ -32286,6 +32286,42 @@ TEST(frontend, response_assignments_are_statement_only) {
     }
 }
 
+TEST(frontend, response_scalar_mutations_reject_conditional_helper_effects) {
+    const char* cases[] = {
+        R"rut(
+func rewrite(_ resp: Response, _ enabled: bool) -> i32 {
+    if enabled {
+        resp.status = 201
+    } else {
+        resp.status = 202
+    }
+}
+)rut",
+        R"rut(
+func rewrite(_ resp: Response, _ enabled: bool) -> str {
+    match enabled {
+        true => {
+            resp.body = "conditional"
+        }
+        false => {
+            resp.body = "fallback"
+        }
+    }
+}
+)rut",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response assignments are only supported in unconditional effect positions")));
+    }
+}
+
 TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
     const char* cases[] = {
         "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) return 204 }\n",

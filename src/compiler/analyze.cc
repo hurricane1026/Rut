@@ -6776,7 +6776,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::Assign) {
-        if (route == nullptr || !route->response_assignment_stmt_ok)
+        if (route == nullptr || !route->allow_respond_effects)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("Response assignments are only supported in unconditional effect "
+                        "positions"));
+        if (!route->response_assignment_stmt_ok)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 expr.span,
@@ -18636,10 +18642,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
+                    const bool saved_allow_respond_effects = route.allow_respond_effects;
+                    route.allow_respond_effects = true;
                     route.response_assignment_stmt_ok = true;
                     auto value = analyze_expr(
                         stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                     route.response_assignment_stmt_ok = false;
+                    route.allow_respond_effects = saved_allow_respond_effects;
                     if (!value) return core::make_unexpected(value.error());
                     if (value->kind != HirExprKind::RespSetStatus &&
                         value->kind != HirExprKind::RespSetBody)
