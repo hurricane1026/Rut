@@ -10056,6 +10056,7 @@ static FrontendResult<void> append_dynamic_json_value(
     const HirModule& mod,
     std::vector<std::string>& segments,
     FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
+    FixedVec<u32, HirTerminator::kMaxJsonMaterializedValues>& value_expr_indices,
     Span span,
     bool materialize_struct,
     u32 depth) {
@@ -10069,18 +10070,16 @@ static FrontendResult<void> append_dynamic_json_value(
         if (value.struct_index >= mod.structs.len)
             return frontend_error(FrontendError::UnsupportedSyntax, span);
         if (materialize_struct && value.kind != HirExprKind::LocalRef) {
-            if (route->locals.len >= HirRoute::kMaxLocals)
+            if (value_expr_indices.len >= HirTerminator::kMaxJsonMaterializedValues ||
+                route->exprs.len >= HirRoute::kMaxExprs)
+                return frontend_error(FrontendError::TooManyItems, span);
+            if (!route->exprs.push(value)) return frontend_error(FrontendError::TooManyItems, span);
+            const u32 expr_index = route->exprs.len - 1;
+            if (!value_expr_indices.push(expr_index))
                 return frontend_error(FrontendError::TooManyItems, span);
             HirLocal local{};
-            local.span = span;
-            local.name = intern_generated_name("$json.struct." + std::to_string(route->locals.len));
-            local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
-            if (local.ref_index >= HirRoute::kMaxLocals)
-                return frontend_error(FrontendError::TooManyItems, span);
+            local.ref_index = HirRoute::kMaxLocals + value_expr_indices.len - 1;
             copy_json_value_metadata(&local, value);
-            local.init = value;
-            if (!route->locals.push(local))
-                return frontend_error(FrontendError::TooManyItems, span);
             value = make_json_local_ref(local, span);
         }
 
@@ -10094,8 +10093,15 @@ static FrontendResult<void> append_dynamic_json_value(
                 return frontend_error(FrontendError::TooManyItems, span);
             auto field = project_json_struct_field(value, decl.fields[i], route, span);
             if (!field) return core::make_unexpected(field.error());
-            auto child = append_dynamic_json_value(
-                field.value(), route, mod, segments, value_refs, span, false, depth + 1);
+            auto child = append_dynamic_json_value(field.value(),
+                                                   route,
+                                                   mod,
+                                                   segments,
+                                                   value_refs,
+                                                   value_expr_indices,
+                                                   span,
+                                                   false,
+                                                   depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -10111,18 +10117,14 @@ static FrontendResult<void> append_dynamic_json_value(
             span,
             lit_str("runtime json values currently support non-optional bool/i32/i64/str only"));
     if (value_refs.len >= HirTerminator::kMaxJsonDynamicValues ||
-        route->locals.len >= HirRoute::kMaxLocals)
+        value_expr_indices.len >= HirTerminator::kMaxJsonMaterializedValues ||
+        route->exprs.len >= HirRoute::kMaxExprs)
         return frontend_error(FrontendError::TooManyItems, span);
 
-    HirLocal local{};
-    local.span = span;
-    local.name = intern_generated_name("$json.response." + std::to_string(value_refs.len));
-    local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
-    if (local.ref_index >= HirRoute::kMaxLocals)
-        return frontend_error(FrontendError::TooManyItems, span);
-    copy_json_value_metadata(&local, value);
-    local.init = value;
-    if (!route->locals.push(local) || !value_refs.push(local.ref_index))
+    if (!route->exprs.push(value)) return frontend_error(FrontendError::TooManyItems, span);
+    const u32 expr_index = route->exprs.len - 1;
+    const u32 ref_index = HirRoute::kMaxLocals + value_expr_indices.len;
+    if (!value_expr_indices.push(expr_index) || !value_refs.push(ref_index))
         return frontend_error(FrontendError::TooManyItems, span);
     segments.emplace_back();
     return {};
@@ -10137,6 +10139,7 @@ static FrontendResult<void> build_dynamic_json_plan(
     const MatchPayloadBinding* binding,
     std::vector<std::string>& segments,
     FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
+    FixedVec<u32, HirTerminator::kMaxJsonMaterializedValues>& value_expr_indices,
     u32 depth = 0) {
     if (depth > 32)
         return frontend_error(FrontendError::TooManyItems, expr.span, kJsonLiteralDetail);
@@ -10176,6 +10179,7 @@ static FrontendResult<void> build_dynamic_json_plan(
                                                  binding,
                                                  segments,
                                                  value_refs,
+                                                 value_expr_indices,
                                                  depth + 1);
             if (!child) return child;
         }
@@ -10197,6 +10201,7 @@ static FrontendResult<void> build_dynamic_json_plan(
                                                  binding,
                                                  segments,
                                                  value_refs,
+                                                 value_expr_indices,
                                                  depth + 1);
             if (!child) return child;
         }
@@ -10207,8 +10212,15 @@ static FrontendResult<void> build_dynamic_json_plan(
 
     auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!value) return core::make_unexpected(value.error());
-    return append_dynamic_json_value(
-        value.value(), route, mod, segments, value_refs, expr.span, true, depth);
+    return append_dynamic_json_value(value.value(),
+                                     route,
+                                     mod,
+                                     segments,
+                                     value_refs,
+                                     value_expr_indices,
+                                     expr.span,
+                                     true,
+                                     depth);
 }
 
 static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index);
@@ -10266,41 +10278,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                         local_count,
                                                         binding,
                                                         segments,
-                                                        term.json_value_ref_indices);
+                                                        term.json_value_ref_indices,
+                                                        term.json_value_expr_indices);
                     if (!plan) return core::make_unexpected(plan.error());
-                    if (route->waits.len != 0) {
-                        bool retained[HirRoute::kMaxLocals]{};
-                        for (u32 ri = 0; ri < term.json_value_ref_indices.len; ri++) {
-                            for (u32 li = 0; li < route->locals.len; li++) {
-                                if (route->locals[li].ref_index ==
-                                    term.json_value_ref_indices[ri]) {
-                                    retained[li] = true;
-                                    break;
-                                }
-                            }
-                        }
-                        // The resumed terminal rematerializes its synthetic JSON
-                        // slots. Preserve the transitive ordinary-local closure
-                        // as well so none of those recipes reads state-0 SSA.
-                        bool changed = true;
-                        while (changed) {
-                            changed = false;
-                            for (u32 li = 0; li < route->locals.len; li++) {
-                                if (!retained[li]) continue;
-                                for (u32 dep = 0; dep < route->locals.len; dep++) {
-                                    if (retained[dep] ||
-                                        !expr_reads_local_ref(route->locals[li].init,
-                                                              route->locals[dep].ref_index))
-                                        continue;
-                                    retained[dep] = true;
-                                    changed = true;
-                                }
-                            }
-                        }
-                        for (u32 li = 0; li < route->locals.len; li++)
-                            if (retained[li] && !route->locals[li].defer_to_terminator)
-                                route->locals[li].rematerialize_after_wait = true;
-                    }
                     u32 minimum_bytes = 0;
                     for (const auto& segment : segments) {
                         if (segment.size() > kJsonResponseScratchCapacity - minimum_bytes)
@@ -10309,17 +10289,18 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     }
                     for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
                         const u32 ref = term.json_value_ref_indices[ji];
-                        const HirLocal* slot = nullptr;
-                        for (u32 li = 0; li < route->locals.len; li++)
-                            if (route->locals[li].ref_index == ref) {
-                                slot = &route->locals[li];
-                                break;
-                            }
-                        if (slot == nullptr)
+                        if (ref < HirRoute::kMaxLocals)
                             return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
-                        const u32 encoded_minimum = slot->type == HirTypeKind::Bool  ? 4u
-                                                    : slot->type == HirTypeKind::Str ? 2u
-                                                                                     : 1u;
+                        const u32 materialized_index = ref - HirRoute::kMaxLocals;
+                        if (materialized_index >= term.json_value_expr_indices.len)
+                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                        const u32 expr_index = term.json_value_expr_indices[materialized_index];
+                        if (expr_index >= route->exprs.len)
+                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                        const auto type = route->exprs[expr_index].type;
+                        const u32 encoded_minimum = type == HirTypeKind::Bool  ? 4u
+                                                    : type == HirTypeKind::Str ? 2u
+                                                                               : 1u;
                         if (encoded_minimum > kJsonResponseScratchCapacity - minimum_bytes)
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                         minimum_bytes += encoded_minimum;

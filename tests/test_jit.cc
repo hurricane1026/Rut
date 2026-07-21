@@ -1493,6 +1493,13 @@ route GET "/api/users" {
     .err => return 500
     }
 }
+route GET "/api/error" {
+    let state = Result.err
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
 )rut";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
@@ -1526,6 +1533,20 @@ route GET "/api/users" {
     REQUIRE(outcome.dynamic_response_body != nullptr);
     const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
     CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42}")));
+
+    auto error_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(error_handler != nullptr);
+    constexpr char kGetErrorRequest[] = "GET /api/error HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    conn.reset();
+    TestHandlerCtxFrame error_frame{};
+    const auto error_outcome = invoke_jit_handler(error_handler,
+                                                  &conn,
+                                                  error_frame.ctx,
+                                                  reinterpret_cast<const u8*>(kGetErrorRequest),
+                                                  sizeof(kGetErrorRequest) - 1,
+                                                  nullptr);
+    CHECK(error_outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(error_outcome.status_code, 500u);
 
     engine.shutdown();
     rir.destroy();
