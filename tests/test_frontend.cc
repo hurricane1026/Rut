@@ -34143,6 +34143,53 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, binary_operands_reject_response_mutation_after_field_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    201
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == mutate(resp) else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating right operand cannot follow a Response field read")));
+}
+
+TEST(frontend, helper_assignment_rejects_earlier_captured_response_read) {
+    const char* src = R"rut(
+func sample(code: i32) -> i32 {
+    let resp = response(200)
+    resp.status = code
+    let saved = resp.status
+    resp.body = "done"
+    saved
+}
+route GET "/x" {
+    let value = sample(201)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("helper Response assignments cannot follow a captured Response field read")));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
