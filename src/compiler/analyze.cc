@@ -11447,6 +11447,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 if (body->type != HirTypeKind::Json)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
+                if (route->waits.len != 0 &&
+                    hir_expr_reads_wait_result_with_locals(
+                        body.value(), route->locals.data, route->locals.len))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        stmt.expr.span,
+                        lit_str("json cannot capture wait-result state after a wait"));
                 if (body->kind == HirExprKind::JsonBuild && body->field_inits.len == 0) {
                     term.response_body = body->str_value;
                 } else if (body->kind == HirExprKind::JsonBuild) {
