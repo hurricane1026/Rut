@@ -7450,6 +7450,70 @@ route GET "/x" {
                                   "move the assignment before the guard")));
 }
 
+TEST(frontend, response_mutating_helper_after_field_read_is_rejected) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    let ignored = rewrite(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let inner = response(200)
+    inner.status = 201
+    0
+}
+route GET "/x" {
+    let outer = response(200)
+    let ignored = rewrite()
+    outer.body = "outer"
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_pipes) {
+    const char* src = R"rut(
+func rewrite(value: str) -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = req.header("X-Value") | rewrite(_)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));
