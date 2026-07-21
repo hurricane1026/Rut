@@ -33768,6 +33768,39 @@ TEST(frontend, imported_array_shapes_reinstantiate_generic_nominal_elements) {
     rir.destroy();
 }
 
+TEST(frontend, empty_array_call_arguments_use_concrete_parameter_shape) {
+    const char* src =
+        "func keep(values: [str]) -> [str] => values "
+        "route GET \"/x\" { let values = keep([]) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_array_variant_payloads_without_runtime_slots) {
+    const char* src =
+        "variant Values { some([i32]), none } "
+        "route GET \"/x\" { let value = Values.some([1]) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, rejects_recursive_array_carriers_without_predeclared_struct_slots) {
+    const char* src =
+        "struct Node { children: [Node] } "
+        "route GET \"/x\" { let nodes: [Node] = [] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
