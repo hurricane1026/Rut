@@ -8627,8 +8627,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                   mixed_int ? kArithMixedWidthDetail : Str{});
         }
         if (expr.kind == AstExprKind::Eq) {
-            if (lhs->type == HirTypeKind::Generic && !lhs->generic_has_eq_constraint)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (lhs->type == HirTypeKind::Generic) {
+                if (!lhs->generic_has_eq_constraint)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            } else {
+                bool struct_visiting[HirModule::kMaxStructs]{};
+                bool variant_visiting[HirModule::kMaxVariants]{};
+                if (!hir_type_shape_satisfies_eq_constraint(mod,
+                                                            lhs->type,
+                                                            lhs->variant_index,
+                                                            lhs->struct_index,
+                                                            lhs->tuple_len,
+                                                            lhs->tuple_types,
+                                                            lhs->tuple_variant_indices,
+                                                            lhs->tuple_struct_indices,
+                                                            struct_visiting,
+                                                            variant_visiting))
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            }
         } else {
             if (lhs->type == HirTypeKind::Generic) {
                 if (!lhs->generic_has_ord_constraint)
@@ -10147,10 +10163,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         HirLocal carrier{};
         carrier.span = expr.args[i]->span;
         carrier.name = {"$array_arg", 10};
-        // A route-level `let` reserves its own ref_index before analyzing the
-        // initializer, but is not in route->locals yet. Keep this synthetic
-        // argument carrier beyond that pending slot.
-        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len) + 1;
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        if (carrier.ref_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, expr.args[i]->span);
         carrier.type = analyzed_args[i].type;
         carrier.shape_index = analyzed_args[i].shape_index;
         carrier.init = analyzed_args[i];
@@ -14516,6 +14531,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             local.span = bstmt.span;
             local.name = bstmt.name;
             local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+            if (local.ref_index >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            HirLocal reserved_local{};
+            reserved_local.span = bstmt.span;
+            reserved_local.ref_index = local.ref_index;
+            const u32 local_storage_index = route->locals.len;
+            if (!route->locals.push(reserved_local))
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            const u32 scoped_carrier_start = route->locals.len;
             auto init = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!init) return core::make_unexpected(init.error());
@@ -14549,9 +14573,21 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             local.error_variant_index = init->error_variant_index;
             local.shape_index = init->shape_index;
             local.init = init.value();
+            route->locals[local_storage_index] = local;
+            // Synthetic locals created while analyzing this initializer must
+            // execute inside each unrolled iteration, before the user local.
+            for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                const u32 carrier_index = loop.body.locals.len;
+                if (!loop.body.locals.push(route->locals[li]))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                HirForLoopBody::Step carrier_step{};
+                carrier_step.kind = HirForLoopBody::Step::Kind::Let;
+                carrier_step.index = carrier_index;
+                carrier_step.span = route->locals[li].span;
+                if (!loop.body.steps.push(carrier_step))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            }
             const u32 local_index = loop.body.locals.len;
-            if (!route->locals.push(local))
-                return frontend_error(FrontendError::TooManyItems, bstmt.span);
             if (!loop.body.locals.push(local))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
             HirForLoopBody::Step step{};
@@ -19894,6 +19930,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 local.span = stmt.span;
                 local.name = stmt.name;
                 local.ref_index = next_local_ref_index(&route, route.locals.data, route.locals.len);
+                if (local.ref_index >= HirRoute::kMaxLocals)
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                // Reserve this destination once before the initializer adds any
+                // synthetic argument carriers. The placeholder is unnameable,
+                // so the initializer cannot accidentally refer to itself.
+                HirLocal reserved_local{};
+                reserved_local.span = stmt.span;
+                reserved_local.ref_index = local.ref_index;
+                const u32 local_storage_index = route.locals.len;
+                if (!route.locals.push(reserved_local))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
                 const bool used_for_iter =
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
@@ -19984,8 +20031,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 local.error_variant_index = init->error_variant_index;
                 local.shape_index = init->shape_index;
                 local.init = init.value();
-                if (!route.locals.push(local))
-                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                // Carriers added while analyzing the initializer must be
+                // materialized before the destination that refers to them.
+                for (u32 li = local_storage_index + 1; li < route.locals.len; li++)
+                    route.locals[li - 1] = route.locals[li];
+                route.locals[route.locals.len - 1] = local;
                 continue;
             }
             if (stmt.kind == AstStmtKind::Guard) {
