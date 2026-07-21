@@ -5,6 +5,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/response_body_storage.h"
 #include <new>
 #include <unordered_map>
 
@@ -73,6 +74,18 @@ struct JsonResponseScratch {
 };
 thread_local JsonResponseScratch t_json_response;
 
+// Reusable Json values may coexist within one handler invocation (for example,
+// the two eagerly lowered arms of an if-expression). Capture each completed
+// document into a distinct bounded slice so a later JsonBuild cannot overwrite
+// an earlier Str view before the select chooses between them.
+struct JsonCaptureArena {
+    static constexpr u32 kCapacity = 8 * JsonResponseScratch::kCapacity;
+    char data[kCapacity]{};
+    u32 len = 0;
+    u32 last_capture_len = 0xffffffffu;
+};
+thread_local JsonCaptureArena t_json_captures;
+
 void json_append(const char* data, u32 len) {
     auto& out = t_json_response;
     if (!out.ok) return;
@@ -117,6 +130,8 @@ const ParseCache& parse_cached(const u8* data, u32 len) {
 
 void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
     t_time_cache.valid = false;  // fresh "now" per invocation
+    t_json_captures.len = 0;
+    t_json_captures.last_capture_len = 0xffffffffu;
     // Parse once for this invocation and mark the cache primed so the
     // following req_* helper calls reuse it.
     ParseCache& pc = t_parse_cache;
@@ -215,11 +230,20 @@ void rut_helper_json_append_bool(u8 value) {
 }
 
 const char* rut_helper_json_capture_data() {
-    return t_json_response.ok ? t_json_response.data : nullptr;
+    auto& captures = t_json_captures;
+    if (!t_json_response.ok || t_json_response.len > JsonCaptureArena::kCapacity - captures.len) {
+        captures.last_capture_len = 0xffffffffu;
+        return nullptr;
+    }
+    char* out = captures.data + captures.len;
+    if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
+    captures.len += t_json_response.len;
+    captures.last_capture_len = t_json_response.len;
+    return out;
 }
 
 u32 rut_helper_json_capture_len() {
-    return t_json_response.ok ? t_json_response.len : 0xffffffffu;
+    return t_json_captures.last_capture_len;
 }
 
 void rut_helper_json_finish(void* ctx) {
@@ -474,14 +498,14 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
     hctx->response_body_pending_set = true;
     hctx->response_body_pending_overflow =
         body == nullptr || len > jit::kMaxResponseBodyMutationBytes;
-    if (hctx->response_body_pending_overflow) {
-        hctx->response_body_pending_data = nullptr;
-        hctx->response_body_pending_len = 0;
-        return;
+    if (!hctx->response_body_pending_overflow && hctx->response_body_mutation_storage == nullptr) {
+        hctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+        if (hctx->response_body_mutation_storage == nullptr)
+            hctx->response_body_pending_overflow = true;
     }
-    if (len != 0) __builtin_memmove(hctx->response_body_pending_storage, body, len);
-    hctx->response_body_pending_data = hctx->response_body_pending_storage;
-    hctx->response_body_pending_len = len;
+    hctx->response_body_pending_len = hctx->response_body_pending_overflow ? 0 : len;
+    if (!hctx->response_body_pending_overflow && len != 0)
+        __builtin_memcpy(hctx->response_body_mutation_storage, body, len);
 }
 
 void rut_helper_resp_commit_headers(void* ctx) {
@@ -493,7 +517,6 @@ void rut_helper_resp_commit_headers(void* ctx) {
         hctx->response_status_pending_invalid ? 0 : static_cast<u16>(hctx->response_status_pending);
     hctx->response_status_set = hctx->response_status_pending_set;
     hctx->response_status_invalid = hctx->response_status_pending_invalid;
-    hctx->response_body_mutation_data = hctx->response_body_pending_data;
     hctx->response_body_mutation_len = hctx->response_body_pending_len;
     hctx->response_body_mutation_set = hctx->response_body_pending_set;
     hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
@@ -511,7 +534,7 @@ void rut_helper_resp_body(
     *out_ptr = fallback_ptr;
     *out_len = fallback_len;
     if (ctx == nullptr) return;
-    const auto* hctx = static_cast<const jit::HandlerCtx*>(ctx);
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     if (hctx->captured_response_valid) {
         *out_ptr = hctx->captured_response_body;
         *out_len = hctx->captured_response_body_len;
@@ -519,7 +542,13 @@ void rut_helper_resp_body(
     // Overflow is already a fail-closed terminal condition. Do not expose a
     // partial or dangling value to later expressions while building that 500.
     if (!hctx->response_body_pending_set || hctx->response_body_pending_overflow) return;
-    *out_ptr = hctx->response_body_pending_data;
+    const char* snapshot = jit::snapshot_response_body(
+        hctx, hctx->response_body_mutation_storage, hctx->response_body_pending_len);
+    if (snapshot == nullptr) {
+        hctx->response_body_pending_overflow = true;
+        return;
+    }
+    *out_ptr = snapshot;
     *out_len = hctx->response_body_pending_len;
 }
 

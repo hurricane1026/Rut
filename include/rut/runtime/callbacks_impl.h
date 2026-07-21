@@ -2860,7 +2860,7 @@ void h2_proxy_finish(Loop* loop,
     if (mutations_valid && response_ctx != nullptr && response_ctx->response_status_set)
         status = response_ctx->response_status;
     if (mutations_valid && response_ctx != nullptr && response_ctx->response_body_mutation_set) {
-        body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_data);
+        body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_storage);
         body_len = response_ctx->response_body_mutation_len;
     }
     if (!mutations_valid || status < 200 || status == 204 || status == 205 || status == 304 ||
@@ -3154,6 +3154,12 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void h2_proxy_begin(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
+    // JIT proxy/capture episodes own a parked HandlerCtx. Repoint the connection
+    // before any upstream callback reads response mutations or capture state; a
+    // later stream in the suspending H2 batch may already have reset the shared
+    // connection scratch frame.
+    if (h2->async_apply_response_mutations || h2->async_capture_response)
+        conn.handler_ctx = h2->async_jit_ctx();
     const RouteConfig* cfg = h2->async_cfg;
     const u16 upstream_id = h2->async_upstream_id;
     if (cfg == nullptr || upstream_id >= cfg->upstream_count) {
@@ -4635,7 +4641,7 @@ void finish_buffered_forward(Loop* loop,
     const char* body =
         reinterpret_cast<const char*>(conn.upstream_recv_buf.data() + parser.header_end);
     if (response_ctx->response_body_mutation_set) {
-        body = response_ctx->response_body_mutation_data;
+        body = response_ctx->response_body_mutation_storage;
         body_len = response_ctx->response_body_mutation_len;
     }
     const bool no_body = status < 200 || status == 204 || status == 205 || status == 304 ||

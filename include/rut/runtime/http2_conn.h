@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/common/wait_limits.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/http_parser.h"
@@ -157,6 +158,15 @@ struct Http2Conn {
     u32 async_timer_ms;
     jit::HandlerFn async_fn;
     u16 async_state;
+    // A yielded stream must not keep using ConnectionBase::handler_ctx_storage:
+    // another stream in the same decoded batch can invoke synchronously and
+    // reset that connection scratch before this stream resumes. The h2 engine
+    // permits one suspended stream, so one dedicated frame preserves its full
+    // HandlerCtx plus live-across-yield slots without multiplying storage by
+    // kMaxStreams.
+    alignas(alignof(u64)) u8
+        async_handler_ctx_storage[sizeof(jit::HandlerCtx) +
+                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8];
     // Proxy suspension only: the matched route (for upstream_id + inflight cap)
     // and the running count of upstream h1 response bytes accumulated back into
     // pending_synth (reused as the response buffer once the request is sent).
@@ -165,6 +175,10 @@ struct Http2Conn {
     bool async_apply_response_mutations;
     bool async_capture_response;
     u32 async_resp_len;
+
+    jit::HandlerCtx* async_jit_ctx() {
+        return reinterpret_cast<jit::HandlerCtx*>(async_handler_ctx_storage);
+    }
 
     // Set callbacks (any may be null) then call init().
     void init();
