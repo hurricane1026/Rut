@@ -714,6 +714,14 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_resp_publish_body(ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::RespCommitBody, nullptr, loc));
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_json_reset(SourceLoc loc = {}) {
         TRY_VOID(emit(Opcode::JsonReset, nullptr, loc));
         return {};
