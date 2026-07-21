@@ -208,8 +208,7 @@ struct Ctx {
     LLVMValueRef get_json_capture_reset() {
         if (!fn_json_capture_reset) {
             LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
-            fn_json_capture_reset =
-                LLVMAddFunction(llvm_mod, "rut_helper_json_capture_reset", ft);
+            fn_json_capture_reset = LLVMAddFunction(llvm_mod, "rut_helper_json_capture_reset", ft);
         }
         return fn_json_capture_reset;
     }
