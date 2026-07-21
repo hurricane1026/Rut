@@ -6986,6 +6986,50 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, chain_after_response_effects_follow_buffered_capture_resume) {
+    const auto src = R"rut(
+upstream api
+func copy_origin(_ resp: Response) -> i32 {
+    resp.set("X-Copy", "yes")
+    0
+}
+chain copy_chain { after copy_origin(resp) }
+route GET "/x" use chain copy_chain {
+    let resp = forward(api, buffered: true)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 2u);
+    CHECK_EQ(mir->functions[0].blocks[0].effects.len, 0u);
+    CHECK_EQ(mir->functions[0].blocks[1].effects.len, 1u);
+}
+
+TEST(frontend, captured_response_rejects_followup_event_wait) {
+    const auto src = R"rut(
+upstream api
+route GET "/x" {
+    let resp = forward(api, buffered: true)
+    wait(downstream.recv())
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("non-timer waits cannot follow a captured Response")));
+}
+
 TEST(frontend, buffered_forward_expression_rejects_unowned_and_request_rewrite_forms) {
     struct Case {
         const char* expression;

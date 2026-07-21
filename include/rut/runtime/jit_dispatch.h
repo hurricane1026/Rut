@@ -170,6 +170,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             }
             if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
                 out.status_code = 500;
+                out.uses_captured_response = false;
                 out.response_body_idx = 0;
                 out.dynamic_response_body = nullptr;
                 out.dynamic_response_body_len = 0;

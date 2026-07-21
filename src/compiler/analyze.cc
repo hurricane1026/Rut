@@ -21118,6 +21118,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                           lit_str("wait cannot be used after a static for-loop"));
                 auto wait_spec = analyze_wait_stmt_spec(stmt, mod);
                 if (!wait_spec) return core::make_unexpected(wait_spec.error());
+                for (u32 li = 0; li < route.locals.len; li++) {
+                    const auto& existing = route.locals[li].init;
+                    if (existing.kind == HirExprKind::ResponseInit && existing.is_wait_result &&
+                        existing.wait_event_kind == WaitEventKind::ForwardBuffered &&
+                        wait_spec->kind != WaitEventKind::Timer)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("non-timer waits cannot follow a captured Response"));
+                }
                 if (wait_spec->kind == WaitEventKind::Timer && wait_spec->payload == 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
                 seen_wait = true;
@@ -21256,6 +21266,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (init->is_wait_result) {
+                    if (init->wait_event_kind != WaitEventKind::Timer) {
+                        for (u32 li = 0; li < route.locals.len; li++) {
+                            const auto& existing = route.locals[li].init;
+                            if (existing.kind == HirExprKind::ResponseInit &&
+                                existing.is_wait_result &&
+                                existing.wait_event_kind == WaitEventKind::ForwardBuffered)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    stmt.span,
+                                    lit_str("non-timer waits cannot follow a captured Response"));
+                        }
+                    }
                     if (seen_for)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,

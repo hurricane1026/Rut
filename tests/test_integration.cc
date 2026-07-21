@@ -9531,6 +9531,15 @@ route HEAD "/capture" {
 }
 )rut";
 
+static constexpr const char kBufferedBodylessReturnSource[] = R"rut(
+upstream api
+route GET "/capture" {
+    let resp = forward(api, buffered: true)
+    resp.status = 204
+    return resp
+}
+)rut";
+
 static constexpr const char kDynamicJsonTransportSource[] = R"rut(
 route GET "/json" {
     let quoted = any(req.header("X-Value"), "")
@@ -10586,6 +10595,51 @@ TEST(shard, discarded_buffered_capture_does_not_override_http2_literal_response)
     }
     CHECK_EQ(h2_status_for_stream(response, total, 1), 404u);
     CHECK_FALSE(h2_response_has_header(response, total, 1, "x-origin", "leaked"));
+    close(client);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, captured_http2_bodyless_status_suppresses_data) {
+    ScriptedUpstreamServer backend;
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\noriginal";
+    REQUIRE(backend.setup(kResp, sizeof(kResp) - 1));
+    CompiledRutRoute compiled;
+    REQUIRE(compiled.compile(kBufferedBodylessReturnSource));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7F000001, backend.port).has_value());
+    REQUIRE(cfg.add_jit_handler("/capture", 'G', compiled.handler));
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+    i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    set_socket_timeouts(client, 2);
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    request_len +=
+        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/capture", 8);
+    REQUIRE(write_all_fd(client, request, request_len));
+    u8 response[4096];
+    u32 total = 0;
+    for (u32 attempt = 0; attempt < 10 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            client, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) == 204) break;
+    }
+    u8 body[16];
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 204u);
+    CHECK_EQ(h2_body_for_stream(response, total, 1, body, sizeof(body)), 0u);
     close(client);
     shard.stop();
     shard.join();

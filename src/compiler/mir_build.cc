@@ -1994,6 +1994,19 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         break;
                     }
                 }
+                // Chain-after effects inherit the helper declaration span, which
+                // may precede the route's expression-form buffered forward even
+                // though they semantically run after its response is captured.
+                // Clamp response effects to the capture's resume block.
+                for (u32 si = 0; si < step_count; si++) {
+                    if (steps[si].kind == RouteStep::Kind::Wait &&
+                        fn.waits[steps[si].index].event_kind ==
+                            WaitEventKind::ForwardBuffered &&
+                        target <= si) {
+                        target = si + 1;
+                        break;
+                    }
+                }
                 if (target >= fn.blocks.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, local.span);
                 auto effect = mir_value(local.init, module, &fn);

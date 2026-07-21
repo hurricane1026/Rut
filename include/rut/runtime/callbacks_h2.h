@@ -385,6 +385,11 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
+    if (o.status_code < 200 || o.status_code == 204 || o.status_code == 205 ||
+        o.status_code == 304) {
+        body = nullptr;
+        body_len = 0;
+    }
     constexpr u32 kMaxEffectiveHeaders = RouteConfig::kMaxHeadersPerSet +
                                          jit::kMaxCapturedResponseHeaders +
                                          jit::kMaxResponseHeaderMutations;
