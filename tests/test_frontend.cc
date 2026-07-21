@@ -34084,6 +34084,54 @@ route GET "/x" {
         lit("a response-mutating right operand cannot follow a Response field read")));
 }
 
+TEST(frontend, method_arguments_reject_response_mutation_after_receiver_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    201
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status.eq(mutate(resp)) else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating right operand cannot follow a Response field read")));
+}
+
+TEST(frontend, struct_fields_reject_response_mutation_after_field_read) {
+    const char* src = R"rut(
+struct Pair { first: i32, second: i32 }
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let pair = Pair(first: resp.status, second: mutate(resp))
+    guard pair.first == 201 else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating struct field cannot follow a Response field read")));
+}
+
 TEST(frontend, helper_assignment_rejects_earlier_captured_response_read) {
     const char* src = R"rut(
 func sample(code: i32) -> i32 {

@@ -2697,6 +2697,26 @@ TEST(jit, invalid_pending_response_status_is_terminal_immediately) {
     CHECK(frame.ctx.response_status_invalid);
 }
 
+TEST(jit, valid_response_status_replacement_clears_pending_error) {
+    TestHandlerCtxFrame frame{};
+    rut_helper_resp_set_status(&frame.ctx, 700);
+    REQUIRE(frame.ctx.response_status_invalid);
+    rut_helper_resp_set_status(&frame.ctx, 201);
+    CHECK_FALSE(frame.ctx.response_status_pending_invalid);
+    CHECK_FALSE(frame.ctx.response_status_invalid);
+}
+
+TEST(jit, valid_response_body_replacement_clears_pending_overflow) {
+    TestHandlerCtxFrame frame{};
+    static char oversized[kMaxResponseBodyMutationBytes + 1]{};
+    rut_helper_resp_set_body(&frame.ctx, oversized, sizeof(oversized));
+    REQUIRE(frame.ctx.response_body_mutation_overflow);
+    static constexpr char kBody[] = "ok";
+    rut_helper_resp_set_body(&frame.ctx, kBody, sizeof(kBody) - 1);
+    CHECK_FALSE(frame.ctx.response_body_pending_overflow);
+    CHECK_FALSE(frame.ctx.response_body_mutation_overflow);
+}
+
 TEST(jit, response_body_mutation_copies_source_bytes) {
     TestHandlerCtxFrame frame{};
     char body[] = "stable";
