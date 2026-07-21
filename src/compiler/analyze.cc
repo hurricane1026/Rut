@@ -9888,16 +9888,15 @@ static FrontendResult<void> build_dynamic_json_plan(
                 !append_json_quoted(segments.back(), expr.field_inits[i].name) ||
                 !append_json_bytes(segments.back(), ":", 1))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            auto child = build_dynamic_json_plan(
-                *expr.field_inits[i].value,
-                route,
-                mod,
-                locals,
-                local_count,
-                binding,
-                segments,
-                value_refs,
-                depth + 1);
+            auto child = build_dynamic_json_plan(*expr.field_inits[i].value,
+                                                 route,
+                                                 mod,
+                                                 locals,
+                                                 local_count,
+                                                 binding,
+                                                 segments,
+                                                 value_refs,
+                                                 depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -9999,15 +9998,14 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         locals = route->locals.data;
                         local_count = route->locals.len;
                     }
-                    auto plan = build_dynamic_json_plan(
-                        *stmt.expr.args[0],
-                        route,
-                        mod,
-                        locals,
-                        local_count,
-                        binding,
-                        segments,
-                        term.json_value_ref_indices);
+                    auto plan = build_dynamic_json_plan(*stmt.expr.args[0],
+                                                        route,
+                                                        mod,
+                                                        locals,
+                                                        local_count,
+                                                        binding,
+                                                        segments,
+                                                        term.json_value_ref_indices);
                     if (!plan) return core::make_unexpected(plan.error());
                     for (const auto& segment : segments) {
                         if (!term.json_segments.push(intern_generated_name(segment)))
@@ -10789,11 +10787,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term =
-            analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term =
-            analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();

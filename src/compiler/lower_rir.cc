@@ -3093,8 +3093,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                                           locals,
                                                           local_count,
                                                           local.span);
-                    if (!materialized)
-                        return core::make_unexpected(materialized.error());
+                    if (!materialized) return core::make_unexpected(materialized.error());
                     json_value = materialized.value();
                     break;
                 }
