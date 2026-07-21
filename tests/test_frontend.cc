@@ -32438,10 +32438,9 @@ TEST(frontend, reusable_json_local_can_be_returned) {
     REQUIRE(hir);
     const auto& term = hir->routes[0].control.direct_term;
     CHECK(term.has_dynamic_response_body);
-    REQUIRE_EQ(term.json_value_ref_indices.len, 1u);
-    REQUIRE_EQ(term.json_segments.len, 2u);
-    CHECK(term.json_segments[0].eq(lit("{\"path\":")));
-    CHECK(term.json_segments[1].eq(lit("}")));
+    CHECK_NE(term.json_body_expr_index, 0xffffffffu);
+    CHECK_EQ(term.json_value_ref_indices.len, 0u);
+    CHECK_EQ(term.json_segments.len, 0u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -32467,8 +32466,9 @@ route GET "/x" {
     REQUIRE(hir);
     const auto& term = hir->routes[0].control.direct_term;
     CHECK(term.has_dynamic_response_body);
-    REQUIRE_EQ(term.json_value_ref_indices.len, 1u);
-    REQUIRE_EQ(term.json_segments.len, 2u);
+    CHECK_NE(term.json_body_expr_index, 0xffffffffu);
+    CHECK_EQ(term.json_value_ref_indices.len, 0u);
+    CHECK_EQ(term.json_segments.len, 0u);
 }
 
 TEST(frontend, nested_terminators_preserve_json_bodies) {
@@ -34183,6 +34183,54 @@ route GET "/x" {
         lit("a response-mutating right operand cannot follow a Response field read")));
 }
 
+TEST(frontend, method_arguments_reject_response_mutation_after_receiver_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    201
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status.eq(mutate(resp)) else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating right operand cannot follow a Response field read")));
+}
+
+TEST(frontend, struct_fields_reject_response_mutation_after_field_read) {
+    const char* src = R"rut(
+struct Pair { first: i32, second: i32 }
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let pair = Pair(first: resp.status, second: mutate(resp))
+    guard pair.first == 201 else { return 500 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("a response-mutating struct field cannot follow a Response field read")));
+}
+
 TEST(frontend, helper_assignment_rejects_earlier_captured_response_read) {
     const char* src = R"rut(
 func sample(code: i32) -> i32 {
@@ -34336,6 +34384,74 @@ TEST(frontend, recursively_adapts_string_lists_at_array_boundaries) {
     const char* src = R"rut(
 func keep(values: [[str]]) -> [[str]] => values
 route GET "/x" { let values = keep([req.queryAll("tag")]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_nested_tuple_array_elements_without_flat_carriers) {
+    const char* src = "route GET \"/x\" { let xs = [((1, 2), 3)] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, rejects_i64_variant_payloads_as_array_elements) {
+    const char* src = R"rut(
+variant Stamp { at(i64), none }
+route GET "/x" { let xs = [Stamp.at(time.nowMicros())] return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, reusable_json_local_is_referenced_at_its_sink) {
+    const char* src = R"rut(
+func choose(flag: bool) -> Json {
+    if flag { json({ value: "old" }) } else { json({ value: "other" }) }
+}
+route GET "/x" {
+    let payload = choose(req.http11)
+    req.set("X-Mode", "new")
+    return 200, payload
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, reusable_json_local_persists_across_wait) {
+    const char* src = R"rut(
+route GET "/x" {
+    let payload = json({ path: req.path })
+    wait(5)
+    return 200, payload
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, json_helper_scalar_arguments_are_captured_at_call_site) {
+    const char* src = R"rut(
+func encode(value: str) -> Json => json({ value: value })
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Mode", "old")
+    let payload = encode(resp.header("X-Mode").or("missing"))
+    resp.set("X-Mode", "new")
+    return 200, payload
+}
 )rut";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));

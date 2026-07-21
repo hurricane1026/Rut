@@ -5447,9 +5447,62 @@ TEST(buffered_forward, mutated_205_suppresses_upstream_and_replacement_bodies) {
     const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
     const u32 wire_len = conn->send_buf.len();
     CHECK(buf_contains(wire, wire_len, "HTTP/1.1 205", 12));
-    CHECK(buf_contains(wire, wire_len, "Content-Length: 0\r\n", 19));
+    CHECK(!buf_contains(wire, wire_len, "Content-Length:", 15));
     CHECK(!buf_contains(wire, wire_len, "original", 8));
     CHECK(!buf_contains(wire, wire_len, "rewritten", 9));
+}
+
+TEST(buffered_forward, head_body_mutation_declares_replacement_length_without_body) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = setup_proxy_conn_head(loop);
+    REQUIRE(conn != nullptr);
+    conn->proxy_response_buffered = true;
+    conn->req_keep_alive = true;
+    conn->keep_alive = true;
+
+    auto* ctx = conn->reset_jit_ctx();
+    static const char kReplacement[] = "rewritten";
+    ctx->response_body_mutation_storage = rut::jit::acquire_response_body_mutation_storage();
+    REQUIRE(ctx->response_body_mutation_storage != nullptr);
+    __builtin_memcpy(ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
+    ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
+    ctx->response_body_mutation_set = true;
+
+    static const char kUpstream[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n";
+    conn->upstream_recv_buf.reset();
+    conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstream), sizeof(kUpstream) - 1);
+    on_upstream_response<SmallLoop>(
+        &loop,
+        *conn,
+        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kUpstream) - 1)));
+
+    const char* wire = reinterpret_cast<const char*>(conn->send_buf.data());
+    const u32 wire_len = conn->send_buf.len();
+    CHECK(buf_contains(wire, wire_len, "Content-Length: 9\r\n", 19));
+    CHECK(!buf_contains(wire, wire_len, "rewritten", 9));
+}
+
+TEST(buffered_forward, snapshots_request_backed_header_mutation_values) {
+    Connection conn;
+    conn.reset();
+    u8 request_storage[128]{};
+    conn.recv_buf.bind(request_storage, sizeof(request_storage));
+    static const char kRequest[] = "GET /first HTTP/1.1\r\nHost: test\r\n\r\n";
+    conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1);
+
+    auto* ctx = conn.reset_jit_ctx();
+    static const char kName[] = "X-Path";
+    ctx->response_header_mutations[0] = {
+        {kName, sizeof(kName) - 1},
+        {reinterpret_cast<const char*>(conn.recv_buf.data() + 4), 6},
+        jit::ResponseHeaderMutationMode::Set};
+    ctx->response_header_count = 1;
+    REQUIRE(snapshot_buffered_response_mutation_views(conn));
+    __builtin_memset(request_storage, 'x', sizeof(kRequest) - 1);
+    CHECK(ctx->response_header_mutations[0].value.eq(Str{"/first", 6}));
+    rut_helper_resp_release_body_storage(ctx);
 }
 
 TEST(buffered_forward, waits_for_and_dechunks_complete_upstream_body) {
