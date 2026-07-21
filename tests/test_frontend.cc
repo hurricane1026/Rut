@@ -7445,8 +7445,9 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
-                                    "move the assignment before the guard")));
+    CHECK(
+        hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
+                                  "move the assignment before the guard")));
 }
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {

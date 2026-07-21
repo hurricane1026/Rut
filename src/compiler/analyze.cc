@@ -6816,8 +6816,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 carrier.init = effect.value();
                 if (!scratch->locals.push(carrier))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return self(
-                    self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
+                return self(self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
