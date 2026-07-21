@@ -518,6 +518,16 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
             struct_visiting[shape.struct_index] = true;
             const auto& st = mod.structs[shape.struct_index];
             for (u32 i = 0; i < st.fields.len; i++) {
+                const auto field_type = st.fields[i].type;
+                const bool lowerable_struct_field =
+                    st.fields[i].is_error_type || field_type == HirTypeKind::Bool ||
+                    field_type == HirTypeKind::I32 || field_type == HirTypeKind::Str ||
+                    field_type == HirTypeKind::Array || field_type == HirTypeKind::Variant ||
+                    field_type == HirTypeKind::Struct || field_type == HirTypeKind::Tuple;
+                if (!lowerable_struct_field) {
+                    struct_visiting[shape.struct_index] = false;
+                    return false;
+                }
                 if (!hir_type_shape_has_runtime_carrier_impl(mod,
                                                              st.fields[i].shape_index,
                                                              struct_visiting,
@@ -2754,7 +2764,7 @@ static bool same_hir_type_shape(const HirModule& mod, const HirExpr& lhs, const 
     if (lhs.type == HirTypeKind::Associated || rhs.type == HirTypeKind::Associated)
         return same_hir_type_shape(lhs, rhs);
     if (lhs.shape_index != 0xffffffffu && rhs.shape_index != 0xffffffffu)
-        if (same_hir_shape_index(mod, lhs.shape_index, rhs.shape_index)) return true;
+        return same_hir_shape_index(mod, lhs.shape_index, rhs.shape_index);
     return same_hir_type_shape(lhs, rhs);
 }
 
