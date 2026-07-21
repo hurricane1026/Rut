@@ -32186,7 +32186,7 @@ route GET "/x" {
     CHECK(term.json_segments[3].eq(lit("}")));
 }
 
-TEST(frontend, return_json_materializes_wide_inline_struct_once) {
+TEST(frontend, return_json_reuses_wide_inline_struct_fields) {
     const char* src = R"rut(
 struct Payload { a: str, b: str, c: str, d: str, e: str, f: str, g: str, h: str }
 route GET "/x" {
@@ -32205,9 +32205,7 @@ route GET "/x" {
     CHECK(term.has_dynamic_response_body);
     REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
     REQUIRE_EQ(route.locals.len, 0u);
-    REQUIRE_EQ(term.json_value_expr_indices.len, 9u);
-    CHECK_EQ(route.exprs[term.json_value_expr_indices[0]].type, HirTypeKind::Struct);
-    CHECK_EQ(route.exprs[term.json_value_expr_indices[0]].kind, HirExprKind::StructInit);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
 }
 
 TEST(frontend, return_json_does_not_materialize_nested_struct_fields) {
@@ -32232,12 +32230,48 @@ route GET "/x" {
     CHECK(term.has_dynamic_response_body);
     REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
     REQUIRE_EQ(route.locals.len, 0u);
-    REQUIRE_EQ(term.json_value_expr_indices.len, 9u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
     u32 struct_value_count = 0;
     for (u32 i = 0; i < term.json_value_expr_indices.len; i++)
         if (route.exprs[term.json_value_expr_indices[i]].type == HirTypeKind::Struct)
             struct_value_count++;
-    CHECK_EQ(struct_value_count, 1u);
+    CHECK_EQ(struct_value_count, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, return_json_reuses_deep_inline_struct_projections) {
+    const char* src = R"rut(
+struct Leaf { value: str }
+struct Mid { leaf: Leaf }
+struct Branch { mid: Mid }
+struct Root { a: Branch, b: Branch, c: Branch, d: Branch,
+              e: Branch, f: Branch, g: Branch, h: Branch }
+route GET "/x" {
+    return 200, json(Root(
+        a: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        b: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        c: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        d: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        e: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        f: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        g: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        h: Branch(mid: Mid(leaf: Leaf(value: req.path)))))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -32355,6 +32389,58 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
     CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     CHECK(hir.error().detail.eq(lit("json cannot capture wait-result state after a wait")));
+}
+
+TEST(frontend, runtime_json_terminators_keep_route_context_in_control_flow) {
+    const char* src = R"rut(
+route GET "/if" {
+    if req.http11 {
+        return 200, json({ path: req.path })
+    } else {
+        return 400
+    }
+}
+route GET "/guard" {
+    guard req.http11 else {
+        return 400, json({ path: req.path })
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 2u);
+    CHECK(hir->routes[0].control.then_term.has_dynamic_response_body);
+    REQUIRE_EQ(hir->routes[1].guards.len, 1u);
+    CHECK(hir->routes[1].guards[0].fail_term.has_dynamic_response_body);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, match_arm_runtime_json_rejects_sibling_arm_locals) {
+    const char* src = R"rut(
+route GET "/x" {
+    match req.http11 {
+        true => { let sibling = 1 return 200 }
+        _ => return 200, json({ value: sibling })
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
 }
 
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
@@ -33141,6 +33227,42 @@ TEST(frontend, response_assignments_are_statement_only) {
     }
 }
 
+TEST(frontend, response_scalar_mutations_reject_conditional_helper_effects) {
+    const char* cases[] = {
+        R"rut(
+func rewrite(_ resp: Response, _ enabled: bool) -> i32 {
+    if enabled {
+        resp.status = 201
+    } else {
+        resp.status = 202
+    }
+}
+)rut",
+        R"rut(
+func rewrite(_ resp: Response, _ enabled: bool) -> str {
+    match enabled {
+        true => {
+            resp.body = "conditional"
+        }
+        false => {
+            resp.body = "fallback"
+        }
+    }
+}
+)rut",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response assignments are only supported in unconditional effect positions")));
+    }
+}
+
 TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
     const char* cases[] = {
         "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) return 204 }\n",
@@ -33157,12 +33279,12 @@ TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
     }
 }
 
-TEST(frontend, dynamic_response_headers_reject_bound_wait_routes) {
+TEST(frontend, dynamic_response_headers_support_bound_wait_routes) {
     const char* src = R"rut(
 route GET "/x" {
     let r = response(200)
     r.set("X-Path", req.path)
-    let ev = wait(timer(1000))
+    let ev = wait(1000)
     return r
 }
 )rut";
@@ -33171,7 +33293,18 @@ route GET "/x" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::RespSetHeader));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::YieldTimer));
+    rir.destroy();
 }
 
 TEST(frontend, infers_generics_nested_in_array_struct_fields) {
@@ -33270,7 +33403,8 @@ route GET "/x" {
 
 TEST(frontend, rejects_equality_for_runtime_array_shapes) {
     const char* cases[] = {
-        "route GET \"/x\" { let a = [1] let b = [1] if a == b { return 200 } else { return 204 } }\n",
+        "route GET \"/x\" { let a = [1] let b = [1] if a == b { return 200 } else { return 204 } "
+        "}\n",
         "struct Box { values: [i32] } route GET \"/x\" { let a = Box(values: [1]) "
         "let b = Box(values: [1]) if a == b { return 200 } else { return 204 } }\n",
     };
@@ -33314,8 +33448,7 @@ route GET "/x" {
 }
 
 TEST(frontend, rejects_arrays_without_runtime_element_carriers) {
-    const char* src =
-        "route GET \"/x\" { let builders = [response(200)] return 200 }\n";
+    const char* src = "route GET \"/x\" { let builders = [response(200)] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33577,8 +33710,7 @@ TEST(frontend, rejects_nominal_array_elements_with_unlowerable_scalar_fields) {
 }
 
 TEST(frontend, rejects_heterogeneous_nested_array_shapes_in_tuples) {
-    const char* src =
-        "route GET \"/x\" { let values = [([1], 1), ([\"x\"], 2)] return 200 }\n";
+    const char* src = "route GET \"/x\" { let values = [([1], 1), ([\"x\"], 2)] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33674,6 +33806,16 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, contextualizes_nested_empty_array_struct_fields) {
+    const char* src = R"rut(
+struct Payload { tags: [[str]] }
+route GET "/x" { let payload = Payload(tags: [[]]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 TEST(frontend, reusable_json_local_persists_across_wait) {
     const char* src = R"rut(
 route GET "/x" {
@@ -33681,6 +33823,16 @@ route GET "/x" {
     wait(5)
     return 200, payload
 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, recursively_adapts_string_lists_at_array_return_boundaries) {
+    const char* src = R"rut(
+func tags(_ ignored: i32) -> [[str]] => [req.queryAll("tag")]
+route GET "/x" { let groups = tags(1) return 200 }
 )rut";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
@@ -33700,6 +33852,82 @@ route GET "/x" {
 )rut";
     FrontendRirModule rir{};
     REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, materializes_reused_struct_arguments_containing_arrays_once) {
+    const char* src = R"rut(
+struct Pair { values: [str], code: i32 }
+func sum(pair: Pair) -> i32 => pair.code + pair.code
+route GET "/x" {
+    let total = sum(Pair(values: req.queryAll("tag"), code: 1))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 query_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            query_reads += block.insts[ii].op == rir::Opcode::ReqQueryAll;
+    }
+    CHECK_EQ(query_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_match_arms_keep_reused_array_carriers_scoped) {
+    const char* src = R"rut(
+func dup(values: [i32]) -> [[i32]] => [values, values]
+route GET "/x" {
+    let items = [1]
+    match item {
+        1 => { let groups = dup([item]) return 201 }
+        _ => return 400
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& statements = ast->items[1].route.statements;
+    REQUIRE_EQ(statements.len, 2u);
+    AstStatement loop_body{};
+    loop_body.kind = AstStmtKind::Block;
+    REQUIRE(loop_body.block_stmts.push(statements[1]));
+    AstStatement loop{};
+    loop.kind = AstStmtKind::For;
+    loop.name = lit("item");
+    loop.expr = statements[0]->expr;
+    loop.then_stmt = &loop_body;
+    AstStatement fallback{};
+    fallback.kind = AstStmtKind::ReturnStatus;
+    fallback.status_code = 500;
+    fallback.span = statements[1]->span;
+    statements[0] = &loop;
+    statements.len = 2;
+    statements[1] = &fallback;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 2u);
+    CHECK(arm.locals[0].name.eq(lit("$call_arg")));
+    CHECK(arm.locals[1].name.eq(lit("groups")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
     rir.destroy();
 }
 
