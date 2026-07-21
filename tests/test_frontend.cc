@@ -32716,6 +32716,45 @@ TEST(frontend, dynamic_response_headers_reject_multiple_response_builders) {
     }
 }
 
+TEST(frontend, response_scalar_mutations_reject_multiple_response_builders) {
+    const char* src = R"rut(
+route GET "/x" {
+    let a = response(200)
+    let b = response(201)
+    a.status = 202
+    b.body = "wrong-builder"
+    return a
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response scalar mutations require exactly one Response builder in the route")));
+}
+
+TEST(frontend, response_assignments_are_statement_only) {
+    const char* cases[] = {
+        "route GET \"/x\" { let resp = response(200) "
+        "let ignored = resp.status = 201 return resp }\n",
+        "route GET \"/x\" { let resp = response(200) "
+        "let ignored = resp.body = \"hidden\" return resp }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response assignments are only allowed as standalone statements")));
+    }
+}
+
 TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
     const char* cases[] = {
         "route GET \"/x\" { let r = response(200) r.set(\"X\", req.path) return 204 }\n",

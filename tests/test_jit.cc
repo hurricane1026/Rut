@@ -41,6 +41,7 @@ struct TestHandlerCtxFrame {
     u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
 
     TestHandlerCtxFrame() { ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+    ~TestHandlerCtxFrame() { rut_helper_resp_release_body_storage(&ctx); }
 };
 
 // RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all

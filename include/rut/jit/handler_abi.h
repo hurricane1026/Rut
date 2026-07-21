@@ -122,6 +122,7 @@ struct HandlerResult {
 
 inline constexpr u32 kMaxResponseHeaderMutations = 16;
 inline constexpr u32 kMaxResponseBodyMutationBytes = 4096;
+inline constexpr u32 kMaxDynamicResponseBodyBytes = 7 * 1024;
 enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
 struct ResponseHeaderMutation {
     Str name;
@@ -171,10 +172,11 @@ struct alignas(alignof(u64)) HandlerCtx {
     bool response_body_mutation_set;
     bool response_body_mutation_overflow;
     RouteParam route_params[kMaxRouteParams];
-    // Accepted body bytes are copied here at assignment time. Keeping the
-    // bounded payload inside the resumable context avoids borrowing request,
-    // temporary, or thread-local storage across a yield.
-    char response_body_mutation_storage[kMaxResponseBodyMutationBytes];
+    // Lazily acquired only when Response.body is assigned. The request owns
+    // this pooled buffer until reset (or an H2 parked frame transfers it), so
+    // mutable/temporary source bytes survive yields without adding 4 KiB to
+    // every preallocated connection context.
+    char* response_body_mutation_storage;
 
     // Access slot storage (8-byte aligned, immediately after header).
     u8* slots() { return reinterpret_cast<u8*>(this + 1); }

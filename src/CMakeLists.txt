@@ -131,6 +131,7 @@ target_compile_options(zstd_compress PRIVATE
 add_library(rut_runtime STATIC
     placement_new.cc
     runtime/arena.cc
+    runtime/response_body_storage.cc
     runtime/callbacks.cc
     runtime/shard.cc
     runtime/io_uring_backend.cc

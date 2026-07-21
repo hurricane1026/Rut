@@ -1096,6 +1096,10 @@ struct HirRoute {
     // One-shot permission for a bare `req.set(...)` statement. Like Cache.set,
     // request mutation cannot escape into an eager/lazy value expression.
     bool req_header_mutation_stmt_ok = false;
+    // One-shot permission consumed by a bare `resp.status = ...` or
+    // `resp.body = ...` statement. Setter expressions carry effects and must
+    // never be materialized as ordinary local/argument values.
+    bool response_assignment_stmt_ok = false;
     // Analysis-only (never serialized): the route body contains a wait, so
     // time.nowMicros() is rejected — locals re-materialize on resume, and a
     // pre-wait timestamp binding would sample after the wait.

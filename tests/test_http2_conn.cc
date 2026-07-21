@@ -1568,9 +1568,18 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
         &decoded_param, 1, Str{raw_path, 10}, synth, kSynthLen, &anchored_param));
     live->route_param_count = 1;
     live->route_params[0] = anchored_param;
+    static const char kBody[] = "parked-body";
+    live->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    REQUIRE(live->response_body_mutation_storage != nullptr);
+    __builtin_memcpy(live->response_body_mutation_storage, kBody, sizeof(kBody) - 1);
+    live->response_body_pending_len = sizeof(kBody) - 1;
+    live->response_body_pending_set = true;
+    char* live_body_storage = live->response_body_mutation_storage;
+    REQUIRE(live_body_storage != nullptr);
 
     REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
     REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
+    CHECK(live->response_body_mutation_storage == nullptr);
     conn.reset_jit_ctx();
     for (u32 i = 0; i < kSynthLen; i++) synth[i] = 'x';
 
@@ -1582,6 +1591,15 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
           reinterpret_cast<const char*>(h2.pending_synth + 4));
     CHECK_EQ(parked->route_params[0].value_len, 4u);
     CHECK(parked->route_params[0].value == reinterpret_cast<const char*>(h2.pending_synth + 10));
+    CHECK(parked->response_body_mutation_storage == live_body_storage);
+    const Str parked_body{parked->response_body_mutation_storage,
+                          parked->response_body_pending_len};
+    CHECK(parked_body.eq(Str{kBody, sizeof(kBody) - 1}));
+
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2_clear_async(h2);
+    CHECK(parked->response_body_mutation_storage == nullptr);
 }
 
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {

@@ -7,6 +7,7 @@
 #include "rut/harness/scenario_driver.h"
 #include "rut/harness/scripted_environment.h"
 #include "rut/harness/source_target.h"
+#include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
 #endif
 
@@ -71,6 +72,16 @@ namespace {
 
 u64 immediate_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(204).pack();
+}
+
+u64 mutable_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    char source[] = "stable-body";
+    rut_helper_resp_set_body(ctx, source, sizeof(source) - 1);
+    __builtin_memset(source, 'x', sizeof(source) - 1);
+    rut_helper_resp_commit_headers(ctx);
+    auto result = jit::HandlerResult::make_status(200);
+    result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+    return result.pack();
 }
 
 u64 timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -196,6 +207,36 @@ TEST(harness_handler, completes_immediate_handler) {
     CHECK_EQ(result.terminal.action, jit::HandlerAction::ReturnStatus);
     CHECK_EQ(result.terminal.status_code, 204);
     CHECK_EQ(result.harness.handler_resumes, 0u);
+}
+
+TEST(harness_handler, owns_mutated_response_body_after_driver_returns) {
+    harness::HandlerExecution execution{};
+    execution.init(&mutable_body_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    REQUIRE(result.dynamic_response_body_valid);
+    REQUIRE_EQ(result.dynamic_response_body_len, 11u);
+    CHECK(std::memcmp(result.dynamic_response_body, "stable-body", 11) == 0);
+}
+
+TEST(harness_handler, copying_session_clones_mutated_response_body_storage) {
+    harness::HandlerExecution original{};
+    original.init(&immediate_handler, nullptr, nullptr, 0);
+    static const char kBody[] = "fork-safe";
+    rut_helper_resp_set_body(&original.frame.context, kBody, sizeof(kBody) - 1);
+    REQUIRE(original.frame.context.response_body_mutation_storage != nullptr);
+
+    harness::HandlerExecution fork = original;
+    REQUIRE(fork.frame.context.response_body_mutation_storage != nullptr);
+    CHECK(fork.frame.context.response_body_mutation_storage !=
+          original.frame.context.response_body_mutation_storage);
+    __builtin_memset(original.frame.context.response_body_mutation_storage, 'x', sizeof(kBody) - 1);
+    CHECK(std::memcmp(
+              fork.frame.context.response_body_mutation_storage, kBody, sizeof(kBody) - 1) == 0);
 }
 
 TEST(harness_handler, advances_virtual_time_for_timer_yield) {
