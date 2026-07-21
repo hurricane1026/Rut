@@ -1771,6 +1771,46 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, conditional_reusable_json_direct_return_keeps_seven_kib_limit) {
+    const std::string payload(5000, 'x');
+    const std::string src =
+        "func choose(flag: bool, yes: Json, no: Json) -> Json { if flag { yes } else { no } } "
+        "route GET \"/x\" { let body = choose(req.http11, json({ data: \"" +
+        payload + "\" }), json({ data: \"short\" })) return 200, body }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kRequest),
+                                            sizeof(kRequest) - 1,
+                                            nullptr);
+    REQUIRE(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    CHECK(outcome.dynamic_response_body_len > jit::kMaxResponseBodyMutationBytes);
+    CHECK(outcome.dynamic_response_body_len <= jit::kMaxDynamicResponseBodyBytes);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, conditional_reusable_json_short_circuit_commits_only_body) {
     const auto src = R"rut(
 func choose(flag: bool, yes: Json, no: Json) -> Json {
@@ -2588,7 +2628,6 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};
     rut_helper_resp_set_body(&frame.ctx, body, sizeof(body));
-    rut_helper_resp_commit_headers(&frame.ctx);
     CHECK(frame.ctx.response_body_mutation_overflow);
 
     const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {

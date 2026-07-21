@@ -6997,6 +6997,70 @@ route GET "/x" {
                                   "move the assignment before the guard")));
 }
 
+TEST(frontend, response_mutating_helper_after_field_read_is_rejected) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    let ignored = rewrite(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let inner = response(200)
+    inner.status = 201
+    0
+}
+route GET "/x" {
+    let outer = response(200)
+    let ignored = rewrite()
+    outer.body = "outer"
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_pipes) {
+    const char* src = R"rut(
+func rewrite(value: str) -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = req.header("X-Value") | rewrite(_)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));
@@ -32697,6 +32761,8 @@ TEST(frontend, json_values_are_opaque_outside_response_sinks) {
         "route GET \"/x\" { let body = json({ ok: true }) let bodies = [body] return 200 }\n",
         "route GET \"/x\" { let body = json({ ok: true }) let pair = (body, 1) return 200 }\n",
         "struct Stored { body: Json } route GET \"/x\" { return 200 }\n",
+        "struct Stored { body: (Json, i32) } route GET \"/x\" { return 200 }\n",
+        "struct Stored { bodies: [Json] } route GET \"/x\" { return 200 }\n",
     };
     const auto detail =
         lit("Json values are opaque response plans; use them only through locals or helper calls "
@@ -32710,6 +32776,46 @@ TEST(frontend, json_values_are_opaque_outside_response_sinks) {
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(detail));
     }
+}
+
+TEST(frontend, optional_and_fallible_json_helper_results_are_rejected) {
+    const char* sources[] = {
+        "func maybe(flag: bool) -> Json { if flag { json({ ok: true }) } else { nil } } "
+        "route GET \"/x\" { let body = maybe(req.http11) return 200, body }\n",
+        "func maybe(flag: bool) -> Json { if flag { json({ ok: true }) } else { "
+        "error(.missing) } } route GET \"/x\" { let body = maybe(req.http11) return 200, body "
+        "}\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, reusable_json_materializes_struct_inputs_once) {
+    const char* src =
+        "struct Payload { a: str, b: str } route GET \"/x\" { "
+        "let body = json(Payload(a: req.path, b: \"fixed\")) return 200, body }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 path_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            path_reads += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqPath;
+    CHECK_EQ(path_reads, 1u);
+    rir.destroy();
 }
 
 TEST(frontend, conditional_json_locals_materialize_only_at_direct_sinks) {
@@ -33287,6 +33393,63 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, infers_generics_nested_in_array_struct_fields) {
+    const char* src =
+        "struct Box<T> { values: [T] } route GET \"/x\" { let box = Box(values: [1]) "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, adapts_string_lists_to_array_struct_fields) {
+    const char* src =
+        "struct Payload { tags: [str] } route GET \"/x\" { "
+        "let payload = Payload(tags: req.queryAll(\"tag\")) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, materializes_reused_array_call_arguments_once) {
+    const char* src =
+        "func dup(values: [str]) -> [[str]] => [values, values] "
+        "route GET \"/x\" { let groups = dup(req.queryAll(\"tag\")) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 query_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            query_reads +=
+                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqQueryAll;
+    CHECK_EQ(query_reads, 1u);
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

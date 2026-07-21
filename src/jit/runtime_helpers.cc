@@ -506,14 +506,29 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
     hctx->response_body_pending_set = true;
     hctx->response_body_pending_overflow = hctx->response_body_snapshot_failed || body == nullptr ||
                                            len > jit::kMaxResponseBodyMutationBytes;
+    if (hctx->response_body_pending_overflow) hctx->response_body_mutation_overflow = true;
     if (!hctx->response_body_pending_overflow && hctx->response_body_mutation_storage == nullptr) {
         hctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
-        if (hctx->response_body_mutation_storage == nullptr)
+        if (hctx->response_body_mutation_storage == nullptr) {
             hctx->response_body_pending_overflow = true;
+            hctx->response_body_mutation_overflow = true;
+        }
     }
     hctx->response_body_pending_len = hctx->response_body_pending_overflow ? 0 : len;
     if (!hctx->response_body_pending_overflow && len != 0)
         __builtin_memcpy(hctx->response_body_mutation_storage, body, len);
+}
+
+void rut_helper_resp_publish_body(void* ctx, const char* body, u32 len) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    hctx->response_body_data = nullptr;
+    hctx->response_body_len = 0;
+    hctx->response_body_valid = 0;
+    if (body == nullptr || len > jit::kMaxDynamicResponseBodyBytes) return;
+    hctx->response_body_data = body;
+    hctx->response_body_len = len;
+    hctx->response_body_valid = 1;
 }
 
 void rut_helper_resp_commit_headers(void* ctx) {
