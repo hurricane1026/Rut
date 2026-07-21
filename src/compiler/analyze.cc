@@ -9852,6 +9852,9 @@ static FrontendResult<void> build_dynamic_json_plan(
     const AstExpr& expr,
     HirRoute* route,
     const HirModule& mod,
+    const HirLocal* locals,
+    u32 local_count,
+    const MatchPayloadBinding* binding,
     std::vector<std::string>& segments,
     FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
     u32 depth = 0) {
@@ -9886,7 +9889,15 @@ static FrontendResult<void> build_dynamic_json_plan(
                 !append_json_bytes(segments.back(), ":", 1))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             auto child = build_dynamic_json_plan(
-                *expr.field_inits[i].value, route, mod, segments, value_refs, depth + 1);
+                *expr.field_inits[i].value,
+                route,
+                mod,
+                locals,
+                local_count,
+                binding,
+                segments,
+                value_refs,
+                depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -9899,8 +9910,15 @@ static FrontendResult<void> build_dynamic_json_plan(
         for (u32 i = 0; i < expr.args.len; i++) {
             if (i != 0 && !append_json_bytes(segments.back(), ",", 1))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            auto child =
-                build_dynamic_json_plan(*expr.args[i], route, mod, segments, value_refs, depth + 1);
+            auto child = build_dynamic_json_plan(*expr.args[i],
+                                                 route,
+                                                 mod,
+                                                 locals,
+                                                 local_count,
+                                                 binding,
+                                                 segments,
+                                                 value_refs,
+                                                 depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "]", 1))
@@ -9908,7 +9926,7 @@ static FrontendResult<void> build_dynamic_json_plan(
         return {};
     }
 
-    auto value = analyze_expr(expr, route, mod, route->locals.data, route->locals.len, nullptr);
+    auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!value) return core::make_unexpected(value.error());
     if ((value->type != HirTypeKind::Bool && value->type != HirTypeKind::I32 &&
          value->type != HirTypeKind::I64 && value->type != HirTypeKind::Str) ||
@@ -9927,6 +9945,7 @@ static FrontendResult<void> build_dynamic_json_plan(
     local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
     local.type = value->type;
     local.shape_index = value->shape_index;
+    local.defer_to_terminator = true;
     local.init = value.value();
     if (!route->locals.push(local) || !value_refs.push(local.ref_index))
         return frontend_error(FrontendError::TooManyItems, expr.span);
@@ -9936,7 +9955,10 @@ static FrontendResult<void> build_dynamic_json_plan(
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
-                                                  HirRoute* route = nullptr) {
+                                                  HirRoute* route = nullptr,
+                                                  const HirLocal* locals = nullptr,
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -9973,8 +9995,19 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                               stmt.expr.span,
                                               kReturnBodyExprDetail);
                     std::vector<std::string> segments(1);
+                    if (locals == nullptr) {
+                        locals = route->locals.data;
+                        local_count = route->locals.len;
+                    }
                     auto plan = build_dynamic_json_plan(
-                        *stmt.expr.args[0], route, mod, segments, term.json_value_ref_indices);
+                        *stmt.expr.args[0],
+                        route,
+                        mod,
+                        locals,
+                        local_count,
+                        binding,
+                        segments,
+                        term.json_value_ref_indices);
                     if (!plan) return core::make_unexpected(plan.error());
                     for (const auto& segment : segments) {
                         if (!term.json_segments.push(intern_generated_name(segment)))
@@ -10756,9 +10789,11 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term =
+            analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term =
+            analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();
@@ -10766,7 +10801,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
 
     arm->body_kind = HirMatchArm::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod, route);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     arm->direct_term = term.value();
     return {};

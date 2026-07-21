@@ -2839,6 +2839,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
 
 static FrontendResult<void> emit_term(const MirTerminator& term,
                                       const MirModule& mir,
+                                      const MirFunction& mir_fn,
                                       const VariantLoweringInfo* variant_infos,
                                       TupleLoweringInfo* tuple_infos,
                                       u32* tuple_info_count,
@@ -3075,9 +3076,31 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 const u32 ref = term.json_value_ref_indices[ji];
                 if (ref >= local_count)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-                if (locals[ref].id >= fn->value_count || fn->values[locals[ref].id].type == nullptr)
+                rir::ValueId json_value = locals[ref];
+                for (u32 li = 0; li < mir_fn.locals.len; li++) {
+                    const auto& local = mir_fn.locals[li];
+                    if (local.ref_index != ref || !local.defer_to_terminator) continue;
+                    auto materialized = materialize_value(local.init,
+                                                          mir,
+                                                          variant_infos,
+                                                          tuple_infos,
+                                                          tuple_info_count,
+                                                          error_scalar_infos,
+                                                          error_variant_infos,
+                                                          error_struct_infos,
+                                                          user_struct_defs,
+                                                          b,
+                                                          locals,
+                                                          local_count,
+                                                          local.span);
+                    if (!materialized)
+                        return core::make_unexpected(materialized.error());
+                    json_value = materialized.value();
+                    break;
+                }
+                if (json_value.id >= fn->value_count || fn->values[json_value.id].type == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-                const auto value_type = fn->values[locals[ref].id].type->kind;
+                const auto value_type = fn->values[json_value.id].type->kind;
                 const rir::Opcode op =
                     value_type == rir::TypeKind::Bool  ? rir::Opcode::JsonAppendBool
                     : value_type == rir::TypeKind::I32 ? rir::Opcode::JsonAppendI32
@@ -3085,7 +3108,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     : value_type == rir::TypeKind::Str ? rir::Opcode::JsonAppendStr
                                                        : rir::Opcode::JsonFinish;
                 if (op == rir::Opcode::JsonFinish ||
-                    !b.emit_json_append(op, locals[ref], {term.span.line, term.span.col}))
+                    !b.emit_json_append(op, json_value, {term.span.line, term.span.col}))
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
             }
             if (!b.emit_json_finish({term.span.line, term.span.col}))
@@ -4529,6 +4552,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+            if (mir.functions[i].locals[li].defer_to_terminator) continue;
             auto val = materialize_local_init(mir.functions[i].locals[li],
                                               mir,
                                               variant_infos,
@@ -4652,6 +4676,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
             }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,
+                                     mir.functions[i],
                                      variant_infos,
                                      tuple_infos,
                                      &tuple_info_count,

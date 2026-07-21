@@ -31638,6 +31638,23 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, match_arm_runtime_json_rejects_sibling_arm_locals) {
+    const char* src = R"rut(
+route GET "/x" {
+    match req.http11 {
+        true => { let sibling = 1 return 200 }
+        _ => return 200, json({ value: sibling })
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
     const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
     const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));
