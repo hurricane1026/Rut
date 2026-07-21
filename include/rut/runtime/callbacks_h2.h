@@ -550,8 +550,8 @@ inline void h2_rebase_synth_view(Str& view,
                                  const u8* new_synth,
                                  u32 synth_len) {
     if (view.ptr == nullptr || old_synth == new_synth) return;
-    const uintptr_t kOld = reinterpret_cast<uintptr_t>(old_synth);
-    const uintptr_t kPtr = reinterpret_cast<uintptr_t>(view.ptr);
+    const auto kOld = reinterpret_cast<uintptr_t>(old_synth);
+    const auto kPtr = reinterpret_cast<uintptr_t>(view.ptr);
     if (kPtr < kOld || kPtr - kOld > synth_len || view.len > synth_len - (kPtr - kOld)) return;
     view.ptr = reinterpret_cast<const char*>(new_synth + (kPtr - kOld));
 }
@@ -593,13 +593,13 @@ inline bool h2_reanchor_route_params(const RouteParam* params,
         return false;
     u32 path_start = 0;
     while (path_start < synth_len && synth[path_start] != ' ') path_start++;
-    if (path_start == synth_len || ++path_start > synth_len ||
-        raw_path.len > synth_len - path_start)
-        return false;
+    if (path_start == synth_len) return false;
+    path_start++;
+    if (raw_path.len > synth_len - path_start) return false;
 
-    const uintptr_t kPath = reinterpret_cast<uintptr_t>(raw_path.ptr);
+    const auto kPath = reinterpret_cast<uintptr_t>(raw_path.ptr);
     for (u32 i = 0; i < param_count; i++) {
-        const uintptr_t kValue = reinterpret_cast<uintptr_t>(params[i].value);
+        const auto kValue = reinterpret_cast<uintptr_t>(params[i].value);
         if (kValue < kPath || kValue - kPath > raw_path.len ||
             params[i].value_len > raw_path.len - (kValue - kPath))
             return false;
