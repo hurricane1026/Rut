@@ -33285,6 +33285,99 @@ TEST(frontend, rejects_equality_for_runtime_array_shapes) {
     }
 }
 
+TEST(frontend, single_use_array_parameter_needs_no_call_carrier) {
+    const char* src = R"rut(
+func wrap(values: [str]) -> [[str]] => [values]
+route GET "/x" {
+    let v0 = 0
+    let v1 = 1
+    let v2 = 2
+    let v3 = 3
+    let v4 = 4
+    let v5 = 5
+    let v6 = 6
+    let v7 = 7
+    let v8 = 8
+    let v9 = 9
+    let v10 = 10
+    let v11 = 11
+    let v12 = 12
+    let v13 = 13
+    let v14 = 14
+    let groups = wrap(req.queryAll("tag"))
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_arrays_without_runtime_element_carriers) {
+    const char* src =
+        "route GET \"/x\" { let builders = [response(200)] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, rejects_reused_helper_local_arrays_without_carriers) {
+    const char* src =
+        "func make() -> [[i64]] { let xs = [time.nowMicros()] [xs, xs] } "
+        "route GET \"/x\" { let groups = make() return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, guard_failure_array_carriers_stay_in_failure_scope) {
+    const char* src = R"rut(
+func dup(values: [str]) -> [[str]] => [values, values]
+route GET "/x" {
+    guard req.http11 else {
+        let tag = "x"
+        let groups = dup([tag])
+        return 400
+    }
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, imported_array_fields_allow_later_nominal_declarations) {
+    const std::string dir = "/tmp/rut_import_array_later_nominal_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/payload.rut", std::ios::binary);
+        out << "struct Payload { items: [Item] }\n"
+               "struct Item { value: i32 }\n";
+    }
+    const char* src =
+        "import \"payload.rut\"\nroute GET \"/x\" { "
+        "let payload = Payload(items: [Item(value: 1)]) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
