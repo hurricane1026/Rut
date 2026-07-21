@@ -514,7 +514,7 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
             return true;
         case HirTypeKind::Struct: {
             if (shape.struct_index >= mod.structs.len) return false;
-            if (struct_visiting[shape.struct_index]) return true;
+            if (struct_visiting[shape.struct_index]) return false;
             struct_visiting[shape.struct_index] = true;
             const auto& st = mod.structs[shape.struct_index];
             for (u32 i = 0; i < st.fields.len; i++) {
@@ -532,7 +532,7 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
         }
         case HirTypeKind::Variant: {
             if (shape.variant_index >= mod.variants.len) return false;
-            if (variant_visiting[shape.variant_index]) return true;
+            if (variant_visiting[shape.variant_index]) return false;
             variant_visiting[shape.variant_index] = true;
             const auto& variant = mod.variants[shape.variant_index];
             for (u32 i = 0; i < variant.cases.len; i++) {
@@ -3707,6 +3707,11 @@ static FrontendResult<HirExpr> analyze_empty_array_lit_with_declared_type(const 
     if (!declared) return core::make_unexpected(declared.error());
     if (declared.value() != HirTypeKind::Array || array_elem_shape_index >= mod.type_shapes.len)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (!hir_type_shape_has_runtime_carrier(mod, array_elem_shape_index))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("array element type does not have a runtime carrier"));
     auto declared_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                 declared.value(),
                                                 0xffffffffu,
@@ -3793,6 +3798,10 @@ static FrontendResult<void> build_reusable_json_plan(
     u32 depth = 0);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
 static bool hir_expr_reads_response_field(const HirExpr& expr);
+static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
+                                                   const HirLocal* locals,
+                                                   u32 local_count,
+                                                   u32 depth = 0);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -5652,6 +5661,15 @@ static FrontendResult<void> instantiate_function_response_effects(
     Span call_span) {
     if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
     if (!function_has_response_effects(fn)) return {};
+    u32 scalar_effect_count = 0;
+    for (u32 ei = 0; ei < fn.exprs.len; ei++)
+        scalar_effect_count += fn.exprs[ei].kind == HirExprKind::RespSetStatus ||
+                               fn.exprs[ei].kind == HirExprKind::RespSetBody;
+    if (scalar_effect_count > 1 && hir_expr_reads_response_field(fn.body))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            call_span,
+            lit_str("helpers cannot read Response fields between multiple assignments"));
     if (fn.owns_response_builder) {
         for (u32 li = 0; li < route->locals.len; li++) {
             if (route->locals[li].init.kind == HirExprKind::ResponseInit ||
@@ -7288,6 +7306,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 set_status ? lit_str("Response.status requires a plain i32 value")
                            : lit_str("Response.body requires a plain string or json(...) "
                                      "value"));
+        if (set_body && route->waits.len != 0 &&
+            hir_expr_reads_wait_result_with_locals(
+                value.value(), route->locals.data, route->locals.len))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.rhs->span,
+                lit_str("json cannot capture wait-result state after a wait"));
         if (set_status && value->kind == HirExprKind::IntLit &&
             (value->int_value < 100 || value->int_value > 599))
             return frontend_error(FrontendError::InvalidStatusCode, expr.rhs->span);
@@ -9328,6 +9353,19 @@ static bool function_param_is_reused(const HirFunction& fn, u32 param_index) {
     return count >= 2;
 }
 
+static bool hir_expr_contains_json_build(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::JsonBuild) return true;
+    if (expr.lhs != nullptr && hir_expr_contains_json_build(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_contains_json_build(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_contains_json_build(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_json_build(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -10515,6 +10553,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
             analyzed_args[param_index] = *first_arg_override;
+        } else if (arg_expr.kind == AstExprKind::ArrayLit && arg_expr.args.len == 0 &&
+                   fn.params[param_index].type == HirTypeKind::Array &&
+                   fn.params[param_index].array_elem_shape_index < mod.type_shapes.len &&
+                   mod.type_shapes[fn.params[param_index].array_elem_shape_index].is_concrete) {
+            analyzed_args[param_index].kind = HirExprKind::ArrayLit;
+            analyzed_args[param_index].type = HirTypeKind::Array;
+            analyzed_args[param_index].shape_index = fn.params[param_index].shape_index;
+            analyzed_args[param_index].array_len = 0;
+            analyzed_args[param_index].span = arg_expr.span;
         } else {
             auto arg = analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
             if (!arg) return core::make_unexpected(arg.error());
@@ -10530,7 +10577,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     for (u32 i = 0; i < effective_arg_count; i++) {
         const bool needs_array_carrier = analyzed_args[i].type == HirTypeKind::Array;
         const bool needs_json_struct_carrier = analyzed_args[i].type == HirTypeKind::Struct &&
-                                               fn.body.kind == HirExprKind::JsonBuild;
+                                               hir_expr_contains_json_build(fn.body);
         if ((!needs_array_carrier && !needs_json_struct_carrier) ||
             analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i))
             continue;
@@ -12308,6 +12355,36 @@ static bool hir_expr_reads_wait_result(const HirExpr& expr) {
     for (u32 i = 0; i < expr.field_inits.len; i++)
         if (expr.field_inits[i].value != nullptr &&
             hir_expr_reads_wait_result(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
+                                                   const HirLocal* locals,
+                                                   u32 local_count,
+                                                   u32 depth) {
+    if (depth > local_count + HirRoute::kMaxLocals) return true;
+    if (expr.kind == HirExprKind::WaitField || expr.is_wait_result) return true;
+    if (expr.kind == HirExprKind::LocalRef) {
+        for (u32 i = 0; i < local_count; i++)
+            if (locals[i].ref_index == expr.local_index)
+                return hir_expr_reads_wait_result_with_locals(
+                    locals[i].init, locals, local_count, depth + 1);
+    }
+    if (expr.lhs != nullptr &&
+        hir_expr_reads_wait_result_with_locals(*expr.lhs, locals, local_count, depth + 1))
+        return true;
+    if (expr.rhs != nullptr &&
+        hir_expr_reads_wait_result_with_locals(*expr.rhs, locals, local_count, depth + 1))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_reads_wait_result_with_locals(
+                                           *expr.args[i], locals, local_count, depth + 1))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_wait_result_with_locals(
+                *expr.field_inits[i].value, locals, local_count, depth + 1))
             return true;
     return false;
 }
@@ -17347,6 +17424,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           item.variant.span);
                 if (!payload_type) return core::make_unexpected(payload_type.error());
                 case_decl.payload_type = payload_type.value();
+                if (case_decl.payload_type == HirTypeKind::Array)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        item.variant.span,
+                        lit_str("array variant payloads do not have a runtime carrier yet"));
                 auto payload_shape = intern_hir_type_shape(&mod,
                                                            case_decl.payload_type,
                                                            case_decl.payload_generic_index,

@@ -12,6 +12,7 @@
 #include "rut/runtime/jit_dispatch.h"  // jit::HandlerCtx for fire_due_timers
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_table.h"  // RouteConfig::kMaxTimers / timers[] for fire_due_timers
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slice_pool.h"
@@ -207,6 +208,7 @@ public:
             if (now < timer_deadline_ns[i]) continue;
             jit::HandlerCtx ctx{};
             (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
+            rut_helper_resp_release_body_storage(&ctx);
             timer_fire_count[i]++;
             // Reschedule from now (not the missed deadline) to avoid a catch-up
             // burst after a long stall.
