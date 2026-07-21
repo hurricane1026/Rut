@@ -448,6 +448,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
       - name: Install tools
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
@@ -459,6 +460,15 @@ jobs:
           echo "CXX=/usr/bin/clang++-21" >> "$GITHUB_ENV"
           echo "LLVM_PROFDATA=/usr/bin/llvm-profdata-21" >> "$GITHUB_ENV"
           echo "LLVM_COV=/usr/bin/llvm-cov-21" >> "$GITHUB_ENV"
+
+      - name: Test coverage report helper
+        run: python3 tests/test_coverage_report.py
+
+      - name: Collect pull request changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff --name-only "$BASE_SHA" "$GITHUB_SHA" > /tmp/coverage-changed-files.txt
 
       - name: Build with coverage
         run: |
@@ -504,6 +514,11 @@ jobs:
         run: |
           "$LLVM_PROFDATA" merge build/*.profraw -o build/merged.profdata
 
+          changed_args=()
+          if [[ -s /tmp/coverage-changed-files.txt ]]; then
+            changed_args+=(--changed-files-from /tmp/coverage-changed-files.txt)
+          fi
+
           # Report first-party coverage areas as the UNION across test binaries:
           # a line counts as covered if any binary hits it. `llvm-cov
           # report` alone picks one binary's instantiation per line for
@@ -514,9 +529,10 @@ jobs:
           # walks per-binary JSON exports and max-merges per line. The
           # threshold still gates runtime coverage by default.
           #
-          # io_uring_backend / epoll_backend are excluded: require
-          # kernel features / permissions that are unreliable in CI.
-          # They are tested via conditional integration tests.
+          # Host-dependent backend/event-loop files remain visible in the
+          # report but are excluded from the percentage gate. llvm-cov exports
+          # only the linked SIMD implementation, so the active backend stays in
+          # this gate; the separate SIMD jobs build the other implementations.
           #
           # test_traffic_capture / test_traffic_replay / test_sim /
           # test_shard_control are not passed as --object because they
@@ -524,9 +540,11 @@ jobs:
           # types; the union merge would incorrectly count those as
           # real production paths. They still run above for correctness
           # validation.
+          set +e
           LLVM_COV="$LLVM_COV" python3 scripts/coverage_report.py \
             --profile build/merged.profdata \
             --threshold 95 \
+            "${changed_args[@]}" \
             build/tests/test_buffer \
             build/tests/test_types \
             build/tests/test_network \
@@ -551,4 +569,15 @@ jobs:
             build/tests/test_simulate_engine \
             build/tests/test_route_trie \
             build/tests/test_route_art \
-            build/tests/test_route_select
+            build/tests/test_route_select | tee build/coverage-report.txt
+          report_status=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo "## First-party line coverage"
+            echo
+            echo '```text'
+            cat build/coverage-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$report_status"
