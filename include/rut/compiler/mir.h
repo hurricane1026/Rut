@@ -22,6 +22,7 @@ enum class MirValueKind : u8 {
     IntConst,
     StrConst,
     ArrayLit,
+    ArrayGet,
     RegexMatch,
     Tuple,
     TupleSlot,
@@ -288,6 +289,8 @@ struct MirTerminator {
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     FixedVec<MirLocal, kMaxJsonMaterializedValues> json_locals;
+    bool has_json_body_plan = false;
+    MirLocal json_body_local{};
     // Optional response headers carried from HIR. Inline-stored.
     // len == 0 means "no kwarg". lower_rir interns these into the
     // RIR module's shared header pool.
