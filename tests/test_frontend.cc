@@ -6959,6 +6959,61 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, helper_local_response_effects_reject_later_caller_builder) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let inner = response(200)
+    inner.status = 201
+    0
+}
+route GET "/x" {
+    let ignored = rewrite()
+    let outer = response(200)
+    outer.body = "outer"
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, protocol_methods_preserve_response_effects_before_reads) {
+    const char* sources[] = {
+        R"rut(
+protocol Status { func status() -> i32 { let resp = response(200) resp.status = 201 resp.status } }
+struct Box { value: i32 }
+Box impl Status {}
+route GET "/x" { let value = Box(value: 0).status() if value == 201 { return 201 } else { return 500 } }
+)rut",
+        R"rut(
+protocol Status { func status() -> i32 => 200 }
+struct Box { value: i32 }
+Box impl Status { func status(self: Box) -> i32 { let resp = response(200) resp.status = 201 resp.status } }
+route GET "/x" { let value = Box(value: 0).status() if value == 201 { return 201 } else { return 500 } }
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        u32 writes = 0;
+        u32 reads = 0;
+        for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+            for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++) {
+                writes += rir.module.functions[0].blocks[bi].insts[ii].op ==
+                          rir::Opcode::RespSetStatus;
+                reads += rir.module.functions[0].blocks[bi].insts[ii].op ==
+                         rir::Opcode::RespStatus;
+            }
+        CHECK_EQ(writes, 1u);
+        CHECK_EQ(reads, 1u);
+        rir.destroy();
+    }
+}
+
 TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_pipes) {
     const char* src = R"rut(
 func rewrite(value: str) -> i32 {
