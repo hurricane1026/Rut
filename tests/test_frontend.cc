@@ -6981,6 +6981,55 @@ route GET "/x" {
         lit("Response.body reads in conditional value branches are not supported")));
 }
 
+TEST(frontend, response_body_reads_in_terminal_control_conditions_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    if choose(req.http11) == "ok" {
+        return 200
+    } else {
+        return 204
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
+TEST(frontend, nested_call_arguments_cannot_reorder_response_reads_and_mutations) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func choose(first: i32, second: i32) -> i32 => first
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let selected = choose(resp.status, mutate(resp))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit(
+        "response-mutating helper arguments cannot follow an earlier Response field read")));
+}
+
 TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
     const char* src = R"rut(
 func rewrite() -> i32 {

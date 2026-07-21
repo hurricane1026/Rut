@@ -10553,6 +10553,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     Span respond_guard_span = expr.span;
     for (u32 i = 0; i < expr.args.len; i++) {
         const auto& arg_expr = *expr.args[i];
+        const u32 locals_before_arg = route->locals.len;
         if (arg_expr.span.end > respond_guard_span.start) {
             respond_guard_span.start = arg_expr.span.end;
             if (respond_guard_span.end < respond_guard_span.start)
@@ -10591,6 +10592,25 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             if (arg->may_nil || arg->may_error)
                 return fail_call(expr.args[i]->span, "arg has nil or error", nullptr);
             analyzed_args[param_index] = arg.value();
+        }
+        bool appended_response_effect = false;
+        for (u32 li = locals_before_arg; li < route->locals.len; li++) {
+            const auto kind = route->locals[li].init.kind;
+            appended_response_effect |= kind == HirExprKind::RespSetHeader ||
+                                        kind == HirExprKind::RespAddHeader ||
+                                        kind == HirExprKind::RespRemoveHeader ||
+                                        kind == HirExprKind::RespSetStatus ||
+                                        kind == HirExprKind::RespSetBody;
+        }
+        if (appended_response_effect) {
+            for (u32 prior = 0; prior < param_index; prior++) {
+                if (!hir_expr_reads_response_field(analyzed_args[prior])) continue;
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    arg_expr.span,
+                    lit_str("response-mutating helper arguments cannot follow an earlier "
+                            "Response field read"));
+            }
         }
         auto checked = check_call_arg(param_index, analyzed_args[param_index], expr.args[i]->span);
         if (!checked) return core::make_unexpected(checked.error());
@@ -12446,6 +12466,43 @@ static bool hir_expr_conditionally_reads_response_body(const HirExpr& expr) {
         if (expr.field_inits[i].value != nullptr &&
             hir_expr_conditionally_reads_response_body(*expr.field_inits[i].value))
             return true;
+    return false;
+}
+
+static bool route_control_conditionally_reads_response_body(const HirRoute& route) {
+    // Control expressions may point into the route expression arena through
+    // intermediate normalization nodes. Scan the arena as well as the rooted
+    // guard/control trees so those embedded IfElse values cannot escape the
+    // eager-lowering safety check.
+    for (u32 ei = 0; ei < route.exprs.len; ei++)
+        if (hir_expr_conditionally_reads_response_body(route.exprs[ei])) return true;
+    for (u32 gi = 0; gi < route.guards.len; gi++) {
+        const auto& guard = route.guards[gi];
+        if (hir_expr_conditionally_reads_response_body(guard.cond) ||
+            (guard.fail_kind == HirGuard::FailKind::Match &&
+             hir_expr_conditionally_reads_response_body(guard.fail_match_expr)) ||
+            (guard.fail_kind == HirGuard::FailKind::Body &&
+             guard.fail_body.body_kind == HirGuardBody::BodyKind::If &&
+             hir_expr_conditionally_reads_response_body(guard.fail_body.cond)))
+            return true;
+    }
+    const auto& control = route.control;
+    if (control.kind == HirControlKind::If &&
+        hir_expr_conditionally_reads_response_body(control.cond))
+        return true;
+    if (control.kind != HirControlKind::Match) return false;
+    if (hir_expr_conditionally_reads_response_body(control.match_expr)) return true;
+    for (u32 ai = 0; ai < control.match_arms.len; ai++) {
+        const auto& arm = control.match_arms[ai];
+        if (hir_expr_conditionally_reads_response_body(arm.pattern) ||
+            (arm.has_arm_guard &&
+             hir_expr_conditionally_reads_response_body(arm.arm_guard)) ||
+            (arm.body_kind == HirMatchArm::BodyKind::If &&
+             hir_expr_conditionally_reads_response_body(arm.cond)))
+            return true;
+        for (u32 gi = 0; gi < arm.guards.len; gi++)
+            if (hir_expr_conditionally_reads_response_body(arm.guards[gi].cond)) return true;
+    }
     return false;
 }
 
@@ -21013,6 +21070,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.locals[li].span,
                 lit_str("Response.body reads in conditional value branches are not supported"));
         }
+        if (route_control_conditionally_reads_response_body(route))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                route_decl.span,
+                lit_str("Response.body reads in conditional value branches are not supported"));
 
         bool has_chain_after_response_effects = false;
         bool has_chain_after_response_scalar_effects = false;
