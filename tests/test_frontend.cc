@@ -15672,6 +15672,71 @@ TEST(frontend, lower_to_rir_defers_array_fields_until_element_struct_is_built) {
     rir.destroy();
 }
 
+TEST(frontend, analyze_accepts_typed_empty_arrays_in_match_and_guard_blocks) {
+    const char* src = R"rut(
+variant Result { ok, err }
+route GET "/match" {
+    match Result.ok {
+        .ok => { let xs: [str] = [] return 200 }
+        .err => return 500
+    }
+}
+route GET "/guard" {
+    guard false else { let xs: [str] = [] return 400 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_preserves_array_shape_nested_in_tuple_elements) {
+    const char* src = "route GET \"/x\" { let xs = [([1, 2], 3)] let alias = xs return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, import_relative_file_remaps_array_helper_shapes) {
+    const std::string dir = "/tmp/rut_import_array_helper_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/arrays.rut", std::ios::binary);
+        out << "func keep(values: [str]) -> [str] => values\n";
+    }
+    const char* src =
+        "import \"arrays.rut\"\n"
+        "route GET \"/x\" { let values = [\"kept\"] let result = keep(values) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
