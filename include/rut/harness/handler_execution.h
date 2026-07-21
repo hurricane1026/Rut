@@ -24,6 +24,11 @@ struct HandlerExecution {
     u32 request_len = 0;
     void* arena = nullptr;
 
+    HandlerExecution() = default;
+    HandlerExecution(const HandlerExecution& other);
+    HandlerExecution& operator=(const HandlerExecution& other);
+    ~HandlerExecution();
+
     void init(jit::HandlerFn fn,
               void* conn,
               const u8* req_data,
@@ -54,7 +59,9 @@ struct HandlerExecutionResult {
     jit::HandlerResult terminal{};
     bool has_terminal = false;
     u32 consumed_events = 0;
-    const char* dynamic_response_body = nullptr;
+    // Result-owned bytes: callers may inspect the body after the local
+    // HandlerExecution frame used by drive_handler_deterministically is gone.
+    char dynamic_response_body[jit::kMaxDynamicResponseBodyBytes]{};
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
     jit::ResponseHeaderMutation response_header_mutations[jit::kMaxResponseHeaderMutations]{};
