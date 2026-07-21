@@ -9477,7 +9477,8 @@ route GET "/api" use chain rewrite_chain { wait(1) return forward(api, buffered:
 
 static constexpr const char kDynamicJsonTransportSource[] = R"rut(
 route GET "/json" {
-    let items = [req.path, "a\"b"]
+    let quoted = any(req.header("X-Value"), "")
+    let items = [req.path, quoted]
     return 200, json({ path: req.path, items: items })
 }
 )rut";
@@ -9975,7 +9976,8 @@ TEST(shard, dynamic_json_bytes_are_exact_over_http1) {
     i32 client = connect_to(port);
     REQUIRE(client >= 0);
     set_socket_timeouts(client, 2);
-    static const char kReq[] = "GET /json HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    static const char kReq[] =
+        "GET /json HTTP/1.1\r\nHost: test\r\nX-Value: a\"b\r\nConnection: close\r\n\r\n";
     REQUIRE(write_all_fd(client, reinterpret_cast<const u8*>(kReq), sizeof(kReq) - 1));
     char response[2048];
     u32 total = 0;
@@ -9984,9 +9986,9 @@ TEST(shard, dynamic_json_bytes_are_exact_over_http1) {
         if (got <= 0) break;
         total += static_cast<u32>(got);
     }
-    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\\\"b"]})json";
+    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\"b"]})json";
     CHECK(buf_contains(response, total, "HTTP/1.1 200", 12));
-    CHECK(buf_contains(response, total, "Content-Length: 43\r\n", 20));
+    CHECK(buf_contains(response, total, "Content-Length: 41\r\n", 20));
     CHECK(buf_contains(response, total, kExpected, sizeof(kExpected) - 1));
 
     close(client);
@@ -10014,10 +10016,21 @@ TEST(shard, dynamic_json_bytes_are_exact_over_http2) {
     i32 client = connect_to(port);
     REQUIRE(client >= 0);
     set_socket_timeouts(client, 2);
+    const hpack::Header request_headers[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/json", 5}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"x-value", 7}, {"a\"b", 3}},
+    };
     u8 request[512];
     u32 request_len = h2_client_prologue(request);
-    request_len +=
-        h2_client_get(request + request_len, sizeof(request) - request_len, 1, "/json", 5);
+    request_len += http2_write_headers(request + request_len,
+                                       sizeof(request) - request_len,
+                                       1,
+                                       request_headers,
+                                       5,
+                                       true);
     REQUIRE(write_all_fd(client, request, request_len));
 
     u8 response[4096];
@@ -10032,7 +10045,7 @@ TEST(shard, dynamic_json_bytes_are_exact_over_http2) {
         body_len = h2_body_for_stream(response, total, 1, body, sizeof(body));
         if (h2_status_for_stream(response, total, 1) == 200 && body_len != 0) break;
     }
-    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\\\"b"]})json";
+    static constexpr char kExpected[] = R"json({"path":"/json","items":["/json","a\"b"]})json";
     CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
     CHECK_EQ(body_len, sizeof(kExpected) - 1);
     CHECK(body_len == sizeof(kExpected) - 1 &&

@@ -374,16 +374,18 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
 
     const auto& response = execution.frame.context;
     if (result.action == jit::HandlerAction::ReturnStatus) {
-        if (response.response_status_invalid || response.response_body_mutation_overflow) {
+        const bool returned_dynamic_json =
+            result.upstream_id == jit::HandlerResult::kDynamicResponseBody;
+        const bool dynamic_json_failed =
+            returned_dynamic_json &&
+            (response.response_body_valid == 0 || response.response_body_data == nullptr);
+        if (response.response_status_invalid || response.response_body_mutation_overflow ||
+            dynamic_json_failed) {
             result = jit::HandlerResult::make_status(500);
         } else {
             if (response.response_status_set) result.status_code = response.response_status;
             if (response.response_body_mutation_set)
                 result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
-            if (result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
-                !response.response_body_mutation_set &&
-                (response.response_body_valid == 0 || response.response_body_data == nullptr))
-                result = jit::HandlerResult::make_status(500);
         }
     }
     out.terminal = result;
