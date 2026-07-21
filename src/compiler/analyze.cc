@@ -10894,6 +10894,168 @@ static bool dynamic_json_shape_supported(const HirModule& mod, u32 shape_index, 
     return true;
 }
 
+static FrontendResult<void> build_reusable_json_plan(
+    const AstExpr& expr,
+    HirRoute* route,
+    const HirModule& mod,
+    std::vector<std::string>& segments,
+    FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
+    const HirLocal* locals,
+    u32 local_count,
+    const MatchPayloadBinding* binding,
+    u32 depth) {
+    if (depth > 32)
+        return frontend_error(FrontendError::TooManyItems, expr.span, kJsonLiteralDetail);
+
+    // Keep wholly literal subtrees on the compile-time path. Besides reducing
+    // runtime calls, this preserves the established literal JSON encoding.
+    std::string literal;
+    auto encoded = serialize_json_literal(expr, literal, depth);
+    if (encoded) {
+        if (!append_json_bytes(segments.back(), literal.data(), static_cast<u32>(literal.size())))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
+    if (expr.kind == AstExprKind::BoolLit || expr.kind == AstExprKind::IntLit ||
+        expr.kind == AstExprKind::StrLit || expr.kind == AstExprKind::Nil)
+        return core::make_unexpected(encoded.error());
+
+    if (expr.kind == AstExprKind::ObjectLit) {
+        if (!append_json_bytes(segments.back(), "{", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        for (u32 i = 0; i < expr.field_inits.len; i++) {
+            for (u32 j = 0; j < i; j++) {
+                if (expr.field_inits[j].name.eq(expr.field_inits[i].name))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          expr.span,
+                                          lit_str("json object field names must be unique"));
+            }
+            if ((i != 0 && !append_json_bytes(segments.back(), ",", 1)) ||
+                !append_json_quoted(segments.back(), expr.field_inits[i].name) ||
+                !append_json_bytes(segments.back(), ":", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            auto child = build_reusable_json_plan(*expr.field_inits[i].value,
+                                                  route,
+                                                  mod,
+                                                  segments,
+                                                  value_refs,
+                                                  locals,
+                                                  local_count,
+                                                  binding,
+                                                  depth + 1);
+            if (!child) return child;
+        }
+        if (!append_json_bytes(segments.back(), "}", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
+    if (expr.kind == AstExprKind::ArrayLit) {
+        if (!append_json_bytes(segments.back(), "[", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        for (u32 i = 0; i < expr.args.len; i++) {
+            if (i != 0 && !append_json_bytes(segments.back(), ",", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            auto child = build_reusable_json_plan(*expr.args[i],
+                                                  route,
+                                                  mod,
+                                                  segments,
+                                                  value_refs,
+                                                  locals,
+                                                  local_count,
+                                                  binding,
+                                                  depth + 1);
+            if (!child) return child;
+        }
+        if (!append_json_bytes(segments.back(), "]", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
+
+    auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
+    if (!value) return core::make_unexpected(value.error());
+    if (value->type == HirTypeKind::Struct && !value->may_nil && !value->may_error) {
+        if (value->struct_index >= mod.structs.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        const auto& decl = mod.structs[value->struct_index];
+        AstExpr materialized_base{};
+        const AstExpr* field_base = &expr;
+        const HirLocal* field_locals = locals;
+        u32 field_local_count = local_count;
+        if (value->kind != HirExprKind::LocalRef) {
+            if (route->locals.len >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            HirLocal local{};
+            local.span = expr.span;
+            local.name = intern_generated_name("$json.struct." + std::to_string(route->locals.len));
+            local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+            local.type = value->type;
+            local.struct_index = value->struct_index;
+            local.shape_index = value->shape_index;
+            local.init = value.value();
+            if (!route->locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            materialized_base.kind = AstExprKind::Ident;
+            materialized_base.span = expr.span;
+            materialized_base.name = local.name;
+            field_base = &materialized_base;
+            field_locals = route->locals.data;
+            field_local_count = route->locals.len;
+        }
+        if (!append_json_bytes(segments.back(), "{", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        for (u32 i = 0; i < decl.fields.len; i++) {
+            if ((i != 0 && !append_json_bytes(segments.back(), ",", 1)) ||
+                !append_json_quoted(segments.back(), decl.fields[i].name) ||
+                !append_json_bytes(segments.back(), ":", 1))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            AstExpr field{};
+            field.kind = AstExprKind::Field;
+            field.span = expr.span;
+            field.lhs = const_cast<AstExpr*>(field_base);
+            field.name = decl.fields[i].name;
+            auto child = build_reusable_json_plan(field,
+                                                  route,
+                                                  mod,
+                                                  segments,
+                                                  value_refs,
+                                                  field_locals,
+                                                  field_local_count,
+                                                  binding,
+                                                  depth + 1);
+            if (!child) return child;
+        }
+        if (!append_json_bytes(segments.back(), "}", 1))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        return {};
+    }
+    const bool supported_array = value->type == HirTypeKind::Array &&
+                                 dynamic_json_shape_supported(mod, value->shape_index, depth);
+    if ((value->type != HirTypeKind::Bool && value->type != HirTypeKind::I32 &&
+         value->type != HirTypeKind::I64 && value->type != HirTypeKind::Str &&
+         value->type != HirTypeKind::StrList && !supported_array) ||
+        value->may_nil || value->may_error)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            expr.span,
+            lit_str("runtime json values support non-optional bool/i32/i64/str, bounded "
+                    "string lists, and bounded arrays of JSON-compatible values only"));
+    if (value_refs.len >= HirTerminator::kMaxJsonDynamicValues ||
+        route->locals.len >= HirRoute::kMaxLocals)
+        return frontend_error(FrontendError::TooManyItems, expr.span);
+
+    HirLocal local{};
+    local.span = expr.span;
+    local.name = intern_generated_name("$json.response." + std::to_string(value_refs.len));
+    local.ref_index = next_local_ref_index(route, locals, local_count);
+    local.type = value->type;
+    local.shape_index = value->shape_index;
+    local.init = value.value();
+    if (!route->locals.push(local) || !value_refs.push(local.ref_index))
+        return frontend_error(FrontendError::TooManyItems, expr.span);
+    segments.emplace_back();
+    return {};
+}
+
 static void copy_json_value_metadata(HirLocal* local, const HirExpr& value) {
     local->type = value.type;
     local->generic_index = value.generic_index;
@@ -17600,6 +17762,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     field.type == HirTypeKind::Tuple ? field_tuple_elem_shape_indices : nullptr);
                 if (!field_shape) return core::make_unexpected(field_shape.error());
                 field.shape_index = field_shape.value();
+                if (hir_type_shape_contains_json(mod, field.shape_index))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.struct_decl.span,
+                                          kJsonOpaqueValueDetail);
             }
             if (!decl.fields.push(field))
                 return frontend_error(FrontendError::TooManyItems, item.struct_decl.span);
@@ -18303,6 +18469,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 body->variant_index != fn.return_variant_index)
                 return frontend_error(FrontendError::UnsupportedSyntax, ast_func.body->span);
         }
+        if (fn.return_type == HirTypeKind::Json && (body->may_nil || body->may_error))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, ast_func.body->span, kJsonOpaqueValueDetail);
         if (fn.return_type == HirTypeKind::Array && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   ast_func.body->span,
@@ -19929,6 +20098,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 body->variant_index != fn.return_variant_index)
                 return frontend_error(FrontendError::UnsupportedSyntax, item.func.body->span);
         }
+        if (fn.return_type == HirTypeKind::Json && (body->may_nil || body->may_error))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, item.func.body->span, kJsonOpaqueValueDetail);
         if (fn.return_type == HirTypeKind::Array && (body->may_nil || body->may_error))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.func.body->span,

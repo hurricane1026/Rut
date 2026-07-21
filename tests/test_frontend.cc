@@ -33078,6 +33078,8 @@ TEST(frontend, json_values_are_opaque_outside_response_sinks) {
         "route GET \"/x\" { let body = json({ ok: true }) let bodies = [body] return 200 }\n",
         "route GET \"/x\" { let body = json({ ok: true }) let pair = (body, 1) return 200 }\n",
         "struct Stored { body: Json } route GET \"/x\" { return 200 }\n",
+        "struct Stored { body: (Json, i32) } route GET \"/x\" { return 200 }\n",
+        "struct Stored { bodies: [Json] } route GET \"/x\" { return 200 }\n",
     };
     const auto detail =
         lit("Json values are opaque response plans; use them only through locals or helper calls "
@@ -33091,6 +33093,46 @@ TEST(frontend, json_values_are_opaque_outside_response_sinks) {
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(detail));
     }
+}
+
+TEST(frontend, optional_and_fallible_json_helper_results_are_rejected) {
+    const char* sources[] = {
+        "func maybe(flag: bool) -> Json { if flag { json({ ok: true }) } else { nil } } "
+        "route GET \"/x\" { let body = maybe(req.http11) return 200, body }\n",
+        "func maybe(flag: bool) -> Json { if flag { json({ ok: true }) } else { "
+        "error(.missing) } } route GET \"/x\" { let body = maybe(req.http11) return 200, body "
+        "}\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, reusable_json_materializes_struct_inputs_once) {
+    const char* src =
+        "struct Payload { a: str, b: str } route GET \"/x\" { "
+        "let body = json(Payload(a: req.path, b: \"fixed\")) return 200, body }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 path_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            path_reads += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqPath;
+    CHECK_EQ(path_reads, 1u);
+    rir.destroy();
 }
 
 TEST(frontend, conditional_json_locals_materialize_only_at_direct_sinks) {

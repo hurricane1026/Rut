@@ -59,6 +59,7 @@ static const HelperEntry kHelpers[] = {
     {"rut_helper_resp_remove_header", reinterpret_cast<void*>(&rut_helper_resp_remove_header)},
     {"rut_helper_resp_set_status", reinterpret_cast<void*>(&rut_helper_resp_set_status)},
     {"rut_helper_resp_set_body", reinterpret_cast<void*>(&rut_helper_resp_set_body)},
+    {"rut_helper_resp_publish_body", reinterpret_cast<void*>(&rut_helper_resp_publish_body)},
     {"rut_helper_resp_commit_headers", reinterpret_cast<void*>(&rut_helper_resp_commit_headers)},
     {"rut_helper_resp_commit_body", reinterpret_cast<void*>(&rut_helper_resp_commit_body)},
     {"rut_helper_resp_header", reinterpret_cast<void*>(&rut_helper_resp_header)},
