@@ -285,9 +285,12 @@ route POST "/form" { return 204 }
 ```
 
 The shipped parser accepts repeated top-level `route METHOD "pattern"`
-declarations. The grouped `route { ... }` surface (middleware pattern
-bindings, host/path groups, method unions, typed captures, expression entries,
-and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
+declarations. Rut Core also accepts a literal-entry `route { ... }` group when
+it carries a group-level `use chain`; generated code should use that form only
+for group-wide chain reuse. Plain literal-entry grouping is compatibility.
+Middleware pattern bindings, host/path groups, method unions, typed captures,
+expression entries, and `_` catch-all remain ⏳ target syntax and must not be
+emitted yet.
 
 Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
 Indistinguishable routes are a compile error. Stable middleware uses an explicit

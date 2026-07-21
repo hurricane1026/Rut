@@ -18,7 +18,7 @@ the parser does not make a spelling part of the stable core.
 
 | Capability | Rut Core spelling | Compatibility surface | Experimental surface |
 |---|---|---|---|
-| Routes | `route GET "/path" { ... }` | grouped `route { ... }` declarations | host/path groups, method unions, expression entries |
+| Routes | `route GET "/path" { ... }`; literal-entry `route { use chain name ... }` for group-wide chain reuse | literal-entry groups without a group-level chain | host/path groups, method unions, expression entries |
 | Middleware | `chain` with ordered `before`; constrained response-header `after` | official built-in decorators | buffered body/status post-processing |
 | Pipe | `value \| fn(_, arg)` | `_.method(...)`, `_1` … `_10` | a dedicated pipe IR or wider runtime tuple projection |
 | Fallback | `.or(default)`, `guard let`, `if let`, explicit `match` | eager `any(value, default)` and present-only `all(value, next)` | none |
@@ -28,6 +28,11 @@ the parser does not make a spelling part of the stable core.
 
 “Compatibility” is not a promise to add more variants. It is a bounded bridge
 to the core form.
+
+The Core route-group subset exists specifically for group-wide `use chain`
+reuse. Without a group-level chain, generated code should emit repeated
+top-level `route METHOD "/path"` declarations. Pattern bindings and the richer
+host/path grouping surface remain experimental.
 
 ## Canonical Generated Forms
 

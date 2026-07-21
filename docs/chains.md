@@ -59,14 +59,12 @@ chain upload_secure {
     before limit_body(req, 1mb) else 413
 }
 
-route {
-    GET "/:id" use chain read_secure {
-        return 200
-    }
+route GET "/:id" use chain read_secure {
+    return 200
+}
 
-    POST "/upload" use chain upload_secure {
-        return 204
-    }
+route POST "/upload" use chain upload_secure {
+    return 204
 }
 ```
 
