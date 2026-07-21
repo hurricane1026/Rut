@@ -3370,6 +3370,38 @@ static bool bind_generic_shape_indices(const HirModule& mod,
     return true;
 }
 
+static FrontendResult<void> adapt_str_list_to_array_carrier(HirExpr* expr,
+                                                            HirModule* mod,
+                                                            Span span) {
+    if (expr->type != HirTypeKind::StrList) return {};
+    auto elem_shape = intern_hir_type_shape(mod,
+                                            HirTypeKind::Str,
+                                            0xffffffffu,
+                                            0xffffffffu,
+                                            0xffffffffu,
+                                            0,
+                                            nullptr,
+                                            nullptr,
+                                            nullptr,
+                                            span);
+    if (!elem_shape) return core::make_unexpected(elem_shape.error());
+    auto array_shape = intern_hir_type_shape(mod,
+                                             HirTypeKind::Array,
+                                             0xffffffffu,
+                                             0xffffffffu,
+                                             0xffffffffu,
+                                             0,
+                                             nullptr,
+                                             nullptr,
+                                             nullptr,
+                                             span,
+                                             elem_shape.value());
+    if (!array_shape) return core::make_unexpected(array_shape.error());
+    expr->type = HirTypeKind::Array;
+    expr->shape_index = array_shape.value();
+    return {};
+}
+
 static bool bind_named_generic_shape(const HirModule& mod,
                                      GenericBinding* generic_bindings,
                                      u32 generic_binding_count,
@@ -7165,12 +7197,29 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               expr.field_inits[fi].value->span);
+                    if (field_decl.type == HirTypeKind::Array) {
+                        auto adapted =
+                            adapt_str_list_to_array_carrier(&field_value.value(),
+                                                            const_cast<HirModule*>(&mod),
+                                                            expr.field_inits[fi].value->span);
+                        if (!adapted) return core::make_unexpected(adapted.error());
+                    }
                     bool bound = false;
                     if (field_decl.generic_index != 0xffffffffu) {
                         bound = bind_generic_shape(bindings,
                                                    mod.structs[struct_index].type_params.len,
                                                    field_decl.generic_index,
                                                    field_value.value());
+                    } else if ((field_decl.type == HirTypeKind::Array ||
+                                field_decl.type == HirTypeKind::Tuple) &&
+                               field_decl.shape_index < mod.type_shapes.len &&
+                               field_value->shape_index < mod.type_shapes.len) {
+                        bound =
+                            bind_generic_shape_indices(mod,
+                                                       bindings,
+                                                       mod.structs[struct_index].type_params.len,
+                                                       field_decl.shape_index,
+                                                       field_value->shape_index);
                     } else if (field_decl.template_variant_index != 0xffffffffu ||
                                field_decl.template_struct_index != 0xffffffffu) {
                         const auto expected =
@@ -7251,6 +7300,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (field_value->may_nil || field_value->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
+            if (field_decl.type == HirTypeKind::Array) {
+                auto adapted = adapt_str_list_to_array_carrier(&field_value.value(),
+                                                               const_cast<HirModule*>(&mod),
+                                                               expr.field_inits[fi].value->span);
+                if (!adapted) return core::make_unexpected(adapted.error());
+            }
             const auto expected = make_expected_type_expr(field_decl.type,
                                                           field_decl.variant_index,
                                                           field_decl.struct_index,
@@ -8886,6 +8941,40 @@ static FrontendResult<HirExpr> analyze_array_iter_expr(const AstExpr& expr,
     return analyze_expr_impl(expr, route, mod, locals, local_count, nullptr, true);
 }
 
+static u32 count_function_param_refs(const HirExpr& expr, u32 param_index, u32 limit) {
+    if (limit == 0) return 0;
+    u32 count = expr.kind == HirExprKind::LocalRef && expr.local_index == param_index ? 1u : 0u;
+    if (count >= limit) return count;
+    if (expr.lhs != nullptr) {
+        count += count_function_param_refs(*expr.lhs, param_index, limit - count);
+        if (count >= limit) return count;
+    }
+    if (expr.rhs != nullptr) {
+        count += count_function_param_refs(*expr.rhs, param_index, limit - count);
+        if (count >= limit) return count;
+    }
+    for (u32 i = 0; i < expr.field_inits.len; i++) {
+        if (expr.field_inits[i].value == nullptr) continue;
+        count += count_function_param_refs(*expr.field_inits[i].value, param_index, limit - count);
+        if (count >= limit) return count;
+    }
+    for (u32 i = 0; i < expr.args.len; i++) {
+        if (expr.args[i] == nullptr) continue;
+        count += count_function_param_refs(*expr.args[i], param_index, limit - count);
+        if (count >= limit) return count;
+    }
+    return count;
+}
+
+static bool function_param_is_reused(const HirFunction& fn, u32 param_index) {
+    u32 count = count_function_param_refs(fn.body, param_index, 2);
+    for (u32 i = 0; count < 2 && i < fn.exprs.len; i++)
+        count += count_function_param_refs(fn.exprs[i], param_index, 2 - count);
+    for (u32 i = 0; count < 2 && i < fn.respond_guards.len; i++)
+        count += count_function_param_refs(fn.respond_guards[i].cond, param_index, 2 - count);
+    return count >= 2;
+}
+
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -9986,6 +10075,29 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     }
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
+    for (u32 i = 0; i < effective_arg_count; i++) {
+        if (analyzed_args[i].type != HirTypeKind::Array ||
+            analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i))
+            continue;
+        HirLocal carrier{};
+        carrier.span = expr.args[i]->span;
+        carrier.name = {"$array_arg", 10};
+        // A route-level `let` reserves its own ref_index before analyzing the
+        // initializer, but is not in route->locals yet. Keep this synthetic
+        // argument carrier beyond that pending slot.
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len) + 1;
+        carrier.type = analyzed_args[i].type;
+        carrier.shape_index = analyzed_args[i].shape_index;
+        carrier.init = analyzed_args[i];
+        if (!route->locals.push(carrier))
+            return frontend_error(FrontendError::TooManyItems, expr.args[i]->span);
+        HirExpr ref{};
+        ref.kind = HirExprKind::LocalRef;
+        ref.span = expr.args[i]->span;
+        ref.local_index = carrier.ref_index;
+        copy_hir_shape(&ref, analyzed_args[i]);
+        analyzed_args[i] = ref;
+    }
     auto respond_guards = instantiate_function_respond_guards(fn,
                                                               route,
                                                               mod,
