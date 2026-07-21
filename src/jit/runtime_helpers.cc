@@ -130,13 +130,16 @@ const ParseCache& parse_cached(const u8* data, u32 len) {
 
 void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
     t_time_cache.valid = false;  // fresh "now" per invocation
-    t_json_captures.len = 0;
-    t_json_captures.last_capture_len = 0xffffffffu;
     // Parse once for this invocation and mark the cache primed so the
     // following req_* helper calls reuse it.
     ParseCache& pc = t_parse_cache;
     parse_into(pc, req_data, req_len);
     pc.primed = true;
+}
+
+void rut_helper_json_capture_reset() {
+    t_json_captures.len = 0;
+    t_json_captures.last_capture_len = 0xffffffffu;
 }
 
 void rut_helper_parse_unprime() {
@@ -496,8 +499,8 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
     if (ctx == nullptr) return;
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     hctx->response_body_pending_set = true;
-    hctx->response_body_pending_overflow =
-        body == nullptr || len > jit::kMaxResponseBodyMutationBytes;
+    hctx->response_body_pending_overflow = hctx->response_body_snapshot_failed || body == nullptr ||
+                                           len > jit::kMaxResponseBodyMutationBytes;
     if (!hctx->response_body_pending_overflow && hctx->response_body_mutation_storage == nullptr) {
         hctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
         if (hctx->response_body_mutation_storage == nullptr)
@@ -540,6 +543,7 @@ void rut_helper_resp_body(
     const char* snapshot = jit::snapshot_response_body(
         hctx, hctx->response_body_mutation_storage, hctx->response_body_pending_len);
     if (snapshot == nullptr) {
+        hctx->response_body_snapshot_failed = true;
         hctx->response_body_pending_overflow = true;
         return;
     }

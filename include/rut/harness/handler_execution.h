@@ -65,6 +65,10 @@ struct HandlerExecutionResult {
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
     jit::ResponseHeaderMutation response_header_mutations[jit::kMaxResponseHeaderMutations]{};
+    // Header values are copied out of the temporary HandlerExecution so values
+    // backed by resp.body snapshots remain valid through result consumption.
+    char response_header_values[jit::kMaxResponseHeaderMutations]
+                               [jit::kMaxResponseBodyMutationBytes]{};
     u8 response_header_count = 0;
     bool response_header_overflow = false;
 };

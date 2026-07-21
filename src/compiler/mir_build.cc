@@ -1198,13 +1198,20 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
             return false;
         };
-        auto static_iter_ref_needed_at_runtime = [&](u32 ref_index) {
+        auto static_iter_ref_needed_at_runtime =
+            [&](auto&& self, u32 ref_index, u32 depth) -> bool {
+            if (depth > HirRoute::kMaxLocals) return false;
             for (u32 li = 0; li < module.routes[i].locals.len; li++) {
                 const auto& consumer = module.routes[i].locals[li];
+                if (!expr_refs_local(expr_refs_local, consumer.init, ref_index, 0)) continue;
                 if (consumer.ref_index < HirRoute::kMaxLocals &&
-                    static_iter_ref[consumer.ref_index])
+                    static_iter_ref[consumer.ref_index]) {
+                    if (consumer.ref_index != ref_index &&
+                        self(self, consumer.ref_index, depth + 1))
+                        return true;
                     continue;
-                if (expr_refs_local(expr_refs_local, consumer.init, ref_index, 0)) return true;
+                }
+                return true;
             }
             const auto& control = module.routes[i].control;
             if (term_refs_local(control.direct_term, ref_index) ||
@@ -1246,13 +1253,17 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
+            // Named Json values are reusable serialization plans, not runtime
+            // carriers. Materialize the selected plan only at its sink. Keep
+            // the synthetic RespSetBody statement carrier: it is the sink.
             if (module.routes[i].locals[li].type == HirTypeKind::Json &&
-                module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild)
+                module.routes[i].locals[li].init.kind != HirExprKind::RespSetBody)
                 continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Array &&
                 module.routes[i].locals[li].ref_index < HirRoute::kMaxLocals &&
                 static_iter_ref[module.routes[i].locals[li].ref_index] &&
-                !static_iter_ref_needed_at_runtime(module.routes[i].locals[li].ref_index))
+                !static_iter_ref_needed_at_runtime(
+                    static_iter_ref_needed_at_runtime, module.routes[i].locals[li].ref_index, 0))
                 continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
@@ -1332,6 +1343,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->json_segments.len = 0;
             out->json_value_ref_indices.len = 0;
             out->json_locals.len = 0;
+            out->has_json_body_plan = false;
             static_assert(
                 HirTerminator::kMaxJsonDynamicValues == MirTerminator::kMaxJsonDynamicValues,
                 "HIR/MIR dynamic JSON caps must match");
@@ -1385,6 +1397,25 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     term_json_copy_error = Diagnostic{FrontendError::TooManyItems, term.span, {}};
                     return;
                 }
+            }
+            if (term.json_body_expr_index != 0xffffffffu) {
+                if (term.json_body_expr_index >= module.routes[i].exprs.len) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error =
+                        Diagnostic{FrontendError::UnsupportedSyntax, term.span, {}};
+                    return;
+                }
+                const auto& value = module.routes[i].exprs[term.json_body_expr_index];
+                out->json_body_local.span = value.span;
+                out->json_body_local.type = mir_type_kind(value.type);
+                auto init = mir_value(value, module, &fn);
+                if (!init) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error = init.error();
+                    return;
+                }
+                out->json_body_local.init = init.value();
+                out->has_json_body_plan = true;
             }
             out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;
@@ -1973,6 +2004,25 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 };
                 return resolve_array(resolve_array, fl.iter_expr, 0);
             };
+            auto materialized_iter_ref_for = [&](const HirForLoop& fl) -> const HirExpr* {
+                const HirExpr* iter = &fl.iter_expr;
+                for (u32 depth = 0; depth <= module.routes[i].locals.len; depth++) {
+                    if (iter->kind != HirExprKind::LocalRef) return nullptr;
+                    if (static_iter_ref_needed_at_runtime(
+                            static_iter_ref_needed_at_runtime, iter->local_index, 0))
+                        return iter;
+                    const HirLocal* source = nullptr;
+                    for (u32 li = 0; li < module.routes[i].locals.len; li++) {
+                        if (module.routes[i].locals[li].ref_index == iter->local_index) {
+                            source = &module.routes[i].locals[li];
+                            break;
+                        }
+                    }
+                    if (source == nullptr) return nullptr;
+                    iter = &source->init;
+                }
+                return nullptr;
+            };
             struct RouteStep {
                 enum class Kind : u8 {
                     Guard,
@@ -2043,6 +2093,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                      u32 order_start) -> FrontendResult<void> {
                 const auto& fl = module.routes[i].for_loops[fi];
                 const HirExpr* iter_array = iter_array_for(fl);
+                const HirExpr* materialized_iter = materialized_iter_ref_for(fl);
                 // This unroll requires a compile-time-known array literal,
                 // either inline in the for expression or through a
                 // route-local array constant. Runtime array values are
@@ -2057,7 +2108,34 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 const u32 iter_count =
                     fl.body.has_term && iter_array->args.len != 0 ? 1u : iter_array->args.len;
                 for (u32 ai = 0; ai < iter_count; ai++) {
-                    auto elem = mir_value(*iter_array->args[ai], module, &fn, parent_ctx);
+                    FrontendResult<MirValue> elem =
+                        frontend_error(FrontendError::UnsupportedSyntax, fl.span);
+                    if (materialized_iter != nullptr) {
+                        auto array = mir_value(*materialized_iter, module, &fn, parent_ctx);
+                        if (!array) return core::make_unexpected(array.error());
+                        if (!fn.values.push(array.value()))
+                            return frontend_error(FrontendError::TooManyItems, fl.span);
+                        MirValue indexed{};
+                        indexed.kind = MirValueKind::ArrayGet;
+                        indexed.type = mir_type_kind(iter_array->args[ai]->type);
+                        indexed.shape_index = iter_array->args[ai]->shape_index;
+                        indexed.variant_index = iter_array->args[ai]->variant_index;
+                        indexed.struct_index = iter_array->args[ai]->struct_index;
+                        indexed.tuple_len = iter_array->args[ai]->tuple_len;
+                        for (u32 ti = 0; ti < indexed.tuple_len; ti++) {
+                            indexed.tuple_types[ti] =
+                                mir_type_kind(iter_array->args[ai]->tuple_types[ti]);
+                            indexed.tuple_variant_indices[ti] =
+                                iter_array->args[ai]->tuple_variant_indices[ti];
+                            indexed.tuple_struct_indices[ti] =
+                                iter_array->args[ai]->tuple_struct_indices[ti];
+                        }
+                        indexed.int_value = ai;
+                        indexed.lhs = &fn.values[fn.values.len - 1];
+                        elem = indexed;
+                    } else {
+                        elem = mir_value(*iter_array->args[ai], module, &fn, parent_ctx);
+                    }
                     if (!elem) return core::make_unexpected(elem.error());
                     ForLoopCtx ctx = parent_ctx ? *parent_ctx : ForLoopCtx{};
                     auto loop_binding =
