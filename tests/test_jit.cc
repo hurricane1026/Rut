@@ -1454,6 +1454,14 @@ TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) 
     CHECK(ctx.response_body_data == nullptr);
     CHECK_EQ(ctx.response_body_len, 0u);
 
+    static const char kInvalidUtf8[] = {static_cast<char>(0xc0), static_cast<char>(0x80)};
+    rut_helper_json_reset();
+    rut_helper_json_append_str(kInvalidUtf8, sizeof(kInvalidUtf8));
+    rut_helper_json_finish(&ctx);
+    CHECK_EQ(ctx.response_body_valid, 0u);
+    CHECK(ctx.response_body_data == nullptr);
+    CHECK_EQ(ctx.response_body_len, 0u);
+
     const auto overflow_handler =
         +[](void*, HandlerCtx* handler_ctx, const u8*, u32, void*) -> u64 {
         char bytes[8 * 1024]{};
@@ -1468,6 +1476,111 @@ TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) 
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+}
+
+TEST(jit, frontend_match_arm_runtime_json_uses_payload_scope) {
+    const auto src = R"rut(
+variant Result { ok(str), err }
+route GET "/x" {
+    let result = Result.ok("ready")
+    match result {
+        .ok(value) => return 200, json({ value: value })
+        .err => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"value\":\"ready\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_match_arm_runtime_json_runs_after_effects) {
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    match req.http11 {
+        true => {
+            buckets.set(req.remoteAddr, 9)
+            return 200, json({ value: buckets.get(req.remoteAddr).or(0) })
+        }
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    cache_registry_set_seed(0x206u);
+    const u32 caps[1] = {64};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0a000206u;
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"value\":9}")));
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
