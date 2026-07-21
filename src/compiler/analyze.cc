@@ -5500,6 +5500,36 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
+static FrontendResult<void> instantiate_function_response_effects(
+    const HirFunction& fn,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirExpr* args,
+    u32 arg_count,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count,
+    Span call_span) {
+    if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        const auto kind = fn.exprs[ei].kind;
+        if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
+            kind != HirExprKind::RespRemoveHeader && kind != HirExprKind::RespSetStatus &&
+            kind != HirExprKind::RespSetBody)
+            continue;
+        auto effect = instantiate_function_expr(
+            fn.exprs[ei], route, mod, args, arg_count, generic_bindings, generic_binding_count);
+        if (!effect) return core::make_unexpected(effect.error());
+        HirLocal carrier{};
+        carrier.span = call_span;
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        carrier.type = effect->type;
+        carrier.init = effect.value();
+        if (!route->locals.push(carrier))
+            return frontend_error(FrontendError::TooManyItems, call_span);
+    }
+    return {};
+}
+
 static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
                                                        HirFunction* fn,
                                                        const HirLocal* locals,
@@ -10127,6 +10157,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                               fn.type_params.len,
                                                               respond_guard_span);
     if (!respond_guards) return core::make_unexpected(respond_guards.error());
+    auto response_effects = instantiate_function_response_effects(fn,
+                                                                  route,
+                                                                  mod,
+                                                                  analyzed_args,
+                                                                  effective_arg_count,
+                                                                  generic_bindings,
+                                                                  fn.type_params.len,
+                                                                  expr.span);
+    if (!response_effects) return core::make_unexpected(response_effects.error());
     auto inlined = instantiate_function_expr(fn.body,
                                              route,
                                              mod,
@@ -11813,6 +11852,30 @@ static bool hir_expr_reads_response_field(const HirExpr& expr) {
         if (expr.field_inits[i].value != nullptr &&
             hir_expr_reads_response_field(*expr.field_inits[i].value))
             return true;
+    return false;
+}
+
+static bool hir_for_loop_reads_response_field(const HirForLoop& loop) {
+    const auto& body = loop.body;
+    for (u32 li = 0; li < body.locals.len; li++)
+        if (hir_expr_reads_response_field(body.locals[li].init)) return true;
+    for (u32 gi = 0; gi < body.guards.len; gi++)
+        if (hir_expr_reads_response_field(body.guards[gi].cond)) return true;
+    for (u32 ii = 0; ii < body.ifs.len; ii++)
+        if (hir_expr_reads_response_field(body.ifs[ii].cond)) return true;
+    for (u32 mi = 0; mi < body.matches.len; mi++) {
+        const auto& match = body.matches[mi];
+        if (hir_expr_reads_response_field(match.match_expr)) return true;
+        for (u32 ai = 0; ai < match.arms.len; ai++) {
+            const auto& arm = match.arms[ai];
+            if (arm.has_arm_guard && hir_expr_reads_response_field(arm.arm_guard)) return true;
+            if (hir_expr_reads_response_field(arm.cond)) return true;
+            for (u32 li = 0; li < arm.locals.len; li++)
+                if (hir_expr_reads_response_field(arm.locals[li].init)) return true;
+            for (u32 gi = 0; gi < arm.guards.len; gi++)
+                if (hir_expr_reads_response_field(arm.guards[gi].cond)) return true;
+        }
+    }
     return false;
 }
 
@@ -19644,6 +19707,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     for (u32 gi = 0; gi < route.guards.len; gi++)
                         prior_guard_reads_response |=
                             hir_expr_reads_response_field(route.guards[gi].cond);
+                    for (u32 fi = 0; fi < route.for_loops.len; fi++)
+                        prior_guard_reads_response |=
+                            hir_for_loop_reads_response_field(route.for_loops[fi]);
                     if (prior_guard_reads_response)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,

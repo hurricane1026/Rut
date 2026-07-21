@@ -1825,6 +1825,43 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, helper_response_scalar_effects_precede_runtime_reads) {
+    const auto src = R"rut(
+func rewrite() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = rewrite()
+    if status == 201 { return 201 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    TestHandlerCtxFrame frame{};
+    const auto result = HandlerResult::unpack(handler(nullptr, &frame.ctx, nullptr, 0, nullptr));
+    REQUIRE(result.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 201u);
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, request_independent_json_captures_reset_per_invocation) {
     const auto src = R"rut(
 func choose(flag: bool, yes: Json, no: Json) -> Json {
