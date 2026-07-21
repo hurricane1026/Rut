@@ -767,15 +767,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     // time (h2->pending_route*), so the deferred body dispatches to exactly the
     // route metered at HEADERS time — h2_dispatch_request charges body routes
     // there (a reload can't swap the route out from under the pinned dispatch).
-    h2_invoke_emit(d,
-                   stream_id,
-                   route,
-                   route_params,
-                   kRouteParamCount,
-                   cfg,
-                   synth,
-                   kLen,
-                   kRequestForwardable);
+    h2_invoke_emit(
+        d, stream_id, route, route_params, kRouteParamCount, cfg, synth, kLen, kRequestForwardable);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -913,16 +906,13 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            // A JIT route may select buffered forwarding even when it does not
-            // read req.body itself. Preserve all DATA until the handler's
-            // terminal action is known so forwarding cannot drop the payload.
             if (!end_stream) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
                                         nheaders,
                                         req,
-                                        /*buffer_body=*/true,
+                                        /*buffer_body=*/route->needs_req_body,
                                         RouteAction::JitHandler,
                                         config,
                                         route,
@@ -944,16 +934,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 500);
                 return;
             }
-            h2_invoke_emit(
-                d,
-                stream_id,
-                route,
-                anchored_params,
-                param_count,
-                config,
-                synth,
-                kSynthLen,
-                h2_proxy_request_forwardable(headers, nheaders));
+            h2_invoke_emit(d,
+                           stream_id,
+                           route,
+                           anchored_params,
+                           param_count,
+                           config,
+                           synth,
+                           kSynthLen,
+                           h2_proxy_request_forwardable(headers, nheaders));
             return;
         }
         case RouteAction::Proxy:
@@ -994,16 +983,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     h2_emit_status(d, stream_id, 400);
                     return;
                 }
-                if (!h2_suspend_proxy(
-                        d,
-                        stream_id,
-                        config,
-                        route,
-                        route->upstream_id,
-                        false,
-                        nullptr,
-                        synth,
-                        kSynthLen))
+                if (!h2_suspend_proxy(d,
+                                      stream_id,
+                                      config,
+                                      route,
+                                      route->upstream_id,
+                                      false,
+                                      nullptr,
+                                      synth,
+                                      kSynthLen))
                     h2_emit_status(d, stream_id, 503);  // a stream is already suspended
             }
             return;
@@ -1064,9 +1052,16 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 [[nodiscard]] bool h2_arm_async_timer(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
+    auto* parked_ctx = h2->async_jit_ctx();
+    // Other streams in the same decoded batch may have reused the connection
+    // scratch context after this stream was parked. Release any lazy body
+    // buffer they acquired before replacing the scratch owner with the parked
+    // frame; otherwise that allocation becomes unreachable.
+    if (conn.handler_ctx != nullptr && conn.handler_ctx != parked_ctx)
+        rut_helper_resp_release_body_storage(conn.handler_ctx);
     conn.pending_handler_fn = h2->async_fn;
     conn.handler_state = h2->async_state;
-    conn.handler_ctx = h2->async_jit_ctx();
+    conn.handler_ctx = parked_ctx;
     conn.pending_yield_kind = jit::YieldKind::Timer;
     conn.transition_to_exec_handler_wait();
     return loop->schedule_yield_timer(conn, h2->async_timer_ms);
@@ -1085,8 +1080,7 @@ template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
     h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
-        if (conn.h2->async_apply_response_mutations)
-            conn.handler_ctx = conn.h2->async_jit_ctx();
+        if (conn.h2->async_apply_response_mutations) conn.handler_ctx = conn.h2->async_jit_ctx();
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }

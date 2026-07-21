@@ -79,17 +79,32 @@ thread_local JsonResponseScratch t_json_response;
 // the two eagerly lowered arms of an if-expression). Capture each completed
 // document into distinct invocation-owned storage so a later JsonBuild cannot
 // overwrite an earlier Str view before the select chooses between them. The
+struct JsonCaptureChunk {
+    char* data = nullptr;
+    u32 capacity = 0;
+    u32 used = 0;
+    JsonCaptureChunk* next = nullptr;
+};
+
 struct JsonCaptureArena {
     // A reusable plan may be published at many sinks, and every eagerly
     // lowered conditional arm gets its own bounded document capture. The HIR
     // expression/local limits bound the total below this request-local cap.
     static constexpr u32 kMaxCapacity = 64 * 1024 * 1024;
-    char* data = nullptr;
-    u32 capacity = 0;
+    JsonCaptureChunk* head = nullptr;
+    JsonCaptureChunk* current = nullptr;
+    u32 total_capacity = 0;
     u32 used = 0;
     u32 last_capture_len = 0xffffffffu;
 
-    ~JsonCaptureArena() { free(data); }
+    ~JsonCaptureArena() {
+        while (head != nullptr) {
+            JsonCaptureChunk* next = head->next;
+            free(head->data);
+            free(head);
+            head = next;
+        }
+    }
 };
 thread_local JsonCaptureArena t_json_captures;
 
@@ -102,6 +117,40 @@ void json_append(const char* data, u32 len) {
     }
     if (len != 0) __builtin_memcpy(out.data + out.len, data, len);
     out.len += len;
+}
+
+bool valid_utf8(const char* data, u32 len) {
+    for (u32 i = 0; i < len;) {
+        const u8 lead = static_cast<u8>(data[i++]);
+        if (lead < 0x80) continue;
+
+        u32 continuation_count = 0;
+        u8 second_min = 0x80;
+        u8 second_max = 0xbf;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            continuation_count = 1;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            continuation_count = 2;
+            if (lead == 0xe0) second_min = 0xa0;  // Reject overlong encodings.
+            if (lead == 0xed) second_max = 0x9f;  // Reject UTF-16 surrogates.
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            continuation_count = 3;
+            if (lead == 0xf0) second_min = 0x90;  // Reject overlong encodings.
+            if (lead == 0xf4) second_max = 0x8f;  // Stay at or below U+10FFFF.
+        } else {
+            return false;
+        }
+
+        if (continuation_count > len - i) return false;
+        const u8 second = static_cast<u8>(data[i]);
+        if (second < second_min || second > second_max) return false;
+        for (u32 ci = 1; ci < continuation_count; ci++) {
+            const u8 continuation = static_cast<u8>(data[i + ci]);
+            if (continuation < 0x80 || continuation > 0xbf) return false;
+        }
+        i += continuation_count;
+    }
+    return true;
 }
 
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
@@ -149,6 +198,9 @@ void rut_helper_json_capture_reset() {
     // views live only for the current invocation, so rewinding is sufficient;
     // retaining the block avoids a 512 KiB malloc/free cycle on every JSON
     // request. JsonCaptureArena releases it when the worker thread exits.
+    for (JsonCaptureChunk* chunk = t_json_captures.head; chunk != nullptr; chunk = chunk->next)
+        chunk->used = 0;
+    t_json_captures.current = t_json_captures.head;
     t_json_captures.used = 0;
     t_json_captures.last_capture_len = 0xffffffffu;
 }
@@ -176,6 +228,10 @@ void rut_helper_json_append_raw(const char* data, u32 len) {
 void rut_helper_json_append_str(const char* data, u32 len) {
     static constexpr char kHex[] = "0123456789abcdef";
     if (data == nullptr && len != 0) {
+        t_json_response.ok = false;
+        return;
+    }
+    if (!valid_utf8(data, len)) {
         t_json_response.ok = false;
         return;
     }
@@ -254,23 +310,46 @@ const char* rut_helper_json_capture_data() {
         captures.last_capture_len = 0xffffffffu;
         return nullptr;
     }
-    const u32 required = captures.used + capture_size;
-    if (required > captures.capacity) {
-        u32 grown = captures.capacity == 0 ? 64 * 1024 : captures.capacity;
-        while (grown < required && grown < JsonCaptureArena::kMaxCapacity)
-            grown = grown > JsonCaptureArena::kMaxCapacity / 2
-                        ? JsonCaptureArena::kMaxCapacity
-                        : grown * 2;
-        auto* resized = static_cast<char*>(realloc(captures.data, grown));
-        if (resized == nullptr) {
+
+    while (captures.current != nullptr &&
+           capture_size > captures.current->capacity - captures.current->used)
+        captures.current = captures.current->next;
+    if (captures.current == nullptr) {
+        const u32 previous_capacity = captures.head == nullptr ? 0 : captures.total_capacity;
+        u32 chunk_capacity = previous_capacity == 0 ? 64 * 1024 : previous_capacity;
+        if (chunk_capacity > JsonCaptureArena::kMaxCapacity - captures.total_capacity)
+            chunk_capacity = JsonCaptureArena::kMaxCapacity - captures.total_capacity;
+        if (chunk_capacity < capture_size) {
             captures.last_capture_len = 0xffffffffu;
             return nullptr;
         }
-        captures.data = resized;
-        captures.capacity = grown;
+        auto* chunk = static_cast<JsonCaptureChunk*>(malloc(sizeof(JsonCaptureChunk)));
+        if (chunk == nullptr) {
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        chunk->data = static_cast<char*>(malloc(chunk_capacity));
+        if (chunk->data == nullptr) {
+            free(chunk);
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        chunk->capacity = chunk_capacity;
+        chunk->used = 0;
+        chunk->next = nullptr;
+        if (captures.head == nullptr) {
+            captures.head = chunk;
+        } else {
+            JsonCaptureChunk* tail = captures.head;
+            while (tail->next != nullptr) tail = tail->next;
+            tail->next = chunk;
+        }
+        captures.current = chunk;
+        captures.total_capacity += chunk_capacity;
     }
-    char* out = captures.data + captures.used;
+    char* out = captures.current->data + captures.current->used;
     if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
+    captures.current->used += capture_size;
     captures.used += capture_size;
     captures.last_capture_len = t_json_response.len;
     return out;

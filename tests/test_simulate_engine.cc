@@ -482,6 +482,27 @@ TEST(simulate_engine, harness_handler_execution_matches_timer_simulation) {
     rir.destroy();
 }
 
+TEST(simulate_engine, dynamic_json_serialization_failure_matches_production_500) {
+    const char* src = R"rut(
+route GET "/json" {
+    return 200, json({ value: req.header("X-Value").or("") })
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    static const char kRequest[] = "GET /json HTTP/1.1\r\nHost: x\r\nX-Value: \xc0\x80\r\n\r\n";
+    const auto result = simulate_one(engine, make_entry(kRequest, 500));
+
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
     const char* src =
         "route POST \"/upload\" { if req.body == \"payload\" { return 204 } else { return 400 } "
@@ -498,6 +519,27 @@ TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
         engine, make_entry("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n", 204));
     CHECK_EQ(result.verdict, Verdict::Unsupported);
     CHECK_EQ(result.actual_status, 0u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, buffered_forward_route_requires_captured_request_body) {
+    const char* src = R"rut(
+upstream api
+route POST "/upload" { return forward(api, buffered: true) }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    REQUIRE_EQ(engine.route_count, 1u);
+    CHECK(engine.routes[0].needs_req_body);
+
+    const auto result = simulate_one(
+        engine, make_entry("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n", 200));
+    CHECK_EQ(result.verdict, Verdict::Unsupported);
 
     engine.shutdown();
     rir.destroy();

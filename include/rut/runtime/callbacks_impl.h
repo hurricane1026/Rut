@@ -1880,8 +1880,7 @@ void handle_jit_outcome(Loop* loop,
             conn.pending_handler_fn = nullptr;
             conn.proxy_response_buffered =
                 outcome.kind == JitDispatchOutcome::Kind::ForwardBuffered;
-            if (conn.proxy_response_buffered &&
-                !snapshot_buffered_response_mutation_views(conn)) {
+            if (conn.proxy_response_buffered && !snapshot_buffered_response_mutation_views(conn)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
                 format_static_response(conn, 500, false);
@@ -2797,9 +2796,10 @@ void h2_proxy_finish(Loop* loop,
         for (u32 i = 0; i < effective_count; i++) {
             // Mutations run after the upstream filter, so filter their final
             // result too: a Set must not reintroduce an HTTP/2-prohibited field.
-            if (h2_drop_response_header(
-                    {effective[i].key_data, effective[i].key_len}))
-                continue;
+            const Str name{effective[i].key_data, effective[i].key_len};
+            const bool retained_head_content_length =
+                is_head && http_header_name_eq_ci(name.ptr, name.len, "content-length", 14);
+            if (!retained_head_content_length && h2_drop_response_header(name)) continue;
             hdrs[nhdrs].name = {effective[i].key_data, effective[i].key_len};
             hdrs[nhdrs].value = {effective[i].value_data, effective[i].value_len};
             nhdrs++;
@@ -4473,6 +4473,7 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
 template <typename Loop>
 void buffered_forward_fail(Loop* loop, Connection& conn, u16 status) {
     conn.proxy_response_buffered = false;
+    conn.buffered_proxy_send_in_progress = true;
     conn.upstream_keep_alive = false;
     conn.resp_status = status;
     conn.keep_alive = false;
@@ -4498,9 +4499,10 @@ void finish_buffered_forward(Loop* loop,
     for (u32 i = 0; i < resp.header_count; i++) {
         const Str name = resp.headers[i].name;
         // Preserve Content-Length on HEAD: it describes the corresponding GET
-        // representation even though this response carries no body.
+        // representation even though this response carries no body. A 304 may
+        // likewise carry the selected representation's length.
         if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
-            if (!is_head) continue;
+            if (!is_head && resp.status_code != 304) continue;
         } else if (h2_drop_response_header(name)) {
             continue;
         }
@@ -4538,10 +4540,12 @@ void finish_buffered_forward(Loop* loop,
     const u32 representation_body_len = body_len;
     const bool status_forbids_body =
         status < 200 || status == 204 || status == 205 || status == 304;
+    const bool status_omits_content_length = status < 200 || status == 204 || status == 205;
     const bool no_body = status_forbids_body || is_head;
     if (no_body) body_len = 0;
 
     conn.proxy_response_buffered = false;
+    conn.buffered_proxy_send_in_progress = true;
     conn.resp_status = status;
     format_response_with_body_and_headers(
         conn,
@@ -4552,11 +4556,11 @@ void finish_buffered_forward(Loop* loop,
         header_count,
         conn.keep_alive,
         false,
-        is_head && !response_ctx->response_body_mutation_set && !status_forbids_body,
+        (is_head || status == 304) && !response_ctx->response_body_mutation_set,
         is_head && response_ctx->response_body_mutation_set && !status_forbids_body
             ? representation_body_len
             : 0xffffffffu,
-        status_forbids_body);
+        status_omits_content_length);
     conn.resp_body_sent = conn.send_buf.len();
     conn.upstream_send_len = conn.upstream_recv_buf.len();
     conn.proxy_resp_started = true;
@@ -5045,12 +5049,34 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 template <typename Loop>
 void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    conn.clear_slots();
 
     if (ev.result < 0) {
         loop->close_conn(conn);
         return;
     }
+
+    const u32 send_len =
+        conn.buffered_proxy_send_in_progress ? conn.send_buf.len() : conn.upstream_send_len;
+    if (conn.send_progress > send_len ||
+        static_cast<u32>(ev.result) > send_len - conn.send_progress) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.send_progress += static_cast<u32>(ev.result);
+    if (conn.send_progress < send_len) {
+        if (ev.result == 0) {
+            loop->close_conn(conn);
+            return;
+        }
+        const u8* source = conn.buffered_proxy_send_in_progress ? conn.send_buf.data()
+                                                                : conn.upstream_recv_buf.data();
+        conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+        client_send(loop, conn, source + conn.send_progress, send_len - conn.send_progress);
+        return;
+    }
+    conn.send_progress = 0;
+    conn.buffered_proxy_send_in_progress = false;
+    conn.clear_slots();
 
     // One-shot proxy response complete (header-only / small Content-Length that
     // finished in the first read). Release the backend concurrency slot promptly

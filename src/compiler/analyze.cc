@@ -577,8 +577,7 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
         case HirTypeKind::Tuple:
             for (u32 i = 0; i < shape.tuple_len; i++) {
                 if (shape.tuple_elem_shape_indices[i] >= mod.type_shapes.len ||
-                    mod.type_shapes[shape.tuple_elem_shape_indices[i]].type ==
-                        HirTypeKind::Tuple)
+                    mod.type_shapes[shape.tuple_elem_shape_indices[i]].type == HirTypeKind::Tuple)
                     return false;
                 if (!hir_type_shape_has_runtime_carrier_impl(mod,
                                                              shape.tuple_elem_shape_indices[i],
@@ -599,19 +598,18 @@ static bool hir_type_shape_contains_array(const HirModule& mod, u32 shape_index,
     if (shape.type == HirTypeKind::Array) return true;
     if (shape.type == HirTypeKind::Tuple) {
         for (u32 i = 0; i < shape.tuple_len; i++)
-            if (hir_type_shape_contains_array(
-                    mod, shape.tuple_elem_shape_indices[i], depth + 1))
+            if (hir_type_shape_contains_array(mod, shape.tuple_elem_shape_indices[i], depth + 1))
                 return true;
     } else if (shape.type == HirTypeKind::Struct && shape.struct_index < mod.structs.len) {
         const auto& st = mod.structs[shape.struct_index];
         for (u32 i = 0; i < st.fields.len; i++)
-            if (hir_type_shape_contains_array(mod, st.fields[i].shape_index, depth + 1)) return true;
+            if (hir_type_shape_contains_array(mod, st.fields[i].shape_index, depth + 1))
+                return true;
     } else if (shape.type == HirTypeKind::Variant && shape.variant_index < mod.variants.len) {
         const auto& variant = mod.variants[shape.variant_index];
         for (u32 i = 0; i < variant.cases.len; i++)
             if (variant.cases[i].has_payload &&
-                hir_type_shape_contains_array(
-                    mod, variant.cases[i].payload_shape_index, depth + 1))
+                hir_type_shape_contains_array(mod, variant.cases[i].payload_shape_index, depth + 1))
                 return true;
     }
     return false;
@@ -3615,10 +3613,8 @@ static FrontendResult<void> adapt_array_carriers_to_expected_shape(HirExpr* expr
     }
     if (expr->type != HirTypeKind::Array || expr->kind != HirExprKind::ArrayLit) return {};
     for (u32 i = 0; i < expr->args.len; i++) {
-        auto adapted = adapt_array_carriers_to_expected_shape(expr->args[i],
-                                                               mod,
-                                                               expected.array_elem_shape_index,
-                                                               expr->args[i]->span);
+        auto adapted = adapt_array_carriers_to_expected_shape(
+            expr->args[i], mod, expected.array_elem_shape_index, expr->args[i]->span);
         if (!adapted) return core::make_unexpected(adapted.error());
     }
     expr->shape_index = expected_shape_index;
@@ -3660,13 +3656,8 @@ static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
     if (!hir_type_shape_has_runtime_carrier(mod, elem_shape_index))
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto elem = analyze_expr_with_expected_array_shape(*expr.args[i],
-                                                           route,
-                                                           mod,
-                                                           locals,
-                                                           local_count,
-                                                           binding,
-                                                           elem_shape_index);
+        auto elem = analyze_expr_with_expected_array_shape(
+            *expr.args[i], route, mod, locals, local_count, binding, elem_shape_index);
         if (!elem) return core::make_unexpected(elem.error());
         HirExpr expected_elem{};
         const auto& shape = mod.type_shapes[elem_shape_index];
@@ -3864,10 +3855,9 @@ static FrontendResult<HirExpr> analyze_empty_array_lit_with_declared_type(const 
     if (declared.value() != HirTypeKind::Array || array_elem_shape_index >= mod.type_shapes.len)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
     if (!hir_type_shape_has_runtime_carrier(mod, array_elem_shape_index))
-        return frontend_error(
-            FrontendError::UnsupportedSyntax,
-            stmt.span,
-            lit_str("array element type does not have a runtime carrier"));
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("array element type does not have a runtime carrier"));
     auto declared_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                 declared.value(),
                                                 0xffffffffu,
@@ -3951,7 +3941,8 @@ static FrontendResult<void> build_reusable_json_plan(
     const HirLocal* locals,
     u32 local_count,
     const MatchPayloadBinding* binding,
-    u32 depth = 0);
+    u32 depth = 0,
+    bool* earlier_response_read = nullptr);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
 static bool hir_expr_reads_response_field(const HirExpr& expr);
 static bool is_response_effect(HirExprKind kind);
@@ -5903,8 +5894,7 @@ static FrontendResult<void> instantiate_function_response_effects(
             if (!is_response_effect(fn.exprs[later].kind) ||
                 fn.exprs[later].span.start <= fn.exprs[ei].span.start)
                 continue;
-            if (hir_expr_reads_response_field_before(fn.exprs[later],
-                                                     fn.exprs[ei].span.start))
+            if (hir_expr_reads_response_field_before(fn.exprs[later], fn.exprs[ei].span.start))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     call_span,
@@ -5928,6 +5918,15 @@ static FrontendResult<void> instantiate_function_response_effects(
             call_span,
             lit_str("response-mutating helpers cannot follow a response field read"));
     if (!fn.owns_response_builder) {
+        u32 response_builder_count = 0;
+        for (u32 li = 0; li < route->locals.len; li++)
+            response_builder_count += route->locals[li].init.kind == HirExprKind::ResponseInit;
+        if (response_builder_count != 1)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                call_span,
+                lit_str("response-mutating helpers require exactly one Response builder in the "
+                        "route"));
         for (u32 pi = 0; pi < fn.params.len && pi < arg_count; pi++) {
             if (fn.params[pi].type != HirTypeKind::Response ||
                 args[pi].kind != HirExprKind::LocalRef)
@@ -5951,8 +5950,7 @@ static FrontendResult<void> instantiate_function_response_effects(
         if (!effect) return core::make_unexpected(effect.error());
         HirLocal carrier{};
         carrier.span = call_span;
-        if (fn.owns_response_builder)
-            carrier.name = lit_str("$helper_owned_response_effect");
+        if (fn.owns_response_builder) carrier.name = lit_str("$helper_owned_response_effect");
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         carrier.type = effect->type;
         carrier.init = effect.value();
@@ -7515,7 +7513,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::Assign) {
-        if (route == nullptr || !route->response_assignment_stmt_ok)
+        if (route == nullptr || !route->allow_respond_effects)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("Response assignments are only supported in unconditional effect "
+                        "positions"));
+        if (!route->response_assignment_stmt_ok)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 expr.span,
@@ -7561,10 +7565,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (set_body && route->waits.len != 0 &&
             hir_expr_reads_wait_result_with_locals(
                 value.value(), route->locals.data, route->locals.len))
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                expr.rhs->span,
-                lit_str("json cannot capture wait-result state after a wait"));
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("json cannot capture wait-result state after a wait"));
         if (set_status && value->kind == HirExprKind::IntLit &&
             (value->int_value < 100 || value->int_value > 599))
             return frontend_error(FrontendError::InvalidStatusCode, expr.rhs->span);
@@ -7665,26 +7668,17 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     const u32 saved_local_count = route->locals.len;
                     auto field_value = [&]() -> FrontendResult<HirExpr> {
                         const auto& value_ast = *expr.field_inits[fi].value;
-                        if (value_ast.kind == AstExprKind::ArrayLit && value_ast.args.len == 0 &&
+                        if (value_ast.kind == AstExprKind::ArrayLit &&
                             field_decl.type == HirTypeKind::Array &&
                             field_decl.shape_index < mod.type_shapes.len &&
-                            mod.type_shapes[field_decl.shape_index].array_elem_shape_index <
-                                mod.type_shapes.len &&
-                            mod.type_shapes[mod.type_shapes[field_decl.shape_index]
-                                                .array_elem_shape_index]
-                                .is_concrete &&
-                            hir_type_shape_has_runtime_carrier(
-                                mod,
-                                mod.type_shapes[field_decl.shape_index]
-                                    .array_elem_shape_index)) {
-                            HirExpr empty{};
-                            empty.kind = HirExprKind::ArrayLit;
-                            empty.type = HirTypeKind::Array;
-                            empty.shape_index = field_decl.shape_index;
-                            empty.array_len = 0;
-                            empty.span = value_ast.span;
-                            return empty;
-                        }
+                            mod.type_shapes[field_decl.shape_index].is_concrete)
+                            return analyze_expr_with_expected_array_shape(value_ast,
+                                                                          route,
+                                                                          mod,
+                                                                          locals,
+                                                                          local_count,
+                                                                          binding,
+                                                                          field_decl.shape_index);
                         return analyze_expr_impl(
                             value_ast, route, mod, locals, local_count, binding, true);
                     }();
@@ -7696,10 +7690,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               expr.field_inits[fi].value->span);
                     if (field_decl.type == HirTypeKind::Array) {
-                        auto adapted =
-                            adapt_str_list_to_array_carrier(&field_value.value(),
-                                                            const_cast<HirModule*>(&mod),
-                                                            expr.field_inits[fi].value->span);
+                        auto adapted = adapt_array_carriers_to_expected_shape(
+                            &field_value.value(),
+                            const_cast<HirModule*>(&mod),
+                            field_decl.shape_index,
+                            expr.field_inits[fi].value->span);
                         if (!adapted) return core::make_unexpected(adapted.error());
                     }
                     bool bound = false;
@@ -7796,26 +7791,18 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             const u32 locals_before_field = route->locals.len;
             auto field_value = [&]() -> FrontendResult<HirExpr> {
                 const auto& value_ast = *expr.field_inits[fi].value;
-                if (value_ast.kind == AstExprKind::ArrayLit && value_ast.args.len == 0 &&
+                if (value_ast.kind == AstExprKind::ArrayLit &&
                     field_decl.type == HirTypeKind::Array &&
                     field_decl.shape_index < mod.type_shapes.len &&
-                    mod.type_shapes[field_decl.shape_index].array_elem_shape_index <
-                        mod.type_shapes.len &&
-                    mod.type_shapes[mod.type_shapes[field_decl.shape_index].array_elem_shape_index]
-                        .is_concrete &&
-                    hir_type_shape_has_runtime_carrier(
-                        mod,
-                        mod.type_shapes[field_decl.shape_index].array_elem_shape_index)) {
-                    HirExpr empty{};
-                    empty.kind = HirExprKind::ArrayLit;
-                    empty.type = HirTypeKind::Array;
-                    empty.shape_index = field_decl.shape_index;
-                    empty.array_len = 0;
-                    empty.span = value_ast.span;
-                    return empty;
-                }
-                return analyze_expr_impl(
-                    value_ast, route, mod, locals, local_count, binding, true);
+                    mod.type_shapes[field_decl.shape_index].is_concrete)
+                    return analyze_expr_with_expected_array_shape(value_ast,
+                                                                  route,
+                                                                  mod,
+                                                                  locals,
+                                                                  local_count,
+                                                                  binding,
+                                                                  field_decl.shape_index);
+                return analyze_expr_impl(value_ast, route, mod, locals, local_count, binding, true);
             }();
             if (!field_value) return core::make_unexpected(field_value.error());
             if (earlier_field_reads_response) {
@@ -7833,9 +7820,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
             if (field_decl.type == HirTypeKind::Array) {
-                auto adapted = adapt_str_list_to_array_carrier(&field_value.value(),
-                                                               const_cast<HirModule*>(&mod),
-                                                               expr.field_inits[fi].value->span);
+                auto adapted =
+                    adapt_array_carriers_to_expected_shape(&field_value.value(),
+                                                           const_cast<HirModule*>(&mod),
+                                                           field_decl.shape_index,
+                                                           expr.field_inits[fi].value->span);
                 if (!adapted) return core::make_unexpected(adapted.error());
             }
             const auto expected = make_expected_type_expr(field_decl.type,
@@ -9634,23 +9623,13 @@ static u32 count_normalized_local_refs(const HirExpr& expr,
     }
     u32 count = 0;
     if (expr.lhs != nullptr) {
-        count += count_normalized_local_refs(*expr.lhs,
-                                             target_index,
-                                             locals,
-                                             local_count,
-                                             param_count,
-                                             visiting,
-                                             limit - count);
+        count += count_normalized_local_refs(
+            *expr.lhs, target_index, locals, local_count, param_count, visiting, limit - count);
         if (count >= limit) return count;
     }
     if (expr.rhs != nullptr) {
-        count += count_normalized_local_refs(*expr.rhs,
-                                             target_index,
-                                             locals,
-                                             local_count,
-                                             param_count,
-                                             visiting,
-                                             limit - count);
+        count += count_normalized_local_refs(
+            *expr.rhs, target_index, locals, local_count, param_count, visiting, limit - count);
         if (count >= limit) return count;
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
@@ -9666,13 +9645,8 @@ static u32 count_normalized_local_refs(const HirExpr& expr,
     }
     for (u32 i = 0; i < expr.args.len; i++) {
         if (expr.args[i] == nullptr) continue;
-        count += count_normalized_local_refs(*expr.args[i],
-                                             target_index,
-                                             locals,
-                                             local_count,
-                                             param_count,
-                                             visiting,
-                                             limit - count);
+        count += count_normalized_local_refs(
+            *expr.args[i], target_index, locals, local_count, param_count, visiting, limit - count);
         if (count >= limit) return count;
     }
     return count;
@@ -10509,11 +10483,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         [&](u32 param_index, HirExpr& analyzed_arg, Span span) -> FrontendResult<void> {
         if (fn.params[param_index].type == HirTypeKind::Array) {
             const u32 expected_elem_shape_index = fn.params[param_index].array_elem_shape_index;
-            auto adapted = adapt_array_carriers_to_expected_shape(
-                &analyzed_arg,
-                const_cast<HirModule*>(&mod),
-                fn.params[param_index].shape_index,
-                span);
+            auto adapted =
+                adapt_array_carriers_to_expected_shape(&analyzed_arg,
+                                                       const_cast<HirModule*>(&mod),
+                                                       fn.params[param_index].shape_index,
+                                                       span);
             if (!adapted) return core::make_unexpected(adapted.error());
             if (analyzed_arg.type == HirTypeKind::StrList &&
                 expected_elem_shape_index < mod.type_shapes.len) {
@@ -10897,12 +10871,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                    fn.params[param_index].shape_index < mod.type_shapes.len &&
                    mod.type_shapes[fn.params[param_index].shape_index].is_concrete) {
             auto arg = analyze_expr_with_expected_array_shape(arg_expr,
-                                                               route,
-                                                               mod,
-                                                               locals,
-                                                               local_count,
-                                                               binding,
-                                                               fn.params[param_index].shape_index);
+                                                              route,
+                                                              mod,
+                                                              locals,
+                                                              local_count,
+                                                              binding,
+                                                              fn.params[param_index].shape_index);
             if (!arg) return core::make_unexpected(arg.error());
             analyzed_args[param_index] = arg.value();
         } else {
@@ -10915,11 +10889,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         bool appended_response_effect = false;
         for (u32 li = locals_before_arg; li < route->locals.len; li++) {
             const auto kind = route->locals[li].init.kind;
-            appended_response_effect |= kind == HirExprKind::RespSetHeader ||
-                                        kind == HirExprKind::RespAddHeader ||
-                                        kind == HirExprKind::RespRemoveHeader ||
-                                        kind == HirExprKind::RespSetStatus ||
-                                        kind == HirExprKind::RespSetBody;
+            appended_response_effect |=
+                kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                kind == HirExprKind::RespSetBody;
         }
         if (appended_response_effect) {
             for (u32 prior = 0; prior < param_index; prior++) {
@@ -10937,9 +10910,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
     for (u32 i = 0; i < effective_arg_count; i++) {
-        const bool needs_array_carrier = analyzed_args[i].type == HirTypeKind::Array;
-        const bool needs_json_arg_carrier = hir_expr_contains_json_build(fn.body) &&
-                                            count_function_param_refs(fn.body, i, 1) != 0;
+        const bool needs_array_carrier =
+            hir_type_shape_contains_array(mod, analyzed_args[i].shape_index);
+        const bool needs_json_arg_carrier =
+            hir_expr_contains_json_build(fn.body) && count_function_param_refs(fn.body, i, 1) != 0;
         const bool needs_reused_array_carrier =
             needs_array_carrier && function_param_is_reused(fn, i);
         if ((!needs_reused_array_carrier && !needs_json_arg_carrier) ||
@@ -11236,7 +11210,10 @@ static FrontendResult<void> build_reusable_json_plan(
     const HirLocal* locals,
     u32 local_count,
     const MatchPayloadBinding* binding,
-    u32 depth) {
+    u32 depth,
+    bool* earlier_response_read) {
+    bool local_earlier_response_read = false;
+    if (earlier_response_read == nullptr) earlier_response_read = &local_earlier_response_read;
     if (depth > 32)
         return frontend_error(FrontendError::TooManyItems, expr.span, kJsonLiteralDetail);
 
@@ -11275,7 +11252,8 @@ static FrontendResult<void> build_reusable_json_plan(
                                                   locals,
                                                   local_count,
                                                   binding,
-                                                  depth + 1);
+                                                  depth + 1,
+                                                  earlier_response_read);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -11296,7 +11274,8 @@ static FrontendResult<void> build_reusable_json_plan(
                                                   locals,
                                                   local_count,
                                                   binding,
-                                                  depth + 1);
+                                                  depth + 1,
+                                                  earlier_response_read);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "]", 1))
@@ -11304,8 +11283,19 @@ static FrontendResult<void> build_reusable_json_plan(
         return {};
     }
 
+    const u32 locals_before_value = route->locals.len;
     auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!value) return core::make_unexpected(value.error());
+    if (*earlier_response_read) {
+        for (u32 li = locals_before_value; li < route->locals.len; li++)
+            if (is_response_effect(route->locals[li].init.kind))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("a response-mutating JSON value cannot follow an earlier Response "
+                            "field read"));
+    }
+    *earlier_response_read |= hir_expr_reads_response_field(value.value());
     if (value->type == HirTypeKind::Struct && !value->may_nil && !value->may_error) {
         if (value->struct_index >= mod.structs.len)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -11354,7 +11344,8 @@ static FrontendResult<void> build_reusable_json_plan(
                                                   field_locals,
                                                   field_local_count,
                                                   binding,
-                                                  depth + 1);
+                                                  depth + 1,
+                                                  earlier_response_read);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -11496,7 +11487,8 @@ static FrontendResult<void> append_dynamic_json_value(
     if (value.type == HirTypeKind::Struct && !value.may_nil && !value.may_error) {
         if (value.struct_index >= mod.structs.len)
             return frontend_error(FrontendError::UnsupportedSyntax, span);
-        if (materialize_struct && value.kind != HirExprKind::LocalRef) {
+        if (materialize_struct && value.kind != HirExprKind::LocalRef &&
+            value.kind != HirExprKind::StructInit) {
             if (value_expr_indices.len >= HirTerminator::kMaxJsonMaterializedValues ||
                 route->exprs.len >= HirRoute::kMaxExprs)
                 return frontend_error(FrontendError::TooManyItems, span);
@@ -11518,9 +11510,24 @@ static FrontendResult<void> append_dynamic_json_value(
                 !append_json_quoted(segments.back(), decl.fields[i].name) ||
                 !append_json_bytes(segments.back(), ":", 1))
                 return frontend_error(FrontendError::TooManyItems, span);
-            auto field = project_json_struct_field(value, decl.fields[i], route, span);
-            if (!field) return core::make_unexpected(field.error());
-            auto child = append_dynamic_json_value(field.value(),
+            HirExpr field_value{};
+            if (value.kind == HirExprKind::StructInit) {
+                const HirExpr* initialized = nullptr;
+                for (u32 fi = 0; fi < value.field_inits.len; fi++) {
+                    if (value.field_inits[fi].name.eq(decl.fields[i].name)) {
+                        initialized = value.field_inits[fi].value;
+                        break;
+                    }
+                }
+                if (initialized == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+                field_value = *initialized;
+            } else {
+                auto field = project_json_struct_field(value, decl.fields[i], route, span);
+                if (!field) return core::make_unexpected(field.error());
+                field_value = field.value();
+            }
+            auto child = append_dynamic_json_value(field_value,
                                                    route,
                                                    mod,
                                                    segments,
@@ -11571,7 +11578,10 @@ static FrontendResult<void> build_dynamic_json_plan(
     FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
     FixedVec<u32, HirTerminator::kMaxJsonMaterializedValues>& value_expr_indices,
     const MatchPayloadBinding* binding,
-    u32 depth = 0) {
+    u32 depth = 0,
+    bool* earlier_response_read = nullptr) {
+    bool local_earlier_response_read = false;
+    if (earlier_response_read == nullptr) earlier_response_read = &local_earlier_response_read;
     if (depth > 32)
         return frontend_error(FrontendError::TooManyItems, expr.span, kJsonLiteralDetail);
 
@@ -11611,7 +11621,8 @@ static FrontendResult<void> build_dynamic_json_plan(
                                                  value_refs,
                                                  value_expr_indices,
                                                  binding,
-                                                 depth + 1);
+                                                 depth + 1,
+                                                 earlier_response_read);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -11633,7 +11644,8 @@ static FrontendResult<void> build_dynamic_json_plan(
                                                  value_refs,
                                                  value_expr_indices,
                                                  binding,
-                                                 depth + 1);
+                                                 depth + 1,
+                                                 earlier_response_read);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "]", 1))
@@ -11641,8 +11653,19 @@ static FrontendResult<void> build_dynamic_json_plan(
         return {};
     }
 
+    const u32 locals_before_value = route->locals.len;
     auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!value) return core::make_unexpected(value.error());
+    if (*earlier_response_read) {
+        for (u32 li = locals_before_value; li < route->locals.len; li++)
+            if (is_response_effect(route->locals[li].init.kind))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.span,
+                    lit_str("a response-mutating JSON value cannot follow an earlier Response "
+                            "field read"));
+    }
+    *earlier_response_read |= hir_expr_reads_response_field(value.value());
     return append_dynamic_json_value(value.value(),
                                      route,
                                      mod,
@@ -11657,9 +11680,9 @@ static FrontendResult<void> build_dynamic_json_plan(
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
                                                   HirRoute* route = nullptr,
-                                                  const MatchPayloadBinding* binding = nullptr,
                                                   const HirLocal* locals = nullptr,
-                                                  u32 local_count = 0) {
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -11931,7 +11954,7 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod, route, nullptr, locals, local_count);
+        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count);
         if (!term) return core::make_unexpected(term.error());
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
@@ -12330,15 +12353,17 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 local.name = inner.name;
                 local.ref_index =
                     next_local_ref_index(route, scoped_locals.data, scoped_locals.len);
-                auto init = inner.has_type && inner.expr.kind == AstExprKind::ArrayLit &&
-                                    inner.expr.args.len == 0
-                                ? analyze_empty_array_lit_with_declared_type(inner, mod)
-                                : analyze_expr(inner.expr,
-                                               route,
-                                               mod,
-                                               scoped_locals.data,
-                                               scoped_locals.len,
-                                               binding);
+                auto init = [&]() -> FrontendResult<HirExpr> {
+                    if (inner.has_type && inner.expr.kind == AstExprKind::ArrayLit &&
+                        inner.expr.args.len == 0)
+                        return analyze_empty_array_lit_with_declared_type(inner, mod);
+                    const bool saved_allow_response_effects = route->allow_response_effects;
+                    route->allow_response_effects = false;
+                    auto analyzed = analyze_expr(
+                        inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
+                    route->allow_response_effects = saved_allow_response_effects;
+                    return analyzed;
+                }();
                 if (!init) return core::make_unexpected(init.error());
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
@@ -12416,9 +12441,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                         auto fail_term = analyze_term(*inner.else_stmt,
                                                       mod,
                                                       route,
-                                                      binding,
                                                       scoped_locals.data,
-                                                      scoped_locals.len);
+                                                      scoped_locals.len,
+                                                      binding);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
@@ -12559,9 +12584,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod, route, binding, locals, local_count);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod, route, binding, locals, local_count);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();
@@ -12569,7 +12594,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
 
     arm->body_kind = HirMatchArm::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod, route, binding, locals, local_count);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     arm->direct_term = term.value();
     return {};
@@ -12607,15 +12632,17 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 if (!route->locals.push(reserved_local))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 const u32 scoped_carrier_start = route->locals.len;
-                auto init = inner.has_type && inner.expr.kind == AstExprKind::ArrayLit &&
-                                    inner.expr.args.len == 0
-                                ? analyze_empty_array_lit_with_declared_type(inner, mod)
-                                : analyze_expr(inner.expr,
-                                               route,
-                                               mod,
-                                               scoped_locals.data,
-                                               scoped_locals.len,
-                                               binding);
+                auto init = [&]() -> FrontendResult<HirExpr> {
+                    if (inner.has_type && inner.expr.kind == AstExprKind::ArrayLit &&
+                        inner.expr.args.len == 0)
+                        return analyze_empty_array_lit_with_declared_type(inner, mod);
+                    const bool saved_allow_response_effects = route->allow_response_effects;
+                    route->allow_response_effects = false;
+                    auto analyzed = analyze_expr(
+                        inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
+                    route->allow_response_effects = saved_allow_response_effects;
+                    return analyzed;
+                }();
                 if (!init) return core::make_unexpected(init.error());
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());
@@ -12688,16 +12715,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod, route, binding, locals, local_count);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod, route, binding, locals, local_count);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         body->then_term = then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod, route, binding, locals, local_count);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
@@ -12745,8 +12772,8 @@ static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
         hir_expr_reads_wait_result_with_locals(*expr.rhs, locals, local_count, depth + 1))
         return true;
     for (u32 i = 0; i < expr.args.len; i++)
-        if (expr.args[i] != nullptr && hir_expr_reads_wait_result_with_locals(
-                                           *expr.args[i], locals, local_count, depth + 1))
+        if (expr.args[i] != nullptr &&
+            hir_expr_reads_wait_result_with_locals(*expr.args[i], locals, local_count, depth + 1))
             return true;
     for (u32 i = 0; i < expr.field_inits.len; i++)
         if (expr.field_inits[i].value != nullptr &&
@@ -12826,8 +12853,7 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
     for (u32 ai = 0; ai < control.match_arms.len; ai++) {
         const auto& arm = control.match_arms[ai];
         if (hir_expr_conditionally_reads_response_body(arm.pattern) ||
-            (arm.has_arm_guard &&
-             hir_expr_conditionally_reads_response_body(arm.arm_guard)) ||
+            (arm.has_arm_guard && hir_expr_conditionally_reads_response_body(arm.arm_guard)) ||
             (arm.body_kind == HirMatchArm::BodyKind::If &&
              hir_expr_conditionally_reads_response_body(arm.cond)))
             return true;
@@ -12886,16 +12912,14 @@ static bool route_reads_response_field(const HirRoute& route) {
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
         if (hir_for_loop_reads_response_field(route.for_loops[fi])) return true;
     const auto& control = route.control;
-    if (control.kind == HirControlKind::If)
-        return hir_expr_reads_response_field(control.cond);
+    if (control.kind == HirControlKind::If) return hir_expr_reads_response_field(control.cond);
     if (control.kind != HirControlKind::Match) return false;
     if (hir_expr_reads_response_field(control.match_expr)) return true;
     for (u32 ai = 0; ai < control.match_arms.len; ai++) {
         const auto& arm = control.match_arms[ai];
         if (hir_expr_reads_response_field(arm.pattern) ||
             (arm.has_arm_guard && hir_expr_reads_response_field(arm.arm_guard)) ||
-            (arm.body_kind == HirMatchArm::BodyKind::If &&
-             hir_expr_reads_response_field(arm.cond)))
+            (arm.body_kind == HirMatchArm::BodyKind::If && hir_expr_reads_response_field(arm.cond)))
             return true;
         for (u32 gi = 0; gi < arm.guards.len; gi++)
             if (hir_expr_reads_response_field(arm.guards[gi].cond) ||
@@ -13025,10 +13049,10 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
             auto then_term =
-                analyze_term(*stmt.then_stmt, mod, route, binding, locals, local_count);
+                analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
             auto else_term =
-                analyze_term(*stmt.else_stmt, mod, route, binding, locals, local_count);
+                analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
@@ -13847,7 +13871,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod, route, binding, route->locals.data, route->locals.len);
+    auto term = analyze_term(stmt, mod, route, route->locals.data, route->locals.len, binding);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
     return {};
@@ -14009,52 +14033,50 @@ static FrontendResult<void> merge_imported_functions(
                 return frontend_error(FrontendError::UnsupportedSyntax, span);
             const auto& source_variant = source.variants[variant_index];
             if (source_variant.template_variant_index == 0xffffffffu) {
-                variant_index = find_variant_index(
-                    *mod, imported_visible_name(source, source_variant.name));
+                variant_index =
+                    find_variant_index(*mod, imported_visible_name(source, source_variant.name));
                 if (variant_index >= mod->variants.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, span);
             } else {
-                const auto& source_template = source.variants[source_variant.template_variant_index];
-                const u32 target_template = find_variant_index(
-                    *mod, imported_visible_name(source, source_template.name));
+                const auto& source_template =
+                    source.variants[source_variant.template_variant_index];
+                const u32 target_template =
+                    find_variant_index(*mod, imported_visible_name(source, source_template.name));
                 if (target_template >= mod->variants.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, span);
                 GenericBinding bindings[HirVariant::kMaxTypeParams]{};
                 for (u32 i = 0; i < source_variant.instance_type_arg_count; i++) {
-                    auto mapped = self(
-                        self, source, source_variant.instance_shape_indices[i], span);
+                    auto mapped =
+                        self(self, source, source_variant.instance_shape_indices[i], span);
                     if (!mapped) return core::make_unexpected(mapped.error());
                     const auto& mapped_shape = mod->type_shapes[mapped.value()];
                     HirTypeKind tuple_types[kMaxTupleSlots]{};
                     u32 tuple_variants[kMaxTupleSlots]{};
                     u32 tuple_structs[kMaxTupleSlots]{};
                     for (u32 ti = 0; ti < mapped_shape.tuple_len; ti++) {
-                        const auto& elem = mod->type_shapes[mapped_shape.tuple_elem_shape_indices[ti]];
+                        const auto& elem =
+                            mod->type_shapes[mapped_shape.tuple_elem_shape_indices[ti]];
                         tuple_types[ti] = elem.type;
                         tuple_variants[ti] = elem.variant_index;
-                        tuple_structs[ti] = elem.type == HirTypeKind::Generic
-                                                ? elem.generic_index
-                                                : elem.struct_index;
+                        tuple_structs[ti] = elem.type == HirTypeKind::Generic ? elem.generic_index
+                                                                              : elem.struct_index;
                     }
                     auto filled = fill_bound_binding_from_type_metadata(&bindings[i],
-                                                                         mod,
-                                                                         mapped_shape.type,
-                                                                         mapped_shape.generic_index,
-                                                                         mapped_shape.variant_index,
-                                                                         mapped_shape.struct_index,
-                                                                         mapped_shape.tuple_len,
-                                                                         tuple_types,
-                                                                         tuple_variants,
-                                                                         tuple_structs,
-                                                                         mapped.value(),
-                                                                         span);
+                                                                        mod,
+                                                                        mapped_shape.type,
+                                                                        mapped_shape.generic_index,
+                                                                        mapped_shape.variant_index,
+                                                                        mapped_shape.struct_index,
+                                                                        mapped_shape.tuple_len,
+                                                                        tuple_types,
+                                                                        tuple_variants,
+                                                                        tuple_structs,
+                                                                        mapped.value(),
+                                                                        span);
                     if (!filled) return core::make_unexpected(filled.error());
                 }
-                auto concrete = instantiate_variant(mod,
-                                                    target_template,
-                                                    bindings,
-                                                    source_variant.instance_type_arg_count,
-                                                    span);
+                auto concrete = instantiate_variant(
+                    mod, target_template, bindings, source_variant.instance_type_arg_count, span);
                 if (!concrete) return core::make_unexpected(concrete.error());
                 variant_index = concrete.value();
             }
@@ -14064,14 +14086,14 @@ static FrontendResult<void> merge_imported_functions(
                 return frontend_error(FrontendError::UnsupportedSyntax, span);
             const auto& source_struct = source.structs[struct_index];
             if (source_struct.template_struct_index == 0xffffffffu) {
-                struct_index = find_struct_index(
-                    *mod, imported_visible_name(source, source_struct.name));
+                struct_index =
+                    find_struct_index(*mod, imported_visible_name(source, source_struct.name));
                 if (struct_index >= mod->structs.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, span);
             } else {
                 const auto& source_template = source.structs[source_struct.template_struct_index];
-                const u32 target_template = find_struct_index(
-                    *mod, imported_visible_name(source, source_template.name));
+                const u32 target_template =
+                    find_struct_index(*mod, imported_visible_name(source, source_template.name));
                 if (target_template >= mod->structs.len)
                     return frontend_error(FrontendError::UnsupportedSyntax, span);
                 GenericBinding bindings[HirStruct::kMaxTypeParams]{};
@@ -14083,32 +14105,29 @@ static FrontendResult<void> merge_imported_functions(
                     u32 tuple_variants[kMaxTupleSlots]{};
                     u32 tuple_structs[kMaxTupleSlots]{};
                     for (u32 ti = 0; ti < mapped_shape.tuple_len; ti++) {
-                        const auto& elem = mod->type_shapes[mapped_shape.tuple_elem_shape_indices[ti]];
+                        const auto& elem =
+                            mod->type_shapes[mapped_shape.tuple_elem_shape_indices[ti]];
                         tuple_types[ti] = elem.type;
                         tuple_variants[ti] = elem.variant_index;
-                        tuple_structs[ti] = elem.type == HirTypeKind::Generic
-                                                ? elem.generic_index
-                                                : elem.struct_index;
+                        tuple_structs[ti] = elem.type == HirTypeKind::Generic ? elem.generic_index
+                                                                              : elem.struct_index;
                     }
                     auto filled = fill_bound_binding_from_type_metadata(&bindings[i],
-                                                                         mod,
-                                                                         mapped_shape.type,
-                                                                         mapped_shape.generic_index,
-                                                                         mapped_shape.variant_index,
-                                                                         mapped_shape.struct_index,
-                                                                         mapped_shape.tuple_len,
-                                                                         tuple_types,
-                                                                         tuple_variants,
-                                                                         tuple_structs,
-                                                                         mapped.value(),
-                                                                         span);
+                                                                        mod,
+                                                                        mapped_shape.type,
+                                                                        mapped_shape.generic_index,
+                                                                        mapped_shape.variant_index,
+                                                                        mapped_shape.struct_index,
+                                                                        mapped_shape.tuple_len,
+                                                                        tuple_types,
+                                                                        tuple_variants,
+                                                                        tuple_structs,
+                                                                        mapped.value(),
+                                                                        span);
                     if (!filled) return core::make_unexpected(filled.error());
                 }
-                auto concrete = instantiate_struct(mod,
-                                                   target_template,
-                                                   bindings,
-                                                   source_struct.instance_type_arg_count,
-                                                   span);
+                auto concrete = instantiate_struct(
+                    mod, target_template, bindings, source_struct.instance_type_arg_count, span);
                 if (!concrete) return core::make_unexpected(concrete.error());
                 struct_index = concrete.value();
             }
@@ -15457,11 +15476,11 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 
         route.control.kind = HirControlKind::If;
         route.control.cond = cond;
-        auto then_term = analyze_term(
-            *timer_arm->stmt, mod, &route, nullptr, route.locals.data, route.locals.len);
+        auto then_term =
+            analyze_term(*timer_arm->stmt, mod, &route, route.locals.data, route.locals.len);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(
-            *recv_arm->stmt, mod, &route, nullptr, route.locals.data, route.locals.len);
+        auto else_term =
+            analyze_term(*recv_arm->stmt, mod, &route, route.locals.data, route.locals.len);
         if (!else_term) return core::make_unexpected(else_term.error());
         route.control.then_term = then_term.value();
         route.control.else_term = else_term.value();
@@ -15777,7 +15796,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         lit_str("guard match inside static for-loop requires an error value"));
                 }
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
-                auto fail = analyze_term(*bstmt.else_stmt, mod);
+                auto fail = analyze_term(
+                    *bstmt.else_stmt, mod, route, route->locals.data, route->locals.len);
                 if (!fail) return core::make_unexpected(fail.error());
                 guard.fail_term = fail.value();
             } else {
@@ -15864,7 +15884,7 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
-            auto t = analyze_term(bstmt, mod);
+            auto t = analyze_term(bstmt, mod, route, route->locals.data, route->locals.len);
             if (!t) return core::make_unexpected(t.error());
             loop.body.term = t.value();
             loop.body.has_term = true;
@@ -15912,9 +15932,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bstmt.expr.span,
                     lit_str("static for-loop if condition must be a non-fallible bool"));
             body_if.cond = cond.value();
-            auto then_term = analyze_term(*bstmt.then_stmt, mod);
+            auto then_term =
+                analyze_term(*bstmt.then_stmt, mod, route, route->locals.data, route->locals.len);
             if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*bstmt.else_stmt, mod);
+            auto else_term =
+                analyze_term(*bstmt.else_stmt, mod, route, route->locals.data, route->locals.len);
             if (!else_term) return core::make_unexpected(else_term.error());
             body_if.then_term = then_term.value();
             body_if.else_term = else_term.value();
@@ -16182,16 +16204,25 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
-                            auto then_term = analyze_term(*inner_arm.stmt->then_stmt, mod);
+                            auto then_term = analyze_term(*inner_arm.stmt->then_stmt,
+                                                          mod,
+                                                          route,
+                                                          route->locals.data,
+                                                          route->locals.len);
                             if (!then_term) return core::make_unexpected(then_term.error());
-                            auto else_term = analyze_term(*inner_arm.stmt->else_stmt, mod);
+                            auto else_term = analyze_term(*inner_arm.stmt->else_stmt,
+                                                          mod,
+                                                          route,
+                                                          route->locals.data,
+                                                          route->locals.len);
                             if (!else_term) return core::make_unexpected(else_term.error());
                             arm.body_kind = HirForLoopMatchArm::BodyKind::If;
                             arm.cond = cond_expr.value();
                             arm.then_term = then_term.value();
                             arm.else_term = else_term.value();
                         } else if (is_ast_hir_terminator(*inner_arm.stmt)) {
-                            auto term = analyze_term(*inner_arm.stmt, mod);
+                            auto term = analyze_term(
+                                *inner_arm.stmt, mod, route, route->locals.data, route->locals.len);
                             if (!term) return core::make_unexpected(term.error());
                             arm.direct_term = term.value();
                         } else {
@@ -16344,6 +16375,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             local.name = inner.name;
                             local.ref_index = next_local_ref_index(
                                 route, arm_scoped_locals.data, arm_scoped_locals.len);
+                            if (local.ref_index >= HirRoute::kMaxLocals)
+                                return frontend_error(FrontendError::TooManyItems, inner.span);
+                            HirLocal reserved_local{};
+                            reserved_local.span = inner.span;
+                            reserved_local.ref_index = local.ref_index;
+                            const u32 local_storage_index = route->locals.len;
+                            if (!route->locals.push(reserved_local))
+                                return frontend_error(FrontendError::TooManyItems, inner.span);
+                            const u32 scoped_carrier_start = route->locals.len;
                             auto init = analyze_expr(inner.expr,
                                                      route,
                                                      mod,
@@ -16383,8 +16423,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             local.error_variant_index = init->error_variant_index;
                             local.shape_index = init->shape_index;
                             local.init = init.value();
+                            for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                                if (!arm.locals.push(route->locals[li]))
+                                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                                route->locals[li].name = {};
+                            }
                             if (!arm.locals.push(local))
                                 return frontend_error(FrontendError::TooManyItems, inner.span);
+                            HirLocal hidden_local = local;
+                            hidden_local.name = {};
+                            route->locals[local_storage_index] = hidden_local;
                             auto inserted = insert_scoped_local(arm_scoped_locals.data,
                                                                 arm_scoped_locals.len,
                                                                 HirRoute::kMaxLocals,
@@ -16440,7 +16488,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 }
                             } else {
                                 if (is_ast_hir_terminator(*inner.else_stmt)) {
-                                    auto fail = analyze_term(*inner.else_stmt, mod);
+                                    auto fail = analyze_term(*inner.else_stmt,
+                                                             mod,
+                                                             route,
+                                                             arm_scoped_locals.data,
+                                                             arm_scoped_locals.len,
+                                                             arm_binding_ptr);
                                     if (!fail) return core::make_unexpected(fail.error());
                                     guard.fail_term = fail.value();
                                 } else {
@@ -16709,16 +16762,31 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                     inner_ast_arm.stmt->expr.span,
                                     lit_str("static for-loop match-arm if condition must be a "
                                             "non-fallible bool"));
-                            auto then_term = analyze_term(*inner_ast_arm.stmt->then_stmt, mod);
+                            auto then_term = analyze_term(*inner_ast_arm.stmt->then_stmt,
+                                                          mod,
+                                                          route,
+                                                          arm_locals,
+                                                          arm_local_count,
+                                                          arm_binding_ptr);
                             if (!then_term) return core::make_unexpected(then_term.error());
-                            auto else_term = analyze_term(*inner_ast_arm.stmt->else_stmt, mod);
+                            auto else_term = analyze_term(*inner_ast_arm.stmt->else_stmt,
+                                                          mod,
+                                                          route,
+                                                          arm_locals,
+                                                          arm_local_count,
+                                                          arm_binding_ptr);
                             if (!else_term) return core::make_unexpected(else_term.error());
                             expanded.body_kind = HirForLoopMatchArm::BodyKind::If;
                             expanded.cond = cond.value();
                             expanded.then_term = then_term.value();
                             expanded.else_term = else_term.value();
                         } else if (is_ast_hir_terminator(*inner_ast_arm.stmt)) {
-                            auto term = analyze_term(*inner_ast_arm.stmt, mod);
+                            auto term = analyze_term(*inner_ast_arm.stmt,
+                                                     mod,
+                                                     route,
+                                                     arm_locals,
+                                                     arm_local_count,
+                                                     arm_binding_ptr);
                             if (!term) return core::make_unexpected(term.error());
                             expanded.body_kind = HirForLoopMatchArm::BodyKind::Direct;
                             expanded.direct_term = term.value();
@@ -16750,16 +16818,27 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             arm_stmt->expr.span,
                             lit_str("static for-loop match-arm if condition must be a "
                                     "non-fallible bool"));
-                    auto then_term = analyze_term(*arm_stmt->then_stmt, mod);
+                    auto then_term = analyze_term(*arm_stmt->then_stmt,
+                                                  mod,
+                                                  route,
+                                                  arm_locals,
+                                                  arm_local_count,
+                                                  arm_binding_ptr);
                     if (!then_term) return core::make_unexpected(then_term.error());
-                    auto else_term = analyze_term(*arm_stmt->else_stmt, mod);
+                    auto else_term = analyze_term(*arm_stmt->else_stmt,
+                                                  mod,
+                                                  route,
+                                                  arm_locals,
+                                                  arm_local_count,
+                                                  arm_binding_ptr);
                     if (!else_term) return core::make_unexpected(else_term.error());
                     arm.body_kind = HirForLoopMatchArm::BodyKind::If;
                     arm.cond = cond.value();
                     arm.then_term = then_term.value();
                     arm.else_term = else_term.value();
                 } else if (is_ast_hir_terminator(*arm_stmt)) {
-                    auto term = analyze_term(*arm_stmt, mod);
+                    auto term = analyze_term(
+                        *arm_stmt, mod, route, arm_locals, arm_local_count, arm_binding_ptr);
                     if (!term) return core::make_unexpected(term.error());
                     arm.direct_term = term.value();
                 } else {
@@ -18064,20 +18143,19 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 }
             }
             if (!field.is_error_type) {
-                auto field_shape = intern_hir_type_shape(&mod,
-                                                         field.type,
-                                                         field.generic_index,
-                                                         field.variant_index,
-                                                         field.struct_index,
-                                                         field.tuple_len,
-                                                         field.tuple_types,
-                                                         field.tuple_variant_indices,
-                                                         field.tuple_struct_indices,
-                                                         item.struct_decl.span,
-                                                         field_array_elem_shape_index,
-                                                         field.type == HirTypeKind::Tuple
-                                                             ? field_tuple_elem_shape_indices
-                                                             : nullptr);
+                auto field_shape = intern_hir_type_shape(
+                    &mod,
+                    field.type,
+                    field.generic_index,
+                    field.variant_index,
+                    field.struct_index,
+                    field.tuple_len,
+                    field.tuple_types,
+                    field.tuple_variant_indices,
+                    field.tuple_struct_indices,
+                    item.struct_decl.span,
+                    field_array_elem_shape_index,
+                    field.type == HirTypeKind::Tuple ? field_tuple_elem_shape_indices : nullptr);
                 if (!field_shape) return core::make_unexpected(field_shape.error());
                 field.shape_index = field_shape.value();
                 if (hir_type_shape_contains_json(mod, field.shape_index))
@@ -18670,9 +18748,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             patch_named_error_variant(&body.value(), error_variant_index, named_error_cases);
             patch_error_variant_refs(&body.value(), error_variant_index);
         }
-        if (fn.return_type == HirTypeKind::Array && body->type == HirTypeKind::StrList) {
-            auto adapted =
-                adapt_str_list_to_array_carrier(&body.value(), &mod, ast_func.body->span);
+        if (fn.return_type == HirTypeKind::Array) {
+            auto adapted = adapt_array_carriers_to_expected_shape(
+                &body.value(), &mod, fn.return_shape_index, ast_func.body->span);
             if (!adapted) return core::make_unexpected(adapted.error());
         }
         if (fn.return_type == HirTypeKind::Unknown) {
@@ -18802,8 +18880,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             const auto& local = scratch->locals[li];
             u32 refs = count_function_param_refs(body.value(), local.ref_index, 2);
             for (u32 gi = 0; refs < 2 && gi < scratch->guards.len; gi++)
-                refs += count_function_param_refs(
-                    scratch->guards[gi].cond, local.ref_index, 2 - refs);
+                refs +=
+                    count_function_param_refs(scratch->guards[gi].cond, local.ref_index, 2 - refs);
             if (local.type == HirTypeKind::Array && refs >= 2)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
@@ -20282,9 +20360,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             patch_named_error_variant(&body.value(), error_variant_index, named_error_cases);
             patch_error_variant_refs(&body.value(), error_variant_index);
         }
-        if (fn.return_type == HirTypeKind::Array && body->type == HirTypeKind::StrList) {
-            auto adapted =
-                adapt_str_list_to_array_carrier(&body.value(), &mod, item.func.body->span);
+        if (fn.return_type == HirTypeKind::Array) {
+            auto adapted = adapt_array_carriers_to_expected_shape(
+                &body.value(), &mod, fn.return_shape_index, item.func.body->span);
             if (!adapted) return core::make_unexpected(adapted.error());
         }
         if (fn.return_type == HirTypeKind::Unknown) {
@@ -20966,10 +21044,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             stmt.span,
                             lit_str("Response scalar assignments after a guard are not supported; "
                                     "move the assignment before the guard"));
+                    const bool saved_allow_respond_effects = route.allow_respond_effects;
+                    route.allow_respond_effects = true;
                     route.response_assignment_stmt_ok = true;
                     auto value = analyze_expr(
                         stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                     route.response_assignment_stmt_ok = false;
+                    route.allow_respond_effects = saved_allow_respond_effects;
                     if (!value) return core::make_unexpected(value.error());
                     if (value->kind != HirExprKind::RespSetStatus &&
                         value->kind != HirExprKind::RespSetBody)
@@ -21214,8 +21295,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         lit_str("Response builders cannot be copied or aliased in this slice"));
                 if (init->kind == HirExprKind::ResponseInit) {
                     for (u32 li = 0; li < route.locals.len; li++) {
-                        if (route.locals[li].name.eq(
-                                lit_str("$helper_owned_response_effect")))
+                        if (route.locals[li].name.eq(lit_str("$helper_owned_response_effect")))
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax,
                                 stmt.expr.span,
@@ -21304,12 +21384,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 } else {
                     if (is_ast_hir_terminator(*stmt.else_stmt)) {
-                        auto fail_term = analyze_term(*stmt.else_stmt,
-                                                      mod,
-                                                      &route,
-                                                      nullptr,
-                                                      route.locals.data,
-                                                      route.locals.len);
+                        auto fail_term = analyze_term(
+                            *stmt.else_stmt, mod, &route, route.locals.data, route.locals.len);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
