@@ -6937,6 +6937,50 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, response_scalar_assignment_after_guard_failure_read_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard req.http11 else {
+        if resp.status == 201 { return 400 } else { return 401 }
+    }
+    resp.status = 202
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
+                                    "move the assignment before the guard")));
+}
+
+TEST(frontend, response_body_reads_in_conditional_value_branches_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    let selected = choose(req.http11)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
 TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
     const char* src = R"rut(
 func rewrite() -> i32 {
