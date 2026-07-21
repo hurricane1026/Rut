@@ -33635,6 +33635,29 @@ route GET "/x" { let values = keep([req.queryAll("tag")]) return 200 }
     rir.destroy();
 }
 
+TEST(frontend, rejects_nested_tuple_array_elements_without_flat_carriers) {
+    const char* src = "route GET \"/x\" { let xs = [((1, 2), 3)] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, rejects_i64_variant_payloads_as_array_elements) {
+    const char* src = R"rut(
+variant Stamp { at(i64), none }
+route GET "/x" { let xs = [Stamp.at(time.nowMicros())] return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
