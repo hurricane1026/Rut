@@ -3334,10 +3334,9 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                                           local_count,
                                           term.json_body_local.span);
             if (!body) return core::make_unexpected(body.error());
-            if (!b.emit_resp_set_body(body.value(), {term.span.line, term.span.col}))
+            if (!b.emit_resp_publish_body(body.value(), {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
-            if (!b.emit_resp_commit_body({term.span.line, term.span.col}))
-                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;  // HandlerResult::kDynamicResponseBody
         } else if (term.has_dynamic_response_body) {
             constexpr u32 kJsonLocalCount =
                 MirFunction::kMaxLocals + MirTerminator::kMaxJsonMaterializedValues;
