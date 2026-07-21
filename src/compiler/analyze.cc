@@ -9175,9 +9175,15 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return tuple;
             }
             if (locals[i].type == HirTypeKind::Json) {
-                HirExpr json = locals[i].init;
-                json.span = expr.span;
-                return json;
+                // Reusable Json locals are materialized encoded documents.
+                // Refer to that carrier so later sinks do not reevaluate the
+                // plan (or its request/response reads) after intervening effects.
+                out.kind = HirExprKind::LocalRef;
+                out.type = HirTypeKind::Json;
+                out.local_index = locals[i].ref_index;
+                out.shape_index = locals[i].shape_index;
+                out.span = expr.span;
+                return out;
             }
             out.kind = HirExprKind::LocalRef;
             out.type = locals[i].type;
@@ -10617,10 +10623,12 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
     for (u32 i = 0; i < effective_arg_count; i++) {
         const bool needs_array_carrier = analyzed_args[i].type == HirTypeKind::Array;
-        const bool needs_json_struct_carrier = analyzed_args[i].type == HirTypeKind::Struct &&
-                                               hir_expr_contains_json_build(fn.body);
-        if ((!needs_array_carrier && !needs_json_struct_carrier) ||
-            analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i))
+        const bool needs_json_arg_carrier = hir_expr_contains_json_build(fn.body) &&
+                                            count_function_param_refs(fn.body, i, 1) != 0;
+        const bool needs_reused_array_carrier =
+            needs_array_carrier && function_param_is_reused(fn, i);
+        if ((!needs_reused_array_carrier && !needs_json_arg_carrier) ||
+            analyzed_args[i].kind == HirExprKind::LocalRef)
             continue;
         HirLocal carrier{};
         carrier.span = expr.args[i]->span;
