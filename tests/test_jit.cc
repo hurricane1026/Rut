@@ -2078,6 +2078,18 @@ TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) 
     CHECK(outcome.dynamic_response_body == nullptr);
 }
 
+TEST(jit, json_capture_arena_covers_every_route_expression) {
+    static char document[7 * 1024];
+    __builtin_memset(document, 'x', sizeof(document));
+    rut_helper_json_capture_reset();
+    for (u32 i = 0; i < 9; i++) {
+        rut_helper_json_reset();
+        rut_helper_json_append_raw(document, sizeof(document));
+        CHECK(rut_helper_json_capture_data() != nullptr);
+        CHECK_EQ(rut_helper_json_capture_len(), sizeof(document));
+    }
+}
+
 TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
     const auto src = R"rut(
 route GET "/api/users" {
