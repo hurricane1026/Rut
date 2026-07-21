@@ -3436,6 +3436,7 @@ static FrontendResult<HirExpr> analyze_expr(const AstExpr& expr,
                                             const HirLocal* locals,
                                             u32 local_count,
                                             const MatchPayloadBinding* binding);
+static bool hir_expr_reads_wait_result(const HirExpr& expr);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -9961,6 +9962,172 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     return term;
 }
 
+static void copy_json_value_metadata(HirLocal* local, const HirExpr& value) {
+    local->type = value.type;
+    local->generic_index = value.generic_index;
+    local->associated_name = value.associated_name;
+    local->generic_has_error_constraint = value.generic_has_error_constraint;
+    local->generic_has_eq_constraint = value.generic_has_eq_constraint;
+    local->generic_has_ord_constraint = value.generic_has_ord_constraint;
+    local->generic_protocol_index = value.generic_protocol_index;
+    local->generic_protocol_count = value.generic_protocol_count;
+    for (u32 i = 0; i < local->generic_protocol_count; i++)
+        local->generic_protocol_indices[i] = value.generic_protocol_indices[i];
+    local->may_nil = value.may_nil;
+    local->may_error = value.may_error;
+    local->variant_index = value.variant_index;
+    local->struct_index = value.struct_index;
+    local->tuple_len = value.tuple_len;
+    for (u32 i = 0; i < local->tuple_len; i++) {
+        local->tuple_types[i] = value.tuple_types[i];
+        local->tuple_variant_indices[i] = value.tuple_variant_indices[i];
+        local->tuple_struct_indices[i] = value.tuple_struct_indices[i];
+    }
+    local->shape_index = value.shape_index;
+    local->error_struct_index = value.error_struct_index;
+    local->error_variant_index = value.error_variant_index;
+}
+
+static HirExpr make_json_local_ref(const HirLocal& local, Span span) {
+    HirExpr out{};
+    out.kind = HirExprKind::LocalRef;
+    out.span = span;
+    out.local_index = local.ref_index;
+    out.type = local.type;
+    out.generic_index = local.generic_index;
+    out.associated_name = local.associated_name;
+    out.generic_has_error_constraint = local.generic_has_error_constraint;
+    out.generic_has_eq_constraint = local.generic_has_eq_constraint;
+    out.generic_has_ord_constraint = local.generic_has_ord_constraint;
+    out.generic_protocol_index = local.generic_protocol_index;
+    out.generic_protocol_count = local.generic_protocol_count;
+    for (u32 i = 0; i < out.generic_protocol_count; i++)
+        out.generic_protocol_indices[i] = local.generic_protocol_indices[i];
+    out.may_nil = local.may_nil;
+    out.may_error = local.may_error;
+    out.variant_index = local.variant_index;
+    out.struct_index = local.struct_index;
+    out.tuple_len = local.tuple_len;
+    for (u32 i = 0; i < out.tuple_len; i++) {
+        out.tuple_types[i] = local.tuple_types[i];
+        out.tuple_variant_indices[i] = local.tuple_variant_indices[i];
+        out.tuple_struct_indices[i] = local.tuple_struct_indices[i];
+    }
+    out.shape_index = local.shape_index;
+    out.error_struct_index = local.error_struct_index;
+    out.error_variant_index = local.error_variant_index;
+    return out;
+}
+
+static FrontendResult<HirExpr> project_json_struct_field(const HirExpr& base,
+                                                         const HirStruct::FieldDecl& field,
+                                                         HirRoute* route,
+                                                         Span span) {
+    HirExpr out{};
+    out.kind = HirExprKind::Field;
+    out.span = span;
+    out.type = field.type;
+    out.generic_index = field.generic_index;
+    out.generic_has_error_constraint = field.generic_has_error_constraint;
+    out.generic_has_eq_constraint = field.generic_has_eq_constraint;
+    out.generic_has_ord_constraint = field.generic_has_ord_constraint;
+    out.generic_protocol_index = field.generic_protocol_index;
+    out.generic_protocol_count = field.generic_protocol_count;
+    for (u32 i = 0; i < out.generic_protocol_count; i++)
+        out.generic_protocol_indices[i] = field.generic_protocol_indices[i];
+    out.variant_index = field.variant_index;
+    out.struct_index = field.struct_index;
+    out.shape_index = field.shape_index;
+    out.tuple_len = field.tuple_len;
+    for (u32 i = 0; i < out.tuple_len; i++) {
+        out.tuple_types[i] = field.tuple_types[i];
+        out.tuple_variant_indices[i] = field.tuple_variant_indices[i];
+        out.tuple_struct_indices[i] = field.tuple_struct_indices[i];
+    }
+    if (!route->exprs.push(base)) return frontend_error(FrontendError::TooManyItems, span);
+    out.lhs = &route->exprs[route->exprs.len - 1];
+    out.str_value = field.name;
+    return out;
+}
+
+static FrontendResult<void> append_dynamic_json_value(
+    HirExpr value,
+    HirRoute* route,
+    const HirModule& mod,
+    std::vector<std::string>& segments,
+    FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
+    Span span,
+    bool materialize_struct,
+    u32 depth) {
+    if (depth > 32) return frontend_error(FrontendError::TooManyItems, span, kJsonLiteralDetail);
+    if (route->waits.len != 0 && hir_expr_reads_wait_result(value))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("json cannot capture wait-result state after a wait"));
+
+    if (value.type == HirTypeKind::Struct && !value.may_nil && !value.may_error) {
+        if (value.struct_index >= mod.structs.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        if (materialize_struct && value.kind != HirExprKind::LocalRef) {
+            if (route->locals.len >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, span);
+            HirLocal local{};
+            local.span = span;
+            local.name = intern_generated_name("$json.struct." + std::to_string(route->locals.len));
+            local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+            if (local.ref_index >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, span);
+            copy_json_value_metadata(&local, value);
+            local.init = value;
+            if (!route->locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, span);
+            value = make_json_local_ref(local, span);
+        }
+
+        const auto& decl = mod.structs[value.struct_index];
+        if (!append_json_bytes(segments.back(), "{", 1))
+            return frontend_error(FrontendError::TooManyItems, span);
+        for (u32 i = 0; i < decl.fields.len; i++) {
+            if ((i != 0 && !append_json_bytes(segments.back(), ",", 1)) ||
+                !append_json_quoted(segments.back(), decl.fields[i].name) ||
+                !append_json_bytes(segments.back(), ":", 1))
+                return frontend_error(FrontendError::TooManyItems, span);
+            auto field = project_json_struct_field(value, decl.fields[i], route, span);
+            if (!field) return core::make_unexpected(field.error());
+            auto child = append_dynamic_json_value(
+                field.value(), route, mod, segments, value_refs, span, false, depth + 1);
+            if (!child) return child;
+        }
+        if (!append_json_bytes(segments.back(), "}", 1))
+            return frontend_error(FrontendError::TooManyItems, span);
+        return {};
+    }
+
+    if ((value.type != HirTypeKind::Bool && value.type != HirTypeKind::I32 &&
+         value.type != HirTypeKind::I64 && value.type != HirTypeKind::Str) ||
+        value.may_nil || value.may_error)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            span,
+            lit_str("runtime json values currently support non-optional bool/i32/i64/str only"));
+    if (value_refs.len >= HirTerminator::kMaxJsonDynamicValues ||
+        route->locals.len >= HirRoute::kMaxLocals)
+        return frontend_error(FrontendError::TooManyItems, span);
+
+    HirLocal local{};
+    local.span = span;
+    local.name = intern_generated_name("$json.response." + std::to_string(value_refs.len));
+    local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+    if (local.ref_index >= HirRoute::kMaxLocals)
+        return frontend_error(FrontendError::TooManyItems, span);
+    copy_json_value_metadata(&local, value);
+    local.init = value;
+    if (!route->locals.push(local) || !value_refs.push(local.ref_index))
+        return frontend_error(FrontendError::TooManyItems, span);
+    segments.emplace_back();
+    return {};
+}
+
 static FrontendResult<void> build_dynamic_json_plan(
     const AstExpr& expr,
     HirRoute* route,
@@ -10040,53 +10207,8 @@ static FrontendResult<void> build_dynamic_json_plan(
 
     auto value = analyze_expr(expr, route, mod, locals, local_count, binding);
     if (!value) return core::make_unexpected(value.error());
-    if (value->type == HirTypeKind::Struct && !value->may_nil && !value->may_error) {
-        if (value->struct_index >= mod.structs.len)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        const auto& decl = mod.structs[value->struct_index];
-        if (!append_json_bytes(segments.back(), "{", 1))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        for (u32 i = 0; i < decl.fields.len; i++) {
-            if ((i != 0 && !append_json_bytes(segments.back(), ",", 1)) ||
-                !append_json_quoted(segments.back(), decl.fields[i].name) ||
-                !append_json_bytes(segments.back(), ":", 1))
-                return frontend_error(FrontendError::TooManyItems, expr.span);
-            AstExpr field{};
-            field.kind = AstExprKind::Field;
-            field.span = expr.span;
-            field.lhs = const_cast<AstExpr*>(&expr);
-            field.name = decl.fields[i].name;
-            auto child =
-                build_dynamic_json_plan(field, route, mod, segments, value_refs, depth + 1);
-            if (!child) return child;
-        }
-        if (!append_json_bytes(segments.back(), "}", 1))
-            return frontend_error(FrontendError::TooManyItems, expr.span);
-        return {};
-    }
-    if ((value->type != HirTypeKind::Bool && value->type != HirTypeKind::I32 &&
-         value->type != HirTypeKind::I64 && value->type != HirTypeKind::Str) ||
-        value->may_nil || value->may_error)
-        return frontend_error(
-            FrontendError::UnsupportedSyntax,
-            expr.span,
-            lit_str("runtime json values currently support non-optional bool/i32/i64/str only"));
-    if (value_refs.len >= HirTerminator::kMaxJsonDynamicValues ||
-        route->locals.len >= HirRoute::kMaxLocals)
-        return frontend_error(FrontendError::TooManyItems, expr.span);
-
-    HirLocal local{};
-    local.span = expr.span;
-    local.name = intern_generated_name("$json.response." + std::to_string(value_refs.len));
-    local.ref_index = next_local_ref_index(route, locals, local_count);
-    local.type = value->type;
-    local.shape_index = value->shape_index;
-    local.defer_to_terminator = true;
-    local.init = value.value();
-    if (!route->locals.push(local) || !value_refs.push(local.ref_index))
-        return frontend_error(FrontendError::TooManyItems, expr.span);
-    segments.emplace_back();
-    return {};
+    return append_dynamic_json_value(
+        value.value(), route, mod, segments, value_refs, expr.span, true, depth);
 }
 
 static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index);

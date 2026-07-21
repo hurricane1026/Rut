@@ -32296,6 +32296,122 @@ route GET "/x" {
     CHECK_EQ(route.locals[0].init.kind, HirExprKind::StructInit);
 }
 
+TEST(frontend, return_json_does_not_materialize_nested_struct_fields) {
+    const char* src = R"rut(
+struct Leaf { value: str }
+struct Payload { a: Leaf, b: Leaf, c: Leaf, d: Leaf, e: Leaf, f: Leaf, g: Leaf, h: Leaf }
+route GET "/x" {
+    return 200, json(Payload(a: Leaf(value: req.path), b: Leaf(value: req.path),
+                             c: Leaf(value: req.path), d: Leaf(value: req.path),
+                             e: Leaf(value: req.path), f: Leaf(value: req.path),
+                             g: Leaf(value: req.path), h: Leaf(value: req.path)))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    const auto& term = route.control.direct_term;
+    CHECK(term.has_dynamic_response_body);
+    REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
+    REQUIRE_EQ(route.locals.len, 9u);
+    u32 struct_local_count = 0;
+    for (u32 i = 0; i < route.locals.len; i++)
+        if (route.locals[i].type == HirTypeKind::Struct) struct_local_count++;
+    CHECK_EQ(struct_local_count, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, return_json_struct_is_supported_in_direct_guard_terminators) {
+    const char* src = R"rut(
+struct Payload { path: str }
+route GET "/x" {
+    let payload = Payload(path: req.path)
+    guard req.http11 else { return 400, json(payload) }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK(hir->routes[0].guards[0].fail_term.has_dynamic_response_body);
+
+    const char* match_src = R"rut(
+struct Payload { path: str }
+route GET "/x" {
+    let payload = Payload(path: req.path)
+    let failed = error(.timeout)
+    guard match failed else {
+        .timeout => return 400, json(payload)
+        _ => return 500
+    }
+    return 200
+}
+)rut";
+    auto match_lexed = lex(lit(match_src));
+    REQUIRE(match_lexed);
+    auto match_ast = parse_file_heap(match_lexed.value());
+    REQUIRE(match_ast);
+    auto match_hir = analyze_file_heap(match_ast.value());
+    REQUIRE(match_hir);
+    REQUIRE_EQ(match_hir->guard_match_arms.len, 2u);
+    CHECK(match_hir->guard_match_arms[0].direct_term.has_dynamic_response_body);
+}
+
+TEST(frontend, return_json_does_not_see_sibling_match_arm_locals) {
+    const char* src = R"rut(
+struct Payload { path: str }
+route GET "/x" {
+    match req.http11 {
+        true => {
+            let payload = Payload(path: req.path)
+            return 201
+        }
+        false => return 200, json(payload)
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("payload")));
+}
+
+TEST(frontend, return_json_rejects_wait_result_state) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+struct Payload { ok: bool }
+route GET "/x" {
+    let ev = wait(upstream(api).connect())
+    return 200, json(Payload(ok: ev.ok))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("json cannot capture wait-result state after a wait")));
+}
+
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
     const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
     const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));
