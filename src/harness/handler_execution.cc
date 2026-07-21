@@ -96,6 +96,42 @@ HandlerExecution::~HandlerExecution() {
     rut_helper_resp_release_body_storage(&frame.context);
 }
 
+HandlerExecutionResult::HandlerExecutionResult(const HandlerExecutionResult& other) {
+    *this = other;
+}
+
+HandlerExecutionResult& HandlerExecutionResult::operator=(const HandlerExecutionResult& other) {
+    if (this == &other) return *this;
+    harness = other.harness;
+    terminal = other.terminal;
+    has_terminal = other.has_terminal;
+    consumed_events = other.consumed_events;
+    __builtin_memcpy(
+        dynamic_response_body, other.dynamic_response_body, sizeof(dynamic_response_body));
+    dynamic_response_body_len = other.dynamic_response_body_len;
+    dynamic_response_body_valid = other.dynamic_response_body_valid;
+    response_header_count = other.response_header_count;
+    response_header_overflow = other.response_header_overflow;
+    for (u32 i = 0; i < jit::kMaxResponseHeaderMutations; i++) {
+        response_header_mutations[i] = other.response_header_mutations[i];
+        response_header_values[i] = other.response_header_values[i];
+        if (response_header_mutations[i].value.ptr != nullptr) {
+            response_header_mutations[i].value.ptr = response_header_values[i].data();
+            response_header_mutations[i].value.len =
+                static_cast<u32>(response_header_values[i].size());
+        }
+    }
+    return *this;
+}
+
+HandlerExecutionResult::HandlerExecutionResult(HandlerExecutionResult&& other) {
+    *this = other;
+}
+
+HandlerExecutionResult& HandlerExecutionResult::operator=(HandlerExecutionResult&& other) {
+    return *this = static_cast<const HandlerExecutionResult&>(other);
+}
+
 void HandlerExecution::init(
     jit::HandlerFn fn, void* conn, const u8* req_data, u32 req_len, void* scratch_arena) {
     rut_helper_resp_release_body_storage(&frame.context);
@@ -365,12 +401,9 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     for (u32 i = 0; i < out.response_header_count; i++) {
         out.response_header_mutations[i] = execution.frame.context.response_header_mutations[i];
         auto& mutation = out.response_header_mutations[i];
-        if (mutation.value.len > jit::kMaxResponseBodyMutationBytes) {
-            out.response_header_overflow = true;
-            mutation.value = {};
-        } else if (mutation.value.len != 0 && mutation.value.ptr != nullptr) {
-            __builtin_memcpy(out.response_header_values[i], mutation.value.ptr, mutation.value.len);
-            mutation.value.ptr = out.response_header_values[i];
+        if (mutation.value.ptr != nullptr) {
+            out.response_header_values[i].assign(mutation.value.ptr, mutation.value.len);
+            mutation.value.ptr = out.response_header_values[i].data();
         }
     }
     if (!publisher.emit(ObservationKind::HandlerTerminated,
