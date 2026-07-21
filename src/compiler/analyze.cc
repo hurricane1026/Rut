@@ -5855,7 +5855,7 @@ static FrontendResult<void> instantiate_function_response_effects(
     Span call_span) {
     if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
     if (!function_has_response_effects(fn)) return {};
-    if (!route->allow_respond_effects)
+    if (!route->allow_response_effects)
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             call_span,
@@ -6253,10 +6253,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return analyze_expr_impl(
                 expr, scratch, mod, cur_locals, cur_local_count, cur_binding, true);
         const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+        const bool saved_allow_response_effects = scratch->allow_response_effects;
         scratch->allow_respond_effects = false;
+        scratch->allow_response_effects = false;
         auto result =
             analyze_expr_impl(expr, scratch, mod, cur_locals, cur_local_count, cur_binding, true);
         scratch->allow_respond_effects = saved_allow_respond_effects;
+        scratch->allow_response_effects = saved_allow_response_effects;
         return result;
     };
 
@@ -6265,10 +6268,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                               const HirLocal* cur_locals,
                                               u32 cur_local_count) -> FrontendResult<HirExpr> {
         const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+        const bool saved_allow_response_effects = scratch->allow_response_effects;
         scratch->allow_respond_effects = false;
+        scratch->allow_response_effects = false;
         auto result = analyze_match_pattern(
             pattern_expr, subject_expr, scratch, mod, cur_locals, cur_local_count);
         scratch->allow_respond_effects = saved_allow_respond_effects;
+        scratch->allow_response_effects = saved_allow_response_effects;
         return result;
     };
 
@@ -6652,10 +6658,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (arm.guard == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.span);
                 const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+                const bool saved_allow_response_effects = scratch->allow_response_effects;
                 scratch->allow_respond_effects = false;
+                scratch->allow_response_effects = false;
                 auto guard =
                     analyze_expr(*arm.guard, scratch, mod, locals, local_count, arm_binding_ptr);
                 scratch->allow_respond_effects = saved_allow_respond_effects;
+                scratch->allow_response_effects = saved_allow_response_effects;
                 if (!guard) return core::make_unexpected(guard.error());
                 if (guard->type != HirTypeKind::Bool || guard->may_nil || guard->may_error)
                     return frontend_error(FrontendError::UnsupportedSyntax, arm.guard->span);
@@ -6715,10 +6724,13 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                     return analyze_expr_impl(
                         expr, scratch, mod, expr_locals, expr_local_count, expr_binding, true);
                 const bool saved_allow_respond_effects = scratch->allow_respond_effects;
+                const bool saved_allow_response_effects = scratch->allow_response_effects;
                 scratch->allow_respond_effects = false;
+                scratch->allow_response_effects = false;
                 auto result = analyze_expr_impl(
                     expr, scratch, mod, expr_locals, expr_local_count, expr_binding, true);
                 scratch->allow_respond_effects = saved_allow_respond_effects;
+                scratch->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             const auto& inner = *stmt.block_stmts[si];
@@ -8622,9 +8634,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         if (route == nullptr)
             return analyze_expr(operand, route, mod, locals, local_count, binding);
         const bool saved_allow_respond_effects = route->allow_respond_effects;
+        const bool saved_allow_response_effects = route->allow_response_effects;
         route->allow_respond_effects = false;
+        route->allow_response_effects = false;
         auto result = analyze_expr(operand, route, mod, locals, local_count, binding);
         route->allow_respond_effects = saved_allow_respond_effects;
+        route->allow_response_effects = saved_allow_response_effects;
         return result;
     };
     if (expr.kind == AstExprKind::Or) {
@@ -8877,18 +8892,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             const auto analyze_conditional_method_stage_expr =
                 [&](const AstExpr& stage_expr) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
+                const bool saved_allow_response_effects = route->allow_response_effects;
                 route->allow_respond_effects = false;
+                route->allow_response_effects = false;
                 auto result = analyze_expr(stage_expr, route, mod, locals, local_count, binding);
                 route->allow_respond_effects = saved_allow_respond_effects;
+                route->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             const auto analyze_conditional_method_stage_call =
                 [&](const HirExpr& recv) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
+                const bool saved_allow_response_effects = route->allow_response_effects;
                 route->allow_respond_effects = false;
+                route->allow_response_effects = false;
                 auto result = analyze_method_call_expr(
                     method_stage, route, mod, locals, local_count, binding, &recv);
                 route->allow_respond_effects = saved_allow_respond_effects;
+                route->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             auto shape_only_result = [](HirExpr value) {
@@ -10656,10 +10677,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             const auto analyze_conditional_pipe_stage_arg =
                 [&](const AstExpr& arg_expr) -> FrontendResult<HirExpr> {
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
+                const bool saved_allow_response_effects = route->allow_response_effects;
                 route->allow_respond_effects = false;
+                route->allow_response_effects = false;
                 auto result =
                     analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
                 route->allow_respond_effects = saved_allow_respond_effects;
+                route->allow_response_effects = saved_allow_response_effects;
                 return result;
             };
             for (u32 i = 0; i < expr.args.len; i++) {
@@ -15472,10 +15496,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             lit_str("static for-loop iterator must be a compile-time array literal or alias"));
 
     const bool saved_allow_respond_effects = route->allow_respond_effects;
+    const bool saved_allow_response_effects = route->allow_response_effects;
     route->allow_respond_effects = false;
+    route->allow_response_effects = false;
     auto iter =
         analyze_array_iter_expr(stmt.expr, route, mod, route->locals.data, route->locals.len);
     route->allow_respond_effects = saved_allow_respond_effects;
+    route->allow_response_effects = saved_allow_response_effects;
     if (!iter) return core::make_unexpected(iter.error());
     if (iter->type != HirTypeKind::Array || iter->shape_index >= mod.type_shapes.len)
         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -21074,7 +21101,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 const bool used_for_iter =
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
+                const bool saved_allow_response_effects = route.allow_response_effects;
                 route.allow_respond_effects = !used_for_iter;
+                route.allow_response_effects = !used_for_iter;
                 auto init =
                     stmt.expr.kind == AstExprKind::Wait
                         ? analyze_wait_result_expr(stmt.expr, mod)
@@ -21098,6 +21127,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                route.locals.len,
                                                                nullptr)));
                 route.allow_respond_effects = saved_allow_respond_effects;
+                route.allow_response_effects = saved_allow_response_effects;
                 if (!init) return core::make_unexpected(init.error());
                 if (init->kind == HirExprKind::WaitResult) {
                     if (seen_for)

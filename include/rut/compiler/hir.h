@@ -1158,6 +1158,7 @@ struct HirRoute {
     FixedVec<HirForLoop, kMaxForLoops> for_loops;
     HirControl control{};
     bool allow_respond_effects = false;
+    bool allow_response_effects = true;
     u32 error_variant_index = 0xffffffffu;
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit).
     // Flows to the RIR Function and on to RouteConfig rate-limit setup.
@@ -1193,6 +1194,7 @@ struct HirRoute {
           for_loops(other.for_loops),
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
+          allow_response_effects(other.allow_response_effects),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
@@ -1217,6 +1219,7 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
+        allow_response_effects = other.allow_response_effects;
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
@@ -1241,6 +1244,7 @@ struct HirRoute {
           for_loops(other.for_loops),
           control(other.control),
           allow_respond_effects(other.allow_respond_effects),
+          allow_response_effects(other.allow_response_effects),
           error_variant_index(other.error_variant_index),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
@@ -1265,6 +1269,7 @@ struct HirRoute {
         for_loops = other.for_loops;
         control = other.control;
         allow_respond_effects = other.allow_respond_effects;
+        allow_response_effects = other.allow_response_effects;
         error_variant_index = other.error_variant_index;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
