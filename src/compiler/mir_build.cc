@@ -492,8 +492,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::ReqQueryAll || expr.kind == HirExprKind::ReqHeaderAll) {
         v.kind = expr.kind == HirExprKind::ReqQueryAll ? MirValueKind::ReqQueryAll
                                                        : MirValueKind::ReqHeaderAll;
-        v.type = MirTypeKind::StrList;
+        v.type = mir_type_kind(expr.type);
         v.str_value = expr.str_value;
+        apply_expr_shape_if_available(module, expr, &v);
         return v;
     }
     if (expr.kind == HirExprKind::StrListLen || expr.kind == HirExprKind::StrListIsEmpty) {
