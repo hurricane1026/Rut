@@ -33061,6 +33061,38 @@ TEST(frontend, empty_array_call_arguments_use_concrete_parameter_shape) {
     rir.destroy();
 }
 
+TEST(frontend, empty_array_struct_fields_use_declared_shape) {
+    const char* src =
+        "struct Payload { tags: [str] } "
+        "route GET \"/x\" { let payload = Payload(tags: []) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, empty_array_call_arguments_reject_non_carrier_elements) {
+    const char* src =
+        "struct Bad { value: Response } "
+        "func keep(values: [Bad]) -> [Bad] => values "
+        "route GET \"/x\" { let values = keep([]) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, tuple_slot_projection_preserves_array_shape) {
+    const char* src =
+        "func keep(values: [str]) -> [str] => values "
+        "route GET \"/x\" { let pair = ([req.path], 1) "
+        "let values = pair | keep(_1) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 TEST(frontend, rejects_array_variant_payloads_without_runtime_slots) {
     const char* src =
         "variant Values { some([i32]), none } "
