@@ -1242,10 +1242,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
-            if (module.routes[i].locals[li].type == HirTypeKind::Json &&
-                module.routes[i].locals[li].init.kind != HirExprKind::RespSetBody &&
-                module.routes[i].locals[li].init.kind != HirExprKind::IfElse)
-                continue;
+            // Named Json values are encoded runtime carriers. Materializing
+            // them once preserves initialization/call-site semantics and lets
+            // the state splitter persist the document across waits.
             if (module.routes[i].locals[li].type == HirTypeKind::Array &&
                 module.routes[i].locals[li].ref_index < HirRoute::kMaxLocals &&
                 static_iter_ref[module.routes[i].locals[li].ref_index] &&
