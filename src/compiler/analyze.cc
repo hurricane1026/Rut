@@ -5922,7 +5922,8 @@ static FrontendResult<void> instantiate_function_response_effects(
     if (!function_has_response_effects(fn)) return {};
     if (fn.owns_response_builder) {
         for (u32 li = 0; li < route->locals.len; li++) {
-            if (route->locals[li].init.kind == HirExprKind::ResponseInit)
+            if (route->locals[li].init.kind == HirExprKind::ResponseInit ||
+                route->locals[li].name.eq(lit_str("$helper_owned_response_effect")))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     call_span,

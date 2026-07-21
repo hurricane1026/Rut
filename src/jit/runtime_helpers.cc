@@ -602,6 +602,7 @@ void rut_helper_resp_set_status(void* ctx, i32 status) {
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     hctx->response_status_pending_set = true;
     hctx->response_status_pending_invalid = status < 100 || status > 599;
+    if (hctx->response_status_pending_invalid) hctx->response_status_invalid = true;
     hctx->response_status_pending = status;
 }
 
