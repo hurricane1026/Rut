@@ -241,6 +241,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
     jit::HandlerCtx response_ctx{};
+    HandlerExecutionResult driven_storage{};
     out.harness = validate_spec(harness);
     if (out.harness.outcome != Outcome::Passed) return out;
     out.harness.phase = Phase::Prepare;
@@ -504,8 +505,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         driver.auto_complete_timers = scenario.auto_complete_timers;
         HarnessSpec handler_harness = harness;
         handler_harness.layer = ExecutionLayer::Handler;
-        const HandlerExecutionResult driven =
-            drive_handler_deterministically(driver, handler_harness);
+        driven_storage = drive_handler_deterministically(driver, handler_harness);
+        const HandlerExecutionResult& driven = driven_storage;
         const u32 state_resets = out.harness.state_resets;
         out.harness = driven.harness;
         out.harness.state_resets += state_resets;
