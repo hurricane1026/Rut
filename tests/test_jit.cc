@@ -2764,6 +2764,16 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK(outcome.dynamic_response_body == nullptr);
 }
 
+TEST(jit, response_body_snapshot_failure_remains_sticky_across_assignment) {
+    TestHandlerCtxFrame frame{};
+    frame.ctx.response_body_snapshot_failed = true;
+    static constexpr char kBody[] = "new";
+    rut_helper_resp_set_body(&frame.ctx, kBody, sizeof(kBody) - 1);
+    CHECK(frame.ctx.response_body_pending_overflow);
+    rut_helper_resp_commit_headers(&frame.ctx);
+    CHECK(frame.ctx.response_body_mutation_overflow);
+}
+
 TEST(jit, response_body_mutation_copies_source_bytes) {
     TestHandlerCtxFrame frame{};
     char body[] = "stable";

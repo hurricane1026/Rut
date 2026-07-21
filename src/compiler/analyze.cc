@@ -4021,6 +4021,7 @@ static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
                                                    u32 depth = 0);
+static bool hir_expr_reads_response_field(const HirExpr& expr);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -6790,6 +6791,24 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 if (effect->kind != HirExprKind::RespSetStatus &&
                     effect->kind != HirExprKind::RespSetBody)
                     return frontend_error(FrontendError::UnsupportedSyntax, inner.span);
+                HirLocal next_locals[HirRoute::kMaxLocals]{};
+                for (u32 i = 0; i < cur_local_count; i++) next_locals[i] = cur_locals[i];
+                if (inner.expr.lhs != nullptr && inner.expr.lhs->lhs != nullptr) {
+                    for (u32 li = cur_local_count; li > 0; li--) {
+                        if (!next_locals[li - 1].name.eq(inner.expr.lhs->lhs->name)) continue;
+                        if (next_locals[li - 1].init.kind == HirExprKind::ResponseInit) {
+                            next_locals[li - 1].init.bool_value = true;
+                            for (u32 ri = scratch->locals.len; ri > 0; ri--) {
+                                if (scratch->locals[ri - 1].ref_index ==
+                                    next_locals[li - 1].ref_index) {
+                                    scratch->locals[ri - 1].init.bool_value = true;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
                 HirLocal carrier{};
                 carrier.span = inner.span;
                 carrier.ref_index = next_local_ref_index(scratch, cur_locals, cur_local_count);
@@ -6797,7 +6816,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 carrier.init = effect.value();
                 if (!scratch->locals.push(carrier))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
-                return self(self, si + 1, cur_locals, cur_local_count, cur_allow_respond_guards);
+                return self(
+                    self, si + 1, next_locals, cur_local_count, cur_allow_respond_guards);
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::MethodCall && inner.expr.lhs != nullptr &&
@@ -12878,6 +12898,19 @@ static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
         if (expr.field_inits[i].value != nullptr &&
             hir_expr_reads_wait_result_with_locals(
                 *expr.field_inits[i].value, locals, local_count, depth + 1))
+            return true;
+    return false;
+}
+
+static bool hir_expr_reads_response_field(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody) return true;
+    if (expr.lhs != nullptr && hir_expr_reads_response_field(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_reads_response_field(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_reads_response_field(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+         if (expr.field_inits[i].value != nullptr &&
+             hir_expr_reads_response_field(*expr.field_inits[i].value))
             return true;
     return false;
 }
@@ -21094,6 +21127,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
+                    bool prior_guard_reads_response = false;
+                    for (u32 gi = 0; gi < route.guards.len; gi++)
+                        prior_guard_reads_response |=
+                            hir_expr_reads_response_field(route.guards[gi].cond);
+                    if (prior_guard_reads_response)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.span,
+                            lit_str("Response scalar assignments after a guard are not supported; "
+                                     "move the assignment before the guard"));
                     const bool saved_allow_respond_effects = route.allow_respond_effects;
                     route.allow_respond_effects = true;
                     route.response_assignment_stmt_ok = true;
