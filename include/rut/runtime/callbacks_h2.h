@@ -1000,9 +1000,16 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 [[nodiscard]] bool h2_arm_async_timer(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
+    auto* parked_ctx = h2->async_jit_ctx();
+    // Other streams in the same decoded batch may have reused the connection
+    // scratch context after this stream was parked. Release any lazy body
+    // buffer they acquired before replacing the scratch owner with the parked
+    // frame; otherwise that allocation becomes unreachable.
+    if (conn.handler_ctx != nullptr && conn.handler_ctx != parked_ctx)
+        rut_helper_resp_release_body_storage(conn.handler_ctx);
     conn.pending_handler_fn = h2->async_fn;
     conn.handler_state = h2->async_state;
-    conn.handler_ctx = h2->async_jit_ctx();
+    conn.handler_ctx = parked_ctx;
     conn.pending_yield_kind = jit::YieldKind::Timer;
     conn.transition_to_exec_handler_wait();
     return loop->schedule_yield_timer(conn, h2->async_timer_ms);

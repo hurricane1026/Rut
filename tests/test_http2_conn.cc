@@ -1479,7 +1479,16 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
 }
 
 namespace {
-struct FakeH2Loop {};
+struct FakeH2Loop {
+    bool yield_scheduled = false;
+    u32 yield_ms = 0;
+
+    [[nodiscard]] bool schedule_yield_timer(Connection&, u32 ms) {
+        yield_scheduled = true;
+        yield_ms = ms;
+        return true;
+    }
+};
 }  // namespace
 
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
@@ -1599,6 +1608,40 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     h2_clear_async(h2);
     CHECK(parked->response_body_mutation_storage == nullptr);
     CHECK(parked->response_body_snapshot_storage == nullptr);
+}
+
+TEST(h2_serving, arming_suspended_handler_releases_scratch_body_storage) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+
+    auto* scratch = conn.reset_jit_ctx();
+    scratch->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    REQUIRE(scratch->response_body_mutation_storage != nullptr);
+    auto* parked = h2.async_jit_ctx();
+    parked->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    REQUIRE(parked->response_body_mutation_storage != nullptr);
+    char* parked_storage = parked->response_body_mutation_storage;
+
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_fn = reinterpret_cast<jit::HandlerFn>(0x1);
+    h2.async_state = 3;
+    h2.async_timer_ms = 25;
+    FakeH2Loop loop;
+    REQUIRE(h2_arm_async_timer(&loop, conn));
+
+    CHECK(scratch->response_body_mutation_storage == nullptr);
+    CHECK(conn.handler_ctx == parked);
+    CHECK(parked->response_body_mutation_storage == parked_storage);
+    CHECK(loop.yield_scheduled);
+    CHECK_EQ(loop.yield_ms, 25u);
+
+    h2_clear_async(h2);
+    CHECK(parked->response_body_mutation_storage == nullptr);
+    conn.handler_ctx = nullptr;
 }
 
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {
