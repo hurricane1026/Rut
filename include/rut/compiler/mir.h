@@ -22,6 +22,7 @@ enum class MirValueKind : u8 {
     IntConst,
     StrConst,
     ArrayLit,
+    ArrayGet,
     RegexMatch,
     Tuple,
     TupleSlot,
