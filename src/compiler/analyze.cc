@@ -494,6 +494,38 @@ static bool hir_type_shape_contains_json(const HirModule& mod, u32 shape_index, 
     return false;
 }
 
+static bool hir_type_shape_has_runtime_carrier(const HirModule& mod,
+                                               u32 shape_index,
+                                               u32 depth = 0) {
+    if (shape_index >= mod.type_shapes.len || depth > HirModule::kMaxTypeShapes) return false;
+    const auto& shape = mod.type_shapes[shape_index];
+    if (!shape.is_concrete) return false;
+    switch (shape.type) {
+        case HirTypeKind::Bool:
+        case HirTypeKind::I32:
+        case HirTypeKind::I64:
+        case HirTypeKind::Str:
+        case HirTypeKind::Method:
+        case HirTypeKind::ByteSize:
+        case HirTypeKind::IP:
+        case HirTypeKind::StrList:
+        case HirTypeKind::Struct:
+        case HirTypeKind::Variant:
+            return true;
+        case HirTypeKind::Array:
+            return hir_type_shape_has_runtime_carrier(
+                mod, shape.array_elem_shape_index, depth + 1);
+        case HirTypeKind::Tuple:
+            for (u32 i = 0; i < shape.tuple_len; i++)
+                if (!hir_type_shape_has_runtime_carrier(
+                        mod, shape.tuple_elem_shape_indices[i], depth + 1))
+                    return false;
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct ImportedModuleInfo {
     static constexpr u32 kMaxSelectedNames = AstImportDecl::kMaxSelectedNames;
     Span span{};
@@ -5596,6 +5628,8 @@ static FrontendResult<void> instantiate_function_response_effects(
         if (!effect) return core::make_unexpected(effect.error());
         HirLocal carrier{};
         carrier.span = call_span;
+        if (fn.owns_response_builder)
+            carrier.name = lit_str("$helper_owned_response_effect");
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         carrier.type = effect->type;
         carrier.init = effect.value();
@@ -8003,6 +8037,8 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (!elem_shape) return core::make_unexpected(elem_shape.error());
             first_elem_shape_index = elem_shape.value();
         }
+        if (!hir_type_shape_has_runtime_carrier(mod, first_elem_shape_index))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto array_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                  HirTypeKind::Array,
                                                  0xffffffffu,
@@ -9148,8 +9184,6 @@ static u32 count_function_param_refs(const HirExpr& expr, u32 param_index, u32 l
 
 static bool function_param_is_reused(const HirFunction& fn, u32 param_index) {
     u32 count = count_function_param_refs(fn.body, param_index, 2);
-    for (u32 i = 0; count < 2 && i < fn.exprs.len; i++)
-        count += count_function_param_refs(fn.exprs[i], param_index, 2 - count);
     for (u32 i = 0; count < 2 && i < fn.respond_guards.len; i++)
         count += count_function_param_refs(fn.respond_guards[i].cond, param_index, 2 - count);
     return count >= 2;
@@ -11962,6 +11996,15 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 local.name = inner.name;
                 local.ref_index =
                     next_local_ref_index(route, scoped_locals.data, scoped_locals.len);
+                if (local.ref_index >= HirRoute::kMaxLocals)
+                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                HirLocal reserved_local{};
+                reserved_local.span = inner.span;
+                reserved_local.ref_index = local.ref_index;
+                const u32 local_storage_index = route->locals.len;
+                if (!route->locals.push(reserved_local))
+                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                const u32 scoped_carrier_start = route->locals.len;
                 auto init = inner.has_type && inner.expr.kind == AstExprKind::ArrayLit &&
                                     inner.expr.args.len == 0
                                 ? analyze_empty_array_lit_with_declared_type(inner, mod)
@@ -11997,14 +12040,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                 local.error_variant_index = init->error_variant_index;
                 local.shape_index = init->shape_index;
                 local.init = init.value();
+                for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                    if (!body->locals.push(route->locals[li]))
+                        return frontend_error(FrontendError::TooManyItems, inner.span);
+                    route->locals[li].name = {};
+                }
                 if (!body->locals.push(local))
                     return frontend_error(FrontendError::TooManyItems, inner.span);
                 HirLocal hidden_local = local;
                 hidden_local.name = {};
-                if (!route->locals.push(hidden_local))
-                    return frontend_error(FrontendError::TooManyItems, inner.span);
-                if (local.ref_index >= HirRoute::kMaxLocals)
-                    return frontend_error(FrontendError::TooManyItems, inner.span);
+                route->locals[local_storage_index] = hidden_local;
                 if (scoped_locals.len <= local.ref_index) scoped_locals.len = local.ref_index + 1;
                 scoped_locals[local.ref_index] = local;
                 continue;
@@ -13705,6 +13750,37 @@ static FrontendResult<void> merge_imported_simple_decls(
     };
     for (u32 ii = 0; ii < imports.len; ii++) {
         const auto& imported = imports[ii];
+        auto selected = [&](Str name) {
+            if (!imported.selective) return true;
+            for (u32 xi = 0; xi < imported.selected_names.len; xi++)
+                if (imported.selected_names[xi].name.eq(name)) return true;
+            return false;
+        };
+        // Reserve all nominal names before remapping aggregate field shapes.
+        // Source declarations are order-independent, so an array/tuple shape
+        // may refer to a struct or variant that appears later in the module.
+        for (u32 si = 0; si < imported.module->structs.len; si++) {
+            const auto& st = imported.module->structs[si];
+            if (st.template_struct_index != 0xffffffffu || !selected(st.name)) continue;
+            HirStruct predeclared = st;
+            predeclared.name = import_visible_name(imported, st.name);
+            if (find_struct_index(*mod, predeclared.name) != mod->structs.len)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, imported.span, predeclared.name);
+            if (!mod->structs.push(predeclared))
+                return frontend_error(FrontendError::TooManyItems, imported.span);
+        }
+        for (u32 vi = 0; vi < imported.module->variants.len; vi++) {
+            const auto& variant = imported.module->variants[vi];
+            if (variant.template_variant_index != 0xffffffffu || !selected(variant.name)) continue;
+            HirVariant predeclared = variant;
+            predeclared.name = import_visible_name(imported, variant.name);
+            if (find_variant_index(*mod, predeclared.name) != mod->variants.len)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, imported.span, predeclared.name);
+            if (!mod->variants.push(predeclared))
+                return frontend_error(FrontendError::TooManyItems, imported.span);
+        }
         for (u32 pi = 0; pi < imported.module->protocols.len; pi++) {
             const auto& proto = imported.module->protocols[pi];
             if (proto.kind != HirProtocolKind::Custom) continue;
@@ -13772,6 +13848,9 @@ static FrontendResult<void> merge_imported_simple_decls(
             }
             HirStruct imported_struct = st;
             imported_struct.name = import_visible_name(imported, st.name);
+            const u32 imported_struct_index = find_struct_index(*mod, imported_struct.name);
+            if (imported_struct_index >= mod->structs.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, imported.span);
             for (u32 fi = 0; fi < imported_struct.fields.len; fi++) {
                 if (imported_struct.fields[fi].is_error_type) continue;
                 for (u32 ai = 0; ai < imported_struct.fields[fi].type_arg_count; ai++) {
@@ -13802,9 +13881,6 @@ static FrontendResult<void> merge_imported_simple_decls(
                 if (!shape) return core::make_unexpected(shape.error());
                 imported_struct.fields[fi].shape_index = shape.value();
             }
-            if (find_struct_index(*mod, imported_struct.name) != mod->structs.len)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, imported.span, imported_struct.name);
             bool ok = true;
             for (u32 fi = 0; fi < imported_struct.fields.len; fi++) {
                 const auto& field = imported_struct.fields[fi];
@@ -13821,8 +13897,7 @@ static FrontendResult<void> merge_imported_simple_decls(
                 }
             }
             if (!ok) continue;
-            if (!mod->structs.push(imported_struct))
-                return frontend_error(FrontendError::TooManyItems, imported.span);
+            mod->structs[imported_struct_index] = imported_struct;
         }
         for (u32 vi = 0; vi < imported.module->variants.len; vi++) {
             const auto& variant = imported.module->variants[vi];
@@ -13839,6 +13914,9 @@ static FrontendResult<void> merge_imported_simple_decls(
             }
             HirVariant imported_variant = variant;
             imported_variant.name = import_visible_name(imported, variant.name);
+            const u32 imported_variant_index = find_variant_index(*mod, imported_variant.name);
+            if (imported_variant_index >= mod->variants.len)
+                return frontend_error(FrontendError::UnsupportedSyntax, imported.span);
             for (u32 ci = 0; ci < imported_variant.cases.len; ci++) {
                 if (!imported_variant.cases[ci].has_payload) continue;
                 for (u32 ai = 0; ai < imported_variant.cases[ci].payload_type_arg_count; ai++) {
@@ -13873,9 +13951,6 @@ static FrontendResult<void> merge_imported_simple_decls(
                 if (!shape) return core::make_unexpected(shape.error());
                 imported_variant.cases[ci].payload_shape_index = shape.value();
             }
-            if (find_variant_index(*mod, imported_variant.name) != mod->variants.len)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, imported.span, imported_variant.name);
             bool ok = true;
             for (u32 ci = 0; ci < imported_variant.cases.len; ci++) {
                 const auto& c = imported_variant.cases[ci];
@@ -13892,8 +13967,7 @@ static FrontendResult<void> merge_imported_simple_decls(
                 }
             }
             if (!ok) continue;
-            if (!mod->variants.push(imported_variant))
-                return frontend_error(FrontendError::TooManyItems, imported.span);
+            mod->variants[imported_variant_index] = imported_variant;
         }
         for (u32 ai = 0; ai < imported.module->type_aliases.len; ai++) {
             const auto& alias = imported.module->type_aliases[ai];
@@ -17876,6 +17950,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
         for (u32 li = 0; li < scratch->locals.len; li++)
             all_locals[all_local_count++] = scratch->locals[li];
+        for (u32 li = 0; li < scratch->locals.len; li++) {
+            const auto& local = scratch->locals[li];
+            u32 refs = count_function_param_refs(body.value(), local.ref_index, 2);
+            for (u32 gi = 0; refs < 2 && gi < scratch->guards.len; gi++)
+                refs += count_function_param_refs(
+                    scratch->guards[gi].cond, local.ref_index, 2 - refs);
+            if (local.type == HirTypeKind::Array && refs >= 2)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    local.span,
+                    lit_str("reused helper-local arrays require a runtime local carrier"));
+        }
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
         for (u32 li = 0; li < scratch->locals.len; li++)
@@ -17898,6 +17984,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        if (!collect_function_response_effects(
+                &fn, *scratch, all_locals, all_local_count, fn.params.len))
+            return frontend_error(FrontendError::TooManyItems, ast_func.body->span);
         auto normalized =
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
@@ -19447,6 +19536,18 @@ static FrontendResult<HirModule*> analyze_file_internal(
         for (u32 pi = 0; pi < fn.params.len; pi++) all_locals[all_local_count++] = param_locals[pi];
         for (u32 li = 0; li < scratch.locals.len; li++)
             all_locals[all_local_count++] = scratch.locals[li];
+        for (u32 li = 0; li < scratch.locals.len; li++) {
+            const auto& local = scratch.locals[li];
+            u32 refs = count_function_param_refs(body.value(), local.ref_index, 2);
+            for (u32 gi = 0; refs < 2 && gi < scratch.guards.len; gi++)
+                refs += count_function_param_refs(
+                    scratch.guards[gi].cond, local.ref_index, 2 - refs);
+            if (local.type == HirTypeKind::Array && refs >= 2)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    local.span,
+                    lit_str("reused helper-local arrays require a runtime local carrier"));
+        }
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
         for (u32 li = 0; li < scratch.locals.len; li++)
@@ -20241,6 +20342,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         stmt.expr.span,
                         lit_str("Response builders cannot be copied or aliased in this slice"));
                 if (init->kind == HirExprKind::ResponseInit) {
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].name.eq(
+                                lit_str("$helper_owned_response_effect")))
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.expr.span,
+                                lit_str("a caller Response builder cannot follow mutations from "
+                                        "a helper-local Response builder"));
+                    }
                     for (u32 li = 0; li < route.locals.len; li++) {
                         if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
                             route.locals[li].init.bool_value)

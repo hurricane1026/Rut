@@ -7041,6 +7041,61 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, helper_local_response_effects_reject_later_caller_builder) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let inner = response(200)
+    inner.status = 201
+    0
+}
+route GET "/x" {
+    let ignored = rewrite()
+    let outer = response(200)
+    outer.body = "outer"
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, protocol_methods_preserve_response_effects_before_reads) {
+    const char* sources[] = {
+        R"rut(
+protocol Status { func status() -> i32 { let resp = response(200) resp.status = 201 resp.status } }
+struct Box { value: i32 }
+Box impl Status {}
+route GET "/x" { let value = Box(value: 0).status() if value == 201 { return 201 } else { return 500 } }
+)rut",
+        R"rut(
+protocol Status { func status() -> i32 => 200 }
+struct Box { value: i32 }
+Box impl Status { func status(self: Box) -> i32 { let resp = response(200) resp.status = 201 resp.status } }
+route GET "/x" { let value = Box(value: 0).status() if value == 201 { return 201 } else { return 500 } }
+)rut",
+    };
+    for (const char* src : sources) {
+        FrontendRirModule rir{};
+        REQUIRE(lower_src_to_rir(src, rir));
+        u32 writes = 0;
+        u32 reads = 0;
+        for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+            for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++) {
+                writes += rir.module.functions[0].blocks[bi].insts[ii].op ==
+                          rir::Opcode::RespSetStatus;
+                reads += rir.module.functions[0].blocks[bi].insts[ii].op ==
+                         rir::Opcode::RespStatus;
+            }
+        CHECK_EQ(writes, 1u);
+        CHECK_EQ(reads, 1u);
+        rir.destroy();
+    }
+}
+
 TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_pipes) {
     const char* src = R"rut(
 func rewrite(value: str) -> i32 {
@@ -33565,6 +33620,99 @@ TEST(frontend, rejects_equality_for_runtime_array_shapes) {
         REQUIRE_FALSE(hir.has_value());
         CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
+}
+
+TEST(frontend, single_use_array_parameter_needs_no_call_carrier) {
+    const char* src = R"rut(
+func wrap(values: [str]) -> [[str]] => [values]
+route GET "/x" {
+    let v0 = 0
+    let v1 = 1
+    let v2 = 2
+    let v3 = 3
+    let v4 = 4
+    let v5 = 5
+    let v6 = 6
+    let v7 = 7
+    let v8 = 8
+    let v9 = 9
+    let v10 = 10
+    let v11 = 11
+    let v12 = 12
+    let v13 = 13
+    let v14 = 14
+    let groups = wrap(req.queryAll("tag"))
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_arrays_without_runtime_element_carriers) {
+    const char* src =
+        "route GET \"/x\" { let builders = [response(200)] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, rejects_reused_helper_local_arrays_without_carriers) {
+    const char* src =
+        "func make() -> [[i64]] { let xs = [time.nowMicros()] [xs, xs] } "
+        "route GET \"/x\" { let groups = make() return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, guard_failure_array_carriers_stay_in_failure_scope) {
+    const char* src = R"rut(
+func dup(values: [str]) -> [[str]] => [values, values]
+route GET "/x" {
+    guard req.http11 else {
+        let tag = "x"
+        let groups = dup([tag])
+        return 400
+    }
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, imported_array_fields_allow_later_nominal_declarations) {
+    const std::string dir = "/tmp/rut_import_array_later_nominal_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/payload.rut", std::ios::binary);
+        out << "struct Payload { items: [Item] }\n"
+               "struct Item { value: i32 }\n";
+    }
+    const char* src =
+        "import \"payload.rut\"\nroute GET \"/x\" { "
+        "let payload = Payload(items: [Item(value: 1)]) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {
