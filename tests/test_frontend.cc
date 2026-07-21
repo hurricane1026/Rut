@@ -33966,6 +33966,101 @@ TEST(frontend, rejects_heterogeneous_nested_array_shapes_in_tuples) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, deferred_protocol_dispatch_replays_response_effects) {
+    const char* src = R"rut(
+protocol Status { func status() -> i32 }
+struct Box { value: i32 }
+Box impl Status {
+    func status(self: Box) -> i32 {
+        let resp = response(200)
+        resp.status = 201
+        resp.status
+    }
+}
+func run<T: Status>(value: T) -> i32 => value.status()
+route GET "/x" {
+    let value = run(Box(value: 0))
+    if value == 201 { return 201 } else { return 500 }
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 writes = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            writes += rir.module.functions[0].blocks[bi].insts[ii].op ==
+                      rir::Opcode::RespSetStatus;
+    CHECK_EQ(writes, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, chain_after_scalar_effects_reject_prior_response_reads) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("chain-after Response scalar effects cannot follow a Response field read")));
+}
+
+TEST(frontend, chain_before_replays_helper_response_effects) {
+    const char* src = R"rut(
+func ready(_ req: i32) -> bool {
+    let resp = response(200)
+    resp.status = 201
+    resp.status == 201
+}
+chain access { before ready(req) else 401 }
+route GET "/x" use chain access { return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 writes = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            writes += rir.module.functions[0].blocks[bi].insts[ii].op ==
+                      rir::Opcode::RespSetStatus;
+    CHECK_EQ(writes, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, wrapper_helpers_propagate_owned_response_builders) {
+    const char* src = R"rut(
+func inner() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    0
+}
+func wrapper() -> i32 => inner()
+route GET "/x" {
+    let outer = response(200)
+    let ignored = wrapper()
+    return outer
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
