@@ -1765,14 +1765,20 @@ TEST(RirBuilder, JsonAppendOperandsRequireMatchingScalarTypes) {
     const auto integer = V(b.emit_const_i32(42));
     const auto wide_integer = V(b.emit_const_i64(42));
     const auto string = V(b.emit_const_str(lit("value")));
+    const auto string_list = V(b.emit_req_query_all(lit("tag")));
+    const auto array = V(b.emit_req_query_all_array(lit("tag")));
     VOK(b.emit_json_append(Opcode::JsonAppendBool, boolean));
     VOK(b.emit_json_append(Opcode::JsonAppendI32, integer));
     VOK(b.emit_json_append(Opcode::JsonAppendI64, wide_integer));
     VOK(b.emit_json_append(Opcode::JsonAppendStr, string));
+    VOK(b.emit_json_append(Opcode::JsonAppendStrList, string_list));
+    VOK(b.emit_json_append(Opcode::JsonAppendArray, array));
     CHECK_FALSE(static_cast<bool>(b.emit_json_append(Opcode::JsonAppendBool, integer)));
     CHECK_FALSE(static_cast<bool>(b.emit_json_append(Opcode::JsonAppendI32, wide_integer)));
     CHECK_FALSE(static_cast<bool>(b.emit_json_append(Opcode::JsonAppendI64, string)));
     CHECK_FALSE(static_cast<bool>(b.emit_json_append(Opcode::JsonAppendStr, boolean)));
+    CHECK_FALSE(static_cast<bool>(b.emit_json_append(Opcode::JsonAppendStrList, array)));
+    CHECK_FALSE(static_cast<bool>(b.emit_json_append(Opcode::JsonAppendArray, string_list)));
 
     ctx.destroy();
 }

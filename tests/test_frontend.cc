@@ -33015,7 +33015,8 @@ route GET "/x" {
 
 TEST(frontend, rejects_equality_for_runtime_array_shapes) {
     const char* cases[] = {
-        "route GET \"/x\" { let a = [1] let b = [1] if a == b { return 200 } else { return 204 } }\n",
+        "route GET \"/x\" { let a = [1] let b = [1] if a == b { return 200 } else { return 204 } "
+        "}\n",
         "struct Box { values: [i32] } route GET \"/x\" { let a = Box(values: [1]) "
         "let b = Box(values: [1]) if a == b { return 200 } else { return 204 } }\n",
     };
@@ -33059,8 +33060,7 @@ route GET "/x" {
 }
 
 TEST(frontend, rejects_arrays_without_runtime_element_carriers) {
-    const char* src =
-        "route GET \"/x\" { let builders = [response(200)] return 200 }\n";
+    const char* src = "route GET \"/x\" { let builders = [response(200)] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33263,8 +33263,7 @@ TEST(frontend, rejects_nominal_array_elements_with_unlowerable_scalar_fields) {
 }
 
 TEST(frontend, rejects_heterogeneous_nested_array_shapes_in_tuples) {
-    const char* src =
-        "route GET \"/x\" { let values = [([1], 1), ([\"x\"], 2)] return 200 }\n";
+    const char* src = "route GET \"/x\" { let values = [([1], 1), ([\"x\"], 2)] return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33342,6 +33341,102 @@ route GET "/x" { let xs = [Stamp.at(time.nowMicros())] return 200 }
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, contextualizes_nested_empty_array_struct_fields) {
+    const char* src = R"rut(
+struct Payload { tags: [[str]] }
+route GET "/x" { let payload = Payload(tags: [[]]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, recursively_adapts_string_lists_at_array_return_boundaries) {
+    const char* src = R"rut(
+func tags(_ ignored: i32) -> [[str]] => [req.queryAll("tag")]
+route GET "/x" { let groups = tags(1) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, materializes_reused_struct_arguments_containing_arrays_once) {
+    const char* src = R"rut(
+struct Pair { values: [str], code: i32 }
+func sum(pair: Pair) -> i32 => pair.code + pair.code
+route GET "/x" {
+    let total = sum(Pair(values: req.queryAll("tag"), code: 1))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 query_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++)
+            query_reads += block.insts[ii].op == rir::Opcode::ReqQueryAll;
+    }
+    CHECK_EQ(query_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, static_loop_match_arms_keep_reused_array_carriers_scoped) {
+    const char* src = R"rut(
+func dup(values: [i32]) -> [[i32]] => [values, values]
+route GET "/x" {
+    let items = [1]
+    match item {
+        1 => { let groups = dup([item]) return 201 }
+        _ => return 400
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto& statements = ast->items[1].route.statements;
+    REQUIRE_EQ(statements.len, 2u);
+    AstStatement loop_body{};
+    loop_body.kind = AstStmtKind::Block;
+    REQUIRE(loop_body.block_stmts.push(statements[1]));
+    AstStatement loop{};
+    loop.kind = AstStmtKind::For;
+    loop.name = lit("item");
+    loop.expr = statements[0]->expr;
+    loop.then_stmt = &loop_body;
+    AstStatement fallback{};
+    fallback.kind = AstStmtKind::ReturnStatus;
+    fallback.status_code = 500;
+    fallback.span = statements[1]->span;
+    statements[0] = &loop;
+    statements.len = 2;
+    statements[1] = &fallback;
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.matches.len, 1u);
+    const auto& arm = hir->routes[0].for_loops[0].body.matches[0].arms[0];
+    REQUIRE_EQ(arm.locals.len, 2u);
+    CHECK(arm.locals[0].name.eq(lit("$array_arg")));
+    CHECK(arm.locals[1].name.eq(lit("groups")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {
