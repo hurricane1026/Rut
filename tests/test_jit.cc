@@ -2173,6 +2173,24 @@ TEST(jit, json_capture_storage_scales_with_repeated_plan_materialization) {
     rut_helper_json_capture_reset();
 }
 
+TEST(jit, json_capture_reset_reuses_thread_local_arena) {
+    rut_helper_json_capture_reset();
+    rut_helper_json_reset();
+    rut_helper_json_append_str("first", 5);
+    const char* first = rut_helper_json_capture_data();
+    REQUIRE(first != nullptr);
+
+    rut_helper_json_capture_reset();
+    rut_helper_json_reset();
+    rut_helper_json_append_str("next", 4);
+    const char* next = rut_helper_json_capture_data();
+    REQUIRE(next != nullptr);
+    CHECK_EQ(next, first);
+    CHECK_EQ(rut_helper_json_capture_len(), 6u);
+
+    rut_helper_json_capture_reset();
+}
+
 TEST(jit, json_capture_arena_covers_every_route_expression) {
     static char document[7 * 1024];
     __builtin_memset(document, 'x', sizeof(document));
