@@ -33102,6 +33102,8 @@ TEST(frontend, optional_and_fallible_json_helper_results_are_rejected) {
         "func maybe(flag: bool) -> Json { if flag { json({ ok: true }) } else { "
         "error(.missing) } } route GET \"/x\" { let body = maybe(req.http11) return 200, body "
         "}\n",
+        "func make<T>() -> T => nil route GET \"/x\" { guard let body = make<Json>() "
+        "else { return 400 } return 200, body }\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
@@ -33117,6 +33119,30 @@ TEST(frontend, reusable_json_materializes_struct_inputs_once) {
     const char* src =
         "struct Payload { a: str, b: str } route GET \"/x\" { "
         "let body = json(Payload(a: req.path, b: \"fixed\")) return 200, body }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 path_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            path_reads += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqPath;
+    CHECK_EQ(path_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, reusable_json_helper_materializes_struct_arguments_once) {
+    const char* src =
+        "struct Payload { a: str, b: str } "
+        "func encode(p: Payload) -> Json => json(p) "
+        "route GET \"/x\" { let body = encode(Payload(a: req.path, b: \"fixed\")) "
+        "return 200, body }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33205,6 +33231,24 @@ TEST(frontend, generic_aggregates_reject_json_instantiations) {
         CHECK(hir.error().detail.eq(
             lit("Json values are opaque response plans; use them only through locals or helper "
                 "calls and consume them with return, respond, or Response.body")));
+    }
+}
+
+TEST(frontend, generic_array_and_tuple_results_reject_json_instantiations) {
+    const char* sources[] = {
+        "func pair<T>(x: T) => (x, 1) route GET \"/x\" { "
+        "let bad = pair(json({ ok: true })) return 200 }\n",
+        "func singleton<T>(x: T) => [x] route GET \"/x\" { "
+        "let bad = singleton(json({ ok: true })) return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
 }
 

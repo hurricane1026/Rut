@@ -3041,6 +3041,20 @@ static FrontendResult<void> concretize_named_instance_shape(HirExpr* expr,
         auto concrete = concretize_shape(concretize_shape, expr->shape_index);
         if (!concrete) return core::make_unexpected(concrete.error());
         expr->shape_index = concrete.value();
+        if (expr->type == HirTypeKind::Tuple) {
+            const auto& shape = mod.type_shapes[expr->shape_index];
+            expr->tuple_len = shape.tuple_len;
+            for (u32 i = 0; i < shape.tuple_len; i++) {
+                const auto& elem = mod.type_shapes[shape.tuple_elem_shape_indices[i]];
+                expr->tuple_types[i] = elem.type;
+                expr->tuple_variant_indices[i] =
+                    elem.type == HirTypeKind::Variant ? elem.variant_index : 0xffffffffu;
+                expr->tuple_struct_indices[i] =
+                    elem.type == HirTypeKind::Struct
+                        ? elem.struct_index
+                        : (elem.type == HirTypeKind::Generic ? elem.generic_index : 0xffffffffu);
+            }
+        }
         return {};
     }
     if (expr->type != HirTypeKind::Unknown) {
@@ -10167,6 +10181,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             target.tuple_variant_indices[i] = ret->tuple_variant_indices[i];
             target.tuple_struct_indices[i] = ret->tuple_struct_indices[i];
         }
+        if ((target.type == HirTypeKind::Json && (target.may_nil || target.may_error)) ||
+            (target.type != HirTypeKind::Json &&
+             hir_type_shape_contains_json(mod, target.shape_index)))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kJsonOpaqueValueDetail);
         return {};
     };
     auto placeholder_slot_expr =
@@ -10635,16 +10654,37 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
     for (u32 i = 0; i < effective_arg_count; i++) {
-        if (analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i) ||
-            !hir_type_shape_contains_array(mod, analyzed_args[i].shape_index))
+        const bool needs_array_carrier =
+            hir_type_shape_contains_array(mod, analyzed_args[i].shape_index);
+        const bool needs_json_struct_carrier =
+            analyzed_args[i].type == HirTypeKind::Struct && fn.body.kind == HirExprKind::JsonBuild;
+        if ((!needs_array_carrier && !needs_json_struct_carrier) ||
+            analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i))
             continue;
         HirLocal carrier{};
         carrier.span = expr.args[i]->span;
-        carrier.name = {"$array_arg", 10};
+        carrier.name = {"$call_arg", 9};
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         if (carrier.ref_index >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.args[i]->span);
         carrier.type = analyzed_args[i].type;
+        carrier.generic_index = analyzed_args[i].generic_index;
+        carrier.associated_name = analyzed_args[i].associated_name;
+        carrier.generic_has_error_constraint = analyzed_args[i].generic_has_error_constraint;
+        carrier.generic_has_eq_constraint = analyzed_args[i].generic_has_eq_constraint;
+        carrier.generic_has_ord_constraint = analyzed_args[i].generic_has_ord_constraint;
+        carrier.generic_protocol_index = analyzed_args[i].generic_protocol_index;
+        carrier.generic_protocol_count = analyzed_args[i].generic_protocol_count;
+        for (u32 cpi = 0; cpi < carrier.generic_protocol_count; cpi++)
+            carrier.generic_protocol_indices[cpi] = analyzed_args[i].generic_protocol_indices[cpi];
+        carrier.variant_index = analyzed_args[i].variant_index;
+        carrier.struct_index = analyzed_args[i].struct_index;
+        carrier.tuple_len = analyzed_args[i].tuple_len;
+        for (u32 ti = 0; ti < carrier.tuple_len; ti++) {
+            carrier.tuple_types[ti] = analyzed_args[i].tuple_types[ti];
+            carrier.tuple_variant_indices[ti] = analyzed_args[i].tuple_variant_indices[ti];
+            carrier.tuple_struct_indices[ti] = analyzed_args[i].tuple_struct_indices[ti];
+        }
         carrier.shape_index = analyzed_args[i].shape_index;
         carrier.init = analyzed_args[i];
         if (!route->locals.push(carrier))
