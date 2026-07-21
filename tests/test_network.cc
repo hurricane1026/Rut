@@ -12741,6 +12741,34 @@ TEST(state_invariant, h2_proxy_timeout_tears_down_upstream_before_sending_504) {
     c->h2 = nullptr;
 }
 
+TEST(state_invariant, h2_followup_proxy_flush_releases_prior_capture) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 1;
+    h2.async_kind = H2AsyncKind::Proxy;
+    c->h2 = &h2;
+    c->protocol = ConnProtocol::Http2;
+    c->epoch_held = true;
+    // SmallLoop has no SlicePool; the pointer is only an ownership sentinel for
+    // this callback-level regression.
+    c->response_capture_slice = c->recv_slice;
+    static const u8 kResponse[] = {0, 0, 0, 1};
+
+    h2_proxy_flush(&loop, *c, kResponse, sizeof(kResponse));
+
+    CHECK_EQ(c->response_capture_slice, nullptr);
+    CHECK_EQ(h2.async_stream, 0u);
+    CHECK(!c->epoch_held);
+    CHECK_EQ(c->on_send, &on_h2_sent<SmallLoop>);
+    c->h2 = nullptr;
+}
+
 TEST(state_invariant, jit_timer_yield_keeps_exec_handler_slots_clear) {
     SmallLoop loop;
     loop.setup();

@@ -593,6 +593,10 @@ public:
     // Called inline from dispatch() when a stale CQE completes reclamation,
     // so a later Accept in the same batch can reuse the slot immediately.
     void reclaim_slot(u32 cid) {
+        if (conns[cid].request_capture_slice) {
+            pool.free(conns[cid].request_capture_slice);
+            conns[cid].request_capture_slice = nullptr;
+        }
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -624,6 +628,10 @@ public:
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
             if (conns[cid].pending_ops == 0) {
+                if (conns[cid].request_capture_slice) {
+                    pool.free(conns[cid].request_capture_slice);
+                    conns[cid].request_capture_slice = nullptr;
+                }
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -742,10 +750,6 @@ public:
             pool.free(c.response_capture_slice);
             c.response_capture_slice = nullptr;
         }
-        if (c.request_capture_slice) {
-            pool.free(c.request_capture_slice);
-            c.request_capture_slice = nullptr;
-        }
         // WebSocket terminate reassembly slices are CPU-only scratch (never handed to a
         // kernel op), so reclaim them now regardless of the async deferred path below.
         if (c.ws_c2u_msg) {
@@ -762,6 +766,7 @@ public:
             // need to defer. This avoids blocking alloc_conn at saturation
             // when a close and accept arrive in the same dispatch batch.
             if (c.pending_ops == 0) {
+                if (c.request_capture_slice) pool.free(c.request_capture_slice);
                 if (c.recv_slice) pool.free(c.recv_slice);
                 if (c.send_slice) pool.free(c.send_slice);
                 if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -774,11 +779,13 @@ public:
             u8* rs = c.recv_slice;
             u8* ss = c.send_slice;
             u8* us = c.upstream_recv_slice;
+            u8* request_capture = c.request_capture_slice;
             u32 ops = c.pending_ops;
             c.reset();
             conns[cid].recv_slice = rs;
             conns[cid].send_slice = ss;
             conns[cid].upstream_recv_slice = us;
+            conns[cid].request_capture_slice = request_capture;
             conns[cid].pending_ops = ops;
             pending_free[pending_free_count++] = cid;
         } else {
@@ -787,6 +794,7 @@ public:
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+            if (c.request_capture_slice) pool.free(c.request_capture_slice);
             c.reset();
             free_stack[free_top++] = cid;
         }

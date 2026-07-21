@@ -1665,7 +1665,10 @@ void handle_jit_outcome(Loop* loop,
                                              outcome.status_code == 304;
             const bool body_mutated = outcome.response_ctx != nullptr &&
                                       outcome.response_ctx->response_body_mutation_set;
-            if (header_count != 0) {
+            // HEAD and bodyless statuses must take the header-aware formatter even
+            // when mutations removed every effective header.  The simpler body
+            // formatters below always write their supplied payload.
+            if (header_count != 0 || captured_head || status_forbids_body) {
                 const char* body_data = nullptr;
                 u32 body_len = 0;
                 bool body_is_fallback = false;
@@ -2844,6 +2847,15 @@ void h2_proxy_teardown_upstream(Loop* loop, Connection& conn) {
 // so a caller-owned stack buffer is fine.
 template <typename Loop>
 void h2_proxy_flush(Loop* loop, Connection& conn, const u8* src, u32 resp_len) {
+    // A capture followed by a terminal buffered forward keeps the first
+    // response slice alive while the resumed handler may still reference it.
+    // Serialization is the last such use, so release it before clearing the
+    // async slot on both the success and failure paths.
+    if (conn.response_capture_slice != nullptr) {
+        if constexpr (requires { loop->pool.free(conn.response_capture_slice); })
+            loop->pool.free(conn.response_capture_slice);
+        conn.response_capture_slice = nullptr;
+    }
     h2_clear_async(*conn.h2);
     h2_async_epoch_leave(loop, conn);  // proxy episode done — release the config epoch
     if (resp_len == 0) {
@@ -2964,6 +2976,19 @@ void h2_proxy_finish(Loop* loop,
             cursor += effective[i].value_len;
             capture_ctx->captured_response_headers[capture_ctx->captured_response_header_count++] =
                 {{name, effective[i].key_len}, {value, effective[i].value_len}};
+        }
+        // http2_write_response has a fixed 8 KiB HPACK block.  Reject a
+        // captured fixture before exposing it to the resumed handler when its
+        // raw fields plus worst-case literal framing cannot fit that encoder.
+        // This avoids a seemingly successful capture later turning into a 500.
+        static constexpr u32 kH2HeaderBlockCap = 8192;
+        static constexpr u32 kHpackFieldOverhead = 11;
+        static constexpr u32 kStatusAndTableUpdateReserve = 32;
+        if (cursor + effective_count * kHpackFieldOverhead +
+                kStatusAndTableUpdateReserve >
+            kH2HeaderBlockCap) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
         }
         if (body_len > SlicePool::kSliceSize - cursor) {
             h2_proxy_fail(loop, conn, 502);

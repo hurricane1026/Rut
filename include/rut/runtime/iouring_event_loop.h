@@ -457,6 +457,10 @@ public:
     }
 
     void reclaim_slot(u32 cid) {
+        if (conns[cid].request_capture_slice) {
+            pool.free(conns[cid].request_capture_slice);
+            conns[cid].request_capture_slice = nullptr;
+        }
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -485,6 +489,10 @@ public:
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
             if (conns[cid].pending_ops == 0) {
+                if (conns[cid].request_capture_slice) {
+                    pool.free(conns[cid].request_capture_slice);
+                    conns[cid].request_capture_slice = nullptr;
+                }
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -546,10 +554,6 @@ public:
             pool.free(c.response_capture_slice);
             c.response_capture_slice = nullptr;
         }
-        if (c.request_capture_slice) {
-            pool.free(c.request_capture_slice);
-            c.request_capture_slice = nullptr;
-        }
         // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
@@ -578,6 +582,7 @@ public:
         }
         // If no ops are in flight, reclaim immediately.
         if (c.pending_ops == 0) {
+            if (c.request_capture_slice) pool.free(c.request_capture_slice);
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
@@ -591,6 +596,9 @@ public:
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         u8* us = c.upstream_recv_slice;
+        // A buffered-forward upstream send may source this slice directly.
+        // Preserve it until every CQE drains, just like the regular send slices.
+        u8* request_capture = c.request_capture_slice;
         u8* tin = c.tls_in_slice;
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
@@ -598,6 +606,7 @@ public:
         conns[cid].recv_slice = rs;
         conns[cid].send_slice = ss;
         conns[cid].upstream_recv_slice = us;
+        conns[cid].request_capture_slice = request_capture;
         conns[cid].tls_in_slice = tin;
         conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
