@@ -33847,6 +33847,100 @@ TEST(frontend, imported_array_shapes_reinstantiate_generic_nominal_elements) {
     rir.destroy();
 }
 
+TEST(frontend, empty_array_call_arguments_use_concrete_parameter_shape) {
+    const char* src =
+        "func keep(values: [str]) -> [str] => values "
+        "route GET \"/x\" { let values = keep([]) return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_array_variant_payloads_without_runtime_slots) {
+    const char* src =
+        "variant Values { some([i32]), none } "
+        "route GET \"/x\" { let value = Values.some([1]) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, rejects_recursive_array_carriers_without_predeclared_struct_slots) {
+    const char* src =
+        "struct Node { children: [Node] } "
+        "route GET \"/x\" { let nodes: [Node] = [] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, conditional_json_helpers_materialize_struct_arguments_once) {
+    const char* src = R"rut(
+struct Payload { a: str, b: str }
+func encode(flag: bool, p: Payload) -> Json {
+    if flag { json(p) } else { json(p) }
+}
+route GET "/x" {
+    let body = encode(req.http11, Payload(a: req.path, b: "fixed"))
+    return 200, body
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    u32 path_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            path_reads += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqPath;
+    CHECK_EQ(path_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, response_json_body_rejects_wait_result_capture) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+route GET "/x" {
+    let resp = response(200)
+    let ev = wait(upstream(api).connect())
+    resp.body = json({ ok: ev.ok })
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, rejects_response_reads_between_multiple_helper_assignments) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    let saved = resp.status
+    resp.status = 202
+    saved
+}
+route GET "/x" {
+    let resp = response(200)
+    let saved = rewrite(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
