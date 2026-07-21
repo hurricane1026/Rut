@@ -5532,6 +5532,19 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
+static bool route_reads_response_field(const HirRoute& route);
+
+static bool function_has_response_effects(const HirFunction& fn) {
+    for (u32 ei = 0; ei < fn.exprs.len; ei++) {
+        const auto kind = fn.exprs[ei].kind;
+        if (kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+            kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+            kind == HirExprKind::RespSetBody)
+            return true;
+    }
+    return false;
+}
+
 static FrontendResult<void> instantiate_function_response_effects(
     const HirFunction& fn,
     HirRoute* route,
@@ -5542,6 +5555,21 @@ static FrontendResult<void> instantiate_function_response_effects(
     u32 generic_binding_count,
     Span call_span) {
     if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
+    if (!function_has_response_effects(fn)) return {};
+    if (fn.owns_response_builder) {
+        for (u32 li = 0; li < route->locals.len; li++) {
+            if (route->locals[li].init.kind == HirExprKind::ResponseInit)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    call_span,
+                    lit_str("a helper-local Response builder cannot mutate caller Response state"));
+        }
+    }
+    if (route_reads_response_field(*route))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            call_span,
+            lit_str("response-mutating helpers cannot follow a response field read"));
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
         const auto kind = fn.exprs[ei].kind;
         if (kind != HirExprKind::RespSetHeader && kind != HirExprKind::RespAddHeader &&
@@ -10104,6 +10132,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     expr.span,
                     "respond-capable helper calls are not supported in conditional pipe",
                     nullptr);
+            if (function_has_response_effects(fn))
+                return fail_call(expr.span,
+                                 "response-mutating helpers are not supported in conditional pipe",
+                                 nullptr);
             auto then_expr = instantiate_function_expr(fn.body,
                                                        route,
                                                        mod,
@@ -11999,6 +12031,7 @@ static bool hir_expr_reads_response_field(const HirExpr& expr) {
 }
 
 static bool hir_for_loop_reads_response_field(const HirForLoop& loop) {
+    if (hir_expr_reads_response_field(loop.iter_expr)) return true;
     const auto& body = loop.body;
     for (u32 li = 0; li < body.locals.len; li++)
         if (hir_expr_reads_response_field(body.locals[li].init)) return true;
@@ -12019,6 +12052,14 @@ static bool hir_for_loop_reads_response_field(const HirForLoop& loop) {
                 if (hir_expr_reads_response_field(arm.guards[gi].cond)) return true;
         }
     }
+    return false;
+}
+
+static bool route_reads_response_field(const HirRoute& route) {
+    for (u32 gi = 0; gi < route.guards.len; gi++)
+        if (hir_expr_reads_response_field(route.guards[gi].cond)) return true;
+    for (u32 fi = 0; fi < route.for_loops.len; fi++)
+        if (hir_for_loop_reads_response_field(route.for_loops[fi])) return true;
     return false;
 }
 
@@ -17754,6 +17795,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             all_locals[all_local_count++] = scratch->locals[li];
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
+        for (u32 li = 0; li < scratch->locals.len; li++)
+            fn.owns_response_builder |= scratch->locals[li].init.kind == HirExprKind::ResponseInit;
         for (u32 gi = 0; gi < scratch->guards.len; gi++) {
             const auto& guard = scratch->guards[gi];
             auto normalized_cond = normalize_function_expr(
@@ -19323,6 +19366,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             all_locals[all_local_count++] = scratch.locals[li];
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
+        for (u32 li = 0; li < scratch.locals.len; li++)
+            fn.owns_response_builder |= scratch.locals[li].init.kind == HirExprKind::ResponseInit;
         for (u32 gi = 0; gi < scratch.guards.len; gi++) {
             const auto& guard = scratch.guards[gi];
             auto normalized_cond = normalize_function_expr(

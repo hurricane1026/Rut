@@ -2574,7 +2574,6 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};
     rut_helper_resp_set_body(&frame.ctx, body, sizeof(body));
-    rut_helper_resp_commit_headers(&frame.ctx);
     CHECK(frame.ctx.response_body_mutation_overflow);
 
     const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {

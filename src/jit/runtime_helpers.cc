@@ -506,10 +506,13 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
     hctx->response_body_pending_set = true;
     hctx->response_body_pending_overflow = hctx->response_body_snapshot_failed || body == nullptr ||
                                            len > jit::kMaxResponseBodyMutationBytes;
+    if (hctx->response_body_pending_overflow) hctx->response_body_mutation_overflow = true;
     if (!hctx->response_body_pending_overflow && hctx->response_body_mutation_storage == nullptr) {
         hctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
-        if (hctx->response_body_mutation_storage == nullptr)
+        if (hctx->response_body_mutation_storage == nullptr) {
             hctx->response_body_pending_overflow = true;
+            hctx->response_body_mutation_overflow = true;
+        }
     }
     hctx->response_body_pending_len = hctx->response_body_pending_overflow ? 0 : len;
     if (!hctx->response_body_pending_overflow && len != 0)
