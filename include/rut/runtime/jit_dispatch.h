@@ -171,14 +171,24 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             // vs. headers-only empty body — is documented on the
             // response_body_idx field above).
             if (r.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
-                // A failed/overflowed serializer is a server error, never a
-                // partial JSON response. The helper clears valid before work.
-                if ((ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) &&
-                    !response_status_forbids_body(out.status_code)) {
-                    out.status_code = 500;
-                } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
-                    out.dynamic_response_body = ctx.response_body_data;
-                    out.dynamic_response_body_len = ctx.response_body_len;
+                // A committed Response.body replacement supersedes the
+                // terminal body's serializer result. In particular, a failed
+                // JSON serialization that is being replaced must not force a
+                // 500 while the replacement itself is valid.
+                if (ctx.response_body_mutation_set) {
+                    out.response_body_idx = 0;
+                } else {
+                    // A failed/overflowed serializer is a server error, never
+                    // a partial JSON response. The helper clears valid before
+                    // work.
+                    if ((ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) &&
+                        !response_status_forbids_body(out.status_code)) {
+                        out.status_code = 500;
+                    } else if (ctx.response_body_valid != 0 &&
+                               ctx.response_body_data != nullptr) {
+                        out.dynamic_response_body = ctx.response_body_data;
+                        out.dynamic_response_body_len = ctx.response_body_len;
+                    }
                 }
             } else {
                 out.response_body_idx = r.upstream_id;

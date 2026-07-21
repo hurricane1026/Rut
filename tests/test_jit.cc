@@ -1976,6 +1976,27 @@ TEST(jit, response_body_mutation_copies_source_bytes) {
     CHECK(outcome.dynamic_response_body == frame.ctx.response_body_mutation_storage);
 }
 
+TEST(jit, response_body_mutation_replaces_failed_dynamic_json) {
+    TestHandlerCtxFrame frame{};
+    rut_helper_resp_set_status(&frame.ctx, 202);
+    rut_helper_resp_set_body(&frame.ctx, "replacement", 11);
+    rut_helper_resp_commit_headers(&frame.ctx);
+    REQUIRE(frame.ctx.response_body_mutation_set);
+    CHECK_EQ(frame.ctx.response_body_valid, 0u);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        HandlerResult result = HandlerResult::make_status(200);
+        result.upstream_id = HandlerResult::kDynamicResponseBody;
+        return result.pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 202u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str replacement{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(replacement.eq(lit("replacement")));
+}
+
 TEST(jit, cache_helpers_miss_and_out_of_range) {
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {64};
