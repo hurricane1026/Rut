@@ -533,11 +533,17 @@ void rut_helper_resp_body(
     *out_ptr = fallback_ptr;
     *out_len = fallback_len;
     if (ctx == nullptr) return;
-    const auto* hctx = static_cast<const jit::HandlerCtx*>(ctx);
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     // Overflow is already a fail-closed terminal condition. Do not expose a
     // partial or dangling value to later expressions while building that 500.
     if (!hctx->response_body_pending_set || hctx->response_body_pending_overflow) return;
-    *out_ptr = hctx->response_body_pending_data;
+    const char* snapshot = jit::snapshot_response_body(
+        hctx, hctx->response_body_mutation_storage, hctx->response_body_pending_len);
+    if (snapshot == nullptr) {
+        hctx->response_body_pending_overflow = true;
+        return;
+    }
+    *out_ptr = snapshot;
     *out_len = hctx->response_body_pending_len;
 }
 

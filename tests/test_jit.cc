@@ -2331,6 +2331,55 @@ TEST(jit, response_status_read_preserves_invalid_pending_value_until_fail_closed
     CHECK_EQ(frame.ctx.response_status, 0u);
 }
 
+TEST(jit, response_body_read_is_an_immutable_snapshot_across_later_assignment) {
+    const auto src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.body = "long"
+    let saved = resp.body
+    resp.body = "x"
+    resp.set("X-Saved", saved)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kRequest),
+                                            sizeof(kRequest) - 1,
+                                            nullptr);
+    REQUIRE(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("x")));
+    REQUIRE_EQ(frame.ctx.response_header_count, 1u);
+    CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-Saved")));
+    CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("long")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, response_body_mutation_overflow_fails_closed) {
     TestHandlerCtxFrame frame{};
     static char body[kMaxResponseBodyMutationBytes + 1]{};

@@ -129,6 +129,7 @@ struct ResponseHeaderMutation {
     Str value;
     ResponseHeaderMutationMode mode;
 };
+struct ResponseBodySnapshotStorage;
 
 // ── Handler Context ────────────────────────────────────────────────
 // Per-request mutable context, allocated from the scratch Arena.
@@ -179,6 +180,10 @@ struct alignas(alignof(u64)) HandlerCtx {
     // mutable/temporary source bytes survive yields without adding 4 KiB to
     // every preallocated connection context.
     char* response_body_mutation_storage;
+    // Immutable copies returned by resp.body. Kept outside HandlerCtx so saved
+    // Str values survive later body assignments and yields without embedding
+    // another body-sized arena in every preallocated connection.
+    ResponseBodySnapshotStorage* response_body_snapshot_storage;
 
     // Access slot storage (8-byte aligned, immediately after header).
     u8* slots() { return reinterpret_cast<u8*>(this + 1); }

@@ -229,14 +229,22 @@ TEST(harness_handler, copying_session_clones_mutated_response_body_storage) {
     static const char kBody[] = "fork-safe";
     rut_helper_resp_set_body(&original.frame.context, kBody, sizeof(kBody) - 1);
     REQUIRE(original.frame.context.response_body_mutation_storage != nullptr);
+    const char* snapshot = nullptr;
+    u32 snapshot_len = 0;
+    rut_helper_resp_body(&original.frame.context, nullptr, 0, &snapshot, &snapshot_len);
+    REQUIRE(snapshot != nullptr);
+    REQUIRE_EQ(snapshot_len, sizeof(kBody) - 1);
 
     harness::HandlerExecution fork = original;
     REQUIRE(fork.frame.context.response_body_mutation_storage != nullptr);
+    CHECK(fork.frame.context.response_body_snapshot_storage ==
+          original.frame.context.response_body_snapshot_storage);
     CHECK(fork.frame.context.response_body_mutation_storage !=
           original.frame.context.response_body_mutation_storage);
     __builtin_memset(original.frame.context.response_body_mutation_storage, 'x', sizeof(kBody) - 1);
     CHECK(std::memcmp(
               fork.frame.context.response_body_mutation_storage, kBody, sizeof(kBody) - 1) == 0);
+    CHECK(std::memcmp(snapshot, kBody, sizeof(kBody) - 1) == 0);
 }
 
 TEST(harness_handler, advances_virtual_time_for_timer_yield) {
