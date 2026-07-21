@@ -1077,6 +1077,8 @@ template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
     h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
+        if (conn.h2->async_apply_response_mutations)
+            conn.handler_ctx = conn.h2->async_jit_ctx();
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }

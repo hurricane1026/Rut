@@ -1635,8 +1635,23 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!build_tuple_field_name(*b.mod->arena, static_cast<u32>(value.int_value), &field_name))
             return frontend_error(FrontendError::OutOfMemory, span);
         const auto slot_shape = resolved_shape(mir, value);
-        auto field_type = rir_type_for_flat_shape(
-            slot_shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
+        auto field_type =
+            (slot_shape.type == MirTypeKind::Array || slot_shape.type == MirTypeKind::Tuple)
+                ? rir_type_for_shape_index(mir,
+                                           value.shape_index,
+                                           variant_infos,
+                                           tuple_infos,
+                                           tuple_info_count,
+                                           user_struct_defs,
+                                           b,
+                                           span)
+                : rir_type_for_flat_shape(slot_shape,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          user_struct_defs,
+                                          b,
+                                          span);
         if (!field_type) return core::make_unexpected(field_type.error());
         auto field = b.emit_struct_field(
             subject.value(), field_name, field_type.value(), {span.line, span.col});
@@ -1973,6 +1988,21 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                                    span);
                 if (!ty) return core::make_unexpected(ty.error());
                 field_type = ty.value();
+            } else if (field_shape.type == MirTypeKind::Tuple) {
+                auto tuple_info = get_or_create_tuple_lowering(field_shape.tuple_len,
+                                                               field_shape.tuple_types,
+                                                               field_shape.tuple_variant_indices,
+                                                               field_shape.tuple_struct_indices,
+                                                               variant_infos,
+                                                               user_struct_defs,
+                                                               tuple_infos,
+                                                               tuple_info_count,
+                                                               b,
+                                                               span,
+                                                               &mir,
+                                                               field.shape_index);
+                if (!tuple_info) return core::make_unexpected(tuple_info.error());
+                field_type = tuple_info.value()->struct_type;
             } else {
                 auto ty = rir_type_for_flat_shape(field_shape,
                                                   variant_infos,
