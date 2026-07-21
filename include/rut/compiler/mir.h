@@ -255,6 +255,7 @@ struct MirHeaderKV {
 
 struct MirTerminator {
     static constexpr u32 kMaxJsonDynamicValues = 8;
+    static constexpr u32 kMaxJsonMaterializedValues = kMaxJsonDynamicValues + 1;
     MirTerminatorKind kind = MirTerminatorKind::ReturnStatus;
     Span span{};
     MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;
@@ -279,6 +280,7 @@ struct MirTerminator {
     bool has_dynamic_response_body = false;
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
+    FixedVec<MirLocal, kMaxJsonMaterializedValues> json_locals;
     // Optional response headers carried from HIR. Inline-stored.
     // len == 0 means "no kwarg". lower_rir interns these into the
     // RIR module's shared header pool.
@@ -460,6 +462,8 @@ private:
             rebase_value(blocks[i].term.cond, other);
             rebase_value(blocks[i].term.lhs, other);
             rebase_value(blocks[i].term.rhs, other);
+            for (u32 li = 0; li < blocks[i].term.json_locals.len; li++)
+                rebase_value(blocks[i].term.json_locals[li].init, other);
         }
     }
 };

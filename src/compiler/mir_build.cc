@@ -1161,7 +1161,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
+        bool term_json_copy_failed = false;
+        Diagnostic term_json_copy_error{};
+        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
@@ -1177,15 +1179,60 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->has_dynamic_response_body = term.has_dynamic_response_body;
             out->json_segments.len = 0;
             out->json_value_ref_indices.len = 0;
+            out->json_locals.len = 0;
             static_assert(
                 HirTerminator::kMaxJsonDynamicValues == MirTerminator::kMaxJsonDynamicValues,
                 "HIR/MIR dynamic JSON caps must match");
+            static_assert(HirTerminator::kMaxJsonMaterializedValues ==
+                              MirTerminator::kMaxJsonMaterializedValues,
+                          "HIR/MIR dynamic JSON materialization caps must match");
+            static_assert(HirRoute::kMaxLocals == MirFunction::kMaxLocals,
+                          "HIR/MIR local ref ranges must match");
             for (u32 ji = 0; ji < term.json_segments.len; ji++) {
                 if (!out->json_segments.push(term.json_segments[ji])) __builtin_trap();
             }
             for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
                 if (!out->json_value_ref_indices.push(term.json_value_ref_indices[ji]))
                     __builtin_trap();
+            }
+            for (u32 ji = 0; ji < term.json_value_expr_indices.len; ji++) {
+                const u32 expr_index = term.json_value_expr_indices[ji];
+                if (expr_index >= module.routes[i].exprs.len) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error =
+                        Diagnostic{FrontendError::UnsupportedSyntax, term.span, {}};
+                    return;
+                }
+                const auto& value = module.routes[i].exprs[expr_index];
+                MirLocal local{};
+                local.span = value.span;
+                local.ref_index = MirFunction::kMaxLocals + ji;
+                local.type = mir_type_kind(value.type);
+                local.shape_index = value.shape_index;
+                local.may_nil = value.may_nil;
+                local.may_error = value.may_error;
+                local.variant_index = value.variant_index;
+                local.struct_index = value.struct_index;
+                local.tuple_len = value.tuple_len;
+                for (u32 ti = 0; ti < local.tuple_len; ti++) {
+                    local.tuple_types[ti] = mir_type_kind(value.tuple_types[ti]);
+                    local.tuple_variant_indices[ti] = value.tuple_variant_indices[ti];
+                    local.tuple_struct_indices[ti] = value.tuple_struct_indices[ti];
+                }
+                local.error_struct_index = value.error_struct_index;
+                local.error_variant_index = value.error_variant_index;
+                auto init = mir_value(value, module, &fn);
+                if (!init) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error = init.error();
+                    return;
+                }
+                local.init = init.value();
+                if (!out->json_locals.push(local)) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error = Diagnostic{FrontendError::TooManyItems, term.span, {}};
+                    return;
+                }
             }
             out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;
@@ -3216,6 +3263,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        if (term_json_copy_failed) return core::make_unexpected(term_json_copy_error);
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 

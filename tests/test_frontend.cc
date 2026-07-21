@@ -31753,9 +31753,10 @@ route GET "/x" {
     const auto& term = route.control.direct_term;
     CHECK(term.has_dynamic_response_body);
     REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
-    REQUIRE_EQ(route.locals.len, 9u);
-    CHECK_EQ(route.locals[0].type, HirTypeKind::Struct);
-    CHECK_EQ(route.locals[0].init.kind, HirExprKind::StructInit);
+    REQUIRE_EQ(route.locals.len, 0u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 9u);
+    CHECK_EQ(route.exprs[term.json_value_expr_indices[0]].type, HirTypeKind::Struct);
+    CHECK_EQ(route.exprs[term.json_value_expr_indices[0]].kind, HirExprKind::StructInit);
 }
 
 TEST(frontend, return_json_does_not_materialize_nested_struct_fields) {
@@ -31779,11 +31780,42 @@ route GET "/x" {
     const auto& term = route.control.direct_term;
     CHECK(term.has_dynamic_response_body);
     REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
-    REQUIRE_EQ(route.locals.len, 9u);
-    u32 struct_local_count = 0;
-    for (u32 i = 0; i < route.locals.len; i++)
-        if (route.locals[i].type == HirTypeKind::Struct) struct_local_count++;
-    CHECK_EQ(struct_local_count, 1u);
+    REQUIRE_EQ(route.locals.len, 0u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 9u);
+    u32 struct_value_count = 0;
+    for (u32 i = 0; i < term.json_value_expr_indices.len; i++)
+        if (route.exprs[term.json_value_expr_indices[i]].type == HirTypeKind::Struct)
+            struct_value_count++;
+    CHECK_EQ(struct_value_count, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, return_json_reuses_terminal_carriers_across_exclusive_paths) {
+    const char* src = R"rut(
+struct Payload { a: str, b: str, c: str, d: str, e: str, f: str, g: str, h: str }
+route GET "/x" {
+    let payload = Payload(a: req.path, b: req.path, c: req.path, d: req.path,
+                          e: req.path, f: req.path, g: req.path, h: req.path)
+    guard req.http11 else { return 400, json(payload) }
+    return 200, json(payload)
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.locals.len, 1u);
+    REQUIRE_EQ(route.guards.len, 1u);
+    CHECK_EQ(route.guards[0].fail_term.json_value_expr_indices.len, 8u);
+    CHECK_EQ(route.control.direct_term.json_value_expr_indices.len, 8u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
