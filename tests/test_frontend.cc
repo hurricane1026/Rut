@@ -31713,6 +31713,29 @@ route GET "/x" {
     CHECK(term.json_segments[3].eq(lit("}")));
 }
 
+TEST(frontend, return_json_materializes_wide_inline_struct_once) {
+    const char* src = R"rut(
+struct Payload { a: str, b: str, c: str, d: str, e: str, f: str, g: str, h: str }
+route GET "/x" {
+    return 200, json(Payload(a: req.path, b: req.path, c: req.path, d: req.path,
+                             e: req.path, f: req.path, g: req.path, h: req.path))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    const auto& term = route.control.direct_term;
+    CHECK(term.has_dynamic_response_body);
+    REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
+    REQUIRE_EQ(route.locals.len, 9u);
+    CHECK_EQ(route.locals[0].type, HirTypeKind::Struct);
+    CHECK_EQ(route.locals[0].init.kind, HirExprKind::StructInit);
+}
+
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
     const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
     const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));

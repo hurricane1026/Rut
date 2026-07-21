@@ -482,6 +482,7 @@ enum class KnownValueState : u8 {
 
 struct MatchPayloadBinding {
     Str name{};
+    u32 outer_local_count = 0;
     HirTypeKind type = HirTypeKind::Unknown;
     u32 generic_index = 0xffffffffu;
     bool generic_has_error_constraint = false;
@@ -4906,8 +4907,10 @@ static void bind_match_payload(MatchPayloadBinding* binding,
                                Str name,
                                const HirVariant::CaseDecl& case_decl,
                                u32 case_index,
-                               const HirExpr* subject) {
+                               const HirExpr* subject,
+                               u32 outer_local_count) {
     binding->name = name;
+    binding->outer_local_count = outer_local_count;
     binding->type = case_decl.payload_type;
     binding->generic_index = case_decl.payload_generic_index;
     binding->generic_has_error_constraint = case_decl.payload_generic_has_error_constraint;
@@ -5789,7 +5792,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                    arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
-                                   subject_ptr);
+                                   subject_ptr,
+                                   local_count);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -5963,8 +5967,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 const auto& case_decl = mod.variants[pattern->variant_index].cases[case_index];
                 if (case_decl.has_payload && arm.pattern->lhs != nullptr) {
-                    bind_match_payload(
-                        &arm_binding, arm.pattern->lhs->name, case_decl, case_index, subject_ptr);
+                    bind_match_payload(&arm_binding,
+                                       arm.pattern->lhs->name,
+                                       case_decl,
+                                       case_index,
+                                       subject_ptr,
+                                       local_count);
                     arm_binding_ptr = &arm_binding;
                 }
             }
@@ -8487,11 +8495,13 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         expr.kind == AstExprKind::Mul || expr.kind == AstExprKind::Div ||
         expr.kind == AstExprKind::Mod)
         return analyze_arith_expr(expr, route, mod, locals, local_count, binding);
-    // Scan newest-first so a same-name rebinding (e.g. the `guard let x`
-    // shorthand's narrowed local) shadows the earlier binding.
+    const bool matches_payload_binding = binding && binding->subject && expr.name.eq(binding->name);
+    // Scan newest-first so locals declared inside the arm shadow its payload
+    // binding. The payload itself shadows locals from the enclosing scope.
     for (u32 ri = local_count; ri > 0; ri--) {
         const u32 i = ri - 1;
         if (locals[i].name.eq(expr.name)) {
+            if (matches_payload_binding && i < binding->outer_local_count) continue;
             if (locals[i].type == HirTypeKind::Tuple) {
                 HirExpr tuple = locals[i].init;
                 tuple.span = expr.span;
@@ -8536,7 +8546,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
     }
-    if (binding && binding->subject && expr.name.eq(binding->name)) {
+    if (matches_payload_binding) {
         out.kind = HirExprKind::MatchPayload;
         out.type = binding->type;
         out.generic_index = binding->generic_index;
@@ -9910,6 +9920,7 @@ static FrontendResult<void> build_dynamic_json_plan(
     const HirModule& mod,
     std::vector<std::string>& segments,
     FixedVec<u32, HirTerminator::kMaxJsonDynamicValues>& value_refs,
+    const MatchPayloadBinding* binding,
     u32 depth = 0) {
     if (depth > 32)
         return frontend_error(FrontendError::TooManyItems, expr.span, kJsonLiteralDetail);
@@ -9942,7 +9953,7 @@ static FrontendResult<void> build_dynamic_json_plan(
                 !append_json_bytes(segments.back(), ":", 1))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
             auto child = build_dynamic_json_plan(
-                *expr.field_inits[i].value, route, mod, segments, value_refs, depth + 1);
+                *expr.field_inits[i].value, route, mod, segments, value_refs, binding, depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -9955,8 +9966,8 @@ static FrontendResult<void> build_dynamic_json_plan(
         for (u32 i = 0; i < expr.args.len; i++) {
             if (i != 0 && !append_json_bytes(segments.back(), ",", 1))
                 return frontend_error(FrontendError::TooManyItems, expr.span);
-            auto child =
-                build_dynamic_json_plan(*expr.args[i], route, mod, segments, value_refs, depth + 1);
+            auto child = build_dynamic_json_plan(
+                *expr.args[i], route, mod, segments, value_refs, binding, depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "]", 1))
@@ -9964,14 +9975,52 @@ static FrontendResult<void> build_dynamic_json_plan(
         return {};
     }
 
-    auto value = analyze_expr(expr, route, mod, route->locals.data, route->locals.len, nullptr);
+    auto value = analyze_expr(expr, route, mod, route->locals.data, route->locals.len, binding);
     if (!value) return core::make_unexpected(value.error());
     if (value->type == HirTypeKind::Struct && !value->may_nil && !value->may_error) {
         if (value->struct_index >= mod.structs.len)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        if (route->locals.len >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+
+        HirLocal local{};
+        local.span = expr.span;
+        local.name = intern_generated_name("$json.struct." + std::to_string(route->locals.len));
+        local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        local.type = value->type;
+        local.generic_index = value->generic_index;
+        local.associated_name = value->associated_name;
+        local.generic_has_error_constraint = value->generic_has_error_constraint;
+        local.generic_has_eq_constraint = value->generic_has_eq_constraint;
+        local.generic_has_ord_constraint = value->generic_has_ord_constraint;
+        local.generic_protocol_index = value->generic_protocol_index;
+        local.generic_protocol_count = value->generic_protocol_count;
+        for (u32 i = 0; i < local.generic_protocol_count; i++)
+            local.generic_protocol_indices[i] = value->generic_protocol_indices[i];
+        local.may_nil = value->may_nil;
+        local.may_error = value->may_error;
+        local.variant_index = value->variant_index;
+        local.struct_index = value->struct_index;
+        local.tuple_len = value->tuple_len;
+        for (u32 i = 0; i < local.tuple_len; i++) {
+            local.tuple_types[i] = value->tuple_types[i];
+            local.tuple_variant_indices[i] = value->tuple_variant_indices[i];
+            local.tuple_struct_indices[i] = value->tuple_struct_indices[i];
+        }
+        local.shape_index = value->shape_index;
+        local.error_struct_index = value->error_struct_index;
+        local.error_variant_index = value->error_variant_index;
+        local.init = value.value();
+        if (!route->locals.push(local))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+
         const auto& decl = mod.structs[value->struct_index];
         if (!append_json_bytes(segments.back(), "{", 1))
             return frontend_error(FrontendError::TooManyItems, expr.span);
+        AstExpr local_ref{};
+        local_ref.kind = AstExprKind::Ident;
+        local_ref.span = expr.span;
+        local_ref.name = local.name;
         for (u32 i = 0; i < decl.fields.len; i++) {
             if ((i != 0 && !append_json_bytes(segments.back(), ",", 1)) ||
                 !append_json_quoted(segments.back(), decl.fields[i].name) ||
@@ -9980,10 +10029,10 @@ static FrontendResult<void> build_dynamic_json_plan(
             AstExpr field{};
             field.kind = AstExprKind::Field;
             field.span = expr.span;
-            field.lhs = const_cast<AstExpr*>(&expr);
+            field.lhs = &local_ref;
             field.name = decl.fields[i].name;
-            auto child =
-                build_dynamic_json_plan(field, route, mod, segments, value_refs, depth + 1);
+            auto child = build_dynamic_json_plan(
+                field, route, mod, segments, value_refs, binding, depth + 1);
             if (!child) return child;
         }
         if (!append_json_bytes(segments.back(), "}", 1))
@@ -10016,7 +10065,8 @@ static FrontendResult<void> build_dynamic_json_plan(
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
-                                                  HirRoute* route = nullptr) {
+                                                  HirRoute* route = nullptr,
+                                                  const MatchPayloadBinding* binding = nullptr) {
     HirTerminator term{};
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
@@ -10053,8 +10103,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                               stmt.expr.span,
                                               kReturnBodyExprDetail);
                     std::vector<std::string> segments(1);
-                    auto plan = build_dynamic_json_plan(
-                        *stmt.expr.args[0], route, mod, segments, term.json_value_ref_indices);
+                    auto plan = build_dynamic_json_plan(*stmt.expr.args[0],
+                                                        route,
+                                                        mod,
+                                                        segments,
+                                                        term.json_value_ref_indices,
+                                                        binding);
                     if (!plan) return core::make_unexpected(plan.error());
                     for (const auto& segment : segments) {
                         if (!term.json_segments.push(intern_generated_name(segment)))
@@ -10584,7 +10638,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                    inner_arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
-                                   subject_ptr);
+                                   subject_ptr,
+                                   local_count);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -10695,7 +10750,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     }
                 } else {
                     if (is_ast_hir_terminator(*inner.else_stmt)) {
-                        auto fail_term = analyze_term(*inner.else_stmt, mod);
+                        auto fail_term = analyze_term(*inner.else_stmt, mod, route, binding);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
@@ -10836,9 +10891,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();
@@ -10846,7 +10901,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
 
     arm->body_kind = HirMatchArm::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod, route);
+    auto term = analyze_term(stmt, mod, route, binding);
     if (!term) return core::make_unexpected(term.error());
     arm->direct_term = term.value();
     return {};
@@ -10951,16 +11006,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         body->then_term = then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, route, binding);
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
@@ -11062,7 +11117,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                    arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
-                                   subject_ptr);
+                                   subject_ptr,
+                                   route->locals.len);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -11107,9 +11163,9 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
-            auto then_term = analyze_term(*stmt.then_stmt, mod);
+            auto then_term = analyze_term(*stmt.then_stmt, mod, route, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*stmt.else_stmt, mod);
+            auto else_term = analyze_term(*stmt.else_stmt, mod, route, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
@@ -11349,7 +11405,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                        arm.pattern->lhs->name,
                                                        case_decl,
                                                        matched_pattern.case_index,
-                                                       &subject.value());
+                                                       &subject.value(),
+                                                       local_count);
                                     arm_binding_ptr = &arm_binding;
                                 }
                             }
@@ -11738,6 +11795,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                 case_decl.payload_tuple_struct_indices[ti];
                         }
                         arm_binding.name = hir_arm.bind_name;
+                        arm_binding.outer_local_count = local_count;
                         arm_binding.type = hir_arm.bind_type;
                         arm_binding.generic_index = case_decl.payload_generic_index;
                         arm_binding.generic_has_error_constraint =
@@ -11926,7 +11984,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod, route);
+    auto term = analyze_term(stmt, mod, route, binding);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
     return {};
@@ -14013,8 +14071,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 arm.bind_tuple_struct_indices[ti] =
                                     case_decl.payload_tuple_struct_indices[ti];
                             }
-                            bind_match_payload(
-                                &arm_binding, arm.bind_name, case_decl, case_index, subject_ptr);
+                            bind_match_payload(&arm_binding,
+                                               arm.bind_name,
+                                               case_decl,
+                                               case_index,
+                                               subject_ptr,
+                                               route->locals.len);
                             arm_binding_ptr = &arm_binding;
                         }
                     } else if (ast_arm.pattern->lhs != nullptr) {
