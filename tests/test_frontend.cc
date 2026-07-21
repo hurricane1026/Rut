@@ -32452,10 +32452,9 @@ TEST(frontend, reusable_json_local_can_be_returned) {
     REQUIRE(hir);
     const auto& term = hir->routes[0].control.direct_term;
     CHECK(term.has_dynamic_response_body);
-    REQUIRE_EQ(term.json_value_ref_indices.len, 1u);
-    REQUIRE_EQ(term.json_segments.len, 2u);
-    CHECK(term.json_segments[0].eq(lit("{\"path\":")));
-    CHECK(term.json_segments[1].eq(lit("}")));
+    CHECK_NE(term.json_body_expr_index, 0xffffffffu);
+    CHECK_EQ(term.json_value_ref_indices.len, 0u);
+    CHECK_EQ(term.json_segments.len, 0u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
@@ -32481,8 +32480,9 @@ route GET "/x" {
     REQUIRE(hir);
     const auto& term = hir->routes[0].control.direct_term;
     CHECK(term.has_dynamic_response_body);
-    REQUIRE_EQ(term.json_value_ref_indices.len, 1u);
-    REQUIRE_EQ(term.json_segments.len, 2u);
+    CHECK_NE(term.json_body_expr_index, 0xffffffffu);
+    CHECK_EQ(term.json_value_ref_indices.len, 0u);
+    CHECK_EQ(term.json_segments.len, 0u);
 }
 
 TEST(frontend, response_body_accepts_reusable_json_and_rejects_other_values) {
