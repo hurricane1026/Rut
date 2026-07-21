@@ -15509,6 +15509,90 @@ TEST(frontend, import_relative_file_remaps_array_helper_shapes) {
     rir.destroy();
 }
 
+TEST(frontend, import_array_shapes_remap_nominal_element_indices) {
+    const std::string dir = "/tmp/rut_import_array_nominal_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/arrays.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n"
+               "func keep(values: [Item]) -> [Item] => values\n";
+    }
+    const char* src = R"rut(
+import "arrays.rut"
+struct Dummy { value: str }
+route GET "/x" {
+    let result = keep([Item(value: 1)])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, generic_array_helpers_bind_element_shapes) {
+    const char* src = R"rut(
+func keep<T>(values: [T]) -> [T] => values
+route GET "/x" {
+    let values = keep([1, 2])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, string_lists_are_accepted_by_string_array_parameters) {
+    const char* src = R"rut(
+func count(values: [str]) -> i32 => 1
+route GET "/x" {
+    let value = count(req.queryAll("tag"))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, optional_and_fallible_array_returns_are_rejected) {
+    const char* sources[] = {
+        "func maybe(ok: bool) -> [i32] { if ok { [1] } else { nil } }\n"
+        "route GET \"/x\" { let values = maybe(req.http11) return 200 }\n",
+        "func maybe(ok: bool) -> [i32] { if ok { [1] } else { error(500) } }\n"
+        "route GET \"/x\" { let values = maybe(req.http11) return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit("optional or fallible array returns are not supported")));
+    }
+}
+
 TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
@@ -32558,11 +32642,23 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    CHECK_FALSE(hir->routes[0].control.direct_term.commit_response_mutations);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK_EQ(mir->functions[0].locals.len, 0u);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 body_commits = 0;
+    u32 full_commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            body_commits += block.insts[ii].op == rir::Opcode::RespCommitBody;
+            full_commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(body_commits, 1u);
+    CHECK_EQ(full_commits, 0u);
     rir.destroy();
 }
 
