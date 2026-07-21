@@ -75,6 +75,23 @@ struct JsonResponseScratch {
 };
 thread_local JsonResponseScratch t_json_response;
 
+// Reusable Json values may coexist within one handler invocation (for example,
+// the two eagerly lowered arms of an if-expression). Capture each completed
+// document into a distinct bounded slice so a later JsonBuild cannot overwrite
+// an earlier Str view before the select chooses between them.
+struct JsonCaptureArena {
+    // A route owns at most 64 HIR expressions. In the worst case each is a
+    // distinct eagerly materialized Json alternative, so reserve one bounded
+    // response slice per expression instead of coupling captures to the
+    // unrelated eight-leaf inline-template limit.
+    static constexpr u32 kMaxDocuments = 64;
+    static constexpr u32 kCapacity = kMaxDocuments * JsonResponseScratch::kCapacity;
+    char data[kCapacity]{};
+    u32 len = 0;
+    u32 last_capture_len = 0xffffffffu;
+};
+thread_local JsonCaptureArena t_json_captures;
+
 void json_append(const char* data, u32 len) {
     auto& out = t_json_response;
     if (!out.ok) return;

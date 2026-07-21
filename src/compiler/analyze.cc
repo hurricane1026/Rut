@@ -1029,6 +1029,12 @@ static FrontendResult<u32> instantiate_variant(HirModule* mod,
                                                const GenericBinding* bindings,
                                                u32 binding_count,
                                                Span span) {
+    for (u32 i = 0; i < binding_count; i++) {
+        if (bindings[i].type == HirTypeKind::Json ||
+            (bindings[i].shape_index < mod->type_shapes.len &&
+             hir_type_shape_contains_json(*mod, bindings[i].shape_index)))
+            return frontend_error(FrontendError::UnsupportedSyntax, span, kJsonOpaqueValueDetail);
+    }
     for (u32 i = 0; i < mod->variants.len; i++) {
         if (same_variant_instance_shape(
                 mod->variants[i], template_variant_index, bindings, binding_count))
@@ -1226,6 +1232,12 @@ static FrontendResult<u32> instantiate_struct(HirModule* mod,
                                               const GenericBinding* bindings,
                                               u32 binding_count,
                                               Span span) {
+    for (u32 i = 0; i < binding_count; i++) {
+        if (bindings[i].type == HirTypeKind::Json ||
+            (bindings[i].shape_index < mod->type_shapes.len &&
+             hir_type_shape_contains_json(*mod, bindings[i].shape_index)))
+            return frontend_error(FrontendError::UnsupportedSyntax, span, kJsonOpaqueValueDetail);
+    }
     for (u32 i = 0; i < mod->structs.len; i++) {
         if (same_struct_instance_shape(
                 mod->structs[i], template_struct_index, bindings, binding_count))
