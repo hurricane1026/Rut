@@ -2771,7 +2771,7 @@ void h2_proxy_finish(Loop* loop,
     if (mutations_valid && response_ctx != nullptr && response_ctx->response_status_set)
         status = response_ctx->response_status;
     if (mutations_valid && response_ctx != nullptr && response_ctx->response_body_mutation_set) {
-        body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_data);
+        body = reinterpret_cast<const u8*>(response_ctx->response_body_mutation_storage);
         body_len = response_ctx->response_body_mutation_len;
     }
     if (!mutations_valid || status < 200 || status == 204 || status == 205 || status == 304 ||
@@ -4484,7 +4484,7 @@ void finish_buffered_forward(Loop* loop,
     const char* body =
         reinterpret_cast<const char*>(conn.upstream_recv_buf.data() + parser.header_end);
     if (response_ctx->response_body_mutation_set) {
-        body = response_ctx->response_body_mutation_data;
+        body = response_ctx->response_body_mutation_storage;
         body_len = response_ctx->response_body_mutation_len;
     }
     const bool no_body = status < 200 || status == 204 || status == 205 || status == 304 ||

@@ -6,6 +6,7 @@
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slab_pool.h"
@@ -5374,8 +5375,9 @@ TEST(buffered_forward, applies_committed_status_body_and_header_mutations) {
     ctx->response_status = 201;
     ctx->response_status_set = true;
     static const char kBody[] = "rewritten";
-    __builtin_memcpy(ctx->response_body_pending_storage, kBody, sizeof(kBody) - 1);
-    ctx->response_body_mutation_data = ctx->response_body_pending_storage;
+    ctx->response_body_mutation_storage = rut::jit::acquire_response_body_mutation_storage();
+    REQUIRE(ctx->response_body_mutation_storage != nullptr);
+    __builtin_memcpy(ctx->response_body_mutation_storage, kBody, sizeof(kBody) - 1);
     ctx->response_body_mutation_len = sizeof(kBody) - 1;
     ctx->response_body_mutation_set = true;
     static const char kName[] = "X-After";
@@ -5426,8 +5428,9 @@ TEST(buffered_forward, mutated_205_suppresses_upstream_and_replacement_bodies) {
     ctx->response_status = 205;
     ctx->response_status_set = true;
     static const char kReplacement[] = "rewritten";
-    __builtin_memcpy(ctx->response_body_pending_storage, kReplacement, sizeof(kReplacement) - 1);
-    ctx->response_body_mutation_data = ctx->response_body_pending_storage;
+    ctx->response_body_mutation_storage = rut::jit::acquire_response_body_mutation_storage();
+    REQUIRE(ctx->response_body_mutation_storage != nullptr);
+    __builtin_memcpy(ctx->response_body_mutation_storage, kReplacement, sizeof(kReplacement) - 1);
     ctx->response_body_mutation_len = sizeof(kReplacement) - 1;
     ctx->response_body_mutation_set = true;
 

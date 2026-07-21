@@ -41,6 +41,7 @@ struct TestHandlerCtxFrame {
     u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
 
     TestHandlerCtxFrame() { ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+    ~TestHandlerCtxFrame() { rut_helper_resp_release_body_storage(&ctx); }
 };
 
 // RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all
@@ -1480,6 +1481,77 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_uses_match_payload_binding) {
+    const auto src = R"rut(
+struct Payload { path: str, answer: i32 }
+variant Result { ok(Payload), err }
+route GET "/api/users" {
+    let payload = Payload(path: "outer", answer: 1)
+    let state = Result.ok(Payload(path: req.path, answer: 42))
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
+route GET "/api/error" {
+    let state = Result.err
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42}")));
+
+    auto error_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(error_handler != nullptr);
+    constexpr char kGetErrorRequest[] = "GET /api/error HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    conn.reset();
+    TestHandlerCtxFrame error_frame{};
+    const auto error_outcome = invoke_jit_handler(error_handler,
+                                                  &conn,
+                                                  error_frame.ctx,
+                                                  reinterpret_cast<const u8*>(kGetErrorRequest),
+                                                  sizeof(kGetErrorRequest) - 1,
+                                                  nullptr);
+    CHECK(error_outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(error_outcome.status_code, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_return_json_serializes_runtime_string_lists) {
     const auto src = R"rut(
 route GET "/api/users" {
@@ -1643,6 +1715,63 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, conditional_reusable_json_preserves_selected_plan) {
+    const auto src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.body = choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kHttp11[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    static constexpr char kHttp10[] = "GET /x HTTP/1.0\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame11{};
+    const auto selected_yes = invoke_jit_handler(handler,
+                                                 nullptr,
+                                                 frame11.ctx,
+                                                 reinterpret_cast<const u8*>(kHttp11),
+                                                 sizeof(kHttp11) - 1,
+                                                 nullptr);
+    REQUIRE(selected_yes.dynamic_response_body != nullptr);
+    const Str yes_body{selected_yes.dynamic_response_body, selected_yes.dynamic_response_body_len};
+    CHECK(yes_body.eq(lit("{\"selected\":\"yes\"}")));
+
+    TestHandlerCtxFrame frame10{};
+    const auto selected_no = invoke_jit_handler(handler,
+                                                nullptr,
+                                                frame10.ctx,
+                                                reinterpret_cast<const u8*>(kHttp10),
+                                                sizeof(kHttp10) - 1,
+                                                nullptr);
+    REQUIRE(selected_no.dynamic_response_body != nullptr);
+    const Str no_body{selected_no.dynamic_response_body, selected_no.dynamic_response_body_len};
+    CHECK(no_body.eq(lit("{\"selected\":\"no\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, reusable_json_response_body_is_stream_owned_across_wait) {
     const auto src = R"rut(
 route GET "/x" {
@@ -1698,7 +1827,7 @@ route GET "/x" {
                                                           nullptr));
     REQUIRE(terminal_a.action == HandlerAction::ReturnStatus);
     REQUIRE(frame_a.ctx.response_body_mutation_set);
-    const Str body_a{frame_a.ctx.response_body_mutation_data,
+    const Str body_a{frame_a.ctx.response_body_mutation_storage,
                      frame_a.ctx.response_body_mutation_len};
     CHECK(body_a.eq(lit("{\"path\":\"/a\"}")));
 
@@ -1712,7 +1841,7 @@ route GET "/x" {
                                                           nullptr));
     REQUIRE(terminal_b.action == HandlerAction::ReturnStatus);
     REQUIRE(frame_b.ctx.response_body_mutation_set);
-    const Str body_b{frame_b.ctx.response_body_mutation_data,
+    const Str body_b{frame_b.ctx.response_body_mutation_storage,
                      frame_b.ctx.response_body_mutation_len};
     CHECK(body_b.eq(lit("{\"path\":\"/b\"}")));
     CHECK(body_a.eq(lit("{\"path\":\"/a\"}")));
@@ -1805,7 +1934,7 @@ route GET "/api/users" use chain access {
                                                         nullptr));
     REQUIRE(terminal.action == HandlerAction::ReturnStatus);
     REQUIRE(frame.ctx.response_body_mutation_set);
-    const Str body{frame.ctx.response_body_mutation_data, frame.ctx.response_body_mutation_len};
+    const Str body{frame.ctx.response_body_mutation_storage, frame.ctx.response_body_mutation_len};
     CHECK(body.eq(lit("{\"path\":\"/api/users\"}")));
 
     engine.shutdown();
@@ -2245,12 +2374,61 @@ route GET "/api/users" use chain rewrite_chain { return forward(api, buffered: t
     CHECK(frame.ctx.response_status_set);
     CHECK_EQ(frame.ctx.response_status, 201u);
     REQUIRE(frame.ctx.response_body_mutation_set);
-    const Str rewritten_body{frame.ctx.response_body_mutation_data,
+    const Str rewritten_body{frame.ctx.response_body_mutation_storage,
                              frame.ctx.response_body_mutation_len};
     CHECK(rewritten_body.eq(lit("rewritten")));
     REQUIRE_EQ(frame.ctx.response_header_count, 1u);
     CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-After")));
     CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("yes")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, response_body_read_is_an_immutable_snapshot_across_later_assignment) {
+    const auto src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.body = "long"
+    let saved = resp.body
+    resp.body = "x"
+    resp.set("X-Saved", saved)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kRequest),
+                                            sizeof(kRequest) - 1,
+                                            nullptr);
+    REQUIRE(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("x")));
+    REQUIRE_EQ(frame.ctx.response_header_count, 1u);
+    CHECK(frame.ctx.response_header_mutations[0].name.eq(lit("X-Saved")));
+    CHECK(frame.ctx.response_header_mutations[0].value.eq(lit("long")));
 
     engine.shutdown();
     rir.destroy();
@@ -2270,6 +2448,23 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+}
+
+TEST(jit, response_body_mutation_copies_source_bytes) {
+    TestHandlerCtxFrame frame{};
+    char body[] = "stable";
+    rut_helper_resp_set_body(&frame.ctx, body, sizeof(body) - 1);
+    __builtin_memset(body, 'x', sizeof(body) - 1);
+    rut_helper_resp_commit_headers(&frame.ctx);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(200).pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str copied{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(copied.eq(lit("stable")));
+    CHECK(outcome.dynamic_response_body == frame.ctx.response_body_mutation_storage);
 }
 
 TEST(jit, cache_helpers_miss_and_out_of_range) {
@@ -7897,6 +8092,15 @@ TEST(jit, bounded_array_carrier_len_and_get) {
     auto index = V(b.emit_const_i32(0));
     auto first = V(b.emit_array_get(array, index));
     auto status = V(b.emit_arith(rir::Opcode::Add, first, len));
+    auto negative = V(b.emit_const_i32(-1));
+    auto past_end = V(b.emit_const_i32(2));
+    auto negative_value = V(b.emit_array_get(array, negative));
+    auto past_end_value = V(b.emit_array_get(array, past_end));
+    auto empty = V(b.emit_array_create(i32_type, nullptr, 0));
+    auto empty_value = V(b.emit_array_get(empty, index));
+    status = V(b.emit_arith(rir::Opcode::Add, status, negative_value));
+    status = V(b.emit_arith(rir::Opcode::Add, status, past_end_value));
+    status = V(b.emit_arith(rir::Opcode::Add, status, empty_value));
     VOK(b.emit_ret_status(status));
 
     auto cg = codegen(tc.mod);
