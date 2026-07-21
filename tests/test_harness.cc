@@ -80,9 +80,7 @@ u64 mutable_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     rut_helper_resp_set_body(ctx, source, sizeof(source) - 1);
     __builtin_memset(source, 'x', sizeof(source) - 1);
     rut_helper_resp_commit_headers(ctx);
-    auto result = jit::HandlerResult::make_status(200);
-    result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
-    return result.pack();
+    return jit::HandlerResult::make_status(200).pack();
 }
 
 u64 snapshotted_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
