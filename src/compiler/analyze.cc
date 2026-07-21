@@ -18971,8 +18971,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 }
             }
             if (dynamic_response != nullptr) {
-                if (stmt.kind != AstStmtKind::ReturnStatus || !stmt.returns_response_local ||
-                    !stmt.name.eq(dynamic_response->name))
+                const HirLocal* returned_response = nullptr;
+                if (stmt.kind == AstStmtKind::ReturnStatus && stmt.returns_response_local) {
+                    for (u32 li = route.locals.len; li > 0; li--) {
+                        if (!route.locals[li - 1].name.eq(stmt.name)) continue;
+                        if (route.locals[li - 1].init.kind == HirExprKind::ResponseInit)
+                            returned_response = &route.locals[li - 1];
+                        break;
+                    }
+                }
+                if (returned_response != dynamic_response)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
                         stmt.span,
