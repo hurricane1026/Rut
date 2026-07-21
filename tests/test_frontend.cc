@@ -15593,6 +15593,92 @@ TEST(frontend, optional_and_fallible_array_returns_are_rejected) {
     }
 }
 
+TEST(frontend, string_list_arguments_adapt_inside_array_helpers) {
+    const char* src = R"rut(
+func wrap(values: [str]) -> [[str]] => [values]
+route GET "/x" {
+    let groups = wrap(req.queryAll("tag"))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, arrays_of_runtime_string_lists_are_carrier_ready) {
+    const char* src = "route GET \"/x\" { let groups = [req.queryAll(\"tag\")] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, generic_struct_array_fields_concretize_element_shapes) {
+    const char* src = R"rut(
+struct Box<T> { values: [T] }
+route GET "/x" {
+    let box = Box<i32>(values: [1])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, imported_structs_preserve_array_field_shapes) {
+    const std::string dir = "/tmp/rut_import_array_struct_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/payload.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n"
+               "struct Payload { items: [Item] }\n";
+    }
+    const char* src = R"rut(
+import "payload.rut"
+struct Dummy { value: str }
+route GET "/x" {
+    let payload = Payload(items: [Item(value: 1)])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
@@ -32663,6 +32749,23 @@ route GET "/x" {
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK_EQ(mir->functions[0].locals.len, 0u);
+    bool found_body_plan = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (!term.has_json_body_plan) continue;
+        found_body_plan = true;
+        const auto* begin = &mir->functions[0].values.data[0];
+        const auto* end = begin + mir->functions[0].values.len;
+        if (term.json_body_local.init.lhs != nullptr) {
+            CHECK(term.json_body_local.init.lhs >= begin);
+            CHECK(term.json_body_local.init.lhs < end);
+        }
+        if (term.json_body_local.init.rhs != nullptr) {
+            CHECK(term.json_body_local.init.rhs >= begin);
+            CHECK(term.json_body_local.init.rhs < end);
+        }
+    }
+    CHECK(found_body_plan);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
     u32 body_commits = 0;
@@ -32677,6 +32780,26 @@ route GET "/x" {
     CHECK_EQ(body_commits, 1u);
     CHECK_EQ(full_commits, 0u);
     rir.destroy();
+}
+
+TEST(frontend, generic_aggregates_reject_json_instantiations) {
+    const char* sources[] = {
+        "struct Box<T> { value: T } route GET \"/x\" { let box = Box<Json>(value: "
+        "json({ ok: true })) return 200 }\n",
+        "variant Wrap<T> { value(T) } func wrap<T>(x: T) -> Wrap<T> => Wrap.value(x) "
+        "route GET \"/x\" { let box = wrap(json({ ok: true })) return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Json values are opaque response plans; use them only through locals or helper "
+                "calls and consume them with return, respond, or Response.body")));
+    }
 }
 
 TEST(frontend, json_is_rejected_from_variant_payload_shapes) {
