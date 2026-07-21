@@ -32362,6 +32362,23 @@ route GET "/x" {
         lit("response scalar mutations require exactly one Response builder in the route")));
 }
 
+TEST(frontend, response_scalar_mutation_rejects_later_shadowing_builder) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    r.status = 201
+    let r = response(202)
+    return r
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, response_assignments_are_statement_only) {
     const char* cases[] = {
         "route GET \"/x\" { let resp = response(200) "
