@@ -33544,6 +33544,26 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, direct_json_sink_resolves_synthetic_wait_result_locals) {
+    const char* src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+upstream api at "127.0.0.1:9000"
+route GET "/x" {
+    let ev = wait(upstream(api).connect())
+    return 200, choose(true, json({ ok: ev.ok }), json({ ok: false }))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("json cannot capture wait-result state after a wait")));
+}
+
 TEST(frontend, rejects_nominal_array_elements_with_unlowerable_scalar_fields) {
     const char* src =
         "struct Stamp { at: i64 } "

@@ -11230,7 +11230,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     if (body->type != HirTypeKind::Json)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
-                    if (route->waits.len != 0 && hir_expr_reads_wait_result(body.value()))
+                    if (route->waits.len != 0 &&
+                        hir_expr_reads_wait_result_with_locals(
+                            body.value(), route->locals.data, route->locals.len))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
                             stmt.expr.span,
