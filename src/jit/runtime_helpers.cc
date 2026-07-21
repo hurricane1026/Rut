@@ -81,7 +81,10 @@ thread_local JsonResponseScratch t_json_response;
 // document into distinct invocation-owned storage so a later JsonBuild cannot
 // overwrite an earlier Str view before the select chooses between them. The
 struct JsonCaptureArena {
-    static constexpr u32 kCapacity = 512 * 1024;
+    // A reusable plan may be published at many sinks, and every eagerly
+    // lowered conditional arm gets its own bounded document capture. The HIR
+    // expression/local limits bound the total below this request-local cap.
+    static constexpr u32 kCapacity = 64 * 1024 * 1024;
     char* data = nullptr;
     u32 used = 0;
     u32 last_capture_len = 0xffffffffu;

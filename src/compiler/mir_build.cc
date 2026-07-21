@@ -1243,7 +1243,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Json &&
-                module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild)
+                module.routes[i].locals[li].init.kind != HirExprKind::RespSetBody &&
+                module.routes[i].locals[li].init.kind != HirExprKind::IfElse)
                 continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Array &&
                 module.routes[i].locals[li].ref_index < HirRoute::kMaxLocals &&
