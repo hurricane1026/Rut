@@ -7058,6 +7058,28 @@ route GET "/users" use chain access { return forward(api) }
     rir.destroy();
 }
 
+TEST(frontend, chain_after_rejects_response_scalar_effects_before_forward) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "not-forwarded"
+    0
+}
+chain access { after rewrite(resp) }
+route GET "/users" use chain access { return forward(api) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(
+        hir.error().detail.eq(lit("Response status/body effects require a buffered response and "
+                                  "cannot be combined with forward yet")));
+}
+
 TEST(frontend, chain_after_rejects_invalid_response_helpers) {
     struct Case {
         const char* src;

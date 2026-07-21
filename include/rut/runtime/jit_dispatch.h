@@ -185,7 +185,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             }
             if (ctx.response_body_mutation_set) {
                 out.response_body_idx = 0;
-                out.dynamic_response_body = ctx.response_body_mutation_data;
+                out.dynamic_response_body = ctx.response_body_mutation_storage;
                 out.dynamic_response_body_len = ctx.response_body_mutation_len;
             }
             out.response_headers_idx = r.next_state;

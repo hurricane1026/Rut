@@ -493,8 +493,9 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
     hctx->response_body_pending_set = true;
     hctx->response_body_pending_overflow =
         body == nullptr || len > jit::kMaxResponseBodyMutationBytes;
-    hctx->response_body_pending_data = hctx->response_body_pending_overflow ? nullptr : body;
     hctx->response_body_pending_len = hctx->response_body_pending_overflow ? 0 : len;
+    if (!hctx->response_body_pending_overflow && len != 0)
+        __builtin_memcpy(hctx->response_body_mutation_storage, body, len);
 }
 
 void rut_helper_resp_commit_headers(void* ctx) {
@@ -505,7 +506,6 @@ void rut_helper_resp_commit_headers(void* ctx) {
     hctx->response_status = hctx->response_status_pending;
     hctx->response_status_set = hctx->response_status_pending_set;
     hctx->response_status_invalid = hctx->response_status_pending_invalid;
-    hctx->response_body_mutation_data = hctx->response_body_pending_data;
     hctx->response_body_mutation_len = hctx->response_body_pending_len;
     hctx->response_body_mutation_set = hctx->response_body_pending_set;
     hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
