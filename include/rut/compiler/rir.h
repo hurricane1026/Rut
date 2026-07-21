@@ -181,7 +181,7 @@ enum class Opcode : u8 {
     RespAddHeader,      // resp.add_header "Name", %val
     RespRemoveHeader,   // resp.remove_header "Name"
     RespSetStatus,      // resp.status = %i32
-    RespSetBody,        // resp.body = %str (bounded copy into HandlerCtx)
+    RespSetBody,        // resp.body = %str (bounded copy into request-owned pooled storage)
     RespCommitHeaders,  // publish all pending Response-builder mutations
     ReqSetPath,         // req.set_path %path
     CtxStoreSlotI32,    // if i < ctx.slot_count: ctx.slot[i] = %val

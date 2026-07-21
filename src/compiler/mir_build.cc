@@ -1142,11 +1142,105 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (!fn.waits.push(w)) return frontend_error(FrontendError::TooManyItems, w.span);
         }
 
+        bool static_iter_ref[HirRoute::kMaxLocals]{};
+        for (u32 fi = 0; fi < module.routes[i].for_loops.len; fi++) {
+            const HirExpr* iter = &module.routes[i].for_loops[fi].iter_expr;
+            for (u32 depth = 0; depth < module.routes[i].locals.len; depth++) {
+                if (iter->kind != HirExprKind::LocalRef ||
+                    iter->local_index >= HirRoute::kMaxLocals)
+                    break;
+                static_iter_ref[iter->local_index] = true;
+                const HirLocal* source = nullptr;
+                for (u32 li = 0; li < module.routes[i].locals.len; li++) {
+                    if (module.routes[i].locals[li].ref_index == iter->local_index) {
+                        source = &module.routes[i].locals[li];
+                        break;
+                    }
+                }
+                if (source == nullptr) break;
+                iter = &source->init;
+            }
+        }
+        auto expr_refs_local =
+            [&](auto&& self, const HirExpr& expr, u32 ref_index, u32 depth) -> bool {
+            if (depth > HirRoute::kMaxExprs) return false;
+            if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index) return true;
+            if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index, depth + 1)) return true;
+            if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index, depth + 1)) return true;
+            for (u32 ai = 0; ai < expr.args.len; ai++)
+                if (expr.args[ai] != nullptr && self(self, *expr.args[ai], ref_index, depth + 1))
+                    return true;
+            for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+                if (expr.field_inits[fi].value != nullptr &&
+                    self(self, *expr.field_inits[fi].value, ref_index, depth + 1))
+                    return true;
+            return false;
+        };
+        auto term_refs_local = [&](const HirTerminator& term, u32 ref_index) {
+            for (u32 ji = 0; ji < term.json_value_expr_indices.len; ji++) {
+                const u32 expr_index = term.json_value_expr_indices[ji];
+                if (expr_index < module.routes[i].exprs.len &&
+                    expr_refs_local(
+                        expr_refs_local, module.routes[i].exprs[expr_index], ref_index, 0))
+                    return true;
+            }
+            return false;
+        };
+        auto static_iter_ref_needed_at_runtime = [&](u32 ref_index) {
+            for (u32 li = 0; li < module.routes[i].locals.len; li++) {
+                const auto& consumer = module.routes[i].locals[li];
+                if (consumer.ref_index < HirRoute::kMaxLocals &&
+                    static_iter_ref[consumer.ref_index])
+                    continue;
+                if (expr_refs_local(expr_refs_local, consumer.init, ref_index, 0)) return true;
+            }
+            const auto& control = module.routes[i].control;
+            if (term_refs_local(control.direct_term, ref_index) ||
+                term_refs_local(control.then_term, ref_index) ||
+                term_refs_local(control.else_term, ref_index))
+                return true;
+            for (u32 ai = 0; ai < control.match_arms.len; ai++) {
+                const auto& arm = control.match_arms[ai];
+                if (term_refs_local(arm.direct_term, ref_index) ||
+                    term_refs_local(arm.then_term, ref_index) ||
+                    term_refs_local(arm.else_term, ref_index))
+                    return true;
+                for (u32 gi = 0; gi < arm.guards.len; gi++) {
+                    const auto& guard = arm.guards[gi];
+                    if (term_refs_local(guard.fail_term, ref_index) ||
+                        term_refs_local(guard.fail_body.direct_term, ref_index) ||
+                        term_refs_local(guard.fail_body.then_term, ref_index) ||
+                        term_refs_local(guard.fail_body.else_term, ref_index))
+                        return true;
+                }
+            }
+            for (u32 gi = 0; gi < module.routes[i].guards.len; gi++) {
+                const auto& guard = module.routes[i].guards[gi];
+                if (term_refs_local(guard.fail_term, ref_index) ||
+                    term_refs_local(guard.fail_body.direct_term, ref_index) ||
+                    term_refs_local(guard.fail_body.then_term, ref_index) ||
+                    term_refs_local(guard.fail_body.else_term, ref_index))
+                    return true;
+                for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+                    const u32 arm_index = guard.fail_match_start + ai;
+                    if (arm_index < module.guard_match_arms.len &&
+                        term_refs_local(module.guard_match_arms[arm_index].direct_term, ref_index))
+                        return true;
+                }
+            }
+            return false;
+        };
+
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Json &&
                 module.routes[i].locals[li].init.kind == HirExprKind::JsonBuild)
+                continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Array &&
+                module.routes[i].locals[li].ref_index < HirRoute::kMaxLocals &&
+                static_iter_ref[module.routes[i].locals[li].ref_index] &&
+                !static_iter_ref_needed_at_runtime(module.routes[i].locals[li].ref_index))
                 continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
@@ -1206,7 +1300,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [](MirTerminator* out, const HirTerminator& term) {
+        bool term_json_copy_failed = false;
+        Diagnostic term_json_copy_error{};
+        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
@@ -1222,15 +1318,60 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             out->has_dynamic_response_body = term.has_dynamic_response_body;
             out->json_segments.len = 0;
             out->json_value_ref_indices.len = 0;
+            out->json_locals.len = 0;
             static_assert(
                 HirTerminator::kMaxJsonDynamicValues == MirTerminator::kMaxJsonDynamicValues,
                 "HIR/MIR dynamic JSON caps must match");
+            static_assert(HirTerminator::kMaxJsonMaterializedValues ==
+                              MirTerminator::kMaxJsonMaterializedValues,
+                          "HIR/MIR dynamic JSON materialization caps must match");
+            static_assert(HirRoute::kMaxLocals == MirFunction::kMaxLocals,
+                          "HIR/MIR local ref ranges must match");
             for (u32 ji = 0; ji < term.json_segments.len; ji++) {
                 if (!out->json_segments.push(term.json_segments[ji])) __builtin_trap();
             }
             for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
                 if (!out->json_value_ref_indices.push(term.json_value_ref_indices[ji]))
                     __builtin_trap();
+            }
+            for (u32 ji = 0; ji < term.json_value_expr_indices.len; ji++) {
+                const u32 expr_index = term.json_value_expr_indices[ji];
+                if (expr_index >= module.routes[i].exprs.len) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error =
+                        Diagnostic{FrontendError::UnsupportedSyntax, term.span, {}};
+                    return;
+                }
+                const auto& value = module.routes[i].exprs[expr_index];
+                MirLocal local{};
+                local.span = value.span;
+                local.ref_index = MirFunction::kMaxLocals + ji;
+                local.type = mir_type_kind(value.type);
+                local.shape_index = value.shape_index;
+                local.may_nil = value.may_nil;
+                local.may_error = value.may_error;
+                local.variant_index = value.variant_index;
+                local.struct_index = value.struct_index;
+                local.tuple_len = value.tuple_len;
+                for (u32 ti = 0; ti < local.tuple_len; ti++) {
+                    local.tuple_types[ti] = mir_type_kind(value.tuple_types[ti]);
+                    local.tuple_variant_indices[ti] = value.tuple_variant_indices[ti];
+                    local.tuple_struct_indices[ti] = value.tuple_struct_indices[ti];
+                }
+                local.error_struct_index = value.error_struct_index;
+                local.error_variant_index = value.error_variant_index;
+                auto init = mir_value(value, module, &fn);
+                if (!init) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error = init.error();
+                    return;
+                }
+                local.init = init.value();
+                if (!out->json_locals.push(local)) {
+                    term_json_copy_failed = true;
+                    term_json_copy_error = Diagnostic{FrontendError::TooManyItems, term.span, {}};
+                    return;
+                }
             }
             out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;
@@ -3260,6 +3401,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             set_term_from_hir(&block.term, module.routes[i].control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        if (term_json_copy_failed) return core::make_unexpected(term_json_copy_error);
         if (!mir->functions.push(fn)) return frontend_error(FrontendError::TooManyItems, fn.span);
     }
 

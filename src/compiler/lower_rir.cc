@@ -3217,6 +3217,31 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
         if (term.has_dynamic_response_body) {
+            constexpr u32 kJsonLocalCount =
+                MirFunction::kMaxLocals + MirTerminator::kMaxJsonMaterializedValues;
+            rir::ValueId json_locals[kJsonLocalCount]{};
+            for (u32 li = 0; li < local_count && li < MirFunction::kMaxLocals; li++)
+                json_locals[li] = locals[li];
+            for (u32 li = 0; li < term.json_locals.len; li++) {
+                const auto& local = term.json_locals[li];
+                if (local.ref_index >= kJsonLocalCount)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                auto value = materialize_value(local.init,
+                                               mir,
+                                               variant_infos,
+                                               tuple_infos,
+                                               tuple_info_count,
+                                               error_scalar_infos,
+                                               error_variant_infos,
+                                               error_struct_infos,
+                                               user_struct_defs,
+                                               b,
+                                               json_locals,
+                                               kJsonLocalCount,
+                                               local.span);
+                if (!value) return core::make_unexpected(value.error());
+                json_locals[local.ref_index] = value.value();
+            }
             if (term.json_segments.len != term.json_value_ref_indices.len + 1 ||
                 !b.emit_json_reset({term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
@@ -3226,11 +3251,12 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     return frontend_error(FrontendError::OutOfMemory, term.span);
                 if (ji >= term.json_value_ref_indices.len) continue;
                 const u32 ref = term.json_value_ref_indices[ji];
-                if (ref >= local_count)
+                if (ref >= kJsonLocalCount)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-                if (locals[ref].id >= fn->value_count || fn->values[locals[ref].id].type == nullptr)
+                if (json_locals[ref].id >= fn->value_count ||
+                    fn->values[json_locals[ref].id].type == nullptr)
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
-                const auto value_type = fn->values[locals[ref].id].type->kind;
+                const auto value_type = fn->values[json_locals[ref].id].type->kind;
                 const rir::Opcode op =
                     value_type == rir::TypeKind::Bool      ? rir::Opcode::JsonAppendBool
                     : value_type == rir::TypeKind::I32     ? rir::Opcode::JsonAppendI32
@@ -3240,7 +3266,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     : value_type == rir::TypeKind::Array   ? rir::Opcode::JsonAppendArray
                                                            : rir::Opcode::JsonFinish;
                 if (op == rir::Opcode::JsonFinish ||
-                    !b.emit_json_append(op, locals[ref], {term.span.line, term.span.col}))
+                    !b.emit_json_append(op, json_locals[ref], {term.span.line, term.span.col}))
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
             }
             if (!b.emit_json_finish({term.span.line, term.span.col}))
@@ -3522,6 +3548,27 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     bool struct_built[MirModule::kMaxStructs]{};
+    auto shape_defs_ready = [&](auto&& self, u32 shape_index, u32 depth) -> bool {
+        if (depth > mir.type_shapes.len || shape_index >= mir.type_shapes.len) return false;
+        const auto& shape = mir.type_shapes[shape_index];
+        if (shape.type == MirTypeKind::Struct)
+            return shape.struct_index < mir.structs.len &&
+                   user_struct_defs[shape.struct_index] != nullptr;
+        if (shape.type == MirTypeKind::Variant) {
+            if (shape.variant_index >= mir.variants.len) return false;
+            bool has_payload = false;
+            for (u32 ci = 0; ci < mir.variants[shape.variant_index].cases.len; ci++)
+                has_payload |= mir.variants[shape.variant_index].cases[ci].has_payload;
+            return !has_payload || variant_infos[shape.variant_index].struct_type != nullptr;
+        }
+        if (shape.type == MirTypeKind::Array)
+            return self(self, shape.array_elem_shape_index, depth + 1);
+        if (shape.type == MirTypeKind::Tuple) {
+            for (u32 ti = 0; ti < shape.tuple_len; ti++)
+                if (!self(self, shape.tuple_elem_shape_indices[ti], depth + 1)) return false;
+        }
+        return true;
+    };
     auto build_user_struct = [&](u32 si) -> FrontendResult<bool> {
         if (struct_built[si]) return true;
         if (!instance_fully_concrete(mir,
@@ -3553,6 +3600,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 } else if (field_shape.type == MirTypeKind::Str) {
                     field_ty = str_ty.value();
                 } else if (field_shape.type == MirTypeKind::Array) {
+                    if (!shape_defs_ready(shape_defs_ready, field.shape_index, 0)) return false;
                     auto ty = rir_type_for_shape_index(mir,
                                                        field.shape_index,
                                                        variant_infos,
