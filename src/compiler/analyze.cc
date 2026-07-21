@@ -518,6 +518,16 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
             struct_visiting[shape.struct_index] = true;
             const auto& st = mod.structs[shape.struct_index];
             for (u32 i = 0; i < st.fields.len; i++) {
+                const auto field_type = st.fields[i].type;
+                const bool lowerable_struct_field =
+                    st.fields[i].is_error_type || field_type == HirTypeKind::Bool ||
+                    field_type == HirTypeKind::I32 || field_type == HirTypeKind::Str ||
+                    field_type == HirTypeKind::Array || field_type == HirTypeKind::Variant ||
+                    field_type == HirTypeKind::Struct || field_type == HirTypeKind::Tuple;
+                if (!lowerable_struct_field) {
+                    struct_visiting[shape.struct_index] = false;
+                    return false;
+                }
                 if (!hir_type_shape_has_runtime_carrier_impl(mod,
                                                              st.fields[i].shape_index,
                                                              struct_visiting,
@@ -2754,7 +2764,7 @@ static bool same_hir_type_shape(const HirModule& mod, const HirExpr& lhs, const 
     if (lhs.type == HirTypeKind::Associated || rhs.type == HirTypeKind::Associated)
         return same_hir_type_shape(lhs, rhs);
     if (lhs.shape_index != 0xffffffffu && rhs.shape_index != 0xffffffffu)
-        if (same_hir_shape_index(mod, lhs.shape_index, rhs.shape_index)) return true;
+        return same_hir_shape_index(mod, lhs.shape_index, rhs.shape_index);
     return same_hir_type_shape(lhs, rhs);
 }
 
@@ -3818,6 +3828,15 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
                                                          u32 arg_count,
                                                          const GenericBinding* generic_bindings,
                                                          u32 generic_binding_count);
+static FrontendResult<void> instantiate_function_response_effects(
+    const HirFunction& fn,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirExpr* args,
+    u32 arg_count,
+    const GenericBinding* generic_bindings,
+    u32 generic_binding_count,
+    Span call_span);
 static FrontendResult<HirExpr> normalize_function_expr(
     const HirExpr& expr, HirFunction* fn, const HirLocal* locals, u32 local_count, u32 param_count);
 static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& stmt,
@@ -5429,6 +5448,15 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
         }
         if (fn.respond_guards.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, fn.name);
+        auto response_effects = instantiate_function_response_effects(fn,
+                                                                      route,
+                                                                      mod,
+                                                                      call_args,
+                                                                      call_arg_count,
+                                                                      impl_bindings,
+                                                                      impl_binding_count,
+                                                                      expr.span);
+        if (!response_effects) return core::make_unexpected(response_effects.error());
         auto inlined = instantiate_function_expr(
             fn.body, route, mod, call_args, call_arg_count, impl_bindings, impl_binding_count);
         if (!inlined) return core::make_unexpected(inlined.error());
@@ -11435,7 +11463,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                     if (body->type != HirTypeKind::Json)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
-                    if (route->waits.len != 0 && hir_expr_reads_wait_result(body.value()))
+                    if (route->waits.len != 0 &&
+                        hir_expr_reads_wait_result_with_locals(
+                            body.value(), route->locals.data, route->locals.len))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
                             stmt.expr.span,
@@ -18490,7 +18520,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
         for (u32 li = 0; li < scratch->locals.len; li++)
-            fn.owns_response_builder |= scratch->locals[li].init.kind == HirExprKind::ResponseInit;
+            fn.owns_response_builder |=
+                scratch->locals[li].init.kind == HirExprKind::ResponseInit ||
+                scratch->locals[li].name.eq(lit_str("$helper_owned_response_effect"));
         for (u32 gi = 0; gi < scratch->guards.len; gi++) {
             const auto& guard = scratch->guards[gi];
             auto normalized_cond = normalize_function_expr(
@@ -20093,7 +20125,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         fn.exprs.len = 0;
         fn.respond_guards.len = 0;
         for (u32 li = 0; li < scratch.locals.len; li++)
-            fn.owns_response_builder |= scratch.locals[li].init.kind == HirExprKind::ResponseInit;
+            fn.owns_response_builder |=
+                scratch.locals[li].init.kind == HirExprKind::ResponseInit ||
+                scratch.locals[li].name.eq(lit_str("$helper_owned_response_effect"));
         for (u32 gi = 0; gi < scratch.guards.len; gi++) {
             const auto& guard = scratch.guards[gi];
             auto normalized_cond = normalize_function_expr(
@@ -20380,6 +20414,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
                 route.allow_respond_effects = saved_allow;
                 if (!expanded) return core::make_unexpected(expanded.error());
+                auto effects = instantiate_function_response_effects(
+                    fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
+                if (!effects) return core::make_unexpected(effects.error());
                 return {};
             }
 
@@ -20394,6 +20431,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     lit_str("bool chain steps need `else <status>`; only respond-capable "
                             "helpers may omit it"));
 
+            auto effects = instantiate_function_response_effects(
+                fn, &route, mod, args, step.call.args.len, nullptr, 0, use_span);
+            if (!effects) return core::make_unexpected(effects.error());
             auto cond = instantiate_function_expr(
                 fn.body, &route, mod, args, step.call.args.len, nullptr, 0);
             if (!cond) return core::make_unexpected(cond.error());
@@ -21160,6 +21200,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 lit_str("Response.body reads in conditional value branches are not supported"));
 
         bool has_chain_after_response_effects = false;
+        bool has_chain_after_response_scalar_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
             const auto& chain_use = route_decl.chains[ci];
             const AstChainDecl* chain = find_chain_decl(file, chain_use.name);
@@ -21174,10 +21215,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (!after) return core::make_unexpected(after.error());
                 if (route.locals.len != before_count) {
                     has_chain_after_response_effects = true;
+                    for (u32 li = before_count; li < route.locals.len; li++) {
+                        const auto kind = route.locals[li].init.kind;
+                        has_chain_after_response_scalar_effects |=
+                            kind == HirExprKind::RespSetStatus || kind == HirExprKind::RespSetBody;
+                    }
                 }
             }
         }
         if (has_chain_after_response_effects) {
+            if (has_chain_after_response_scalar_effects && route_reads_response_field(route))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    route_decl.span,
+                    lit_str("chain-after Response scalar effects cannot follow a Response "
+                            "field read"));
             auto is_streaming_forward = [](const HirTerminator& term) {
                 return term.kind == HirTerminatorKind::ForwardUpstream && !term.forward_buffered;
             };
@@ -21698,6 +21750,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (deco_fn.respond_guards.len != 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, ast_deco.span, deco_fn.name);
+            auto effects = instantiate_function_response_effects(
+                deco_fn, &route, mod, deco_args, 1u, nullptr, 0u, ast_deco.span);
+            if (!effects) return core::make_unexpected(effects.error());
             auto inlined =
                 instantiate_function_expr(deco_fn.body, &route, mod, deco_args, 1u, nullptr, 0u);
             if (!inlined) return core::make_unexpected(inlined.error());
