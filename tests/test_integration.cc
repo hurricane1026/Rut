@@ -10025,12 +10025,8 @@ TEST(shard, dynamic_json_bytes_are_exact_over_http2) {
     };
     u8 request[512];
     u32 request_len = h2_client_prologue(request);
-    request_len += http2_write_headers(request + request_len,
-                                       sizeof(request) - request_len,
-                                       1,
-                                       request_headers,
-                                       5,
-                                       true);
+    request_len += http2_write_headers(
+        request + request_len, sizeof(request) - request_len, 1, request_headers, 5, true);
     REQUIRE(write_all_fd(client, request, request_len));
 
     u8 response[4096];

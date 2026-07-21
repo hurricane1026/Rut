@@ -537,7 +537,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
 
     if (out.has_terminal && out.terminal.action == jit::HandlerAction::ReturnStatus &&
         out.harness.outcome == Outcome::Passed)
-        (void)publish_response_body(harness, out.harness, connection.connection, scenario.now_us);
+        (void)publish_response_body(
+            harness, out.harness, connection.connection, out.harness.virtual_time_us);
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal &&
         !expectation_matches(scenario.expected, out.terminal)) {
