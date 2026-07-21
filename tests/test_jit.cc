@@ -1721,9 +1721,8 @@ func choose(flag: bool, yes: Json, no: Json) -> Json {
     if flag { yes } else { no }
 }
 route GET "/x" {
-    let resp = response(200)
-    resp.body = choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
-    return resp
+    let payload = choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
+    return 200, payload
 }
 )rut";
     auto lexed = lex(lit(src));
@@ -1767,6 +1766,54 @@ route GET "/x" {
     REQUIRE(selected_no.dynamic_response_body != nullptr);
     const Str no_body{selected_no.dynamic_response_body, selected_no.dynamic_response_body_len};
     CHECK(no_body.eq(lit("{\"selected\":\"no\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, request_independent_json_captures_reset_per_invocation) {
+    const auto src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let payload = choose(true, json({ selected: "yes" }), json({ selected: "no" }))
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    for (u32 i = 0; i < 2000; i++) {
+        TestHandlerCtxFrame frame{};
+        const auto outcome = invoke_jit_handler(handler,
+                                                &conn,
+                                                frame.ctx,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1,
+                                                nullptr);
+        REQUIRE(outcome.dynamic_response_body != nullptr);
+        const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+        CHECK(body.eq(lit("{\"selected\":\"yes\"}")));
+    }
 
     engine.shutdown();
     rir.destroy();
@@ -2519,6 +2566,16 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+}
+
+TEST(jit, response_body_snapshot_failure_remains_sticky_across_assignment) {
+    TestHandlerCtxFrame frame{};
+    frame.ctx.response_body_snapshot_failed = true;
+    static constexpr char kBody[] = "new";
+    rut_helper_resp_set_body(&frame.ctx, kBody, sizeof(kBody) - 1);
+    CHECK(frame.ctx.response_body_pending_overflow);
+    rut_helper_resp_commit_headers(&frame.ctx);
+    CHECK(frame.ctx.response_body_mutation_overflow);
 }
 
 TEST(jit, response_body_mutation_copies_source_bytes) {

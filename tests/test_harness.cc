@@ -85,6 +85,18 @@ u64 mutable_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     return result.pack();
 }
 
+u64 snapshotted_header_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    static constexpr char kBody[] = "saved-body";
+    static constexpr char kName[] = "X-Saved";
+    rut_helper_resp_set_body(ctx, kBody, sizeof(kBody) - 1);
+    const char* snapshot = nullptr;
+    u32 snapshot_len = 0;
+    rut_helper_resp_body(ctx, nullptr, 0, &snapshot, &snapshot_len);
+    rut_helper_resp_set_header(ctx, kName, sizeof(kName) - 1, snapshot, snapshot_len);
+    rut_helper_resp_commit_headers(ctx);
+    return jit::HandlerResult::make_status(200).pack();
+}
+
 u64 timer_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 25).pack();
@@ -258,6 +270,19 @@ TEST(harness_handler, owns_mutated_response_body_after_driver_returns) {
     REQUIRE(result.dynamic_response_body_valid);
     REQUIRE_EQ(result.dynamic_response_body_len, 11u);
     CHECK(std::memcmp(result.dynamic_response_body, "stable-body", 11) == 0);
+}
+
+TEST(harness_handler, owns_snapshotted_response_header_values_after_driver_returns) {
+    harness::HandlerExecution execution{};
+    execution.init(&snapshotted_header_handler, nullptr, nullptr, 0);
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+
+    const auto result = harness::drive_handler_deterministically({execution}, spec);
+    REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(result.response_header_count, 1u);
+    CHECK(result.response_header_mutations[0].name.eq({"X-Saved", 7}));
+    CHECK(result.response_header_mutations[0].value.eq({"saved-body", 10}));
 }
 
 TEST(harness_handler, copying_session_clones_mutated_response_body_storage) {

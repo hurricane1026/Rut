@@ -191,6 +191,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     u32 response_body_pending_len;
     bool response_body_pending_set;
     bool response_body_pending_overflow;
+    // Snapshot allocation failure is terminal for this response and must not
+    // be cleared by a later otherwise-valid body assignment.
+    bool response_body_snapshot_failed;
     u32 response_body_mutation_len;
     bool response_body_mutation_set;
     bool response_body_mutation_overflow;

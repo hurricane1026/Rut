@@ -814,6 +814,9 @@ struct HirTerminator {
     FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
     FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     FixedVec<u32, kMaxJsonMaterializedValues> json_value_expr_indices;
+    // Whole reusable Json plan for a direct return/respond sink. Unlike the
+    // scalar template fields above, its materialized Str is already encoded.
+    u32 json_body_expr_index = 0xffffffffu;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0
