@@ -1546,6 +1546,44 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     CHECK(sp.name == params[0].name);                 // name still points into stable config
 }
 
+TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+
+    auto* live = conn.reset_jit_ctx();
+    live->slot_count = 1;
+    live->store_slot<i64>(0, 73);
+
+    u8 synth[] = "GET /slow/abcd HTTP/1.1\r\nhost: example\r\n\r\n";
+    constexpr u32 kSynthLen = sizeof(synth) - 1;
+    live->response_header_pending_count = 1;
+    live->response_header_mutations[0].name = {"X-Path", 6};
+    live->response_header_mutations[0].value = {reinterpret_cast<const char*>(synth + 4), 10};
+    const char raw_path[] = "/slow/abcd";
+    RouteParam decoded_param{"id", 2, raw_path + 6, 4};
+    RouteParam anchored_param;
+    REQUIRE(h2_reanchor_route_params(
+        &decoded_param, 1, Str{raw_path, 10}, synth, kSynthLen, &anchored_param));
+    live->route_param_count = 1;
+    live->route_params[0] = anchored_param;
+
+    REQUIRE_EQ(h2_stash_synth(h2, synth, kSynthLen), kSynthLen);
+    REQUIRE(h2_snapshot_async_jit_ctx(h2, *live, synth, kSynthLen));
+    conn.reset_jit_ctx();
+    for (u32 i = 0; i < kSynthLen; i++) synth[i] = 'x';
+
+    const auto* parked = h2.async_jit_ctx();
+    CHECK(parked != live);
+    CHECK_EQ(parked->load_slot<i64>(0), 73);
+    CHECK(parked->response_header_mutations[0].value.eq(Str{"/slow/abcd", 10}));
+    CHECK(parked->response_header_mutations[0].value.ptr ==
+          reinterpret_cast<const char*>(h2.pending_synth + 4));
+    CHECK_EQ(parked->route_params[0].value_len, 4u);
+    CHECK(parked->route_params[0].value == reinterpret_cast<const char*>(h2.pending_synth + 10));
+}
+
 TEST(http2_conn, padded_data_missing_pad_length_is_error) {
     Http2Conn c;
     Capture cap;
