@@ -6108,7 +6108,9 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             }
             if (inner.kind == AstStmtKind::Expr && !is_last &&
                 inner.expr.kind == AstExprKind::Assign) {
+                scratch->response_assignment_stmt_ok = true;
                 auto effect = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
+                scratch->response_assignment_stmt_ok = false;
                 if (!effect) return core::make_unexpected(effect.error());
                 if (effect->kind != HirExprKind::RespSetStatus &&
                     effect->kind != HirExprKind::RespSetBody)
@@ -6784,6 +6786,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::Assign) {
+        if (route == nullptr || !route->response_assignment_stmt_ok)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("Response assignments are only allowed as standalone statements"));
+        route->response_assignment_stmt_ok = false;
         if (expr.lhs == nullptr || expr.rhs == nullptr || expr.lhs->kind != AstExprKind::Field ||
             expr.lhs->lhs == nullptr || expr.lhs->lhs->kind != AstExprKind::Ident)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -6802,6 +6810,15 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("only Response.status and Response.body are assignable"));
+        u32 response_builder_count = 0;
+        for (u32 li = 0; li < local_count; li++)
+            response_builder_count += locals[li].type == HirTypeKind::Response;
+        if (response_builder_count != 1)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("response scalar mutations require exactly one Response builder in the "
+                        "route"));
         auto value = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
         if (!value) return core::make_unexpected(value.error());
         if (value->may_nil || value->may_error || (set_status && value->type != HirTypeKind::I32) ||
@@ -18739,8 +18756,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 }
                 if (stmt.expr.kind == AstExprKind::Assign) {
+                    route.response_assignment_stmt_ok = true;
                     auto value = analyze_expr(
                         stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
+                    route.response_assignment_stmt_ok = false;
                     if (!value) return core::make_unexpected(value.error());
                     if (value->kind != HirExprKind::RespSetStatus &&
                         value->kind != HirExprKind::RespSetBody)

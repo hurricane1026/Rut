@@ -470,6 +470,8 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
+    if (h2.async_stream != 0 && h2.async_kind == H2AsyncKind::Timer)
+        rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.async_stream = 0;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
@@ -503,16 +505,23 @@ inline void h2_rebase_synth_view(Str& view,
 }
 
 inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
-                                      const jit::HandlerCtx& live,
+                                      jit::HandlerCtx& live,
                                       const u8* old_synth,
                                       u32 synth_len) {
-    if (live.slot_count > kMaxJitHandlerSlots) return false;
+    if (live.slot_count > kMaxJitHandlerSlots ||
+        live.response_header_pending_count > jit::kMaxResponseHeaderMutations ||
+        live.route_param_count > kMaxRouteParams)
+        return false;
     const size_t kBytes = sizeof(jit::HandlerCtx) + static_cast<size_t>(live.slot_count) * 8;
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
 
+    // The parked frame now owns the lazily allocated mutation buffer. Clear the
+    // connection scratch copy so another H2 stream can reset it without freeing
+    // bytes still needed by this suspended stream.
+    live.response_body_mutation_storage = nullptr;
+
     const u32 kMutationCount = parked->response_header_pending_count;
-    if (kMutationCount > jit::kMaxResponseHeaderMutations) return false;
     for (u32 i = 0; i < kMutationCount; i++) {
         h2_rebase_synth_view(
             parked->response_header_mutations[i].name, old_synth, h2.pending_synth, synth_len);
@@ -520,7 +529,6 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
             parked->response_header_mutations[i].value, old_synth, h2.pending_synth, synth_len);
     }
     const u32 kParamCount = parked->route_param_count;
-    if (kParamCount > kMaxRouteParams) return false;
     for (u32 i = 0; i < kParamCount; i++) {
         Str value{parked->route_params[i].value, parked->route_params[i].value_len};
         h2_rebase_synth_view(value, old_synth, h2.pending_synth, synth_len);
@@ -565,7 +573,7 @@ template <typename Loop>
 bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       u32 stream_id,
                       jit::HandlerFn fn,
-                      const jit::HandlerCtx& live_ctx,
+                      jit::HandlerCtx& live_ctx,
                       const JitDispatchOutcome& o,
                       const RouteConfig* cfg,
                       const u8* synth,

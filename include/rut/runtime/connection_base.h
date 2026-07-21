@@ -6,6 +6,7 @@
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -301,16 +302,18 @@ struct ConnectionBase {
     jit::YieldKind pending_yield_kind;
     jit::YieldKind resume_event_kind;
     i32 resume_event_result;
-    void* handler_ctx;
+    void* handler_ctx = nullptr;
     jit::HandlerFn pending_handler_fn;
     alignas(alignof(u64)) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
                                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
 
     jit::HandlerCtx* reset_jit_ctx() {
         auto* ctx = reinterpret_cast<jit::HandlerCtx*>(handler_ctx_storage);
-        // The owned response-body bytes are guarded by their set/length flags;
-        // avoid clearing the full 4 KiB payload on every request.
-        __builtin_memset(ctx, 0, offsetof(jit::HandlerCtx, response_body_mutation_storage));
+        // Release the previous request's lazy Response.body buffer. handler_ctx
+        // can point at the H2 parked frame; release clears its pointer before
+        // this connection-local frame is reused.
+        if (handler_ctx != nullptr) rut_helper_resp_release_body_storage(handler_ctx);
+        __builtin_memset(ctx, 0, sizeof(*ctx));
         __builtin_memset(ctx->slots(), 0, static_cast<size_t>(kMaxJitHandlerSlots) * 8);
         ctx->slot_count = kMaxJitHandlerSlots;
         handler_ctx = ctx;
@@ -548,6 +551,7 @@ struct ConnectionBase {
     Buffer upstream_recv_buf;
 
     void reset() {
+        if (handler_ctx != nullptr) rut_helper_resp_release_body_storage(handler_ctx);
         on_recv = nullptr;
         on_send = nullptr;
         on_upstream_recv = nullptr;
