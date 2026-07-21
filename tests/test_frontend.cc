@@ -15821,6 +15821,92 @@ TEST(frontend, optional_and_fallible_array_returns_are_rejected) {
     }
 }
 
+TEST(frontend, string_list_arguments_adapt_inside_array_helpers) {
+    const char* src = R"rut(
+func wrap(values: [str]) -> [[str]] => [values]
+route GET "/x" {
+    let groups = wrap(req.queryAll("tag"))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, arrays_of_runtime_string_lists_are_carrier_ready) {
+    const char* src = "route GET \"/x\" { let groups = [req.queryAll(\"tag\")] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, generic_struct_array_fields_concretize_element_shapes) {
+    const char* src = R"rut(
+struct Box<T> { values: [T] }
+route GET "/x" {
+    let box = Box<i32>(values: [1])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, imported_structs_preserve_array_field_shapes) {
+    const std::string dir = "/tmp/rut_import_array_struct_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/payload.rut", std::ios::binary);
+        out << "struct Item { value: i32 }\n"
+               "struct Payload { items: [Item] }\n";
+    }
+    const char* src = R"rut(
+import "payload.rut"
+struct Dummy { value: str }
+route GET "/x" {
+    let payload = Payload(items: [Item(value: 1)])
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
