@@ -85,6 +85,40 @@ void json_append(const char* data, u32 len) {
     out.len += len;
 }
 
+bool valid_utf8(const char* data, u32 len) {
+    for (u32 i = 0; i < len;) {
+        const u8 lead = static_cast<u8>(data[i++]);
+        if (lead < 0x80) continue;
+
+        u32 continuation_count = 0;
+        u8 second_min = 0x80;
+        u8 second_max = 0xbf;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            continuation_count = 1;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            continuation_count = 2;
+            if (lead == 0xe0) second_min = 0xa0;  // Reject overlong encodings.
+            if (lead == 0xed) second_max = 0x9f;  // Reject UTF-16 surrogates.
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            continuation_count = 3;
+            if (lead == 0xf0) second_min = 0x90;  // Reject overlong encodings.
+            if (lead == 0xf4) second_max = 0x8f;  // Stay at or below U+10FFFF.
+        } else {
+            return false;
+        }
+
+        if (continuation_count > len - i) return false;
+        const u8 second = static_cast<u8>(data[i]);
+        if (second < second_min || second > second_max) return false;
+        for (u32 ci = 1; ci < continuation_count; ci++) {
+            const u8 continuation = static_cast<u8>(data[i + ci]);
+            if (continuation < 0x80 || continuation > 0xbf) return false;
+        }
+        i += continuation_count;
+    }
+    return true;
+}
+
 // Parse (data, len) into `pc`, populating ok / header_end / req. Leaves
 // pc.primed untouched — callers set it.
 void parse_into(ParseCache& pc, const u8* data, u32 len) {
@@ -148,6 +182,10 @@ void rut_helper_json_append_raw(const char* data, u32 len) {
 void rut_helper_json_append_str(const char* data, u32 len) {
     static constexpr char kHex[] = "0123456789abcdef";
     if (data == nullptr && len != 0) {
+        t_json_response.ok = false;
+        return;
+    }
+    if (!valid_utf8(data, len)) {
         t_json_response.ok = false;
         return;
     }
