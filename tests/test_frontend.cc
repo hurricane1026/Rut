@@ -5476,6 +5476,35 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     CHECK_EQ(hir->routes[0].control.else_term.status_code, 204u);
 }
 
+TEST(frontend, wait_any_direct_arm_json_sees_route_struct_locals) {
+    const char* src = R"rut(
+struct Payload { path: str }
+route GET "/x" {
+    let payload = Payload(path: req.path)
+    wait any {
+        downstream.recv() => { return 204 }
+        timer(250) => { return 408, json(payload) }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir->routes[0];
+    REQUIRE_EQ(route.control.kind, HirControlKind::If);
+    CHECK(route.control.then_term.has_dynamic_response_body);
+    CHECK_EQ(route.control.then_term.json_value_ref_indices.len, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_wait_any_arm_result_binding_is_arm_local) {
     const char* src =
         "route GET \"/x\" { wait any { "
