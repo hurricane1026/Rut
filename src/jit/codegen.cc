@@ -105,6 +105,7 @@ struct Ctx {
     LLVMValueRef fn_time_now_micros;
     LLVMValueRef fn_parse_prime;
     LLVMValueRef fn_parse_unprime;
+    LLVMValueRef fn_json_capture_reset;
     LLVMValueRef fn_time_unlatch;
     LLVMValueRef fn_json_reset;
     LLVMValueRef fn_json_append_raw;
@@ -204,6 +205,14 @@ struct Ctx {
         }
         return fn_json_reset;
     }
+    LLVMValueRef get_json_capture_reset() {
+        if (!fn_json_capture_reset) {
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, nullptr, 0, 0);
+            fn_json_capture_reset =
+                LLVMAddFunction(llvm_mod, "rut_helper_json_capture_reset", ft);
+        }
+        return fn_json_capture_reset;
+    }
     LLVMValueRef get_json_append_raw() {
         if (!fn_json_append_raw) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty};
@@ -275,6 +284,15 @@ struct Ctx {
         LLVMValueRef args[] = {param_req_data, param_req_len};
         LLVMBuildCall2(
             builder, LLVMGlobalGetValueType(get_parse_prime()), get_parse_prime(), args, 2, "");
+    }
+
+    void emit_json_capture_reset() {
+        LLVMBuildCall2(builder,
+                       LLVMGlobalGetValueType(get_json_capture_reset()),
+                       get_json_capture_reset(),
+                       nullptr,
+                       0,
+                       "");
     }
 
     // void rut_helper_parse_unprime()
@@ -2459,6 +2477,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
         LLVMPositionBuilderAtEnd(c.builder, dispatch_bb);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        c.emit_json_capture_reset();
         // Parse-once: prime the per-thread parse cache before any state runs,
         // so every req_* helper in this invocation shares one parse. Skipped
         // for handlers that never read the request (status/forward only).
@@ -2517,6 +2536,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     } else {
         LLVMPositionBuilderAtEnd(c.builder, c.block_map[fn.blocks[0].id.id]);
         c.ctx_store_sink = LLVMBuildAlloca(c.builder, c.i64_ty, "ctx.slot.store.sink");
+        c.emit_json_capture_reset();
         // Parse-once: prime the per-thread parse cache at handler entry,
         // unless the handler never reads the request.
         if (kNeedsParse) c.emit_parse_prime();
@@ -2573,6 +2593,7 @@ CodegenResult codegen(const rir::Module& rir_mod) {
     c.fn_time_now_micros = nullptr;
     c.fn_parse_prime = nullptr;
     c.fn_parse_unprime = nullptr;
+    c.fn_json_capture_reset = nullptr;
     c.fn_str_has_prefix = nullptr;
     c.fn_str_eq = nullptr;
     c.fn_str_cmp = nullptr;

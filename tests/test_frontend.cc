@@ -15243,6 +15243,71 @@ TEST(frontend, lower_to_rir_defers_array_fields_until_element_struct_is_built) {
     rir.destroy();
 }
 
+TEST(frontend, analyze_accepts_typed_empty_arrays_in_match_and_guard_blocks) {
+    const char* src = R"rut(
+variant Result { ok, err }
+route GET "/match" {
+    match Result.ok {
+        .ok => { let xs: [str] = [] return 200 }
+        .err => return 500
+    }
+}
+route GET "/guard" {
+    guard false else { let xs: [str] = [] return 400 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_preserves_array_shape_nested_in_tuple_elements) {
+    const char* src = "route GET \"/x\" { let xs = [([1, 2], 3)] let alias = xs return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, import_relative_file_remaps_array_helper_shapes) {
+    const std::string dir = "/tmp/rut_import_array_helper_shape_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/arrays.rut", std::ios::binary);
+        out << "func keep(values: [str]) -> [str] => values\n";
+    }
+    const char* src =
+        "import \"arrays.rut\"\n"
+        "route GET \"/x\" { let values = [\"kept\"] let result = keep(values) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "
@@ -32274,6 +32339,70 @@ TEST(frontend, json_values_are_opaque_outside_response_sinks) {
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(detail));
     }
+}
+
+TEST(frontend, conditional_json_locals_materialize_only_at_direct_sinks) {
+    const char* src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let payload = choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, json_is_rejected_from_variant_payload_shapes) {
+    const char* sources[] = {
+        "variant Box { value(Json) } route GET \"/x\" { return 200 }\n",
+        "variant Wrap<T> { value(T) } variant Box { value(Wrap<Json>) } "
+        "route GET \"/x\" { return 200 }\n",
+        "variant Box { value((i32, Json)) } route GET \"/x\" { return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Json values are opaque response plans; use them only through locals or helper "
+                "calls and consume them with return, respond, or Response.body")));
+    }
+}
+
+TEST(frontend, reusable_json_plan_rejects_wait_result_leaves) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let ev = wait(upstream(api).connect())
+    return 200, choose(ev.ok, json({ selected: "yes" }), json({ selected: "no" }))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("json cannot capture wait-result state after a wait")));
 }
 
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
