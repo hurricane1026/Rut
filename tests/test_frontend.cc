@@ -6863,6 +6863,57 @@ func inspect(_ resp: Response) -> i32 { resp.status }
     }
 }
 
+TEST(frontend, helper_block_response_assignment_marks_later_read_runtime) {
+    const char* src = R"rut(
+func rewrite() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    resp.status
+}
+route GET "/x" {
+    let status = rewrite()
+    if status == 201 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    bool saw_status_read = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            saw_status_read |=
+                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::RespStatus;
+    CHECK(saw_status_read);
+    rir.destroy();
+}
+
+TEST(frontend, response_scalar_assignment_after_guard_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard resp.status == 201 else { return 400 }
+    resp.status = 202
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
+                                    "move the assignment before the guard")));
+}
+
 TEST(frontend, parse_func_param_accepts_underscore_label) {
     const char* src = "func auth(_ req: i32) -> i32 => 0\n";
     auto lexed = lex(lit(src));
