@@ -7839,6 +7839,15 @@ TEST(jit, bounded_array_carrier_len_and_get) {
     auto index = V(b.emit_const_i32(0));
     auto first = V(b.emit_array_get(array, index));
     auto status = V(b.emit_arith(rir::Opcode::Add, first, len));
+    auto negative = V(b.emit_const_i32(-1));
+    auto past_end = V(b.emit_const_i32(2));
+    auto negative_value = V(b.emit_array_get(array, negative));
+    auto past_end_value = V(b.emit_array_get(array, past_end));
+    auto empty = V(b.emit_array_create(i32_type, nullptr, 0));
+    auto empty_value = V(b.emit_array_get(empty, index));
+    status = V(b.emit_arith(rir::Opcode::Add, status, negative_value));
+    status = V(b.emit_arith(rir::Opcode::Add, status, past_end_value));
+    status = V(b.emit_arith(rir::Opcode::Add, status, empty_value));
     VOK(b.emit_ret_status(status));
 
     auto cg = codegen(tc.mod);

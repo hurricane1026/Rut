@@ -15635,6 +15635,43 @@ TEST(frontend, analyze_accepts_typed_empty_array_local_alias) {
     rir.destroy();
 }
 
+TEST(frontend, analyze_accepts_typed_empty_array_in_helper_body) {
+    const char* src =
+        "func emptyTags() -> [str] { let xs: [str] = [] xs }\n"
+        "route GET \"/x\" { let xs = emptyTags() let alias = xs return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].init.array_len, 0u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, lower_to_rir_defers_array_fields_until_element_struct_is_built) {
+    const char* src =
+        "struct Payload { items: [Item] }\n"
+        "struct Item { value: i32 }\n"
+        "route GET \"/x\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, analyze_accepts_array_local_alias_chain) {
     const char* src =
         "route GET \"/x\" { let nums = [1, 2, 3] let second = nums let third = second return 200 "

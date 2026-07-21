@@ -3350,7 +3350,7 @@ static FrontendResult<void> apply_declared_type_to_expr(HirExpr* expr,
 }
 
 static FrontendResult<HirExpr> analyze_empty_array_lit_with_declared_type(const AstStatement& stmt,
-                                                                          HirModule& mod) {
+                                                                          const HirModule& mod) {
     if (!stmt.has_type || stmt.expr.kind != AstExprKind::ArrayLit || stmt.expr.args.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
 
@@ -3376,7 +3376,7 @@ static FrontendResult<HirExpr> analyze_empty_array_lit_with_declared_type(const 
     if (!declared) return core::make_unexpected(declared.error());
     if (declared.value() != HirTypeKind::Array || array_elem_shape_index >= mod.type_shapes.len)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
-    auto declared_shape = intern_hir_type_shape(&mod,
+    auto declared_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                 declared.value(),
                                                 0xffffffffu,
                                                 variant_index,
@@ -6108,7 +6108,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             const auto& inner = *stmt.block_stmts[si];
             const bool is_last = si + 1 == stmt.block_stmts.len;
             if (inner.kind == AstStmtKind::Let && !is_last) {
-                auto init = analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
+                auto init =
+                    inner.expr.kind == AstExprKind::ArrayLit && inner.expr.args.len == 0 &&
+                            inner.has_type
+                        ? analyze_empty_array_lit_with_declared_type(inner, mod)
+                        : analyze_block_expr(inner.expr, cur_locals, cur_local_count, nullptr);
                 if (!init) return core::make_unexpected(init.error());
                 auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                 if (!typed) return core::make_unexpected(typed.error());

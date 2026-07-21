@@ -1122,9 +1122,59 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             if (!fn.waits.push(w)) return frontend_error(FrontendError::TooManyItems, w.span);
         }
 
+        bool static_iter_ref[HirRoute::kMaxLocals]{};
+        for (u32 fi = 0; fi < module.routes[i].for_loops.len; fi++) {
+            const HirExpr* iter = &module.routes[i].for_loops[fi].iter_expr;
+            for (u32 depth = 0; depth < module.routes[i].locals.len; depth++) {
+                if (iter->kind != HirExprKind::LocalRef ||
+                    iter->local_index >= HirRoute::kMaxLocals)
+                    break;
+                static_iter_ref[iter->local_index] = true;
+                const HirLocal* source = nullptr;
+                for (u32 li = 0; li < module.routes[i].locals.len; li++) {
+                    if (module.routes[i].locals[li].ref_index == iter->local_index) {
+                        source = &module.routes[i].locals[li];
+                        break;
+                    }
+                }
+                if (source == nullptr) break;
+                iter = &source->init;
+            }
+        }
+        auto expr_refs_local =
+            [&](auto&& self, const HirExpr& expr, u32 ref_index, u32 depth) -> bool {
+            if (depth > HirRoute::kMaxExprs) return false;
+            if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index) return true;
+            if (expr.lhs != nullptr && self(self, *expr.lhs, ref_index, depth + 1)) return true;
+            if (expr.rhs != nullptr && self(self, *expr.rhs, ref_index, depth + 1)) return true;
+            for (u32 ai = 0; ai < expr.args.len; ai++)
+                if (expr.args[ai] != nullptr && self(self, *expr.args[ai], ref_index, depth + 1))
+                    return true;
+            for (u32 fi = 0; fi < expr.field_inits.len; fi++)
+                if (expr.field_inits[fi].value != nullptr &&
+                    self(self, *expr.field_inits[fi].value, ref_index, depth + 1))
+                    return true;
+            return false;
+        };
+        auto static_iter_ref_needed_at_runtime = [&](u32 ref_index) {
+            for (u32 li = 0; li < module.routes[i].locals.len; li++) {
+                const auto& consumer = module.routes[i].locals[li];
+                if (consumer.ref_index < HirRoute::kMaxLocals &&
+                    static_iter_ref[consumer.ref_index])
+                    continue;
+                if (expr_refs_local(expr_refs_local, consumer.init, ref_index, 0)) return true;
+            }
+            return false;
+        };
+
         for (u32 li = 0; li < module.routes[i].locals.len; li++) {
             if (module.routes[i].locals[li].type == HirTypeKind::Tuple) continue;
             if (module.routes[i].locals[li].type == HirTypeKind::Response) continue;
+            if (module.routes[i].locals[li].type == HirTypeKind::Array &&
+                module.routes[i].locals[li].ref_index < HirRoute::kMaxLocals &&
+                static_iter_ref[module.routes[i].locals[li].ref_index] &&
+                !static_iter_ref_needed_at_runtime(module.routes[i].locals[li].ref_index))
+                continue;
             // Skip synthetic name-cleared locals. Analyze keeps for-loop
             // loop variables in HirRoute::locals so body LocalRefs bind to
             // a stable ref_index, then blanks the name for scope-hiding
