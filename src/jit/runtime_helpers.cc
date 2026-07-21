@@ -83,8 +83,9 @@ struct JsonCaptureArena {
     // A reusable plan may be published at many sinks, and every eagerly
     // lowered conditional arm gets its own bounded document capture. The HIR
     // expression/local limits bound the total below this request-local cap.
-    static constexpr u32 kCapacity = 64 * 1024 * 1024;
+    static constexpr u32 kMaxCapacity = 64 * 1024 * 1024;
     char* data = nullptr;
+    u32 capacity = 0;
     u32 used = 0;
     u32 last_capture_len = 0xffffffffu;
 
@@ -249,16 +250,24 @@ const char* rut_helper_json_capture_data() {
         return nullptr;
     }
     const u32 capture_size = t_json_response.len == 0 ? 1 : t_json_response.len;
-    if (capture_size > JsonCaptureArena::kCapacity - captures.used) {
+    if (capture_size > JsonCaptureArena::kMaxCapacity - captures.used) {
         captures.last_capture_len = 0xffffffffu;
         return nullptr;
     }
-    if (captures.data == nullptr) {
-        captures.data = static_cast<char*>(malloc(JsonCaptureArena::kCapacity));
-        if (captures.data == nullptr) {
+    const u32 required = captures.used + capture_size;
+    if (required > captures.capacity) {
+        u32 grown = captures.capacity == 0 ? 64 * 1024 : captures.capacity;
+        while (grown < required && grown < JsonCaptureArena::kMaxCapacity)
+            grown = grown > JsonCaptureArena::kMaxCapacity / 2
+                        ? JsonCaptureArena::kMaxCapacity
+                        : grown * 2;
+        auto* resized = static_cast<char*>(realloc(captures.data, grown));
+        if (resized == nullptr) {
             captures.last_capture_len = 0xffffffffu;
             return nullptr;
         }
+        captures.data = resized;
+        captures.capacity = grown;
     }
     char* out = captures.data + captures.used;
     if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
@@ -514,7 +523,7 @@ void rut_helper_resp_set_status(void* ctx, i32 status) {
     auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
     hctx->response_status_pending_set = true;
     hctx->response_status_pending_invalid = status < 100 || status > 599;
-    if (hctx->response_status_pending_invalid) hctx->response_status_invalid = true;
+    hctx->response_status_invalid = hctx->response_status_pending_invalid;
     hctx->response_status_pending = status;
 }
 
@@ -524,7 +533,6 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
     hctx->response_body_pending_set = true;
     hctx->response_body_pending_overflow = hctx->response_body_snapshot_failed || body == nullptr ||
                                            len > jit::kMaxResponseBodyMutationBytes;
-    if (hctx->response_body_pending_overflow) hctx->response_body_mutation_overflow = true;
     if (!hctx->response_body_pending_overflow && hctx->response_body_mutation_storage == nullptr) {
         hctx->response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
         if (hctx->response_body_mutation_storage == nullptr) {
@@ -532,6 +540,7 @@ void rut_helper_resp_set_body(void* ctx, const char* body, u32 len) {
             hctx->response_body_mutation_overflow = true;
         }
     }
+    hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
     hctx->response_body_pending_len = hctx->response_body_pending_overflow ? 0 : len;
     if (!hctx->response_body_pending_overflow && len != 0)
         __builtin_memcpy(hctx->response_body_mutation_storage, body, len);
