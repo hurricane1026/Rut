@@ -5945,6 +5945,8 @@ static FrontendResult<void> instantiate_function_response_effects(
         if (!effect) return core::make_unexpected(effect.error());
         HirLocal carrier{};
         carrier.span = call_span;
+        if (fn.owns_response_builder)
+            carrier.name = lit_str("$helper_owned_response_effect");
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         carrier.type = effect->type;
         carrier.init = effect.value();
@@ -19092,6 +19094,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (!fn.respond_guards.push(respond_guard))
                 return frontend_error(FrontendError::TooManyItems, guard.fail_term.span);
         }
+        if (!collect_function_response_effects(
+                &fn, *scratch, all_locals, all_local_count, fn.params.len))
+            return frontend_error(FrontendError::TooManyItems, ast_func.body->span);
         auto normalized =
             normalize_function_expr(body.value(), &fn, all_locals, all_local_count, fn.params.len);
         if (!normalized) return core::make_unexpected(normalized.error());
@@ -21504,6 +21509,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         stmt.expr.span,
                         lit_str("Response builders cannot be copied or aliased in this slice"));
                 if (init->kind == HirExprKind::ResponseInit) {
+                    for (u32 li = 0; li < route.locals.len; li++) {
+                        if (route.locals[li].name.eq(
+                                lit_str("$helper_owned_response_effect")))
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax,
+                                stmt.expr.span,
+                                lit_str("a caller Response builder cannot follow mutations from "
+                                        "a helper-local Response builder"));
+                    }
                     for (u32 li = 0; li < route.locals.len; li++) {
                         if (route.locals[li].init.kind == HirExprKind::ResponseInit &&
                             route.locals[li].init.bool_value)

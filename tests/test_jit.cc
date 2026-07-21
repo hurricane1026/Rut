@@ -2810,6 +2810,19 @@ TEST(jit, response_body_snapshot_failure_remains_sticky_across_assignment) {
     CHECK(frame.ctx.response_body_mutation_overflow);
 }
 
+TEST(jit, response_body_snapshot_failure_publishes_terminal_overflow_immediately) {
+    TestHandlerCtxFrame frame{};
+    frame.ctx.response_body_pending_set = true;
+    frame.ctx.response_body_pending_len = 1;
+    frame.ctx.response_body_mutation_storage = nullptr;
+    const char* out_ptr = nullptr;
+    u32 out_len = 0;
+    rut_helper_resp_body(&frame.ctx, "fallback", 8, &out_ptr, &out_len);
+    CHECK(frame.ctx.response_body_snapshot_failed);
+    CHECK(frame.ctx.response_body_pending_overflow);
+    CHECK(frame.ctx.response_body_mutation_overflow);
+}
+
 TEST(jit, response_body_mutation_copies_source_bytes) {
     TestHandlerCtxFrame frame{};
     char body[] = "stable";
