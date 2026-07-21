@@ -1715,6 +1715,164 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, conditional_reusable_json_preserves_selected_plan) {
+    const auto src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let payload = choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kHttp11[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    static constexpr char kHttp10[] = "GET /x HTTP/1.0\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame11{};
+    const auto selected_yes = invoke_jit_handler(handler,
+                                                 nullptr,
+                                                 frame11.ctx,
+                                                 reinterpret_cast<const u8*>(kHttp11),
+                                                 sizeof(kHttp11) - 1,
+                                                 nullptr);
+    REQUIRE(selected_yes.dynamic_response_body != nullptr);
+    const Str yes_body{selected_yes.dynamic_response_body, selected_yes.dynamic_response_body_len};
+    CHECK(yes_body.eq(lit("{\"selected\":\"yes\"}")));
+
+    TestHandlerCtxFrame frame10{};
+    const auto selected_no = invoke_jit_handler(handler,
+                                                nullptr,
+                                                frame10.ctx,
+                                                reinterpret_cast<const u8*>(kHttp10),
+                                                sizeof(kHttp10) - 1,
+                                                nullptr);
+    REQUIRE(selected_no.dynamic_response_body != nullptr);
+    const Str no_body{selected_no.dynamic_response_body, selected_no.dynamic_response_body_len};
+    CHECK(no_body.eq(lit("{\"selected\":\"no\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, conditional_reusable_json_short_circuit_commits_only_body) {
+    const auto src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    resp.set("X-Pending", "yes")
+    resp.body = "pending"
+    guard req.http11 else {
+        respond 401, choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
+    }
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kHttp10[] = "GET /x HTTP/1.0\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kHttp10),
+                                            sizeof(kHttp10) - 1,
+                                            nullptr);
+    REQUIRE(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 401u);
+    CHECK_FALSE(frame.ctx.response_status_set);
+    CHECK_EQ(frame.ctx.response_header_count, 0u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"selected\":\"no\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, request_independent_json_captures_reset_per_invocation) {
+    const auto src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let payload = choose(true, json({ selected: "yes" }), json({ selected: "no" }))
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    for (u32 i = 0; i < 2000; i++) {
+        TestHandlerCtxFrame frame{};
+        const auto outcome = invoke_jit_handler(handler,
+                                                &conn,
+                                                frame.ctx,
+                                                reinterpret_cast<const u8*>(kRequest),
+                                                sizeof(kRequest) - 1,
+                                                nullptr);
+        REQUIRE(outcome.dynamic_response_body != nullptr);
+        const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+        CHECK(body.eq(lit("{\"selected\":\"yes\"}")));
+    }
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, reusable_json_response_body_is_stream_owned_across_wait) {
     const auto src = R"rut(
 route GET "/x" {

@@ -210,6 +210,7 @@ void rut_helper_resp_set_body(void* ctx, const char* body, rut::u32 len);
 // thread's bounded cache and clear the HandlerCtx pointer. Safe on null.
 void rut_helper_resp_release_body_storage(void* ctx);
 void rut_helper_resp_commit_headers(void* ctx);
+void rut_helper_resp_commit_body(void* ctx);
 void rut_helper_resp_header(void* ctx,
                             const char* name,
                             rut::u32 nlen,

@@ -33093,6 +33093,82 @@ TEST(frontend, json_values_are_opaque_outside_response_sinks) {
     }
 }
 
+TEST(frontend, conditional_json_locals_materialize_only_at_direct_sinks) {
+    const char* src = R"rut(
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let payload = choose(req.http11, json({ selected: "yes" }), json({ selected: "no" }))
+    return 200, payload
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_FALSE(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].locals.len, 0u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 body_commits = 0;
+    u32 full_commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            body_commits += block.insts[ii].op == rir::Opcode::RespCommitBody;
+            full_commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(body_commits, 1u);
+    CHECK_EQ(full_commits, 0u);
+    rir.destroy();
+}
+
+TEST(frontend, json_is_rejected_from_variant_payload_shapes) {
+    const char* sources[] = {
+        "variant Box { value(Json) } route GET \"/x\" { return 200 }\n",
+        "variant Wrap<T> { value(T) } variant Box { value(Wrap<Json>) } "
+        "route GET \"/x\" { return 200 }\n",
+        "variant Box { value((i32, Json)) } route GET \"/x\" { return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Json values are opaque response plans; use them only through locals or helper "
+                "calls and consume them with return, respond, or Response.body")));
+    }
+}
+
+TEST(frontend, reusable_json_plan_rejects_wait_result_leaves) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+func choose(flag: bool, yes: Json, no: Json) -> Json {
+    if flag { yes } else { no }
+}
+route GET "/x" {
+    let ev = wait(upstream(api).connect())
+    return 200, choose(ev.ok, json({ selected: "yes" }), json({ selected: "no" }))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("json cannot capture wait-result state after a wait")));
+}
+
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
     const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
     auto lexed = lex(lit(src));

@@ -3328,7 +3328,26 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
-        if (term.has_dynamic_response_body) {
+        if (term.has_json_body_plan) {
+            auto body = materialize_value(term.json_body_local.init,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          term.json_body_local.span);
+            if (!body) return core::make_unexpected(body.error());
+            if (!b.emit_resp_set_body(body.value(), {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (!b.emit_resp_commit_body({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+        } else if (term.has_dynamic_response_body) {
             constexpr u32 kJsonLocalCount =
                 MirFunction::kMaxLocals + MirTerminator::kMaxJsonMaterializedValues;
             rir::ValueId json_locals[kJsonLocalCount]{};

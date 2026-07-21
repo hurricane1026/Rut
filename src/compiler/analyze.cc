@@ -11206,12 +11206,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 auto body = analyze_expr(
                     stmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
                 if (!body) return core::make_unexpected(body.error());
-                if (body->type != HirTypeKind::Json || body->kind != HirExprKind::JsonBuild)
+                if (body->type != HirTypeKind::Json)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
-                if (body->field_inits.len == 0) {
+                if (body->kind == HirExprKind::JsonBuild && body->field_inits.len == 0) {
                     term.response_body = body->str_value;
-                } else {
+                } else if (body->kind == HirExprKind::JsonBuild) {
                     for (u32 i = 0; i < body->field_inits.len; i++) {
                         const auto& part = body->field_inits[i];
                         if (part.value == nullptr || !term.json_segments.push(part.name))
@@ -11221,32 +11221,28 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                 return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                             continue;
                         }
-                        HirLocal captured{};
-                        captured.span = part.value->span;
-                        captured.name = intern_generated_name("$json.return." + std::to_string(i));
-                        captured.ref_index =
-                            next_local_ref_index(route, route->locals.data, route->locals.len);
-                        captured.type = part.value->type;
-                        captured.shape_index = part.value->shape_index;
-                        captured.may_nil = part.value->may_nil;
-                        captured.may_error = part.value->may_error;
-                        captured.variant_index = part.value->variant_index;
-                        captured.struct_index = part.value->struct_index;
-                        captured.tuple_len = part.value->tuple_len;
-                        for (u32 ti = 0; ti < part.value->tuple_len; ti++) {
-                            captured.tuple_types[ti] = part.value->tuple_types[ti];
-                            captured.tuple_variant_indices[ti] =
-                                part.value->tuple_variant_indices[ti];
-                            captured.tuple_struct_indices[ti] =
-                                part.value->tuple_struct_indices[ti];
-                        }
-                        captured.init = *part.value;
-                        if (!route->locals.push(captured) ||
-                            !term.json_value_ref_indices.push(captured.ref_index))
+                        if (term.json_value_expr_indices.len >=
+                                HirTerminator::kMaxJsonMaterializedValues ||
+                            !route->exprs.push(*part.value))
+                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        const u32 expr_index = route->exprs.len - 1;
+                        const u32 ref_index =
+                            HirRoute::kMaxLocals + term.json_value_expr_indices.len;
+                        if (!term.json_value_expr_indices.push(expr_index) ||
+                            !term.json_value_ref_indices.push(ref_index))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                     }
                     if (!term.json_segments.push(body->str_value))
                         return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                    term.has_dynamic_response_body = true;
+                } else {
+                    // A reusable Json value can be a conditional/helper plan,
+                    // not only a direct JsonBuild. Materialize that plan into
+                    // a captured Str at this selected sink, then stream the
+                    // captured document as the dynamic response body.
+                    if (!route->exprs.push(body.value()))
+                        return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                    term.json_body_expr_index = route->exprs.len - 1;
                     term.has_dynamic_response_body = true;
                 }
             }

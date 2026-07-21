@@ -709,6 +709,11 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_resp_commit_body(SourceLoc loc = {}) {
+        TRY_VOID(emit(Opcode::RespCommitBody, nullptr, loc));
+        return {};
+    }
+
     VoidResult emit_json_reset(SourceLoc loc = {}) {
         TRY_VOID(emit(Opcode::JsonReset, nullptr, loc));
         return {};
