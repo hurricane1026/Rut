@@ -712,7 +712,8 @@ struct Builder {
         const TypeKind expected = op == Opcode::JsonAppendBool  ? TypeKind::Bool
                                   : op == Opcode::JsonAppendI32 ? TypeKind::I32
                                   : op == Opcode::JsonAppendI64 ? TypeKind::I64
-                                                                : TypeKind::Str;
+                                  : op == Opcode::JsonAppendStr ? TypeKind::Str
+                                                                : TypeKind::StrList;
         if (!val_has_type(value, expected)) return err(RirError::InvalidState);
         auto r = TRY(emit(op, nullptr, loc));
         r.inst->operands[0] = value;
