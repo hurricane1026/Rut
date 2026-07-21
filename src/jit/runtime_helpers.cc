@@ -578,6 +578,7 @@ void rut_helper_resp_body(
     if (snapshot == nullptr) {
         hctx->response_body_snapshot_failed = true;
         hctx->response_body_pending_overflow = true;
+        hctx->response_body_mutation_overflow = true;
         return;
     }
     *out_ptr = snapshot;
