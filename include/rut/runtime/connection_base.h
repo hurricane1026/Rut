@@ -307,8 +307,11 @@ struct ConnectionBase {
                                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
 
     jit::HandlerCtx* reset_jit_ctx() {
-        __builtin_memset(handler_ctx_storage, 0, sizeof(handler_ctx_storage));
         auto* ctx = reinterpret_cast<jit::HandlerCtx*>(handler_ctx_storage);
+        // The owned response-body bytes are guarded by their set/length flags;
+        // avoid clearing the full 4 KiB payload on every request.
+        __builtin_memset(ctx, 0, offsetof(jit::HandlerCtx, response_body_mutation_storage));
+        __builtin_memset(ctx->slots(), 0, static_cast<size_t>(kMaxJitHandlerSlots) * 8);
         ctx->slot_count = kMaxJitHandlerSlots;
         handler_ctx = ctx;
         return ctx;

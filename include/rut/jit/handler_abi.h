@@ -164,15 +164,17 @@ struct alignas(alignof(u64)) HandlerCtx {
     u16 response_status;
     bool response_status_set;
     bool response_status_invalid;
-    const char* response_body_pending_data;
     u32 response_body_pending_len;
     bool response_body_pending_set;
     bool response_body_pending_overflow;
-    const char* response_body_mutation_data;
     u32 response_body_mutation_len;
     bool response_body_mutation_set;
     bool response_body_mutation_overflow;
     RouteParam route_params[kMaxRouteParams];
+    // Accepted body bytes are copied here at assignment time. Keeping the
+    // bounded payload inside the resumable context avoids borrowing request,
+    // temporary, or thread-local storage across a yield.
+    char response_body_mutation_storage[kMaxResponseBodyMutationBytes];
 
     // Access slot storage (8-byte aligned, immediately after header).
     u8* slots() { return reinterpret_cast<u8*>(this + 1); }

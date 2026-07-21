@@ -302,7 +302,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
     if (result.action == jit::HandlerAction::ReturnStatus &&
         result.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
         if (response.response_body_mutation_set) {
-            out.dynamic_response_body = response.response_body_mutation_data;
+            out.dynamic_response_body = response.response_body_mutation_storage;
             out.dynamic_response_body_len = response.response_body_mutation_len;
             out.dynamic_response_body_valid = !response.response_body_mutation_overflow;
         } else {
