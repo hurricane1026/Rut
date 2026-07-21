@@ -10711,7 +10711,6 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         if (!route->exprs.push(body.value()))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
                         term.json_body_expr_index = route->exprs.len - 1;
-                        term.commit_response_mutations = true;
                     }
                 }
             }

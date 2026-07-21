@@ -3310,6 +3310,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!body) return core::make_unexpected(body.error());
             if (!b.emit_resp_set_body(body.value(), {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
+            if (!b.emit_resp_commit_body({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
         } else if (term.has_dynamic_response_body) {
             constexpr u32 kJsonLocalCount =
                 MirFunction::kMaxLocals + MirTerminator::kMaxJsonMaterializedValues;

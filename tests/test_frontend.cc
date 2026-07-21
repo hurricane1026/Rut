@@ -32441,11 +32441,23 @@ route GET "/x" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
+    CHECK_FALSE(hir->routes[0].control.direct_term.commit_response_mutations);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     CHECK_EQ(mir->functions[0].locals.len, 0u);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 body_commits = 0;
+    u32 full_commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            body_commits += block.insts[ii].op == rir::Opcode::RespCommitBody;
+            full_commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(body_commits, 1u);
+    CHECK_EQ(full_commits, 0u);
     rir.destroy();
 }
 

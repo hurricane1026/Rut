@@ -449,6 +449,7 @@ struct Ctx {
     LLVMValueRef fn_resp_set_status = nullptr;
     LLVMValueRef fn_resp_set_body = nullptr;
     LLVMValueRef fn_resp_commit_headers = nullptr;
+    LLVMValueRef fn_resp_commit_body = nullptr;
     LLVMValueRef fn_resp_header = nullptr;
     LLVMValueRef get_resp_set_header() {
         if (!fn_resp_set_header) {
@@ -498,6 +499,14 @@ struct Ctx {
                                                      LLVMFunctionType(void_ty, params, 1, 0));
         }
         return fn_resp_commit_headers;
+    }
+    LLVMValueRef get_resp_commit_body() {
+        if (!fn_resp_commit_body) {
+            LLVMTypeRef params[] = {ptr_ty};
+            fn_resp_commit_body = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_commit_body", LLVMFunctionType(void_ty, params, 1, 0));
+        }
+        return fn_resp_commit_body;
     }
     LLVMValueRef get_resp_header() {
         if (!fn_resp_header) {
@@ -1362,6 +1371,16 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_resp_commit_headers()),
                            c.get_resp_commit_headers(),
+                           args,
+                           1,
+                           "");
+            break;
+        }
+        case rir::Opcode::RespCommitBody: {
+            LLVMValueRef args[] = {c.param_ctx};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_resp_commit_body()),
+                           c.get_resp_commit_body(),
                            args,
                            1,
                            "");

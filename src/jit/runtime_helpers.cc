@@ -525,6 +525,14 @@ void rut_helper_resp_commit_headers(void* ctx) {
     hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
 }
 
+void rut_helper_resp_commit_body(void* ctx) {
+    if (ctx == nullptr) return;
+    auto* hctx = static_cast<jit::HandlerCtx*>(ctx);
+    hctx->response_body_mutation_len = hctx->response_body_pending_len;
+    hctx->response_body_mutation_set = hctx->response_body_pending_set;
+    hctx->response_body_mutation_overflow = hctx->response_body_pending_overflow;
+}
+
 void rut_helper_resp_header(void* ctx,
                             const char* name,
                             u32 nlen,
