@@ -2626,6 +2626,13 @@ TEST(jit, response_body_snapshot_failure_publishes_terminal_overflow_immediately
     CHECK(frame.ctx.response_body_mutation_overflow);
 }
 
+TEST(jit, invalid_pending_response_status_is_terminal_immediately) {
+    TestHandlerCtxFrame frame{};
+    rut_helper_resp_set_status(&frame.ctx, 700);
+    CHECK(frame.ctx.response_status_pending_invalid);
+    CHECK(frame.ctx.response_status_invalid);
+}
+
 TEST(jit, response_body_mutation_copies_source_bytes) {
     TestHandlerCtxFrame frame{};
     char body[] = "stable";
