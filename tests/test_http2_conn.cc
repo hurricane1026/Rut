@@ -1528,6 +1528,8 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     path_buf[8] = '9';
 
     REQUIRE(h2.pending_route_param_count == 1u);
+    CHECK(h2.pending_buffer_body);
+    CHECK_FALSE(h2.pending_request_forwardable);  // missing :scheme
     const H2RouteParam& sp = h2.pending_route_params[0];
     CHECK_EQ(sp.value_len, 2u);
     CHECK(sp.value != path_buf + 7);  // not aliasing the reusable matcher source
@@ -1536,6 +1538,7 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     CHECK(sp.value == reinterpret_cast<const char*>(h2.pending_synth + 4 + 7));
     CHECK(sp.value[0] == '4' && sp.value[1] == '2');  // pre-clobber bytes intact
     CHECK(sp.name == params[0].name);                 // name still points into stable config
+
 }
 
 TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
@@ -1595,7 +1598,8 @@ TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     CHECK(parked_body.eq(Str{kBody, sizeof(kBody) - 1}));
 
     h2.async_stream = 1;
-    h2.async_kind = H2AsyncKind::Timer;
+    h2.async_kind = H2AsyncKind::Proxy;
+    h2.async_apply_response_mutations = true;
     h2_clear_async(h2);
     CHECK(parked->response_body_mutation_storage == nullptr);
     CHECK(parked->response_body_snapshot_storage == nullptr);
