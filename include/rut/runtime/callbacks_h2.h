@@ -615,6 +615,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
                       const RouteEntry* route,
                       u16 upstream_id,
                       bool apply_response_mutations,
+                      jit::HandlerCtx* live_ctx,
                       const u8* synth,
                       u32 synth_len) {
     Http2Conn* h2 = d.conn->h2;
@@ -626,6 +627,12 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
+    if (apply_response_mutations &&
+        (live_ctx == nullptr ||
+         !h2_snapshot_async_jit_ctx(*h2, *live_ctx, synth, h2->async_synth_len))) {
+        h2_async_epoch_leave(d.loop, *d.conn);
+        return false;
+    }
     h2->async_stream = stream_id;
     h2->async_kind = H2AsyncKind::Proxy;
     h2->async_cfg = cfg;
@@ -665,7 +672,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::ForwardBuffered) {
         if (!h2_suspend_proxy(
-                d, stream_id, cfg, route, kOutcome.upstream_id, true, synth, synth_len))
+                d, stream_id, cfg, route, kOutcome.upstream_id, true, ctx, synth, synth_len))
             h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -952,7 +959,15 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     return;
                 }
                 if (!h2_suspend_proxy(
-                        d, stream_id, config, route, route->upstream_id, false, synth, kSynthLen))
+                        d,
+                        stream_id,
+                        config,
+                        route,
+                        route->upstream_id,
+                        false,
+                        nullptr,
+                        synth,
+                        kSynthLen))
                     h2_emit_status(d, stream_id, 503);  // a stream is already suspended
             }
             return;
@@ -1034,6 +1049,8 @@ template <typename Loop>
 void h2_begin_suspended_io(Loop* loop, Connection& conn) {
     h2_async_epoch_enter(loop, conn);
     if (conn.h2->async_kind == H2AsyncKind::Proxy) {
+        if (conn.h2->async_apply_response_mutations)
+            conn.handler_ctx = conn.h2->async_jit_ctx();
         h2_proxy_begin<Loop>(loop, conn);
         return;
     }

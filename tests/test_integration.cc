@@ -9468,6 +9468,7 @@ func rewrite(_ resp: Response) -> i32 {
     resp.status = 201
     resp.body = "rewritten"
     resp.set("X-After", "yes")
+    resp.set("X-Path", req.path)
     0
 }
 chain rewrite_chain { after rewrite(resp) }
@@ -10149,6 +10150,7 @@ TEST(shard, buffered_jit_forward_applies_response_mutations_over_http2) {
     CHECK(body_len == 9 && __builtin_memcmp(body, "rewritten", 9) == 0);
     CHECK(h2_response_has_header(response, total, 1, "x-after", "yes"));
     CHECK(h2_response_has_header(response, total, 1, "x-origin", "kept"));
+    CHECK(h2_response_has_header(response, total, 1, "x-path", "/api"));
     CHECK(!h2_response_has_header(response, total, 1, "x-after", "no"));
 
     close(client);
