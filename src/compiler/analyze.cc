@@ -494,9 +494,11 @@ static bool hir_type_shape_contains_json(const HirModule& mod, u32 shape_index, 
     return false;
 }
 
-static bool hir_type_shape_has_runtime_carrier(const HirModule& mod,
-                                               u32 shape_index,
-                                               u32 depth = 0) {
+static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
+                                                    u32 shape_index,
+                                                    bool* struct_visiting,
+                                                    bool* variant_visiting,
+                                                    u32 depth) {
     if (shape_index >= mod.type_shapes.len || depth > HirModule::kMaxTypeShapes) return false;
     const auto& shape = mod.type_shapes[shape_index];
     if (!shape.is_concrete) return false;
@@ -509,21 +511,66 @@ static bool hir_type_shape_has_runtime_carrier(const HirModule& mod,
         case HirTypeKind::ByteSize:
         case HirTypeKind::IP:
         case HirTypeKind::StrList:
-        case HirTypeKind::Struct:
-        case HirTypeKind::Variant:
             return true;
+        case HirTypeKind::Struct: {
+            if (shape.struct_index >= mod.structs.len) return false;
+            if (struct_visiting[shape.struct_index]) return true;
+            struct_visiting[shape.struct_index] = true;
+            const auto& st = mod.structs[shape.struct_index];
+            for (u32 i = 0; i < st.fields.len; i++) {
+                if (!hir_type_shape_has_runtime_carrier_impl(mod,
+                                                             st.fields[i].shape_index,
+                                                             struct_visiting,
+                                                             variant_visiting,
+                                                             depth + 1)) {
+                    struct_visiting[shape.struct_index] = false;
+                    return false;
+                }
+            }
+            struct_visiting[shape.struct_index] = false;
+            return true;
+        }
+        case HirTypeKind::Variant: {
+            if (shape.variant_index >= mod.variants.len) return false;
+            if (variant_visiting[shape.variant_index]) return true;
+            variant_visiting[shape.variant_index] = true;
+            const auto& variant = mod.variants[shape.variant_index];
+            for (u32 i = 0; i < variant.cases.len; i++) {
+                if (!variant.cases[i].has_payload) continue;
+                if (!hir_type_shape_has_runtime_carrier_impl(mod,
+                                                             variant.cases[i].payload_shape_index,
+                                                             struct_visiting,
+                                                             variant_visiting,
+                                                             depth + 1)) {
+                    variant_visiting[shape.variant_index] = false;
+                    return false;
+                }
+            }
+            variant_visiting[shape.variant_index] = false;
+            return true;
+        }
         case HirTypeKind::Array:
-            return hir_type_shape_has_runtime_carrier(
-                mod, shape.array_elem_shape_index, depth + 1);
+            return hir_type_shape_has_runtime_carrier_impl(
+                mod, shape.array_elem_shape_index, struct_visiting, variant_visiting, depth + 1);
         case HirTypeKind::Tuple:
             for (u32 i = 0; i < shape.tuple_len; i++)
-                if (!hir_type_shape_has_runtime_carrier(
-                        mod, shape.tuple_elem_shape_indices[i], depth + 1))
+                if (!hir_type_shape_has_runtime_carrier_impl(mod,
+                                                             shape.tuple_elem_shape_indices[i],
+                                                             struct_visiting,
+                                                             variant_visiting,
+                                                             depth + 1))
                     return false;
             return true;
         default:
             return false;
     }
+}
+
+static bool hir_type_shape_has_runtime_carrier(const HirModule& mod, u32 shape_index) {
+    bool struct_visiting[HirModule::kMaxStructs]{};
+    bool variant_visiting[HirModule::kMaxVariants]{};
+    return hir_type_shape_has_runtime_carrier_impl(
+        mod, shape_index, struct_visiting, variant_visiting, 0);
 }
 
 struct ImportedModuleInfo {
@@ -9055,6 +9102,77 @@ static u32 count_function_param_refs(const HirExpr& expr, u32 param_index, u32 l
     return count;
 }
 
+static u32 count_normalized_local_refs(const HirExpr& expr,
+                                       u32 target_index,
+                                       const HirLocal* locals,
+                                       u32 local_count,
+                                       u32 param_count,
+                                       bool* visiting,
+                                       u32 limit) {
+    if (limit == 0) return 0;
+    if (expr.kind == HirExprKind::LocalRef) {
+        if (expr.local_index == target_index) return 1;
+        if (expr.local_index >= param_count && expr.local_index < local_count &&
+            !visiting[expr.local_index]) {
+            visiting[expr.local_index] = true;
+            const u32 count = count_normalized_local_refs(locals[expr.local_index].init,
+                                                          target_index,
+                                                          locals,
+                                                          local_count,
+                                                          param_count,
+                                                          visiting,
+                                                          limit);
+            visiting[expr.local_index] = false;
+            return count;
+        }
+        return 0;
+    }
+    u32 count = 0;
+    if (expr.lhs != nullptr) {
+        count += count_normalized_local_refs(*expr.lhs,
+                                             target_index,
+                                             locals,
+                                             local_count,
+                                             param_count,
+                                             visiting,
+                                             limit - count);
+        if (count >= limit) return count;
+    }
+    if (expr.rhs != nullptr) {
+        count += count_normalized_local_refs(*expr.rhs,
+                                             target_index,
+                                             locals,
+                                             local_count,
+                                             param_count,
+                                             visiting,
+                                             limit - count);
+        if (count >= limit) return count;
+    }
+    for (u32 i = 0; i < expr.field_inits.len; i++) {
+        if (expr.field_inits[i].value == nullptr) continue;
+        count += count_normalized_local_refs(*expr.field_inits[i].value,
+                                             target_index,
+                                             locals,
+                                             local_count,
+                                             param_count,
+                                             visiting,
+                                             limit - count);
+        if (count >= limit) return count;
+    }
+    for (u32 i = 0; i < expr.args.len; i++) {
+        if (expr.args[i] == nullptr) continue;
+        count += count_normalized_local_refs(*expr.args[i],
+                                             target_index,
+                                             locals,
+                                             local_count,
+                                             param_count,
+                                             visiting,
+                                             limit - count);
+        if (count >= limit) return count;
+    }
+    return count;
+}
+
 static bool function_param_is_reused(const HirFunction& fn, u32 param_index) {
     u32 count = count_function_param_refs(fn.body, param_index, 2);
     for (u32 i = 0; count < 2 && i < fn.respond_guards.len; i++)
@@ -9861,10 +9979,34 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             const u32 expected_elem_shape_index = fn.params[param_index].array_elem_shape_index;
             if (analyzed_arg.type == HirTypeKind::StrList &&
                 expected_elem_shape_index < mod.type_shapes.len) {
-                if (mod.type_shapes[expected_elem_shape_index].type == HirTypeKind::Str) {
+                const auto expected_elem_type = mod.type_shapes[expected_elem_shape_index].type;
+                if (expected_elem_type == HirTypeKind::Str ||
+                    expected_elem_type == HirTypeKind::Generic) {
+                    auto str_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                                           HirTypeKind::Str,
+                                                           0xffffffffu,
+                                                           0xffffffffu,
+                                                           0xffffffffu,
+                                                           0,
+                                                           nullptr,
+                                                           nullptr,
+                                                           nullptr,
+                                                           span);
+                    if (!str_shape) return core::make_unexpected(str_shape.error());
+                    auto array_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                                             HirTypeKind::Array,
+                                                             0xffffffffu,
+                                                             0xffffffffu,
+                                                             0xffffffffu,
+                                                             0,
+                                                             nullptr,
+                                                             nullptr,
+                                                             nullptr,
+                                                             span,
+                                                             str_shape.value());
+                    if (!array_shape) return core::make_unexpected(array_shape.error());
                     analyzed_arg.type = HirTypeKind::Array;
-                    analyzed_arg.shape_index = fn.params[param_index].shape_index;
-                    return {};
+                    analyzed_arg.shape_index = array_shape.value();
                 }
             }
             if (analyzed_arg.type != HirTypeKind::Array ||
@@ -13079,18 +13221,111 @@ static FrontendResult<void> merge_imported_functions(
         if (source_shape.type == HirTypeKind::Variant) {
             if (variant_index >= source.variants.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, span);
-            variant_index = find_variant_index(
-                *mod, imported_visible_name(source, source.variants[variant_index].name));
-            if (variant_index >= mod->variants.len)
-                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            const auto& source_variant = source.variants[variant_index];
+            if (source_variant.template_variant_index == 0xffffffffu) {
+                variant_index = find_variant_index(
+                    *mod, imported_visible_name(source, source_variant.name));
+                if (variant_index >= mod->variants.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+            } else {
+                const auto& source_template = source.variants[source_variant.template_variant_index];
+                const u32 target_template = find_variant_index(
+                    *mod, imported_visible_name(source, source_template.name));
+                if (target_template >= mod->variants.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+                GenericBinding bindings[HirVariant::kMaxTypeParams]{};
+                for (u32 i = 0; i < source_variant.instance_type_arg_count; i++) {
+                    auto mapped = self(
+                        self, source, source_variant.instance_shape_indices[i], span);
+                    if (!mapped) return core::make_unexpected(mapped.error());
+                    const auto& mapped_shape = mod->type_shapes[mapped.value()];
+                    HirTypeKind tuple_types[kMaxTupleSlots]{};
+                    u32 tuple_variants[kMaxTupleSlots]{};
+                    u32 tuple_structs[kMaxTupleSlots]{};
+                    for (u32 ti = 0; ti < mapped_shape.tuple_len; ti++) {
+                        const auto& elem = mod->type_shapes[mapped_shape.tuple_elem_shape_indices[ti]];
+                        tuple_types[ti] = elem.type;
+                        tuple_variants[ti] = elem.variant_index;
+                        tuple_structs[ti] = elem.type == HirTypeKind::Generic
+                                                ? elem.generic_index
+                                                : elem.struct_index;
+                    }
+                    auto filled = fill_bound_binding_from_type_metadata(&bindings[i],
+                                                                         mod,
+                                                                         mapped_shape.type,
+                                                                         mapped_shape.generic_index,
+                                                                         mapped_shape.variant_index,
+                                                                         mapped_shape.struct_index,
+                                                                         mapped_shape.tuple_len,
+                                                                         tuple_types,
+                                                                         tuple_variants,
+                                                                         tuple_structs,
+                                                                         mapped.value(),
+                                                                         span);
+                    if (!filled) return core::make_unexpected(filled.error());
+                }
+                auto concrete = instantiate_variant(mod,
+                                                    target_template,
+                                                    bindings,
+                                                    source_variant.instance_type_arg_count,
+                                                    span);
+                if (!concrete) return core::make_unexpected(concrete.error());
+                variant_index = concrete.value();
+            }
         }
         if (source_shape.type == HirTypeKind::Struct) {
             if (struct_index >= source.structs.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, span);
-            struct_index = find_struct_index(
-                *mod, imported_visible_name(source, source.structs[struct_index].name));
-            if (struct_index >= mod->structs.len)
-                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            const auto& source_struct = source.structs[struct_index];
+            if (source_struct.template_struct_index == 0xffffffffu) {
+                struct_index = find_struct_index(
+                    *mod, imported_visible_name(source, source_struct.name));
+                if (struct_index >= mod->structs.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+            } else {
+                const auto& source_template = source.structs[source_struct.template_struct_index];
+                const u32 target_template = find_struct_index(
+                    *mod, imported_visible_name(source, source_template.name));
+                if (target_template >= mod->structs.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+                GenericBinding bindings[HirStruct::kMaxTypeParams]{};
+                for (u32 i = 0; i < source_struct.instance_type_arg_count; i++) {
+                    auto mapped = self(self, source, source_struct.instance_shape_indices[i], span);
+                    if (!mapped) return core::make_unexpected(mapped.error());
+                    const auto& mapped_shape = mod->type_shapes[mapped.value()];
+                    HirTypeKind tuple_types[kMaxTupleSlots]{};
+                    u32 tuple_variants[kMaxTupleSlots]{};
+                    u32 tuple_structs[kMaxTupleSlots]{};
+                    for (u32 ti = 0; ti < mapped_shape.tuple_len; ti++) {
+                        const auto& elem = mod->type_shapes[mapped_shape.tuple_elem_shape_indices[ti]];
+                        tuple_types[ti] = elem.type;
+                        tuple_variants[ti] = elem.variant_index;
+                        tuple_structs[ti] = elem.type == HirTypeKind::Generic
+                                                ? elem.generic_index
+                                                : elem.struct_index;
+                    }
+                    auto filled = fill_bound_binding_from_type_metadata(&bindings[i],
+                                                                         mod,
+                                                                         mapped_shape.type,
+                                                                         mapped_shape.generic_index,
+                                                                         mapped_shape.variant_index,
+                                                                         mapped_shape.struct_index,
+                                                                         mapped_shape.tuple_len,
+                                                                         tuple_types,
+                                                                         tuple_variants,
+                                                                         tuple_structs,
+                                                                         mapped.value(),
+                                                                         span);
+                    if (!filled) return core::make_unexpected(filled.error());
+                }
+                auto concrete = instantiate_struct(mod,
+                                                   target_template,
+                                                   bindings,
+                                                   source_struct.instance_type_arg_count,
+                                                   span);
+                if (!concrete) return core::make_unexpected(concrete.error());
+                struct_index = concrete.value();
+            }
         }
         u32 array_elem_shape_index = 0xffffffffu;
         u32 tuple_elem_shape_indices[kMaxTupleSlots]{};
@@ -19340,10 +19575,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
             all_locals[all_local_count++] = scratch.locals[li];
         for (u32 li = 0; li < scratch.locals.len; li++) {
             const auto& local = scratch.locals[li];
-            u32 refs = count_function_param_refs(body.value(), local.ref_index, 2);
+            bool visiting[AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals]{};
+            u32 refs = count_normalized_local_refs(body.value(),
+                                                   local.ref_index,
+                                                   all_locals,
+                                                   all_local_count,
+                                                   fn.params.len,
+                                                   visiting,
+                                                   2);
             for (u32 gi = 0; refs < 2 && gi < scratch.guards.len; gi++)
-                refs += count_function_param_refs(
-                    scratch.guards[gi].cond, local.ref_index, 2 - refs);
+                refs += count_normalized_local_refs(scratch.guards[gi].cond,
+                                                    local.ref_index,
+                                                    all_locals,
+                                                    all_local_count,
+                                                    fn.params.len,
+                                                    visiting,
+                                                    2 - refs);
             if (local.type == HirTypeKind::Array && refs >= 2)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
