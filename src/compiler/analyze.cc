@@ -2840,11 +2840,12 @@ static FrontendResult<void> concretize_named_instance_shape(HirExpr* expr,
             expr->struct_index = concrete.value();
         }
     }
-    // Array element metadata lives only in the indexed shape tree. Substitute
-    // generic leaves recursively and re-intern the concrete tree so [T]
-    // parameters/returns become [i32], [str], etc. at the call site.
-    if (expr->type == HirTypeKind::Array && expr->shape_index < mod.type_shapes.len &&
-        mod.type_shapes[expr->shape_index].type == HirTypeKind::Array) {
+    // Aggregate element metadata lives in the indexed shape tree. Substitute
+    // generic leaves recursively and re-intern the concrete tree so [T] and
+    // (T, i32) parameters/returns become concrete at the call site.
+    if ((expr->type == HirTypeKind::Array || expr->type == HirTypeKind::Tuple) &&
+        expr->shape_index < mod.type_shapes.len &&
+        mod.type_shapes[expr->shape_index].type == expr->type) {
         auto concretize_shape = [&](auto&& self, u32 index) -> FrontendResult<u32> {
             if (index >= mod.type_shapes.len)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr->span);
@@ -2895,6 +2896,20 @@ static FrontendResult<void> concretize_named_instance_shape(HirExpr* expr,
         auto concrete = concretize_shape(concretize_shape, expr->shape_index);
         if (!concrete) return core::make_unexpected(concrete.error());
         expr->shape_index = concrete.value();
+        if (expr->type == HirTypeKind::Tuple) {
+            const auto& shape = mod.type_shapes[expr->shape_index];
+            expr->tuple_len = shape.tuple_len;
+            for (u32 i = 0; i < shape.tuple_len; i++) {
+                const auto& elem = mod.type_shapes[shape.tuple_elem_shape_indices[i]];
+                expr->tuple_types[i] = elem.type;
+                expr->tuple_variant_indices[i] =
+                    elem.type == HirTypeKind::Variant ? elem.variant_index : 0xffffffffu;
+                expr->tuple_struct_indices[i] =
+                    elem.type == HirTypeKind::Struct
+                        ? elem.struct_index
+                        : (elem.type == HirTypeKind::Generic ? elem.generic_index : 0xffffffffu);
+            }
+        }
         return {};
     }
     if (expr->type != HirTypeKind::Unknown) {
@@ -8752,8 +8767,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                   mixed_int ? kArithMixedWidthDetail : Str{});
         }
         if (expr.kind == AstExprKind::Eq) {
-            if (lhs->type == HirTypeKind::Generic && !lhs->generic_has_eq_constraint)
-                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            if (lhs->type == HirTypeKind::Generic) {
+                if (!lhs->generic_has_eq_constraint)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            } else {
+                bool struct_visiting[HirModule::kMaxStructs]{};
+                bool variant_visiting[HirModule::kMaxVariants]{};
+                if (!hir_type_shape_satisfies_eq_constraint(mod,
+                                                            lhs->type,
+                                                            lhs->variant_index,
+                                                            lhs->struct_index,
+                                                            lhs->tuple_len,
+                                                            lhs->tuple_types,
+                                                            lhs->tuple_variant_indices,
+                                                            lhs->tuple_struct_indices,
+                                                            struct_visiting,
+                                                            variant_visiting))
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            }
         } else {
             if (lhs->type == HirTypeKind::Generic) {
                 if (!lhs->generic_has_ord_constraint)
@@ -9861,6 +9892,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             target.tuple_variant_indices[i] = ret->tuple_variant_indices[i];
             target.tuple_struct_indices[i] = ret->tuple_struct_indices[i];
         }
+        if ((target.type == HirTypeKind::Json && (target.may_nil || target.may_error)) ||
+            (target.type != HirTypeKind::Json &&
+             hir_type_shape_contains_json(mod, target.shape_index)))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, kJsonOpaqueValueDetail);
         return {};
     };
     auto placeholder_slot_expr =
@@ -10270,17 +10306,36 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (pipe_lhs != nullptr && placeholder_count == 0)
         return fail_call(expr.span, "pipe call missing placeholder", nullptr);
     for (u32 i = 0; i < effective_arg_count; i++) {
-        if (analyzed_args[i].type != HirTypeKind::Array ||
+        const bool needs_array_carrier = analyzed_args[i].type == HirTypeKind::Array;
+        const bool needs_json_struct_carrier = analyzed_args[i].type == HirTypeKind::Struct &&
+                                               fn.body.kind == HirExprKind::JsonBuild;
+        if ((!needs_array_carrier && !needs_json_struct_carrier) ||
             analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i))
             continue;
         HirLocal carrier{};
         carrier.span = expr.args[i]->span;
-        carrier.name = {"$array_arg", 10};
-        // A route-level `let` reserves its own ref_index before analyzing the
-        // initializer, but is not in route->locals yet. Keep this synthetic
-        // argument carrier beyond that pending slot.
-        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len) + 1;
+        carrier.name = {"$call_arg", 9};
+        carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        if (carrier.ref_index >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, expr.args[i]->span);
         carrier.type = analyzed_args[i].type;
+        carrier.generic_index = analyzed_args[i].generic_index;
+        carrier.associated_name = analyzed_args[i].associated_name;
+        carrier.generic_has_error_constraint = analyzed_args[i].generic_has_error_constraint;
+        carrier.generic_has_eq_constraint = analyzed_args[i].generic_has_eq_constraint;
+        carrier.generic_has_ord_constraint = analyzed_args[i].generic_has_ord_constraint;
+        carrier.generic_protocol_index = analyzed_args[i].generic_protocol_index;
+        carrier.generic_protocol_count = analyzed_args[i].generic_protocol_count;
+        for (u32 cpi = 0; cpi < carrier.generic_protocol_count; cpi++)
+            carrier.generic_protocol_indices[cpi] = analyzed_args[i].generic_protocol_indices[cpi];
+        carrier.variant_index = analyzed_args[i].variant_index;
+        carrier.struct_index = analyzed_args[i].struct_index;
+        carrier.tuple_len = analyzed_args[i].tuple_len;
+        for (u32 ti = 0; ti < carrier.tuple_len; ti++) {
+            carrier.tuple_types[ti] = analyzed_args[i].tuple_types[ti];
+            carrier.tuple_variant_indices[ti] = analyzed_args[i].tuple_variant_indices[ti];
+            carrier.tuple_struct_indices[ti] = analyzed_args[i].tuple_struct_indices[ti];
+        }
         carrier.shape_index = analyzed_args[i].shape_index;
         carrier.init = analyzed_args[i];
         if (!route->locals.push(carrier))
@@ -14700,6 +14755,15 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             local.span = bstmt.span;
             local.name = bstmt.name;
             local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+            if (local.ref_index >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            HirLocal reserved_local{};
+            reserved_local.span = bstmt.span;
+            reserved_local.ref_index = local.ref_index;
+            const u32 local_storage_index = route->locals.len;
+            if (!route->locals.push(reserved_local))
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            const u32 scoped_carrier_start = route->locals.len;
             auto init = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!init) return core::make_unexpected(init.error());
@@ -14733,9 +14797,21 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             local.error_variant_index = init->error_variant_index;
             local.shape_index = init->shape_index;
             local.init = init.value();
+            route->locals[local_storage_index] = local;
+            // Synthetic locals created while analyzing this initializer must
+            // execute inside each unrolled iteration, before the user local.
+            for (u32 li = scoped_carrier_start; li < route->locals.len; li++) {
+                const u32 carrier_index = loop.body.locals.len;
+                if (!loop.body.locals.push(route->locals[li]))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                HirForLoopBody::Step carrier_step{};
+                carrier_step.kind = HirForLoopBody::Step::Kind::Let;
+                carrier_step.index = carrier_index;
+                carrier_step.span = route->locals[li].span;
+                if (!loop.body.steps.push(carrier_step))
+                    return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            }
             const u32 local_index = loop.body.locals.len;
-            if (!route->locals.push(local))
-                return frontend_error(FrontendError::TooManyItems, bstmt.span);
             if (!loop.body.locals.push(local))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
             HirForLoopBody::Step step{};
@@ -20095,6 +20171,17 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 local.span = stmt.span;
                 local.name = stmt.name;
                 local.ref_index = next_local_ref_index(&route, route.locals.data, route.locals.len);
+                if (local.ref_index >= HirRoute::kMaxLocals)
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                // Reserve this destination once before the initializer adds any
+                // synthetic argument carriers. The placeholder is unnameable,
+                // so the initializer cannot accidentally refer to itself.
+                HirLocal reserved_local{};
+                reserved_local.span = stmt.span;
+                reserved_local.ref_index = local.ref_index;
+                const u32 local_storage_index = route.locals.len;
+                if (!route.locals.push(reserved_local))
+                    return frontend_error(FrontendError::TooManyItems, stmt.span);
                 const bool used_for_iter =
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
@@ -20185,8 +20272,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 local.error_variant_index = init->error_variant_index;
                 local.shape_index = init->shape_index;
                 local.init = init.value();
-                if (!route.locals.push(local))
-                    return frontend_error(FrontendError::TooManyItems, stmt.span);
+                // Carriers added while analyzing the initializer must be
+                // materialized before the destination that refers to them.
+                for (u32 li = local_storage_index + 1; li < route.locals.len; li++)
+                    route.locals[li - 1] = route.locals[li];
+                route.locals[route.locals.len - 1] = local;
                 continue;
             }
             if (stmt.kind == AstStmtKind::Guard) {

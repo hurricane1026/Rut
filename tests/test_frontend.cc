@@ -32703,6 +32703,8 @@ TEST(frontend, optional_and_fallible_json_helper_results_are_rejected) {
         "func maybe(flag: bool) -> Json { if flag { json({ ok: true }) } else { "
         "error(.missing) } } route GET \"/x\" { let body = maybe(req.http11) return 200, body "
         "}\n",
+        "func make<T>() -> T => nil route GET \"/x\" { guard let body = make<Json>() "
+        "else { return 400 } return 200, body }\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
@@ -32718,6 +32720,30 @@ TEST(frontend, reusable_json_materializes_struct_inputs_once) {
     const char* src =
         "struct Payload { a: str, b: str } route GET \"/x\" { "
         "let body = json(Payload(a: req.path, b: \"fixed\")) return 200, body }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 path_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            path_reads += rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqPath;
+    CHECK_EQ(path_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, reusable_json_helper_materializes_struct_arguments_once) {
+    const char* src =
+        "struct Payload { a: str, b: str } "
+        "func encode(p: Payload) -> Json => json(p) "
+        "route GET \"/x\" { let body = encode(Payload(a: req.path, b: \"fixed\")) "
+        "return 200, body }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -32806,6 +32832,24 @@ TEST(frontend, generic_aggregates_reject_json_instantiations) {
         CHECK(hir.error().detail.eq(
             lit("Json values are opaque response plans; use them only through locals or helper "
                 "calls and consume them with return, respond, or Response.body")));
+    }
+}
+
+TEST(frontend, generic_array_and_tuple_results_reject_json_instantiations) {
+    const char* sources[] = {
+        "func pair<T>(x: T) => (x, 1) route GET \"/x\" { "
+        "let bad = pair(json({ ok: true })) return 200 }\n",
+        "func singleton<T>(x: T) => [x] route GET \"/x\" { "
+        "let bad = singleton(json({ ok: true })) return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
 }
 
@@ -33368,6 +33412,60 @@ TEST(frontend, materializes_reused_array_call_arguments_once) {
                 rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqQueryAll;
     CHECK_EQ(query_reads, 1u);
     rir.destroy();
+}
+
+TEST(frontend, reused_array_argument_carriers_respect_route_local_limit) {
+    const char* src = R"rut(
+func dup(a: [str], b: [str]) -> [[str]] => [a, b, a, b]
+route GET "/x" {
+    let v0 = 0
+    let v1 = 1
+    let v2 = 2
+    let v3 = 3
+    let v4 = 4
+    let v5 = 5
+    let v6 = 6
+    let v7 = 7
+    let v8 = 8
+    let v9 = 9
+    let v10 = 10
+    let v11 = 11
+    let v12 = 12
+    let groups = dup(req.queryAll("a"), req.queryAll("b"))
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, HirRoute::kMaxLocals);
+    for (u32 i = 0; i < hir->routes[0].locals.len; i++)
+        CHECK_LT(hir->routes[0].locals[i].ref_index, HirRoute::kMaxLocals);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_equality_for_runtime_array_shapes) {
+    const char* cases[] = {
+        "route GET \"/x\" { let a = [1] let b = [1] if a == b { return 200 } else { return 204 } }\n",
+        "struct Box { values: [i32] } route GET \"/x\" { let a = Box(values: [1]) "
+        "let b = Box(values: [1]) if a == b { return 200 } else { return 204 } }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
 }
 
 int main(int argc, char** argv) {
