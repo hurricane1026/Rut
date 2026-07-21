@@ -3990,6 +3990,11 @@ static FrontendResult<void> build_dynamic_json_plan(
     u32 local_count,
     const MatchPayloadBinding* binding,
     u32 depth = 0);
+static bool hir_expr_reads_wait_result(const HirExpr& expr);
+static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
+                                                   const HirLocal* locals,
+                                                   u32 local_count,
+                                                   u32 depth = 0);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -7423,6 +7428,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 set_status ? lit_str("Response.status requires a plain i32 value")
                            : lit_str("Response.body requires a plain string or json(...) "
                                      "value"));
+        if (set_body && route->waits.len != 0 &&
+            hir_expr_reads_wait_result_with_locals(
+                value.value(), route->locals.data, route->locals.len))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("json cannot capture wait-result state after a wait"));
         if (set_status && value->kind == HirExprKind::IntLit &&
             (value->int_value < 100 || value->int_value > 599))
             return frontend_error(FrontendError::InvalidStatusCode, expr.rhs->span);
@@ -9444,6 +9455,19 @@ static bool function_param_is_reused(const HirFunction& fn, u32 param_index) {
     return count >= 2;
 }
 
+static bool hir_expr_contains_json_build(const HirExpr& expr) {
+    if (expr.kind == HirExprKind::JsonBuild) return true;
+    if (expr.lhs != nullptr && hir_expr_contains_json_build(*expr.lhs)) return true;
+    if (expr.rhs != nullptr && hir_expr_contains_json_build(*expr.rhs)) return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr && hir_expr_contains_json_build(*expr.args[i])) return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_contains_json_build(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
 static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -10657,7 +10681,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         const bool needs_array_carrier =
             hir_type_shape_contains_array(mod, analyzed_args[i].shape_index);
         const bool needs_json_struct_carrier =
-            analyzed_args[i].type == HirTypeKind::Struct && fn.body.kind == HirExprKind::JsonBuild;
+            analyzed_args[i].type == HirTypeKind::Struct && hir_expr_contains_json_build(fn.body);
         if ((!needs_array_carrier && !needs_json_struct_carrier) ||
             analyzed_args[i].kind == HirExprKind::LocalRef || !function_param_is_reused(fn, i))
             continue;
@@ -12532,6 +12556,36 @@ static bool hir_expr_reads_wait_result(const HirExpr& expr) {
     for (u32 i = 0; i < expr.field_inits.len; i++)
         if (expr.field_inits[i].value != nullptr &&
             hir_expr_reads_wait_result(*expr.field_inits[i].value))
+            return true;
+    return false;
+}
+
+static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
+                                                   const HirLocal* locals,
+                                                   u32 local_count,
+                                                   u32 depth) {
+    if (depth > local_count + HirRoute::kMaxLocals) return true;
+    if (expr.kind == HirExprKind::WaitField || expr.is_wait_result) return true;
+    if (expr.kind == HirExprKind::LocalRef) {
+        for (u32 i = 0; i < local_count; i++)
+            if (locals[i].ref_index == expr.local_index)
+                return hir_expr_reads_wait_result_with_locals(
+                    locals[i].init, locals, local_count, depth + 1);
+    }
+    if (expr.lhs != nullptr &&
+        hir_expr_reads_wait_result_with_locals(*expr.lhs, locals, local_count, depth + 1))
+        return true;
+    if (expr.rhs != nullptr &&
+        hir_expr_reads_wait_result_with_locals(*expr.rhs, locals, local_count, depth + 1))
+        return true;
+    for (u32 i = 0; i < expr.args.len; i++)
+        if (expr.args[i] != nullptr &&
+            hir_expr_reads_wait_result_with_locals(*expr.args[i], locals, local_count, depth + 1))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; i++)
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_wait_result_with_locals(
+                *expr.field_inits[i].value, locals, local_count, depth + 1))
             return true;
     return false;
 }

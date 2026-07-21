@@ -80,15 +80,10 @@ thread_local JsonResponseScratch t_json_response;
 // the two eagerly lowered arms of an if-expression). Capture each completed
 // document into distinct invocation-owned storage so a later JsonBuild cannot
 // overwrite an earlier Str view before the select chooses between them. The
-// linked arena is reset at the next handler entry and scales with the emitted
-// JsonCapture operations rather than an unrelated HIR expression count.
-struct JsonCaptureNode {
-    JsonCaptureNode* next = nullptr;
-    char data[1];
-};
-
 struct JsonCaptureArena {
-    JsonCaptureNode* head = nullptr;
+    static constexpr u32 kCapacity = 512 * 1024;
+    char* data = nullptr;
+    u32 used = 0;
     u32 last_capture_len = 0xffffffffu;
 };
 thread_local JsonCaptureArena t_json_captures;
@@ -179,13 +174,9 @@ void rut_helper_parse_prime(const u8* req_data, u32 req_len) {
 }
 
 void rut_helper_json_capture_reset() {
-    auto* node = t_json_captures.head;
-    while (node != nullptr) {
-        auto* next = node->next;
-        free(node);
-        node = next;
-    }
-    t_json_captures.head = nullptr;
+    free(t_json_captures.data);
+    t_json_captures.data = nullptr;
+    t_json_captures.used = 0;
     t_json_captures.last_capture_len = 0xffffffffu;
 }
 
@@ -289,17 +280,21 @@ const char* rut_helper_json_capture_data() {
         captures.last_capture_len = 0xffffffffu;
         return nullptr;
     }
-    const size_t allocation_size =
-        offsetof(JsonCaptureNode, data) + (t_json_response.len == 0 ? 1 : t_json_response.len);
-    auto* node = static_cast<JsonCaptureNode*>(malloc(allocation_size));
-    if (node == nullptr) {
+    const u32 capture_size = t_json_response.len == 0 ? 1 : t_json_response.len;
+    if (capture_size > JsonCaptureArena::kCapacity - captures.used) {
         captures.last_capture_len = 0xffffffffu;
         return nullptr;
     }
-    node->next = captures.head;
-    captures.head = node;
-    char* out = node->data;
+    if (captures.data == nullptr) {
+        captures.data = static_cast<char*>(malloc(JsonCaptureArena::kCapacity));
+        if (captures.data == nullptr) {
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+    }
+    char* out = captures.data + captures.used;
     if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
+    captures.used += capture_size;
     captures.last_capture_len = t_json_response.len;
     return out;
 }
