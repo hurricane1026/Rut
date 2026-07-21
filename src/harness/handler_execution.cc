@@ -382,6 +382,10 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         if (response.response_status_invalid || response.response_body_mutation_overflow ||
             dynamic_json_failed) {
             result = jit::HandlerResult::make_status(500);
+            if (dynamic_json_failed && !response.response_status_invalid &&
+                !response.response_body_mutation_overflow &&
+                response.response_body_mutation_set)
+                result.upstream_id = jit::HandlerResult::kDynamicResponseBody;
         } else {
             if (response.response_status_set) result.status_code = response.response_status;
             if (response.response_body_mutation_set)
