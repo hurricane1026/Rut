@@ -3483,6 +3483,27 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
     }
 
     bool struct_built[MirModule::kMaxStructs]{};
+    auto shape_defs_ready = [&](auto&& self, u32 shape_index, u32 depth) -> bool {
+        if (depth > mir.type_shapes.len || shape_index >= mir.type_shapes.len) return false;
+        const auto& shape = mir.type_shapes[shape_index];
+        if (shape.type == MirTypeKind::Struct)
+            return shape.struct_index < mir.structs.len &&
+                   user_struct_defs[shape.struct_index] != nullptr;
+        if (shape.type == MirTypeKind::Variant) {
+            if (shape.variant_index >= mir.variants.len) return false;
+            bool has_payload = false;
+            for (u32 ci = 0; ci < mir.variants[shape.variant_index].cases.len; ci++)
+                has_payload |= mir.variants[shape.variant_index].cases[ci].has_payload;
+            return !has_payload || variant_infos[shape.variant_index].struct_type != nullptr;
+        }
+        if (shape.type == MirTypeKind::Array)
+            return self(self, shape.array_elem_shape_index, depth + 1);
+        if (shape.type == MirTypeKind::Tuple) {
+            for (u32 ti = 0; ti < shape.tuple_len; ti++)
+                if (!self(self, shape.tuple_elem_shape_indices[ti], depth + 1)) return false;
+        }
+        return true;
+    };
     auto build_user_struct = [&](u32 si) -> FrontendResult<bool> {
         if (struct_built[si]) return true;
         if (!instance_fully_concrete(mir,
@@ -3514,6 +3535,7 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                 } else if (field_shape.type == MirTypeKind::Str) {
                     field_ty = str_ty.value();
                 } else if (field_shape.type == MirTypeKind::Array) {
+                    if (!shape_defs_ready(shape_defs_ready, field.shape_index, 0)) return false;
                     auto ty = rir_type_for_shape_index(mir,
                                                        field.shape_index,
                                                        variant_infos,

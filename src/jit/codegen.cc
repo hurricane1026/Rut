@@ -2044,9 +2044,22 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMTypeRef elem_type = c.map_type(array_type->inner);
             LLVMValueRef array = c.get_value(inst.operands[0]);
             LLVMValueRef storage = LLVMBuildExtractValue(c.builder, array, 0, "array.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, array, 1, "array.len");
             LLVMValueRef index = c.get_value(inst.operands[1]);
+            LLVMValueRef zero = LLVMConstInt(c.i32_ty, 0, 0);
+            LLVMValueRef nonnegative =
+                LLVMBuildICmp(c.builder, LLVMIntSGE, index, zero, "array.index.nonnegative");
+            LLVMValueRef below =
+                LLVMBuildICmp(c.builder, LLVMIntSLT, index, len, "array.index.below");
+            LLVMValueRef valid = LLVMBuildAnd(c.builder, nonnegative, below, "array.index.valid");
+            LLVMValueRef fallback = LLVMBuildAlloca(c.builder, elem_type, "array.oob");
+            LLVMBuildStore(c.builder, LLVMConstNull(elem_type), fallback);
+            LLVMValueRef safe_storage =
+                LLVMBuildSelect(c.builder, valid, storage, fallback, "array.ptr.safe");
+            LLVMValueRef safe_index =
+                LLVMBuildSelect(c.builder, valid, index, zero, "array.index.safe");
             LLVMValueRef slot =
-                LLVMBuildGEP2(c.builder, elem_type, storage, &index, 1, "array.slot");
+                LLVMBuildGEP2(c.builder, elem_type, safe_storage, &safe_index, 1, "array.slot");
             c.set_value(inst.result, LLVMBuildLoad2(c.builder, elem_type, slot, "array.elem"));
             break;
         }
