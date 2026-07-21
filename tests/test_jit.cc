@@ -1779,6 +1779,23 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK(outcome.dynamic_response_body == nullptr);
 }
 
+TEST(jit, response_body_mutation_copies_source_bytes) {
+    TestHandlerCtxFrame frame{};
+    char body[] = "stable";
+    rut_helper_resp_set_body(&frame.ctx, body, sizeof(body) - 1);
+    __builtin_memset(body, 'x', sizeof(body) - 1);
+    rut_helper_resp_commit_headers(&frame.ctx);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(200).pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str copied{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(copied.eq(lit("stable")));
+    CHECK(outcome.dynamic_response_body == frame.ctx.response_body_mutation_storage);
+}
+
 TEST(jit, cache_helpers_miss_and_out_of_range) {
     cache_registry_set_seed(0x5EEDu);
     const u32 caps[1] = {64};

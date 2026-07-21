@@ -18977,6 +18977,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
 
         bool has_chain_after_response_effects = false;
+        bool has_chain_after_response_scalar_effects = false;
         for (u32 ci = 0; ci < route_decl.chains.len; ci++) {
             const auto& chain_use = route_decl.chains[ci];
             const AstChainDecl* chain = find_chain_decl(file, chain_use.name);
@@ -18989,10 +18990,45 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 const u32 before_count = route.locals.len;
                 auto after = analyze_chain_after_response_step(step, chain_use.span, &route, mod);
                 if (!after) return core::make_unexpected(after.error());
-                if (route.locals.len != before_count) has_chain_after_response_effects = true;
+                if (route.locals.len != before_count) {
+                    has_chain_after_response_effects = true;
+                    for (u32 li = before_count; li < route.locals.len; li++) {
+                        const auto kind = route.locals[li].init.kind;
+                        has_chain_after_response_scalar_effects |=
+                            kind == HirExprKind::RespSetStatus || kind == HirExprKind::RespSetBody;
+                    }
+                }
             }
         }
         if (has_chain_after_response_effects) {
+            if (has_chain_after_response_scalar_effects) {
+                bool forwards = false;
+                auto check_forward = [&](const HirTerminator& term) {
+                    forwards |= term.kind == HirTerminatorKind::ForwardUpstream;
+                };
+                if (route.control.kind == HirControlKind::Direct) {
+                    check_forward(route.control.direct_term);
+                } else if (route.control.kind == HirControlKind::If) {
+                    check_forward(route.control.then_term);
+                    check_forward(route.control.else_term);
+                } else {
+                    for (u32 ai = 0; ai < route.control.match_arms.len; ai++) {
+                        const auto& arm = route.control.match_arms[ai];
+                        if (arm.body_kind == HirMatchArm::BodyKind::Direct) {
+                            check_forward(arm.direct_term);
+                        } else {
+                            check_forward(arm.then_term);
+                            check_forward(arm.else_term);
+                        }
+                    }
+                }
+                if (forwards)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        route_decl.span,
+                        lit_str("Response status/body effects require a buffered response and "
+                                "cannot be combined with forward yet"));
+            }
             auto mark_commit = [](HirTerminator& term) { term.commit_response_mutations = true; };
             if (route.control.kind == HirControlKind::Direct) {
                 mark_commit(route.control.direct_term);
