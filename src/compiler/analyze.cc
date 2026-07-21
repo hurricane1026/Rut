@@ -10045,7 +10045,8 @@ static FrontendResult<void> append_dynamic_json_value(
     if (value.type == HirTypeKind::Struct && !value.may_nil && !value.may_error) {
         if (value.struct_index >= mod.structs.len)
             return frontend_error(FrontendError::UnsupportedSyntax, span);
-        if (materialize_struct && value.kind != HirExprKind::LocalRef) {
+        if (materialize_struct && value.kind != HirExprKind::LocalRef &&
+            value.kind != HirExprKind::StructInit) {
             if (value_expr_indices.len >= HirTerminator::kMaxJsonMaterializedValues ||
                 route->exprs.len >= HirRoute::kMaxExprs)
                 return frontend_error(FrontendError::TooManyItems, span);
@@ -10067,9 +10068,24 @@ static FrontendResult<void> append_dynamic_json_value(
                 !append_json_quoted(segments.back(), decl.fields[i].name) ||
                 !append_json_bytes(segments.back(), ":", 1))
                 return frontend_error(FrontendError::TooManyItems, span);
-            auto field = project_json_struct_field(value, decl.fields[i], route, span);
-            if (!field) return core::make_unexpected(field.error());
-            auto child = append_dynamic_json_value(field.value(),
+            HirExpr field_value{};
+            if (value.kind == HirExprKind::StructInit) {
+                const HirExpr* initialized = nullptr;
+                for (u32 fi = 0; fi < value.field_inits.len; fi++) {
+                    if (value.field_inits[fi].name.eq(decl.fields[i].name)) {
+                        initialized = value.field_inits[fi].value;
+                        break;
+                    }
+                }
+                if (initialized == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+                field_value = *initialized;
+            } else {
+                auto field = project_json_struct_field(value, decl.fields[i], route, span);
+                if (!field) return core::make_unexpected(field.error());
+                field_value = field.value();
+            }
+            auto child = append_dynamic_json_value(field_value,
                                                    route,
                                                    mod,
                                                    segments,

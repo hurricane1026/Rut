@@ -31764,7 +31764,7 @@ route GET "/x" {
     CHECK(term.json_segments[3].eq(lit("}")));
 }
 
-TEST(frontend, return_json_materializes_wide_inline_struct_once) {
+TEST(frontend, return_json_reuses_wide_inline_struct_fields) {
     const char* src = R"rut(
 struct Payload { a: str, b: str, c: str, d: str, e: str, f: str, g: str, h: str }
 route GET "/x" {
@@ -31783,9 +31783,7 @@ route GET "/x" {
     CHECK(term.has_dynamic_response_body);
     REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
     REQUIRE_EQ(route.locals.len, 0u);
-    REQUIRE_EQ(term.json_value_expr_indices.len, 9u);
-    CHECK_EQ(route.exprs[term.json_value_expr_indices[0]].type, HirTypeKind::Struct);
-    CHECK_EQ(route.exprs[term.json_value_expr_indices[0]].kind, HirExprKind::StructInit);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
 }
 
 TEST(frontend, return_json_does_not_materialize_nested_struct_fields) {
@@ -31810,12 +31808,48 @@ route GET "/x" {
     CHECK(term.has_dynamic_response_body);
     REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
     REQUIRE_EQ(route.locals.len, 0u);
-    REQUIRE_EQ(term.json_value_expr_indices.len, 9u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
     u32 struct_value_count = 0;
     for (u32 i = 0; i < term.json_value_expr_indices.len; i++)
         if (route.exprs[term.json_value_expr_indices[i]].type == HirTypeKind::Struct)
             struct_value_count++;
-    CHECK_EQ(struct_value_count, 1u);
+    CHECK_EQ(struct_value_count, 0u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, return_json_reuses_deep_inline_struct_projections) {
+    const char* src = R"rut(
+struct Leaf { value: str }
+struct Mid { leaf: Leaf }
+struct Branch { mid: Mid }
+struct Root { a: Branch, b: Branch, c: Branch, d: Branch,
+              e: Branch, f: Branch, g: Branch, h: Branch }
+route GET "/x" {
+    return 200, json(Root(
+        a: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        b: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        c: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        d: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        e: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        f: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        g: Branch(mid: Mid(leaf: Leaf(value: req.path))),
+        h: Branch(mid: Mid(leaf: Leaf(value: req.path)))))
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
