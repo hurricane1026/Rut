@@ -32786,6 +32786,63 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, infers_generics_nested_in_array_struct_fields) {
+    const char* src =
+        "struct Box<T> { values: [T] } route GET \"/x\" { let box = Box(values: [1]) "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, adapts_string_lists_to_array_struct_fields) {
+    const char* src =
+        "struct Payload { tags: [str] } route GET \"/x\" { "
+        "let payload = Payload(tags: req.queryAll(\"tag\")) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, materializes_reused_array_call_arguments_once) {
+    const char* src =
+        "func dup(values: [str]) -> [[str]] => [values, values] "
+        "route GET \"/x\" { let groups = dup(req.queryAll(\"tag\")) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 query_reads = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++)
+        for (u32 ii = 0; ii < rir.module.functions[0].blocks[bi].inst_count; ii++)
+            query_reads +=
+                rir.module.functions[0].blocks[bi].insts[ii].op == rir::Opcode::ReqQueryAll;
+    CHECK_EQ(query_reads, 1u);
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
