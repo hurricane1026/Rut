@@ -4017,11 +4017,12 @@ static FrontendResult<void> build_reusable_json_plan(
     const MatchPayloadBinding* binding,
     u32 depth = 0);
 static bool hir_expr_reads_wait_result(const HirExpr& expr);
+static bool hir_expr_reads_response_field(const HirExpr& expr);
+static bool is_response_effect(HirExprKind kind);
 static bool hir_expr_reads_wait_result_with_locals(const HirExpr& expr,
                                                    const HirLocal* locals,
                                                    u32 local_count,
                                                    u32 depth = 0);
-static bool hir_expr_reads_response_field(const HirExpr& expr);
 static bool is_static_for_iter_expr(const HirExpr& expr,
                                     const HirLocal* locals,
                                     u32 local_count,
@@ -4972,8 +4973,19 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                expr.name.eq({"le", 2}) || expr.name.eq({"ge", 2});
     if (is_eq_family || is_ord_family) {
         if (expr.args.len != 1) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(recv)) {
+            for (u32 li = locals_before_rhs; li < route->locals.len; li++) {
+                if (is_response_effect(route->locals[li].init.kind))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        expr.args[0]->span,
+                        lit_str("a response-mutating right operand cannot follow a Response field "
+                                "read"));
+            }
+        }
         if (rhs->may_nil || rhs->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         adopt_int_literal_type(&recv, &rhs.value());
@@ -7830,6 +7842,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     }
                     const u32 saved_expr_count = route->exprs.len;
                     const u32 saved_guard_count = route->guards.len;
+                    const u32 saved_local_count = route->locals.len;
                     auto field_value = [&]() -> FrontendResult<HirExpr> {
                         const auto& value_ast = *expr.field_inits[fi].value;
                         if (value_ast.kind == AstExprKind::ArrayLit &&
@@ -7849,6 +7862,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                     }();
                     route->exprs.len = saved_expr_count;
                     route->guards.len = saved_guard_count;
+                    route->locals.len = saved_local_count;
                     if (!field_value) return core::make_unexpected(field_value.error());
                     if (field_value->may_nil || field_value->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -7933,6 +7947,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                   expr.span);
         if (!struct_shape) return core::make_unexpected(struct_shape.error());
         out.shape_index = struct_shape.value();
+        bool earlier_field_reads_response = false;
         for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
             for (u32 seen = 0; seen < fi; seen++) {
                 if (expr.field_inits[seen].name.eq(expr.field_inits[fi].name))
@@ -7951,6 +7966,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, expr.span, expr.field_inits[fi].name);
             const auto& field_decl = mod.structs[concrete_struct_index].fields[field_index];
+            const u32 locals_before_field = route->locals.len;
             auto field_value = [&]() -> FrontendResult<HirExpr> {
                 const auto& value_ast = *expr.field_inits[fi].value;
                 if (value_ast.kind == AstExprKind::ArrayLit &&
@@ -7967,6 +7983,17 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 return analyze_expr_impl(value_ast, route, mod, locals, local_count, binding, true);
             }();
             if (!field_value) return core::make_unexpected(field_value.error());
+            if (earlier_field_reads_response) {
+                for (u32 li = locals_before_field; li < route->locals.len; li++) {
+                    if (is_response_effect(route->locals[li].init.kind))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            expr.field_inits[fi].value->span,
+                            lit_str("a response-mutating struct field cannot follow a Response "
+                                    "field read"));
+                }
+            }
+            earlier_field_reads_response |= hir_expr_reads_response_field(field_value.value());
             if (field_value->may_nil || field_value->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       expr.field_inits[fi].value->span);
