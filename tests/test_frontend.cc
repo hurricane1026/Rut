@@ -7131,6 +7131,50 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, response_scalar_assignment_after_guard_failure_read_is_rejected) {
+    const char* src = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    guard req.http11 else {
+        if resp.status == 201 { return 400 } else { return 401 }
+    }
+    resp.status = 202
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(lit("Response scalar assignments after a guard are not supported; "
+                                    "move the assignment before the guard")));
+}
+
+TEST(frontend, response_body_reads_in_conditional_value_branches_are_rejected) {
+    const char* src = R"rut(
+func choose(flag: bool) -> str {
+    let resp = response(200)
+    resp.body = "pending"
+    if flag { "ok" } else { resp.body }
+}
+route GET "/x" {
+    let selected = choose(req.http11)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("Response.body reads in conditional value branches are not supported")));
+}
+
 TEST(frontend, helper_local_response_builder_cannot_mutate_caller_builder) {
     const char* src = R"rut(
 func rewrite() -> i32 {
@@ -33840,6 +33884,68 @@ TEST(frontend, imported_array_fields_allow_later_nominal_declarations) {
     const char* src =
         "import \"payload.rut\"\nroute GET \"/x\" { "
         "let payload = Payload(items: [Item(value: 1)]) return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
+TEST(frontend, generic_array_helpers_bind_runtime_string_lists) {
+    const char* src = R"rut(
+func keep<T>(values: [T]) -> [T] => values
+route GET "/x" {
+    let values = keep(req.queryAll("tag"))
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_nominal_arrays_with_nested_non_carrier_payloads) {
+    const char* src =
+        "variant Build { ready(Response), none } "
+        "route GET \"/x\" { let values = [Build.ready(response(200))] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+}
+
+TEST(frontend, rejects_transitively_reused_helper_local_arrays) {
+    const char* src =
+        "func make() { let xs = [time.nowMicros()] let ys = xs [ys, xs] } "
+        "route GET \"/x\" { let values = make() return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, imported_array_shapes_reinstantiate_generic_nominal_elements) {
+    const std::string dir = "/tmp/rut_import_array_generic_nominal_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/arrays.rut", std::ios::binary);
+        out << "struct Box<T> { value: T }\n"
+               "func keep(values: [Box<i32>]) -> [Box<i32>] => values\n";
+    }
+    const char* src =
+        "import \"arrays.rut\"\nroute GET \"/x\" { "
+        "let values = keep([Box<i32>(value: 1)]) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

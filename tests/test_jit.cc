@@ -2664,6 +2664,52 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, response_helper_mutation_marks_caller_builder_for_commit) {
+    const auto src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    let ignored = rewrite(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static constexpr char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\n\r\n";
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kRequest),
+                                            sizeof(kRequest) - 1,
+                                            nullptr);
+    REQUIRE(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 201u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, response_body_read_is_an_immutable_snapshot_across_later_assignment) {
     const auto src = R"rut(
 route GET "/x" {
