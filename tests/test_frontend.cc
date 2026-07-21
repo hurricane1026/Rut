@@ -34108,6 +34108,93 @@ route GET "/x" {
         lit("helper Response assignments cannot follow a captured Response field read")));
 }
 
+TEST(frontend, helper_effect_rejects_response_read_before_later_scalar_assignment) {
+    const char* src = R"rut(
+func sample(_ resp: Response) -> str {
+    resp.body = "old"
+    let saved = resp.body
+    resp.body = "new"
+    resp.set("X-Saved", saved)
+    resp.header("X-Saved")
+}
+route GET "/x" {
+    let resp = response(200)
+    let saved = sample(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, chain_after_scalar_effects_reject_terminal_control_response_reads) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response {
+    let resp = response(200)
+    resp.status = 201
+    if resp.status == 201 { return resp } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_value_branches) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    1
+}
+func choose(flag: bool, _ resp: Response) -> i32 {
+    if flag { mutate(resp) } else { 0 }
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = choose(req.http10, resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_lazy_bool_operands) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> bool {
+    resp.status = 202
+    true
+}
+route GET "/x" {
+    let resp = response(200)
+    let value = req.http10 && mutate(resp)
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, lowers_tuple_valued_struct_fields_with_indexed_shapes) {
     const char* src = R"rut(
 struct Holder { pair: ([str], i32) }

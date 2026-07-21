@@ -5819,6 +5819,12 @@ static bool function_has_response_effects(const HirFunction& fn) {
     return false;
 }
 
+static bool is_response_effect(HirExprKind kind) {
+    return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+           kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+           kind == HirExprKind::RespSetBody;
+}
+
 static bool hir_expr_reads_response_field_before(const HirExpr& expr, u32 source_offset) {
     if ((expr.kind == HirExprKind::RespStatus || expr.kind == HirExprKind::RespBody) &&
         expr.span.start < source_offset)
@@ -5849,6 +5855,11 @@ static FrontendResult<void> instantiate_function_response_effects(
     Span call_span) {
     if (route == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, call_span);
     if (!function_has_response_effects(fn)) return {};
+    if (!route->allow_respond_effects)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            call_span,
+            lit_str("response-mutating helper calls are not supported in conditional branches"));
     for (u32 ei = 0; ei < fn.exprs.len; ei++) {
         if (fn.exprs[ei].kind != HirExprKind::RespSetStatus &&
             fn.exprs[ei].kind != HirExprKind::RespSetBody)
@@ -5859,6 +5870,18 @@ static FrontendResult<void> instantiate_function_response_effects(
                 call_span,
                 lit_str("helper Response assignments cannot follow a captured Response field "
                         "read"));
+        for (u32 later = 0; later < fn.exprs.len; later++) {
+            if (!is_response_effect(fn.exprs[later].kind) ||
+                fn.exprs[later].span.start <= fn.exprs[ei].span.start)
+                continue;
+            if (hir_expr_reads_response_field_before(fn.exprs[later],
+                                                     fn.exprs[ei].span.start))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    call_span,
+                    lit_str("helper Response assignments cannot follow a captured Response field "
+                            "read"));
+        }
     }
     if (fn.owns_response_builder) {
         for (u32 li = 0; li < route->locals.len; li++) {
@@ -12747,7 +12770,9 @@ static bool hir_for_loop_reads_response_field(const HirForLoop& loop) {
     for (u32 li = 0; li < body.locals.len; li++)
         if (hir_expr_reads_response_field(body.locals[li].init)) return true;
     for (u32 gi = 0; gi < body.guards.len; gi++)
-        if (hir_expr_reads_response_field(body.guards[gi].cond)) return true;
+        if (hir_expr_reads_response_field(body.guards[gi].cond) ||
+            guard_failure_reads_response_field(body.guards[gi]))
+            return true;
     for (u32 ii = 0; ii < body.ifs.len; ii++)
         if (hir_expr_reads_response_field(body.ifs[ii].cond)) return true;
     for (u32 mi = 0; mi < body.matches.len; mi++) {
@@ -12760,7 +12785,9 @@ static bool hir_for_loop_reads_response_field(const HirForLoop& loop) {
             for (u32 li = 0; li < arm.locals.len; li++)
                 if (hir_expr_reads_response_field(arm.locals[li].init)) return true;
             for (u32 gi = 0; gi < arm.guards.len; gi++)
-                if (hir_expr_reads_response_field(arm.guards[gi].cond)) return true;
+                if (hir_expr_reads_response_field(arm.guards[gi].cond) ||
+                    guard_failure_reads_response_field(arm.guards[gi]))
+                    return true;
         }
     }
     return false;
@@ -12774,6 +12801,23 @@ static bool route_reads_response_field(const HirRoute& route) {
     }
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
         if (hir_for_loop_reads_response_field(route.for_loops[fi])) return true;
+    const auto& control = route.control;
+    if (control.kind == HirControlKind::If)
+        return hir_expr_reads_response_field(control.cond);
+    if (control.kind != HirControlKind::Match) return false;
+    if (hir_expr_reads_response_field(control.match_expr)) return true;
+    for (u32 ai = 0; ai < control.match_arms.len; ai++) {
+        const auto& arm = control.match_arms[ai];
+        if (hir_expr_reads_response_field(arm.pattern) ||
+            (arm.has_arm_guard && hir_expr_reads_response_field(arm.arm_guard)) ||
+            (arm.body_kind == HirMatchArm::BodyKind::If &&
+             hir_expr_reads_response_field(arm.cond)))
+            return true;
+        for (u32 gi = 0; gi < arm.guards.len; gi++)
+            if (hir_expr_reads_response_field(arm.guards[gi].cond) ||
+                guard_failure_reads_response_field(arm.guards[gi]))
+                return true;
+    }
     return false;
 }
 
