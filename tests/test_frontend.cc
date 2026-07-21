@@ -34243,6 +34243,74 @@ route GET "/x" { let values = keep([req.queryAll("tag")]) return 200 }
     rir.destroy();
 }
 
+TEST(frontend, rejects_nested_tuple_array_elements_without_flat_carriers) {
+    const char* src = "route GET \"/x\" { let xs = [((1, 2), 3)] return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, rejects_i64_variant_payloads_as_array_elements) {
+    const char* src = R"rut(
+variant Stamp { at(i64), none }
+route GET "/x" { let xs = [Stamp.at(time.nowMicros())] return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, reusable_json_local_is_referenced_at_its_sink) {
+    const char* src = R"rut(
+func choose(flag: bool) -> Json {
+    if flag { json({ value: "old" }) } else { json({ value: "other" }) }
+}
+route GET "/x" {
+    let payload = choose(req.http11)
+    req.set("X-Mode", "new")
+    return 200, payload
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, reusable_json_local_persists_across_wait) {
+    const char* src = R"rut(
+route GET "/x" {
+    let payload = json({ path: req.path })
+    wait(5)
+    return 200, payload
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, json_helper_scalar_arguments_are_captured_at_call_site) {
+    const char* src = R"rut(
+func encode(value: str) -> Json => json({ value: value })
+route GET "/x" {
+    let resp = response(200)
+    resp.set("X-Mode", "old")
+    let payload = encode(resp.header("X-Mode").or("missing"))
+    resp.set("X-Mode", "new")
+    return 200, payload
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
