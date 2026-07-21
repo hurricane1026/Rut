@@ -514,7 +514,7 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
             return true;
         case HirTypeKind::Struct: {
             if (shape.struct_index >= mod.structs.len) return false;
-            if (struct_visiting[shape.struct_index]) return true;
+            if (struct_visiting[shape.struct_index]) return false;
             struct_visiting[shape.struct_index] = true;
             const auto& st = mod.structs[shape.struct_index];
             for (u32 i = 0; i < st.fields.len; i++) {
@@ -532,7 +532,7 @@ static bool hir_type_shape_has_runtime_carrier_impl(const HirModule& mod,
         }
         case HirTypeKind::Variant: {
             if (shape.variant_index >= mod.variants.len) return false;
-            if (variant_visiting[shape.variant_index]) return true;
+            if (variant_visiting[shape.variant_index]) return false;
             variant_visiting[shape.variant_index] = true;
             const auto& variant = mod.variants[shape.variant_index];
             for (u32 i = 0; i < variant.cases.len; i++) {
@@ -3707,6 +3707,11 @@ static FrontendResult<HirExpr> analyze_empty_array_lit_with_declared_type(const 
     if (!declared) return core::make_unexpected(declared.error());
     if (declared.value() != HirTypeKind::Array || array_elem_shape_index >= mod.type_shapes.len)
         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+    if (!hir_type_shape_has_runtime_carrier(mod, array_elem_shape_index))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("array element type does not have a runtime carrier"));
     auto declared_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                 declared.value(),
                                                 0xffffffffu,
@@ -10338,6 +10343,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             analyzed_args[param_index] = slot_expr.value();
         } else if (first_arg_override != nullptr && param_index == 0) {
             analyzed_args[param_index] = *first_arg_override;
+        } else if (arg_expr.kind == AstExprKind::ArrayLit && arg_expr.args.len == 0 &&
+                   fn.params[param_index].type == HirTypeKind::Array &&
+                   fn.params[param_index].array_elem_shape_index < mod.type_shapes.len &&
+                   mod.type_shapes[fn.params[param_index].array_elem_shape_index].is_concrete) {
+            analyzed_args[param_index].kind = HirExprKind::ArrayLit;
+            analyzed_args[param_index].type = HirTypeKind::Array;
+            analyzed_args[param_index].shape_index = fn.params[param_index].shape_index;
+            analyzed_args[param_index].array_len = 0;
+            analyzed_args[param_index].span = arg_expr.span;
         } else {
             auto arg = analyze_expr_impl(arg_expr, route, mod, locals, local_count, binding, true);
             if (!arg) return core::make_unexpected(arg.error());
@@ -17063,6 +17077,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                           item.variant.span);
                 if (!payload_type) return core::make_unexpected(payload_type.error());
                 case_decl.payload_type = payload_type.value();
+                if (case_decl.payload_type == HirTypeKind::Array)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        item.variant.span,
+                        lit_str("array variant payloads do not have a runtime carrier yet"));
                 auto payload_shape = intern_hir_type_shape(&mod,
                                                            case_decl.payload_type,
                                                            case_decl.payload_generic_index,
