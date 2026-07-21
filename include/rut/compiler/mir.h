@@ -475,6 +475,8 @@ private:
             rebase_value(blocks[i].term.rhs, other);
             for (u32 li = 0; li < blocks[i].term.json_locals.len; li++)
                 rebase_value(blocks[i].term.json_locals[li].init, other);
+            if (blocks[i].term.has_json_body_plan)
+                rebase_value(blocks[i].term.json_body_local.init, other);
         }
     }
 };
