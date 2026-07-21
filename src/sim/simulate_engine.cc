@@ -613,7 +613,8 @@ bool build_module_from_manifest(const Manifest& manifest, ModuleContext& ctx) {
 static SimulateResult finalize_handler_result(const Engine& engine,
                                               const CaptureEntry& entry,
                                               SimulateResult result,
-                                              const jit::HandlerResult& unpacked) {
+                                              const jit::HandlerResult& unpacked,
+                                              const jit::HandlerCtx& context) {
     if (unpacked.action == jit::HandlerAction::Yield) {
         result.verdict = Verdict::Failed;
         return result;
@@ -621,9 +622,13 @@ static SimulateResult finalize_handler_result(const Engine& engine,
 
     result.action = unpacked.action;
     if (unpacked.action == jit::HandlerAction::ReturnStatus) {
-        result.actual_status = unpacked.status_code;
+        result.actual_status =
+            unpacked.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
+                    (context.response_body_valid == 0 || context.response_body_data == nullptr)
+                ? 500
+                : unpacked.status_code;
         result.verdict =
-            (unpacked.status_code == entry.resp_status && entry.upstream_name[0] == '\0')
+            (result.actual_status == entry.resp_status && entry.upstream_name[0] == '\0')
                 ? Verdict::Match
                 : Verdict::Mismatch;
         return result;
@@ -829,7 +834,7 @@ static SimulateResult drive_handler_to_completion(const Engine& engine,
         execution.apply_resume(unpacked, completion.kind, completion.result);
     }
 
-    return finalize_handler_result(engine, entry, result, unpacked);
+    return finalize_handler_result(engine, entry, result, unpacked, execution.frame.context);
 }
 
 bool Engine::init(const rir::Module& module,
