@@ -683,6 +683,7 @@ struct RoutedLoop {
 struct ReplayBodyObservation {
     bool seen = false;
     bool truncated = false;
+    u32 sequence = 0;
     u32 full_len = 0;
     u32 copied_len = 0;
     u8 bytes[ReplayResult::kMaxObservedBodyLen]{};
@@ -693,6 +694,7 @@ static bool capture_replay_body(void* context, const harness::Observation& event
     auto* captured = static_cast<ReplayBodyObservation*>(context);
     captured->seen = true;
     captured->truncated = event.value1 != 0;
+    captured->sequence = event.sequence;
     captured->full_len = static_cast<u32>(event.value0);
     captured->copied_len = event.label.len;
     if (event.label.len != 0) __builtin_memcpy(captured->bytes, event.label.ptr, event.label.len);
@@ -719,6 +721,7 @@ TEST(harness_replay, publishes_dynamic_json_response_body_bytes) {
     REQUIRE_EQ(result.harness.outcome, harness::Outcome::Passed);
     REQUIRE(observed.seen);
     CHECK(!observed.truncated);
+    CHECK_EQ(observed.sequence, 1u);
     CHECK_EQ(observed.full_len, sizeof(kExpected) - 1);
     CHECK_EQ(observed.copied_len, sizeof(kExpected) - 1);
     CHECK(__builtin_memcmp(observed.bytes, kExpected, sizeof(kExpected) - 1) == 0);
