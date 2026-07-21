@@ -573,7 +573,13 @@ public:
         if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
-        if (c.h2) h2_pool.free(c.h2);
+        if (c.h2) {
+            auto* async_ctx = c.h2->async_jit_ctx();
+            if (c.h2->async_stream != 0 && c.h2->async_kind == H2AsyncKind::Timer)
+                rut_helper_resp_release_body_storage(static_cast<void*>(async_ctx));
+            if (c.handler_ctx == async_ctx) c.handler_ctx = nullptr;
+            h2_pool.free(c.h2);
+        }
         c.reset();
         free_stack[free_top++] = cid;
     }

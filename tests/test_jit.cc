@@ -41,6 +41,7 @@ struct TestHandlerCtxFrame {
     u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
 
     TestHandlerCtxFrame() { ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+    ~TestHandlerCtxFrame() { rut_helper_resp_release_body_storage(&ctx); }
 };
 
 // RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all
@@ -1480,6 +1481,77 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_uses_match_payload_binding) {
+    const auto src = R"rut(
+struct Payload { path: str, answer: i32 }
+variant Result { ok(Payload), err }
+route GET "/api/users" {
+    let payload = Payload(path: "outer", answer: 1)
+    let state = Result.ok(Payload(path: req.path, answer: 42))
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
+route GET "/api/error" {
+    let state = Result.err
+    match state {
+    .ok(payload) => return 200, json(payload)
+    .err => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42}")));
+
+    auto error_handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(error_handler != nullptr);
+    constexpr char kGetErrorRequest[] = "GET /api/error HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    conn.reset();
+    TestHandlerCtxFrame error_frame{};
+    const auto error_outcome = invoke_jit_handler(error_handler,
+                                                  &conn,
+                                                  error_frame.ctx,
+                                                  reinterpret_cast<const u8*>(kGetErrorRequest),
+                                                  sizeof(kGetErrorRequest) - 1,
+                                                  nullptr);
+    CHECK(error_outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(error_outcome.status_code, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_return_json_serializes_runtime_string_lists) {
     const auto src = R"rut(
 route GET "/api/users" {
@@ -1868,6 +1940,23 @@ TEST(jit, response_body_mutation_overflow_fails_closed) {
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+}
+
+TEST(jit, response_body_mutation_copies_source_bytes) {
+    TestHandlerCtxFrame frame{};
+    char body[] = "stable";
+    rut_helper_resp_set_body(&frame.ctx, body, sizeof(body) - 1);
+    __builtin_memset(body, 'x', sizeof(body) - 1);
+    rut_helper_resp_commit_headers(&frame.ctx);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(200).pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str copied{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(copied.eq(lit("stable")));
+    CHECK(outcome.dynamic_response_body == frame.ctx.response_body_mutation_storage);
 }
 
 TEST(jit, cache_helpers_miss_and_out_of_range) {
