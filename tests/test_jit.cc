@@ -2155,6 +2155,24 @@ TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) 
     CHECK(outcome.dynamic_response_body == nullptr);
 }
 
+TEST(jit, json_capture_storage_scales_with_repeated_plan_materialization) {
+    static char document[4011]{};
+    document[0] = 'x';
+    rut_helper_json_capture_reset();
+    const char* first = nullptr;
+    for (u32 i = 0; i < 116; i++) {
+        rut_helper_json_reset();
+        rut_helper_json_append_raw(document, sizeof(document));
+        const char* captured = rut_helper_json_capture_data();
+        REQUIRE(captured != nullptr);
+        CHECK_EQ(rut_helper_json_capture_len(), static_cast<u32>(sizeof(document)));
+        if (i == 0) first = captured;
+    }
+    REQUIRE(first != nullptr);
+    CHECK_EQ(first[0], 'x');
+    rut_helper_json_capture_reset();
+}
+
 TEST(jit, json_capture_arena_covers_every_route_expression) {
     static char document[7 * 1024];
     __builtin_memset(document, 'x', sizeof(document));
@@ -2731,6 +2749,13 @@ TEST(jit, response_body_snapshot_failure_publishes_terminal_overflow_immediately
     CHECK(frame.ctx.response_body_snapshot_failed);
     CHECK(frame.ctx.response_body_pending_overflow);
     CHECK(frame.ctx.response_body_mutation_overflow);
+}
+
+TEST(jit, invalid_pending_response_status_is_terminal_immediately) {
+    TestHandlerCtxFrame frame{};
+    rut_helper_resp_set_status(&frame.ctx, 700);
+    CHECK(frame.ctx.response_status_pending_invalid);
+    CHECK(frame.ctx.response_status_invalid);
 }
 
 TEST(jit, response_body_mutation_copies_source_bytes) {

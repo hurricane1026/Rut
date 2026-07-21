@@ -7175,6 +7175,32 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, successive_helper_local_response_builders_are_rejected) {
+    const char* src = R"rut(
+func first() -> i32 {
+    let resp = response(200)
+    resp.status = 201
+    0
+}
+func second() -> i32 {
+    let resp = response(200)
+    resp.body = "second"
+    resp.status
+}
+route GET "/x" {
+    let ignored = first()
+    let status = second()
+    if status == 200 { return 200 } else { return 500 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
 TEST(frontend, protocol_methods_preserve_response_effects_before_reads) {
     const char* sources[] = {
         R"rut(
