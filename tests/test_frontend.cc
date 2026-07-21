@@ -33140,6 +33140,54 @@ TEST(frontend, rejects_heterogeneous_nested_array_shapes_in_tuples) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, lowers_tuple_valued_struct_fields_with_indexed_shapes) {
+    const char* src = R"rut(
+struct Holder { pair: ([str], i32) }
+func keep(values: [str]) -> [str] => values
+route GET "/x" {
+    let holder = Holder(pair: ([req.path], 1))
+    let values = holder.pair | keep(_1)
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, rejects_arrays_nested_in_tuple_variant_payloads) {
+    const char* src = R"rut(
+variant V { ints(([i32], i32)), strs(([str], i32)) }
+route GET "/x" { let value = V.strs((["x"], 1)) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, contextualizes_nested_empty_array_call_arguments) {
+    const char* src = R"rut(
+func keep(values: [[str]]) -> [[str]] => values
+route GET "/x" { let values = keep([[]]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
+TEST(frontend, recursively_adapts_string_lists_at_array_boundaries) {
+    const char* src = R"rut(
+func keep(values: [[str]]) -> [[str]] => values
+route GET "/x" { let values = keep([req.queryAll("tag")]) return 200 }
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
