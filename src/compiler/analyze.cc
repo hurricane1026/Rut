@@ -13421,9 +13421,11 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 
         route.control.kind = HirControlKind::If;
         route.control.cond = cond;
-        auto then_term = analyze_term(*timer_arm->stmt, mod);
+        auto then_term = analyze_term(
+            *timer_arm->stmt, mod, &route, nullptr, route.locals.data, route.locals.len);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*recv_arm->stmt, mod);
+        auto else_term = analyze_term(
+            *recv_arm->stmt, mod, &route, nullptr, route.locals.data, route.locals.len);
         if (!else_term) return core::make_unexpected(else_term.error());
         route.control.then_term = then_term.value();
         route.control.else_term = else_term.value();
