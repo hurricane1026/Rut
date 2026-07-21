@@ -57,6 +57,7 @@ HandlerExecution& HandlerExecution::operator=(const HandlerExecution& other) {
     if (this == &other) return *this;
     rut_helper_resp_release_body_storage(&frame.context);
     frame = other.frame;
+    jit::retain_response_body_snapshot_storage(&frame.context);
     frame.context.response_body_mutation_storage = nullptr;
     if (other.frame.context.response_body_mutation_storage != nullptr) {
         frame.context.response_body_mutation_storage =

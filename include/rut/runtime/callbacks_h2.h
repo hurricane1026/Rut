@@ -576,6 +576,7 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
     // connection scratch copy so another H2 stream can reset it without freeing
     // bytes still needed by this suspended stream.
     live.response_body_mutation_storage = nullptr;
+    live.response_body_snapshot_storage = nullptr;
 
     const u32 kMutationCount = parked->response_header_pending_count;
     for (u32 i = 0; i < kMutationCount; i++) {
