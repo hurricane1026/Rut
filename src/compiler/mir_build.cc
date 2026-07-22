@@ -1292,6 +1292,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     MirBlock then_block{};
                     then_block.label = then_label();
                     set_term_from_hir(&then_block.term, guard.fail_body.then_term);
+                    if (guard.fail_body.has_then_local) {
+                        auto local = set_branch_local(&then_block, guard.fail_body.then_local);
+                        if (!local) return core::make_unexpected(local.error());
+                    }
                     if (!fn.blocks.push(then_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
 

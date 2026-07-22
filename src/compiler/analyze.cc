@@ -9975,7 +9975,7 @@ static FrontendResult<void> build_dynamic_json_plan(
     HirLocal local{};
     local.span = expr.span;
     local.name = intern_generated_name("$json.response." + std::to_string(value_refs.len));
-    local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+    local.ref_index = next_local_ref_index(route, locals, local_count);
     local.type = value->type;
     local.shape_index = value->shape_index;
     local.defer_to_terminator = true;
@@ -11062,8 +11062,12 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                                      binding,
                                                      &then_locals,
                                                      &then_local,
-                                                     /*materialize_in_branch=*/false);
+                                                     /*materialize_in_branch=*/true);
             if (!appended) return core::make_unexpected(appended.error());
+            if (!folds_false) {
+                body->has_then_local = true;
+                body->then_local = then_local;
+            }
         } else {
             auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
             if (!cond) return core::make_unexpected(cond.error());

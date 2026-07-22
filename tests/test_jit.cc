@@ -1540,6 +1540,58 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, frontend_guard_failure_if_let_json_uses_failure_scope) {
+    const auto src = R"rut(
+route GET "/x" {
+    guard false else {
+        let candidate = req.header("X-Value")
+        if let value = candidate {
+            return 400, json({ value: value })
+        } else {
+            return 401
+        }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char request[] = "GET /x HTTP/1.1\r\nHost: localhost\r\nX-Value: ready\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(request),
+                                            sizeof(request) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 400u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    CHECK((Str{outcome.dynamic_response_body, outcome.dynamic_response_body_len})
+              .eq(lit("{\"value\":\"ready\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_match_arm_runtime_json_runs_after_effects) {
     const auto src = R"rut(
 let buckets = Cache<IP, i64>(capacity: 64)

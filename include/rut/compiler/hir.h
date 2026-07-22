@@ -820,6 +820,8 @@ struct HirGuardBody {
     BodyKind body_kind = BodyKind::Direct;
     FixedVec<HirLocal, kMaxLocals> locals;
     HirExpr cond{};
+    bool has_then_local = false;
+    HirLocal then_local{};
     HirTerminator then_term{};
     HirTerminator else_term{};
     HirTerminator direct_term{};
@@ -1278,6 +1280,7 @@ private:
         for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
             rebase_expr(guard.fail_body.locals[li].init, other);
         }
+        if (guard.fail_body.has_then_local) rebase_expr(guard.fail_body.then_local.init, other);
         rebase_expr(guard.fail_body.cond, other);
     }
 

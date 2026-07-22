@@ -6771,6 +6771,53 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(frontend, guard_failure_if_let_materializes_scoped_dependency_in_then_block) {
+    const char* src = R"rut(
+route GET "/users" {
+    guard false else {
+        let candidate = req.header("X-Value")
+        if let value = candidate {
+            return 400, json({ value: value })
+        } else {
+            return 401
+        }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& fail_body = hir->routes[0].guards[0].fail_body;
+    REQUIRE_EQ(fail_body.locals.len, 1u);
+    REQUIRE(fail_body.has_then_local);
+    bool registered_at_entry = false;
+    for (u32 li = 0; li < hir->routes[0].locals.len; li++) {
+        if (hir->routes[0].locals[li].ref_index == fail_body.then_local.ref_index)
+            registered_at_entry = true;
+    }
+    CHECK_FALSE(registered_at_entry);
+
+    const u32 then_ref = fail_body.then_local.ref_index;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    bool materialized_in_then_block = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        for (u32 ei = 0; ei < mir->functions[0].blocks[bi].effects.len; ei++) {
+            if (mir->functions[0].blocks[bi].effects[ei].local_ref_index == then_ref)
+                materialized_in_then_block = true;
+        }
+    }
+    CHECK(materialized_in_then_block);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, match_arm_folded_false_if_let_discards_dead_json_binding) {
     const char* src = R"rut(
 route GET "/users" {
