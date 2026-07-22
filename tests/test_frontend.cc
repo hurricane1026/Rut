@@ -31966,6 +31966,19 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(frontend, return_json_rejects_raw_template_larger_than_runtime_scratch) {
+    std::string src = "route GET \"/x\" { return 200, json({ literal: \"";
+    src.append(8 * 1024, 'x');
+    src += "\", path: req.path }) }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+}
+
 TEST(frontend, runtime_json_terminators_keep_route_context_in_control_flow) {
     const char* src = R"rut(
 route GET "/if" {

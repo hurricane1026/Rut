@@ -1,5 +1,6 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "rut/common/json_response_limits.h"
 #include "rut/common/shard_limits.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
@@ -66,7 +67,7 @@ thread_local const u64* t_virtual_time_us = nullptr;
 // header formatting and H2 framing both reuse that buffer). Keep the cap below
 // the H2 response scratch so framing overhead remains bounded as well.
 struct JsonResponseScratch {
-    static constexpr u32 kCapacity = 7 * 1024;
+    static constexpr u32 kCapacity = kJsonResponseScratchCapacity;
     char data[kCapacity]{};
     u32 len = 0;
     bool ok = true;

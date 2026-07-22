@@ -1,6 +1,7 @@
 #include "rut/compiler/analyze.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/json_response_limits.h"
 #include "rut/common/shard_limits.h"
 #include "rut/compiler/builtin_decls.h"
 #include "rut/compiler/lexer.h"
@@ -10040,6 +10041,12 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                         segments,
                                                         term.json_value_ref_indices);
                     if (!plan) return core::make_unexpected(plan.error());
+                    u32 raw_bytes = 0;
+                    for (const auto& segment : segments) {
+                        if (segment.size() > kJsonResponseScratchCapacity - raw_bytes)
+                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        raw_bytes += static_cast<u32>(segment.size());
+                    }
                     for (const auto& segment : segments) {
                         if (!term.json_segments.push(intern_generated_name(segment)))
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
