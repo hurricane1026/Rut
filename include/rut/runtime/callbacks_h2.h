@@ -440,6 +440,13 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
+    // Informational, 204, and 304 responses never carry a message body. Keep
+    // the effective headers, but close the stream on HEADERS instead of
+    // emitting the dynamic/static payload as a DATA frame.
+    if (o.status_code < 200 || o.status_code == 204 || o.status_code == 304) {
+        body = nullptr;
+        body_len = 0;
+    }
     h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len);
 }
 

@@ -649,6 +649,61 @@ TEST(harness_scenario, dynamic_json_body_is_accounted_as_runtime_output) {
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 
+TEST(harness_scenario, dynamic_json_failure_preserves_committed_response_headers) {
+    TempSource source;
+    REQUIRE(source.write(R"rut(
+func add_stage(_ resp: Response) -> i32 {
+    resp.set("X-Stage", "after")
+    0
+}
+chain observed { after add_stage(resp) }
+route GET "/with" use chain observed {
+    return 200, json({ value: req.header("X-Value").or("") })
+}
+route GET "/without" {
+    return 200, json({ value: req.header("X-Value").or("") })
+}
+)rut"));
+    harness::SourceTarget target{};
+    harness::HarnessSpec load_spec{};
+    REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
+               harness::Outcome::Passed);
+
+    auto run = [&](const char* path, u32 path_len, const char* request, u32 request_len) {
+        harness::ScenarioSpec scenario{};
+        scenario.target = &target;
+        scenario.path = {path, path_len};
+        scenario.method = kRouteMethodGet;
+        scenario.request_data = reinterpret_cast<const u8*>(request);
+        scenario.request_len = request_len;
+        scenario.expected = {true, jit::HandlerAction::ReturnStatus, 500};
+        auto spec = scripted_scenario_harness();
+        spec.required_capabilities =
+            harness::Capability::SyntheticIo | harness::Capability::VirtualTime;
+        spec.environment_capabilities = spec.required_capabilities;
+        return harness::drive_scenario(scenario, spec);
+    };
+
+    static const char kWith[] =
+        "GET /with HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
+    static const char kWithout[] =
+        "GET /without HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
+    const auto with_header = run("/with", 5, kWith, sizeof(kWith) - 1);
+    const auto without_header = run("/without", 8, kWithout, sizeof(kWithout) - 1);
+
+    REQUIRE_EQ(with_header.harness.outcome, harness::Outcome::Passed);
+    REQUIRE_EQ(without_header.harness.outcome, harness::Outcome::Passed);
+    CHECK_EQ(with_header.terminal.status_code, 500u);
+    CHECK_EQ(without_header.terminal.status_code, 500u);
+    // The committed-header path is header-only after the failed dynamic body;
+    // the baseline static 500 contains "Internal Server Error" and grows its
+    // Content-Length field from one digit to two.
+    CHECK_EQ(with_header.harness.output_bytes,
+             without_header.harness.output_bytes + sizeof("X-Stage: after\r\n") - 1 -
+                 (sizeof("Internal Server Error") - 1) - 1);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
 TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     harness::SourceTarget target{};
     REQUIRE(target.program.config.add_static("/static", kRouteMethodGet, 204));

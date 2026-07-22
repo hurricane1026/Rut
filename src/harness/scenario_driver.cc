@@ -117,19 +117,16 @@ bool account_terminal_output(const HarnessSpec& spec,
     if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
 
     connection.resp_status = terminal.status_code;
-    const bool wants_dynamic_body =
+    bool wants_dynamic_body =
         terminal.upstream_id == jit::HandlerResult::kDynamicResponseBody;
     if (wants_dynamic_body && (!dynamic_body_valid || dynamic_body == nullptr)) {
-        terminal = jit::HandlerResult::make_status(500);
+        // Match production dispatch: turn the failed serializer into a 500,
+        // discard only its body marker, and continue through normal response
+        // formatting so committed response mutations remain observable.
+        terminal.status_code = 500;
+        terminal.upstream_id = 0;
         connection.resp_status = 500;
-        format_static_response(connection, 500, false);
-        result.output_bytes = connection.send_buf.len();
-        if (result.output_bytes <= spec.limits.max_output_bytes) return true;
-        result.outcome = Outcome::Failed;
-        result.has_reached_limit = true;
-        result.reached_limit = LimitKind::OutputBytes;
-        copy_detail(result, "output-bytes limit reached");
-        return false;
+        wants_dynamic_body = false;
     }
     const RouteConfig* config = connection.request_config;
     const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
