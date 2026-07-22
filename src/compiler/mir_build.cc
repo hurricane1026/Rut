@@ -1140,6 +1140,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.is_wait_result = module.routes[i].locals[li].is_wait_result;
             local.defer_to_terminator = module.routes[i].locals[li].defer_to_terminator;
             local.materialize_on_resume = module.routes[i].locals[li].materialize_on_resume;
+            local.rematerialize_after_wait = module.routes[i].locals[li].rematerialize_after_wait;
             local.wait_event_kind = module.routes[i].locals[li].wait_event_kind;
             local.wait_payload = module.routes[i].locals[li].wait_payload;
             local.wait_arm_mask = module.routes[i].locals[li].wait_arm_mask;

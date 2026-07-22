@@ -743,6 +743,7 @@ struct HirLocal {
     bool is_magic_request_proxy = false;
     bool defer_to_terminator = false;
     bool materialize_on_resume = false;
+    bool rematerialize_after_wait = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;

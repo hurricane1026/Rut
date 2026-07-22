@@ -9986,6 +9986,8 @@ static FrontendResult<void> build_dynamic_json_plan(
     return {};
 }
 
+static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index);
+
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
                                                   HirRoute* route = nullptr,
@@ -10041,6 +10043,39 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                         segments,
                                                         term.json_value_ref_indices);
                     if (!plan) return core::make_unexpected(plan.error());
+                    if (route->waits.len != 0) {
+                        bool retained[HirRoute::kMaxLocals]{};
+                        for (u32 ri = 0; ri < term.json_value_ref_indices.len; ri++) {
+                            for (u32 li = 0; li < route->locals.len; li++) {
+                                if (route->locals[li].ref_index ==
+                                    term.json_value_ref_indices[ri]) {
+                                    retained[li] = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // The resumed terminal rematerializes its synthetic JSON
+                        // slots. Preserve the transitive ordinary-local closure
+                        // as well so none of those recipes reads state-0 SSA.
+                        bool changed = true;
+                        while (changed) {
+                            changed = false;
+                            for (u32 li = 0; li < route->locals.len; li++) {
+                                if (!retained[li]) continue;
+                                for (u32 dep = 0; dep < route->locals.len; dep++) {
+                                    if (retained[dep] ||
+                                        !expr_reads_local_ref(route->locals[li].init,
+                                                              route->locals[dep].ref_index))
+                                        continue;
+                                    retained[dep] = true;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        for (u32 li = 0; li < route->locals.len; li++)
+                            if (retained[li] && !route->locals[li].defer_to_terminator)
+                                route->locals[li].rematerialize_after_wait = true;
+                    }
                     u32 minimum_bytes = 0;
                     for (const auto& segment : segments) {
                         if (segment.size() > kJsonResponseScratchCapacity - minimum_bytes)
@@ -13403,6 +13438,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
             if (!local.defer_to_terminator) {
                 local.name = {};
                 local.materialize_on_resume = true;
+                local.rematerialize_after_wait = false;
                 local.wait_index = wait_index;
             }
             if (!retained_locals.push(local))

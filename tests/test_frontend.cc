@@ -6616,6 +6616,31 @@ route GET "/users" use chain secure {
     rir.destroy();
 }
 
+TEST(frontend, wait_json_rematerializes_pre_wait_local_dependencies) {
+    const char* src = R"rut(
+route GET "/users" {
+    let saved = req.path
+    wait(50)
+    return 200, json({ saved: saved })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK(hir->routes[0].locals[0].rematerialize_after_wait);
+    CHECK(hir->routes[0].locals[1].defer_to_terminator);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, decorated_wait_rejects_deferred_json_reads_of_pre_wait_locals) {
     const char* src = R"rut(
 func require_http11(_ req: i32) -> bool => req.http11
