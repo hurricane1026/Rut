@@ -68,6 +68,10 @@ struct JitDispatchOutcome {
     u16 response_headers_idx = 0;
 };
 
+inline constexpr bool response_status_forbids_body(u16 status) {
+    return status < 200 || status == 204 || status == 205 || status == 304;
+}
+
 // Round-up conversion from ms to seconds. Callers using a 1-second
 // TimerWheel (legacy keepalive mechanism) can use this to bucket timer_ms.
 // Native ms-precision paths (IORING_OP_TIMEOUT / epoll min-heap) should
@@ -159,9 +163,10 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             if (r.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
                 // A failed/overflowed serializer is a server error, never a
                 // partial JSON response. The helper clears valid before work.
-                if (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) {
+                if ((ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) &&
+                    !response_status_forbids_body(out.status_code)) {
                     out.status_code = 500;
-                } else {
+                } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
                     out.dynamic_response_body = ctx.response_body_data;
                     out.dynamic_response_body_len = ctx.response_body_len;
                 }

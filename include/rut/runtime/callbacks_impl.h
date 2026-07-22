@@ -448,13 +448,20 @@ void pipeline_stash(Connection& conn);
 bool pipeline_recover(Connection& conn);
 void capture_stage_headers(Connection& conn);
 const char* status_reason(u16 code);
-void format_static_response(Connection& conn, u16 code, bool keep_alive);
+void format_static_response(Connection& conn,
+                            u16 code,
+                            bool keep_alive,
+                            bool suppress_body = false);
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
 // bytes. For codes that must have no body (1xx / 204 / 205 / 304) falls
 // back to format_static_response.
-void format_response_with_body(
-    Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
+void format_response_with_body(Connection& conn,
+                               u16 code,
+                               const char* body_data,
+                               u32 body_len,
+                               bool keep_alive,
+                               bool suppress_body = false);
 
 // Custom-headers variant: emits each `headers[i]` pair (indexed
 // [0, header_count)) before the blank line. If any user-supplied key
@@ -487,7 +494,8 @@ void format_response_with_body_and_headers(Connection& conn,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
                                            bool keep_alive,
-                                           bool body_is_fallback_reason_phrase = false);
+                                           bool body_is_fallback_reason_phrase = false,
+                                           bool suppress_body = false);
 void prepare_early_response_state(Connection& conn);
 u32 consume_upstream_sent(Connection& conn);
 
@@ -1538,6 +1546,7 @@ void handle_jit_outcome(Loop* loop,
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
+            const bool suppress_body = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
             const bool has_dynamic_body = outcome.dynamic_response_body != nullptr;
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
@@ -1598,19 +1607,21 @@ void handle_jit_outcome(Loop* loop,
                                                       kvs,
                                                       header_count,
                                                       keep_alive,
-                                                      body_is_fallback);
+                                                      body_is_fallback,
+                                                      suppress_body);
             } else if (has_dynamic_body) {
                 format_response_with_body(conn,
                                           outcome.status_code,
                                           outcome.dynamic_response_body,
                                           outcome.dynamic_response_body_len,
-                                          keep_alive);
+                                          keep_alive,
+                                          suppress_body);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(
-                    conn, outcome.status_code, body.data, body.len, keep_alive);
+                    conn, outcome.status_code, body.data, body.len, keep_alive, suppress_body);
             } else {
-                format_static_response(conn, outcome.status_code, keep_alive);
+                format_static_response(conn, outcome.status_code, keep_alive, suppress_body);
             }
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());

@@ -9117,11 +9117,8 @@ static u64 return_200_with_body_1_handler(void* /*conn*/,
     return r.pack();
 }
 
-static u64 return_204_with_dynamic_body_handler(void* /*conn*/,
-                                                rut::jit::HandlerCtx* ctx,
-                                                const u8* /*req*/,
-                                                u32 /*len*/,
-                                                void* /*arena*/) {
+static u64 return_204_with_dynamic_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
     static const char kBody[] = "must not be emitted";
     ctx->response_body_data = kBody;
     ctx->response_body_len = sizeof(kBody) - 1;
@@ -9131,11 +9128,8 @@ static u64 return_204_with_dynamic_body_handler(void* /*conn*/,
     return r.pack();
 }
 
-static u64 return_200_with_dynamic_body_handler(void* /*conn*/,
-                                                rut::jit::HandlerCtx* ctx,
-                                                const u8* /*req*/,
-                                                u32 /*len*/,
-                                                void* /*arena*/) {
+static u64 return_200_with_dynamic_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
     static const char kBody[] = "must not be emitted for HEAD";
     ctx->response_body_data = kBody;
     ctx->response_body_len = sizeof(kBody) - 1;
@@ -9143,6 +9137,60 @@ static u64 return_200_with_dynamic_body_handler(void* /*conn*/,
     auto r = rut::jit::HandlerResult::make_status(200);
     r.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
     return r.pack();
+}
+
+TEST(route, suppresses_http1_dynamic_body_for_head) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/head", 'H', &return_200_with_dynamic_body_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    const i32 lfd = lfd_result.value();
+    const u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    const i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    static const char kRequest[] = "HEAD /head HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[1024];
+    const i32 received = recv_timeout(client, response, sizeof(response), 2000);
+    REQUIRE_GT(received, 0);
+
+    u32 header_end = 0;
+    for (u32 i = 0; i + 3 < static_cast<u32>(received); i++) {
+        if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+            response[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(header_end, static_cast<u32>(received));
+    const auto contains = [&](const char* needle, u32 needle_len) {
+        for (u32 i = 0; i + needle_len <= static_cast<u32>(received); i++) {
+            if (__builtin_memcmp(response + i, needle, needle_len) == 0) return true;
+        }
+        return false;
+    };
+    static const char kContentLength[] = "Content-Length: 28";
+    static const char kBody[] = "must not be emitted for HEAD";
+    CHECK(contains(kContentLength, sizeof(kContentLength) - 1));
+    CHECK(!contains(kBody, sizeof(kBody) - 1));
+
+    close(client);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
 }
 
 // End-to-end: handler returns ReturnStatus with body_idx=1;

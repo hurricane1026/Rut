@@ -472,21 +472,26 @@ static void write_response_headers(Connection& conn,
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
 }
 
-void format_static_response(Connection& conn, u16 code, bool keep_alive) {
+void format_static_response(Connection& conn, u16 code, bool keep_alive, bool suppress_body) {
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
-    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
+    const bool kNoBody = response_status_forbids_body(code);
     const u32 kBodyLen = kNoBody ? 0 : reason_len;
     write_response_headers(conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0);
-    if (kBodyLen > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
+    if (kBodyLen > 0 && !suppress_body)
+        conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
 
-void format_response_with_body(
-    Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive) {
+void format_response_with_body(Connection& conn,
+                               u16 code,
+                               const char* body_data,
+                               u32 body_len,
+                               bool keep_alive,
+                               bool suppress_body) {
     // 204 / 205 / 304 / 1xx carry no body per HTTP spec; fall back to the
     // default formatter for those codes even if a body was supplied.
-    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
+    const bool kNoBody = response_status_forbids_body(code);
     if (kNoBody) {
         format_static_response(conn, code, keep_alive);
         return;
@@ -503,7 +508,8 @@ void format_response_with_body(
                            keep_alive,
                            kDefaultContentType,
                            sizeof(kDefaultContentType) - 1);
-    if (body_len > 0) conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
+    if (body_len > 0 && !suppress_body)
+        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
 // Case-insensitive compare against a string literal. Templated on the
@@ -580,9 +586,11 @@ void format_response_with_body_and_headers(Connection& conn,
                                            const ResponseHeaderKV* headers,
                                            u32 header_count,
                                            bool keep_alive,
-                                           bool body_is_fallback_reason_phrase) {
-    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
-    const u32 body_len_emit = kNoBody ? 0 : body_len;
+                                           bool body_is_fallback_reason_phrase,
+                                           bool suppress_body) {
+    const bool kNoBody = response_status_forbids_body(code);
+    const u32 representation_len = kNoBody ? 0 : body_len;
+    const u32 body_len_emit = suppress_body ? 0 : representation_len;
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
@@ -604,7 +612,7 @@ void format_response_with_body_and_headers(Connection& conn,
     // Content-Type at all here, so suppressing it keeps the fallback
     // wire shape consistent regardless of whether headers are present.
     const bool emit_default_content_type =
-        !user_has_content_type && body_len_emit > 0 && !body_is_fallback_reason_phrase;
+        !user_has_content_type && representation_len > 0 && !body_is_fallback_reason_phrase;
 
     // Precompute the exact number of bytes we're about to write.
     // Buffer::write() silently truncates on capacity — if we ran past
@@ -622,7 +630,7 @@ void format_response_with_body_and_headers(Connection& conn,
     constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
     u64 needed = kStatusLineFixed + reason_len + kContentLengthPrefix +
-                 decimal_digit_count(body_len_emit) + 2;
+                 decimal_digit_count(representation_len) + 2;
     if (emit_default_content_type) needed += kDefaultContentTypeLine;
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
@@ -643,7 +651,7 @@ void format_response_with_body_and_headers(Connection& conn,
         // the original status rather than the 500 we actually sent.
         conn.resp_status = 500;
         conn.keep_alive = false;
-        format_static_response(conn, 500, /*keep_alive=*/false);
+        format_static_response(conn, 500, /*keep_alive=*/false, /*suppress_body=*/suppress_body);
         return;
     }
 
@@ -660,7 +668,7 @@ void format_response_with_body_and_headers(Connection& conn,
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
     // Content-Length (from body_len_emit, not the user's headers).
     conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
-    write_content_length_digits(conn, body_len_emit);
+    write_content_length_digits(conn, representation_len);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
     // Default Content-Type only if the user didn't supply one AND
     // we're actually going to send a body. No-body responses (1xx /

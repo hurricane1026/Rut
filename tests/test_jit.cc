@@ -1475,6 +1475,20 @@ TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) 
     CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
     CHECK_EQ(outcome.status_code, 500u);
     CHECK(outcome.dynamic_response_body == nullptr);
+
+    const auto invalid_bodyless_handler =
+        +[](void*, HandlerCtx* handler_ctx, const u8*, u32, void*) -> u64 {
+        handler_ctx->response_body_valid = 0;
+        handler_ctx->response_body_data = nullptr;
+        HandlerResult result = HandlerResult::make_status(204);
+        result.upstream_id = HandlerResult::kDynamicResponseBody;
+        return result.pack();
+    };
+    const auto bodyless =
+        invoke_jit_handler(invalid_bodyless_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(bodyless.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(bodyless.status_code, 204u);
+    CHECK(bodyless.dynamic_response_body == nullptr);
 }
 
 TEST(jit, frontend_match_arm_runtime_json_uses_payload_scope) {
