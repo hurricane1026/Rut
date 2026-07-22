@@ -15978,11 +15978,14 @@ TEST(response_headers, head_header_collection_failure_suppresses_fallback_body) 
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
     conn->req_method = static_cast<u8>(LogHttpMethod::Head);
-    conn->resp_header_mutation_overflow = true;
+
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_header_overflow = true;
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
     outcome.status_code = 200;
+    outcome.response_ctx = &response_ctx;
     loop.backend.clear_ops();
     handle_jit_outcome<SmallLoop>(
         &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
