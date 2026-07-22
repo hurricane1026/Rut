@@ -131,6 +131,26 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
     h2_emit_response(d, stream_id, status, nullptr, 0, nullptr, 0);
 }
 
+inline bool h2_response_status_forbids_body(u16 status) {
+    return status < 200 || status == 204 || status == 205 || status == 304;
+}
+
+inline u32 h2_u32_to_dec(u32 value, char* out) {
+    char reversed[10];
+    u32 len = 0;
+    do {
+        reversed[len++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    for (u32 i = 0; i < len; i++) out[i] = reversed[len - i - 1];
+    return len;
+}
+
+inline bool h2_synth_request_is_head(const u8* synth, u32 synth_len) {
+    return synth != nullptr && synth_len >= 5 && synth[0] == 'H' && synth[1] == 'E' &&
+           synth[2] == 'A' && synth[3] == 'D' && synth[4] == ' ';
+}
+
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
 // handler's parse-cache prime (which parses raw HTTP/1 bytes) sees the request.
 // Returns the byte length, or 0 on missing pseudo-headers / overflow.
@@ -371,18 +391,25 @@ template <typename Loop>
 void h2_emit_outcome(H2Dispatch<Loop>& d,
                      u32 stream_id,
                      const JitDispatchOutcome& o,
-                     const RouteConfig* cfg) {
+                     const RouteConfig* cfg,
+                     bool head_request) {
     const u8* body = nullptr;
     u32 body_len = 0;
-    if (o.response_body_idx != 0 && cfg != nullptr &&
-        o.response_body_idx <= cfg->response_body_count) {
+    if (o.dynamic_response_body != nullptr) {
+        body = reinterpret_cast<const u8*>(o.dynamic_response_body);
+        body_len = o.dynamic_response_body_len;
+    } else if (o.response_body_idx != 0 && cfg != nullptr &&
+               o.response_body_idx <= cfg->response_body_count) {
         const auto& b = cfg->response_bodies[o.response_body_idx - 1];
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations + 2;
     hpack::Header hdrs[kMaxEffectiveHeaders];
+    // Header values are non-owning Str views and are encoded only after the
+    // list is complete, so storage synthesized below must span the emit call.
+    char content_length[10];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
@@ -436,6 +463,36 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             hdrs[nhdrs].value = mutation.value;
             nhdrs++;
         }
+    }
+    const bool status_forbids_body = h2_response_status_forbids_body(o.status_code);
+    if (o.dynamic_response_body != nullptr && !status_forbids_body) {
+        bool has_content_type = false;
+        for (u32 i = 0; i < nhdrs; i++) {
+            if (http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12)) {
+                has_content_type = true;
+                break;
+            }
+        }
+        if (!has_content_type) {
+            hdrs[nhdrs].name = {"content-type", 12};
+            hdrs[nhdrs].value = {"text/plain; charset=utf-8", 25};
+            nhdrs++;
+        }
+    }
+    // HEAD suppresses DATA while retaining the representation metadata that the
+    // equivalent GET would emit. http2_write_response normally derives
+    // content-length from body_len, so preserve it explicitly before clearing
+    // the payload passed to the writer.
+    if (head_request && body_len != 0 && !status_forbids_body) {
+        const u32 content_length_len = h2_u32_to_dec(body_len, content_length);
+        hdrs[nhdrs].name = {"content-length", 14};
+        hdrs[nhdrs].value = {content_length, content_length_len};
+        nhdrs++;
+    }
+    // Informational, 204, 205, and 304 responses never carry a message body.
+    if (head_request || status_forbids_body) {
+        body = nullptr;
+        body_len = 0;
     }
     h2_emit_response(d, stream_id, o.status_code, hdrs, nhdrs, body, body_len);
 }
@@ -582,7 +639,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
-    h2_emit_outcome(d, stream_id, kOutcome, cfg);
+    h2_emit_outcome(d, stream_id, kOutcome, cfg, h2_synth_request_is_head(synth, synth_len));
 }
 
 // A deferred stream is complete. If the matched handler reads req.body,
@@ -1127,6 +1184,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // (mirrors the HTTP/1 resume_jit_handler).
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
+    const bool kHeadRequest = h2_synth_request_is_head(h2->pending_synth, h2->async_synth_len);
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
@@ -1149,7 +1207,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     u8 resp[8192];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
-        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
+        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kHeadRequest);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
     }

@@ -2839,6 +2839,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
 
 static FrontendResult<void> emit_term(const MirTerminator& term,
                                       const MirModule& mir,
+                                      const MirFunction& mir_fn,
                                       const VariantLoweringInfo* variant_infos,
                                       TupleLoweringInfo* tuple_infos,
                                       u32* tuple_info_count,
@@ -3063,7 +3064,56 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
-        if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
+        if (term.has_dynamic_response_body) {
+            if (term.json_segments.len != term.json_value_ref_indices.len + 1 ||
+                !b.emit_json_reset({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            for (u32 ji = 0; ji < term.json_segments.len; ji++) {
+                if (!b.emit_json_append_raw(term.json_segments[ji],
+                                            {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::OutOfMemory, term.span);
+                if (ji >= term.json_value_ref_indices.len) continue;
+                const u32 ref = term.json_value_ref_indices[ji];
+                if (ref >= local_count)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                rir::ValueId json_value = locals[ref];
+                for (u32 li = 0; li < mir_fn.locals.len; li++) {
+                    const auto& local = mir_fn.locals[li];
+                    if (local.ref_index != ref || !local.defer_to_terminator) continue;
+                    auto materialized = materialize_value(local.init,
+                                                          mir,
+                                                          variant_infos,
+                                                          tuple_infos,
+                                                          tuple_info_count,
+                                                          error_scalar_infos,
+                                                          error_variant_infos,
+                                                          error_struct_infos,
+                                                          user_struct_defs,
+                                                          b,
+                                                          locals,
+                                                          local_count,
+                                                          local.span);
+                    if (!materialized) return core::make_unexpected(materialized.error());
+                    json_value = materialized.value();
+                    break;
+                }
+                if (json_value.id >= fn->value_count || fn->values[json_value.id].type == nullptr)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                const auto value_type = fn->values[json_value.id].type->kind;
+                const rir::Opcode op =
+                    value_type == rir::TypeKind::Bool  ? rir::Opcode::JsonAppendBool
+                    : value_type == rir::TypeKind::I32 ? rir::Opcode::JsonAppendI32
+                    : value_type == rir::TypeKind::I64 ? rir::Opcode::JsonAppendI64
+                    : value_type == rir::TypeKind::Str ? rir::Opcode::JsonAppendStr
+                                                       : rir::Opcode::JsonFinish;
+                if (op == rir::Opcode::JsonFinish ||
+                    !b.emit_json_append(op, json_value, {term.span.line, term.span.col}))
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            }
+            if (!b.emit_json_finish({term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;  // HandlerResult::kDynamicResponseBody
+        } else if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
             body_idx = b.intern_response_body(term.response_body);
             if (body_idx == 0) {
                 // intern returns 0 for both "table full" and "arena
@@ -4501,6 +4551,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+            if (mir.functions[i].locals[li].defer_to_terminator ||
+                mir.functions[i].locals[li].materialize_on_resume)
+                continue;
             auto val = materialize_local_init(mir.functions[i].locals[li],
                                               mir,
                                               variant_infos,
@@ -4574,10 +4627,12 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
         for (u32 bi = 0; bi < mir.functions[i].blocks.len; bi++) {
             b.set_insert_point(fn.value(), block_ids[bi]);
+            bool is_resume_block = false;
             if (mir.functions[i].has_explicit_resume_blocks) {
                 const Span store_span = mir.functions[i].blocks[bi].term.span;
                 for (u32 wi = 0; wi < mir.functions[i].waits.len; wi++) {
                     if (mir.functions[i].resume_blocks[wi + 1] != bi) continue;
+                    is_resume_block = true;
                     // Slot persistence is optional at runtime: some callers run
                     // handlers without frame slots by leaving ctx.slot_count==0.
                     // Codegen defends against this by guarding slot writes with
@@ -4597,6 +4652,59 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return frontend_error(FrontendError::OutOfMemory, store_span);
                     }
                 }
+            }
+            if (is_resume_block) {
+                for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                    const auto& local = mir.functions[i].locals[li];
+                    if (!local.rematerialize_after_wait) continue;
+                    auto val = materialize_local_init(local,
+                                                      mir,
+                                                      variant_infos,
+                                                      tuple_infos,
+                                                      &tuple_info_count,
+                                                      error_scalar_infos,
+                                                      error_variant_infos,
+                                                      error_struct_infos,
+                                                      error_struct_def.value(),
+                                                      user_struct_defs,
+                                                      b,
+                                                      local_vals,
+                                                      MirFunction::kMaxLocals,
+                                                      mir.functions[i].name,
+                                                      out.module.name);
+                    if (!val) {
+                        out.destroy();
+                        return core::make_unexpected(val.error());
+                    }
+                    local_vals[local.ref_index] = val.value();
+                }
+            }
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                const auto& local = mir.functions[i].locals[li];
+                if (!local.materialize_on_resume ||
+                    local.wait_index >= mir.functions[i].waits.len ||
+                    mir.functions[i].resume_blocks[local.wait_index + 1] != bi)
+                    continue;
+                auto val = materialize_local_init(local,
+                                                  mir,
+                                                  variant_infos,
+                                                  tuple_infos,
+                                                  &tuple_info_count,
+                                                  error_scalar_infos,
+                                                  error_variant_infos,
+                                                  error_struct_infos,
+                                                  error_struct_def.value(),
+                                                  user_struct_defs,
+                                                  b,
+                                                  local_vals,
+                                                  MirFunction::kMaxLocals,
+                                                  mir.functions[i].name,
+                                                  out.module.name);
+                if (!val) {
+                    out.destroy();
+                    return core::make_unexpected(val.error());
+                }
+                local_vals[local.ref_index] = val.value();
             }
             for (u32 ei = 0; ei < mir.functions[i].blocks[bi].effects.len; ei++) {
                 const auto& effect = mir.functions[i].blocks[bi].effects[ei];
@@ -4621,9 +4729,17 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     out.destroy();
                     return core::make_unexpected(emitted.error());
                 }
+                if (effect.local_ref_index != 0xffffffffu) {
+                    if (effect.local_ref_index >= MirFunction::kMaxLocals) {
+                        out.destroy();
+                        return frontend_error(FrontendError::UnsupportedSyntax, effect.span);
+                    }
+                    local_vals[effect.local_ref_index] = emitted.value();
+                }
             }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,
+                                     mir.functions[i],
                                      variant_infos,
                                      tuple_infos,
                                      &tuple_info_count,

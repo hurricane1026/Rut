@@ -58,6 +58,10 @@ enum class YieldKind : u8 {
 // goes in RAX, matching the LLVM IR `ret i64`.
 
 struct HandlerResult {
+    // ReturnStatus reserves this body id for a body serialized at handler
+    // runtime. The bytes are exposed through HandlerCtx::response_body_* and
+    // must be consumed before the next handler invocation on the shard.
+    static constexpr u16 kDynamicResponseBody = 0xffffu;
     HandlerAction action;
     u16 status_code;
     u16 upstream_id;
@@ -132,6 +136,9 @@ struct alignas(alignof(u64)) HandlerCtx {
     i32 resume_event_result;  // IoEvent::result for event waits
     u32 route_param_count;    // number of populated route_params entries
     u32 reserved0;
+    const char* response_body_data;  // shard-owned dynamic response bytes
+    u32 response_body_len;
+    u32 response_body_valid;  // 1 only after successful serialization
     RouteParam route_params[kMaxRouteParams];
 
     // Access slot storage (8-byte aligned, immediately after header).

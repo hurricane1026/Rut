@@ -741,6 +741,9 @@ struct HirLocal {
     u32 error_variant_index = 0xffffffffu;
     bool is_wait_result = false;
     bool is_magic_request_proxy = false;
+    bool defer_to_terminator = false;
+    bool materialize_on_resume = false;
+    bool rematerialize_after_wait = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
@@ -767,6 +770,7 @@ struct HirHeaderKV {
 };
 
 struct HirTerminator {
+    static constexpr u32 kMaxJsonDynamicValues = 8;
     HirTerminatorKind kind = HirTerminatorKind::ReturnStatus;
     Span span{};
     HirTerminatorSourceKind source_kind = HirTerminatorSourceKind::Literal;
@@ -785,6 +789,12 @@ struct HirTerminator {
     // had `has_response_body == true`, so the sentinel is preserved
     // end-to-end.
     Str response_body{};
+    // Runtime JSON template. json_segments has one more item than
+    // json_value_ref_indices: segment[0], value[0], segment[1], ... .
+    // Values name synthetic route locals and are limited to scalar carriers.
+    bool has_dynamic_response_body = false;
+    FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
+    FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0
@@ -810,6 +820,8 @@ struct HirGuardBody {
     BodyKind body_kind = BodyKind::Direct;
     FixedVec<HirLocal, kMaxLocals> locals;
     HirExpr cond{};
+    bool has_then_local = false;
+    HirLocal then_local{};
     HirTerminator then_term{};
     HirTerminator else_term{};
     HirTerminator direct_term{};
@@ -868,6 +880,10 @@ struct HirMatchArm {
     FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
+    // A narrowed if-let value following arm effects must be initialized in the
+    // selected success block, after those effects, rather than at route entry.
+    bool has_then_local = false;
+    HirLocal then_local{};
     HirExpr cond{};
     HirTerminator then_term{};
     HirTerminator else_term{};
@@ -1264,6 +1280,7 @@ private:
         for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
             rebase_expr(guard.fail_body.locals[li].init, other);
         }
+        if (guard.fail_body.has_then_local) rebase_expr(guard.fail_body.then_local.init, other);
         rebase_expr(guard.fail_body.cond, other);
     }
 
@@ -1309,6 +1326,8 @@ private:
             for (u32 gi = 0; gi < control.match_arms[i].guards.len; gi++) {
                 rebase_guard(control.match_arms[i].guards[gi], other);
             }
+            if (control.match_arms[i].has_then_local)
+                rebase_expr(control.match_arms[i].then_local.init, other);
             rebase_expr(control.match_arms[i].cond, other);
         }
     }

@@ -1103,10 +1103,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // the slot is still being initialized, turning any future
             // substitution regression into a silent miscompile.
             //
-            // EXCEPT bare statement-effect carriers: they are also name-cleared
-            // (unnameable by design) but their init is the side effect itself —
-            // dropping one would silently delete the write.
+            // EXCEPT retained wait-arm dependencies and bare statement-effect
+            // carriers: both are name-cleared (unnameable by design), but the
+            // former must be rebuilt after resume and the latter carries the
+            // side effect itself.
             if (module.routes[i].locals[li].name.len == 0 &&
+                !module.routes[i].locals[li].materialize_on_resume &&
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
@@ -1136,6 +1138,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.error_struct_index = module.routes[i].locals[li].error_struct_index;
             local.error_variant_index = module.routes[i].locals[li].error_variant_index;
             local.is_wait_result = module.routes[i].locals[li].is_wait_result;
+            local.defer_to_terminator = module.routes[i].locals[li].defer_to_terminator;
+            local.materialize_on_resume = module.routes[i].locals[li].materialize_on_resume;
+            local.rematerialize_after_wait = module.routes[i].locals[li].rematerialize_after_wait;
             local.wait_event_kind = module.routes[i].locals[li].wait_event_kind;
             local.wait_payload = module.routes[i].locals[li].wait_payload;
             local.wait_arm_mask = module.routes[i].locals[li].wait_arm_mask;
@@ -1160,6 +1165,19 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
+            out->has_dynamic_response_body = term.has_dynamic_response_body;
+            out->json_segments.len = 0;
+            out->json_value_ref_indices.len = 0;
+            static_assert(
+                HirTerminator::kMaxJsonDynamicValues == MirTerminator::kMaxJsonDynamicValues,
+                "HIR/MIR dynamic JSON caps must match");
+            for (u32 ji = 0; ji < term.json_segments.len; ji++) {
+                if (!out->json_segments.push(term.json_segments[ji])) __builtin_trap();
+            }
+            for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
+                if (!out->json_value_ref_indices.push(term.json_value_ref_indices[ji]))
+                    __builtin_trap();
+            }
             out->forward_set_path = term.forward_set_path;
             out->response_headers.len = 0;
             // Both HIR and MIR cap at 16 headers per terminator, so a
@@ -1201,6 +1219,15 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
             return {};
         };
+        auto set_branch_local = [&](MirBlock* out, const HirLocal& local) -> FrontendResult<void> {
+            auto value = mir_value(local.init, module, &fn);
+            if (!value) return core::make_unexpected(value.error());
+            if (!fn.values.push(value.value()))
+                return frontend_error(FrontendError::TooManyItems, local.span);
+            if (!out->effects.push({fn.values.len - 1, local.span, local.ref_index}))
+                return frontend_error(FrontendError::TooManyItems, local.span);
+            return {};
+        };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;
             if (guard.fail_kind == HirGuard::FailKind::Body)
@@ -1226,6 +1253,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
 
             if (guard.fail_kind == HirGuard::FailKind::Body) {
+                MirBlock fail_block{};
+                fail_block.label = fail_label();
                 ForLoopCtx scoped_ctx{};
                 const ForLoopCtx* body_ctx = ctx;
                 if (guard.fail_body.locals.len != 0) {
@@ -1237,15 +1266,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         if (!local_value) return core::make_unexpected(local_value.error());
                         if (!fn.values.push(local_value.value()))
                             return frontend_error(FrontendError::TooManyItems, local.span);
+                        const u32 value_index = fn.values.len - 1;
+                        if (!fail_block.effects.push({value_index, local.span, local.ref_index}))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
-                        binding.value = &fn.values[fn.values.len - 1];
+                        binding.value = &fn.values[value_index];
                         if (!scoped_ctx.locals.push(binding))
                             return frontend_error(FrontendError::TooManyItems, local.span);
                     }
                 }
-                MirBlock fail_block{};
-                fail_block.label = fail_label();
                 if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
                     fail_block.term.kind = MirTerminatorKind::Branch;
                     fail_block.term.span = guard.fail_body.cond.span;
@@ -1262,6 +1292,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     MirBlock then_block{};
                     then_block.label = then_label();
                     set_term_from_hir(&then_block.term, guard.fail_body.then_term);
+                    if (guard.fail_body.has_then_local) {
+                        auto local = set_branch_local(&then_block, guard.fail_body.then_local);
+                        if (!local) return core::make_unexpected(local.error());
+                    }
                     if (!fn.blocks.push(then_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
 
@@ -1601,6 +1635,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         MirBlock then_block{};
                         then_block.label = then_label();
                         set_term_from_hir(&then_block.term, arm.then_term);
+                        if (arm.has_then_local) {
+                            auto local = set_branch_local(&then_block, arm.then_local);
+                            if (!local) return core::make_unexpected(local.error());
+                        }
                         if (!fn.blocks.push(then_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                         MirBlock else_block{};
@@ -1697,6 +1735,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             MirBlock then_block{};
                             then_block.label = then_label();
                             set_term_from_hir(&then_block.term, arm.then_term);
+                            if (arm.has_then_local) {
+                                auto local = set_branch_local(&then_block, arm.then_local);
+                                if (!local) return core::make_unexpected(local.error());
+                            }
                             if (!fn.blocks.push(then_block))
                                 return frontend_error(FrontendError::TooManyItems, fn.span);
                             MirBlock else_block{};
@@ -2484,6 +2526,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                             MirBlock then_block{};
                             then_block.label = then_label();
                             set_term_from_hir(&then_block.term, arm.then_term);
+                            if (arm.has_then_local) {
+                                auto local = set_branch_local(&then_block, arm.then_local);
+                                if (!local) return core::make_unexpected(local.error());
+                            }
                             if (!fn.blocks.push(then_block))
                                 return frontend_error(FrontendError::TooManyItems, fn.span);
                             MirBlock else_block{};
@@ -2579,6 +2625,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                                 MirBlock then_block{};
                                 then_block.label = then_label();
                                 set_term_from_hir(&then_block.term, arm.then_term);
+                                if (arm.has_then_local) {
+                                    auto local = set_branch_local(&then_block, arm.then_local);
+                                    if (!local) return core::make_unexpected(local.error());
+                                }
                                 if (!fn.blocks.push(then_block))
                                     return frontend_error(FrontendError::TooManyItems, fn.span);
                                 MirBlock else_block{};
@@ -2938,6 +2988,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         MirBlock then_block{};
                         then_block.label = then_label();
                         set_term_from_hir(&then_block.term, arm.then_term);
+                        if (arm.has_then_local) {
+                            auto local = set_branch_local(&then_block, arm.then_local);
+                            if (!local) return core::make_unexpected(local.error());
+                        }
                         if (!fn.blocks.push(then_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                         MirBlock else_block{};
@@ -3082,6 +3136,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                     MirBlock then_block{};
                     then_block.label = then_label();
                     set_term_from_hir(&then_block.term, arm.then_term);
+                    if (arm.has_then_local) {
+                        auto local = set_branch_local(&then_block, arm.then_local);
+                        if (!local) return core::make_unexpected(local.error());
+                    }
                     if (!fn.blocks.push(then_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     MirBlock else_block{};
@@ -3175,6 +3233,10 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         MirBlock then_block{};
                         then_block.label = then_label();
                         set_term_from_hir(&then_block.term, arm.then_term);
+                        if (arm.has_then_local) {
+                            auto local = set_branch_local(&then_block, arm.then_local);
+                            if (!local) return core::make_unexpected(local.error());
+                        }
                         if (!fn.blocks.push(then_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                         MirBlock else_block{};

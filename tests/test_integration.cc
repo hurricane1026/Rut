@@ -9117,6 +9117,94 @@ static u64 return_200_with_body_1_handler(void* /*conn*/,
     return r.pack();
 }
 
+static u64 return_204_with_dynamic_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    static const char kBody[] = "must not be emitted";
+    ctx->response_body_data = kBody;
+    ctx->response_body_len = sizeof(kBody) - 1;
+    ctx->response_body_valid = 1;
+    auto r = rut::jit::HandlerResult::make_status(204);
+    r.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
+    return r.pack();
+}
+
+static u64 return_200_with_dynamic_body_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    static const char kBody[] = "must not be emitted for HEAD";
+    ctx->response_body_data = kBody;
+    ctx->response_body_len = sizeof(kBody) - 1;
+    ctx->response_body_valid = 1;
+    auto r = rut::jit::HandlerResult::make_status(200);
+    r.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
+    return r.pack();
+}
+
+static u64 return_200_with_dynamic_body_and_headers_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    static const char kBody[] = "{\"ok\":true}";
+    ctx->response_body_data = kBody;
+    ctx->response_body_len = sizeof(kBody) - 1;
+    ctx->response_body_valid = 1;
+    auto r = rut::jit::HandlerResult::make_status(200);
+    r.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
+    r.next_state = 1;
+    return r.pack();
+}
+
+TEST(route, suppresses_http1_dynamic_body_for_head) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/head", 'H', &return_200_with_dynamic_body_handler));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    const i32 lfd = lfd_result.value();
+    const u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    const i32 client = connect_to(port);
+    REQUIRE(client >= 0);
+    static const char kRequest[] = "HEAD /head HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[1024];
+    const i32 received = recv_timeout(client, response, sizeof(response), 2000);
+    REQUIRE_GT(received, 0);
+
+    u32 header_end = 0;
+    for (u32 i = 0; i + 3 < static_cast<u32>(received); i++) {
+        if (response[i] == '\r' && response[i + 1] == '\n' && response[i + 2] == '\r' &&
+            response[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(header_end, static_cast<u32>(received));
+    const auto contains = [&](const char* needle, u32 needle_len) {
+        for (u32 i = 0; i + needle_len <= static_cast<u32>(received); i++) {
+            if (__builtin_memcmp(response + i, needle, needle_len) == 0) return true;
+        }
+        return false;
+    };
+    static const char kContentLength[] = "Content-Length: 28";
+    static const char kBody[] = "must not be emitted for HEAD";
+    CHECK(contains(kContentLength, sizeof(kContentLength) - 1));
+    CHECK(!contains(kBody, sizeof(kBody) - 1));
+
+    close(client);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+}
+
 // End-to-end: handler returns ReturnStatus with body_idx=1;
 // RouteConfig has a body pre-registered; runtime formats response
 // with the body bytes + matching Content-Length + default Content-Type.
@@ -9168,6 +9256,159 @@ TEST(shard, serves_http2_jit_handler_with_body) {
     for (u32 i = 0; i < blen && body_ok; i++)
         if (body[i] != static_cast<u8>(kBody[i])) body_ok = false;
     CHECK(body_ok);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_dynamic_body_with_effective_content_type) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char* keys[] = {"Content-Type"};
+    u32 key_lens[] = {12};
+    const char* vals[] = {"application/json"};
+    u32 val_lens[] = {16};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/default", 'G', &return_200_with_dynamic_body_handler));
+    REQUIRE(cfg.add_jit_handler("/custom", 'G', &return_200_with_dynamic_body_and_headers_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[1024];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/default", 8);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/custom", 7);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[8192];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0 && h2_status_for_stream(resp, total, 3) != 0)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-type", "text/plain; charset=utf-8"));
+    CHECK(h2_response_has_header(resp, total, 3, "content-type", "application/json"));
+    CHECK_FALSE(
+        h2_response_has_header(resp, total, 3, "content-type", "text/plain; charset=utf-8"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, suppresses_http2_dynamic_body_for_204) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/empty", 'G', &return_204_with_dynamic_body_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/empty", 6);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);
+    u8 body[64];
+    CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
+    CHECK_FALSE(
+        h2_response_has_header(resp, total, 1, "content-type", "text/plain; charset=utf-8"));
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, suppresses_http2_dynamic_body_for_head) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/head", 'H', &return_200_with_dynamic_body_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"HEAD", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/head", 5}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    u8 body[64];
+    CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-length", "28"));
+    CHECK(h2_response_has_header(resp, total, 1, "content-type", "text/plain; charset=utf-8"));
 
     close(c);
     shard.stop();

@@ -9413,6 +9413,22 @@ TEST(metadata, format_static_response_wire_format) {
     }
 }
 
+TEST(metadata, format_dynamic_205_response_suppresses_body) {
+    Connection conn;
+    conn.reset();
+    u8 send_storage[4096];
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    format_response_with_body(conn, 205, "{\"value\":1}", 11, true);
+
+    const std::string_view response(reinterpret_cast<const char*>(conn.send_buf.data()),
+                                    conn.send_buf.len());
+    CHECK(response.find("HTTP/1.1 205 Unknown\r\n") != std::string_view::npos);
+    CHECK(response.find("Content-Length: 0\r\n") != std::string_view::npos);
+    CHECK(response.ends_with("\r\n\r\n"));
+    CHECK(response.find("{\"value\":1}") == std::string_view::npos);
+}
+
 TEST(early_response, prepare_state_direct_content_length_body) {
     Connection conn;
     conn.reset();
@@ -15954,6 +15970,36 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
     conn.resp_header_mutation_overflow = true;
     CHECK_FALSE(collect_effective_response_headers(
         conn, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
+}
+
+TEST(response_headers, head_header_collection_failure_suppresses_fallback_body) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+    conn->resp_header_mutation_overflow = true;
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    loop.backend.clear_ops();
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK_EQ(conn->resp_status, 500u);
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    u32 header_end = 0;
+    for (u32 i = 0; i + 3 < conn->send_buf.len(); i++) {
+        const u8* data = conn->send_buf.data();
+        if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE(header_end != 0);
+    CHECK_EQ(header_end, conn->send_buf.len());
 }
 
 int main(int argc, char** argv) {

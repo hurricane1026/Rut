@@ -110,13 +110,28 @@ bool publish_route_selected(const HarnessSpec& spec,
 bool account_terminal_output(const HarnessSpec& spec,
                              HarnessResult& result,
                              Connection& connection,
-                             jit::HandlerResult& terminal) {
+                             jit::HandlerResult& terminal,
+                             const char* dynamic_body = nullptr,
+                             u32 dynamic_body_len = 0,
+                             bool dynamic_body_valid = false) {
     if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
 
     connection.resp_status = terminal.status_code;
+    bool wants_dynamic_body = terminal.upstream_id == jit::HandlerResult::kDynamicResponseBody;
+    if (wants_dynamic_body && (!dynamic_body_valid || dynamic_body == nullptr) &&
+        !response_status_forbids_body(terminal.status_code)) {
+        // Match production dispatch: turn the failed serializer into a 500,
+        // discard only its body marker, and continue through normal response
+        // formatting so committed response mutations remain observable.
+        terminal.status_code = 500;
+        terminal.upstream_id = 0;
+        connection.resp_status = 500;
+        wants_dynamic_body = false;
+    }
     const RouteConfig* config = connection.request_config;
-    const bool has_body = terminal.upstream_id != 0 && config != nullptr &&
+    const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
+    const bool suppress_body = connection.req_method == static_cast<u8>(LogHttpMethod::Head);
     constexpr u32 kMaxHeaders =
         RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
@@ -124,12 +139,15 @@ bool account_terminal_output(const HarnessSpec& spec,
     if (!collect_effective_response_headers(
             connection, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
         connection.resp_status = 500;
-        format_static_response(connection, 500, false);
+        format_static_response(connection, 500, false, suppress_body);
     } else if (header_count != 0) {
         const char* body_data = nullptr;
         u32 body_len = 0;
         bool fallback_body = false;
-        if (has_body) {
+        if (wants_dynamic_body) {
+            body_data = dynamic_body;
+            body_len = dynamic_body_len;
+        } else if (has_body) {
             const auto& body = config->response_bodies[terminal.upstream_id - 1];
             body_data = body.data;
             body_len = body.len;
@@ -145,13 +163,26 @@ bool account_terminal_output(const HarnessSpec& spec,
                                               headers,
                                               header_count,
                                               connection.keep_alive,
-                                              fallback_body);
+                                              fallback_body,
+                                              suppress_body);
+    } else if (wants_dynamic_body) {
+        format_response_with_body(connection,
+                                  terminal.status_code,
+                                  dynamic_body,
+                                  dynamic_body_len,
+                                  connection.keep_alive,
+                                  suppress_body);
     } else if (has_body) {
         const auto& body = config->response_bodies[terminal.upstream_id - 1];
-        format_response_with_body(
-            connection, terminal.status_code, body.data, body.len, connection.keep_alive);
+        format_response_with_body(connection,
+                                  terminal.status_code,
+                                  body.data,
+                                  body.len,
+                                  connection.keep_alive,
+                                  suppress_body);
     } else {
-        format_static_response(connection, terminal.status_code, connection.keep_alive);
+        format_static_response(
+            connection, terminal.status_code, connection.keep_alive, suppress_body);
     }
 
     result.output_bytes = connection.send_buf.len();
@@ -169,6 +200,9 @@ bool account_terminal_output(const HarnessSpec& spec,
 
 ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& harness) {
     ScenarioResult out{};
+    const char* dynamic_response_body = nullptr;
+    u32 dynamic_response_body_len = 0;
+    bool dynamic_response_body_valid = false;
     out.harness = validate_spec(harness);
     if (out.harness.outcome != Outcome::Passed) return out;
     out.harness.phase = Phase::Prepare;
@@ -439,10 +473,19 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
         out.harness.state_resets += state_resets;
         out.terminal = driven.terminal;
         out.has_terminal = driven.has_terminal;
+        dynamic_response_body = driven.dynamic_response_body;
+        dynamic_response_body_len = driven.dynamic_response_body_len;
+        dynamic_response_body_valid = driven.dynamic_response_body_valid;
     }
 
     if (out.harness.outcome == Outcome::Passed && out.has_terminal)
-        (void)account_terminal_output(harness, out.harness, connection.connection, out.terminal);
+        (void)account_terminal_output(harness,
+                                      out.harness,
+                                      connection.connection,
+                                      out.terminal,
+                                      dynamic_response_body,
+                                      dynamic_response_body_len,
+                                      dynamic_response_body_valid);
 
     if (out.has_terminal && out.harness.outcome == Outcome::Passed)
         (void)publish_terminal(harness, out.harness, out.terminal, scenario.now_us);

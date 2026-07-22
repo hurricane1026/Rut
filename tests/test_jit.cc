@@ -1387,6 +1387,267 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(jit, frontend_return_json_serializes_runtime_scalars) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    let answer = 40 + 2
+    return 200, json({ path: req.path, answer: answer, http11: req.http11 })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    CHECK_EQ(outcome.response_body_idx, 0u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"path\":\"/api/users\",\"answer\":42,\"http11\":true}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, runtime_json_serializer_escapes_strings_and_fails_closed_on_overflow) {
+    HandlerCtx ctx{};
+    rut_helper_json_reset();
+    rut_helper_json_append_raw("{\"value\":", 9);
+    static const char kValue[] = "quote\" newline\n control\x01";
+    rut_helper_json_append_str(kValue, sizeof(kValue) - 1);
+    rut_helper_json_append_raw("}", 1);
+    rut_helper_json_finish(&ctx);
+    REQUIRE_EQ(ctx.response_body_valid, 1u);
+    const Str escaped{ctx.response_body_data, ctx.response_body_len};
+    CHECK(escaped.eq(lit("{\"value\":\"quote\\\" newline\\n control\\u0001\"}")));
+
+    char oversized[8 * 1024]{};
+    rut_helper_json_reset();
+    rut_helper_json_append_raw(oversized, sizeof(oversized));
+    rut_helper_json_finish(&ctx);
+    CHECK_EQ(ctx.response_body_valid, 0u);
+    CHECK(ctx.response_body_data == nullptr);
+    CHECK_EQ(ctx.response_body_len, 0u);
+
+    static const char kInvalidUtf8[] = {static_cast<char>(0xc0), static_cast<char>(0x80)};
+    rut_helper_json_reset();
+    rut_helper_json_append_str(kInvalidUtf8, sizeof(kInvalidUtf8));
+    rut_helper_json_finish(&ctx);
+    CHECK_EQ(ctx.response_body_valid, 0u);
+    CHECK(ctx.response_body_data == nullptr);
+    CHECK_EQ(ctx.response_body_len, 0u);
+
+    const auto overflow_handler =
+        +[](void*, HandlerCtx* handler_ctx, const u8*, u32, void*) -> u64 {
+        char bytes[8 * 1024]{};
+        rut_helper_json_reset();
+        rut_helper_json_append_raw(bytes, sizeof(bytes));
+        rut_helper_json_finish(handler_ctx);
+        HandlerResult result = HandlerResult::make_status(200);
+        result.upstream_id = HandlerResult::kDynamicResponseBody;
+        return result.pack();
+    };
+    const auto outcome = invoke_jit_handler(overflow_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 500u);
+    CHECK(outcome.dynamic_response_body == nullptr);
+
+    const auto invalid_bodyless_handler =
+        +[](void*, HandlerCtx* handler_ctx, const u8*, u32, void*) -> u64 {
+        handler_ctx->response_body_valid = 0;
+        handler_ctx->response_body_data = nullptr;
+        HandlerResult result = HandlerResult::make_status(204);
+        result.upstream_id = HandlerResult::kDynamicResponseBody;
+        return result.pack();
+    };
+    const auto bodyless =
+        invoke_jit_handler(invalid_bodyless_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK(bodyless.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(bodyless.status_code, 204u);
+    CHECK(bodyless.dynamic_response_body == nullptr);
+}
+
+TEST(jit, frontend_match_arm_runtime_json_uses_payload_scope) {
+    const auto src = R"rut(
+variant Result { ok(str), err }
+route GET "/x" {
+    let result = Result.ok("ready")
+    match result {
+        .ok(value) => return 200, json({ value: value })
+        .err => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"value\":\"ready\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_guard_failure_if_let_json_uses_failure_scope) {
+    const auto src = R"rut(
+route GET "/x" {
+    guard false else {
+        let candidate = req.header("X-Value")
+        if let value = candidate {
+            return 400, json({ value: value })
+        } else {
+            return 401
+        }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char request[] = "GET /x HTTP/1.1\r\nHost: localhost\r\nX-Value: ready\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(request),
+                                            sizeof(request) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 400u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    CHECK((Str{outcome.dynamic_response_body, outcome.dynamic_response_body_len})
+              .eq(lit("{\"value\":\"ready\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_match_arm_runtime_json_runs_after_effects) {
+    const auto src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    match req.http11 {
+        true => {
+            buckets.set(req.remoteAddr, 9)
+            return 200, json({ value: buckets.get(req.remoteAddr).or(0) })
+        }
+        _ => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    cache_registry_set_seed(0x206u);
+    const u32 caps[1] = {64};
+    const u64 idents[1] = {cache_instance_identity("buckets", 7)};
+    cache_registry_publish(caps, idents, 1);
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0a000206u;
+    TestHandlerCtxFrame frame{};
+    const auto outcome = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetRootRequest),
+                                            sizeof(kGetRootRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 200u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str body{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(body.eq(lit("{\"value\":9}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_response_dynamic_headers_record_ordered_mutations) {
     const auto src = R"rut(
 route GET "/api/users" {
@@ -18927,6 +19188,61 @@ route GET "/sleep" { wait(1000) return 200 }
     rir.destroy();
 }
 
+TEST(jit, frontend_wait_json_rematerializes_pre_wait_local_on_resume) {
+    const auto src = R"rut(
+route GET "/x" {
+    let saved = req.path
+    wait(50)
+    return 200, json({ saved: saved })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char request[] = "GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    const auto first = invoke_jit_handler(handler,
+                                          &conn,
+                                          frame.ctx,
+                                          reinterpret_cast<const u8*>(request),
+                                          sizeof(request) - 1,
+                                          nullptr);
+    REQUIRE(first.kind == JitDispatchOutcome::Kind::TimerYield);
+    frame.ctx.state = first.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+    const auto resumed = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(request),
+                                            sizeof(request) - 1,
+                                            nullptr);
+    CHECK(resumed.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(resumed.status_code, 200u);
+    REQUIRE(resumed.dynamic_response_body != nullptr);
+    CHECK((Str{resumed.dynamic_response_body, resumed.dynamic_response_body_len})
+              .eq(lit("{\"saved\":\"/x\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_route_event_waits_emit_event_yield_kinds) {
     struct Case {
         const char* wait_src;
@@ -19066,6 +19382,69 @@ route GET "/x" {
                                                     nullptr));
     CHECK_EQ(static_cast<u8>(timer_done.action), static_cast<u8>(HandlerAction::ReturnStatus));
     CHECK_EQ(timer_done.status_code, 408);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_wait_any_materializes_if_let_json_binding_on_resume) {
+    const auto src = R"rut(
+route GET "/x" {
+    wait any {
+        downstream.recv() => {
+            if let value = req.header("X-Value") {
+                return 200, json({ value: value })
+            } else {
+                return 404
+            }
+        }
+        timer(250) => { return 408 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char request[] = "GET /x HTTP/1.1\r\nHost: localhost\r\nX-Value: ready\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    auto first = invoke_jit_handler(handler,
+                                    &conn,
+                                    frame.ctx,
+                                    reinterpret_cast<const u8*>(request),
+                                    sizeof(request) - 1,
+                                    nullptr);
+    REQUIRE(first.kind == JitDispatchOutcome::Kind::EventYield);
+    frame.ctx.state = first.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
+    frame.ctx.resume_event_result = 8;
+    const auto resumed = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(request),
+                                            sizeof(request) - 1,
+                                            nullptr);
+    CHECK(resumed.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(resumed.status_code, 200u);
+    REQUIRE(resumed.dynamic_response_body != nullptr);
+    CHECK((Str{resumed.dynamic_response_body, resumed.dynamic_response_body_len})
+              .eq(lit("{\"value\":\"ready\"}")));
 
     engine.shutdown();
     rir.destroy();

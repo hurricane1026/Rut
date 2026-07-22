@@ -234,6 +234,9 @@ struct MirLocal {
     u32 error_struct_index = 0xffffffffu;
     u32 error_variant_index = 0xffffffffu;
     bool is_wait_result = false;
+    bool defer_to_terminator = false;
+    bool materialize_on_resume = false;
+    bool rematerialize_after_wait = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
@@ -252,6 +255,7 @@ struct MirHeaderKV {
 };
 
 struct MirTerminator {
+    static constexpr u32 kMaxJsonDynamicValues = 8;
     MirTerminatorKind kind = MirTerminatorKind::ReturnStatus;
     Span span{};
     MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;
@@ -273,6 +277,9 @@ struct MirTerminator {
     // ReturnStatus terminators. lower_rir maps identical literals to a
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
     Str response_body{};
+    bool has_dynamic_response_body = false;
+    FixedVec<Str, kMaxJsonDynamicValues + 1> json_segments;
+    FixedVec<u32, kMaxJsonDynamicValues> json_value_ref_indices;
     // Optional response headers carried from HIR. Inline-stored.
     // len == 0 means "no kwarg". lower_rir interns these into the
     // RIR module's shared header pool.
@@ -290,11 +297,14 @@ struct MirBlock {
     struct Effect {
         u32 value_index = 0xffffffffu;
         Span span{};
+        // Non-sentinel for a branch-local initializer whose result becomes
+        // visible to the owning block's terminator.
+        u32 local_ref_index = 0xffffffffu;
     };
     Str label{};
     // Side effects materialized in this block immediately before `term`.
     // Each entry indexes the owning MirFunction::values pool.
-    static constexpr u32 kMaxEffects = 2;
+    static constexpr u32 kMaxEffects = 4;
     FixedVec<Effect, kMaxEffects> effects;
     MirTerminator term{};
 };
