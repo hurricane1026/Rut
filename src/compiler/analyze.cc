@@ -10151,7 +10151,8 @@ static FrontendResult<void> analyze_guard_match_arms(
     const HirLocal* locals,
     u32 local_count,
     FixedVec<HirGuardMatchArm, HirModule::kMaxGuardMatchArms>* guard_match_arms,
-    HirGuard* guard) {
+    HirGuard* guard,
+    const MatchPayloadBinding* binding = nullptr) {
     bool seen_wildcard = false;
     guard->fail_match_start = guard_match_arms->len;
     guard->fail_match_count = 0;
@@ -10204,7 +10205,7 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count);
+        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count, binding);
         if (!term) return core::make_unexpected(term.error());
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
@@ -10675,7 +10676,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                                                    scoped_locals.data,
                                                                    scoped_locals.len,
                                                                    guard_match_arms,
-                                                                   &guard);
+                                                                   &guard,
+                                                                   binding);
                         if (!fail_match) return core::make_unexpected(fail_match.error());
                     } else {
                         return frontend_error(FrontendError::UnsupportedSyntax, inner.expr.span);
@@ -14192,7 +14194,8 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                                  arm_scoped_locals.data,
                                                                  arm_scoped_locals.len,
                                                                  &mod.guard_match_arms,
-                                                                 &guard);
+                                                                 &guard,
+                                                                 arm_binding_ptr);
                                     if (!fail_match)
                                         return core::make_unexpected(fail_match.error());
                                 } else {

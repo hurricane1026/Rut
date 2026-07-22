@@ -31868,6 +31868,27 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, guard_match_json_return_sees_enclosing_match_payload) {
+    const char* src = R"rut(
+variant Result { ok(i32) }
+route GET "/x" {
+    match Result.ok(7) {
+        .ok(value) => {
+            let failed = error(.timeout)
+            guard match failed else {
+                .timeout => return 401, json({ value: value })
+                _ => return 500
+            }
+            return 200
+        }
+    }
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(src, rir));
+    rir.destroy();
+}
+
 TEST(frontend, control_plane_builtin_declarations_preserve_signatures_and_contexts) {
     const BuiltinDecl* stats = find_control_plane_builtin(BuiltinReceiver::None, lit("stats"));
     const BuiltinDecl* metrics = find_control_plane_builtin(BuiltinReceiver::None, lit("metrics"));
