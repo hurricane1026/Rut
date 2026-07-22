@@ -19,6 +19,7 @@
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/rate_limit_enforce.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -393,6 +394,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      const JitDispatchOutcome& o,
                      const RouteConfig* cfg,
                      bool head_request) {
+    jit::ScopedResponseBodyMutationStorageRelease release_body_storage(o.response_ctx);
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.dynamic_response_body != nullptr) {

@@ -184,8 +184,7 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                     if ((ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) &&
                         !response_status_forbids_body(out.status_code)) {
                         out.status_code = 500;
-                    } else if (ctx.response_body_valid != 0 &&
-                               ctx.response_body_data != nullptr) {
+                    } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
                         out.dynamic_response_body = ctx.response_body_data;
                         out.dynamic_response_body_len = ctx.response_body_len;
                     }

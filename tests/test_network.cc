@@ -15971,6 +15971,35 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
         &ctx, &cfg, 1, out, static_cast<u32>(std::size(out)), &count));
 }
 
+TEST(response_body, mutation_storage_is_released_after_http1_serialization) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    static constexpr char kBody[] = "owned response";
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    REQUIRE(response_ctx.response_body_mutation_storage != nullptr);
+    __builtin_memcpy(response_ctx.response_body_mutation_storage, kBody, sizeof(kBody) - 1);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = response_ctx.response_body_mutation_storage;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+    handle_jit_outcome<SmallLoop>(
+        &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+
+    CHECK(response_ctx.response_body_mutation_storage == nullptr);
+    REQUIRE(conn->send_buf.len() >= sizeof(kBody) - 1);
+    CHECK(__builtin_memcmp(conn->send_buf.data() + conn->send_buf.len() - (sizeof(kBody) - 1),
+                           kBody,
+                           sizeof(kBody) - 1) == 0);
+}
+
 TEST(response_headers, head_header_collection_failure_suppresses_fallback_body) {
     SmallLoop loop;
     loop.setup();

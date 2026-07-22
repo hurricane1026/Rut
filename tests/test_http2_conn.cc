@@ -1523,6 +1523,35 @@ TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
     CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + header.length);
 }
 
+TEST(h2_serving, mutation_storage_is_released_after_serialization) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    static constexpr char kBody[] = "owned response";
+    jit::HandlerCtx response_ctx{};
+    response_ctx.response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    REQUIRE(response_ctx.response_body_mutation_storage != nullptr);
+    __builtin_memcpy(response_ctx.response_body_mutation_storage, kBody, sizeof(kBody) - 1);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = response_ctx.response_body_mutation_storage;
+    outcome.dynamic_response_body_len = sizeof(kBody) - 1;
+    outcome.response_ctx = &response_ctx;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    CHECK(response_ctx.response_body_mutation_storage == nullptr);
+    REQUIRE(dispatch.resp_len >= sizeof(kBody) - 1);
+    CHECK(__builtin_memcmp(
+              response + dispatch.resp_len - (sizeof(kBody) - 1), kBody, sizeof(kBody) - 1) == 0);
+}
+
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     // A deferred dynamic route's param VALUES point into hdr_scratch, which the
     // engine reuses for the next decoded header block. The snapshot must copy

@@ -1536,6 +1536,8 @@ void handle_jit_outcome(Loop* loop,
                         bool keep_alive) {
     switch (outcome.kind) {
         case JitDispatchOutcome::Kind::ReturnStatus: {
+            jit::ScopedResponseBodyMutationStorageRelease release_body_storage(
+                outcome.response_ctx);
             conn.pending_handler_fn = nullptr;
             conn.resp_status = outcome.status_code;
             // ABI: upstream_id is a 1-based index into the pinned
