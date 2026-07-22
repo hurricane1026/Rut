@@ -6557,6 +6557,73 @@ route GET "/users" use chain secure {
     rir.destroy();
 }
 
+TEST(frontend, decorated_wait_rejects_deferred_json_reads_of_pre_wait_locals) {
+    const char* src = R"rut(
+func require_http11(_ req: i32) -> bool => req.http11
+chain secure { before require_http11(req) else 505 }
+route GET "/users" use chain secure {
+    let saved = req.path
+    wait(50)
+    return 200, json({ saved: saved })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, direct_if_let_dynamic_json_sees_then_binding) {
+    const char* src = R"rut(
+route GET "/users" {
+    if let value = req.header("X-Value") {
+        return 200, json({ value: value })
+    } else {
+        return 404
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, const_match_payload_is_visible_to_direct_dynamic_json) {
+    const char* src = R"rut(
+variant Result { ok(str), err }
+route GET "/users" {
+    let state = Result.ok(req.path)
+    match const state {
+        .ok(value) => return 200, json({ value: value })
+        .err => return 500
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, analyze_chain_after_lowers_ordered_response_effects) {
     const char* src = R"rut(
 func response_headers(_ req: i32, _ resp: Response) -> i32 {

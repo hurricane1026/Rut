@@ -1481,6 +1481,15 @@ namespace {
 struct FakeH2Loop {};
 }  // namespace
 
+TEST(h2_serving, response_status_body_rules_include_reset_content) {
+    CHECK(h2_response_status_forbids_body(199));
+    CHECK(h2_response_status_forbids_body(204));
+    CHECK(h2_response_status_forbids_body(205));
+    CHECK(h2_response_status_forbids_body(304));
+    CHECK_FALSE(h2_response_status_forbids_body(200));
+    CHECK_FALSE(h2_response_status_forbids_body(206));
+}
+
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     // A deferred dynamic route's param VALUES point into hdr_scratch, which the
     // engine reuses for the next decoded header block. The snapshot must copy

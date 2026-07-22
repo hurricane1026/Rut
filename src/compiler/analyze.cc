@@ -10054,18 +10054,6 @@ static bool is_ast_hir_terminator(const AstStatement& stmt) {
            stmt.kind == AstStmtKind::ForwardUpstream;
 }
 
-static bool terminator_reads_any_local(const HirTerminator& term,
-                                       const HirLocal* locals,
-                                       u32 local_count) {
-    if (term.kind != HirTerminatorKind::ReturnStatus ||
-        term.source_kind != HirTerminatorSourceKind::LocalRef)
-        return false;
-    for (u32 li = 0; li < local_count; li++) {
-        if (locals[li].ref_index == term.local_ref_index) return true;
-    }
-    return false;
-}
-
 static bool expr_reads_any_local(const HirExpr& expr, const HirLocal* locals, u32 local_count) {
     if (expr.kind == HirExprKind::LocalRef) {
         for (u32 li = 0; li < local_count; li++) {
@@ -10082,6 +10070,26 @@ static bool expr_reads_any_local(const HirExpr& expr, const HirLocal* locals, u3
     for (u32 ai = 0; ai < expr.args.len; ai++) {
         if (expr.args[ai] != nullptr && expr_reads_any_local(*expr.args[ai], locals, local_count))
             return true;
+    }
+    return false;
+}
+
+static bool terminator_reads_any_local(const HirTerminator& term,
+                                       const HirLocal* locals,
+                                       u32 local_count,
+                                       u32 all_local_count = 0) {
+    if (term.kind != HirTerminatorKind::ReturnStatus) return false;
+    if (term.source_kind == HirTerminatorSourceKind::LocalRef) {
+        for (u32 li = 0; li < local_count; li++)
+            if (locals[li].ref_index == term.local_ref_index) return true;
+    }
+    if (all_local_count == 0) all_local_count = local_count;
+    for (u32 ri = 0; ri < term.json_value_ref_indices.len; ri++) {
+        for (u32 li = 0; li < all_local_count; li++) {
+            if (locals[li].ref_index != term.json_value_ref_indices[ri]) continue;
+            if (expr_reads_any_local(locals[li].init, locals, local_count)) return true;
+            break;
+        }
     }
     return false;
 }
@@ -11058,7 +11066,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         const auto simple_branch = [](const AstStatement& branch) {
             return is_ast_hir_terminator(branch);
         };
-        if (simple_branch(*stmt.then_stmt) && simple_branch(*stmt.else_stmt)) {
+        if (!stmt.bind_value && simple_branch(*stmt.then_stmt) && simple_branch(*stmt.else_stmt)) {
             // Terminator branches take no locals, so an `if let` binding here is
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
@@ -11884,7 +11892,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod, route);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     route->control.direct_term = term.value();
     return {};
@@ -19580,7 +19588,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 i = 0; i < num_deco_guards; i++) route.guards[i] = tmp[num_user_guards + i];
             for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
         }
-        if (route.waits.len != 0 && route.decorator_guard_count != 0) {
+        if (route.waits.len != 0 &&
+            (route.decorator_guard_count != 0 || route_decl.chains.len != 0)) {
             const u32 first_wait_start = route.waits[0].span.start;
             // Pre-wait locals are allowed only for pre-wait work. They may feed
             // user guards before the first wait, but must not be introduced by a
@@ -19610,7 +19619,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // Keep decorated wait routes from reading user locals there.
             if (terminator_reads_any_local(route.control.direct_term,
                                            route.locals.data,
-                                           user_local_count_before_decorators)) {
+                                           user_local_count_before_decorators,
+                                           route.locals.len)) {
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       route.control.direct_term.span);
             }

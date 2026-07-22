@@ -131,6 +131,10 @@ void h2_emit_status(H2Dispatch<Loop>& d, u32 stream_id, u16 status) {
     h2_emit_response(d, stream_id, status, nullptr, 0, nullptr, 0);
 }
 
+inline bool h2_response_status_forbids_body(u16 status) {
+    return status < 200 || status == 204 || status == 205 || status == 304;
+}
+
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
 // handler's parse-cache prime (which parses raw HTTP/1 bytes) sees the request.
 // Returns the byte length, or 0 on missing pseudo-headers / overflow.
@@ -440,10 +444,10 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    // Informational, 204, and 304 responses never carry a message body. Keep
+    // Informational, 204, 205, and 304 responses never carry a message body. Keep
     // the effective headers, but close the stream on HEADERS instead of
     // emitting the dynamic/static payload as a DATA frame.
-    if (o.status_code < 200 || o.status_code == 204 || o.status_code == 304) {
+    if (h2_response_status_forbids_body(o.status_code)) {
         body = nullptr;
         body_len = 0;
     }
