@@ -119,7 +119,8 @@ bool account_terminal_output(const HarnessSpec& spec,
     connection.resp_status = terminal.status_code;
     bool wants_dynamic_body =
         terminal.upstream_id == jit::HandlerResult::kDynamicResponseBody;
-    if (wants_dynamic_body && (!dynamic_body_valid || dynamic_body == nullptr)) {
+    if (wants_dynamic_body && (!dynamic_body_valid || dynamic_body == nullptr) &&
+        !response_status_forbids_body(terminal.status_code)) {
         // Match production dispatch: turn the failed serializer into a 500,
         // discard only its body marker, and continue through normal response
         // formatting so committed response mutations remain observable.
@@ -131,6 +132,8 @@ bool account_terminal_output(const HarnessSpec& spec,
     const RouteConfig* config = connection.request_config;
     const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
+    const bool suppress_body =
+        connection.req_method == static_cast<u8>(LogHttpMethod::Head);
     constexpr u32 kMaxHeaders =
         RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
@@ -162,19 +165,26 @@ bool account_terminal_output(const HarnessSpec& spec,
                                               headers,
                                               header_count,
                                               connection.keep_alive,
-                                              fallback_body);
+                                              fallback_body,
+                                              suppress_body);
     } else if (wants_dynamic_body) {
         format_response_with_body(connection,
                                   terminal.status_code,
                                   dynamic_body,
                                   dynamic_body_len,
-                                  connection.keep_alive);
+                                  connection.keep_alive,
+                                  suppress_body);
     } else if (has_body) {
         const auto& body = config->response_bodies[terminal.upstream_id - 1];
-        format_response_with_body(
-            connection, terminal.status_code, body.data, body.len, connection.keep_alive);
+        format_response_with_body(connection,
+                                  terminal.status_code,
+                                  body.data,
+                                  body.len,
+                                  connection.keep_alive,
+                                  suppress_body);
     } else {
-        format_static_response(connection, terminal.status_code, connection.keep_alive);
+        format_static_response(
+            connection, terminal.status_code, connection.keep_alive, suppress_body);
     }
 
     result.output_bytes = connection.send_buf.len();

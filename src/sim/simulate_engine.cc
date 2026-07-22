@@ -12,6 +12,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/sim_engine.h"
 #include "rut/runtime/traffic_capture.h"
@@ -624,7 +625,8 @@ static SimulateResult finalize_handler_result(const Engine& engine,
     if (unpacked.action == jit::HandlerAction::ReturnStatus) {
         result.actual_status =
             unpacked.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
-                    (context.response_body_valid == 0 || context.response_body_data == nullptr)
+                    (context.response_body_valid == 0 || context.response_body_data == nullptr) &&
+                    !response_status_forbids_body(unpacked.status_code)
                 ? 500
                 : unpacked.status_code;
         result.verdict =

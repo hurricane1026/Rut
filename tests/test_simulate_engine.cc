@@ -503,6 +503,27 @@ route GET "/json" {
     rir.destroy();
 }
 
+TEST(simulate_engine, bodyless_dynamic_json_failure_preserves_status) {
+    const char* src = R"rut(
+route GET "/json" {
+    return 204, json({ value: req.header("X-Value").or("") })
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    static const char kRequest[] = "GET /json HTTP/1.1\r\nHost: x\r\nX-Value: \xc0\x80\r\n\r\n";
+    const auto result = simulate_one(engine, make_entry(kRequest, 204));
+
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 204u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
     const char* src =
         "route POST \"/upload\" { if req.body == \"payload\" { return 204 } else { return 400 } "
