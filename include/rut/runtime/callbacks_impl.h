@@ -451,7 +451,7 @@ const char* status_reason(u16 code);
 void format_static_response(Connection& conn, u16 code, bool keep_alive);
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
-// bytes. For codes that must have no body (1xx / 204 / 304) falls
+// bytes. For codes that must have no body (1xx / 204 / 205 / 304) falls
 // back to format_static_response.
 void format_response_with_body(
     Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive);
@@ -462,7 +462,7 @@ void format_response_with_body(
 // Content-Type is suppressed so the user's value wins. User-supplied
 // "Content-Length" is skipped — the formatter recomputes it from
 // `body_len` to keep the framing honest. For codes that must have no
-// body (1xx / 204 / 304), headers are still emitted (they can be
+// body (1xx / 204 / 205 / 304), headers are still emitted (they can be
 // meaningful on 204/304, e.g. Cache-Control) but the body is omitted
 // per spec. If the precomputed response size won't fit in the
 // connection's send_buf, fails closed with a 500 + Connection: close.

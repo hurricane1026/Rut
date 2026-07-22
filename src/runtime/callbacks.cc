@@ -476,7 +476,7 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive) {
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     const u32 kBodyLen = kNoBody ? 0 : reason_len;
     write_response_headers(conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0);
     if (kBodyLen > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
@@ -484,9 +484,9 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive) {
 
 void format_response_with_body(
     Connection& conn, u16 code, const char* body_data, u32 body_len, bool keep_alive) {
-    // 204 / 304 / 1xx carry no body per HTTP spec; fall back to the
+    // 204 / 205 / 304 / 1xx carry no body per HTTP spec; fall back to the
     // default formatter for those codes even if a body was supplied.
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     if (kNoBody) {
         format_static_response(conn, code, keep_alive);
         return;
@@ -581,7 +581,7 @@ void format_response_with_body_and_headers(Connection& conn,
                                            u32 header_count,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase) {
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
     u32 reason_len = 0;
