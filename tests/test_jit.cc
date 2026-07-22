@@ -20080,6 +20080,32 @@ TEST(jit_dispatch, timer_seconds_rounds_up_from_ms) {
     CHECK_EQ(timer_seconds_from_ms(2500), 3);  // 2500ms → 3s
 }
 
+TEST(jit_dispatch, effective_return_status_applies_committed_scalar_precedence) {
+    auto result = HandlerResult::make_status(200);
+    HandlerCtx ctx{};
+    CHECK_EQ(effective_return_status(result, ctx), 200u);
+
+    ctx.response_status_set = true;
+    ctx.response_status = 201;
+    CHECK_EQ(effective_return_status(result, ctx), 201u);
+
+    ctx.response_status_invalid = true;
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
+    ctx.response_status_invalid = false;
+    ctx.response_body_mutation_overflow = true;
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
+
+    ctx = {};
+    result.upstream_id = HandlerResult::kDynamicResponseBody;
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
+    ctx.response_body_mutation_set = true;
+    CHECK_EQ(effective_return_status(result, ctx), 200u);
+    ctx.response_status_set = true;
+    ctx.response_status = 204;
+    ctx.response_body_mutation_set = false;
+    CHECK_EQ(effective_return_status(result, ctx), 204u);
+}
+
 TEST(jit_dispatch, wait_handler_yields_then_resumes_to_status) {
     const auto src = R"rut(
 route GET "/sleep" { wait(1500) return 200 }

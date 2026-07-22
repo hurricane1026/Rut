@@ -73,6 +73,18 @@ inline constexpr bool response_status_forbids_body(u16 status) {
     return status < 200 || status == 204 || status == 205 || status == 304;
 }
 
+// Resolve committed Response scalar mutations with the same precedence for
+// production dispatch, deterministic harnessing, replay, and simulation.
+inline u16 effective_return_status(const jit::HandlerResult& result, const jit::HandlerCtx& ctx) {
+    if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) return 500;
+    const u16 status = ctx.response_status_set ? ctx.response_status : result.status_code;
+    const bool dynamic_body_failed =
+        result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
+        !ctx.response_body_mutation_set &&
+        (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr);
+    return dynamic_body_failed && !response_status_forbids_body(status) ? 500 : status;
+}
+
 // Round-up conversion from ms to seconds. Callers using a 1-second
 // TimerWheel (legacy keepalive mechanism) can use this to bucket timer_ms.
 // Native ms-precision paths (IORING_OP_TIMEOUT / epoll min-heap) should
@@ -154,16 +166,14 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
     switch (r.action) {
         case jit::HandlerAction::ReturnStatus:
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
-            out.status_code = r.status_code;
+            out.status_code = effective_return_status(r, ctx);
             out.response_ctx = &ctx;
             if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
-                out.status_code = 500;
                 out.response_body_idx = 0;
                 out.dynamic_response_body = nullptr;
                 out.dynamic_response_body_len = 0;
                 return out;
             }
-            if (ctx.response_status_set) out.status_code = ctx.response_status;
             // ABI: upstream_id carries a 1-based response-body index
             // and next_state a 1-based response-header-set index for
             // ReturnStatus (0 = no custom body / no custom headers;
@@ -177,17 +187,9 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
                 // 500 while the replacement itself is valid.
                 if (ctx.response_body_mutation_set) {
                     out.response_body_idx = 0;
-                } else {
-                    // A failed/overflowed serializer is a server error, never
-                    // a partial JSON response. The helper clears valid before
-                    // work.
-                    if ((ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) &&
-                        !response_status_forbids_body(out.status_code)) {
-                        out.status_code = 500;
-                    } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
-                        out.dynamic_response_body = ctx.response_body_data;
-                        out.dynamic_response_body_len = ctx.response_body_len;
-                    }
+                } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
+                    out.dynamic_response_body = ctx.response_body_data;
+                    out.dynamic_response_body_len = ctx.response_body_len;
                 }
             } else {
                 out.response_body_idx = r.upstream_id;
