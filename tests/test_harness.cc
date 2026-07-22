@@ -689,8 +689,7 @@ route GET "/x" {
     REQUIRE_EQ(target.prepare({source.path, jit::OptLevel::O0}, load_spec).outcome,
                harness::Outcome::Passed);
 
-    static const char kRequest[] =
-        "GET /x HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
+    static const char kRequest[] = "GET /x HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
     harness::ScenarioSpec scenario{};
     scenario.target = &target;
     scenario.path = {"/x", 2};
@@ -744,8 +743,7 @@ route GET "/without" {
         return harness::drive_scenario(scenario, spec);
     };
 
-    static const char kWith[] =
-        "GET /with HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
+    static const char kWith[] = "GET /with HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
     static const char kWithout[] =
         "GET /without HTTP/1.1\r\nHost: test\r\nX-Value: \xc0\x80\r\n\r\n";
     const auto with_header = run("/with", 5, kWith, sizeof(kWith) - 1);

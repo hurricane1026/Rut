@@ -117,8 +117,7 @@ bool account_terminal_output(const HarnessSpec& spec,
     if (terminal.action != jit::HandlerAction::ReturnStatus) return true;
 
     connection.resp_status = terminal.status_code;
-    bool wants_dynamic_body =
-        terminal.upstream_id == jit::HandlerResult::kDynamicResponseBody;
+    bool wants_dynamic_body = terminal.upstream_id == jit::HandlerResult::kDynamicResponseBody;
     if (wants_dynamic_body && (!dynamic_body_valid || dynamic_body == nullptr) &&
         !response_status_forbids_body(terminal.status_code)) {
         // Match production dispatch: turn the failed serializer into a 500,
@@ -132,8 +131,7 @@ bool account_terminal_output(const HarnessSpec& spec,
     const RouteConfig* config = connection.request_config;
     const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
-    const bool suppress_body =
-        connection.req_method == static_cast<u8>(LogHttpMethod::Head);
+    const bool suppress_body = connection.req_method == static_cast<u8>(LogHttpMethod::Head);
     constexpr u32 kMaxHeaders =
         RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];

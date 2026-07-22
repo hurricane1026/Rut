@@ -1147,8 +1147,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // (mirrors the HTTP/1 resume_jit_handler).
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
-    const bool kHeadRequest =
-        h2_synth_request_is_head(h2->pending_synth, h2->async_synth_len);
+    const bool kHeadRequest = h2_synth_request_is_head(h2->pending_synth, h2->async_synth_len);
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
