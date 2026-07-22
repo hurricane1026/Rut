@@ -4551,7 +4551,9 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
 
         rir::ValueId local_vals[MirFunction::kMaxLocals]{};
         for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
-            if (mir.functions[i].locals[li].defer_to_terminator) continue;
+            if (mir.functions[i].locals[li].defer_to_terminator ||
+                mir.functions[i].locals[li].materialize_on_resume)
+                continue;
             auto val = materialize_local_init(mir.functions[i].locals[li],
                                               mir,
                                               variant_infos,
@@ -4648,6 +4650,33 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                         return frontend_error(FrontendError::OutOfMemory, store_span);
                     }
                 }
+            }
+            for (u32 li = 0; li < mir.functions[i].locals.len; li++) {
+                const auto& local = mir.functions[i].locals[li];
+                if (!local.materialize_on_resume ||
+                    local.wait_index >= mir.functions[i].waits.len ||
+                    mir.functions[i].resume_blocks[local.wait_index + 1] != bi)
+                    continue;
+                auto val = materialize_local_init(local,
+                                                  mir,
+                                                  variant_infos,
+                                                  tuple_infos,
+                                                  &tuple_info_count,
+                                                  error_scalar_infos,
+                                                  error_variant_infos,
+                                                  error_struct_infos,
+                                                  error_struct_def.value(),
+                                                  user_struct_defs,
+                                                  b,
+                                                  local_vals,
+                                                  MirFunction::kMaxLocals,
+                                                  mir.functions[i].name,
+                                                  out.module.name);
+                if (!val) {
+                    out.destroy();
+                    return core::make_unexpected(val.error());
+                }
+                local_vals[local.ref_index] = val.value();
             }
             for (u32 ei = 0; ei < mir.functions[i].blocks[bi].effects.len; ei++) {
                 const auto& effect = mir.functions[i].blocks[bi].effects[ei];

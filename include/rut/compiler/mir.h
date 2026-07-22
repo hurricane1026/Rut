@@ -235,6 +235,7 @@ struct MirLocal {
     u32 error_variant_index = 0xffffffffu;
     bool is_wait_result = false;
     bool defer_to_terminator = false;
+    bool materialize_on_resume = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;

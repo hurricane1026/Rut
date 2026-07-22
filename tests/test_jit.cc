@@ -19280,6 +19280,69 @@ route GET "/x" {
     rir.destroy();
 }
 
+TEST(jit, frontend_wait_any_materializes_if_let_json_binding_on_resume) {
+    const auto src = R"rut(
+route GET "/x" {
+    wait any {
+        downstream.recv() => {
+            if let value = req.header("X-Value") {
+                return 200, json({ value: value })
+            } else {
+                return 404
+            }
+        }
+        timer(250) => { return 408 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    static const char request[] = "GET /x HTTP/1.1\r\nHost: localhost\r\nX-Value: ready\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    TestHandlerCtxFrame frame{};
+    auto first = invoke_jit_handler(handler,
+                                    &conn,
+                                    frame.ctx,
+                                    reinterpret_cast<const u8*>(request),
+                                    sizeof(request) - 1,
+                                    nullptr);
+    REQUIRE(first.kind == JitDispatchOutcome::Kind::EventYield);
+    frame.ctx.state = first.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Recv);
+    frame.ctx.resume_event_result = 8;
+    const auto resumed = invoke_jit_handler(handler,
+                                            &conn,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(request),
+                                            sizeof(request) - 1,
+                                            nullptr);
+    CHECK(resumed.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(resumed.status_code, 200u);
+    REQUIRE(resumed.dynamic_response_body != nullptr);
+    CHECK((Str{resumed.dynamic_response_body, resumed.dynamic_response_body_len})
+              .eq(lit("{\"value\":\"ready\"}")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_route_wait_result_fields_drive_control_flow) {
     const auto src = R"rut(
 route GET "/x" {

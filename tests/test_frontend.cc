@@ -1,3 +1,4 @@
+#include "rut/common/json_response_limits.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/builtin_decls.h"
 #include "rut/compiler/lexer.h"
@@ -6818,6 +6819,7 @@ route GET "/users" {
     REQUIRE_EQ(hir->routes[0].locals.len, 2u);
     CHECK_EQ(hir->routes[0].locals[0].name.len, 0u);
     CHECK_FALSE(hir->routes[0].locals[0].defer_to_terminator);
+    CHECK(hir->routes[0].locals[0].materialize_on_resume);
     CHECK(hir->routes[0].locals[1].defer_to_terminator);
     CHECK_EQ(hir->routes[0].locals[1].init.local_index, hir->routes[0].locals[0].ref_index);
     auto mir = build_mir_heap(hir.value());
@@ -31970,6 +31972,22 @@ TEST(frontend, return_json_rejects_raw_template_larger_than_runtime_scratch) {
     std::string src = "route GET \"/x\" { return 200, json({ literal: \"";
     src.append(8 * 1024, 'x');
     src += "\", path: req.path }) }\n";
+    auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::TooManyItems);
+}
+
+TEST(frontend, return_json_scratch_bound_includes_dynamic_slot_minima) {
+    constexpr u32 kRawOverhead =
+        sizeof("{\"padding\":\"") - 1 + sizeof("\",\"flag\":") - 1 + sizeof("}") - 1;
+    static_assert(kJsonResponseScratchCapacity > kRawOverhead + 1);
+    std::string src = "route GET \"/x\" { return 200, json({ padding: \"";
+    src.append(kJsonResponseScratchCapacity - 1 - kRawOverhead, 'x');
+    src += "\", flag: req.http11 }) }\n";
     auto lexed = lex({src.data(), static_cast<u32>(src.size())});
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());

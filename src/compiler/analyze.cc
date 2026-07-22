@@ -10041,11 +10041,28 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                         segments,
                                                         term.json_value_ref_indices);
                     if (!plan) return core::make_unexpected(plan.error());
-                    u32 raw_bytes = 0;
+                    u32 minimum_bytes = 0;
                     for (const auto& segment : segments) {
-                        if (segment.size() > kJsonResponseScratchCapacity - raw_bytes)
+                        if (segment.size() > kJsonResponseScratchCapacity - minimum_bytes)
                             return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                        raw_bytes += static_cast<u32>(segment.size());
+                        minimum_bytes += static_cast<u32>(segment.size());
+                    }
+                    for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
+                        const u32 ref = term.json_value_ref_indices[ji];
+                        const HirLocal* slot = nullptr;
+                        for (u32 li = 0; li < route->locals.len; li++)
+                            if (route->locals[li].ref_index == ref) {
+                                slot = &route->locals[li];
+                                break;
+                            }
+                        if (slot == nullptr)
+                            return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
+                        const u32 encoded_minimum = slot->type == HirTypeKind::Bool  ? 4u
+                                                    : slot->type == HirTypeKind::Str ? 2u
+                                                                                     : 1u;
+                        if (encoded_minimum > kJsonResponseScratchCapacity - minimum_bytes)
+                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        minimum_bytes += encoded_minimum;
                     }
                     for (const auto& segment : segments) {
                         if (!term.json_segments.push(intern_generated_name(segment)))
@@ -13383,7 +13400,11 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         for (u32 li = saved_locals; li < route.locals.len; li++) {
             if (!retained[li]) continue;
             HirLocal local = route.locals[li];
-            if (!local.defer_to_terminator) local.name = {};
+            if (!local.defer_to_terminator) {
+                local.name = {};
+                local.materialize_on_resume = true;
+                local.wait_index = wait_index;
+            }
             if (!retained_locals.push(local))
                 return frontend_error(FrontendError::TooManyItems, ast_arm.span);
         }

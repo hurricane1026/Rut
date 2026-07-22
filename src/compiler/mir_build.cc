@@ -1103,10 +1103,12 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             // the slot is still being initialized, turning any future
             // substitution regression into a silent miscompile.
             //
-            // EXCEPT bare statement-effect carriers: they are also name-cleared
-            // (unnameable by design) but their init is the side effect itself —
-            // dropping one would silently delete the write.
+            // EXCEPT retained wait-arm dependencies and bare statement-effect
+            // carriers: both are name-cleared (unnameable by design), but the
+            // former must be rebuilt after resume and the latter carries the
+            // side effect itself.
             if (module.routes[i].locals[li].name.len == 0 &&
+                !module.routes[i].locals[li].materialize_on_resume &&
                 module.routes[i].locals[li].init.kind != HirExprKind::CacheSet &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
@@ -1137,6 +1139,7 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             local.error_variant_index = module.routes[i].locals[li].error_variant_index;
             local.is_wait_result = module.routes[i].locals[li].is_wait_result;
             local.defer_to_terminator = module.routes[i].locals[li].defer_to_terminator;
+            local.materialize_on_resume = module.routes[i].locals[li].materialize_on_resume;
             local.wait_event_kind = module.routes[i].locals[li].wait_event_kind;
             local.wait_payload = module.routes[i].locals[li].wait_payload;
             local.wait_arm_mask = module.routes[i].locals[li].wait_arm_mask;
