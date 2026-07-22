@@ -57,6 +57,9 @@ struct HandlerExecutionResult {
     const char* dynamic_response_body = nullptr;
     u32 dynamic_response_body_len = 0;
     bool dynamic_response_body_valid = false;
+    jit::ResponseHeaderMutation response_header_mutations[jit::kMaxResponseHeaderMutations]{};
+    u8 response_header_count = 0;
+    bool response_header_overflow = false;
 };
 
 HandlerExecutionResult drive_handler_deterministically(const DeterministicHandlerSpec& driver,

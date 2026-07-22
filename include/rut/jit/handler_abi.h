@@ -120,6 +120,14 @@ struct HandlerResult {
     }
 };
 
+inline constexpr u32 kMaxResponseHeaderMutations = 16;
+enum class ResponseHeaderMutationMode : u8 { Set, Add, Remove };
+struct ResponseHeaderMutation {
+    Str name;
+    Str value;
+    ResponseHeaderMutationMode mode;
+};
+
 // ── Handler Context ────────────────────────────────────────────────
 // Per-request mutable context, allocated from the scratch Arena.
 // Holds the state machine index and live-across-yield values.
@@ -139,6 +147,14 @@ struct alignas(alignof(u64)) HandlerCtx {
     const char* response_body_data;  // shard-owned dynamic response bytes
     u32 response_body_len;
     u32 response_body_valid;  // 1 only after successful serialization
+    // Builder-local mutation log. Pending entries are visible to resp.header();
+    // commit publishes exactly this prefix to the terminal response. Keeping
+    // it in HandlerCtx makes it survive yields without leaking across streams.
+    ResponseHeaderMutation response_header_mutations[kMaxResponseHeaderMutations];
+    u8 response_header_pending_count;
+    bool response_header_pending_overflow;
+    u8 response_header_count;
+    bool response_header_overflow;
     RouteParam route_params[kMaxRouteParams];
 
     // Access slot storage (8-byte aligned, immediately after header).

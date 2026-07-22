@@ -194,13 +194,15 @@ void rut_helper_req_set_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_req_add_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+// Response builder mutations are request/stream-owned HandlerCtx state. This
+// keeps pending and committed logs isolated across keepalive and H2 streams.
 void rut_helper_resp_set_header(
-    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+    void* ctx, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_resp_add_header(
-    void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
-void rut_helper_resp_remove_header(void* conn, const char* name, rut::u32 nlen);
-void rut_helper_resp_commit_headers(void* conn);
-void rut_helper_resp_header(void* conn,
+    void* ctx, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_resp_remove_header(void* ctx, const char* name, rut::u32 nlen);
+void rut_helper_resp_commit_headers(void* ctx);
+void rut_helper_resp_header(void* ctx,
                             const char* name,
                             rut::u32 nlen,
                             rut::u8 fallback_has,

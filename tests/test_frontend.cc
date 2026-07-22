@@ -7108,7 +7108,7 @@ route GET "/users" use chain access { return 200 }
     }
 }
 
-TEST(frontend, chain_after_rejects_wait_routes_until_effects_are_resumable) {
+TEST(frontend, chain_after_response_effects_are_resumable_across_wait) {
     const char* src = R"rut(
 func mutate(_ resp: Response) -> i32 {
     resp.set("X-Test", "yes")
@@ -7125,9 +7125,18 @@ route GET "/users" use chain access {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-    CHECK(hir.error().detail.eq(
-        lit("chain after Response effects cannot be combined with wait/for yet")));
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    bool found_committing_terminal = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& term = mir->functions[0].blocks[bi].term;
+        if (term.kind == MirTerminatorKind::ReturnStatus && term.commit_response_mutations)
+            found_committing_terminal = true;
+    }
+    CHECK(found_committing_terminal);
 }
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {
@@ -32659,12 +32668,12 @@ TEST(frontend, dynamic_response_headers_require_returning_mutated_builder) {
     }
 }
 
-TEST(frontend, dynamic_response_headers_reject_bound_wait_routes) {
+TEST(frontend, dynamic_response_headers_support_bound_wait_routes) {
     const char* src = R"rut(
 route GET "/x" {
     let r = response(200)
     r.set("X-Path", req.path)
-    let ev = wait(timer(1000))
+    let ev = wait(1000)
     return r
 }
 )rut";
@@ -32673,7 +32682,18 @@ route GET "/x" {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].waits.len, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::RespSetHeader));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::YieldTimer));
+    rir.destroy();
 }
 
 int main(int argc, char** argv) {

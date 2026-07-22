@@ -405,7 +405,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations + 2;
+        RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations + 2;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     // Header values are non-owning Str views and are encoded only after the
     // list is complete, so storage synthesized below must span the emit call.
@@ -429,13 +429,15 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    if (d.conn->resp_header_mutation_overflow) {
+    if (o.response_ctx != nullptr && o.response_ctx->response_header_overflow) {
         h2_emit_status(d, stream_id, 500);
         return;
     }
-    for (u32 mi = 0; mi < d.conn->resp_header_mutation_count; mi++) {
-        const auto& mutation = d.conn->resp_header_mutations[mi];
-        const bool remove = mutation.mode == Connection::RespHeaderMutationMode::Remove;
+    const u32 mutation_count =
+        o.response_ctx != nullptr ? o.response_ctx->response_header_count : 0;
+    for (u32 mi = 0; mi < mutation_count; mi++) {
+        const auto& mutation = o.response_ctx->response_header_mutations[mi];
+        const bool remove = mutation.mode == jit::ResponseHeaderMutationMode::Remove;
         if (validate_response_header(mutation.name.ptr,
                                      mutation.name.len,
                                      remove ? "" : mutation.value.ptr,
@@ -443,7 +445,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 500);
             return;
         }
-        if (mutation.mode != Connection::RespHeaderMutationMode::Add) {
+        if (mutation.mode != jit::ResponseHeaderMutationMode::Add) {
             for (u32 i = 0; i < nhdrs;) {
                 if (!http_header_name_eq_ci(
                         hdrs[i].name.ptr, hdrs[i].name.len, mutation.name.ptr, mutation.name.len)) {
@@ -543,6 +545,70 @@ inline u32 h2_stash_synth(Http2Conn& h2, const u8* synth, u32 synth_len) {
     return kN;
 }
 
+inline void h2_rebase_synth_view(Str& view,
+                                 const u8* old_synth,
+                                 const u8* new_synth,
+                                 u32 synth_len) {
+    if (view.ptr == nullptr || old_synth == new_synth) return;
+    const auto kOld = reinterpret_cast<uintptr_t>(old_synth);
+    const auto kPtr = reinterpret_cast<uintptr_t>(view.ptr);
+    if (kPtr < kOld || kPtr - kOld > synth_len || view.len > synth_len - (kPtr - kOld)) return;
+    view.ptr = reinterpret_cast<const char*>(new_synth + (kPtr - kOld));
+}
+
+inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
+                                      const jit::HandlerCtx& live,
+                                      const u8* old_synth,
+                                      u32 synth_len) {
+    if (live.slot_count > kMaxJitHandlerSlots) return false;
+    const size_t kBytes = sizeof(jit::HandlerCtx) + static_cast<size_t>(live.slot_count) * 8;
+    auto* parked = h2.async_jit_ctx();
+    __builtin_memcpy(parked, &live, kBytes);
+
+    const u32 kMutationCount = parked->response_header_pending_count;
+    if (kMutationCount > jit::kMaxResponseHeaderMutations) return false;
+    for (u32 i = 0; i < kMutationCount; i++) {
+        h2_rebase_synth_view(
+            parked->response_header_mutations[i].name, old_synth, h2.pending_synth, synth_len);
+        h2_rebase_synth_view(
+            parked->response_header_mutations[i].value, old_synth, h2.pending_synth, synth_len);
+    }
+    const u32 kParamCount = parked->route_param_count;
+    if (kParamCount > kMaxRouteParams) return false;
+    for (u32 i = 0; i < kParamCount; i++) {
+        Str value{parked->route_params[i].value, parked->route_params[i].value_len};
+        h2_rebase_synth_view(value, old_synth, h2.pending_synth, synth_len);
+        parked->route_params[i].value = value.ptr;
+    }
+    return true;
+}
+
+inline bool h2_reanchor_route_params(const RouteParam* params,
+                                     u32 param_count,
+                                     Str raw_path,
+                                     const u8* synth,
+                                     u32 synth_len,
+                                     RouteParam* anchored) {
+    if (param_count > kMaxRouteParams || (param_count != 0 && raw_path.ptr == nullptr))
+        return false;
+    u32 path_start = 0;
+    while (path_start < synth_len && synth[path_start] != ' ') path_start++;
+    if (path_start == synth_len) return false;
+    path_start++;
+    if (raw_path.len > synth_len - path_start) return false;
+
+    const auto kPath = reinterpret_cast<uintptr_t>(raw_path.ptr);
+    for (u32 i = 0; i < param_count; i++) {
+        const auto kValue = reinterpret_cast<uintptr_t>(params[i].value);
+        if (kValue < kPath || kValue - kPath > raw_path.len ||
+            params[i].value_len > raw_path.len - (kValue - kPath))
+            return false;
+        anchored[i] = params[i];
+        anchored[i].value = reinterpret_cast<const char*>(synth + path_start + (kValue - kPath));
+    }
+    return true;
+}
+
 // Park a timer-yielding handler's resume point on the connection's single async
 // slot (the request bytes are copied into pending_synth so they survive the
 // sleep). The precise yield timer is armed later by h2_arm_async_timer, after
@@ -553,6 +619,7 @@ template <typename Loop>
 bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       u32 stream_id,
                       jit::HandlerFn fn,
+                      const jit::HandlerCtx& live_ctx,
                       const JitDispatchOutcome& o,
                       const RouteConfig* cfg,
                       const u8* synth,
@@ -567,6 +634,10 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // suspending batch could otherwise let a hot reload reclaim them while parked.
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
+    if (!h2_snapshot_async_jit_ctx(*h2, live_ctx, synth, h2->async_synth_len)) {
+        h2_async_epoch_leave(d.loop, *d.conn);
+        return false;
+    }
     h2->async_stream = stream_id;
     h2->async_kind = H2AsyncKind::Timer;
     h2->async_cfg = cfg;
@@ -618,10 +689,6 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     const u8* synth,
                     u32 synth_len) {
     auto* ctx = d.conn->reset_jit_ctx();
-    d.conn->resp_header_mutation_pending_count = 0;
-    d.conn->resp_header_mutation_pending_overflow = false;
-    d.conn->resp_header_mutation_count = 0;
-    d.conn->resp_header_mutation_overflow = false;
     ctx->state = 0;
     ctx->resume_event_kind = static_cast<u32>(jit::YieldKind::Timer);
     ctx->resume_event_result = 0;
@@ -631,7 +698,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
-        if (!h2_suspend_timer(d, stream_id, route->fn, kOutcome, cfg, synth, synth_len))
+        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         return;
     }
@@ -869,7 +936,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                 h2_emit_status(d, stream_id, 400);
                 return;
             }
-            h2_invoke_emit(d, stream_id, route, params, param_count, config, synth, kSynthLen);
+            RouteParam anchored_params[kMaxRouteParams];
+            if (!h2_reanchor_route_params(
+                    params, param_count, req.path, synth, kSynthLen, anchored_params)) {
+                h2_emit_status(d, stream_id, 500);
+                return;
+            }
+            h2_invoke_emit(
+                d, stream_id, route, anchored_params, param_count, config, synth, kSynthLen);
             return;
         }
         case RouteAction::Proxy:
@@ -973,6 +1047,7 @@ template <typename Loop>
     Http2Conn* h2 = conn.h2;
     conn.pending_handler_fn = h2->async_fn;
     conn.handler_state = h2->async_state;
+    conn.handler_ctx = h2->async_jit_ctx();
     conn.pending_yield_kind = jit::YieldKind::Timer;
     conn.transition_to_exec_handler_wait();
     return loop->schedule_yield_timer(conn, h2->async_timer_ms);
@@ -1216,6 +1291,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // recv (async_stream == 0) rather than the timer. The async episode is over —
     // release the config epoch pinned at park time.
     conn.pending_handler_fn = nullptr;
+    conn.handler_ctx = nullptr;
     h2_clear_async(*h2);
     h2_async_epoch_leave(loop, conn);
 

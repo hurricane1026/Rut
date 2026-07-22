@@ -25,9 +25,11 @@ dynamic body through replay/harness observations.
 
 ### Stream-owned Response mutation
 
-Move Response body/status/header mutations into resumable request or stream
-state. Today `chain after` supports ordered header effects only and rejects
-routes containing `wait` or `for`.
+Response header mutation logs now live in resumable `HandlerCtx` state rather
+than `Connection`; pending logs survive `wait`, stay isolated per request or H2
+stream invocation, and `chain after` no longer rejects `wait`/`for` routes.
+Remaining work is to add mutable buffered body/status carriers and move those
+through the same commit boundary.
 
 **Acceptance**:
 - `chain after` can mutate buffered status/body and survive a yield.
