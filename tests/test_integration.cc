@@ -9139,6 +9139,18 @@ static u64 return_200_with_dynamic_body_handler(
     return r.pack();
 }
 
+static u64 return_200_with_dynamic_body_and_headers_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* ctx, const u8* /*req*/, u32 /*len*/, void* /*arena*/) {
+    static const char kBody[] = "{\"ok\":true}";
+    ctx->response_body_data = kBody;
+    ctx->response_body_len = sizeof(kBody) - 1;
+    ctx->response_body_valid = 1;
+    auto r = rut::jit::HandlerResult::make_status(200);
+    r.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
+    r.next_state = 1;
+    return r.pack();
+}
+
 TEST(route, suppresses_http1_dynamic_body_for_head) {
     using namespace rut;
 
@@ -9244,6 +9256,61 @@ TEST(shard, serves_http2_jit_handler_with_body) {
     for (u32 i = 0; i < blen && body_ok; i++)
         if (body[i] != static_cast<u8>(kBody[i])) body_ok = false;
     CHECK(body_ok);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, serves_http2_dynamic_body_with_effective_content_type) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    const char* keys[] = {"Content-Type"};
+    u32 key_lens[] = {12};
+    const char* vals[] = {"application/json"};
+    u32 val_lens[] = {16};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, vals, val_lens, 1), 1u);
+    REQUIRE(cfg.add_jit_handler("/default", 'G', &return_200_with_dynamic_body_handler));
+    REQUIRE(cfg.add_jit_handler("/custom", 'G', &return_200_with_dynamic_body_and_headers_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[1024];
+    u32 n = h2_client_prologue(out);
+    n += h2_client_get(out + n, sizeof(out) - n, 1, "/default", 8);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/custom", 7);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[8192];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0 && h2_status_for_stream(resp, total, 3) != 0)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-type", "text/plain; charset=utf-8"));
+    CHECK(h2_response_has_header(resp, total, 3, "content-type", "application/json"));
+    CHECK_FALSE(
+        h2_response_has_header(resp, total, 3, "content-type", "text/plain; charset=utf-8"));
 
     close(c);
     shard.stop();

@@ -6653,6 +6653,64 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(frontend, match_arm_folded_false_if_let_discards_dead_json_binding) {
+    const char* src = R"rut(
+route GET "/users" {
+    match req.http11 {
+        true => if let value = error(7) {
+            return 500
+        } else {
+            return 200, json({ path: req.path })
+        }
+        _ => return 400
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, guard_failure_folded_false_if_let_discards_dead_json_binding) {
+    const char* src = R"rut(
+route GET "/users" {
+    guard req.http11 else {
+        if let value = nil {
+            return 500
+        } else {
+            return 401, json({ path: req.path })
+        }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, wait_any_dynamic_json_retains_deferred_route_local) {
     const char* src = R"rut(
 route GET "/users" {
@@ -6670,6 +6728,40 @@ route GET "/users" {
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, wait_any_dynamic_json_retains_hidden_if_let_dependency) {
+    const char* src = R"rut(
+route GET "/users" {
+    wait any {
+        downstream.recv() => {
+            if let value = req.header("X-Value") {
+                return 200, json({ value: value })
+            } else {
+                return 404
+            }
+        }
+        timer(250) => { return 408 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    CHECK_EQ(hir->routes[0].locals[0].name.len, 0u);
+    CHECK_FALSE(hir->routes[0].locals[0].defer_to_terminator);
+    CHECK(hir->routes[0].locals[1].defer_to_terminator);
+    CHECK_EQ(hir->routes[0].locals[1].init.local_index, hir->routes[0].locals[0].ref_index);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};

@@ -394,7 +394,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations + 1;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
@@ -447,6 +447,20 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             }
             hdrs[nhdrs].name = mutation.name;
             hdrs[nhdrs].value = mutation.value;
+            nhdrs++;
+        }
+    }
+    if (o.dynamic_response_body != nullptr) {
+        bool has_content_type = false;
+        for (u32 i = 0; i < nhdrs; i++) {
+            if (http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12)) {
+                has_content_type = true;
+                break;
+            }
+        }
+        if (!has_content_type) {
+            hdrs[nhdrs].name = {"content-type", 12};
+            hdrs[nhdrs].value = {"text/plain; charset=utf-8", 25};
             nhdrs++;
         }
     }

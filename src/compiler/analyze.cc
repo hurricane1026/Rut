@@ -10102,6 +10102,22 @@ static bool expr_reads_any_local(const HirExpr& expr, const HirLocal* locals, u3
     return false;
 }
 
+static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index) {
+    if (expr.kind == HirExprKind::LocalRef && expr.local_index == ref_index) return true;
+    if (expr.lhs != nullptr && expr_reads_local_ref(*expr.lhs, ref_index)) return true;
+    if (expr.rhs != nullptr && expr_reads_local_ref(*expr.rhs, ref_index)) return true;
+    for (u32 fi = 0; fi < expr.field_inits.len; fi++) {
+        if (expr.field_inits[fi].value != nullptr &&
+            expr_reads_local_ref(*expr.field_inits[fi].value, ref_index))
+            return true;
+    }
+    for (u32 ai = 0; ai < expr.args.len; ai++) {
+        if (expr.args[ai] != nullptr && expr_reads_local_ref(*expr.args[ai], ref_index))
+            return true;
+    }
+    return false;
+}
+
 static bool terminator_reads_any_local(const HirTerminator& term,
                                        const HirLocal* locals,
                                        u32 local_count,
@@ -10815,6 +10831,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             if (!then_locals.push(locals[i]))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
+        const u32 saved_locals = route->locals.len;
+        bool folds_false = false;
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
                                            route,
@@ -10826,6 +10844,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                            /*is_match_guard=*/false);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
+            folds_false = cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
             auto appended = append_if_let_then_local(
                 stmt, route, mod, locals, local_count, binding, &then_locals);
             if (!appended) return core::make_unexpected(appended.error());
@@ -10840,9 +10859,13 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
         auto then_term =
             analyze_term(*stmt.then_stmt, mod, route, then_locals.data, then_locals.len, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
+        if (folds_false) route->locals.len = saved_locals;
         auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
-        arm->then_term = then_term.value();
+        // The statically-dead arm was still type-checked with its binding in
+        // scope. Do not retain its impossible ValueOf(error/nil) initializer or
+        // any deferred JSON locals; point both lowered edges at the live term.
+        arm->then_term = folds_false ? else_term.value() : then_term.value();
         arm->else_term = else_term.value();
         return {};
     }
@@ -10939,6 +10962,8 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             if (!then_locals.push(locals[i]))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
         }
+        const u32 saved_locals = route->locals.len;
+        bool folds_false = false;
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
                                            route,
@@ -10950,6 +10975,7 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                            /*is_match_guard=*/false);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
+            folds_false = cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
             auto appended = append_if_let_then_local(
                 stmt, route, mod, locals, local_count, binding, &then_locals);
             if (!appended) return core::make_unexpected(appended.error());
@@ -10964,9 +10990,10 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
         auto then_term =
             analyze_term(*stmt.then_stmt, mod, route, then_locals.data, then_locals.len, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
+        if (folds_false) route->locals.len = saved_locals;
         auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
-        body->then_term = then_term.value();
+        body->then_term = folds_false ? else_term.value() : then_term.value();
         body->else_term = else_term.value();
         return {};
     }
@@ -13298,15 +13325,39 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         const u32 saved_locals = route.locals.len;
         auto body = analyze_match_arm_body(
             *ast_arm.stmt, &arm, &route, mod, scoped.data, scoped.len, nullptr);
-        FixedVec<HirLocal, HirTerminator::kMaxJsonDynamicValues> deferred_locals;
+        bool retained[HirRoute::kMaxLocals]{};
+        for (u32 li = saved_locals; li < route.locals.len; li++)
+            retained[li] = route.locals[li].defer_to_terminator;
+        // Deferred JSON locals can depend on success-only if-let bindings (and
+        // those bindings can in turn depend on another arm local). Retain the
+        // transitive initializer closure, while hiding dependency names so a
+        // sibling wait-any arm cannot resolve them.
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (u32 li = saved_locals; li < route.locals.len; li++) {
+                if (!retained[li]) continue;
+                for (u32 dep = saved_locals; dep < route.locals.len; dep++) {
+                    if (retained[dep] ||
+                        !expr_reads_local_ref(route.locals[li].init, route.locals[dep].ref_index))
+                        continue;
+                    retained[dep] = true;
+                    changed = true;
+                }
+            }
+        }
+        FixedVec<HirLocal, HirRoute::kMaxLocals> retained_locals;
         for (u32 li = saved_locals; li < route.locals.len; li++) {
-            if (route.locals[li].defer_to_terminator && !deferred_locals.push(route.locals[li]))
+            if (!retained[li]) continue;
+            HirLocal local = route.locals[li];
+            if (!local.defer_to_terminator) local.name = {};
+            if (!retained_locals.push(local))
                 return frontend_error(FrontendError::TooManyItems, ast_arm.span);
         }
         route.locals.len = saved_locals;
         if (!body) return core::make_unexpected(body.error());
-        for (u32 li = 0; li < deferred_locals.len; li++) {
-            if (!route.locals.push(deferred_locals[li]))
+        for (u32 li = 0; li < retained_locals.len; li++) {
+            if (!route.locals.push(retained_locals[li]))
                 return frontend_error(FrontendError::TooManyItems, ast_arm.span);
         }
         if (!route.control.match_arms.push(arm))
