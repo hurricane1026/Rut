@@ -19586,7 +19586,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // user guards before the first wait, but must not be introduced by a
             // wait expression or after the first resume boundary.
             for (u32 li = 0; li < user_local_count_before_decorators; li++) {
-                if (route.locals[li].name.len != 0 &&
+                if (route.locals[li].name.len != 0 && !route.locals[li].defer_to_terminator &&
                     (route.locals[li].is_wait_result ||
                      route.locals[li].span.start > first_wait_start)) {
                     return frontend_error(FrontendError::UnsupportedSyntax, route.locals[li].span);

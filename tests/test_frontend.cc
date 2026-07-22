@@ -6525,6 +6525,38 @@ chain secure {
              static_cast<u8>(MirTerminatorKind::YieldTimer));
 }
 
+TEST(frontend, decorated_wait_allows_deferred_runtime_json_values) {
+    const char* src = R"rut(
+func require_http11(_ req: i32) -> bool => req.http11
+chain secure {
+    before require_http11(req) else 505
+}
+route GET "/users" use chain secure {
+    wait(50)
+    return 200, json({ path: req.path })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    CHECK(hir->routes[0].control.direct_term.has_dynamic_response_body);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto verified = rir::verify_module(rir.module);
+    CHECK(verified.ok);
+    rir.destroy();
+}
+
 TEST(frontend, analyze_chain_after_lowers_ordered_response_effects) {
     const char* src = R"rut(
 func response_headers(_ req: i32, _ resp: Response) -> i32 {
