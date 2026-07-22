@@ -133,8 +133,7 @@ bool account_terminal_output(const HarnessSpec& spec,
     const bool has_body = !wants_dynamic_body && terminal.upstream_id != 0 && config != nullptr &&
                           terminal.upstream_id <= config->response_body_count;
     const bool suppress_body = connection.req_method == static_cast<u8>(LogHttpMethod::Head);
-    constexpr u32 kMaxHeaders =
-        RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
+    constexpr u32 kMaxHeaders = RouteConfig::kMaxHeadersPerSet + jit::kMaxResponseHeaderMutations;
     ResponseHeaderKV headers[kMaxHeaders];
     u32 header_count = 0;
     if (!collect_effective_response_headers(
