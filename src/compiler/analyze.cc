@@ -4752,7 +4752,9 @@ static FrontendResult<void> append_if_let_then_local(
     const HirLocal* locals,
     u32 local_count,
     const MatchPayloadBinding* binding,
-    FixedVec<HirLocal, HirRoute::kMaxLocals>* then_locals) {
+    FixedVec<HirLocal, HirRoute::kMaxLocals>* then_locals,
+    HirLocal* branch_local,
+    bool materialize_in_branch) {
     auto bound = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
     if (!bound) return core::make_unexpected(bound.error());
     if (route->waits.len != 0 && hir_expr_reads_wait_result(bound.value()))
@@ -4762,10 +4764,13 @@ static FrontendResult<void> append_if_let_then_local(
     const u32 ref_index = next_local_ref_index(route, locals, local_count);
     auto local = make_if_let_local(route, bound.value(), stmt.name, ref_index, stmt.span);
     if (!local) return core::make_unexpected(local.error());
-    if (!route->locals.push(local.value()))
+    if (!materialize_in_branch && !route->locals.push(local.value()))
         return frontend_error(FrontendError::TooManyItems, stmt.span);
-    return insert_scoped_local(
+    auto inserted = insert_scoped_local(
         then_locals->data, then_locals->len, HirRoute::kMaxLocals, local.value(), stmt.span);
+    if (!inserted) return core::make_unexpected(inserted.error());
+    *branch_local = local.value();
+    return {};
 }
 
 static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count) {
@@ -10845,9 +10850,22 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
             folds_false = cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
-            auto appended = append_if_let_then_local(
-                stmt, route, mod, locals, local_count, binding, &then_locals);
+            HirLocal then_local{};
+            const bool materialize_in_branch = arm->effect_expr_indices.len != 0;
+            auto appended = append_if_let_then_local(stmt,
+                                                     route,
+                                                     mod,
+                                                     locals,
+                                                     local_count,
+                                                     binding,
+                                                     &then_locals,
+                                                     &then_local,
+                                                     materialize_in_branch);
             if (!appended) return core::make_unexpected(appended.error());
+            if (!folds_false && materialize_in_branch) {
+                arm->has_then_local = true;
+                arm->then_local = then_local;
+            }
         } else {
             auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
             if (!cond) return core::make_unexpected(cond.error());
@@ -10976,8 +10994,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
             folds_false = cond_expr.kind == HirExprKind::BoolLit && !cond_expr.bool_value;
-            auto appended = append_if_let_then_local(
-                stmt, route, mod, locals, local_count, binding, &then_locals);
+            HirLocal then_local{};
+            auto appended = append_if_let_then_local(stmt,
+                                                     route,
+                                                     mod,
+                                                     locals,
+                                                     local_count,
+                                                     binding,
+                                                     &then_locals,
+                                                     &then_local,
+                                                     /*materialize_in_branch=*/false);
             if (!appended) return core::make_unexpected(appended.error());
         } else {
             auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);

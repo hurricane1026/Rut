@@ -9355,6 +9355,8 @@ TEST(shard, suppresses_http2_dynamic_body_for_204) {
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);
     u8 body[64];
     CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
+    CHECK_FALSE(
+        h2_response_has_header(resp, total, 1, "content-type", "text/plain; charset=utf-8"));
 
     close(c);
     shard.stop();
@@ -9405,6 +9407,8 @@ TEST(shard, suppresses_http2_dynamic_body_for_head) {
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
     u8 body[64];
     CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-length", "28"));
+    CHECK(h2_response_has_header(resp, total, 1, "content-type", "text/plain; charset=utf-8"));
 
     close(c);
     shard.stop();

@@ -1562,7 +1562,7 @@ void handle_jit_outcome(Loop* loop,
                                                     &header_count)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
-                format_static_response(conn, 500, false);
+                format_static_response(conn, 500, false, suppress_body);
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;

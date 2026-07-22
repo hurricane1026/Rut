@@ -295,6 +295,9 @@ struct MirBlock {
     struct Effect {
         u32 value_index = 0xffffffffu;
         Span span{};
+        // Non-sentinel for a branch-local initializer whose result becomes
+        // visible to the owning block's terminator.
+        u32 local_ref_index = 0xffffffffu;
     };
     Str label{};
     // Side effects materialized in this block immediately before `term`.

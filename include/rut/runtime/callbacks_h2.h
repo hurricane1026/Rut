@@ -135,6 +135,17 @@ inline bool h2_response_status_forbids_body(u16 status) {
     return status < 200 || status == 204 || status == 205 || status == 304;
 }
 
+inline u32 h2_u32_to_dec(u32 value, char* out) {
+    char reversed[10];
+    u32 len = 0;
+    do {
+        reversed[len++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    for (u32 i = 0; i < len; i++) out[i] = reversed[len - i - 1];
+    return len;
+}
+
 inline bool h2_synth_request_is_head(const u8* synth, u32 synth_len) {
     return synth != nullptr && synth_len >= 5 && synth[0] == 'H' && synth[1] == 'E' &&
            synth[2] == 'A' && synth[3] == 'D' && synth[4] == ' ';
@@ -394,7 +405,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations + 1;
+        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations + 2;
     hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
@@ -450,7 +461,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    if (o.dynamic_response_body != nullptr) {
+    const bool status_forbids_body = h2_response_status_forbids_body(o.status_code);
+    if (o.dynamic_response_body != nullptr && !status_forbids_body) {
         bool has_content_type = false;
         for (u32 i = 0; i < nhdrs; i++) {
             if (http_header_name_eq_ci(hdrs[i].name.ptr, hdrs[i].name.len, "content-type", 12)) {
@@ -464,10 +476,19 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    // Informational, 204, 205, and 304 responses never carry a message body. Keep
-    // the effective headers, but close the stream on HEADERS instead of
-    // emitting the dynamic/static payload as a DATA frame.
-    if (head_request || h2_response_status_forbids_body(o.status_code)) {
+    // HEAD suppresses DATA while retaining the representation metadata that the
+    // equivalent GET would emit. http2_write_response normally derives
+    // content-length from body_len, so preserve it explicitly before clearing
+    // the payload passed to the writer.
+    if (head_request && body_len != 0 && !status_forbids_body) {
+        char content_length[10];
+        const u32 content_length_len = h2_u32_to_dec(body_len, content_length);
+        hdrs[nhdrs].name = {"content-length", 14};
+        hdrs[nhdrs].value = {content_length, content_length_len};
+        nhdrs++;
+    }
+    // Informational, 204, 205, and 304 responses never carry a message body.
+    if (head_request || status_forbids_body) {
         body = nullptr;
         body_len = 0;
     }

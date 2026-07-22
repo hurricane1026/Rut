@@ -4672,6 +4672,13 @@ FrontendResult<void> lower_to_rir(const MirModule& mir, FrontendRirModule& out) 
                     out.destroy();
                     return core::make_unexpected(emitted.error());
                 }
+                if (effect.local_ref_index != 0xffffffffu) {
+                    if (effect.local_ref_index >= MirFunction::kMaxLocals) {
+                        out.destroy();
+                        return frontend_error(FrontendError::UnsupportedSyntax, effect.span);
+                    }
+                    local_vals[effect.local_ref_index] = emitted.value();
+                }
             }
             auto emitted = emit_term(mir.functions[i].blocks[bi].term,
                                      mir,

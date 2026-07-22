@@ -1842,6 +1842,64 @@ route GET "/x" {
     CHECK_EQ(arms[1].effect_expr_indices.len, 0u);
 }
 
+TEST(frontend, nested_if_let_binding_materializes_after_selected_arm_effects) {
+    const char* src = R"rut(
+let buckets = Cache<IP, i64>(capacity: 64)
+route GET "/x" {
+    match req.http11 {
+        true => {
+            buckets.set(req.remoteAddr, 1)
+            if let value = buckets.get(req.remoteAddr) {
+                return 200, json({ value: value })
+            } else {
+                return 404
+            }
+        }
+        _ => return 400
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& arm = hir->routes[0].control.match_arms[0];
+    REQUIRE_EQ(arm.effect_expr_indices.len, 1u);
+    REQUIRE(arm.has_then_local);
+    CHECK_EQ(static_cast<u8>(arm.then_local.init.kind), static_cast<u8>(HirExprKind::ValueOf));
+    for (u32 li = 0; li < hir->routes[0].locals.len; li++) {
+        if (hir->routes[0].locals[li].ref_index == arm.then_local.ref_index)
+            CHECK(hir->routes[0].locals[li].defer_to_terminator);
+    }
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    u32 cache_set_effects = 0;
+    u32 branch_local_effects = 0;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        const auto& block = mir->functions[0].blocks[bi];
+        for (u32 ei = 0; ei < block.effects.len; ei++) {
+            const auto& effect = block.effects[ei];
+            REQUIRE_LT(effect.value_index, mir->functions[0].values.len);
+            const auto kind = mir->functions[0].values[effect.value_index].kind;
+            if (kind == MirValueKind::CacheSet) cache_set_effects++;
+            if (effect.local_ref_index != 0xffffffffu) {
+                branch_local_effects++;
+                CHECK_EQ(effect.local_ref_index, arm.then_local.ref_index);
+                CHECK_EQ(static_cast<u8>(kind), static_cast<u8>(MirValueKind::ValueOf));
+            }
+        }
+    }
+    CHECK_EQ(cache_set_effects, 1u);
+    CHECK_EQ(branch_local_effects, 1u);
+
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, cache_set_is_statement_only_no_expression_escape) {
     // `let _ = b.set(...)` after a guard would materialize at handler entry
     // and write on rejected requests — set is not an expression anywhere.

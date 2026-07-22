@@ -139,7 +139,7 @@ bool account_terminal_output(const HarnessSpec& spec,
     if (!collect_effective_response_headers(
             connection, config, terminal.next_state, headers, kMaxHeaders, &header_count)) {
         connection.resp_status = 500;
-        format_static_response(connection, 500, false);
+        format_static_response(connection, 500, false, suppress_body);
     } else if (header_count != 0) {
         const char* body_data = nullptr;
         u32 body_len = 0;

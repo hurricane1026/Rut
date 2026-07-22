@@ -876,6 +876,10 @@ struct HirMatchArm {
     FixedVec<u32, kMaxEffects> effect_expr_indices;
     static constexpr u32 kMaxPreludeGuards = 4;
     FixedVec<HirGuard, kMaxPreludeGuards> guards;
+    // A narrowed if-let value following arm effects must be initialized in the
+    // selected success block, after those effects, rather than at route entry.
+    bool has_then_local = false;
+    HirLocal then_local{};
     HirExpr cond{};
     HirTerminator then_term{};
     HirTerminator else_term{};
@@ -1317,6 +1321,8 @@ private:
             for (u32 gi = 0; gi < control.match_arms[i].guards.len; gi++) {
                 rebase_guard(control.match_arms[i].guards[gi], other);
             }
+            if (control.match_arms[i].has_then_local)
+                rebase_expr(control.match_arms[i].then_local.init, other);
             rebase_expr(control.match_arms[i].cond, other);
         }
     }
