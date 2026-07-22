@@ -304,7 +304,7 @@ struct MirBlock {
     Str label{};
     // Side effects materialized in this block immediately before `term`.
     // Each entry indexes the owning MirFunction::values pool.
-    static constexpr u32 kMaxEffects = 2;
+    static constexpr u32 kMaxEffects = 4;
     FixedVec<Effect, kMaxEffects> effects;
     MirTerminator term{};
 };

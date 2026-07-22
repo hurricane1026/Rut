@@ -1253,6 +1253,8 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
             }
 
             if (guard.fail_kind == HirGuard::FailKind::Body) {
+                MirBlock fail_block{};
+                fail_block.label = fail_label();
                 ForLoopCtx scoped_ctx{};
                 const ForLoopCtx* body_ctx = ctx;
                 if (guard.fail_body.locals.len != 0) {
@@ -1264,15 +1266,16 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                         if (!local_value) return core::make_unexpected(local_value.error());
                         if (!fn.values.push(local_value.value()))
                             return frontend_error(FrontendError::TooManyItems, local.span);
+                        const u32 value_index = fn.values.len - 1;
+                        if (!fail_block.effects.push({value_index, local.span, local.ref_index}))
+                            return frontend_error(FrontendError::TooManyItems, local.span);
                         ForLoopCtx::LocalBinding binding{};
                         binding.ref_index = local.ref_index;
-                        binding.value = &fn.values[fn.values.len - 1];
+                        binding.value = &fn.values[value_index];
                         if (!scoped_ctx.locals.push(binding))
                             return frontend_error(FrontendError::TooManyItems, local.span);
                     }
                 }
-                MirBlock fail_block{};
-                fail_block.label = fail_label();
                 if (guard.fail_body.body_kind == HirGuardBody::BodyKind::If) {
                     fail_block.term.kind = MirTerminatorKind::Branch;
                     fail_block.term.span = guard.fail_body.cond.span;

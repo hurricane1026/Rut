@@ -6737,6 +6737,40 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(frontend, guard_failure_dynamic_json_sees_scoped_local) {
+    const char* src = R"rut(
+route GET "/users" {
+    guard false else {
+        let saved = req.path
+        return 400, json({ saved: saved })
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].guards[0].fail_body.locals.len, 1u);
+    const u32 saved_ref = hir->routes[0].guards[0].fail_body.locals[0].ref_index;
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    bool materialized_in_failure_block = false;
+    for (u32 bi = 0; bi < mir->functions[0].blocks.len; bi++) {
+        for (u32 ei = 0; ei < mir->functions[0].blocks[bi].effects.len; ei++) {
+            if (mir->functions[0].blocks[bi].effects[ei].local_ref_index == saved_ref)
+                materialized_in_failure_block = true;
+        }
+    }
+    CHECK(materialized_in_failure_block);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, match_arm_folded_false_if_let_discards_dead_json_binding) {
     const char* src = R"rut(
 route GET "/users" {
