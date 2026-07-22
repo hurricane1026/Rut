@@ -9131,6 +9131,20 @@ static u64 return_204_with_dynamic_body_handler(void* /*conn*/,
     return r.pack();
 }
 
+static u64 return_200_with_dynamic_body_handler(void* /*conn*/,
+                                                rut::jit::HandlerCtx* ctx,
+                                                const u8* /*req*/,
+                                                u32 /*len*/,
+                                                void* /*arena*/) {
+    static const char kBody[] = "must not be emitted for HEAD";
+    ctx->response_body_data = kBody;
+    ctx->response_body_len = sizeof(kBody) - 1;
+    ctx->response_body_valid = 1;
+    auto r = rut::jit::HandlerResult::make_status(200);
+    r.upstream_id = rut::jit::HandlerResult::kDynamicResponseBody;
+    return r.pack();
+}
+
 // End-to-end: handler returns ReturnStatus with body_idx=1;
 // RouteConfig has a body pre-registered; runtime formats response
 // with the body bytes + matching Content-Length + default Content-Type.
@@ -9224,6 +9238,56 @@ TEST(shard, suppresses_http2_dynamic_body_for_204) {
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 204u);
+    u8 body[64];
+    CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
+
+    close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+
+TEST(shard, suppresses_http2_dynamic_body_for_head) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_jit_handler("/head", 'H', &return_200_with_dynamic_body_handler));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+
+    u8 out[512];
+    u32 n = h2_client_prologue(out);
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"HEAD", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/head", 5}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    n += http2_write_headers(out + n, sizeof(out) - n, 1, hs, 4, /*end_stream=*/true);
+    REQUIRE(write_all_fd(c, out, n));
+
+    u8 resp[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(resp, total, 1) != 0) break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
     u8 body[64];
     CHECK_EQ(h2_body_for_stream(resp, total, 1, body, sizeof(body)), 0u);
 

@@ -135,6 +135,11 @@ inline bool h2_response_status_forbids_body(u16 status) {
     return status < 200 || status == 204 || status == 205 || status == 304;
 }
 
+inline bool h2_synth_request_is_head(const u8* synth, u32 synth_len) {
+    return synth != nullptr && synth_len >= 5 && synth[0] == 'H' && synth[1] == 'E' &&
+           synth[2] == 'A' && synth[3] == 'D' && synth[4] == ' ';
+}
+
 // Synthesize a minimal HTTP/1 request from decoded h2 headers into out, so a JIT
 // handler's parse-cache prime (which parses raw HTTP/1 bytes) sees the request.
 // Returns the byte length, or 0 on missing pseudo-headers / overflow.
@@ -375,7 +380,8 @@ template <typename Loop>
 void h2_emit_outcome(H2Dispatch<Loop>& d,
                      u32 stream_id,
                      const JitDispatchOutcome& o,
-                     const RouteConfig* cfg) {
+                     const RouteConfig* cfg,
+                     bool head_request) {
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.dynamic_response_body != nullptr) {
@@ -447,7 +453,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     // Informational, 204, 205, and 304 responses never carry a message body. Keep
     // the effective headers, but close the stream on HEADERS instead of
     // emitting the dynamic/static payload as a DATA frame.
-    if (h2_response_status_forbids_body(o.status_code)) {
+    if (head_request || h2_response_status_forbids_body(o.status_code)) {
         body = nullptr;
         body_len = 0;
     }
@@ -596,7 +602,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
-    h2_emit_outcome(d, stream_id, kOutcome, cfg);
+    h2_emit_outcome(d, stream_id, kOutcome, cfg, h2_synth_request_is_head(synth, synth_len));
 }
 
 // A deferred stream is complete. If the matched handler reads req.body,
@@ -1141,6 +1147,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // (mirrors the HTTP/1 resume_jit_handler).
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
+    const bool kHeadRequest =
+        h2_synth_request_is_head(h2->pending_synth, h2->async_synth_len);
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
@@ -1163,7 +1171,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     u8 resp[8192];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
-        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
+        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kHeadRequest);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
     }
