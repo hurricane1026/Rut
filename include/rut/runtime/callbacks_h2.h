@@ -407,6 +407,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     constexpr u32 kMaxEffectiveHeaders =
         RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations + 2;
     hpack::Header hdrs[kMaxEffectiveHeaders];
+    // Header values are non-owning Str views and are encoded only after the
+    // list is complete, so storage synthesized below must span the emit call.
+    char content_length[10];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
@@ -481,7 +484,6 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     // content-length from body_len, so preserve it explicitly before clearing
     // the payload passed to the writer.
     if (head_request && body_len != 0 && !status_forbids_body) {
-        char content_length[10];
         const u32 content_length_len = h2_u32_to_dec(body_len, content_length);
         hdrs[nhdrs].name = {"content-length", 14};
         hdrs[nhdrs].value = {content_length, content_length_len};
