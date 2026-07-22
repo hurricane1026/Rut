@@ -6599,6 +6599,85 @@ route GET "/users" {
     rir.destroy();
 }
 
+TEST(frontend, match_arm_if_let_dynamic_json_sees_then_binding) {
+    const char* src = R"rut(
+route GET "/users" {
+    match req.http11 {
+        true => if let value = req.header("X-Value") {
+            return 200, json({ value: value })
+        } else {
+            return 404
+        }
+        _ => return 400
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, guard_failure_if_let_dynamic_json_sees_then_binding) {
+    const char* src = R"rut(
+route GET "/users" {
+    guard req.http11 else {
+        if let value = req.header("X-Value") {
+            return 400, json({ value: value })
+        } else {
+            return 401
+        }
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, wait_any_dynamic_json_retains_deferred_route_local) {
+    const char* src = R"rut(
+route GET "/users" {
+    wait any {
+        downstream.recv() => { return 200, json({ path: req.path }) }
+        timer(250) => { return 408 }
+    }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, const_match_payload_is_visible_to_direct_dynamic_json) {
     const char* src = R"rut(
 variant Result { ok(str), err }

@@ -4740,6 +4740,34 @@ static FrontendResult<HirLocal> make_if_let_local(
     return local;
 }
 
+static FrontendResult<void> insert_scoped_local(
+    HirLocal* locals, u32& local_count, u32 capacity, const HirLocal& local, Span span);
+static bool hir_expr_reads_wait_result(const HirExpr& expr);
+static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count);
+
+static FrontendResult<void> append_if_let_then_local(
+    const AstStatement& stmt,
+    HirRoute* route,
+    const HirModule& mod,
+    const HirLocal* locals,
+    u32 local_count,
+    const MatchPayloadBinding* binding,
+    FixedVec<HirLocal, HirRoute::kMaxLocals>* then_locals) {
+    auto bound = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+    if (!bound) return core::make_unexpected(bound.error());
+    if (route->waits.len != 0 && hir_expr_reads_wait_result(bound.value()))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("if-let cannot bind wait-result state after a wait"));
+    const u32 ref_index = next_local_ref_index(route, locals, local_count);
+    auto local = make_if_let_local(route, bound.value(), stmt.name, ref_index, stmt.span);
+    if (!local) return core::make_unexpected(local.error());
+    if (!route->locals.push(local.value()))
+        return frontend_error(FrontendError::TooManyItems, stmt.span);
+    return insert_scoped_local(
+        then_locals->data, then_locals->len, HirRoute::kMaxLocals, local.value(), stmt.span);
+}
+
 static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count) {
     u32 next = 0;
     for (u32 i = 0; i < local_count; i++) {
@@ -10777,10 +10805,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
         arm->body_kind = HirMatchArm::BodyKind::If;
         // `if let` inside a match arm: the cond folds to `HasValue(expr)` (with
         // known-value folding + pure-optional rejection via analyze_guard_cond).
-        // Both branches here are route terminators (return/forward), which take
-        // no locals, so the binding is never referenceable — no local is
-        // injected. Plain `if cond` keeps its bool-condition path.
+        // The then terminator may contain a dynamic JSON plan, so an if-let
+        // binding must be visible in its success-only scope.
         HirExpr cond_expr{};
+        FixedVec<HirLocal, HirRoute::kMaxLocals> then_locals;
+        for (u32 i = 0; i < local_count; i++) {
+            if (!then_locals.push(locals[i]))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
                                            route,
@@ -10792,6 +10824,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                            /*is_match_guard=*/false);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
+            auto appended = append_if_let_then_local(
+                stmt, route, mod, locals, local_count, binding, &then_locals);
+            if (!appended) return core::make_unexpected(appended.error());
         } else {
             auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
             if (!cond) return core::make_unexpected(cond.error());
@@ -10800,7 +10835,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
+        auto then_term =
+            analyze_term(*stmt.then_stmt, mod, route, then_locals.data, then_locals.len, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
@@ -10893,9 +10929,14 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
         body->body_kind = HirGuardBody::BodyKind::If;
         // `if let` inside a guard-fail body: cond folds to `HasValue(expr)`
         // (known-value folding + pure-optional rejection via analyze_guard_cond).
-        // Both branches are route terminators (no locals), so the binding is
-        // never referenceable — no local is injected.
+        // The then terminator may contain a dynamic JSON plan, so an if-let
+        // binding must be visible in its success-only scope.
         HirExpr cond_expr{};
+        FixedVec<HirLocal, HirRoute::kMaxLocals> then_locals;
+        for (u32 i = 0; i < local_count; i++) {
+            if (!then_locals.push(locals[i]))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
         if (stmt.bind_value) {
             auto cond = analyze_guard_cond(stmt.expr,
                                            route,
@@ -10907,6 +10948,9 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
                                            /*is_match_guard=*/false);
             if (!cond) return core::make_unexpected(cond.error());
             cond_expr = cond.value();
+            auto appended = append_if_let_then_local(
+                stmt, route, mod, locals, local_count, binding, &then_locals);
+            if (!appended) return core::make_unexpected(appended.error());
         } else {
             auto cond = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
             if (!cond) return core::make_unexpected(cond.error());
@@ -10915,7 +10959,8 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
+        auto then_term =
+            analyze_term(*stmt.then_stmt, mod, route, then_locals.data, then_locals.len, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
         auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
@@ -13251,8 +13296,17 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         const u32 saved_locals = route.locals.len;
         auto body = analyze_match_arm_body(
             *ast_arm.stmt, &arm, &route, mod, scoped.data, scoped.len, nullptr);
+        FixedVec<HirLocal, HirTerminator::kMaxJsonDynamicValues> deferred_locals;
+        for (u32 li = saved_locals; li < route.locals.len; li++) {
+            if (route.locals[li].defer_to_terminator && !deferred_locals.push(route.locals[li]))
+                return frontend_error(FrontendError::TooManyItems, ast_arm.span);
+        }
         route.locals.len = saved_locals;
         if (!body) return core::make_unexpected(body.error());
+        for (u32 li = 0; li < deferred_locals.len; li++) {
+            if (!route.locals.push(deferred_locals[li]))
+                return frontend_error(FrontendError::TooManyItems, ast_arm.span);
+        }
         if (!route.control.match_arms.push(arm))
             return frontend_error(FrontendError::TooManyItems, ast_arm.span);
         return {};
