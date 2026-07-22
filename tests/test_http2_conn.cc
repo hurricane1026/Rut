@@ -1499,6 +1499,30 @@ TEST(h2_serving, response_status_body_rules_include_reset_content) {
     CHECK_FALSE(h2_response_status_forbids_body(206));
 }
 
+TEST(h2_serving, bodyless_mutated_status_suppresses_dynamic_data) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, response, sizeof(response), 0, false};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 204;
+    outcome.dynamic_response_body = "must-not-be-sent";
+    outcome.dynamic_response_body_len = sizeof("must-not-be-sent") - 1;
+
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+
+    Http2FrameHeader header{};
+    REQUIRE(parse_frame_header(response, dispatch.resp_len, &header) == ParseStatus::Complete);
+    CHECK_EQ(header.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((header.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + header.length);
+}
+
 TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     // A deferred dynamic route's param VALUES point into hdr_scratch, which the
     // engine reuses for the next decoded header block. The snapshot must copy
