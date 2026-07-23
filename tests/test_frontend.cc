@@ -32772,6 +32772,41 @@ TEST(frontend, response_assignments_are_statement_only) {
     }
 }
 
+TEST(frontend, response_assignment_cannot_read_wait_result_state) {
+    const char* rejected = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    let ev = wait(1ms)
+    resp.status = 200 + ev.result
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(rejected));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("Response assignments cannot read wait-result state")));
+
+    // A post-wait assignment from state already captured before the wait does
+    // not read the resume slots and remains valid.
+    const char* pre_wait_value = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    let code = 201
+    wait(1ms)
+    resp.status = code
+    return resp
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(pre_wait_value, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, response_scalar_mutations_reject_conditional_helper_effects) {
     const char* cases[] = {
         R"rut(

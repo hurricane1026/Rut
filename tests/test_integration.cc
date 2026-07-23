@@ -1476,6 +1476,15 @@ static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut
     return 0;
 }
 
+static char* g_timer_body_storage = nullptr;
+static rut::u64 timer_body_storage_fn(
+    void*, rut::jit::HandlerCtx* ctx, const rut::u8*, rut::u32, void*) {
+    ctx->response_body_mutation_storage = rut::jit::acquire_response_body_mutation_storage();
+    ctx->response_body_mutation_set = true;
+    g_timer_body_storage = ctx->response_body_mutation_storage;
+    return rut::jit::HandlerResult::make_status(200).pack();
+}
+
 // The event loop fires a registered timer once its interval elapses, invoking the
 // compiled handler with no Connection/Request and bumping the per-timer count.
 // A shard selector within the compile-time range can still exceed the
@@ -1529,6 +1538,28 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+}
+
+TEST(timer, event_loop_releases_response_body_storage_after_firing) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_body_storage_fn));
+    auto loop = std::make_unique<EpollEventLoop>();
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    g_timer_body_storage = nullptr;
+
+    loop->fire_due_timers();
+    usleep(5000);
+    loop->fire_due_timers();
+    REQUIRE(g_timer_body_storage != nullptr);
+
+    // The per-thread pool is LIFO: immediately reacquiring must return the
+    // handler's allocation if fire_due_timers released the discarded context.
+    jit::HandlerCtx recycled{};
+    recycled.response_body_mutation_storage = jit::acquire_response_body_mutation_storage();
+    CHECK_EQ(recycled.response_body_mutation_storage, g_timer_body_storage);
+    jit::release_response_body_mutation_storage(&recycled);
 }
 
 // The same scheduler must drive timers on the io_uring backend: main.cc prefers

@@ -18863,6 +18863,16 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     if (value->kind != HirExprKind::RespSetStatus &&
                         value->kind != HirExprKind::RespSetBody)
                         return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
+                    // Bare response-effect carriers are materialized in state 0.
+                    // A post-wait RHS that reads the resume result would therefore
+                    // observe the zero-initialized slot instead of the completed
+                    // event. Reject that shape until effects can be placed in the
+                    // corresponding resume block.
+                    if (seen_wait && hir_expr_reads_wait_result(value.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.expr.rhs != nullptr ? stmt.expr.rhs->span : stmt.span,
+                            lit_str("Response assignments cannot read wait-result state"));
                     if (stmt.expr.lhs != nullptr && stmt.expr.lhs->lhs != nullptr) {
                         for (u32 li = route.locals.len; li > 0; li--) {
                             if (!route.locals[li - 1].name.eq(stmt.expr.lhs->lhs->name)) continue;
