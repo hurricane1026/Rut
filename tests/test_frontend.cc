@@ -33744,6 +33744,54 @@ TEST(frontend, rejects_transitively_reused_helper_local_arrays) {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, rejects_reused_helper_struct_locals_containing_arrays) {
+    const char* src = R"rut(
+struct Box { values: [i64] }
+func make() {
+    let box = Box(values: [time.nowMicros()])
+    [box, box]
+}
+route GET "/x" { let values = make() return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, contextual_array_return_rejects_wrong_element_type) {
+    const char* src =
+        "func bad() -> [str] => [1] "
+        "route GET \"/x\" { let values = bad() return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, contextual_arrays_reject_optional_and_fallible_elements) {
+    const char* sources[] = {
+        "func maybe(ok: bool) -> i32 { if ok { 1 } else { nil } } "
+        "func keep(values: [i32]) -> [i32] => values "
+        "route GET \"/x\" { let values = keep([maybe(req.http11)]) return 200 }\n",
+        "func maybe(ok: bool) -> i32 { if ok { 1 } else { error(500) } } "
+        "func keep(values: [i32]) -> [i32] => values "
+        "route GET \"/x\" { let values = keep([maybe(req.http11)]) return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
 TEST(frontend, imported_array_shapes_reinstantiate_generic_nominal_elements) {
     const std::string dir = "/tmp/rut_import_array_generic_nominal_frontend";
     std::filesystem::create_directories(dir);

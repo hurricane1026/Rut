@@ -3564,10 +3564,22 @@ static FrontendResult<void> adapt_array_carriers_to_expected_shape(HirExpr* expr
         return {};
     }
     if (expr->type != HirTypeKind::Array || expr->kind != HirExprKind::ArrayLit) return {};
+    const u32 elem_shape_index = expected.array_elem_shape_index;
+    if (elem_shape_index >= mod->type_shapes.len) return {};
     for (u32 i = 0; i < expr->args.len; i++) {
         auto adapted = adapt_array_carriers_to_expected_shape(
-            expr->args[i], mod, expected.array_elem_shape_index, expr->args[i]->span);
+            expr->args[i], mod, elem_shape_index, expr->args[i]->span);
         if (!adapted) return core::make_unexpected(adapted.error());
+        const auto& shape = mod->type_shapes[elem_shape_index];
+        HirExpr expected_elem{};
+        expected_elem.type = shape.type;
+        expected_elem.generic_index = shape.generic_index;
+        expected_elem.variant_index = shape.variant_index;
+        expected_elem.struct_index = shape.struct_index;
+        expected_elem.shape_index = elem_shape_index;
+        if (expr->args[i]->may_nil || expr->args[i]->may_error ||
+            !same_hir_type_shape(*mod, *expr->args[i], expected_elem))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr->args[i]->span);
     }
     expr->shape_index = expected_shape_index;
     return {};
@@ -3618,6 +3630,8 @@ static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
         expected_elem.variant_index = shape.variant_index;
         expected_elem.struct_index = shape.struct_index;
         expected_elem.shape_index = elem_shape_index;
+        if (elem->may_nil || elem->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
         if (!same_hir_type_shape(mod, elem.value(), expected_elem))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
         if (!route->exprs.push(elem.value()))
@@ -18175,7 +18189,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 gi = 0; refs < 2 && gi < scratch->guards.len; gi++)
                 refs +=
                     count_function_param_refs(scratch->guards[gi].cond, local.ref_index, 2 - refs);
-            if (local.type == HirTypeKind::Array && refs >= 2)
+            if (refs >= 2 && hir_type_shape_contains_array(mod, local.shape_index))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     local.span,
