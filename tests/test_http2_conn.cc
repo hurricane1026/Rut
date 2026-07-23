@@ -1651,6 +1651,34 @@ TEST(h2_serving, deferred_route_params_copied_to_stable_storage) {
     CHECK(sp.name == params[0].name);                 // name still points into stable config
 }
 
+TEST(h2_serving, terminal_outcome_releases_response_body_snapshots) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+
+    FakeH2Loop loop;
+    u8 resp[1024];
+    H2Dispatch<FakeH2Loop> dispatch{&loop, &conn, resp, sizeof(resp), 0, false};
+    jit::HandlerCtx ctx{};
+    const char body[] = "snapshot";
+    const char* snapshot = jit::snapshot_response_body(&ctx, body, sizeof(body) - 1);
+    REQUIRE(snapshot != nullptr);
+    REQUIRE(ctx.response_body_snapshot_storage != nullptr);
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.dynamic_response_body = snapshot;
+    outcome.dynamic_response_body_len = sizeof(body) - 1;
+    outcome.response_ctx = &ctx;
+    h2_emit_outcome(dispatch, 1, outcome, nullptr);
+
+    CHECK(ctx.response_body_snapshot_storage == nullptr);
+    CHECK(ctx.response_body_mutation_storage == nullptr);
+}
+
 TEST(h2_serving, suspended_handler_context_is_snapshotted_and_rebased) {
     Http2Conn h2;
     h2.init();

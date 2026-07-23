@@ -35465,6 +35465,146 @@ route GET "/x" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
 }
+TEST(frontend, dynamic_json_rejects_mutation_after_earlier_response_read) {
+    const char* src = R"rut(
+func mutate(_ resp: Response) -> i32 {
+    resp.status = 202
+    0
+}
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    return 200, json([resp.status, mutate(resp)])
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+              lit("a response-mutating JSON value cannot follow an earlier Response field read")) ||
+          hir.error().detail.eq(lit("a dynamically mutated Response builder must be returned "
+                                    "directly")));
+}
+
+TEST(frontend, response_mutating_helpers_are_rejected_in_conditional_body_locals) {
+    const char* sources[] = {
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    match req.http11 {
+        true => { let ignored = mutate(resp) return resp }
+        _ => return resp
+    }
+}
+)rut",
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    guard req.http11 else { let ignored = mutate(resp) return resp }
+    return resp
+}
+)rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("response-mutating helper calls are not supported in conditional branches")));
+    }
+}
+
+TEST(frontend, response_mutating_helpers_require_one_caller_builder) {
+    const char* src = R"rut(
+func mutate(_ resp: Response, code: i32) -> i32 {
+    resp.status = code
+    0
+}
+route GET "/x" {
+    let first = response(200)
+    let second = response(300)
+    let ignored = mutate(first, 201)
+    return first
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response-mutating helpers require exactly one Response builder in the route")));
+}
+
+TEST(frontend, aggregate_elements_reject_response_mutation_after_field_read) {
+    const char* sources[] = {
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let pair = (resp.status, mutate(resp))
+    return resp
+}
+)rut",
+        R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 0 }
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let values = [resp.status, mutate(resp)]
+    return resp
+}
+)rut",
+    };
+    for (u32 source_index = 0; source_index < 2; source_index++) {
+        const char* src = sources[source_index];
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, builtin_operands_reject_response_mutation_after_field_read) {
+    const char* expressions[] = {
+        "bitwise.and(resp.status, mutate(resp))",
+        "max(resp.status, mutate(resp))",
+        "any(resp.status, mutate(resp))",
+        "all(resp.status, mutate(resp))",
+    };
+    for (const char* expression : expressions) {
+        std::string src = R"rut(
+func mutate(_ resp: Response) -> i32 { resp.status = 202 255 }
+route GET "/x" {
+    let resp = response(200)
+    resp.status = 201
+    let value = )rut";
+        src += expression;
+        src += R"rut(
+    return resp
+}
+)rut";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

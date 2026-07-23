@@ -3694,6 +3694,9 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  bool allow_array_lit);
 
+static bool hir_expr_reads_response_field(const HirExpr& expr);
+static bool route_appended_response_effect(const HirRoute& route, u32 previous_local_count);
+
 static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
     const AstExpr& expr,
     HirRoute* route,
@@ -3724,10 +3727,19 @@ static FrontendResult<HirExpr> analyze_expr_with_expected_array_shape(
     const u32 elem_shape_index = mod.type_shapes[expected_shape_index].array_elem_shape_index;
     if (!hir_type_shape_has_runtime_carrier(mod, elem_shape_index))
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    bool earlier_element_reads_response = false;
     for (u32 i = 0; i < expr.args.len; i++) {
+        const u32 locals_before_element = route->locals.len;
         auto elem = analyze_expr_with_expected_array_shape(
             *expr.args[i], route, mod, locals, local_count, binding, elem_shape_index);
         if (!elem) return core::make_unexpected(elem.error());
+        if (earlier_element_reads_response &&
+            route_appended_response_effect(*route, locals_before_element))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[i]->span,
+                lit_str("a response-mutating array element cannot follow a Response field read"));
+        earlier_element_reads_response |= hir_expr_reads_response_field(elem.value());
         HirExpr expected_elem{};
         const auto& shape = mod.type_shapes[elem_shape_index];
         expected_elem.type = shape.type;
@@ -4271,8 +4283,15 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         rhs_expr.span = expr.span;
         rhs_expr.int_value = -1;
     } else {
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(lhs.value()) &&
+            route_appended_response_effect(*route, locals_before_rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[1]->span,
+                lit_str("a response-mutating bitwise operand cannot follow a Response field read"));
         rhs_expr = rhs.value();
     }
     // Same-width rule as arithmetic: both operands i32 or both i64, with a
@@ -5957,6 +5976,12 @@ static bool is_response_effect(HirExprKind kind) {
     return kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
            kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
            kind == HirExprKind::RespSetBody;
+}
+
+static bool route_appended_response_effect(const HirRoute& route, u32 previous_local_count) {
+    for (u32 li = previous_local_count; li < route.locals.len; li++)
+        if (is_response_effect(route.locals[li].init.kind)) return true;
+    return false;
 }
 
 static bool hir_expr_reads_response_field_before(const HirExpr& expr, u32 source_offset) {
@@ -8556,10 +8581,20 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         // uniformity across the array and (b) intern the element shape.
         HirExpr first_elem_snapshot{};
         u32 first_elem_shape_index = 0xffffffffu;
+        bool earlier_element_reads_response = false;
         for (u32 i = 0; i < expr.args.len; i++) {
+            const u32 locals_before_element = route->locals.len;
             auto elem =
                 analyze_expr_impl(*expr.args[i], route, mod, locals, local_count, binding, true);
             if (!elem) return core::make_unexpected(elem.error());
+            if (earlier_element_reads_response &&
+                route_appended_response_effect(*route, locals_before_element))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[i]->span,
+                    lit_str(
+                        "a response-mutating array element cannot follow a Response field read"));
+            earlier_element_reads_response |= hir_expr_reads_response_field(elem.value());
             // Reject element kinds that need contextual inference or union
             // widening. Tuple elements are allowed: their shape_index carries
             // slot metadata and same_hir_type_shape enforces homogeneous
@@ -8622,10 +8657,20 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.type = HirTypeKind::Tuple;
         out.tuple_len = expr.args.len;
         u32 tuple_elem_shape_indices[kMaxTupleSlots]{};
+        bool earlier_element_reads_response = false;
         for (u32 i = 0; i < expr.args.len; i++) {
+            const u32 locals_before_element = route->locals.len;
             auto elem =
                 analyze_expr_impl(*expr.args[i], route, mod, locals, local_count, binding, true);
             if (!elem) return core::make_unexpected(elem.error());
+            if (earlier_element_reads_response &&
+                route_appended_response_effect(*route, locals_before_element))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[i]->span,
+                    lit_str(
+                        "a response-mutating tuple element cannot follow a Response field read"));
+            earlier_element_reads_response |= hir_expr_reads_response_field(elem.value());
             if (elem->may_nil || elem->may_error || elem->type == HirTypeKind::Unknown ||
                 elem->type == HirTypeKind::Tuple)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.args[i]->span);
@@ -9966,8 +10011,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
         auto lhs = analyze_builtin_arg(*expr.args[0]);
         if (!lhs) return core::make_unexpected(lhs.error());
+        const u32 locals_before_rhs = route->locals.len;
         auto rhs = analyze_builtin_arg(*expr.args[1]);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (hir_expr_reads_response_field(lhs.value()) &&
+            route_appended_response_effect(*route, locals_before_rhs))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.args[1]->span,
+                lit_str(
+                    "a response-mutating fallback operand cannot follow a Response field read"));
         *out_lhs = lhs.value();
         *out_rhs = rhs.value();
         return {};
@@ -10377,8 +10430,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kMinMaxDetail);
             auto lhs = analyze_builtin_arg(*expr.args[0]);
             if (!lhs) return core::make_unexpected(lhs.error());
+            const u32 locals_before_rhs = route->locals.len;
             auto rhs = analyze_builtin_arg(*expr.args[1]);
             if (!rhs) return core::make_unexpected(rhs.error());
+            if (hir_expr_reads_response_field(lhs.value()) &&
+                route_appended_response_effect(*route, locals_before_rhs))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[1]->span,
+                    lit_str(
+                        "a response-mutating min/max operand cannot follow a Response field read"));
             adopt_int_literal_type(&lhs.value(), &rhs.value());
             const bool int_typed =
                 (lhs->type == HirTypeKind::I32 || lhs->type == HirTypeKind::I64) &&
