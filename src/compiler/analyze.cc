@@ -10459,6 +10459,23 @@ static bool terminator_reads_local_ref(const HirTerminator& term,
     return false;
 }
 
+static bool guard_terminators_read_local_ref(const HirGuard& guard,
+                                             const HirModule& mod,
+                                             const HirExpr* exprs,
+                                             u32 expr_count,
+                                             u32 ref_index) {
+    if (terminator_reads_local_ref(guard.fail_term, exprs, expr_count, ref_index) ||
+        terminator_reads_local_ref(guard.fail_body.then_term, exprs, expr_count, ref_index) ||
+        terminator_reads_local_ref(guard.fail_body.else_term, exprs, expr_count, ref_index) ||
+        terminator_reads_local_ref(guard.fail_body.direct_term, exprs, expr_count, ref_index))
+        return true;
+    for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
+        const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
+        if (terminator_reads_local_ref(arm.direct_term, exprs, expr_count, ref_index)) return true;
+    }
+    return false;
+}
+
 static bool terminator_reads_any_local(const HirTerminator& term,
                                        const HirLocal* locals,
                                        u32 local_count,
@@ -13719,6 +13736,9 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
                     arm.direct_term, route.exprs.data, route.exprs.len, ref) ||
                 terminator_reads_local_ref(arm.then_term, route.exprs.data, route.exprs.len, ref) ||
                 terminator_reads_local_ref(arm.else_term, route.exprs.data, route.exprs.len, ref);
+            for (u32 gi = 0; gi < arm.guards.len && !retained[li]; gi++)
+                retained[li] = guard_terminators_read_local_ref(
+                    arm.guards[gi], mod, route.exprs.data, route.exprs.len, ref);
         }
         // Deferred JSON locals can depend on success-only if-let bindings (and
         // those bindings can in turn depend on another arm local). Retain the

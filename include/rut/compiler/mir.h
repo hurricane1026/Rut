@@ -258,7 +258,7 @@ struct MirHeaderKV {
 
 struct MirTerminator {
     static constexpr u32 kMaxJsonDynamicValues = 8;
-    static constexpr u32 kMaxJsonMaterializedValues = kMaxJsonDynamicValues + 1;
+    static constexpr u32 kMaxJsonMaterializedValues = 64;
     MirTerminatorKind kind = MirTerminatorKind::ReturnStatus;
     Span span{};
     MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;

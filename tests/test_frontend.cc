@@ -32341,6 +32341,35 @@ route GET "/x" {
     REQUIRE_EQ(term.json_value_expr_indices.len, 8u);
 }
 
+TEST(frontend, return_json_allows_multiple_projected_struct_roots) {
+    const char* src = R"rut(
+struct Leaf4 { a: str, b: str, c: str, d: str }
+struct Container { left: Leaf4, right: Leaf4 }
+route GET "/x" {
+    let value = Container(
+        left: Leaf4(a: req.path, b: req.path, c: req.path, d: req.path),
+        right: Leaf4(a: req.path, b: req.path, c: req.path, d: req.path))
+    return 200, json({ left: value.left, right: value.right })
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.json_value_ref_indices.len, 8u);
+    REQUIRE_EQ(term.json_value_expr_indices.len, 10u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
 TEST(frontend, return_json_does_not_materialize_nested_struct_fields) {
     const char* src = R"rut(
 struct Leaf { value: str }
