@@ -273,6 +273,10 @@ static bool reject_replay_observation(void*, const harness::Observation&) {
     return false;
 }
 
+static bool reject_replay_body_observation(void*, const harness::Observation& event) {
+    return event.kind != harness::ObservationKind::ResponseBodyProduced;
+}
+
 TEST(harness_replay, maps_match_mismatch_and_failure_to_common_outcomes) {
     harness::HarnessSpec spec{};
     spec.layer = harness::ExecutionLayer::Connection;
@@ -727,6 +731,39 @@ TEST(harness_replay, publishes_dynamic_json_response_body_bytes) {
     CHECK(__builtin_memcmp(observed.bytes, kExpected, sizeof(kExpected) - 1) == 0);
     CHECK_EQ(result.replay.response_body_len, sizeof(kExpected) - 1);
     CHECK_EQ(result.harness.semantic_events, 2u);
+}
+
+TEST(harness_replay, body_oracle_mismatch_takes_precedence_over_unsupported_file_entry) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("backend", 0x7F000001, 9999);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(upstream.value())));
+    REQUIRE(cfg.add_jit_handler("/dynamic", 'G', &replay_dynamic_json_handler));
+    RoutedLoop rl;
+    rl.setup(&cfg);
+
+    CaptureEntry entries[2];
+    entries[0] = make_captured_request("GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    entries[1] = make_captured_request("GET /dynamic HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+    TempCapture tmp;
+    REQUIRE(tmp.create(entries, 2));
+    ReplayReader reader;
+    REQUIRE(reader.open(tmp.path) == 0);
+
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Connection;
+    spec.required_capabilities = harness::CapabilitySet::one(harness::Capability::SyntheticIo);
+    spec.environment_capabilities = spec.required_capabilities;
+    spec.observations.observe = &reject_replay_body_observation;
+
+    const auto result = harness::drive_replay_file(rl.loop, reader, spec);
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Mismatched);
+    CHECK_EQ(result.harness.cleanup, harness::CleanupOutcome::Clean);
+    CHECK_EQ(result.replay.total, 2u);
+    CHECK_EQ(result.replay.skipped, 1u);
+    CHECK_EQ(result.replay.replayed, 1u);
+    CHECK_EQ(result.replay.matched, 1u);
+    reader.close();
 }
 
 TEST(route, static_200) {

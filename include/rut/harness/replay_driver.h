@@ -48,7 +48,7 @@ inline bool publish_replay_result(const HarnessSpec& spec,
                                   : (replay.skipped ? Str{"unsupported", 11} : Str{"failed", 6});
     result.semantic_events++;
     if (!spec.observations.publish(event)) {
-        if (result.outcome == Outcome::Passed) {
+        if (result.outcome == Outcome::Passed || result.outcome == Outcome::Unsupported) {
             result.outcome = Outcome::Mismatched;
             set_detail(result, "observation rejected by oracle");
         }
@@ -74,7 +74,7 @@ inline bool publish_replay_result(const HarnessSpec& spec,
     result.semantic_events++;
     if (spec.observations.publish(body)) return true;
 
-    if (result.outcome == Outcome::Passed) {
+    if (result.outcome == Outcome::Passed || result.outcome == Outcome::Unsupported) {
         result.outcome = Outcome::Mismatched;
         set_detail(result, "observation rejected by oracle");
     }
