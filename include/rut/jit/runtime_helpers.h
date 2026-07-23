@@ -221,7 +221,7 @@ void rut_helper_resp_body(void* ctx,
                           const char* fallback_ptr,
                           rut::u32 fallback_len,
                           const char** out_ptr,
-                       rut::u32* out_len);
+                          rut::u32* out_len);
 void rut_helper_resp_header(void* ctx,
                             const char* name,
                             rut::u32 nlen,

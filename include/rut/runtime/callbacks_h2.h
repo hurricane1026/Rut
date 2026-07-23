@@ -433,7 +433,6 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     }
     if (o.response_ctx != nullptr && o.response_ctx->response_header_overflow) {
         h2_emit_status(d, stream_id, 500);
-        release_body_storage();
         return;
     }
     const u32 mutation_count =
@@ -446,7 +445,6 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                      remove ? "" : mutation.value.ptr,
                                      remove ? 0 : mutation.value.len) != HttpHeaderValidation::Ok) {
             h2_emit_status(d, stream_id, 500);
-            release_body_storage();
             return;
         }
         if (mutation.mode != jit::ResponseHeaderMutationMode::Add) {
@@ -463,7 +461,6 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         if (!remove && !h2_is_prohibited_response_header(mutation.name.ptr, mutation.name.len)) {
             if (nhdrs >= kMaxEffectiveHeaders) {
                 h2_emit_status(d, stream_id, 500);
-                release_body_storage();
                 return;
             }
             hdrs[nhdrs].name = mutation.name;

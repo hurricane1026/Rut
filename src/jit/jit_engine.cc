@@ -125,7 +125,7 @@ bool JitEngine::init() {
     // If kHelpers ever grows past kMaxHelpers, fail loudly instead of
     // silently skipping helpers (which would produce opaque JIT link
     // failures at runtime).
-    static constexpr u32 kMaxHelpers = 48;
+    static constexpr u32 kMaxHelpers = 64;
     u32 count = 0;
     for (const auto* h = kHelpers; h->name; h++) count++;
     if (count > kMaxHelpers) {

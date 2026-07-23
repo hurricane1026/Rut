@@ -1673,7 +1673,7 @@ TEST(h2_serving, terminal_outcome_releases_response_body_snapshots) {
     outcome.dynamic_response_body = snapshot;
     outcome.dynamic_response_body_len = sizeof(body) - 1;
     outcome.response_ctx = &ctx;
-    h2_emit_outcome(dispatch, 1, outcome, nullptr);
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
 
     CHECK(ctx.response_body_snapshot_storage == nullptr);
     CHECK(ctx.response_body_mutation_storage == nullptr);

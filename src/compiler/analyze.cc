@@ -6028,18 +6028,17 @@ static FrontendResult<void> instantiate_function_response_effects(
                 FrontendError::UnsupportedSyntax,
                 call_span,
                 lit_str("helper Response assignments cannot follow a captured Response field "
-                         "read"));
+                        "read"));
         for (u32 later = 0; later < fn.exprs.len; later++) {
             if (!is_response_effect(fn.exprs[later].kind) ||
                 fn.exprs[later].span.start <= fn.exprs[ei].span.start)
                 continue;
-            if (hir_expr_reads_response_field_before(fn.exprs[later],
-                                                     fn.exprs[ei].span.start))
+            if (hir_expr_reads_response_field_before(fn.exprs[later], fn.exprs[ei].span.start))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     call_span,
                     lit_str("helper Response assignments cannot follow a captured Response field "
-                             "read"));
+                            "read"));
         }
     }
     if (fn.owns_response_builder) {
@@ -6058,6 +6057,15 @@ static FrontendResult<void> instantiate_function_response_effects(
             call_span,
             lit_str("response-mutating helpers cannot follow a response field read"));
     if (!fn.owns_response_builder) {
+        u32 response_builder_count = 0;
+        for (u32 li = 0; li < route->locals.len; li++)
+            response_builder_count += route->locals[li].init.kind == HirExprKind::ResponseInit;
+        if (response_builder_count != 1)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                call_span,
+                lit_str("response-mutating helpers require exactly one Response builder in the "
+                        "route"));
         for (u32 pi = 0; pi < fn.params.len && pi < arg_count; pi++) {
             if (fn.params[pi].type != HirTypeKind::Response ||
                 args[pi].kind != HirExprKind::LocalRef)
@@ -6081,8 +6089,7 @@ static FrontendResult<void> instantiate_function_response_effects(
         if (!effect) return core::make_unexpected(effect.error());
         HirLocal carrier{};
         carrier.span = call_span;
-        if (fn.owns_response_builder)
-            carrier.name = lit_str("$helper_owned_response_effect");
+        if (fn.owns_response_builder) carrier.name = lit_str("$helper_owned_response_effect");
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         carrier.type = effect->type;
         carrier.init = effect.value();
@@ -11133,11 +11140,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         bool appended_response_effect = false;
         for (u32 li = locals_before_arg; li < route->locals.len; li++) {
             const auto kind = route->locals[li].init.kind;
-            appended_response_effect |= kind == HirExprKind::RespSetHeader ||
-                                        kind == HirExprKind::RespAddHeader ||
-                                        kind == HirExprKind::RespRemoveHeader ||
-                                        kind == HirExprKind::RespSetStatus ||
-                                        kind == HirExprKind::RespSetBody;
+            appended_response_effect |=
+                kind == HirExprKind::RespSetHeader || kind == HirExprKind::RespAddHeader ||
+                kind == HirExprKind::RespRemoveHeader || kind == HirExprKind::RespSetStatus ||
+                kind == HirExprKind::RespSetBody;
         }
         if (appended_response_effect) {
             for (u32 prior = 0; prior < param_index; prior++) {
@@ -13226,8 +13232,8 @@ static bool hir_expr_reads_response_field(const HirExpr& expr) {
     for (u32 i = 0; i < expr.args.len; i++)
         if (expr.args[i] != nullptr && hir_expr_reads_response_field(*expr.args[i])) return true;
     for (u32 i = 0; i < expr.field_inits.len; i++)
-         if (expr.field_inits[i].value != nullptr &&
-             hir_expr_reads_response_field(*expr.field_inits[i].value))
+        if (expr.field_inits[i].value != nullptr &&
+            hir_expr_reads_response_field(*expr.field_inits[i].value))
             return true;
     return false;
 }
@@ -13289,8 +13295,7 @@ static bool route_control_conditionally_reads_response_body(const HirRoute& rout
     for (u32 ai = 0; ai < control.match_arms.len; ai++) {
         const auto& arm = control.match_arms[ai];
         if (hir_expr_conditionally_reads_response_body(arm.pattern) ||
-            (arm.has_arm_guard &&
-             hir_expr_conditionally_reads_response_body(arm.arm_guard)) ||
+            (arm.has_arm_guard && hir_expr_conditionally_reads_response_body(arm.arm_guard)) ||
             (arm.body_kind == HirMatchArm::BodyKind::If &&
              hir_expr_conditionally_reads_response_body(arm.cond)))
             return true;
@@ -13349,16 +13354,14 @@ static bool route_reads_response_field(const HirRoute& route) {
     for (u32 fi = 0; fi < route.for_loops.len; fi++)
         if (hir_for_loop_reads_response_field(route.for_loops[fi])) return true;
     const auto& control = route.control;
-    if (control.kind == HirControlKind::If)
-        return hir_expr_reads_response_field(control.cond);
+    if (control.kind == HirControlKind::If) return hir_expr_reads_response_field(control.cond);
     if (control.kind != HirControlKind::Match) return false;
     if (hir_expr_reads_response_field(control.match_expr)) return true;
     for (u32 ai = 0; ai < control.match_arms.len; ai++) {
         const auto& arm = control.match_arms[ai];
         if (hir_expr_reads_response_field(arm.pattern) ||
             (arm.has_arm_guard && hir_expr_reads_response_field(arm.arm_guard)) ||
-            (arm.body_kind == HirMatchArm::BodyKind::If &&
-             hir_expr_reads_response_field(arm.cond)))
+            (arm.body_kind == HirMatchArm::BodyKind::If && hir_expr_reads_response_field(arm.cond)))
             return true;
         for (u32 gi = 0; gi < arm.guards.len; gi++)
             if (hir_expr_reads_response_field(arm.guards[gi].cond) ||
@@ -21605,7 +21608,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             FrontendError::UnsupportedSyntax,
                             stmt.span,
                             lit_str("Response scalar assignments after a guard are not supported; "
-                                     "move the assignment before the guard"));
+                                    "move the assignment before the guard"));
                     const bool saved_allow_respond_effects = route.allow_respond_effects;
                     route.allow_respond_effects = true;
                     route.response_assignment_stmt_ok = true;
@@ -21867,8 +21870,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         lit_str("Response builders cannot be copied or aliased in this slice"));
                 if (init->kind == HirExprKind::ResponseInit) {
                     for (u32 li = 0; li < route.locals.len; li++) {
-                        if (route.locals[li].name.eq(
-                                lit_str("$helper_owned_response_effect")))
+                        if (route.locals[li].name.eq(lit_str("$helper_owned_response_effect")))
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax,
                                 stmt.expr.span,
