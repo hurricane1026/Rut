@@ -8553,8 +8553,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         expr.kind == AstExprKind::Mul || expr.kind == AstExprKind::Div ||
         expr.kind == AstExprKind::Mod)
         return analyze_arith_expr(expr, route, mod, locals, local_count, binding);
-    const bool matches_payload_binding =
-        binding && binding->subject && expr.name.eq(binding->name);
+    const bool matches_payload_binding = binding && binding->subject && expr.name.eq(binding->name);
     // Locals declared inside an arm shadow its payload binding; the payload
     // binding itself shadows same-name locals from the enclosing scope.
     for (u32 ri = local_count; ri > 0; ri--) {
@@ -10316,9 +10315,9 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                         bool retained[HirRoute::kMaxLocals]{};
                         for (u32 li = 0; li < route->locals.len; li++)
                             retained[li] = terminator_reads_local_ref(term,
-                                                                     route->exprs.data,
-                                                                     route->exprs.len,
-                                                                     route->locals[li].ref_index);
+                                                                      route->exprs.data,
+                                                                      route->exprs.len,
+                                                                      route->locals[li].ref_index);
                         bool changed = true;
                         while (changed) {
                             changed = false;
@@ -10450,8 +10449,7 @@ static bool terminator_reads_local_ref(const HirTerminator& term,
                                        u32 expr_count,
                                        u32 ref_index) {
     if (term.kind != HirTerminatorKind::ReturnStatus) return false;
-    if (term.source_kind == HirTerminatorSourceKind::LocalRef &&
-        term.local_ref_index == ref_index)
+    if (term.source_kind == HirTerminatorSourceKind::LocalRef && term.local_ref_index == ref_index)
         return true;
     for (u32 i = 0; i < term.json_value_expr_indices.len; i++) {
         const u32 expr_index = term.json_value_expr_indices[i];
@@ -13716,12 +13714,11 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         bool retained[HirRoute::kMaxLocals]{};
         for (u32 li = saved_locals; li < route.locals.len; li++) {
             const u32 ref = route.locals[li].ref_index;
-            retained[li] = terminator_reads_local_ref(
-                               arm.direct_term, route.exprs.data, route.exprs.len, ref) ||
-                           terminator_reads_local_ref(
-                               arm.then_term, route.exprs.data, route.exprs.len, ref) ||
-                           terminator_reads_local_ref(
-                               arm.else_term, route.exprs.data, route.exprs.len, ref);
+            retained[li] =
+                terminator_reads_local_ref(
+                    arm.direct_term, route.exprs.data, route.exprs.len, ref) ||
+                terminator_reads_local_ref(arm.then_term, route.exprs.data, route.exprs.len, ref) ||
+                terminator_reads_local_ref(arm.else_term, route.exprs.data, route.exprs.len, ref);
         }
         // Deferred JSON locals can depend on success-only if-let bindings (and
         // those bindings can in turn depend on another arm local). Retain the
