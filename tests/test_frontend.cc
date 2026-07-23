@@ -30839,6 +30839,30 @@ TEST(frontend, parse_for_loop_rejects_missing_in) {
 }
 
 #endif
+TEST(frontend, guard_fail_json_resolves_scoped_struct_local) {
+    const char* src = R"rut(
+struct Payload { path: str }
+route GET "/x" {
+    guard false else {
+        let payload = Payload(path: req.path)
+        return 400, json(payload)
+    }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+}
+
 TEST(frontend, match_rejects_case_keyword_with_fixit) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200 => return 200 _ => return "
