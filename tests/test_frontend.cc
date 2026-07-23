@@ -7058,6 +7058,28 @@ route GET "/users" use chain access { return forward(api) }
     rir.destroy();
 }
 
+TEST(frontend, chain_after_rejects_response_scalar_effects_before_forward) {
+    const char* src = R"rut(
+upstream api at "127.0.0.1:9000"
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "not-forwarded"
+    0
+}
+chain access { after rewrite(resp) }
+route GET "/users" use chain access { return forward(api) }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK(
+        hir.error().detail.eq(lit("Response status/body effects require a buffered response and "
+                                  "cannot be combined with forward yet")));
+}
+
 TEST(frontend, chain_after_rejects_invalid_response_helpers) {
     struct Case {
         const char* src;
@@ -7137,6 +7159,48 @@ route GET "/users" use chain access {
             found_committing_terminal = true;
     }
     CHECK(found_committing_terminal);
+}
+
+TEST(frontend, chain_after_lowers_mutable_response_status_and_body) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "rewritten"
+    0
+}
+chain rewrite_response { after rewrite(resp) }
+route GET "/x" use chain rewrite_response {
+    wait(1)
+    return 200, "original"
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.commit_response_mutations);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    u32 statuses = 0;
+    u32 bodies = 0;
+    u32 commits = 0;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            statuses += block.insts[ii].op == rir::Opcode::RespSetStatus;
+            bodies += block.insts[ii].op == rir::Opcode::RespSetBody;
+            commits += block.insts[ii].op == rir::Opcode::RespCommitHeaders;
+        }
+    }
+    CHECK_EQ(statuses, 1u);
+    CHECK_EQ(bodies, 1u);
+    CHECK_EQ(commits, 1u);
+    rir.destroy();
 }
 
 TEST(frontend, parse_func_param_accepts_underscore_label) {
@@ -32649,6 +32713,133 @@ TEST(frontend, dynamic_response_headers_reject_multiple_response_builders) {
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
+    }
+}
+
+TEST(frontend, response_scalar_mutations_reject_multiple_response_builders) {
+    const char* src = R"rut(
+route GET "/x" {
+    let a = response(200)
+    let b = response(201)
+    a.status = 202
+    b.body = "wrong-builder"
+    return a
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK(hir.error().detail.eq(
+        lit("response scalar mutations require exactly one Response builder in the route")));
+}
+
+TEST(frontend, response_scalar_mutation_rejects_later_shadowing_builder) {
+    const char* src = R"rut(
+route GET "/x" {
+    let r = response(200)
+    r.status = 201
+    let r = response(202)
+    return r
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+}
+
+TEST(frontend, response_assignments_are_statement_only) {
+    const char* cases[] = {
+        "route GET \"/x\" { let resp = response(200) "
+        "let ignored = resp.status = 201 return resp }\n",
+        "route GET \"/x\" { let resp = response(200) "
+        "let ignored = resp.body = \"hidden\" return resp }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response assignments are only allowed as standalone statements")));
+    }
+}
+
+TEST(frontend, response_assignment_cannot_read_wait_result_state) {
+    const char* rejected = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    let ev = wait(1ms)
+    resp.status = 200 + ev.result
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(rejected));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("Response assignments cannot read wait-result state")));
+
+    // A post-wait assignment from state already captured before the wait does
+    // not read the resume slots and remains valid.
+    const char* pre_wait_value = R"rut(
+route GET "/x" {
+    let resp = response(200)
+    let code = 201
+    wait(1ms)
+    resp.status = code
+    return resp
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(lower_src_to_rir(pre_wait_value, rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, response_scalar_mutations_reject_conditional_helper_effects) {
+    const char* cases[] = {
+        R"rut(
+func rewrite(_ resp: Response, _ enabled: bool) -> i32 {
+    if enabled {
+        resp.status = 201
+    } else {
+        resp.status = 202
+    }
+}
+)rut",
+        R"rut(
+func rewrite(_ resp: Response, _ enabled: bool) -> str {
+    match enabled {
+        true => {
+            resp.body = "conditional"
+        }
+        false => {
+            resp.body = "fallback"
+        }
+    }
+}
+)rut",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("Response assignments are only supported in unconditional effect positions")));
     }
 }
 

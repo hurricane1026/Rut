@@ -157,6 +157,10 @@ enum class AstExprKind : u8 {
     And,
     Or,
     Pipe,
+    // Assignment is parsed as the lowest-precedence expression so the
+    // analyzer can issue a precise diagnostic. The only accepted targets are
+    // mutable Response fields (`resp.status` and `resp.body`).
+    Assign,
     Wait,
 };
 

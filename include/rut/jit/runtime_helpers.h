@@ -201,6 +201,11 @@ void rut_helper_resp_set_header(
 void rut_helper_resp_add_header(
     void* ctx, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_resp_remove_header(void* ctx, const char* name, rut::u32 nlen);
+void rut_helper_resp_set_status(void* ctx, rut::i32 status);
+void rut_helper_resp_set_body(void* ctx, const char* body, rut::u32 len);
+// Return a lazily acquired Response.body mutation buffer to the current
+// thread's bounded cache and clear the HandlerCtx pointer. Safe on null.
+void rut_helper_resp_release_body_storage(void* ctx);
 void rut_helper_resp_commit_headers(void* ctx);
 void rut_helper_resp_header(void* ctx,
                             const char* name,

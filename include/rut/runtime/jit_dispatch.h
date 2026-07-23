@@ -73,6 +73,38 @@ inline constexpr bool response_status_forbids_body(u16 status) {
     return status < 200 || status == 204 || status == 205 || status == 304;
 }
 
+// Resolve committed Response scalar mutations with the same precedence for
+// production dispatch, deterministic harnessing, replay, and simulation.
+inline u16 effective_return_status(const jit::HandlerResult& result, const jit::HandlerCtx& ctx) {
+    if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) return 500;
+    const u16 status = ctx.response_status_set ? ctx.response_status : result.status_code;
+    const bool dynamic_body_failed =
+        result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
+        !ctx.response_body_mutation_set &&
+        (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr);
+    return dynamic_body_failed && !response_status_forbids_body(status) ? 500 : status;
+}
+
+// Apply the complete terminal precedence while retaining ABI fields that stay
+// meaningful (notably committed headers). Consumers that operate on the packed
+// HandlerResult directly use this instead of reconstructing only scalar status.
+inline jit::HandlerResult effective_return_result(const jit::HandlerResult& result,
+                                                  const jit::HandlerCtx& ctx) {
+    if (result.action != jit::HandlerAction::ReturnStatus) return result;
+    if (ctx.response_status_invalid || ctx.response_body_mutation_overflow)
+        return jit::HandlerResult::make_status(effective_return_status(result, ctx));
+
+    jit::HandlerResult effective = result;
+    effective.status_code = effective_return_status(result, ctx);
+    if (ctx.response_body_mutation_set) {
+        effective.upstream_id = jit::HandlerResult::kDynamicResponseBody;
+    } else if (result.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
+               (ctx.response_body_valid == 0 || ctx.response_body_data == nullptr)) {
+        effective.upstream_id = 0;
+    }
+    return effective;
+}
+
 // Round-up conversion from ms to seconds. Callers using a 1-second
 // TimerWheel (legacy keepalive mechanism) can use this to bucket timer_ms.
 // Native ms-precision paths (IORING_OP_TIMEOUT / epoll min-heap) should
@@ -149,13 +181,20 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
     if (fn == nullptr) return out;  // Kind::Error by default
 
     const u64 packed = fn(conn, &ctx, req_data, req_len, arena);
-    const auto r = jit::HandlerResult::unpack(packed);
+    const auto raw = jit::HandlerResult::unpack(packed);
+    const auto r = effective_return_result(raw, ctx);
 
     switch (r.action) {
         case jit::HandlerAction::ReturnStatus:
             out.kind = JitDispatchOutcome::Kind::ReturnStatus;
             out.status_code = r.status_code;
             out.response_ctx = &ctx;
+            if (ctx.response_status_invalid || ctx.response_body_mutation_overflow) {
+                out.response_body_idx = 0;
+                out.dynamic_response_body = nullptr;
+                out.dynamic_response_body_len = 0;
+                return out;
+            }
             // ABI: upstream_id carries a 1-based response-body index
             // and next_state a 1-based response-header-set index for
             // ReturnStatus (0 = no custom body / no custom headers;
@@ -163,17 +202,23 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             // vs. headers-only empty body — is documented on the
             // response_body_idx field above).
             if (r.upstream_id == jit::HandlerResult::kDynamicResponseBody) {
-                // A failed/overflowed serializer is a server error, never a
-                // partial JSON response. The helper clears valid before work.
-                if ((ctx.response_body_valid == 0 || ctx.response_body_data == nullptr) &&
-                    !response_status_forbids_body(out.status_code)) {
-                    out.status_code = 500;
+                // A committed Response.body replacement supersedes the
+                // terminal body's serializer result. In particular, a failed
+                // JSON serialization that is being replaced must not force a
+                // 500 while the replacement itself is valid.
+                if (ctx.response_body_mutation_set) {
+                    out.response_body_idx = 0;
                 } else if (ctx.response_body_valid != 0 && ctx.response_body_data != nullptr) {
                     out.dynamic_response_body = ctx.response_body_data;
                     out.dynamic_response_body_len = ctx.response_body_len;
                 }
             } else {
                 out.response_body_idx = r.upstream_id;
+            }
+            if (ctx.response_body_mutation_set) {
+                out.response_body_idx = 0;
+                out.dynamic_response_body = ctx.response_body_mutation_storage;
+                out.dynamic_response_body_len = ctx.response_body_mutation_len;
             }
             out.response_headers_idx = r.next_state;
             return out;

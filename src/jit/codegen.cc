@@ -403,6 +403,8 @@ struct Ctx {
     LLVMValueRef fn_resp_set_header = nullptr;
     LLVMValueRef fn_resp_add_header = nullptr;
     LLVMValueRef fn_resp_remove_header = nullptr;
+    LLVMValueRef fn_resp_set_status = nullptr;
+    LLVMValueRef fn_resp_set_body = nullptr;
     LLVMValueRef fn_resp_commit_headers = nullptr;
     LLVMValueRef fn_resp_header = nullptr;
     LLVMValueRef get_resp_set_header() {
@@ -428,6 +430,22 @@ struct Ctx {
                 llvm_mod, "rut_helper_resp_remove_header", LLVMFunctionType(void_ty, params, 3, 0));
         }
         return fn_resp_remove_header;
+    }
+    LLVMValueRef get_resp_set_status() {
+        if (!fn_resp_set_status) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty};
+            fn_resp_set_status = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_set_status", LLVMFunctionType(void_ty, params, 2, 0));
+        }
+        return fn_resp_set_status;
+    }
+    LLVMValueRef get_resp_set_body() {
+        if (!fn_resp_set_body) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            fn_resp_set_body = LLVMAddFunction(
+                llvm_mod, "rut_helper_resp_set_body", LLVMFunctionType(void_ty, params, 3, 0));
+        }
+        return fn_resp_set_body;
     }
     LLVMValueRef get_resp_commit_headers() {
         if (!fn_resp_commit_headers) {
@@ -1143,6 +1161,22 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                            args,
                            3,
                            "");
+            break;
+        }
+        case rir::Opcode::RespSetStatus: {
+            LLVMValueRef status = c.get_value(inst.operands[0]);
+            LLVMValueRef args[] = {c.param_ctx, status};
+            LLVMValueRef helper = c.get_resp_set_status();
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 2, "");
+            break;
+        }
+        case rir::Opcode::RespSetBody: {
+            LLVMValueRef value = c.get_value(inst.operands[0]);
+            LLVMValueRef ptr = LLVMBuildExtractValue(c.builder, value, 0, "respbody.ptr");
+            LLVMValueRef len = LLVMBuildExtractValue(c.builder, value, 1, "respbody.len");
+            LLVMValueRef args[] = {c.param_ctx, ptr, len};
+            LLVMValueRef helper = c.get_resp_set_body();
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 3, "");
             break;
         }
         case rir::Opcode::RespCommitHeaders: {

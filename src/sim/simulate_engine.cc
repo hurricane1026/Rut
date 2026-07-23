@@ -623,12 +623,7 @@ static SimulateResult finalize_handler_result(const Engine& engine,
 
     result.action = unpacked.action;
     if (unpacked.action == jit::HandlerAction::ReturnStatus) {
-        result.actual_status =
-            unpacked.upstream_id == jit::HandlerResult::kDynamicResponseBody &&
-                    (context.response_body_valid == 0 || context.response_body_data == nullptr) &&
-                    !response_status_forbids_body(unpacked.status_code)
-                ? 500
-                : unpacked.status_code;
+        result.actual_status = effective_return_status(unpacked, context);
         result.verdict =
             (result.actual_status == entry.resp_status && entry.upstream_name[0] == '\0')
                 ? Verdict::Match

@@ -431,6 +431,18 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
+    if (expr.kind == HirExprKind::RespSetStatus || expr.kind == HirExprKind::RespSetBody) {
+        if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto value = mir_value(*expr.lhs, module, fn, ctx);
+        if (!value) return core::make_unexpected(value.error());
+        if (!fn->values.push(value.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        v.kind = expr.kind == HirExprKind::RespSetStatus ? MirValueKind::RespSetStatus
+                                                         : MirValueKind::RespSetBody;
+        v.type = value->type;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqParam) {
         v.kind = MirValueKind::ReqParam;
         v.type = MirTypeKind::Str;
@@ -1114,7 +1126,9 @@ FrontendResult<MirModule*> build_mir(const HirModule& module) {
                 module.routes[i].locals[li].init.kind != HirExprKind::ReqAddHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespSetHeader &&
                 module.routes[i].locals[li].init.kind != HirExprKind::RespAddHeader &&
-                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader)
+                module.routes[i].locals[li].init.kind != HirExprKind::RespRemoveHeader &&
+                module.routes[i].locals[li].init.kind != HirExprKind::RespSetStatus &&
+                module.routes[i].locals[li].init.kind != HirExprKind::RespSetBody)
                 continue;
             if (module.routes[i].locals[li].is_wait_result) continue;
             MirLocal local{};

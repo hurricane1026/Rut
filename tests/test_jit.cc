@@ -41,6 +41,7 @@ struct TestHandlerCtxFrame {
     u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
 
     TestHandlerCtxFrame() { ctx.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+    ~TestHandlerCtxFrame() { rut_helper_resp_release_body_storage(&ctx); }
 };
 
 // RAII wrapper — frontend APIs (parse_file/analyze_file/build_mir) all
@@ -1803,6 +1804,7 @@ func response_headers(_ resp: Response) -> i32 {
 }
 chain access { after response_headers(resp) }
 route GET "/api/users" use chain access {
+    guard req.http11 else { return 505 }
     wait(5)
     return 200
 }
@@ -1824,6 +1826,18 @@ route GET "/api/users" use chain access {
     REQUIRE(engine.compile(cg.mod, cg.ctx));
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame rejected_frame{};
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(nullptr,
+                                                        &rejected_frame.ctx,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    REQUIRE(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505u);
+    CHECK_FALSE(rejected_frame.ctx.response_status_set);
+    CHECK_FALSE(rejected_frame.ctx.response_body_mutation_set);
 
     TestHandlerCtxFrame frame{};
     auto yielded = HandlerResult::unpack(handler(nullptr,
@@ -1854,6 +1868,133 @@ route GET "/api/users" use chain access {
 
     engine.shutdown();
     rir.destroy();
+}
+
+TEST(jit, chain_after_response_status_and_body_survive_wait) {
+    const auto src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    resp.body = "after-wait"
+    0
+}
+chain access { after rewrite(resp) }
+route GET "/api/users" use chain access {
+    guard req.http11 else { return 505 }
+    wait(5)
+    return 200, "before-wait"
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    TestHandlerCtxFrame rejected_frame{};
+    static const char kHttp10Request[] = "GET /api/users HTTP/1.0\r\nHost: localhost\r\n\r\n";
+    const auto rejected = HandlerResult::unpack(handler(nullptr,
+                                                        &rejected_frame.ctx,
+                                                        reinterpret_cast<const u8*>(kHttp10Request),
+                                                        sizeof(kHttp10Request) - 1,
+                                                        nullptr));
+    REQUIRE(rejected.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(rejected.status_code, 505u);
+    CHECK_FALSE(rejected_frame.ctx.response_status_set);
+    CHECK_FALSE(rejected_frame.ctx.response_body_mutation_set);
+
+    TestHandlerCtxFrame frame{};
+    auto yielded = HandlerResult::unpack(handler(nullptr,
+                                                 &frame.ctx,
+                                                 reinterpret_cast<const u8*>(kGetApiRequest),
+                                                 sizeof(kGetApiRequest) - 1,
+                                                 nullptr));
+    REQUIRE(yielded.action == HandlerAction::Yield);
+    CHECK_FALSE(frame.ctx.response_status_set);
+    CHECK_FALSE(frame.ctx.response_body_mutation_set);
+
+    frame.ctx.state = yielded.next_state;
+    frame.ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+    frame.ctx.resume_event_result = 0;
+    const auto outcome = invoke_jit_handler(handler,
+                                            nullptr,
+                                            frame.ctx,
+                                            reinterpret_cast<const u8*>(kGetApiRequest),
+                                            sizeof(kGetApiRequest) - 1,
+                                            nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 201u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str rewritten{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(rewritten.eq(lit("after-wait")));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, response_body_mutation_overflow_fails_closed) {
+    TestHandlerCtxFrame frame{};
+    static char body[kMaxResponseBodyMutationBytes + 1]{};
+    rut_helper_resp_set_body(&frame.ctx, body, sizeof(body));
+    rut_helper_resp_commit_headers(&frame.ctx);
+    CHECK(frame.ctx.response_body_mutation_overflow);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(200).pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 500u);
+    CHECK(outcome.dynamic_response_body == nullptr);
+}
+
+TEST(jit, response_body_mutation_copies_source_bytes) {
+    TestHandlerCtxFrame frame{};
+    char body[] = "stable";
+    rut_helper_resp_set_body(&frame.ctx, body, sizeof(body) - 1);
+    __builtin_memset(body, 'x', sizeof(body) - 1);
+    rut_helper_resp_commit_headers(&frame.ctx);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        return HandlerResult::make_status(200).pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str copied{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(copied.eq(lit("stable")));
+    CHECK(outcome.dynamic_response_body == frame.ctx.response_body_mutation_storage);
+}
+
+TEST(jit, response_body_mutation_replaces_failed_dynamic_json) {
+    TestHandlerCtxFrame frame{};
+    rut_helper_resp_set_status(&frame.ctx, 202);
+    rut_helper_resp_set_body(&frame.ctx, "replacement", 11);
+    rut_helper_resp_commit_headers(&frame.ctx);
+    REQUIRE(frame.ctx.response_body_mutation_set);
+    CHECK_EQ(frame.ctx.response_body_valid, 0u);
+
+    const auto terminal = +[](void*, HandlerCtx*, const u8*, u32, void*) -> u64 {
+        HandlerResult result = HandlerResult::make_status(200);
+        result.upstream_id = HandlerResult::kDynamicResponseBody;
+        return result.pack();
+    };
+    const auto outcome = invoke_jit_handler(terminal, nullptr, frame.ctx, nullptr, 0, nullptr);
+    CHECK(outcome.kind == JitDispatchOutcome::Kind::ReturnStatus);
+    CHECK_EQ(outcome.status_code, 202u);
+    REQUIRE(outcome.dynamic_response_body != nullptr);
+    const Str replacement{outcome.dynamic_response_body, outcome.dynamic_response_body_len};
+    CHECK(replacement.eq(lit("replacement")));
 }
 
 TEST(jit, cache_helpers_miss_and_out_of_range) {
@@ -19937,6 +20078,32 @@ TEST(jit_dispatch, timer_seconds_rounds_up_from_ms) {
     CHECK_EQ(timer_seconds_from_ms(1000), 1);  // 1000ms → 1s (exact)
     CHECK_EQ(timer_seconds_from_ms(1001), 2);  // 1001ms → 2s
     CHECK_EQ(timer_seconds_from_ms(2500), 3);  // 2500ms → 3s
+}
+
+TEST(jit_dispatch, effective_return_status_applies_committed_scalar_precedence) {
+    auto result = HandlerResult::make_status(200);
+    HandlerCtx ctx{};
+    CHECK_EQ(effective_return_status(result, ctx), 200u);
+
+    ctx.response_status_set = true;
+    ctx.response_status = 201;
+    CHECK_EQ(effective_return_status(result, ctx), 201u);
+
+    ctx.response_status_invalid = true;
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
+    ctx.response_status_invalid = false;
+    ctx.response_body_mutation_overflow = true;
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
+
+    ctx = {};
+    result.upstream_id = HandlerResult::kDynamicResponseBody;
+    CHECK_EQ(effective_return_status(result, ctx), 500u);
+    ctx.response_body_mutation_set = true;
+    CHECK_EQ(effective_return_status(result, ctx), 200u);
+    ctx.response_status_set = true;
+    ctx.response_status = 204;
+    ctx.response_body_mutation_set = false;
+    CHECK_EQ(effective_return_status(result, ctx), 204u);
 }
 
 TEST(jit_dispatch, wait_handler_yields_then_resumes_to_status) {

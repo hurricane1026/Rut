@@ -19,6 +19,7 @@
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/rate_limit_enforce.h"
+#include "rut/runtime/response_body_storage.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -393,6 +394,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      const JitDispatchOutcome& o,
                      const RouteConfig* cfg,
                      bool head_request) {
+    jit::ScopedResponseBodyMutationStorageRelease release_body_storage(o.response_ctx);
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.dynamic_response_body != nullptr) {
@@ -524,6 +526,8 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
+    if (h2.async_stream != 0 && h2.async_kind == H2AsyncKind::Timer)
+        rut_helper_resp_release_body_storage(static_cast<void*>(h2.async_jit_ctx()));
     h2.async_stream = 0;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
@@ -557,16 +561,23 @@ inline void h2_rebase_synth_view(Str& view,
 }
 
 inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
-                                      const jit::HandlerCtx& live,
+                                      jit::HandlerCtx& live,
                                       const u8* old_synth,
                                       u32 synth_len) {
-    if (live.slot_count > kMaxJitHandlerSlots) return false;
+    if (live.slot_count > kMaxJitHandlerSlots ||
+        live.response_header_pending_count > jit::kMaxResponseHeaderMutations ||
+        live.route_param_count > kMaxRouteParams)
+        return false;
     const size_t kBytes = sizeof(jit::HandlerCtx) + static_cast<size_t>(live.slot_count) * 8;
     auto* parked = h2.async_jit_ctx();
     __builtin_memcpy(parked, &live, kBytes);
 
+    // The parked frame now owns the lazily allocated mutation buffer. Clear the
+    // connection scratch copy so another H2 stream can reset it without freeing
+    // bytes still needed by this suspended stream.
+    live.response_body_mutation_storage = nullptr;
+
     const u32 kMutationCount = parked->response_header_pending_count;
-    if (kMutationCount > jit::kMaxResponseHeaderMutations) return false;
     for (u32 i = 0; i < kMutationCount; i++) {
         h2_rebase_synth_view(
             parked->response_header_mutations[i].name, old_synth, h2.pending_synth, synth_len);
@@ -574,7 +585,6 @@ inline bool h2_snapshot_async_jit_ctx(Http2Conn& h2,
             parked->response_header_mutations[i].value, old_synth, h2.pending_synth, synth_len);
     }
     const u32 kParamCount = parked->route_param_count;
-    if (kParamCount > kMaxRouteParams) return false;
     for (u32 i = 0; i < kParamCount; i++) {
         Str value{parked->route_params[i].value, parked->route_params[i].value_len};
         h2_rebase_synth_view(value, old_synth, h2.pending_synth, synth_len);
@@ -619,7 +629,7 @@ template <typename Loop>
 bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       u32 stream_id,
                       jit::HandlerFn fn,
-                      const jit::HandlerCtx& live_ctx,
+                      jit::HandlerCtx& live_ctx,
                       const JitDispatchOutcome& o,
                       const RouteConfig* cfg,
                       const u8* synth,
@@ -698,11 +708,14 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     const JitDispatchOutcome kOutcome = invoke_jit_handler(
         route->fn, static_cast<void*>(d.conn), *ctx, synth, synth_len, /*arena=*/nullptr);
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
-        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len))
+        if (!h2_suspend_timer(d, stream_id, route->fn, *ctx, kOutcome, cfg, synth, synth_len)) {
+            jit::release_response_body_mutation_storage(ctx);
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+        }
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
+        jit::release_response_body_mutation_storage(ctx);
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
@@ -1045,9 +1058,16 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 [[nodiscard]] bool h2_arm_async_timer(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
+    auto* parked_ctx = h2->async_jit_ctx();
+    // Other streams in the same decoded batch may have reused the connection
+    // scratch context after this stream was parked. Release any lazy body
+    // buffer they acquired before replacing the scratch owner with the parked
+    // frame; otherwise that allocation becomes unreachable.
+    if (conn.handler_ctx != nullptr && conn.handler_ctx != parked_ctx)
+        rut_helper_resp_release_body_storage(conn.handler_ctx);
     conn.pending_handler_fn = h2->async_fn;
     conn.handler_state = h2->async_state;
-    conn.handler_ctx = h2->async_jit_ctx();
+    conn.handler_ctx = parked_ctx;
     conn.pending_yield_kind = jit::YieldKind::Timer;
     conn.transition_to_exec_handler_wait();
     return loop->schedule_yield_timer(conn, h2->async_timer_ms);

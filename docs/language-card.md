@@ -223,8 +223,8 @@ resp.set("X-Request-Path", req.path) // ✅ dynamic value
 resp.remove("Server")             // ✅ literal delete
 resp.add("Set-Cookie", "a=1")     // ✅ literal append/multi-value
 resp.header("Retry-After")        // ✅ str?; observes prior set/add/remove mutations
-resp.body = json(data)            // body
-resp.status                       // StatusCode, read/write
+resp.body = "retry later"         // ✅ bounded plain-string body replacement
+resp.status = 503                 // ✅ StatusCode replacement
 return resp
 return 200, json({ ok: true, items: [] }) // ✅ compact literal JSON body
 ```
@@ -233,11 +233,15 @@ Dynamic Response header mutations are stored in the resumable handler context,
 so pending mutations survive `wait` and remain isolated per request/stream. A
 handler-local builder must be returned directly. A `chain after` helper
 must have exactly one `Response` parameter and may use `set`/`add`/`remove` with
-literal names and runtime string values; its effects apply to successful direct
-and forwarded responses. Mutations stay pending until the selected success
-terminator, so a guard or pre-middleware short circuit cannot inherit them.
-Reading or changing a buffered response body/status remains ⏳ and needs a
-resumable, stream-owned runtime Response object.
+literal names and runtime string values; its header effects apply to successful
+direct and forwarded responses. Mutations stay pending until the selected
+success terminator, so a guard or pre-middleware short circuit cannot inherit
+them. Status/body writes use the same resumable commit boundary as headers, may
+be used by `chain after` after a yield, and require explicit buffered forwarding
+when applied to a forwarded response. Body replacement is a bounded plain `str`
+view (4 KiB maximum); overflow or a runtime status outside 100...599 fails
+closed as 500. Reading either field, assigning `json(...)`, and mutating a
+streaming forwarded response remain ⏳.
 
 ## State types (top-level, per-shard, bounded)
 
@@ -303,8 +307,9 @@ chain observability { after add_trace(req, resp) }
 route GET "/users" use chain observability { return forward(users) }
 ```
 
-`before` helpers may gate a route; `after` currently supports Response header
-effects only. Full buffered body/status middleware remains ⏳.
+`before` helpers may gate a route; `after` supports committed Response header,
+status, and bounded plain-string body writes. Reading or incrementally editing
+a buffered body remains ⏳.
 
 ## I/O
 

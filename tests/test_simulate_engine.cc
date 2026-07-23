@@ -524,6 +524,61 @@ route GET "/json" {
     rir.destroy();
 }
 
+TEST(simulate_engine, committed_response_status_after_wait_matches_production) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 201
+    0
+}
+chain access { after rewrite(resp) }
+route GET "/mutated" use chain access {
+    wait(5)
+    return 200
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    const auto result =
+        simulate_one(engine, make_entry("GET /mutated HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 201u);
+    CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, committed_body_replaces_failed_dynamic_json) {
+    const char* src = R"rut(
+func rewrite(_ resp: Response) -> i32 {
+    resp.status = 202
+    resp.body = "replacement"
+    0
+}
+chain access { after rewrite(resp) }
+route GET "/json" use chain access {
+    return 200, json({ value: req.header("X-Value").or("") })
+}
+)rut";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    static const char kRequest[] = "GET /json HTTP/1.1\r\nHost: x\r\nX-Value: \xc0\x80\r\n\r\n";
+    const auto result = simulate_one(engine, make_entry(kRequest, 202));
+
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 202u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(simulate_engine, req_body_route_is_unsupported_for_header_only_capture) {
     const char* src =
         "route POST \"/upload\" { if req.body == \"payload\" { return 204 } else { return 400 } "
