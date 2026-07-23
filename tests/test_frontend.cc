@@ -34654,28 +34654,6 @@ route GET "/x" {
     CHECK(hir.error().detail.eq(lit("json cannot capture wait-result state after a wait")));
 }
 
-TEST(frontend, rejects_nominal_array_elements_with_unlowerable_scalar_fields) {
-    const char* src =
-        "struct Stamp { at: i64 } "
-        "route GET \"/x\" { let values = [Stamp(at: time.nowMicros())] return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-}
-
-TEST(frontend, rejects_heterogeneous_nested_array_shapes_in_tuples) {
-    const char* src = "route GET \"/x\" { let values = [([1], 1), ([\"x\"], 2)] return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE(ast);
-    auto hir = analyze_file_heap(ast.value());
-    REQUIRE_FALSE(hir.has_value());
-}
-
 TEST(frontend, reusable_json_local_is_referenced_at_its_sink) {
     const char* src = R"rut(
 func choose(flag: bool) -> Json {

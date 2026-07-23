@@ -1968,7 +1968,7 @@ route GET "/x" {
                                                           nullptr));
     REQUIRE(terminal_a.action == HandlerAction::ReturnStatus);
     REQUIRE(frame_a.ctx.response_body_mutation_set);
-    const Str body_a{frame_a.ctx.response_body_mutation_data,
+    const Str body_a{frame_a.ctx.response_body_mutation_storage,
                      frame_a.ctx.response_body_mutation_len};
     CHECK(body_a.eq(lit("{\"path\":\"/a\"}")));
 
@@ -1982,7 +1982,7 @@ route GET "/x" {
                                                           nullptr));
     REQUIRE(terminal_b.action == HandlerAction::ReturnStatus);
     REQUIRE(frame_b.ctx.response_body_mutation_set);
-    const Str body_b{frame_b.ctx.response_body_mutation_data,
+    const Str body_b{frame_b.ctx.response_body_mutation_storage,
                      frame_b.ctx.response_body_mutation_len};
     CHECK(body_b.eq(lit("{\"path\":\"/b\"}")));
     CHECK(body_a.eq(lit("{\"path\":\"/a\"}")));
@@ -2075,7 +2075,7 @@ route GET "/api/users" use chain access {
                                                         nullptr));
     REQUIRE(terminal.action == HandlerAction::ReturnStatus);
     REQUIRE(frame.ctx.response_body_mutation_set);
-    const Str body{frame.ctx.response_body_mutation_data, frame.ctx.response_body_mutation_len};
+    const Str body{frame.ctx.response_body_mutation_storage, frame.ctx.response_body_mutation_len};
     CHECK(body.eq(lit("{\"path\":\"/api/users\"}")));
 
     engine.shutdown();

@@ -80,17 +80,32 @@ thread_local JsonResponseScratch t_json_response;
 // the two eagerly lowered arms of an if-expression). Capture each completed
 // document into distinct invocation-owned storage so a later JsonBuild cannot
 // overwrite an earlier Str view before the select chooses between them. The
+struct JsonCaptureChunk {
+    char* data = nullptr;
+    u32 capacity = 0;
+    u32 used = 0;
+    JsonCaptureChunk* next = nullptr;
+};
+
 struct JsonCaptureArena {
     // A reusable plan may be published at many sinks, and every eagerly
     // lowered conditional arm gets its own bounded document capture. The HIR
     // expression/local limits bound the total below this request-local cap.
     static constexpr u32 kMaxCapacity = 64 * 1024 * 1024;
-    char* data = nullptr;
-    u32 capacity = 0;
+    JsonCaptureChunk* head = nullptr;
+    JsonCaptureChunk* current = nullptr;
+    u32 total_capacity = 0;
     u32 used = 0;
     u32 last_capture_len = 0xffffffffu;
 
-    ~JsonCaptureArena() { free(data); }
+    ~JsonCaptureArena() {
+        while (head != nullptr) {
+            JsonCaptureChunk* next = head->next;
+            free(head->data);
+            free(head);
+            head = next;
+        }
+    }
 };
 thread_local JsonCaptureArena t_json_captures;
 
@@ -184,6 +199,9 @@ void rut_helper_json_capture_reset() {
     // views live only for the current invocation, so rewinding is sufficient;
     // retaining the block avoids a 512 KiB malloc/free cycle on every JSON
     // request. JsonCaptureArena releases it when the worker thread exits.
+    for (JsonCaptureChunk* chunk = t_json_captures.head; chunk != nullptr; chunk = chunk->next)
+        chunk->used = 0;
+    t_json_captures.current = t_json_captures.head;
     t_json_captures.used = 0;
     t_json_captures.last_capture_len = 0xffffffffu;
 }
@@ -293,23 +311,45 @@ const char* rut_helper_json_capture_data() {
         captures.last_capture_len = 0xffffffffu;
         return nullptr;
     }
-    const u32 required = captures.used + capture_size;
-    if (required > captures.capacity) {
-        u32 grown = captures.capacity == 0 ? 64 * 1024 : captures.capacity;
-        while (grown < required && grown < JsonCaptureArena::kMaxCapacity)
-            grown = grown > JsonCaptureArena::kMaxCapacity / 2
-                        ? JsonCaptureArena::kMaxCapacity
-                        : grown * 2;
-        auto* resized = static_cast<char*>(realloc(captures.data, grown));
-        if (resized == nullptr) {
+    while (captures.current != nullptr &&
+           capture_size > captures.current->capacity - captures.current->used)
+        captures.current = captures.current->next;
+    if (captures.current == nullptr) {
+        const u32 previous_capacity = captures.head == nullptr ? 0 : captures.total_capacity;
+        u32 chunk_capacity = previous_capacity == 0 ? 64 * 1024 : previous_capacity;
+        if (chunk_capacity > JsonCaptureArena::kMaxCapacity - captures.total_capacity)
+            chunk_capacity = JsonCaptureArena::kMaxCapacity - captures.total_capacity;
+        if (chunk_capacity < capture_size) {
             captures.last_capture_len = 0xffffffffu;
             return nullptr;
         }
-        captures.data = resized;
-        captures.capacity = grown;
+        auto* chunk = static_cast<JsonCaptureChunk*>(malloc(sizeof(JsonCaptureChunk)));
+        if (chunk == nullptr) {
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        chunk->data = static_cast<char*>(malloc(chunk_capacity));
+        if (chunk->data == nullptr) {
+            free(chunk);
+            captures.last_capture_len = 0xffffffffu;
+            return nullptr;
+        }
+        chunk->capacity = chunk_capacity;
+        chunk->used = 0;
+        chunk->next = nullptr;
+        if (captures.head == nullptr) {
+            captures.head = chunk;
+        } else {
+            JsonCaptureChunk* tail = captures.head;
+            while (tail->next != nullptr) tail = tail->next;
+            tail->next = chunk;
+        }
+        captures.current = chunk;
+        captures.total_capacity += chunk_capacity;
     }
-    char* out = captures.data + captures.used;
+    char* out = captures.current->data + captures.current->used;
     if (t_json_response.len != 0) __builtin_memcpy(out, t_json_response.data, t_json_response.len);
+    captures.current->used += capture_size;
     captures.used += capture_size;
     captures.last_capture_len = t_json_response.len;
     return out;

@@ -602,6 +602,30 @@ static bool hir_type_shape_contains_array(const HirModule& mod, u32 shape_index,
     return false;
 }
 
+static bool hir_type_shape_contains_json(const HirModule& mod, u32 shape_index, u32 depth = 0) {
+    if (shape_index >= mod.type_shapes.len || depth > HirModule::kMaxTypeShapes) return false;
+    const auto& shape = mod.type_shapes[shape_index];
+    if (shape.type == HirTypeKind::Json) return true;
+    if (shape.type == HirTypeKind::Array)
+        return hir_type_shape_contains_json(mod, shape.array_elem_shape_index, depth + 1);
+    if (shape.type == HirTypeKind::Tuple) {
+        for (u32 i = 0; i < shape.tuple_len; i++)
+            if (hir_type_shape_contains_json(mod, shape.tuple_elem_shape_indices[i], depth + 1))
+                return true;
+    } else if (shape.type == HirTypeKind::Struct && shape.struct_index < mod.structs.len) {
+        const auto& st = mod.structs[shape.struct_index];
+        for (u32 i = 0; i < st.fields.len; i++)
+            if (hir_type_shape_contains_json(mod, st.fields[i].shape_index, depth + 1)) return true;
+    } else if (shape.type == HirTypeKind::Variant && shape.variant_index < mod.variants.len) {
+        const auto& variant = mod.variants[shape.variant_index];
+        for (u32 i = 0; i < variant.cases.len; i++)
+            if (variant.cases[i].has_payload &&
+                hir_type_shape_contains_json(mod, variant.cases[i].payload_shape_index, depth + 1))
+                return true;
+    }
+    return false;
+}
+
 static bool hir_type_shape_has_runtime_carrier(const HirModule& mod, u32 shape_index) {
     bool struct_visiting[HirModule::kMaxStructs]{};
     bool variant_visiting[HirModule::kMaxVariants]{};
@@ -3982,7 +4006,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                  u32 local_count,
                                                  const MatchPayloadBinding* binding,
                                                  bool allow_array_lit);
-static FrontendResult<void> build_dynamic_json_plan(
+static FrontendResult<void> build_reusable_json_plan(
     const AstExpr& expr,
     HirRoute* route,
     const HirModule& mod,
@@ -9662,7 +9686,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kJsonLiteralDetail);
         std::vector<std::string> segments(1);
         FixedVec<u32, HirTerminator::kMaxJsonDynamicValues> value_refs;
-        auto plan = build_dynamic_json_plan(
+        auto plan = build_reusable_json_plan(
             *expr.args[0], route, mod, segments, value_refs, locals, local_count, binding);
         if (!plan) return core::make_unexpected(plan.error());
         HirExpr out{};
@@ -10717,7 +10741,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             continue;
         HirLocal carrier{};
         carrier.span = expr.args[i]->span;
-        carrier.name = {"$call_arg", 9};
+        carrier.name = needs_reused_array_carrier ? Str{"$array_arg", 10} : Str{"$call_arg", 9};
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
         if (carrier.ref_index >= HirRoute::kMaxLocals)
             return frontend_error(FrontendError::TooManyItems, expr.args[i]->span);
@@ -11471,54 +11495,140 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 if (route == nullptr)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
-                auto body = analyze_expr(
-                    stmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
-                if (!body) return core::make_unexpected(body.error());
-                if (body->type != HirTypeKind::Json)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
-                if (route->waits.len != 0 &&
-                    hir_expr_reads_wait_result_with_locals(
-                        body.value(), route->locals.data, route->locals.len))
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        stmt.expr.span,
-                        lit_str("json cannot capture wait-result state after a wait"));
-                if (body->kind == HirExprKind::JsonBuild && body->field_inits.len == 0) {
-                    term.response_body = body->str_value;
-                } else if (body->kind == HirExprKind::JsonBuild) {
-                    for (u32 i = 0; i < body->field_inits.len; i++) {
-                        const auto& part = body->field_inits[i];
-                        if (part.value == nullptr || !term.json_segments.push(part.name))
-                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                        if (part.value->kind == HirExprKind::LocalRef) {
-                            if (!term.json_value_ref_indices.push(part.value->local_index))
-                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                            continue;
+                if (locals == nullptr) {
+                    locals = route->locals.data;
+                    local_count = route->locals.len;
+                }
+                const bool direct_json_call =
+                    stmt.expr.kind == AstExprKind::Call && stmt.expr.name.eq({"json", 4}) &&
+                    stmt.expr.args.len == 1 && stmt.expr.args[0] != nullptr;
+                if (direct_json_call) {
+                    std::string serialized;
+                    auto encoded = serialize_json_literal(*stmt.expr.args[0], serialized);
+                    if (encoded) {
+                        term.response_body = intern_generated_name(serialized);
+                    } else {
+                        std::vector<std::string> segments(1);
+                        auto plan = build_dynamic_json_plan(*stmt.expr.args[0],
+                                                            route,
+                                                            mod,
+                                                            locals,
+                                                            local_count,
+                                                            binding,
+                                                            segments,
+                                                            term.json_value_ref_indices,
+                                                            term.json_value_expr_indices);
+                        if (!plan) return core::make_unexpected(plan.error());
+                        if (route->waits.len != 0) {
+                            bool retained[HirRoute::kMaxLocals]{};
+                            for (u32 li = 0; li < route->locals.len; li++)
+                                retained[li] =
+                                    terminator_reads_local_ref(term,
+                                                               route->exprs.data,
+                                                               route->exprs.len,
+                                                               route->locals[li].ref_index);
+                            bool changed = true;
+                            while (changed) {
+                                changed = false;
+                                for (u32 li = 0; li < route->locals.len; li++) {
+                                    if (!retained[li]) continue;
+                                    for (u32 dep = 0; dep < route->locals.len; dep++) {
+                                        if (retained[dep] ||
+                                            !expr_reads_local_ref(route->locals[li].init,
+                                                                  route->locals[dep].ref_index))
+                                            continue;
+                                        retained[dep] = true;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            for (u32 li = 0; li < route->locals.len; li++)
+                                if (retained[li] && !route->locals[li].materialize_on_resume)
+                                    route->locals[li].rematerialize_after_wait = true;
                         }
-                        if (term.json_value_expr_indices.len >=
-                                HirTerminator::kMaxJsonMaterializedValues ||
-                            !route->exprs.push(*part.value))
-                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                        const u32 expr_index = route->exprs.len - 1;
-                        const u32 ref_index =
-                            HirRoute::kMaxLocals + term.json_value_expr_indices.len;
-                        if (!term.json_value_expr_indices.push(expr_index) ||
-                            !term.json_value_ref_indices.push(ref_index))
-                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        u32 minimum_bytes = 0;
+                        for (const auto& segment : segments) {
+                            if (segment.size() > kJsonResponseScratchCapacity - minimum_bytes)
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                            minimum_bytes += static_cast<u32>(segment.size());
+                        }
+                        for (u32 ji = 0; ji < term.json_value_ref_indices.len; ji++) {
+                            const u32 ref = term.json_value_ref_indices[ji];
+                            if (ref < HirRoute::kMaxLocals)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      stmt.expr.span);
+                            const u32 materialized_index = ref - HirRoute::kMaxLocals;
+                            if (materialized_index >= term.json_value_expr_indices.len)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      stmt.expr.span);
+                            const u32 expr_index = term.json_value_expr_indices[materialized_index];
+                            if (expr_index >= route->exprs.len)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      stmt.expr.span);
+                            const auto type = route->exprs[expr_index].type;
+                            const u32 encoded_minimum = type == HirTypeKind::Bool  ? 4u
+                                                        : type == HirTypeKind::Str ? 2u
+                                                                                   : 1u;
+                            if (encoded_minimum > kJsonResponseScratchCapacity - minimum_bytes)
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                            minimum_bytes += encoded_minimum;
+                        }
+                        for (const auto& segment : segments) {
+                            if (!term.json_segments.push(intern_generated_name(segment)))
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        }
+                        term.has_dynamic_response_body = true;
                     }
-                    if (!term.json_segments.push(body->str_value))
-                        return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                    term.has_dynamic_response_body = true;
                 } else {
-                    // A reusable Json value can be a conditional/helper plan,
-                    // not only a direct JsonBuild. Materialize that plan into
-                    // a captured Str at this selected sink, then stream the
-                    // captured document as the dynamic response body.
-                    if (!route->exprs.push(body.value()))
-                        return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
-                    term.json_body_expr_index = route->exprs.len - 1;
-                    term.has_dynamic_response_body = true;
+                    auto body = analyze_expr(stmt.expr, route, mod, locals, local_count, binding);
+                    if (!body) return core::make_unexpected(body.error());
+                    if (body->type != HirTypeKind::Json)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, stmt.expr.span, body_expr_detail);
+                    if (route->waits.len != 0 &&
+                        hir_expr_reads_wait_result_with_locals(
+                            body.value(), route->locals.data, route->locals.len))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            stmt.expr.span,
+                            lit_str("json cannot capture wait-result state after a wait"));
+                    if (body->kind == HirExprKind::JsonBuild && body->field_inits.len == 0) {
+                        term.response_body = body->str_value;
+                    } else if (body->kind == HirExprKind::JsonBuild) {
+                        for (u32 i = 0; i < body->field_inits.len; i++) {
+                            const auto& part = body->field_inits[i];
+                            if (part.value == nullptr || !term.json_segments.push(part.name))
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                            if (part.value->kind == HirExprKind::LocalRef) {
+                                if (!term.json_value_ref_indices.push(part.value->local_index))
+                                    return frontend_error(FrontendError::TooManyItems,
+                                                          stmt.expr.span);
+                                continue;
+                            }
+                            if (term.json_value_expr_indices.len >=
+                                    HirTerminator::kMaxJsonMaterializedValues ||
+                                !route->exprs.push(*part.value))
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                            const u32 expr_index = route->exprs.len - 1;
+                            const u32 ref_index =
+                                HirRoute::kMaxLocals + term.json_value_expr_indices.len;
+                            if (!term.json_value_expr_indices.push(expr_index) ||
+                                !term.json_value_ref_indices.push(ref_index))
+                                return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        }
+                        if (!term.json_segments.push(body->str_value))
+                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        term.has_dynamic_response_body = true;
+                    } else {
+                        // A reusable Json value can be a conditional/helper plan,
+                        // not only a direct JsonBuild. Materialize that plan into
+                        // a captured Str at this selected sink, then stream the
+                        // captured document as the dynamic response body.
+                        if (!route->exprs.push(body.value()))
+                            return frontend_error(FrontendError::TooManyItems, stmt.expr.span);
+                        term.json_body_expr_index = route->exprs.len - 1;
+                        term.has_dynamic_response_body = true;
+                    }
                 }
             }
         }
@@ -17666,6 +17776,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                       item.variant.span);
                             if (!payload_shape) return core::make_unexpected(payload_shape.error());
                             case_decl.payload_shape_index = payload_shape.value();
+                            if (hir_type_shape_contains_json(mod, case_decl.payload_shape_index))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      item.variant.span,
+                                                      kJsonOpaqueValueDetail);
                             if (!variant.cases.push(case_decl))
                                 return frontend_error(FrontendError::TooManyItems,
                                                       item.variant.span);
@@ -17698,6 +17812,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                            item.variant.span);
                 if (!payload_shape) return core::make_unexpected(payload_shape.error());
                 case_decl.payload_shape_index = payload_shape.value();
+                if (hir_type_shape_contains_json(mod, case_decl.payload_shape_index))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.variant.span,
+                                          kJsonOpaqueValueDetail);
                 if (hir_type_shape_contains_array(mod, case_decl.payload_shape_index))
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
