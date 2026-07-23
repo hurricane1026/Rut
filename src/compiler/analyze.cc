@@ -483,6 +483,7 @@ enum class KnownValueState : u8 {
 
 struct MatchPayloadBinding {
     Str name{};
+    u32 outer_local_count = 0;
     HirTypeKind type = HirTypeKind::Unknown;
     u32 generic_index = 0xffffffffu;
     bool generic_has_error_constraint = false;
@@ -4941,8 +4942,10 @@ static void bind_match_payload(MatchPayloadBinding* binding,
                                Str name,
                                const HirVariant::CaseDecl& case_decl,
                                u32 case_index,
-                               const HirExpr* subject) {
+                               const HirExpr* subject,
+                               u32 outer_local_count) {
     binding->name = name;
+    binding->outer_local_count = outer_local_count;
     binding->type = case_decl.payload_type;
     binding->generic_index = case_decl.payload_generic_index;
     binding->generic_has_error_constraint = case_decl.payload_generic_has_error_constraint;
@@ -5824,7 +5827,8 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                                    arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
-                                   subject_ptr);
+                                   subject_ptr,
+                                   local_count);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -5998,8 +6002,12 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                 const u32 case_index = static_cast<u32>(pattern->int_value);
                 const auto& case_decl = mod.variants[pattern->variant_index].cases[case_index];
                 if (case_decl.has_payload && arm.pattern->lhs != nullptr) {
-                    bind_match_payload(
-                        &arm_binding, arm.pattern->lhs->name, case_decl, case_index, subject_ptr);
+                    bind_match_payload(&arm_binding,
+                                       arm.pattern->lhs->name,
+                                       case_decl,
+                                       case_index,
+                                       subject_ptr,
+                                       local_count);
                     arm_binding_ptr = &arm_binding;
                 }
             }
@@ -8545,11 +8553,14 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         expr.kind == AstExprKind::Mul || expr.kind == AstExprKind::Div ||
         expr.kind == AstExprKind::Mod)
         return analyze_arith_expr(expr, route, mod, locals, local_count, binding);
-    // Scan newest-first so a same-name rebinding (e.g. the `guard let x`
-    // shorthand's narrowed local) shadows the earlier binding.
+    const bool matches_payload_binding =
+        binding && binding->subject && expr.name.eq(binding->name);
+    // Locals declared inside an arm shadow its payload binding; the payload
+    // binding itself shadows same-name locals from the enclosing scope.
     for (u32 ri = local_count; ri > 0; ri--) {
         const u32 i = ri - 1;
         if (locals[i].name.eq(expr.name)) {
+            if (matches_payload_binding && i < binding->outer_local_count) continue;
             if (locals[i].type == HirTypeKind::Tuple) {
                 HirExpr tuple = locals[i].init;
                 tuple.span = expr.span;
@@ -8594,7 +8605,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return out;
         }
     }
-    if (binding && binding->subject && expr.name.eq(binding->name)) {
+    if (matches_payload_binding) {
         out.kind = HirExprKind::MatchPayload;
         out.type = binding->type;
         out.generic_index = binding->generic_index;
@@ -10240,6 +10251,10 @@ static FrontendResult<void> build_dynamic_json_plan(
 }
 
 static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index);
+static bool terminator_reads_local_ref(const HirTerminator& term,
+                                       const HirExpr* exprs,
+                                       u32 expr_count,
+                                       u32 ref_index);
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                   const HirModule& mod,
@@ -10297,6 +10312,32 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                                         term.json_value_ref_indices,
                                                         term.json_value_expr_indices);
                     if (!plan) return core::make_unexpected(plan.error());
+                    if (route->waits.len != 0) {
+                        bool retained[HirRoute::kMaxLocals]{};
+                        for (u32 li = 0; li < route->locals.len; li++)
+                            retained[li] = terminator_reads_local_ref(term,
+                                                                     route->exprs.data,
+                                                                     route->exprs.len,
+                                                                     route->locals[li].ref_index);
+                        bool changed = true;
+                        while (changed) {
+                            changed = false;
+                            for (u32 li = 0; li < route->locals.len; li++) {
+                                if (!retained[li]) continue;
+                                for (u32 dep = 0; dep < route->locals.len; dep++) {
+                                    if (retained[dep] ||
+                                        !expr_reads_local_ref(route->locals[li].init,
+                                                              route->locals[dep].ref_index))
+                                        continue;
+                                    retained[dep] = true;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        for (u32 li = 0; li < route->locals.len; li++)
+                            if (retained[li] && !route->locals[li].materialize_on_resume)
+                                route->locals[li].rematerialize_after_wait = true;
+                    }
                     u32 minimum_bytes = 0;
                     for (const auto& segment : segments) {
                         if (segment.size() > kJsonResponseScratchCapacity - minimum_bytes)
@@ -10404,16 +10445,39 @@ static bool expr_reads_local_ref(const HirExpr& expr, u32 ref_index) {
     return false;
 }
 
+static bool terminator_reads_local_ref(const HirTerminator& term,
+                                       const HirExpr* exprs,
+                                       u32 expr_count,
+                                       u32 ref_index) {
+    if (term.kind != HirTerminatorKind::ReturnStatus) return false;
+    if (term.source_kind == HirTerminatorSourceKind::LocalRef &&
+        term.local_ref_index == ref_index)
+        return true;
+    for (u32 i = 0; i < term.json_value_expr_indices.len; i++) {
+        const u32 expr_index = term.json_value_expr_indices[i];
+        if (expr_index < expr_count && expr_reads_local_ref(exprs[expr_index], ref_index))
+            return true;
+    }
+    return false;
+}
+
 static bool terminator_reads_any_local(const HirTerminator& term,
                                        const HirLocal* locals,
                                        u32 local_count,
-                                       u32 all_local_count = 0) {
+                                       u32 all_local_count = 0,
+                                       const HirExpr* exprs = nullptr,
+                                       u32 expr_count = 0) {
     if (term.kind != HirTerminatorKind::ReturnStatus) return false;
     if (term.source_kind == HirTerminatorSourceKind::LocalRef) {
         for (u32 li = 0; li < local_count; li++)
             if (locals[li].ref_index == term.local_ref_index) return true;
     }
     if (all_local_count == 0) all_local_count = local_count;
+    if (exprs != nullptr) {
+        for (u32 li = 0; li < local_count; li++)
+            if (terminator_reads_local_ref(term, exprs, expr_count, locals[li].ref_index))
+                return true;
+    }
     for (u32 ri = 0; ri < term.json_value_ref_indices.len; ri++) {
         for (u32 li = 0; li < all_local_count; li++) {
             if (locals[li].ref_index != term.json_value_ref_indices[ri]) continue;
@@ -10426,23 +10490,32 @@ static bool terminator_reads_any_local(const HirTerminator& term,
 
 static bool guard_reads_any_local(const HirGuard& guard,
                                   const HirModule& mod,
+                                  const HirExpr* exprs,
+                                  u32 expr_count,
                                   const HirLocal* locals,
                                   u32 local_count) {
     if (expr_reads_any_local(guard.cond, locals, local_count)) return true;
-    if (terminator_reads_any_local(guard.fail_term, locals, local_count)) return true;
+    if (terminator_reads_any_local(
+            guard.fail_term, locals, local_count, local_count, exprs, expr_count))
+        return true;
     if (expr_reads_any_local(guard.fail_match_expr, locals, local_count)) return true;
     for (u32 ai = 0; ai < guard.fail_match_count; ai++) {
         const auto& arm = mod.guard_match_arms[guard.fail_match_start + ai];
         if (expr_reads_any_local(arm.pattern, locals, local_count)) return true;
-        if (terminator_reads_any_local(arm.direct_term, locals, local_count)) return true;
+        if (terminator_reads_any_local(
+                arm.direct_term, locals, local_count, local_count, exprs, expr_count))
+            return true;
     }
     for (u32 li = 0; li < guard.fail_body.locals.len; li++) {
         if (expr_reads_any_local(guard.fail_body.locals[li].init, locals, local_count)) return true;
     }
     if (expr_reads_any_local(guard.fail_body.cond, locals, local_count)) return true;
-    return terminator_reads_any_local(guard.fail_body.then_term, locals, local_count) ||
-           terminator_reads_any_local(guard.fail_body.else_term, locals, local_count) ||
-           terminator_reads_any_local(guard.fail_body.direct_term, locals, local_count);
+    return terminator_reads_any_local(
+               guard.fail_body.then_term, locals, local_count, local_count, exprs, expr_count) ||
+           terminator_reads_any_local(
+               guard.fail_body.else_term, locals, local_count, local_count, exprs, expr_count) ||
+           terminator_reads_any_local(
+               guard.fail_body.direct_term, locals, local_count, local_count, exprs, expr_count);
 }
 
 static FrontendResult<void> analyze_guard_match_arms(
@@ -10874,7 +10947,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                                    inner_arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
-                                   subject_ptr);
+                                   subject_ptr,
+                                   local_count);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -11411,7 +11485,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                    arm.pattern->lhs->name,
                                    case_decl,
                                    pattern->case_index,
-                                   subject_ptr);
+                                   subject_ptr,
+                                   route->locals.len);
                 selected_binding_ptr = &selected_binding;
             }
             break;
@@ -11700,7 +11775,8 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                                        arm.pattern->lhs->name,
                                                        case_decl,
                                                        matched_pattern.case_index,
-                                                       &subject.value());
+                                                       &subject.value(),
+                                                       local_count);
                                     arm_binding_ptr = &arm_binding;
                                 }
                             }
@@ -12089,6 +12165,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                                 case_decl.payload_tuple_struct_indices[ti];
                         }
                         arm_binding.name = hir_arm.bind_name;
+                        arm_binding.outer_local_count = local_count;
                         arm_binding.type = hir_arm.bind_type;
                         arm_binding.generic_index = case_decl.payload_generic_index;
                         arm_binding.generic_has_error_constraint =
@@ -13637,8 +13714,15 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
         auto body = analyze_match_arm_body(
             *ast_arm.stmt, &arm, &route, mod, scoped.data, scoped.len, nullptr);
         bool retained[HirRoute::kMaxLocals]{};
-        for (u32 li = saved_locals; li < route.locals.len; li++)
-            retained[li] = route.locals[li].defer_to_terminator;
+        for (u32 li = saved_locals; li < route.locals.len; li++) {
+            const u32 ref = route.locals[li].ref_index;
+            retained[li] = terminator_reads_local_ref(
+                               arm.direct_term, route.exprs.data, route.exprs.len, ref) ||
+                           terminator_reads_local_ref(
+                               arm.then_term, route.exprs.data, route.exprs.len, ref) ||
+                           terminator_reads_local_ref(
+                               arm.else_term, route.exprs.data, route.exprs.len, ref);
+        }
         // Deferred JSON locals can depend on success-only if-let bindings (and
         // those bindings can in turn depend on another arm local). Retain the
         // transitive initializer closure, while hiding dependency names so a
@@ -14416,8 +14500,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 arm.bind_tuple_struct_indices[ti] =
                                     case_decl.payload_tuple_struct_indices[ti];
                             }
-                            bind_match_payload(
-                                &arm_binding, arm.bind_name, case_decl, case_index, subject_ptr);
+                            bind_match_payload(&arm_binding,
+                                               arm.bind_name,
+                                               case_decl,
+                                               case_index,
+                                               subject_ptr,
+                                               route->locals.len);
                             arm_binding_ptr = &arm_binding;
                         }
                     } else if (ast_arm.pattern->lhs != nullptr) {
@@ -20101,8 +20189,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (guard.span.start > first_wait_start) {
                     if (guard.fail_body.locals.len != 0)
                         return frontend_error(FrontendError::UnsupportedSyntax, guard.span);
-                    if (guard_reads_any_local(
-                            guard, mod, route.locals.data, user_local_count_before_decorators)) {
+                    if (guard_reads_any_local(guard,
+                                              mod,
+                                              route.exprs.data,
+                                              route.exprs.len,
+                                              route.locals.data,
+                                              user_local_count_before_decorators)) {
                         return frontend_error(FrontendError::UnsupportedSyntax, guard.span);
                     }
                 }
@@ -20112,7 +20204,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (terminator_reads_any_local(route.control.direct_term,
                                            route.locals.data,
                                            user_local_count_before_decorators,
-                                           route.locals.len)) {
+                                           route.locals.len,
+                                           route.exprs.data,
+                                           route.exprs.len)) {
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       route.control.direct_term.span);
             }

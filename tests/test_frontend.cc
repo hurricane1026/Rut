@@ -6631,8 +6631,8 @@ route GET "/users" use chain secure {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     REQUIRE_EQ(hir->routes.len, 1u);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
+    CHECK_GT(hir->routes[0].control.direct_term.json_value_expr_indices.len, 0u);
     CHECK(hir->routes[0].control.direct_term.has_dynamic_response_body);
 
     auto mir = build_mir_heap(hir.value());
@@ -6659,9 +6659,8 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK(hir->routes[0].locals[0].rematerialize_after_wait);
-    CHECK(hir->routes[0].locals[1].defer_to_terminator);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -6866,8 +6865,7 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -6895,8 +6893,7 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -6920,8 +6917,7 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
-    CHECK(hir->routes[0].locals[0].defer_to_terminator);
+    REQUIRE_EQ(hir->routes[0].locals.len, 0u);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -6951,12 +6947,9 @@ route GET "/users" {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
     CHECK_EQ(hir->routes[0].locals[0].name.len, 0u);
-    CHECK_FALSE(hir->routes[0].locals[0].defer_to_terminator);
     CHECK(hir->routes[0].locals[0].materialize_on_resume);
-    CHECK(hir->routes[0].locals[1].defer_to_terminator);
-    CHECK_EQ(hir->routes[0].locals[1].init.local_index, hir->routes[0].locals[0].ref_index);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     FrontendRirModule rir{};
@@ -32619,8 +32612,9 @@ TEST(frontend, return_body_expression_rejects_non_json_calls) {
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
-    CHECK(
-        hir.error().detail.eq(lit("return body expressions currently support json(literal) only")));
+    CHECK(hir.error().detail.eq(
+        lit("return body expressions require json(...) with a supported literal or declared "
+            "struct value")));
 }
 
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
